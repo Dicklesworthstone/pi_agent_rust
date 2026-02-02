@@ -1,0 +1,108 @@
+{
+  "version": "1.0",
+  "tool": "ls",
+  "description": "Conformance tests for the ls tool",
+  "cases": [
+    {
+      "name": "ls_directory",
+      "description": "List directory contents",
+      "setup": [
+        {"type": "create_file", "path": "file.txt", "content": "content"},
+        {"type": "create_dir", "path": "subdir"}
+      ],
+      "input": {},
+      "expected": {
+        "content_contains": ["file.txt", "subdir/"],
+        "details": {
+          "totalEntries": 2
+        }
+      }
+    },
+    {
+      "name": "ls_empty_directory",
+      "description": "List empty directory",
+      "input": {},
+      "expected": {
+        "content_contains": ["empty directory"],
+        "details": {
+          "totalEntries": 0
+        }
+      }
+    },
+    {
+      "name": "ls_nonexistent_directory",
+      "description": "List nonexistent directory errors",
+      "input": {"path": "/nonexistent/directory"},
+      "expect_error": true,
+      "error_contains": "not found",
+      "expected": {}
+    },
+    {
+      "name": "ls_file_not_directory",
+      "description": "List a file (not directory) errors",
+      "setup": [
+        {"type": "create_file", "path": "file.txt", "content": "content"}
+      ],
+      "input": {"path": "file.txt"},
+      "expect_error": true,
+      "error_contains": "not a directory",
+      "expected": {}
+    },
+    {
+      "name": "ls_with_sizes",
+      "description": "Output includes file sizes",
+      "setup": [
+        {"type": "create_file", "path": "small.txt", "content": "x"},
+        {"type": "create_file", "path": "larger.txt", "content": "xxxxxxxxxxxxxxxxxxxx"}
+      ],
+      "input": {},
+      "expected": {
+        "content_regex": "\\d+B\\s+small\\.txt",
+        "details": {
+          "totalEntries": 2
+        }
+      }
+    },
+    {
+      "name": "ls_directories_first",
+      "description": "Directories are listed before files",
+      "setup": [
+        {"type": "create_file", "path": "zfile.txt", "content": ""},
+        {"type": "create_dir", "path": "adir"}
+      ],
+      "input": {},
+      "expected": {
+        "content_regex": "(?s)adir/.*zfile\\.txt"
+      }
+    },
+    {
+      "name": "ls_with_limit",
+      "description": "Respects limit parameter",
+      "setup": [
+        {"type": "create_file", "path": "a.txt", "content": ""},
+        {"type": "create_file", "path": "b.txt", "content": ""},
+        {"type": "create_file", "path": "c.txt", "content": ""}
+      ],
+      "input": {"limit": 2},
+      "expected": {
+        "details": {
+          "limit": 2,
+          "shownEntries": 2,
+          "totalEntries": 3
+        }
+      }
+    },
+    {
+      "name": "ls_case_insensitive_sort",
+      "description": "Sorting is case-insensitive",
+      "setup": [
+        {"type": "create_file", "path": "Zebra.txt", "content": ""},
+        {"type": "create_file", "path": "apple.txt", "content": ""}
+      ],
+      "input": {},
+      "expected": {
+        "content_regex": "(?s)apple\\.txt.*Zebra\\.txt"
+      }
+    }
+  ]
+}

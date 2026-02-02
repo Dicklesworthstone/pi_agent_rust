@@ -1,0 +1,176 @@
+{
+  "version": "1.0",
+  "tool": "grep",
+  "description": "Conformance tests for the grep tool",
+  "cases": [
+    {
+      "name": "grep_basic_pattern",
+      "description": "Simple pattern match",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "hello world\ngoodbye world\nhello again"}
+      ],
+      "input": {"pattern": "hello"},
+      "expected": {
+        "content_contains": ["hello world", "hello again"],
+        "details": {
+          "matchCount": 2,
+          "filesWithMatches": 1
+        }
+      }
+    },
+    {
+      "name": "grep_case_sensitive",
+      "description": "Case-sensitive matching by default",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "Hello World\nHELLO WORLD\nhello world"}
+      ],
+      "input": {"pattern": "hello"},
+      "expected": {
+        "content_contains": ["hello world"],
+        "content_not_contains": ["Hello World", "HELLO WORLD"],
+        "details": {
+          "matchCount": 1
+        }
+      }
+    },
+    {
+      "name": "grep_case_insensitive",
+      "description": "Case-insensitive matching",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "Hello World\nHELLO WORLD\nhello world"}
+      ],
+      "input": {"pattern": "hello", "ignoreCase": true},
+      "expected": {
+        "content_contains": ["Hello World", "HELLO WORLD", "hello world"],
+        "details": {
+          "matchCount": 3
+        }
+      }
+    },
+    {
+      "name": "grep_regex_pattern",
+      "description": "Regex pattern matching",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "foo123\nbar456\nfoo789"}
+      ],
+      "input": {"pattern": "foo\\d+"},
+      "expected": {
+        "content_contains": ["foo123", "foo789"],
+        "content_not_contains": ["bar456"],
+        "details": {
+          "matchCount": 2
+        }
+      }
+    },
+    {
+      "name": "grep_literal_pattern",
+      "description": "Literal string matching (escapes regex)",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "foo.bar\nfooXbar\nfoo*bar"}
+      ],
+      "input": {"pattern": "foo.bar", "literal": true},
+      "expected": {
+        "content_contains": ["foo.bar"],
+        "content_not_contains": ["fooXbar"],
+        "details": {
+          "matchCount": 1
+        }
+      }
+    },
+    {
+      "name": "grep_no_matches",
+      "description": "Pattern with no matches",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "hello world"}
+      ],
+      "input": {"pattern": "notfound"},
+      "expected": {
+        "content_contains": ["No matches found"],
+        "details": {
+          "matchCount": 0,
+          "filesWithMatches": 0
+        }
+      }
+    },
+    {
+      "name": "grep_multiple_files",
+      "description": "Search across multiple files",
+      "setup": [
+        {"type": "create_file", "path": "file1.txt", "content": "hello in file1"},
+        {"type": "create_file", "path": "file2.txt", "content": "hello in file2"},
+        {"type": "create_file", "path": "file3.txt", "content": "no match here"}
+      ],
+      "input": {"pattern": "hello"},
+      "expected": {
+        "content_contains": ["file1.txt", "file2.txt"],
+        "details": {
+          "matchCount": 2,
+          "filesWithMatches": 2
+        }
+      }
+    },
+    {
+      "name": "grep_with_glob",
+      "description": "Search with glob filter",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "hello world"},
+        {"type": "create_file", "path": "test.rs", "content": "hello rust"}
+      ],
+      "input": {"pattern": "hello", "glob": "*.txt"},
+      "expected": {
+        "content_contains": ["hello world"],
+        "content_not_contains": ["hello rust"],
+        "details": {
+          "filesWithMatches": 1
+        }
+      }
+    },
+    {
+      "name": "grep_with_limit",
+      "description": "Limit number of matches",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "match1\nmatch2\nmatch3\nmatch4\nmatch5"}
+      ],
+      "input": {"pattern": "match", "limit": 3},
+      "expected": {
+        "details": {
+          "matchCount": 3,
+          "limitReached": true
+        }
+      }
+    },
+    {
+      "name": "grep_with_context",
+      "description": "Include context lines",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\ntarget\nline4\nline5"}
+      ],
+      "input": {"pattern": "target", "context": 1},
+      "expected": {
+        "content_contains": ["line2", "target", "line4"]
+      }
+    },
+    {
+      "name": "grep_line_numbers",
+      "description": "Output includes line numbers",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "first\nsecond\nthird"}
+      ],
+      "input": {"pattern": "second"},
+      "expected": {
+        "content_regex": ">\\s*2:"
+      }
+    },
+    {
+      "name": "grep_truncates_long_lines",
+      "description": "Long lines should be truncated",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "short line with match"}
+      ],
+      "input": {"pattern": "match"},
+      "expected": {
+        "content_contains": ["match"]
+      }
+    }
+  ]
+}

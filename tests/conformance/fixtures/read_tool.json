@@ -1,0 +1,145 @@
+{
+  "version": "1.0",
+  "tool": "read",
+  "description": "Conformance tests for the read tool",
+  "cases": [
+    {
+      "name": "read_simple_file",
+      "description": "Read a simple text file",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+      ],
+      "input": {"path": "test.txt"},
+      "expected": {
+        "content_contains": ["line1", "line2", "line3", "line4", "line5"],
+        "content_regex": "^1\\t",
+        "details": {
+          "totalLines": 5,
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "read_with_offset",
+      "description": "Read file starting from a specific line",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+      ],
+      "input": {"path": "test.txt", "offset": 3},
+      "expected": {
+        "content_contains": ["line3", "line4", "line5"],
+        "content_not_contains": ["line1", "line2"],
+        "content_regex": "^3\\t",
+        "details": {
+          "offset": 3,
+          "totalLines": 5
+        }
+      }
+    },
+    {
+      "name": "read_with_limit",
+      "description": "Read file with line limit",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+      ],
+      "input": {"path": "test.txt", "limit": 2},
+      "expected": {
+        "content_contains": ["line1", "line2"],
+        "content_not_contains": ["line3", "line4", "line5"],
+        "details": {
+          "limit": 2,
+          "outputLines": 2
+        }
+      }
+    },
+    {
+      "name": "read_with_offset_and_limit",
+      "description": "Read file with both offset and limit",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+      ],
+      "input": {"path": "test.txt", "offset": 2, "limit": 2},
+      "expected": {
+        "content_contains": ["line2", "line3"],
+        "content_not_contains": ["line1", "line4", "line5"],
+        "details": {
+          "offset": 2,
+          "limit": 2,
+          "outputLines": 2
+        }
+      }
+    },
+    {
+      "name": "read_nonexistent_file",
+      "description": "Reading a nonexistent file should error",
+      "input": {"path": "/nonexistent/path/file.txt"},
+      "expect_error": true,
+      "error_contains": "not found",
+      "expected": {}
+    },
+    {
+      "name": "read_directory",
+      "description": "Reading a directory should error",
+      "setup": [
+        {"type": "create_dir", "path": "mydir"}
+      ],
+      "input": {"path": "mydir"},
+      "expect_error": true,
+      "error_contains": "directory",
+      "expected": {}
+    },
+    {
+      "name": "read_empty_file",
+      "description": "Read an empty file",
+      "setup": [
+        {"type": "create_file", "path": "empty.txt", "content": ""}
+      ],
+      "input": {"path": "empty.txt"},
+      "expected": {
+        "details": {
+          "totalLines": 0,
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "read_unicode_content",
+      "description": "Read file with Unicode content",
+      "setup": [
+        {"type": "create_file", "path": "unicode.txt", "content": "Hello 世界\nこんにちは\n🎉 emoji"}
+      ],
+      "input": {"path": "unicode.txt"},
+      "expected": {
+        "content_contains": ["世界", "こんにちは", "🎉"],
+        "details": {
+          "totalLines": 3,
+          "truncated": false
+        }
+      }
+    },
+    {
+      "name": "read_with_line_numbers",
+      "description": "Output should include line numbers in cat -n format",
+      "setup": [
+        {"type": "create_file", "path": "numbered.txt", "content": "first\nsecond\nthird"}
+      ],
+      "input": {"path": "numbered.txt"},
+      "expected": {
+        "content_regex": "1\\tfirst",
+        "content_contains": ["2\tsecond", "3\tthird"]
+      }
+    },
+    {
+      "name": "read_offset_line_numbers",
+      "description": "Line numbers should start at offset value",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+      ],
+      "input": {"path": "test.txt", "offset": 3},
+      "expected": {
+        "content_regex": "3\\tline3",
+        "content_contains": ["4\tline4", "5\tline5"]
+      }
+    }
+  ]
+}

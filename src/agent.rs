@@ -110,11 +110,7 @@ pub struct Agent {
 
 impl Agent {
     /// Create a new agent with the given provider and tools.
-    pub fn new(
-        provider: Arc<dyn Provider>,
-        tools: ToolRegistry,
-        config: AgentConfig,
-    ) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, tools: ToolRegistry, config: AgentConfig) -> Self {
         Self {
             provider,
             tools,
@@ -223,12 +219,11 @@ impl Agent {
                 .await?;
 
             // Process stream events
-            let assistant_message = self
-                .process_stream(&mut stream, on_event)
-                .await?;
+            let assistant_message = self.process_stream(&mut stream, on_event).await?;
 
             // Add assistant message to history
-            self.messages.push(Message::Assistant(assistant_message.clone()));
+            self.messages
+                .push(Message::Assistant(assistant_message.clone()));
 
             on_event(AgentEvent::AssistantDone {
                 message: assistant_message.clone(),

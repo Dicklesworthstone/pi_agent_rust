@@ -27,6 +27,7 @@ pub mod model;
 pub mod provider;
 pub mod providers;
 pub mod session;
+pub mod sse;
 pub mod tools;
 pub mod tui;
 

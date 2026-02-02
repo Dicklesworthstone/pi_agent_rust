@@ -1,0 +1,142 @@
+{
+  "version": "1.0",
+  "tool": "bash",
+  "description": "Conformance tests for the bash tool",
+  "cases": [
+    {
+      "name": "bash_simple_echo",
+      "description": "Simple echo command",
+      "input": {"command": "echo 'Hello, World!'"},
+      "expected": {
+        "content_contains": ["Hello, World!"],
+        "details_exact": {
+          "exitCode": 0,
+          "timedOut": false
+        }
+      }
+    },
+    {
+      "name": "bash_exit_code",
+      "description": "Command with non-zero exit code",
+      "input": {"command": "exit 42"},
+      "expected": {
+        "details_exact": {
+          "exitCode": 42,
+          "timedOut": false
+        }
+      }
+    },
+    {
+      "name": "bash_exit_code_1",
+      "description": "Command with exit code 1",
+      "input": {"command": "exit 1"},
+      "expected": {
+        "details_exact": {
+          "exitCode": 1,
+          "timedOut": false
+        }
+      }
+    },
+    {
+      "name": "bash_multiline_output",
+      "description": "Command with multiline output",
+      "input": {"command": "echo 'line1'; echo 'line2'; echo 'line3'"},
+      "expected": {
+        "content_contains": ["line1", "line2", "line3"],
+        "details_exact": {
+          "exitCode": 0,
+          "timedOut": false
+        }
+      }
+    },
+    {
+      "name": "bash_stderr",
+      "description": "Command that writes to stderr",
+      "input": {"command": "echo 'error' >&2"},
+      "expected": {
+        "content_contains": ["error"],
+        "details_exact": {
+          "exitCode": 0,
+          "timedOut": false
+        }
+      }
+    },
+    {
+      "name": "bash_mixed_output",
+      "description": "Command with both stdout and stderr",
+      "input": {"command": "echo 'stdout'; echo 'stderr' >&2"},
+      "expected": {
+        "content_contains": ["stdout", "stderr"],
+        "details_exact": {
+          "exitCode": 0
+        }
+      }
+    },
+    {
+      "name": "bash_working_directory",
+      "description": "Command runs in correct working directory",
+      "input": {"command": "pwd"},
+      "expected": {
+        "details_exact": {
+          "exitCode": 0,
+          "timedOut": false
+        }
+      }
+    },
+    {
+      "name": "bash_environment",
+      "description": "Environment variables are available",
+      "input": {"command": "echo $HOME"},
+      "expected": {
+        "content_regex": "^/",
+        "details_exact": {
+          "exitCode": 0
+        }
+      }
+    },
+    {
+      "name": "bash_pipe",
+      "description": "Piped commands work correctly",
+      "input": {"command": "echo 'hello world' | tr ' ' '\\n'"},
+      "expected": {
+        "content_contains": ["hello", "world"],
+        "details_exact": {
+          "exitCode": 0
+        }
+      }
+    },
+    {
+      "name": "bash_subshell",
+      "description": "Subshell commands work",
+      "input": {"command": "echo $(echo nested)"},
+      "expected": {
+        "content_contains": ["nested"],
+        "details_exact": {
+          "exitCode": 0
+        }
+      }
+    },
+    {
+      "name": "bash_empty_output",
+      "description": "Command with no output",
+      "input": {"command": "true"},
+      "expected": {
+        "details_exact": {
+          "exitCode": 0,
+          "timedOut": false
+        }
+      }
+    },
+    {
+      "name": "bash_false_command",
+      "description": "False command returns exit code 1",
+      "input": {"command": "false"},
+      "expected": {
+        "details_exact": {
+          "exitCode": 1,
+          "timedOut": false
+        }
+      }
+    }
+  ]
+}

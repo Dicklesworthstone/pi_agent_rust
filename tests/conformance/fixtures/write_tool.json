@@ -1,0 +1,105 @@
+{
+  "version": "1.0",
+  "tool": "write",
+  "description": "Conformance tests for the write tool",
+  "cases": [
+    {
+      "name": "write_new_file",
+      "description": "Write content to a new file",
+      "input": {
+        "path": "newfile.txt",
+        "content": "Hello, World!\nLine 2"
+      },
+      "expected": {
+        "content_contains": ["Wrote", "bytes"],
+        "details": {
+          "bytesWritten": 20,
+          "lines": 2
+        }
+      }
+    },
+    {
+      "name": "write_creates_directories",
+      "description": "Write should create parent directories",
+      "input": {
+        "path": "nested/dir/file.txt",
+        "content": "content"
+      },
+      "expected": {
+        "content_contains": ["Wrote"],
+        "details": {
+          "bytesWritten": 7
+        }
+      }
+    },
+    {
+      "name": "write_overwrites_existing",
+      "description": "Write should overwrite existing files",
+      "setup": [
+        {"type": "create_file", "path": "existing.txt", "content": "old content"}
+      ],
+      "input": {
+        "path": "existing.txt",
+        "content": "new content"
+      },
+      "expected": {
+        "content_contains": ["Wrote"],
+        "details": {
+          "bytesWritten": 11
+        }
+      }
+    },
+    {
+      "name": "write_empty_file",
+      "description": "Write empty content creates empty file",
+      "input": {
+        "path": "empty.txt",
+        "content": ""
+      },
+      "expected": {
+        "details": {
+          "bytesWritten": 0,
+          "lines": 0
+        }
+      }
+    },
+    {
+      "name": "write_unicode_content",
+      "description": "Write Unicode content correctly",
+      "input": {
+        "path": "unicode.txt",
+        "content": "Hello 世界\nこんにちは\n🎉 emoji"
+      },
+      "expected": {
+        "content_contains": ["Wrote"],
+        "details": {
+          "lines": 3
+        }
+      }
+    },
+    {
+      "name": "write_preserves_newlines",
+      "description": "Write preserves trailing newlines",
+      "input": {
+        "path": "trailing.txt",
+        "content": "line1\nline2\n"
+      },
+      "expected": {
+        "details": {
+          "lines": 3
+        }
+      }
+    },
+    {
+      "name": "write_special_characters",
+      "description": "Write content with special characters",
+      "input": {
+        "path": "special.txt",
+        "content": "Tab:\tNewline:\nBackslash:\\"
+      },
+      "expected": {
+        "content_contains": ["Wrote"]
+      }
+    }
+  ]
+}

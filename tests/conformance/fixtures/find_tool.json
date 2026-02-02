@@ -1,0 +1,105 @@
+{
+  "version": "1.0",
+  "tool": "find",
+  "description": "Conformance tests for the find tool",
+  "cases": [
+    {
+      "name": "find_glob_pattern",
+      "description": "Find files matching glob pattern",
+      "setup": [
+        {"type": "create_file", "path": "file1.txt", "content": ""},
+        {"type": "create_file", "path": "file2.txt", "content": ""},
+        {"type": "create_file", "path": "file.rs", "content": ""}
+      ],
+      "input": {"pattern": "*.txt"},
+      "expected": {
+        "content_contains": ["file1.txt", "file2.txt"],
+        "content_not_contains": ["file.rs"],
+        "details": {
+          "count": 2
+        }
+      }
+    },
+    {
+      "name": "find_no_matches",
+      "description": "Find with no matching files",
+      "setup": [
+        {"type": "create_file", "path": "file.txt", "content": ""}
+      ],
+      "input": {"pattern": "*.rs"},
+      "expected": {
+        "content_contains": ["No files found"],
+        "details": {
+          "count": 0
+        }
+      }
+    },
+    {
+      "name": "find_recursive_glob",
+      "description": "Find files recursively with **",
+      "setup": [
+        {"type": "create_dir", "path": "subdir"},
+        {"type": "create_file", "path": "root.txt", "content": ""},
+        {"type": "create_file", "path": "subdir/nested.txt", "content": ""}
+      ],
+      "input": {"pattern": "**/*.txt"},
+      "expected": {
+        "content_contains": ["root.txt", "nested.txt"],
+        "details": {
+          "count": 2
+        }
+      }
+    },
+    {
+      "name": "find_with_limit",
+      "description": "Find respects limit parameter",
+      "setup": [
+        {"type": "create_file", "path": "a.txt", "content": ""},
+        {"type": "create_file", "path": "b.txt", "content": ""},
+        {"type": "create_file", "path": "c.txt", "content": ""},
+        {"type": "create_file", "path": "d.txt", "content": ""},
+        {"type": "create_file", "path": "e.txt", "content": ""}
+      ],
+      "input": {"pattern": "*.txt", "limit": 3},
+      "expected": {
+        "details": {
+          "count": 3,
+          "limit": 3
+        }
+      }
+    },
+    {
+      "name": "find_specific_extension",
+      "description": "Find only .rs files",
+      "setup": [
+        {"type": "create_file", "path": "main.rs", "content": ""},
+        {"type": "create_file", "path": "lib.rs", "content": ""},
+        {"type": "create_file", "path": "test.ts", "content": ""}
+      ],
+      "input": {"pattern": "*.rs"},
+      "expected": {
+        "content_contains": ["main.rs", "lib.rs"],
+        "content_not_contains": ["test.ts"],
+        "details": {
+          "count": 2
+        }
+      }
+    },
+    {
+      "name": "find_sorted_by_mtime",
+      "description": "Results are sorted by modification time (newest first)",
+      "setup": [
+        {"type": "create_file", "path": "old.txt", "content": "old"},
+        {"type": "run_command", "command": "sleep 0.1"},
+        {"type": "create_file", "path": "new.txt", "content": "new"}
+      ],
+      "input": {"pattern": "*.txt"},
+      "expected": {
+        "content_regex": "(?s)new\\.txt.*old\\.txt",
+        "details": {
+          "count": 2
+        }
+      }
+    }
+  ]
+}

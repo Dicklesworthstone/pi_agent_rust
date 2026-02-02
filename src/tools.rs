@@ -6,12 +6,14 @@ use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent, TextContent};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::mpsc;
+use uuid::Uuid;
 
 // ============================================================================
 // Tool Trait
@@ -68,6 +70,15 @@ pub const GREP_MAX_LINE_LENGTH: usize = 500;
 
 /// Default bash timeout in seconds.
 pub const DEFAULT_BASH_TIMEOUT: u64 = 120;
+
+/// Default grep result limit.
+pub const DEFAULT_GREP_LIMIT: usize = 1000;
+
+/// Default find result limit.
+pub const DEFAULT_FIND_LIMIT: usize = 1000;
+
+/// Default ls result limit.
+pub const DEFAULT_LS_LIMIT: usize = 1000;
 
 /// Result of truncation operation.
 #[derive(Debug, Clone, Serialize)]
@@ -270,6 +281,21 @@ fn truncate_string_to_bytes_from_end(s: &str, max_bytes: usize) -> String {
         .unwrap_or_default()
 }
 
+/// Format a byte count into a human-readable string with appropriate unit suffix.
+#[allow(clippy::cast_precision_loss)]
+fn format_size(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+
+    if bytes >= MB {
+        format!("{:.1}MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1}KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 // ============================================================================
 // Path Utilities (port of pi-mono path-utils.ts)
 // ============================================================================
@@ -283,6 +309,28 @@ fn normalize_unicode_spaces(s: &str) -> String {
     s.chars()
         .map(|c| if is_special_unicode_space(c) { ' ' } else { c })
         .collect()
+}
+
+fn normalize_quotes(s: &str) -> String {
+    s.replace(['\u{2018}', '\u{2019}'], "'")
+        .replace(['\u{201C}', '\u{201D}', '\u{201E}', '\u{201F}'], "\"")
+}
+
+fn normalize_dashes(s: &str) -> String {
+    s.replace(
+        ['\u{2010}', '\u{2011}', '\u{2012}', '\u{2013}', '\u{2014}', '\u{2015}', '\u{2212}'],
+        "-",
+    )
+}
+
+fn normalize_for_match(s: &str) -> String {
+    let s = normalize_unicode_spaces(s);
+    let s = normalize_quotes(&s);
+    normalize_dashes(&s)
+}
+
+fn normalize_line_for_match(line: &str) -> String {
+    normalize_for_match(line.trim_end())
 }
 
 fn expand_path(file_path: &str) -> String {
@@ -680,100 +728,186 @@ impl Tool for BashTool {
         let mut stderr_reader = BufReader::new(stderr).lines();
 
         let mut output = String::new();
+        let mut rolling_output = String::new();
+        let mut exit_code: Option<i32> = None;
+        let mut timed_out = false;
 
-        // Stream output with timeout
         let timeout = tokio::time::Duration::from_secs(timeout_secs);
         let start = tokio::time::Instant::now();
 
         loop {
             if start.elapsed() > timeout {
+                timed_out = true;
                 let _ = child.kill().await;
-                return Ok(ToolOutput {
-                    content: vec![ContentBlock::Text(TextContent::new(format!(
-                        "{output}\n\n[Command timed out after {timeout_secs}s]"
-                    )))],
-                    details: Some(serde_json::json!({
-                        "exitCode": null,
-                        "timedOut": true,
-                        "timeout": timeout_secs,
-                    })),
-                });
+                break;
             }
 
             tokio::select! {
                 line = stdout_reader.next_line() => {
-                    match line {
-                        Ok(Some(line)) => {
-                            if !output.is_empty() {
-                                output.push('\n');
-                            }
-                            output.push_str(&line);
-                            // Send incremental update if callback provided
-                            if let Some(ref callback) = on_update {
-                                callback(ToolUpdate {
-                                    content: vec![ContentBlock::Text(TextContent::new(line))],
-                                    details: None,
-                                });
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!("Error reading stdout: {e}");
+                    if let Ok(Some(line)) = line {
+                        append_output(&mut output, &mut rolling_output, &line);
+                        if let Some(ref callback) = on_update {
+                            callback(ToolUpdate {
+                                content: vec![ContentBlock::Text(TextContent::new(rolling_output.clone()))],
+                                details: None,
+                            });
                         }
                     }
                 }
                 line = stderr_reader.next_line() => {
-                    match line {
-                        Ok(Some(line)) => {
-                            if !output.is_empty() {
-                                output.push('\n');
-                            }
-                            output.push_str(&line);
-                            // Send incremental update
-                            if let Some(ref callback) = on_update {
-                                callback(ToolUpdate {
-                                    content: vec![ContentBlock::Text(TextContent::new(line))],
-                                    details: None,
-                                });
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!("Error reading stderr: {e}");
+                    if let Ok(Some(line)) = line {
+                        append_output(&mut output, &mut rolling_output, &line);
+                        if let Some(ref callback) = on_update {
+                            callback(ToolUpdate {
+                                content: vec![ContentBlock::Text(TextContent::new(rolling_output.clone()))],
+                                details: None,
+                            });
                         }
                     }
                 }
                 status = child.wait() => {
-                    let exit_code = status
+                    exit_code = status
                         .map_err(|e| Error::tool("bash", e.to_string()))?
                         .code();
-
-                    // Apply tail truncation
-                    let result = truncate_tail(&output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
-
-                    let content = if result.truncated {
-                        format!(
-                            "[Output truncated: showing last {} of {} lines]\n{}",
-                            result.output_lines, result.total_lines, result.content
-                        )
-                    } else {
-                        result.content
-                    };
-
-                    return Ok(ToolOutput {
-                        content: vec![ContentBlock::Text(TextContent::new(content))],
-                        details: Some(serde_json::json!({
-                            "exitCode": exit_code,
-                            "timedOut": false,
-                            "totalLines": result.total_lines,
-                            "outputLines": result.output_lines,
-                            "truncated": result.truncated,
-                        })),
-                    });
+                    break;
                 }
             }
         }
+
+        Ok(build_bash_output(&output, exit_code, timed_out, timeout_secs))
     }
+}
+
+const BASH_ROLLING_BUFFER_BYTES: usize = 100 * 1024;
+
+fn append_output(full: &mut String, rolling: &mut String, line: &str) {
+    if !full.is_empty() {
+        full.push('\n');
+    }
+    full.push_str(line);
+
+    if !rolling.is_empty() {
+        rolling.push('\n');
+    }
+    rolling.push_str(line);
+
+    if rolling.len() > BASH_ROLLING_BUFFER_BYTES {
+        *rolling = truncate_string_to_bytes_from_end(rolling, BASH_ROLLING_BUFFER_BYTES);
+    }
+}
+
+fn build_bash_output(
+    full_output: &str,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    timeout_secs: u64,
+) -> ToolOutput {
+    let truncation = truncate_tail(full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let mut output_text = if truncation.content.is_empty() {
+        "(no output)".to_string()
+    } else {
+        truncation.content.clone()
+    };
+
+    let mut details = serde_json::Map::new();
+    details.insert(
+        "exitCode".to_string(),
+        exit_code.map_or(serde_json::Value::Null, |c| {
+            serde_json::Value::Number(c.into())
+        }),
+    );
+    details.insert(
+        "timedOut".to_string(),
+        serde_json::Value::Bool(timed_out),
+    );
+    details.insert(
+        "timeout".to_string(),
+        serde_json::Value::Number(timeout_secs.into()),
+    );
+    details.insert(
+        "totalLines".to_string(),
+        serde_json::Value::Number(truncation.total_lines.into()),
+    );
+    details.insert(
+        "outputLines".to_string(),
+        serde_json::Value::Number(truncation.output_lines.into()),
+    );
+    details.insert(
+        "truncated".to_string(),
+        serde_json::Value::Bool(truncation.truncated),
+    );
+
+    let is_error = timed_out || exit_code.is_some_and(|c| c != 0);
+    details.insert("isError".to_string(), serde_json::Value::Bool(is_error));
+
+    if truncation.truncated {
+        if let Ok(path) = write_full_output(full_output) {
+            details.insert(
+                "fullOutputPath".to_string(),
+                serde_json::Value::String(path.display().to_string()),
+            );
+
+            let start_line = truncation
+                .total_lines
+                .saturating_sub(truncation.output_lines)
+                .saturating_add(1);
+            let end_line = truncation.total_lines;
+
+            if truncation.last_line_partial {
+                let last_line_bytes = full_output
+                    .split('\n')
+                    .next_back()
+                    .map_or(0, str::len);
+                let _ = write!(
+                    output_text,
+                    "\n\n[Showing last {} of line {end_line} (line is {}). Full output: {}]",
+                    format_size(truncation.output_bytes),
+                    format_size(last_line_bytes),
+                    path.display()
+                );
+            } else if truncation.truncated_by == Some(TruncatedBy::Lines) {
+                let _ = write!(
+                    output_text,
+                    "\n\n[Showing lines {start_line}-{end_line} of {}. Full output: {}]",
+                    truncation.total_lines,
+                    path.display()
+                );
+            } else {
+                let _ = write!(
+                    output_text,
+                    "\n\n[Showing lines {start_line}-{end_line} of {} ({} limit). Full output: {}]",
+                    truncation.total_lines,
+                    format_size(DEFAULT_MAX_BYTES),
+                    path.display()
+                );
+            }
+        }
+    }
+
+    if timed_out {
+        let _ = write!(
+            output_text,
+            "\n\nCommand timed out after {timeout_secs} seconds"
+        );
+    } else if let Some(code) = exit_code {
+        if code != 0 {
+            let _ = write!(output_text, "\n\nCommand exited with code {code}");
+        }
+    }
+
+    ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(output_text))],
+        details: Some(serde_json::Value::Object(details)),
+    }
+}
+
+fn write_full_output(output: &str) -> Result<PathBuf> {
+    let mut file = tempfile::NamedTempFile::new().map_err(|e| Error::tool("bash", e.to_string()))?;
+    use std::io::Write;
+    file.write_all(output.as_bytes())
+        .map_err(|e| Error::tool("bash", e.to_string()))?;
+    let (_file, path) = file.keep().map_err(|e| Error::tool("bash", e.to_string()))?;
+    Ok(path)
 }
 
 // ============================================================================
@@ -858,6 +992,116 @@ fn compute_diff(old: &str, new: &str, path: &str) -> String {
     diff
 }
 
+fn strip_bom(s: &str) -> (String, bool) {
+    if let Some(stripped) = s.strip_prefix('\u{FEFF}') {
+        (stripped.to_string(), true)
+    } else {
+        (s.to_string(), false)
+    }
+}
+
+fn detect_line_ending(s: &str) -> &str {
+    if s.contains("\r\n") {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn line_offsets(lines: &[&str]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(lines.len() + 1);
+    let mut pos = 0usize;
+    for line in lines {
+        offsets.push(pos);
+        pos += line.len() + 1; // +1 for '\n'
+    }
+    offsets.push(pos);
+    offsets
+}
+
+fn find_exact_match(content: &str, old_text: &str) -> Result<(usize, usize, usize)> {
+    let mut occurrences = 0;
+    let mut first_start = 0;
+    for (idx, _) in content.match_indices(old_text) {
+        occurrences += 1;
+        if occurrences == 1 {
+            first_start = idx;
+        }
+    }
+
+    if occurrences == 0 {
+        return Err(Error::tool(
+            "edit",
+            "Text not found in file. Make sure the oldText matches exactly, including whitespace."
+                .to_string(),
+        ));
+    }
+    if occurrences > 1 {
+        return Err(Error::tool(
+            "edit",
+            format!(
+                "Found {occurrences} occurrences of the text. Please provide more context to make the match unique."
+            ),
+        ));
+    }
+
+    let start = first_start;
+    let end = first_start + old_text.len();
+    let first_line = content[..start].lines().count() + 1;
+    Ok((start, end, first_line))
+}
+
+fn find_fuzzy_match(content: &str, old_text: &str) -> Result<(usize, usize, usize)> {
+    let content_lines: Vec<&str> = content.split('\n').collect();
+    let old_lines: Vec<&str> = old_text.split('\n').collect();
+
+    if old_lines.is_empty() {
+        return Err(Error::tool(
+            "edit",
+            "Old text is empty".to_string(),
+        ));
+    }
+
+    let normalized_content: Vec<String> = content_lines
+        .iter()
+        .map(|l| normalize_line_for_match(l))
+        .collect();
+    let normalized_old: Vec<String> = old_lines
+        .iter()
+        .map(|l| normalize_line_for_match(l))
+        .collect();
+
+    let mut match_start: Option<usize> = None;
+    if content_lines.len() >= old_lines.len() {
+        for i in 0..=content_lines.len() - old_lines.len() {
+            if normalized_content[i..i + old_lines.len()] == normalized_old[..] {
+                if match_start.is_some() {
+                    return Err(Error::tool(
+                        "edit",
+                        "Multiple fuzzy matches found. Please provide more context to make the match unique."
+                            .to_string(),
+                    ));
+                }
+                match_start = Some(i);
+            }
+        }
+    }
+
+    let Some(start_line) = match_start else {
+        return Err(Error::tool(
+            "edit",
+            "Text not found in file. Make sure the oldText matches exactly, including whitespace."
+                .to_string(),
+        ));
+    };
+
+    let offsets = line_offsets(&content_lines);
+    let start = offsets[start_line];
+    let end = offsets[start_line + old_lines.len()];
+    let first_line = start_line + 1;
+    Ok((start, end, first_line))
+}
+
 #[async_trait]
 impl Tool for EditTool {
     fn name(&self) -> &'static str {
@@ -910,42 +1154,53 @@ impl Tool for EditTool {
             ));
         }
 
-        // Read the file
-        let content = tokio::fs::read_to_string(&path)
+        // Read the file as bytes to preserve BOM and line endings.
+        let raw = tokio::fs::read(&path)
             .await
             .map_err(|e| Error::tool("edit", format!("Failed to read file: {e}")))?;
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let (content_no_bom, had_bom) = strip_bom(&text);
+        let line_ending = detect_line_ending(&content_no_bom);
+        let content_lf = content_no_bom.replace("\r\n", "\n");
+        let old_lf = input.old_text.replace("\r\n", "\n");
+        let new_lf = input.new_text.replace("\r\n", "\n");
 
-        // Check if oldText exists in the file
-        if !content.contains(&input.old_text) {
+        if old_lf == new_lf {
             return Err(Error::tool(
                 "edit",
-                "Text not found in file. Make sure the oldText matches exactly, including whitespace.".to_string(),
+                "oldText and newText are identical. No changes to apply.".to_string(),
             ));
         }
 
-        // Check for multiple occurrences
-        let occurrences = content.matches(&input.old_text).count();
-        if occurrences > 1 {
-            return Err(Error::tool(
-                "edit",
-                format!(
-                    "Found {occurrences} occurrences of the text. Please provide more context to make the match unique."
-                ),
-            ));
-        }
+        // Try exact match first.
+        let match_result = find_exact_match(&content_lf, &old_lf)
+            .or_else(|_| find_fuzzy_match(&content_lf, &old_lf))?;
 
-        // Perform the replacement
-        let new_content = content.replacen(&input.old_text, &input.new_text, 1);
+        let (start, end, first_line) = match_result;
 
-        // Compute diff
-        let diff = compute_diff(&content, &new_content, &input.path);
+        let mut new_content_lf = String::new();
+        new_content_lf.push_str(&content_lf[..start]);
+        new_content_lf.push_str(&new_lf);
+        new_content_lf.push_str(&content_lf[end..]);
+
+        // Compute diff (LF normalized)
+        let diff = compute_diff(&content_lf, &new_content_lf, &input.path);
 
         // Write atomically using tempfile
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let temp_file = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| Error::tool("edit", format!("Failed to create temp file: {e}")))?;
 
-        tokio::fs::write(temp_file.path(), &new_content)
+        let mut output_content = if line_ending == "\r\n" {
+            new_content_lf.replace("\n", "\r\n")
+        } else {
+            new_content_lf.clone()
+        };
+        if had_bom {
+            output_content = format!("\u{FEFF}{output_content}");
+        }
+
+        tokio::fs::write(temp_file.path(), &output_content)
             .await
             .map_err(|e| Error::tool("edit", format!("Failed to write temp file: {e}")))?;
 
@@ -954,12 +1209,21 @@ impl Tool for EditTool {
             .persist(&path)
             .map_err(|e| Error::tool("edit", format!("Failed to persist file: {e}")))?;
 
+        let summary = format!(
+            "Successfully replaced text in {}. Changed {} characters to {} characters.",
+            path.display(),
+            input.old_text.len(),
+            input.new_text.len()
+        );
+
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(diff))],
+            content: vec![ContentBlock::Text(TextContent::new(summary))],
             details: Some(serde_json::json!({
                 "path": path.display().to_string(),
                 "oldLength": input.old_text.len(),
                 "newLength": input.new_text.len(),
+                "firstLine": first_line,
+                "diff": diff,
             })),
         })
     }
@@ -1054,7 +1318,7 @@ impl Tool for WriteTool {
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(
-                "Wrote {} bytes to {}",
+                "Successfully wrote {} bytes to {}",
                 bytes_written,
                 path.display()
             )))],
@@ -1181,131 +1445,219 @@ impl Tool for GrepTool {
         let input: GrepInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
-        let search_path = input
-            .path
-            .as_ref()
-            .map_or_else(|| self.cwd.clone(), |p| resolve_path(p, &self.cwd));
+        let search_dir = input.path.as_deref().unwrap_or(".");
+        let search_path = resolve_path(search_dir, &self.cwd);
 
-        let limit = input.limit.unwrap_or(100);
-        let context = input.context.unwrap_or(0);
+        let is_directory = std::fs::metadata(&search_path)
+            .map_err(|_| Error::tool("grep", format!("Path not found: {}", search_path.display())))?
+            .is_dir();
 
-        // Build regex
-        let pattern = if input.literal.unwrap_or(false) {
-            regex::escape(&input.pattern)
-        } else {
-            input.pattern.clone()
-        };
+        let context_value = input.context.unwrap_or(0);
+        let effective_limit = input.limit.unwrap_or(DEFAULT_GREP_LIMIT).max(1);
 
-        let regex = if input.ignore_case.unwrap_or(false) {
-            regex::RegexBuilder::new(&pattern)
-                .case_insensitive(true)
-                .build()
-        } else {
-            regex::Regex::new(&pattern)
+        let mut args: Vec<String> = vec![
+            "--json".to_string(),
+            "--line-number".to_string(),
+            "--color=never".to_string(),
+            "--hidden".to_string(),
+        ];
+
+        if input.ignore_case.unwrap_or(false) {
+            args.push("--ignore-case".to_string());
         }
-        .map_err(|e| Error::tool("grep", format!("Invalid regex: {e}")))?;
+        if input.literal.unwrap_or(false) {
+            args.push("--fixed-strings".to_string());
+        }
+        if let Some(glob) = &input.glob {
+            args.push("--glob".to_string());
+            args.push(glob.clone());
+        }
 
-        // Build file walker
-        let mut builder = ignore::WalkBuilder::new(&search_path);
-        builder.hidden(false).git_ignore(true).git_exclude(true);
+        args.push(input.pattern.clone());
+        args.push(search_path.display().to_string());
 
-        // Apply glob filter if specified
-        let glob_matcher = input
-            .glob
-            .as_ref()
-            .map(|g| glob::Pattern::new(g))
-            .transpose()
-            .map_err(|e| Error::tool("grep", format!("Invalid glob: {e}")))?;
+        let mut child = Command::new("rg")
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| Error::tool("grep", format!("Failed to run ripgrep: {}", e)))?;
 
-        let mut results: Vec<String> = Vec::new();
-        let mut match_count = 0;
-        let mut files_searched = 0;
-        let mut files_with_matches = 0;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::tool("grep", "Missing stdout".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
 
-        for entry in builder.build() {
-            if match_count >= limit {
+        let mut stdout_lines = BufReader::new(stdout).lines();
+        let stderr_task = tokio::spawn(async move {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            let _ = reader.read_to_end(&mut buf).await;
+            buf
+        });
+
+        let mut matches: Vec<(PathBuf, usize)> = Vec::new();
+        let mut match_count: usize = 0;
+        let mut match_limit_reached = false;
+
+        while let Some(line) = stdout_lines
+            .next_line()
+            .await
+            .map_err(|e| Error::tool("grep", e.to_string()))?
+        {
+            if match_count >= effective_limit {
                 break;
             }
 
-            let Ok(entry) = entry else {
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
                 continue;
             };
 
-            let path = entry.path();
-
-            // Skip directories
-            if path.is_dir() {
+            if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
                 continue;
             }
 
-            // Apply glob filter
-            if let Some(ref matcher) = glob_matcher {
-                let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !matcher.matches(file_name) {
-                    continue;
-                }
+            match_count += 1;
+
+            let file_path = event
+                .pointer("/data/path/text")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from);
+            let line_number = event
+                .pointer("/data/line_number")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|n| usize::try_from(n).ok());
+
+            if let (Some(fp), Some(ln)) = (file_path, line_number) {
+                matches.push((fp, ln));
             }
 
-            files_searched += 1;
-
-            // Read file - skip binary/unreadable files
-            let Ok(file_content) = std::fs::read_to_string(path) else {
-                continue;
-            };
-
-            let lines: Vec<&str> = file_content.lines().collect();
-            let mut file_matches = Vec::new();
-
-            for (line_num, line) in lines.iter().enumerate() {
-                if match_count >= limit {
-                    break;
-                }
-
-                if regex.is_match(line) {
-                    match_count += 1;
-
-                    // Get context lines
-                    let start = line_num.saturating_sub(context);
-                    let end = (line_num + context + 1).min(lines.len());
-
-                    for (idx, context_line) in lines.iter().enumerate().take(end).skip(start) {
-                        let prefix = if idx == line_num { ">" } else { " " };
-                        let truncated = truncate_line(context_line, GREP_MAX_LINE_LENGTH);
-                        file_matches.push(format!("{}{:6}:{}", prefix, idx + 1, truncated.text));
-                    }
-
-                    if context > 0 && end < lines.len() {
-                        file_matches.push("--".to_string());
-                    }
-                }
-            }
-
-            if !file_matches.is_empty() {
-                files_with_matches += 1;
-                let relative_path = path
-                    .strip_prefix(&self.cwd)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string();
-                results.push(format!("{}:\n{}", relative_path, file_matches.join("\n")));
+            if match_count >= effective_limit {
+                match_limit_reached = true;
+                let _ = child.kill().await;
+                break;
             }
         }
 
-        let output = if results.is_empty() {
-            "No matches found".to_string()
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| Error::tool("grep", e.to_string()))?;
+
+        let stderr_bytes = stderr_task.await.unwrap_or_default();
+        let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        let code = status.code().unwrap_or(0);
+
+        if !match_limit_reached && code != 0 && code != 1 {
+            let msg = if stderr_text.is_empty() {
+                format!("ripgrep exited with code {code}")
+            } else {
+                stderr_text
+            };
+            return Err(Error::tool("grep", msg));
+        }
+
+        if match_count == 0 {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("No matches found"))],
+                details: None,
+            });
+        }
+
+        let mut file_cache: HashMap<PathBuf, Vec<String>> = HashMap::new();
+        let mut output_lines: Vec<String> = Vec::new();
+        let mut lines_truncated = false;
+
+        for (file_path, line_number) in &matches {
+            let relative_path = format_grep_path(file_path, &search_path, is_directory);
+            let lines = get_file_lines(file_path, &mut file_cache);
+
+            if lines.is_empty() {
+                output_lines.push(format!(
+                    "{relative_path}:{line_number}: (unable to read file)"
+                ));
+                continue;
+            }
+
+            let start = if context_value > 0 {
+                line_number.saturating_sub(context_value).max(1)
+            } else {
+                *line_number
+            };
+            let end = if context_value > 0 {
+                (line_number + context_value).min(lines.len())
+            } else {
+                *line_number
+            };
+
+            for current in start..=end {
+                let line_text = lines.get(current - 1).map(String::as_str).unwrap_or("");
+                let sanitized = line_text.replace('\r', "");
+                let truncated = truncate_line(&sanitized, GREP_MAX_LINE_LENGTH);
+                if truncated.was_truncated {
+                    lines_truncated = true;
+                }
+
+                if current == *line_number {
+                    output_lines.push(format!("{relative_path}:{current}: {}", truncated.text));
+                } else {
+                    output_lines.push(format!("{relative_path}-{current}- {}", truncated.text));
+                }
+            }
+        }
+
+        // Apply byte truncation (no line limit since we already have match limit).
+        let raw_output = output_lines.join("\n");
+        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+
+        let mut output = truncation.content.clone();
+        let mut notices: Vec<String> = Vec::new();
+        let mut details_map = serde_json::Map::new();
+
+        if match_limit_reached {
+            notices.push(format!(
+                "{effective_limit} matches limit reached. Use limit={} for more, or refine pattern",
+                effective_limit * 2
+            ));
+            details_map.insert(
+                "matchLimitReached".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(effective_limit)),
+            );
+        }
+
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
+        }
+
+        if lines_truncated {
+            notices.push(format!(
+                "Some lines truncated to {GREP_MAX_LINE_LENGTH} chars. Use read tool to see full lines"
+            ));
+            details_map.insert("linesTruncated".to_string(), serde_json::Value::Bool(true));
+        }
+
+        if !notices.is_empty() {
+            output.push_str(&format!("\n\n[{}]", notices.join(". ")));
+        }
+
+        let details = if details_map.is_empty() {
+            None
         } else {
-            results.join("\n\n")
+            Some(serde_json::Value::Object(details_map))
         };
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(output))],
-            details: Some(serde_json::json!({
-                "matchCount": match_count,
-                "filesSearched": files_searched,
-                "filesWithMatches": files_with_matches,
-                "limit": limit,
-                "limitReached": match_count >= limit,
-            })),
+            details,
         })
     }
 }
@@ -1361,7 +1713,7 @@ impl Tool for FindTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of results (default: 100)"
+                    "description": "Maximum number of results (default: 1000)"
                 }
             },
             "required": ["pattern"]
@@ -1377,74 +1729,154 @@ impl Tool for FindTool {
         let input: FindInput =
             serde_json::from_value(input).map_err(|e| Error::validation(e.to_string()))?;
 
-        let search_path = input
-            .path
-            .as_ref()
-            .map_or_else(|| self.cwd.clone(), |p| resolve_path(p, &self.cwd));
+        let search_dir = input.path.as_deref().unwrap_or(".");
+        let search_path = resolve_path(search_dir, &self.cwd);
+        let effective_limit = input.limit.unwrap_or(DEFAULT_FIND_LIMIT);
 
-        let limit = input.limit.unwrap_or(100);
+        let fd_cmd = find_fd_binary().ok_or_else(|| {
+            Error::tool("find", "fd is not available and could not be found in PATH".to_string())
+        })?;
 
-        // Build glob pattern
-        let full_pattern = search_path.join(&input.pattern);
-        let pattern_str = full_pattern.to_string_lossy();
+        // Build fd arguments
+        let mut args: Vec<String> = vec![
+            "--glob".to_string(),
+            "--color=never".to_string(),
+            "--hidden".to_string(),
+            "--max-results".to_string(),
+            effective_limit.to_string(),
+        ];
 
-        let paths = glob::glob(&pattern_str)
-            .map_err(|e| Error::tool("find", format!("Invalid glob pattern: {e}")))?;
+        // Include root .gitignore and nested .gitignore files (excluding node_modules/.git).
+        let mut gitignore_files: Vec<PathBuf> = Vec::new();
+        let root_gitignore = search_path.join(".gitignore");
+        if root_gitignore.exists() {
+            gitignore_files.push(root_gitignore);
+        }
 
-        // Collect and sort by modification time (newest first)
-        let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
-
-        for entry in paths {
-            if entries.len() >= limit * 2 {
-                // Collect extra for sorting
-                break;
+        let nested_pattern = search_path.join("**/.gitignore");
+        if let Some(pattern_str) = nested_pattern.to_str() {
+            if let Ok(paths) = glob::glob(pattern_str) {
+                for entry in paths.flatten() {
+                    let entry_str = entry.to_string_lossy();
+                    if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
+                        continue;
+                    }
+                    gitignore_files.push(entry);
+                }
             }
+        }
 
-            let Ok(path) = entry else { continue };
+        gitignore_files.sort();
+        gitignore_files.dedup();
 
-            if path.is_dir() {
+        for gi in gitignore_files {
+            args.push("--ignore-file".to_string());
+            args.push(gi.display().to_string());
+        }
+
+        args.push(input.pattern.clone());
+        args.push(search_path.display().to_string());
+
+        let output = Command::new(fd_cmd)
+            .args(args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| Error::tool("find", format!("Failed to run fd: {e}")))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+
+        if !output.status.success() && stdout.is_empty() {
+            let code = output.status.code().unwrap_or(1);
+            let msg = if stderr.is_empty() {
+                format!("fd exited with code {code}")
+            } else {
+                stderr
+            };
+            return Err(Error::tool("find", msg));
+        }
+
+        if stdout.is_empty() {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "No files found matching pattern",
+                ))],
+                details: None,
+            });
+        }
+
+        let search_path_str = search_path.display().to_string();
+        let mut relativized: Vec<String> = Vec::new();
+        for raw_line in stdout.lines() {
+            let line = raw_line.trim_end_matches('\r').trim();
+            if line.is_empty() {
                 continue;
             }
 
-            let mtime = path
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
+            let had_trailing_slash = line.ends_with('/') || line.ends_with('\\');
+            let mut rel = if Path::new(line).is_absolute() && line.starts_with(&search_path_str) {
+                line[search_path_str.len()..]
+                    .trim_start_matches(['/', '\\'])
+                    .to_string()
+            } else {
+                line.to_string()
+            };
 
-            entries.push((path, mtime));
+            if had_trailing_slash && !rel.ends_with('/') {
+                rel.push('/');
+            }
+
+            relativized.push(rel);
         }
 
-        // Sort by modification time (newest first)
-        entries.sort_by_key(|entry| Reverse(entry.1));
+        if relativized.is_empty() {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(
+                    "No files found matching pattern",
+                ))],
+                details: None,
+            });
+        }
 
-        // Take only limit entries
-        let entries: Vec<_> = entries.into_iter().take(limit).collect();
-        let count = entries.len();
+        let result_limit_reached = relativized.len() >= effective_limit;
+        let raw_output = relativized.join("\n");
+        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
 
-        // Format output
-        let output: Vec<String> = entries
-            .iter()
-            .map(|(path, _)| {
-                path.strip_prefix(&self.cwd)
-                    .unwrap_or(path)
-                    .display()
-                    .to_string()
-            })
-            .collect();
+        let mut result_output = truncation.content.clone();
+        let mut notices: Vec<String> = Vec::new();
+        let mut details_map = serde_json::Map::new();
 
-        let result = if output.is_empty() {
-            "No files found".to_string()
+        if result_limit_reached {
+            notices.push(format!(
+                "{effective_limit} results limit reached. Use limit={} for more, or refine pattern",
+                effective_limit * 2
+            ));
+            details_map.insert(
+                "resultLimitReached".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(effective_limit)),
+            );
+        }
+
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
+        }
+
+        if !notices.is_empty() {
+            result_output.push_str(&format!("\n\n[{}]", notices.join(". ")));
+        }
+
+        let details = if details_map.is_empty() {
+            None
         } else {
-            output.join("\n")
+            Some(serde_json::Value::Object(details_map))
         };
 
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(result))],
-            details: Some(serde_json::json!({
-                "count": count,
-                "limit": limit,
-                "pattern": input.pattern,
-            })),
+            content: vec![ContentBlock::Text(TextContent::new(result_output))],
+            details,
         })
     }
 }
@@ -1473,24 +1905,6 @@ impl LsTool {
     }
 }
 
-/// Format file size in human-readable form.
-#[allow(clippy::cast_precision_loss)] // File sizes won't exceed f64 mantissa precision
-fn format_size(size: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if size >= GB {
-        format!("{:.1}G", size as f64 / GB as f64)
-    } else if size >= MB {
-        format!("{:.1}M", size as f64 / MB as f64)
-    } else if size >= KB {
-        format!("{:.1}K", size as f64 / KB as f64)
-    } else {
-        format!("{size}B")
-    }
-}
-
 #[async_trait]
 impl Tool for LsTool {
     fn name(&self) -> &'static str {
@@ -1513,7 +1927,7 @@ impl Tool for LsTool {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum number of entries (default: 100)"
+                    "description": "Maximum number of entries to return (default: 500)"
                 }
             }
         })
@@ -1533,79 +1947,290 @@ impl Tool for LsTool {
             .as_ref()
             .map_or_else(|| self.cwd.clone(), |p| resolve_path(p, &self.cwd));
 
-        let limit = input.limit.unwrap_or(100);
+        let effective_limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT);
 
         if !dir_path.exists() {
-            return Err(Error::tool(
-                "ls",
-                format!("Directory not found: {}", dir_path.display()),
-            ));
+            return Err(Error::tool("ls", format!("Path not found: {}", dir_path.display())));
         }
-
         if !dir_path.is_dir() {
             return Err(Error::tool(
                 "ls",
-                format!("Path is not a directory: {}", dir_path.display()),
+                format!("Not a directory: {}", dir_path.display()),
             ));
         }
 
-        let mut entries: Vec<(String, bool, u64)> = Vec::new();
-
+        let mut entries = Vec::new();
         let mut read_dir = tokio::fs::read_dir(&dir_path)
             .await
-            .map_err(|e| Error::tool("ls", format!("Failed to read directory: {e}")))?;
+            .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
 
         while let Some(entry) = read_dir
             .next_entry()
             .await
-            .map_err(|e| Error::tool("ls", format!("Failed to read entry: {e}")))?
+            .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?
         {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let metadata = entry.metadata().await.ok();
-            let is_dir = metadata.as_ref().is_some_and(std::fs::Metadata::is_dir);
-            let size = metadata.as_ref().map_or(0, std::fs::Metadata::len);
-
-            entries.push((name, is_dir, size));
+            entries.push(entry.file_name().to_string_lossy().to_string());
         }
 
-        // Sort: directories first, then by name
-        entries.sort_by(|a, b| match (a.1, b.1) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => a.0.to_lowercase().cmp(&b.0.to_lowercase()),
-        });
+        // Sort alphabetically (case-insensitive).
+        entries.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
 
-        let total_entries = entries.len();
-        let entries: Vec<_> = entries.into_iter().take(limit).collect();
+        let mut results: Vec<String> = Vec::new();
+        let mut entry_limit_reached = false;
 
-        // Format output
-        let output: Vec<String> = entries
-            .iter()
-            .map(|(name, is_dir, size)| {
-                if *is_dir {
-                    format!("{name}/")
-                } else {
-                    format!("{:>8}  {name}", format_size(*size))
-                }
-            })
-            .collect();
+        for entry in entries {
+            if results.len() >= effective_limit {
+                entry_limit_reached = true;
+                break;
+            }
 
-        let result = if output.is_empty() {
-            "(empty directory)".to_string()
+            let full_path = dir_path.join(&entry);
+            let Ok(meta) = tokio::fs::metadata(&full_path).await else {
+                // Skip entries we can't stat.
+                continue;
+            };
+
+            if meta.is_dir() {
+                results.push(format!("{entry}/"));
+            } else {
+                results.push(entry);
+            }
+        }
+
+        if results.is_empty() {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("(empty directory)"))],
+                details: None,
+            });
+        }
+
+        // Apply byte truncation (no line limit since we already have entry limit).
+        let raw_output = results.join("\n");
+        let truncation = truncate_head(&raw_output, usize::MAX, DEFAULT_MAX_BYTES);
+
+        let mut output = truncation.content.clone();
+        let mut details_map = serde_json::Map::new();
+        let mut notices: Vec<String> = Vec::new();
+
+        if entry_limit_reached {
+            notices.push(format!(
+                "{effective_limit} entries limit reached. Use limit={} for more",
+                effective_limit * 2
+            ));
+            details_map.insert(
+                "entryLimitReached".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(effective_limit)),
+            );
+        }
+
+        if truncation.truncated {
+            notices.push(format!("{} limit reached", format_size(DEFAULT_MAX_BYTES)));
+            details_map.insert("truncation".to_string(), serde_json::to_value(truncation)?);
+        }
+
+        if !notices.is_empty() {
+            output.push_str(&format!("\n\n[{}]", notices.join(". ")));
+        }
+
+        let details = if details_map.is_empty() {
+            None
         } else {
-            output.join("\n")
+            Some(serde_json::Value::Object(details_map))
         };
 
         Ok(ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(result))],
-            details: Some(serde_json::json!({
-                "path": dir_path.display().to_string(),
-                "totalEntries": total_entries,
-                "shownEntries": entries.len(),
-                "limit": limit,
-            })),
+            content: vec![ContentBlock::Text(TextContent::new(output))],
+            details,
         })
     }
+}
+
+// ============================================================================
+// Helper functions
+// ============================================================================
+
+async fn pump_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    mut reader: R,
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let mut buf = vec![0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let _ = tx.send(buf[..n].to_vec());
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+fn concat_chunks(chunks: &VecDeque<Vec<u8>>) -> Vec<u8> {
+    let total: usize = chunks.iter().map(Vec::len).sum();
+    let mut out = Vec::with_capacity(total);
+    for chunk in chunks {
+        out.extend_from_slice(chunk);
+    }
+    out
+}
+
+async fn process_bash_chunk(
+    chunk: &[u8],
+    total_bytes: &mut usize,
+    temp_file_path: &mut Option<PathBuf>,
+    temp_file: &mut Option<tokio::fs::File>,
+    chunks: &mut VecDeque<Vec<u8>>,
+    chunks_bytes: &mut usize,
+    max_chunks_bytes: usize,
+    on_update: Option<&dyn Fn(ToolUpdate)>,
+) -> Result<()> {
+    *total_bytes = total_bytes.saturating_add(chunk.len());
+
+    if *total_bytes > DEFAULT_MAX_BYTES && temp_file.is_none() {
+        let id = Uuid::new_v4().simple().to_string();
+        let path = std::env::temp_dir().join(format!("pi-bash-{id}.log"));
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|e| Error::tool("bash", e.to_string()))?;
+
+        // Write buffered chunks to file first so it contains output from the beginning.
+        for existing in chunks.iter() {
+            file.write_all(existing)
+                .await
+                .map_err(|e| Error::tool("bash", e.to_string()))?;
+        }
+
+        *temp_file_path = Some(path);
+        *temp_file = Some(file);
+    }
+
+    if let Some(file) = temp_file.as_mut() {
+        file.write_all(chunk)
+            .await
+            .map_err(|e| Error::tool("bash", e.to_string()))?;
+    }
+
+    chunks.push_back(chunk.to_vec());
+    *chunks_bytes = chunks_bytes.saturating_add(chunk.len());
+    while *chunks_bytes > max_chunks_bytes && chunks.len() > 1 {
+        if let Some(front) = chunks.pop_front() {
+            *chunks_bytes = chunks_bytes.saturating_sub(front.len());
+        }
+    }
+
+    if let Some(callback) = on_update {
+        let full_text = String::from_utf8_lossy(&concat_chunks(chunks)).to_string();
+        let truncation = truncate_tail(&full_text, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+
+        let mut details_map = serde_json::Map::new();
+        if truncation.truncated {
+            details_map.insert("truncation".to_string(), serde_json::to_value(&truncation)?);
+        }
+        if let Some(path) = temp_file_path.as_ref() {
+            details_map.insert(
+                "fullOutputPath".to_string(),
+                serde_json::Value::String(path.display().to_string()),
+            );
+        }
+
+        let details = if details_map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(details_map))
+        };
+
+        callback(ToolUpdate {
+            content: vec![ContentBlock::Text(TextContent::new(truncation.content))],
+            details,
+        });
+    }
+
+    Ok(())
+}
+
+fn kill_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    let root = sysinfo::Pid::from_u32(pid);
+
+    let mut sys = sysinfo::System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let mut children_map: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
+    for (p, proc_) in sys.processes() {
+        if let Some(parent) = proc_.parent() {
+            children_map.entry(parent).or_default().push(*p);
+        }
+    }
+
+    let mut to_kill = Vec::new();
+    collect_process_tree(root, &children_map, &mut to_kill);
+
+    // Kill children first.
+    for pid in to_kill.into_iter().rev() {
+        if let Some(proc_) = sys.process(pid) {
+            let _ = proc_.kill();
+        }
+    }
+}
+
+fn collect_process_tree(
+    pid: sysinfo::Pid,
+    children_map: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
+    out: &mut Vec<sysinfo::Pid>,
+) {
+    out.push(pid);
+    if let Some(children) = children_map.get(&pid) {
+        for child in children {
+            collect_process_tree(*child, children_map, out);
+        }
+    }
+}
+
+fn format_grep_path(file_path: &Path, search_path: &Path, is_directory: bool) -> String {
+    if is_directory {
+        if let Ok(rel) = file_path.strip_prefix(search_path) {
+            let rel_str = rel.display().to_string().replace('\\', "/");
+            if !rel_str.is_empty() && !rel_str.starts_with("..") {
+                return rel_str;
+            }
+        }
+    }
+    file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn get_file_lines<'a>(path: &Path, cache: &'a mut HashMap<PathBuf, Vec<String>>) -> &'a [String] {
+    let lines = cache.entry(path.to_path_buf()).or_insert_with(|| {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
+        normalized.split('\n').map(str::to_string).collect()
+    });
+    lines.as_slice()
+}
+
+fn find_fd_binary() -> Option<&'static str> {
+    if std::process::Command::new("fd")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+    {
+        return Some("fd");
+    }
+    if std::process::Command::new("fdfind")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
+    {
+        return Some("fdfind");
+    }
+    None
 }
 
 // ============================================================================
@@ -1674,10 +2299,10 @@ mod tests {
     #[test]
     fn test_format_size() {
         assert_eq!(format_size(500), "500B");
-        assert_eq!(format_size(1024), "1.0K");
-        assert_eq!(format_size(1536), "1.5K");
-        assert_eq!(format_size(1_048_576), "1.0M");
-        assert_eq!(format_size(1_073_741_824), "1.0G");
+        assert_eq!(format_size(1024), "1.0KB");
+        assert_eq!(format_size(1536), "1.5KB");
+        assert_eq!(format_size(1_048_576), "1.0MB");
+        assert_eq!(format_size(1_073_741_824), "1024.0MB");
     }
 
     #[test]

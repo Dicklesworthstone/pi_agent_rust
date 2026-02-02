@@ -200,7 +200,11 @@ fn get_input_message(cli: &cli::Cli) -> Result<String> {
         let path = PathBuf::from(file_arg);
         let content = std::fs::read_to_string(&path)
             .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", path.display(), e))?;
-        parts.push(format!("Contents of {}:\n```\n{}\n```", path.display(), content));
+        parts.push(format!(
+            "Contents of {}:\n```\n{}\n```",
+            path.display(),
+            content
+        ));
     }
 
     // Add message args

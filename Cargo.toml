@@ -23,6 +23,9 @@ clap = { version = "4", features = ["derive", "env", "string"] }
 clap_complete = "4"
 
 # Async runtime
+# Note: asupersync provides structured concurrency and cancel-correctness.
+# Tokio retained for now during gradual migration.
+asupersync = { path = "../asupersync", features = ["tls"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
@@ -40,7 +43,8 @@ serde_json = "1"
 anyhow = "1"
 thiserror = "2"
 
-# Terminal
+# Terminal output (rich_rust for beautiful TUI)
+rich_rust = { path = "../rich_rust" }
 crossterm = "0.28"
 unicode-width = "0.2"
 textwrap = "0.16"
@@ -64,10 +68,12 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"
 sha2 = "0.10"
 regex = "1"
+unicode-normalization = "0.1"
+similar = "2"
+sysinfo = "0.32"
 
 # Image processing (optional)
 image = { version = "0.25", optional = true }
-unicode-normalization = "0.1.25"
 
 [build-dependencies]
 vergen-gix = { version = "1", features = ["build", "cargo", "rustc"] }

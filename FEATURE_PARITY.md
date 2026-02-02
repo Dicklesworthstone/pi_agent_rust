@@ -82,6 +82,7 @@
 | Feature | Status | Location | Notes |
 |---------|--------|----------|-------|
 | SSE parsing (Anthropic) | ✅ | `anthropic.rs` | reqwest-eventsource |
+| SSE parser module | ✅ | `src/sse.rs` | Custom parser for asupersync migration |
 | Text delta streaming | ✅ | `anthropic.rs:339-352` | Real-time text |
 | Thinking delta streaming | ✅ | `anthropic.rs:354-367` | Extended thinking |
 | Tool call streaming | ✅ | `anthropic.rs:368-382` | JSON accumulation |
@@ -235,25 +236,57 @@
 
 ## Test Coverage Summary
 
-| Category | Unit Tests | Integration Tests | Conformance Tests | Total |
-|----------|------------|-------------------|-------------------|-------|
+| Category | Unit Tests | Integration Tests | Fixture Tests | Total |
+|----------|------------|-------------------|---------------|-------|
 | Core types | 4 | 0 | 0 | 4 |
 | Provider (Anthropic) | 2 | 0 | 0 | 2 |
-| Tools | 7 | 20 | 20 | 47 |
+| Tools | 7 | 20 | 65+ | 92+ |
+| Truncation | 3 | 0 | 9 | 12 |
 | Agent | 2 | 0 | 0 | 2 |
 | Session | 0 | 0 | 0 | 0 |
-| **Total** | **15** | **20** | **20** | **55** |
+| Conformance infra | 6 | 0 | 0 | 6 |
+| **Total** | **24** | **20** | **74+** | **118+** |
 
 ---
 
 ## Conformance Testing Status
 
-| Component | Has Fixture Tests | Reference Captured | Notes |
-|-----------|-------------------|-------------------|-------|
-| Tools | ✅ Yes | TypeScript (manual) | `tests/tools_conformance.rs` |
-| Session format | ❌ No | - | Need JSONL fixtures |
-| Provider responses | ❌ No | - | Need mock API fixtures |
-| CLI flags | ❌ No | - | Need behavior fixtures |
+| Component | Has Fixture Tests | Fixture File | Cases |
+|-----------|-------------------|--------------|-------|
+| read tool | ✅ Yes | `read_tool.json` | 10 |
+| write tool | ✅ Yes | `write_tool.json` | 7 |
+| edit tool | ✅ Yes | `edit_tool.json` | 8 |
+| bash tool | ✅ Yes | `bash_tool.json` | 12 |
+| grep tool | ✅ Yes | `grep_tool.json` | 12 |
+| find tool | ✅ Yes | `find_tool.json` | 6 |
+| ls tool | ✅ Yes | `ls_tool.json` | 8 |
+| truncation | ✅ Yes | `truncation.json` | 9 |
+| Session format | ❌ No | - | - |
+| Provider responses | ❌ No | - | - |
+| CLI flags | ❌ No | - | - |
+
+### Fixture Schema
+
+Fixtures are JSON files in `tests/conformance/fixtures/` with this structure:
+
+```json
+{
+  "version": "1.0",
+  "tool": "tool_name",
+  "cases": [
+    {
+      "name": "test_name",
+      "setup": [{"type": "create_file", "path": "...", "content": "..."}],
+      "input": {"param": "value"},
+      "expected": {
+        "content_contains": ["..."],
+        "content_regex": "...",
+        "details_exact": {"key": "value"}
+      }
+    }
+  ]
+}
+```
 
 ---
 
@@ -271,9 +304,9 @@
 ## Next Steps (Priority Order)
 
 1. **Complete print mode** - Non-interactive single response
-2. **Add OpenAI provider** - Second provider implementation  
-3. **Implement auth.json** - Credential storage
+2. **Add OpenAI provider** - Second provider implementation
+3. ~~**Implement auth.json** - Credential storage~~ ✅ Done (src/auth.rs)
 4. **Session picker UI** - Basic TUI for --resume
 5. **Branching/navigation** - Tree operations
 6. **Benchmark harness** - Performance validation
-7. **Conformance fixtures** - TypeScript reference capture
+7. ~~**Conformance fixtures** - TypeScript reference capture~~ ✅ Done (tests/conformance/)

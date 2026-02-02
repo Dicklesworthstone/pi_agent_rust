@@ -1,0 +1,161 @@
+{
+  "version": "1.0",
+  "tool": "truncation",
+  "description": "Conformance tests for truncation algorithms (truncate_head, truncate_tail)",
+  "cases": [
+    {
+      "name": "head_no_truncation",
+      "description": "Content within limits should not be truncated",
+      "input": {
+        "content": "line1\nline2\nline3",
+        "max_lines": 10,
+        "max_bytes": 1000
+      },
+      "expected": {
+        "content_exact": "line1\nline2\nline3",
+        "details_exact": {
+          "truncated": false,
+          "total_lines": 3,
+          "output_lines": 3
+        }
+      }
+    },
+    {
+      "name": "head_truncate_by_lines",
+      "description": "Truncate from head when exceeding line limit",
+      "input": {
+        "content": "line1\nline2\nline3\nline4\nline5",
+        "max_lines": 3,
+        "max_bytes": 10000
+      },
+      "expected": {
+        "content_exact": "line1\nline2\nline3",
+        "details_exact": {
+          "truncated": true,
+          "truncated_by": "lines",
+          "total_lines": 5,
+          "output_lines": 3
+        }
+      }
+    },
+    {
+      "name": "head_truncate_by_bytes",
+      "description": "Truncate from head when exceeding byte limit",
+      "input": {
+        "content": "short\nthis is a much longer line\nanother line here",
+        "max_lines": 100,
+        "max_bytes": 20
+      },
+      "expected": {
+        "content_contains": ["short"],
+        "details_exact": {
+          "truncated": true,
+          "truncated_by": "bytes"
+        }
+      }
+    },
+    {
+      "name": "head_first_line_exceeds_bytes",
+      "description": "When first line alone exceeds byte limit, return empty",
+      "input": {
+        "content": "this is a very long first line that exceeds the limit",
+        "max_lines": 100,
+        "max_bytes": 10
+      },
+      "expected": {
+        "content_exact": "",
+        "details_exact": {
+          "truncated": true,
+          "truncated_by": "bytes",
+          "first_line_exceeds_limit": true,
+          "output_lines": 0
+        }
+      }
+    },
+    {
+      "name": "tail_no_truncation",
+      "description": "Content within limits should not be truncated",
+      "input": {
+        "content": "line1\nline2\nline3",
+        "max_lines": 10,
+        "max_bytes": 1000
+      },
+      "expected": {
+        "content_exact": "line1\nline2\nline3",
+        "details_exact": {
+          "truncated": false,
+          "total_lines": 3,
+          "output_lines": 3
+        }
+      }
+    },
+    {
+      "name": "tail_truncate_by_lines",
+      "description": "Truncate from tail keeps last N lines",
+      "input": {
+        "content": "line1\nline2\nline3\nline4\nline5",
+        "max_lines": 3,
+        "max_bytes": 10000
+      },
+      "expected": {
+        "content_exact": "line3\nline4\nline5",
+        "details_exact": {
+          "truncated": true,
+          "truncated_by": "lines",
+          "total_lines": 5,
+          "output_lines": 3
+        }
+      }
+    },
+    {
+      "name": "empty_content",
+      "description": "Empty content should return empty without truncation",
+      "input": {
+        "content": "",
+        "max_lines": 100,
+        "max_bytes": 10000
+      },
+      "expected": {
+        "content_exact": "",
+        "details_exact": {
+          "truncated": false,
+          "total_lines": 1,
+          "output_lines": 1
+        }
+      }
+    },
+    {
+      "name": "single_line",
+      "description": "Single line within limits",
+      "input": {
+        "content": "single line content",
+        "max_lines": 100,
+        "max_bytes": 10000
+      },
+      "expected": {
+        "content_exact": "single line content",
+        "details_exact": {
+          "truncated": false,
+          "total_lines": 1,
+          "output_lines": 1
+        }
+      }
+    },
+    {
+      "name": "unicode_content",
+      "description": "Unicode content should be handled correctly",
+      "input": {
+        "content": "Hello 世界\nこんにちは\n🎉🎊",
+        "max_lines": 100,
+        "max_bytes": 10000
+      },
+      "expected": {
+        "content_contains": ["世界", "こんにちは", "🎉"],
+        "details_exact": {
+          "truncated": false,
+          "total_lines": 3
+        }
+      }
+    }
+  ]
+}
