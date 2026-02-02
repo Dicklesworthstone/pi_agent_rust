@@ -24,9 +24,9 @@
 | **Agent Runtime** | 1 | 1 | 0 | 0 | 2 |
 | **Session Management** | 1 | 1 | 2 | 0 | 4 |
 | **CLI** | 1 | 0 | 2 | 2 | 5 |
-| **TUI** | 0 | 0 | 6 | 2 | 8 |
+| **TUI** | 13 | 1 | 3 | 2 | 19 |
 | **Configuration** | 1 | 0 | 1 | 0 | 2 |
-| **Authentication** | 0 | 0 | 2 | 0 | 2 |
+| **Authentication** | 6 | 1 | 1 | 0 | 8 |
 
 ---
 
@@ -192,6 +192,8 @@
 
 ## 8. Terminal UI
 
+### 8.1 Non-Interactive Output (rich_rust)
+
 | Feature | Status | Rust Location | Tests | Notes |
 |---------|--------|---------------|-------|-------|
 | PiConsole wrapper | ✅ | `src/tui.rs` | 3 | rich_rust integration |
@@ -201,12 +203,22 @@
 | Panel rendering | ✅ | `src/tui.rs` | - | Via rich_rust Panels |
 | Rule rendering | ✅ | `src/tui.rs` | - | Horizontal dividers |
 | Spinner styles | ✅ | `src/tui.rs` | 1 | Dots, line, simple |
-| Terminal state (raw mode) | ❌ | - | - | Not yet needed |
-| Differential renderer | ❌ | - | - | Not started |
+
+### 8.2 Interactive TUI (charmed_rust/bubbletea)
+
+| Feature | Status | Rust Location | Tests | Notes |
+|---------|--------|---------------|-------|-------|
+| PiApp Model | ✅ | `src/interactive.rs` | 2 | Elm Architecture |
+| TextInput with history | ✅ | `src/interactive.rs` | - | bubbles TextInput |
+| Markdown rendering | ✅ | `src/interactive.rs` | - | glamour Dark style |
+| Token/cost footer | ✅ | `src/interactive.rs` | - | Usage tracking |
+| Spinner animation | ✅ | `src/interactive.rs` | - | bubbles spinner |
+| Tool status display | ✅ | `src/interactive.rs` | - | Running tool indicator |
+| Keyboard navigation | ✅ | `src/interactive.rs` | - | Up/Down history, Esc quit |
+| Agent integration | 🔶 | `src/interactive.rs` | - | Events defined, not wired |
 | Multi-line editor | ❌ | - | - | Not started |
 | Slash command system | ❌ | - | - | Not started |
-| Status line | ❌ | - | - | Not started |
-| Markdown rendering | 🔶 | `src/tui.rs` | - | Available via rich_rust |
+| Viewport scrolling | ❌ | - | - | Viewport component unused |
 | Image display | ⬜ | - | - | Terminal dependent |
 | Autocomplete | ⬜ | - | - | Defer |
 
@@ -248,14 +260,16 @@
 |----------|------------|-------------------|---------------|-------|
 | Core types | 4 | 0 | 0 | 4 |
 | Provider (Anthropic) | 2 | 0 | 0 | 2 |
+| Provider (OpenAI) | 3 | 0 | 0 | 3 |
 | SSE parser | 11 | 0 | 0 | 11 |
 | Tools | 5 | 20 | 67 | 92 |
-| TUI | 3 | 0 | 0 | 3 |
+| TUI (rich_rust) | 3 | 0 | 0 | 3 |
+| TUI (interactive) | 2 | 0 | 0 | 2 |
 | Agent | 2 | 0 | 0 | 2 |
 | Conformance infra | 6 | 0 | 0 | 6 |
-| **Total** | **27** | **20** | **67** | **114** |
+| **Total** | **32** | **20** | **67** | **119** |
 
-**All 62 tests pass** (27 unit + 15 fixture wrappers + 20 integration)
+**All 67 tests pass** (32 unit + 15 fixture wrappers + 20 integration)
 
 ---
 
