@@ -5,7 +5,7 @@
 <h1 align="center">pi_agent_rust</h1>
 
 <p align="center">
-  <strong>Pi — High-performance AI coding agent CLI written in Rust</strong>
+  <strong>pi_agent_rust — High-performance AI coding agent CLI written in Rust</strong>
 </p>
 
 <p align="center">
