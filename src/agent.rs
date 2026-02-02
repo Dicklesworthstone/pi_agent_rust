@@ -18,6 +18,7 @@ use crate::model::{
     ToolResultMessage, UserContent, UserMessage,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+use serde::Serialize;
 use crate::session::Session;
 use crate::session_index::SessionIndex;
 use crate::tools::ToolRegistry;
@@ -57,7 +58,7 @@ impl Default for AgentConfig {
 // ============================================================================
 
 /// Events emitted by the agent during execution.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub enum AgentEvent {
     /// Starting a new LLM request.
     RequestStart,

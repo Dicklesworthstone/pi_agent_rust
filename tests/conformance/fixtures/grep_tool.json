@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tool": "grep",
-  "description": "Conformance tests for the grep tool",
+  "description": "Conformance tests for the grep tool (pi-mono parity)",
   "cases": [
     {
       "name": "grep_basic_pattern",
@@ -11,7 +11,8 @@
       ],
       "input": {"pattern": "hello"},
       "expected": {
-        "content_contains": ["hello world", "hello again"]
+        "content_contains": ["hello world", "hello again"],
+        "details_none": true
       }
     },
     {
@@ -23,7 +24,8 @@
       "input": {"pattern": "hello"},
       "expected": {
         "content_contains": ["hello world"],
-        "content_not_contains": ["Hello World", "HELLO WORLD"]
+        "content_not_contains": ["Hello World", "HELLO WORLD"],
+        "details_none": true
       }
     },
     {
@@ -34,7 +36,8 @@
       ],
       "input": {"pattern": "hello", "ignoreCase": true},
       "expected": {
-        "content_contains": ["Hello World", "HELLO WORLD", "hello world"]
+        "content_contains": ["Hello World", "HELLO WORLD", "hello world"],
+        "details_none": true
       }
     },
     {
@@ -46,7 +49,8 @@
       "input": {"pattern": "foo\\d+"},
       "expected": {
         "content_contains": ["foo123", "foo789"],
-        "content_not_contains": ["bar456"]
+        "content_not_contains": ["bar456"],
+        "details_none": true
       }
     },
     {
@@ -58,7 +62,8 @@
       "input": {"pattern": "foo.bar", "literal": true},
       "expected": {
         "content_contains": ["foo.bar"],
-        "content_not_contains": ["fooXbar"]
+        "content_not_contains": ["fooXbar"],
+        "details_none": true
       }
     },
     {
@@ -69,7 +74,8 @@
       ],
       "input": {"pattern": "notfound"},
       "expected": {
-        "content_contains": ["No matches found"]
+        "content_exact": "No matches found",
+        "details_none": true
       }
     },
     {
@@ -82,7 +88,8 @@
       ],
       "input": {"pattern": "hello"},
       "expected": {
-        "content_contains": ["file1.txt", "file2.txt"]
+        "content_contains": ["file1.txt", "file2.txt"],
+        "details_none": true
       }
     },
     {
@@ -95,7 +102,8 @@
       "input": {"pattern": "hello", "glob": "*.txt"},
       "expected": {
         "content_contains": ["hello world"],
-        "content_not_contains": ["hello rust"]
+        "content_not_contains": ["hello rust"],
+        "details_none": true
       }
     },
     {
@@ -107,7 +115,7 @@
       "input": {"pattern": "match", "limit": 3},
       "expected": {
         "content_contains": ["limit reached"],
-        "details": {
+        "details_exact": {
           "matchLimitReached": 3
         }
       }
@@ -120,7 +128,8 @@
       ],
       "input": {"pattern": "target", "context": 1},
       "expected": {
-        "content_contains": ["line2", "target", "line4"]
+        "content_contains": ["line2", "target", "line4"],
+        "details_none": true
       }
     },
     {
@@ -131,18 +140,28 @@
       ],
       "input": {"pattern": "second"},
       "expected": {
-        "content_regex": ":2:"
+        "content_regex": ":2:",
+        "details_none": true
       }
     },
     {
       "name": "grep_truncates_long_lines",
       "description": "Long lines should be truncated",
       "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "short line with match"}
+        {
+          "type": "run_command",
+          "command": "python3 -c \"print('match ' + 'a'*600)\" > test.txt"
+        }
       ],
       "input": {"pattern": "match"},
       "expected": {
-        "content_contains": ["match"]
+        "content_contains": [
+          "... [truncated]",
+          "Some lines truncated to 500 chars. Use read tool to see full lines"
+        ],
+        "details_exact": {
+          "linesTruncated": true
+        }
       }
     }
   ]

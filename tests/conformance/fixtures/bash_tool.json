@@ -9,33 +9,25 @@
       "input": {"command": "echo 'Hello, World!'"},
       "expected": {
         "content_contains": ["Hello, World!"],
-        "details_exact": {
-          "exitCode": 0,
-          "timedOut": false
-        }
+        "details_none": true
       }
     },
     {
-      "name": "bash_exit_code",
-      "description": "Command with non-zero exit code",
+      "name": "bash_no_output",
+      "description": "Command with no output returns (no output)",
+      "input": {"command": "true"},
+      "expected": {
+        "content_exact": "(no output)",
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_exit_code_error",
+      "description": "Non-zero exit code should be treated as an error",
       "input": {"command": "exit 42"},
-      "expected": {
-        "details_exact": {
-          "exitCode": 42,
-          "timedOut": false
-        }
-      }
-    },
-    {
-      "name": "bash_exit_code_1",
-      "description": "Command with exit code 1",
-      "input": {"command": "exit 1"},
-      "expected": {
-        "details_exact": {
-          "exitCode": 1,
-          "timedOut": false
-        }
-      }
+      "expect_error": true,
+      "error_contains": "exited with code 42",
+      "expected": {}
     },
     {
       "name": "bash_multiline_output",
@@ -43,22 +35,16 @@
       "input": {"command": "echo 'line1'; echo 'line2'; echo 'line3'"},
       "expected": {
         "content_contains": ["line1", "line2", "line3"],
-        "details_exact": {
-          "exitCode": 0,
-          "timedOut": false
-        }
+        "details_none": true
       }
     },
     {
-      "name": "bash_stderr",
-      "description": "Command that writes to stderr",
+      "name": "bash_stderr_is_included",
+      "description": "Stderr should be included in output",
       "input": {"command": "echo 'error' >&2"},
       "expected": {
         "content_contains": ["error"],
-        "details_exact": {
-          "exitCode": 0,
-          "timedOut": false
-        }
+        "details_none": true
       }
     },
     {
@@ -67,31 +53,7 @@
       "input": {"command": "echo 'stdout'; echo 'stderr' >&2"},
       "expected": {
         "content_contains": ["stdout", "stderr"],
-        "details_exact": {
-          "exitCode": 0
-        }
-      }
-    },
-    {
-      "name": "bash_working_directory",
-      "description": "Command runs in correct working directory",
-      "input": {"command": "pwd"},
-      "expected": {
-        "details_exact": {
-          "exitCode": 0,
-          "timedOut": false
-        }
-      }
-    },
-    {
-      "name": "bash_environment",
-      "description": "Environment variables are available",
-      "input": {"command": "echo $HOME"},
-      "expected": {
-        "content_regex": "^/",
-        "details_exact": {
-          "exitCode": 0
-        }
+        "details_none": true
       }
     },
     {
@@ -100,9 +62,7 @@
       "input": {"command": "echo 'hello world' | tr ' ' '\\n'"},
       "expected": {
         "content_contains": ["hello", "world"],
-        "details_exact": {
-          "exitCode": 0
-        }
+        "details_none": true
       }
     },
     {
@@ -111,31 +71,16 @@
       "input": {"command": "echo $(echo nested)"},
       "expected": {
         "content_contains": ["nested"],
-        "details_exact": {
-          "exitCode": 0
-        }
+        "details_none": true
       }
     },
     {
-      "name": "bash_empty_output",
-      "description": "Command with no output",
-      "input": {"command": "true"},
+      "name": "bash_environment",
+      "description": "Environment variables are available",
+      "input": {"command": "echo $HOME"},
       "expected": {
-        "details_exact": {
-          "exitCode": 0,
-          "timedOut": false
-        }
-      }
-    },
-    {
-      "name": "bash_false_command",
-      "description": "False command returns exit code 1",
-      "input": {"command": "false"},
-      "expected": {
-        "details_exact": {
-          "exitCode": 1,
-          "timedOut": false
-        }
+        "content_regex": "^/",
+        "details_none": true
       }
     }
   ]

@@ -11,12 +11,8 @@
       ],
       "input": {"path": "test.txt"},
       "expected": {
-        "content_contains": ["line1", "line2", "line3", "line4", "line5"],
-        "content_regex": "^1\\t",
-        "details": {
-          "totalLines": 5,
-          "truncated": false
-        }
+        "content_exact": "line1\nline2\nline3\nline4\nline5",
+        "details_none": true
       }
     },
     {
@@ -27,13 +23,8 @@
       ],
       "input": {"path": "test.txt", "offset": 3},
       "expected": {
-        "content_contains": ["line3", "line4", "line5"],
-        "content_not_contains": ["line1", "line2"],
-        "content_regex": "^3\\t",
-        "details": {
-          "offset": 3,
-          "totalLines": 5
-        }
+        "content_exact": "line3\nline4\nline5",
+        "details_none": true
       }
     },
     {
@@ -44,12 +35,8 @@
       ],
       "input": {"path": "test.txt", "limit": 2},
       "expected": {
-        "content_contains": ["line1", "line2"],
-        "content_not_contains": ["line3", "line4", "line5"],
-        "details": {
-          "limit": 2,
-          "outputLines": 2
-        }
+        "content_exact": "line1\nline2\n\n[3 more lines in file. Use offset=3 to continue.]",
+        "details_none": true
       }
     },
     {
@@ -60,21 +47,27 @@
       ],
       "input": {"path": "test.txt", "offset": 2, "limit": 2},
       "expected": {
-        "content_contains": ["line2", "line3"],
-        "content_not_contains": ["line1", "line4", "line5"],
-        "details": {
-          "offset": 2,
-          "limit": 2,
-          "outputLines": 2
-        }
+        "content_exact": "line2\nline3\n\n[2 more lines in file. Use offset=4 to continue.]",
+        "details_none": true
       }
+    },
+    {
+      "name": "read_offset_out_of_bounds",
+      "description": "Offset beyond EOF should error with an actionable message",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
+      ],
+      "input": {"path": "test.txt", "offset": 999},
+      "expect_error": true,
+      "error_contains": "Offset 999 is beyond end of file",
+      "expected": {}
     },
     {
       "name": "read_nonexistent_file",
       "description": "Reading a nonexistent file should error",
       "input": {"path": "/nonexistent/path/file.txt"},
       "expect_error": true,
-      "error_contains": "not found",
+      "error_contains": "No such file",
       "expected": {}
     },
     {
@@ -96,10 +89,8 @@
       ],
       "input": {"path": "empty.txt"},
       "expected": {
-        "details": {
-          "totalLines": 0,
-          "truncated": false
-        }
+        "content_exact": "",
+        "details_none": true
       }
     },
     {
@@ -110,35 +101,8 @@
       ],
       "input": {"path": "unicode.txt"},
       "expected": {
-        "content_contains": ["世界", "こんにちは", "🎉"],
-        "details": {
-          "totalLines": 3,
-          "truncated": false
-        }
-      }
-    },
-    {
-      "name": "read_with_line_numbers",
-      "description": "Output should include line numbers in cat -n format",
-      "setup": [
-        {"type": "create_file", "path": "numbered.txt", "content": "first\nsecond\nthird"}
-      ],
-      "input": {"path": "numbered.txt"},
-      "expected": {
-        "content_regex": "1\\tfirst",
-        "content_contains": ["2\tsecond", "3\tthird"]
-      }
-    },
-    {
-      "name": "read_offset_line_numbers",
-      "description": "Line numbers should start at offset value",
-      "setup": [
-        {"type": "create_file", "path": "test.txt", "content": "line1\nline2\nline3\nline4\nline5"}
-      ],
-      "input": {"path": "test.txt", "offset": 3},
-      "expected": {
-        "content_regex": "3\\tline3",
-        "content_contains": ["4\tline4", "5\tline5"]
+        "content_exact": "Hello 世界\nこんにちは\n🎉 emoji",
+        "details_none": true
       }
     }
   ]

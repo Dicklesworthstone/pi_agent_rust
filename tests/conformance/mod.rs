@@ -103,6 +103,9 @@ pub struct Expected {
     /// Details values that must match exactly
     #[serde(default)]
     pub details_exact: HashMap<String, serde_json::Value>,
+    /// Require that tool returned no details (i.e., `details` is None).
+    #[serde(default)]
+    pub details_none: bool,
 }
 
 /// Result of running a conformance test.
@@ -190,6 +193,19 @@ pub fn validate_expected(
                 "Content does not match regex: '{pattern}'\nActual content:\n{content}"
             ));
         }
+    }
+
+    if expected.details_none {
+        if details.is_some() {
+            return Err("Expected details to be None but tool returned Some".to_string());
+        }
+        if !expected.details.is_empty() || !expected.details_exact.is_empty() {
+            return Err(
+                "Invalid fixture: details_none cannot be combined with details expectations"
+                    .to_string(),
+            );
+        }
+        return Ok(());
     }
 
     // Check details

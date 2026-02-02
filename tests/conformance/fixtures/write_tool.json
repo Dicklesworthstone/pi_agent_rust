@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tool": "write",
-  "description": "Conformance tests for the write tool",
+  "description": "Conformance tests for the write tool (pi-mono parity)",
   "cases": [
     {
       "name": "write_new_file",
@@ -11,11 +11,8 @@
         "content": "Hello, World!\nLine 2"
       },
       "expected": {
-        "content_contains": ["Successfully wrote", "bytes", "newfile.txt"],
-        "details_exact": {
-          "bytesWritten": 20,
-          "lines": 2
-        }
+        "content_exact": "Successfully wrote 20 bytes to newfile.txt",
+        "details_none": true
       }
     },
     {
@@ -26,11 +23,8 @@
         "content": "content"
       },
       "expected": {
-        "content_contains": ["Successfully wrote"],
-        "details_exact": {
-          "bytesWritten": 7,
-          "lines": 1
-        }
+        "content_exact": "Successfully wrote 7 bytes to nested/dir/file.txt",
+        "details_none": true
       }
     },
     {
@@ -44,11 +38,8 @@
         "content": "new content"
       },
       "expected": {
-        "content_contains": ["Successfully wrote"],
-        "details_exact": {
-          "bytesWritten": 11,
-          "lines": 1
-        }
+        "content_exact": "Successfully wrote 11 bytes to existing.txt",
+        "details_none": true
       }
     },
     {
@@ -59,11 +50,8 @@
         "content": ""
       },
       "expected": {
-        "content_contains": ["Successfully wrote", "0 bytes"],
-        "details_exact": {
-          "bytesWritten": 0,
-          "lines": 0
-        }
+        "content_exact": "Successfully wrote 0 bytes to empty.txt",
+        "details_none": true
       }
     },
     {
@@ -74,10 +62,8 @@
         "content": "Hello 世界\nこんにちは\n🎉 emoji"
       },
       "expected": {
-        "content_contains": ["Successfully wrote"],
-        "details_exact": {
-          "lines": 3
-        }
+        "content_exact": "Successfully wrote 23 bytes to unicode.txt",
+        "details_none": true
       }
     },
     {
@@ -88,10 +74,8 @@
         "content": "line1\nline2\n"
       },
       "expected": {
-        "content_contains": ["Successfully wrote"],
-        "details_exact": {
-          "lines": 2
-        }
+        "content_exact": "Successfully wrote 12 bytes to trailing.txt",
+        "details_none": true
       }
     },
     {
@@ -102,7 +86,8 @@
         "content": "Tab:\tNewline:\nBackslash:\\"
       },
       "expected": {
-        "content_contains": ["Successfully wrote"]
+        "content_exact": "Successfully wrote 25 bytes to special.txt",
+        "details_none": true
       }
     }
   ]

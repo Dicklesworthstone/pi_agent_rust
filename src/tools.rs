@@ -468,68 +468,168 @@ impl ResizedImage {
 }
 
 #[cfg(feature = "image-resize")]
-fn image_format_for_mime(mime: &str) -> Option<image::ImageFormat> {
-    match mime {
-        "image/jpeg" => Some(image::ImageFormat::Jpeg),
-        "image/png" => Some(image::ImageFormat::Png),
-        "image/gif" => Some(image::ImageFormat::Gif),
-        "image/webp" => Some(image::ImageFormat::WebP),
-        "image/bmp" => Some(image::ImageFormat::Bmp),
-        "image/x-icon" => Some(image::ImageFormat::Ico),
-        "image/tiff" => Some(image::ImageFormat::Tiff),
-        _ => None,
-    }
-}
-
-#[cfg(feature = "image-resize")]
 fn resize_image_if_needed(bytes: &[u8], mime_type: &'static str) -> Result<ResizedImage> {
-    use image::GenericImageView;
-    use std::io::Cursor;
+    // Match legacy behavior from pi-mono `utils/image-resize.ts`.
+    //
+    // Strategy:
+    // 1) If image already fits within max dims AND max bytes: return original
+    // 2) Otherwise resize to maxWidth/maxHeight (2000x2000)
+    // 3) Encode as PNG and JPEG, pick smaller
+    // 4) If still too large, try JPEG with different quality steps
+    // 5) If still too large, progressively scale down dimensions
+    //
+    // Note: even if dimensions don't change, an oversized image may be re-encoded to fit max bytes.
+    use image::codecs::jpeg::JpegEncoder;
+    use image::codecs::png::PngEncoder;
+    use image::imageops::FilterType;
+    use image::{GenericImageView, ImageEncoder};
+
+    const MAX_WIDTH: u32 = 2000;
+    const MAX_HEIGHT: u32 = 2000;
+    const MAX_BYTES: usize = 4_718_592; // 4.5MB (below Anthropic's 5MB limit)
+    const DEFAULT_JPEG_QUALITY: u8 = 80;
+    const QUALITY_STEPS: [u8; 4] = [85, 70, 55, 40];
+    const SCALE_STEPS: [f32; 5] = [1.0, 0.75, 0.5, 0.35, 0.25];
 
     let img = match image::load_from_memory(bytes) {
         Ok(img) => img,
         Err(_) => return Ok(ResizedImage::original(bytes.to_vec(), mime_type)),
     };
-    let (width, height) = img.dimensions();
-    let max_dim = width.max(height);
-    if max_dim <= 2000 {
+
+    let (original_width, original_height) = img.dimensions();
+    let original_size = bytes.len();
+
+    if original_width <= MAX_WIDTH && original_height <= MAX_HEIGHT && original_size <= MAX_BYTES {
         return Ok(ResizedImage {
             bytes: bytes.to_vec(),
             mime_type,
             resized: false,
-            width: Some(width),
-            height: Some(height),
-            original_width: Some(width),
-            original_height: Some(height),
+            width: Some(original_width),
+            height: Some(original_height),
+            original_width: Some(original_width),
+            original_height: Some(original_height),
         });
     }
 
-    let scale = 2000.0 / max_dim as f32;
-    let new_width = (width as f32 * scale).round() as u32;
-    let new_height = (height as f32 * scale).round() as u32;
-    let resized_img = img.resize(new_width, new_height, image::imageops::FilterType::Triangle);
+    let mut target_width = original_width;
+    let mut target_height = original_height;
 
-    let format = image_format_for_mime(mime_type);
-    let Some(format) = format else {
-        return Ok(ResizedImage::original(bytes.to_vec(), mime_type));
-    };
+    if target_width > MAX_WIDTH {
+        target_height = ((target_height as f64 * MAX_WIDTH as f64) / target_width as f64).round() as u32;
+        target_width = MAX_WIDTH;
+    }
+    if target_height > MAX_HEIGHT {
+        target_width = ((target_width as f64 * MAX_HEIGHT as f64) / target_height as f64).round() as u32;
+        target_height = MAX_HEIGHT;
+    }
 
-    let mut out = Vec::new();
-    if resized_img
-        .write_to(&mut Cursor::new(&mut out), format)
-        .is_err()
-    {
-        return Ok(ResizedImage::original(bytes.to_vec(), mime_type));
+    fn encode_png(img: &image::DynamicImage) -> Result<Vec<u8>> {
+        let rgba = img.to_rgba8();
+        let mut out = Vec::new();
+        PngEncoder::new(&mut out)
+            .write_image(
+                rgba.as_raw(),
+                rgba.width(),
+                rgba.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .map_err(|e| Error::tool("read", format!("Failed to encode PNG: {e}")))?;
+        Ok(out)
+    }
+
+    fn encode_jpeg(img: &image::DynamicImage, quality: u8) -> Result<Vec<u8>> {
+        let rgb = img.to_rgb8();
+        let mut out = Vec::new();
+        JpegEncoder::new_with_quality(&mut out, quality)
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                image::ExtendedColorType::Rgb8,
+            )
+            .map_err(|e| Error::tool("read", format!("Failed to encode JPEG: {e}")))?;
+        Ok(out)
+    }
+
+    fn try_both_formats(
+        img: &image::DynamicImage,
+        width: u32,
+        height: u32,
+        jpeg_quality: u8,
+    ) -> Result<(Vec<u8>, &'static str)> {
+        let resized = img.resize_exact(width, height, FilterType::Lanczos3);
+        let png = encode_png(&resized)?;
+        let jpeg = encode_jpeg(&resized, jpeg_quality)?;
+        if png.len() <= jpeg.len() {
+            Ok((png, "image/png"))
+        } else {
+            Ok((jpeg, "image/jpeg"))
+        }
+    }
+
+    let mut best = try_both_formats(&img, target_width, target_height, DEFAULT_JPEG_QUALITY)?;
+    let mut final_width = target_width;
+    let mut final_height = target_height;
+
+    if best.0.len() <= MAX_BYTES {
+        return Ok(ResizedImage {
+            bytes: best.0,
+            mime_type: best.1,
+            resized: true,
+            width: Some(final_width),
+            height: Some(final_height),
+            original_width: Some(original_width),
+            original_height: Some(original_height),
+        });
+    }
+
+    for quality in QUALITY_STEPS {
+        best = try_both_formats(&img, target_width, target_height, quality)?;
+        if best.0.len() <= MAX_BYTES {
+            return Ok(ResizedImage {
+                bytes: best.0,
+                mime_type: best.1,
+                resized: true,
+                width: Some(final_width),
+                height: Some(final_height),
+                original_width: Some(original_width),
+                original_height: Some(original_height),
+            });
+        }
+    }
+
+    for scale in SCALE_STEPS {
+        final_width = ((target_width as f32) * scale).round() as u32;
+        final_height = ((target_height as f32) * scale).round() as u32;
+
+        if final_width < 100 || final_height < 100 {
+            break;
+        }
+
+        for quality in QUALITY_STEPS {
+            best = try_both_formats(&img, final_width, final_height, quality)?;
+            if best.0.len() <= MAX_BYTES {
+                return Ok(ResizedImage {
+                    bytes: best.0,
+                    mime_type: best.1,
+                    resized: true,
+                    width: Some(final_width),
+                    height: Some(final_height),
+                    original_width: Some(original_width),
+                    original_height: Some(original_height),
+                });
+            }
+        }
     }
 
     Ok(ResizedImage {
-        bytes: out,
-        mime_type,
+        bytes: best.0,
+        mime_type: best.1,
         resized: true,
-        width: Some(new_width),
-        height: Some(new_height),
-        original_width: Some(width),
-        original_height: Some(height),
+        width: Some(final_width),
+        height: Some(final_height),
+        original_width: Some(original_width),
+        original_height: Some(original_height),
     })
 }
 
@@ -1017,6 +1117,15 @@ impl Tool for BashTool {
                 None,
             )
             .await?;
+        }
+
+        // Wait for exit code if we haven't gotten it yet (channel closed before child.wait() was selected)
+        if exit_code.is_none() && !timed_out {
+            exit_code = child
+                .wait()
+                .await
+                .map_err(|e| Error::tool("bash", e.to_string()))?
+                .code();
         }
 
         drop(temp_file);
@@ -2522,7 +2631,9 @@ fn format_grep_path(file_path: &Path, search_path: &Path, is_directory: bool) ->
 
 fn get_file_lines<'a>(path: &Path, cache: &'a mut HashMap<PathBuf, Vec<String>>) -> &'a [String] {
     let lines = cache.entry(path.to_path_buf()).or_insert_with(|| {
-        let content = std::fs::read_to_string(path).unwrap_or_default();
+        // Match Node's `readFileSync(..., "utf-8")` behavior: decode lossily rather than failing.
+        let bytes = std::fs::read(path).unwrap_or_default();
+        let content = String::from_utf8_lossy(&bytes).to_string();
         let normalized = content.replace("\r\n", "\n").replace('\r', "\n");
         normalized.split('\n').map(str::to_string).collect()
     });

@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tool": "ls",
-  "description": "Conformance tests for the ls tool",
+  "description": "Conformance tests for the ls tool (pi-mono parity)",
   "cases": [
     {
       "name": "ls_directory",
@@ -12,7 +12,8 @@
       ],
       "input": {},
       "expected": {
-        "content_contains": ["file.txt", "subdir/"]
+        "content_contains": ["file.txt", "subdir/"],
+        "details_none": true
       }
     },
     {
@@ -20,7 +21,8 @@
       "description": "List empty directory",
       "input": {},
       "expected": {
-        "content_contains": ["empty directory"]
+        "content_exact": "(empty directory)",
+        "details_none": true
       }
     },
     {
@@ -28,7 +30,7 @@
       "description": "List nonexistent directory errors",
       "input": {"path": "/nonexistent/directory"},
       "expect_error": true,
-      "error_contains": "not found",
+      "error_contains": "Path not found",
       "expected": {}
     },
     {
@@ -39,7 +41,7 @@
       ],
       "input": {"path": "file.txt"},
       "expect_error": true,
-      "error_contains": "not a directory",
+      "error_contains": "Not a directory",
       "expected": {}
     },
     {
@@ -51,7 +53,8 @@
       ],
       "input": {},
       "expected": {
-        "content_contains": ["small.txt", "mydir/"]
+        "content_contains": ["small.txt", "mydir/"],
+        "details_none": true
       }
     },
     {
@@ -63,7 +66,8 @@
       ],
       "input": {},
       "expected": {
-        "content_contains": ["adir/", "zfile.txt"]
+        "content_contains": ["adir/", "zfile.txt"],
+        "details_none": true
       }
     },
     {
@@ -77,7 +81,7 @@
       "input": {"limit": 2},
       "expected": {
         "content_contains": ["limit reached"],
-        "details": {
+        "details_exact": {
           "entryLimitReached": 2
         }
       }
@@ -91,7 +95,8 @@
       ],
       "input": {},
       "expected": {
-        "content_regex": "(?s)apple\\.txt.*Zebra\\.txt"
+        "content_regex": "(?s)apple\\.txt.*Zebra\\.txt",
+        "details_none": true
       }
     }
   ]

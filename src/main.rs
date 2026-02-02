@@ -16,6 +16,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use clap::Parser;
 use pi::agent::{Agent, AgentConfig, AgentEvent};
+use pi::auth::AuthStorage;
 use pi::providers::anthropic::AnthropicProvider;
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
@@ -106,13 +107,17 @@ async fn run_print_mode(
         anyhow::bail!("No input provided. Use: pi -p \"your message\" or pipe input via stdin");
     }
 
-    // Get API key
-    let api_key = cli
-        .api_key
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+    // Get API key from auth storage with precedence: --api-key > auth.json > env
+    let auth_path = dirs::home_dir()
+        .map(|h| h.join(".pi/agent/auth.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from(".pi/agent/auth.json"));
+    let auth = AuthStorage::load(auth_path).unwrap_or_else(|_| {
+        AuthStorage::load(std::path::PathBuf::new()).unwrap()
+    });
+    let api_key = auth
+        .resolve_api_key("anthropic", cli.api_key.as_deref())
         .ok_or_else(|| {
-            anyhow::anyhow!("No API key found. Set ANTHROPIC_API_KEY or use --api-key")
+            anyhow::anyhow!("No API key found. Set ANTHROPIC_API_KEY, use --api-key, or add to ~/.pi/agent/auth.json")
         })?;
 
     // Create provider

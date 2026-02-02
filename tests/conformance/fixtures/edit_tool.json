@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tool": "edit",
-  "description": "Conformance tests for the edit tool",
+  "description": "Conformance tests for the edit tool (pi-mono parity)",
   "cases": [
     {
       "name": "edit_simple_replace",
@@ -15,10 +15,10 @@
         "newText": "Rust"
       },
       "expected": {
-        "content_contains": ["Successfully replaced", "test.txt"],
-        "details": {
-          "oldLength": 5,
-          "newLength": 4
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_exact": {
+          "diff": "-1 Hello, World!\n+1 Hello, Rust!",
+          "firstChangedLine": 1
         }
       }
     },
@@ -34,7 +34,11 @@
         "newText": "replaced"
       },
       "expected": {
-        "content_contains": ["Successfully replaced"]
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_exact": {
+          "diff": " 1 line1\n-2 line2\n+2 replaced\n 3 line3",
+          "firstChangedLine": 2
+        }
       }
     },
     {
@@ -49,7 +53,7 @@
         "newText": "New"
       },
       "expect_error": true,
-      "error_contains": "not found",
+      "error_contains": "Could not find the exact text in test.txt",
       "expected": {}
     },
     {
@@ -61,7 +65,22 @@
         "newText": "new"
       },
       "expect_error": true,
-      "error_contains": "not found",
+      "error_contains": "File not found",
+      "expected": {}
+    },
+    {
+      "name": "edit_multiple_occurrences",
+      "description": "If oldText occurs more than once, edit should error",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "Hello, Hello, Hello!"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "Hello",
+        "newText": "Hi"
+      },
+      "expect_error": true,
+      "error_contains": "Found 3 occurrences",
       "expected": {}
     },
     {
@@ -76,7 +95,10 @@
         "newText": "const fn = () => x;"
       },
       "expected": {
-        "content_contains": ["Successfully replaced"]
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details": {
+          "diff": {}
+        }
       }
     },
     {
@@ -91,7 +113,10 @@
         "newText": "World"
       },
       "expected": {
-        "content_contains": ["Successfully replaced"]
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details": {
+          "diff": {}
+        }
       }
     }
   ]

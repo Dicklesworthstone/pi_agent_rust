@@ -1,7 +1,7 @@
 {
   "version": "1.0",
   "tool": "find",
-  "description": "Conformance tests for the find tool",
+  "description": "Conformance tests for the find tool (pi-mono parity)",
   "cases": [
     {
       "name": "find_glob_pattern",
@@ -14,7 +14,8 @@
       "input": {"pattern": "*.txt"},
       "expected": {
         "content_contains": ["file1.txt", "file2.txt"],
-        "content_not_contains": ["file.rs"]
+        "content_not_contains": ["file.rs"],
+        "details_none": true
       }
     },
     {
@@ -25,7 +26,8 @@
       ],
       "input": {"pattern": "*.rs"},
       "expected": {
-        "content_contains": ["No files found"]
+        "content_exact": "No files found matching pattern",
+        "details_none": true
       }
     },
     {
@@ -38,7 +40,8 @@
       ],
       "input": {"pattern": "**/*.txt"},
       "expected": {
-        "content_contains": ["root.txt", "nested.txt"]
+        "content_contains": ["root.txt", "nested.txt"],
+        "details_none": true
       }
     },
     {
@@ -54,7 +57,7 @@
       "input": {"pattern": "*.txt", "limit": 3},
       "expected": {
         "content_contains": ["limit reached"],
-        "details": {
+        "details_exact": {
           "resultLimitReached": 3
         }
       }
@@ -70,20 +73,21 @@
       "input": {"pattern": "*.rs"},
       "expected": {
         "content_contains": ["main.rs", "lib.rs"],
-        "content_not_contains": ["test.ts"]
+        "content_not_contains": ["test.ts"],
+        "details_none": true
       }
     },
     {
-      "name": "find_sorted_by_mtime",
-      "description": "Results are sorted by modification time (newest first)",
+      "name": "find_multiple_matches_present",
+      "description": "Find returns all matches (order unspecified)",
       "setup": [
         {"type": "create_file", "path": "old.txt", "content": "old"},
-        {"type": "run_command", "command": "sleep 0.1"},
         {"type": "create_file", "path": "new.txt", "content": "new"}
       ],
       "input": {"pattern": "*.txt"},
       "expected": {
-        "content_contains": ["old.txt", "new.txt"]
+        "content_contains": ["old.txt", "new.txt"],
+        "details_none": true
       }
     }
   ]

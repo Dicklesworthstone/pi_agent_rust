@@ -123,6 +123,9 @@ pub enum PackageSource {
 impl Config {
     /// Load configuration from global and project settings.
     pub fn load() -> Result<Self> {
+        if let Ok(path) = std::env::var("PI_CONFIG_PATH") {
+            return Self::load_from_path(&PathBuf::from(path));
+        }
         let global = Self::load_global()?;
         let project = Self::load_project()?;
 
@@ -150,7 +153,18 @@ impl Config {
 
     /// Get the sessions directory.
     pub fn sessions_dir() -> PathBuf {
+        if let Ok(path) = std::env::var("PI_SESSIONS_DIR") {
+            return PathBuf::from(path);
+        }
         Self::global_dir().join("sessions")
+    }
+
+    /// Get the package directory.
+    pub fn package_dir() -> PathBuf {
+        if let Ok(path) = std::env::var("PI_PACKAGE_DIR") {
+            return PathBuf::from(path);
+        }
+        Self::global_dir().join("packages")
     }
 
     /// Get the auth file path.

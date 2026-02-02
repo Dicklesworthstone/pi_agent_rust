@@ -217,11 +217,14 @@
 
 | Feature | Status | Rust Location | Tests | Notes |
 |---------|--------|---------------|-------|-------|
-| API key from env | ✅ | `anthropic.rs` | - | ANTHROPIC_API_KEY |
-| API key from flag | ✅ | `anthropic.rs` | - | --api-key |
-| auth.json storage | ❌ | - | - | File with 0600 perms |
+| API key from env | ✅ | `src/auth.rs` | - | ANTHROPIC_API_KEY, etc. |
+| API key from flag | ✅ | `src/main.rs` | - | --api-key |
+| auth.json storage | ✅ | `src/auth.rs` | - | File with 0600 perms |
+| File locking | ✅ | `src/auth.rs` | - | Exclusive lock with timeout |
+| Key resolution | ✅ | `src/auth.rs` | - | override > auth.json > env |
+| Multi-provider keys | ✅ | `src/auth.rs` | - | 12 providers supported |
 | OAuth flow | ❌ | - | - | Browser callback |
-| Token refresh | ❌ | - | - | Expiry handling |
+| Token refresh | 🔶 | `src/auth.rs` | - | Expiry check exists, no refresh |
 
 ---
 

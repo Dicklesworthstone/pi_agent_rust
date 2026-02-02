@@ -24,15 +24,9 @@ mod read_tool {
             .await
             .expect("should succeed");
 
-        // Verify output contains numbered lines
         let text = get_text_content(&result.content);
-        assert!(text.contains("line1"));
-        assert!(text.contains("line5"));
-
-        // Verify details
-        let details = result.details.unwrap();
-        assert_eq!(details["totalLines"], 5);
-        assert_eq!(details["truncated"], false);
+        assert_eq!(text, "line1\nline2\nline3\nline4\nline5");
+        assert!(result.details.is_none());
     }
 
     #[tokio::test]
@@ -53,10 +47,11 @@ mod read_tool {
             .await
             .expect("should succeed");
 
-        let details = result.details.unwrap();
-        assert_eq!(details["offset"], 2);
-        assert_eq!(details["limit"], 2);
-        assert_eq!(details["outputLines"], 2);
+        let text = get_text_content(&result.content);
+        assert!(text.contains("line2"));
+        assert!(text.contains("line3"));
+        assert!(text.contains("[2 more lines in file. Use offset=4 to continue.]"));
+        assert!(result.details.is_none());
     }
 
     #[tokio::test]
@@ -108,10 +103,9 @@ mod write_tool {
         assert!(test_file.exists());
         assert_eq!(std::fs::read_to_string(&test_file).unwrap(), content);
 
-        // Verify details
-        let details = result.details.unwrap();
-        assert_eq!(details["bytesWritten"], content.len());
-        assert_eq!(details["lines"], 2);
+        let text = get_text_content(&result.content);
+        assert!(text.contains("Successfully wrote 20 bytes"));
+        assert!(result.details.is_none());
     }
 
     #[tokio::test]
@@ -159,8 +153,9 @@ mod edit_tool {
 
         // Verify success message output
         let text = get_text_content(&result.content);
-        assert!(text.contains("Successfully replaced"));
+        assert!(text.contains("Successfully replaced text in"));
         assert!(text.contains("test.txt"));
+        assert!(result.details.as_ref().is_some_and(|d| d.get("diff").is_some()));
     }
 
     #[tokio::test]
@@ -216,10 +211,7 @@ mod bash_tool {
 
         let text = get_text_content(&result.content);
         assert!(text.contains("Hello, World!"));
-
-        let details = result.details.unwrap();
-        assert_eq!(details["exitCode"], 0);
-        assert_eq!(details["timedOut"], false);
+        assert!(result.details.is_none());
     }
 
     #[tokio::test]
@@ -230,13 +222,12 @@ mod bash_tool {
             "command": "exit 42"
         });
 
-        let result = tool
+        let err = tool
             .execute("test-id", input, None)
             .await
-            .expect("should succeed even with non-zero exit");
-
-        let details = result.details.unwrap();
-        assert_eq!(details["exitCode"], 42);
+            .err()
+            .expect("should error");
+        assert!(err.to_string().contains("Command exited with code 42"));
     }
 
     #[tokio::test]
