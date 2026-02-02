@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Dicklesworthstone/pi/main/assets/pi-logo.svg" alt="Pi Logo" width="200"/>
+  <img src="https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/assets/pi-logo.svg" alt="Pi Logo" width="200"/>
 </p>
 
 <h1 align="center">Pi</h1>
@@ -67,7 +67,7 @@ pi -p "What does this error mean?" < error.log
 
 ```bash
 # From source (requires Rust nightly)
-git clone https://github.com/Dicklesworthstone/pi.git
+git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
 cd pi
 cargo install --path .
 ```
@@ -166,7 +166,7 @@ rustup install nightly
 rustup default nightly
 
 # Clone and build
-git clone https://github.com/Dicklesworthstone/pi.git
+git clone https://github.com/Dicklesworthstone/pi_agent_rust.git
 cd pi
 cargo build --release
 

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "High-performance AI coding agent CLI - Rust port of pi-mono"
 license = "MIT"
-repository = "https://github.com/Dicklesworthstone/pi"
+repository = "https://github.com/Dicklesworthstone/pi_agent_rust"
 keywords = ["ai", "cli", "coding-agent", "llm", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
 
