@@ -318,6 +318,227 @@ Then:
 
 ---
 
+## 2A. Extc Compatibility Contract (Normative)
+
+This section defines the **extc compiler contract** that maps legacy Node/Bun imports
+to PiJS shims so **all 16 extensions in `docs/extension-sample.json` run unmodified**
+(no manual source edits required).
+
+### 2A.1 Genericity Constraint (Non-Negotiable)
+
+- **No per-extension exceptions** in extc rewrites.
+- Rewrites MUST be defined solely in terms of import specifiers and generic,
+  semantics-preserving code patterns.
+- If the sample reveals a gap, fix it by adding a **general rule + tests**, not by
+  branching on extension id.
+
+### 2A.2 Canonical Import Rewrite Rules
+
+Extc MUST ensure every import specifier is resolvable inside PiJS without Node/Bun.
+
+#### A) Node Builtins (`node:*`)
+
+Rewrite `node:*` builtins to an internal namespace that PiJS provides (so bundlers
+don't externalize them):
+
+| Source Specifier        | Target Specifier           |
+|-------------------------|----------------------------|
+| `node:fs`               | `pi:node/fs`               |
+| `node:fs/promises`      | `pi:node/fs_promises`      |
+| `node:path`             | `pi:node/path`             |
+| `node:os`               | `pi:node/os`               |
+| `node:url`              | `pi:node/url`              |
+| `node:crypto`           | `pi:node/crypto`           |
+| `node:child_process`    | `pi:node/child_process`    |
+| `node:module`           | `pi:node/module`           |
+
+#### B) Bare Builtins (No Prefix)
+
+Many real-world deps import builtins without the `node:` prefix. Treat these
+identically:
+
+| Source Specifier        | Target Specifier           |
+|-------------------------|----------------------------|
+| `fs`                    | `pi:node/fs`               |
+| `fs/promises`           | `pi:node/fs_promises`      |
+| `path`                  | `pi:node/path`             |
+| `os`                    | `pi:node/os`               |
+| `url`                   | `pi:node/url`              |
+| `crypto`                | `pi:node/crypto`           |
+| `child_process`         | `pi:node/child_process`    |
+| `module`                | `pi:node/module`           |
+
+### 2A.3 Global Polyfill Injection
+
+Extc MAY inject an idempotent prelude import at the bundle entrypoint:
+
+```javascript
+import 'pi:polyfills/node_globals'  // installs process, Buffer, __dirname, __filename
+import 'pi:polyfills/fetch'         // if needed: fetch, Headers, Request, Response
+import 'pi:polyfills/webassembly'   // PiWasm bridge (QuickJS has no native wasm)
+```
+
+**Injection rules:**
+- **Deterministic**: stable ordering, always at the top of the entry module.
+- **Sourcemap-correct**: injected imports MUST NOT corrupt sourcemap line mappings.
+- **Versioned**: `shim_version` MUST be included in the artifact hash.
+- **Idempotent**: multiple injections produce identical output.
+
+**Node globals provided by `pi:polyfills/node_globals`:**
+- `process` (with `process.env`, `process.cwd()`, `process.platform`, etc.)
+- `Buffer`
+- `__dirname` / `__filename` (computed from module URL)
+- `global` (alias for `globalThis`)
+- `setImmediate` / `clearImmediate`
+
+### 2A.4 Forbidden and Flagged APIs
+
+The compatibility scanner MUST classify APIs into:
+
+#### Forbidden (Hard Error)
+
+APIs that bypass capability policy or escape the sandbox. Extc MUST reject bundles
+using these:
+
+| API / Pattern                        | Reason                                   |
+|--------------------------------------|------------------------------------------|
+| `require('vm')` / `node:vm`          | Arbitrary code execution                 |
+| `require('worker_threads')`          | Unsupported concurrency model            |
+| `require('cluster')`                 | Unsupported concurrency model            |
+| `require('dgram')`                   | Raw UDP sockets                          |
+| `require('net')` (raw sockets)       | Bypasses HTTP policy                     |
+| `require('tls')` (raw sockets)       | Bypasses HTTP policy                     |
+| `require('inspector')`               | Debugger access                          |
+| `require('perf_hooks')`              | Performance timing oracle                |
+| `require('v8')`                      | Engine internals                         |
+| `require('repl')`                    | Interactive eval                         |
+| `process.binding()`                  | Native module access                     |
+| `process.dlopen()`                   | Native addon loading                     |
+| Direct `eval()` with dynamic string  | Arbitrary code execution (see note)      |
+
+**Note on `new Function(...)`:** The pinned sample includes `new Function(...)` for
+loading a bundled script. This is **flagged but allowed** with evidence logging,
+not forbidden outright.
+
+#### Flagged (Warning + Evidence)
+
+Risky constructs that require evidence logging but don't block compilation:
+
+| API / Pattern                        | Evidence Required                        |
+|--------------------------------------|------------------------------------------|
+| `new Function(...)`                  | Log function body hash + call site       |
+| `eval(variable)`                     | Log if variable is not a literal         |
+| `setTimeout(string, ...)`            | Log string body hash                     |
+| `setInterval(string, ...)`           | Log string body hash                     |
+| `Proxy` / `Reflect` (reflection)     | Log usage pattern                        |
+| `Object.defineProperty` on builtins  | Log target + property                    |
+
+### 2A.5 Extc Input/Output Contract
+
+#### Input
+
+- Extension manifest (`extension.json` or `package.json`)
+- Source files (TypeScript or JavaScript)
+- Optional: `tsconfig.json` for type resolution
+
+#### Output
+
+- **ESM bundle**: single entry module, tree-shaken, minified
+- **Sourcemap**: accurate line/column mapping to original source
+- **Artifact metadata** (`artifact.json`):
+  ```json
+  {
+    "schema": "pi.ext.artifact.v1",
+    "extension_id": "...",
+    "entry_module": "index.js",
+    "hash": "sha256:...",
+    "shim_version": "1.0.0",
+    "rewrite_log": [
+      { "from": "node:fs", "to": "pi:node/fs", "locations": [...] }
+    ],
+    "injected_polyfills": ["pi:polyfills/node_globals"],
+    "flagged_apis": [
+      { "api": "new Function", "locations": [...], "evidence_hash": "..." }
+    ],
+    "forbidden_apis": [],
+    "capabilities_required": ["read", "exec"]
+  }
+  ```
+
+#### Side-Effect Policy
+
+- Extc MUST NOT execute extension code during compilation.
+- Static analysis only; no `require()` resolution that triggers side effects.
+- If a dependency cannot be statically analyzed, emit a warning and include it
+  verbatim (the runtime will handle capability checks).
+
+### 2A.6 Compatibility Matrix
+
+The following Node APIs are supported via shims. Each maps to a PiJS connector
+with explicit capability requirements:
+
+| Node API                 | Shim Module             | Sync/Async | Capability   | Notes                          |
+|--------------------------|-------------------------|------------|--------------|--------------------------------|
+| `fs.readFileSync`        | `pi:node/fs`            | sync       | `read`       | Blocks event loop              |
+| `fs.writeFileSync`       | `pi:node/fs`            | sync       | `write`      | Blocks event loop              |
+| `fs.promises.readFile`   | `pi:node/fs_promises`   | async      | `read`       | Preferred                      |
+| `fs.promises.writeFile`  | `pi:node/fs_promises`   | async      | `write`      | Preferred                      |
+| `fs.existsSync`          | `pi:node/fs`            | sync       | `read`       |                                |
+| `fs.readdirSync`         | `pi:node/fs`            | sync       | `read`       |                                |
+| `fs.statSync`            | `pi:node/fs`            | sync       | `read`       |                                |
+| `fs.mkdirSync`           | `pi:node/fs`            | sync       | `write`      |                                |
+| `path.join`              | `pi:node/path`          | sync       | (none)       | Pure computation               |
+| `path.resolve`           | `pi:node/path`          | sync       | (none)       | Uses `process.cwd()`           |
+| `path.dirname`           | `pi:node/path`          | sync       | (none)       | Pure computation               |
+| `path.basename`          | `pi:node/path`          | sync       | (none)       | Pure computation               |
+| `path.extname`           | `pi:node/path`          | sync       | (none)       | Pure computation               |
+| `os.platform`            | `pi:node/os`            | sync       | `env`        | Returns host platform          |
+| `os.homedir`             | `pi:node/os`            | sync       | `env`        | Returns home directory         |
+| `os.tmpdir`              | `pi:node/os`            | sync       | `env`        | Returns temp directory         |
+| `child_process.spawn`    | `pi:node/child_process` | async      | `exec`       | Streams stdout/stderr          |
+| `child_process.exec`     | `pi:node/child_process` | async      | `exec`       | Buffers output                 |
+| `child_process.execSync` | `pi:node/child_process` | sync       | `exec`       | Blocks; prefer async           |
+| `crypto.randomBytes`     | `pi:node/crypto`        | sync       | (none)       | CSPRNG                         |
+| `crypto.createHash`      | `pi:node/crypto`        | sync       | (none)       | Pure computation               |
+| `url.parse`              | `pi:node/url`           | sync       | (none)       | Pure computation               |
+| `url.URL`                | `pi:node/url`           | sync       | (none)       | WHATWG URL                     |
+| `process.env`            | `pi:polyfills/...`      | sync       | `env`        | Filtered by policy             |
+| `process.cwd()`          | `pi:polyfills/...`      | sync       | (none)       | Project root                   |
+| `process.exit()`         | `pi:polyfills/...`      | sync       | (none)       | Throws; extension cannot exit  |
+| `Buffer.from`            | `pi:polyfills/...`      | sync       | (none)       | Binary data handling           |
+| `Buffer.alloc`           | `pi:polyfills/...`      | sync       | (none)       | Binary data handling           |
+| `fetch`                  | `pi:polyfills/fetch`    | async      | `http`       | WHATWG Fetch                   |
+
+**Error mapping:** All shim errors MUST map to the hostcall error taxonomy (§3.2):
+`denied`, `timeout`, `io`, `invalid_request`, `internal`.
+
+### 2A.7 Sourcemap Contract
+
+Extc MUST produce sourcemaps that:
+
+1. **Map accurately**: every generated line/column MUST map to the correct original
+   source location.
+2. **Preserve through rewrites**: import rewrites MUST NOT corrupt mappings.
+3. **Include sources**: sourcemap SHOULD include `sourcesContent` for offline
+   debugging.
+4. **Inline or external**: support both inline (`//# sourceMappingURL=data:...`)
+   and external (`.map` file) formats.
+
+**Runtime usage:**
+- When an error occurs, the runtime MUST use the sourcemap to produce a stack trace
+  with original file/line/column.
+- Structured logs (§3.1) MUST include sourcemapped locations in `source.location`.
+
+### 2A.8 Test Requirements
+
+- **Unit transform fixtures**: common imports + injection patterns with expected
+  output.
+- **Negative tests**: forbidden APIs MUST produce exact error messages.
+- **E2E harness**: verify rewritten bundles run 16/16 sample extensions with
+  actionable failure diagnostics.
+
+---
+
 ## 3. Extension Protocol (v1)
 
 All communication uses a **versioned, JSON‑encoded protocol**:
@@ -485,6 +706,49 @@ Error example:
 
 ---
 
+### 3.2A Unified JS + WASM Capability Model (Normative)
+
+This section defines a **single, coherent capability model** that applies
+equally to **PiJS (JS)** and **WASM** extensions. Policy evaluation, logging,
+and tooling **must not diverge** by runtime.
+
+#### Capability taxonomy (v1)
+
+| Capability | JS surface (PiJS) | WASM hostcall | Scope | Notes |
+|---|---|---|---|---|
+| `read` | `pi.tool(read/grep/find/ls)`; `pi.fs.read/list/stat` | `host_call(method=tool, name in {read,grep,find,ls})`; `host_call(method=fs, op in {read,list,stat})` | `paths` | Path scope enforced by connector. |
+| `write` | `pi.tool(write/edit)`; `pi.fs.write/mkdir/delete` | `host_call(method=tool, name in {write,edit})`; `host_call(method=fs, op in {write,mkdir,delete})` | `paths` | Includes mutation; default-deny in strict mode. |
+| `exec` | `pi.exec(...)`; `pi.tool(bash)` | `host_call(method=exec)`; `host_call(method=tool, name=bash)` | none | Process execution; high-risk. |
+| `http` | `pi.http(request)` | `host_call(method=http)` | `hosts` | Host allow-list enforced. |
+| `session` | `pi.session.*` | `host_call(method=session)` | none | Session metadata access. |
+| `ui` | `pi.ui.*` | `host_call(method=ui)` | none | May be denied in non-interactive mode. |
+| `log` | `pi.log(...)` | `host_call(method=log)` | none | Structured logging only. |
+| `tool` | `pi.tool(<non-core>)` | `host_call(method=tool, name=<non-core>)` | none | Used for unknown/custom tools; forces prompt/deny in strict/prompt modes. |
+
+Notes:
+- The `fs` hostcall method is optional until the FS connector lands, but **when
+  present** it MUST map to `read`/`write` exactly as shown above.
+- The `tool` capability is a **catch-all** for non-core tools; the host should
+  prefer explicit `read`/`write`/`exec` mapping for built-ins.
+
+#### Mapping rules (required)
+
+1) **Core derives capability** from `method` + `params` (never trust extension
+   provided capability for authorization).
+2) **JS and WASM map to the same capability names**. A policy decision made for
+   JS must be identical for the equivalent WASM call.
+3) **Mismatch is an error**: if `host_call.payload.capability` disagrees with
+   the derived capability, respond with `invalid_request`.
+
+#### Policy + logging alignment
+
+- The **same policy evaluator** applies to both runtimes.
+- Audit logs **must include** `capability`, `method`, and the derived decision.
+- Recommended: include a `runtime` field in `log.data` (`js` or `wasm`) to make
+  cross-runtime comparisons trivial.
+
+---
+
 ### 3.3 Capability Manifest (`pi.ext.cap.v1`)
 
 `register.payload.capability_manifest` optionally declares the extension’s
@@ -515,6 +779,8 @@ Fields:
 Notes:
 - `register.payload.capabilities` remains the legacy, flat list; it will be
   treated as a coarse capability set until all extensions emit a manifest.
+- The manifest applies **equally to JS and WASM** runtimes; capability names and
+  scope semantics are identical across both.
 
 ---
 
