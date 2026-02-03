@@ -89,3 +89,85 @@ Normalization rules (remove non-determinism, preserve semantics):
 - Rewrite `run-<uuid>` to `<RUN_ID>` and bare UUIDs to `<UUID>`.
 - Rewrite mock OpenAI base URLs to `http://127.0.0.1:<PORT>/v1`.
 - Rewrite `Total output lines: N` to `Total output lines: <N>`.
+
+## Regenerating Legacy Fixtures (bd-16n / bd-vbs)
+
+This section is the “new maintainer path” for reproducing the committed legacy fixtures.
+
+### What Gets Generated
+
+- **Raw capture artifacts** (one directory per scenario run): `target/legacy_capture/<scenario_id>/<run_id>/`
+  - `stdout.jsonl`, `stderr.txt`, `meta.json`, `capture.log.jsonl`
+  - plus normalized siblings: `stdout.normalized.jsonl`, `meta.normalized.json`, `capture.normalized.log.jsonl`
+- **Golden fixture outputs** (one file per extension): `tests/ext_conformance/fixtures/<extension_id>.json`
+  - Schema: `pi.ext.legacy_fixtures.v1`
+  - Captures provenance (legacy pi-mono HEAD, node/npm versions, manifest commit/checksum, etc.)
+
+### Prerequisites
+
+- Rust nightly toolchain (see `rust-toolchain.toml`)
+- Node + npm available on PATH
+- Legacy pi-mono workspace has its dependencies installed (we need `legacy_pi_mono_code/pi-mono/node_modules/tsx/...`)
+
+If you see `missing tsx runner`, run:
+
+```bash
+cd legacy_pi_mono_code/pi-mono
+npm install
+```
+
+### Verify Pins
+
+The sample set pins the legacy reference source via:
+
+- `docs/extension-sample.json` → `source_commit` (pi-mono revision used to select the sample)
+- `docs/extension-sample.json` → `items[].source.commit` + `items[].checksum.sha256` (per-extension provenance)
+
+The capture tool records the actual legacy pi-mono checkout used in each scenario’s `meta.normalized.json` under:
+
+- `pi_mono.head`
+- `pi_mono.extension_path`
+- `pi_mono.manifest_commit`
+- `pi_mono.manifest_checksum_sha256`
+
+### Run the Full Capture
+
+From repo root:
+
+```bash
+cargo run --bin pi_legacy_capture
+```
+
+Defaults (see `src/bin/pi_legacy_capture.rs`):
+
+- Manifest: `docs/extension-sample.json`
+- Legacy root: `legacy_pi_mono_code/pi-mono`
+- Raw out dir: `target/legacy_capture`
+- Fixtures dir: `tests/ext_conformance/fixtures`
+- Deterministic/offline: `--no-env` (default true)
+- Timeout per scenario: `--timeout-secs 20`
+
+### Run a Single Scenario (Debugging)
+
+```bash
+cargo run --bin pi_legacy_capture -- --scenario-id scn-todo-003
+```
+
+This is useful when fixing one scenario without regenerating everything.
+
+### Determinism Notes
+
+`pi_legacy_capture` aims to make runs reproducible:
+
+- Sets `TZ=UTC`.
+- Runs legacy pi-mono against a local mock OpenAI server for predictable streaming + tool-call events.
+- Supports per-scenario mocking hooks from the manifest:
+  - `setup.mock_exec`: generates a `node_preload.cjs` to stub `child_process.spawn`.
+  - `setup.mock_http`: stubs `fetch()` for offline “image generation” fixtures.
+  - `setup.session_branch`: writes `seed_session.jsonl` to preload session history (e.g. toolResult details).
+
+### Troubleshooting
+
+- **Timeouts / hangs:** re-run with a higher timeout and inspect `stderr.txt` + `capture.log.jsonl` under the scenario directory in `target/legacy_capture/...`.
+- **Node preload not applied:** confirm the scenario wrote `node_preload.cjs` and that `meta.json` includes `node_preload`; legacy pi-mono should receive it via `NODE_OPTIONS=--require <abs path>`.
+- **Seed session failures:** inspect `seed_session.jsonl` for malformed messages; seeded `toolResult` entries must include `toolCallId`, `toolName`, `content` (array), `isError`, and numeric `timestamp`.
