@@ -1,0 +1,39 @@
+{
+  "version": "1.0",
+  "provider": "gemini",
+  "cases": [
+    {
+      "name": "text_basic",
+      "events": [
+        {
+          "candidates": [
+            { "content": { "parts": [{ "text": "Hello " }] } }
+          ],
+          "usageMetadata": {
+            "promptTokenCount": 5,
+            "candidatesTokenCount": 1,
+            "totalTokenCount": 6
+          }
+        },
+        {
+          "candidates": [
+            {
+              "content": { "parts": [{ "text": "world" }] },
+              "finishReason": "STOP"
+            }
+          ],
+          "usageMetadata": {
+            "promptTokenCount": 5,
+            "candidatesTokenCount": 2,
+            "totalTokenCount": 7
+          }
+        }
+      ],
+      "expected": [
+        { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "world" },
+        { "kind": "done", "reason": "stop" }
+      ]
+    }
+  ]
+}

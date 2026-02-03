@@ -1,0 +1,283 @@
+{
+  "schema": "pi.ext.sample.v1",
+  "generated_at": "2026-02-03T06:05:00Z",
+  "target_sample_size": 16,
+  "min_sample_size": 12,
+  "max_sample_size": 20,
+  "source_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+  "selection_rationale": "Applied CONFORMANCE.md scoring and EXTENSION_SAMPLING_MATRIX quotas. Adjusted the initial example-only list to satisfy multi-file/pkg-with-deps/small-complexity coverage by adding sandbox/, subagent/, hello.ts, and status-line.ts while removing truncated-tool.ts, overlay-qa-tests.ts, custom-compaction.ts, and rpc-demo.ts.",
+  "items": [
+    {
+      "id": "permission-gate",
+      "name": "permission-gate.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/permission-gate.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["event_hook", "ui_integration"],
+      "capabilities": ["exec", "env"],
+      "io_pattern": ["ui-centric", "os-heavy"],
+      "complexity": "medium",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "protected-paths",
+      "name": "protected-paths.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/protected-paths.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["event_hook"],
+      "capabilities": ["read", "write"],
+      "io_pattern": ["fs-heavy"],
+      "complexity": "small",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "todo",
+      "name": "todo.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/todo.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["tool_only", "slash_command", "ui_integration"],
+      "capabilities": ["read", "write"],
+      "io_pattern": ["fs-heavy", "ui-centric"],
+      "complexity": "medium",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "hello",
+      "name": "hello.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/hello.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["tool_only"],
+      "capabilities": ["env"],
+      "io_pattern": ["ui-centric"],
+      "complexity": "small",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "antigravity-image-gen",
+      "name": "antigravity-image-gen.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/antigravity-image-gen.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["tool_only"],
+      "capabilities": ["http", "write"],
+      "io_pattern": ["network-heavy"],
+      "complexity": "medium",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "plan-mode",
+      "name": "plan-mode/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/plan-mode"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": ["slash_command", "ui_integration"],
+      "capabilities": ["read"],
+      "io_pattern": ["ui-centric"],
+      "complexity": "large",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "status-line",
+      "name": "status-line.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/status-line.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["event_hook", "ui_integration"],
+      "capabilities": ["env"],
+      "io_pattern": ["ui-centric"],
+      "complexity": "small",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "doom-overlay",
+      "name": "doom-overlay/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/doom-overlay"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": ["ui_integration"],
+      "capabilities": ["env"],
+      "io_pattern": ["cpu-heavy", "ui-centric"],
+      "complexity": "large",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "sandbox",
+      "name": "sandbox/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/sandbox"
+      },
+      "runtime_tier": "pkg-with-deps",
+      "interaction_tags": ["event_hook", "slash_command", "ui_integration"],
+      "capabilities": ["exec", "read"],
+      "io_pattern": ["os-heavy", "fs-heavy"],
+      "complexity": "large",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "inline-bash",
+      "name": "inline-bash.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/inline-bash.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["input_transform"],
+      "capabilities": ["exec"],
+      "io_pattern": ["os-heavy"],
+      "complexity": "medium",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "dynamic-resources",
+      "name": "dynamic-resources/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/dynamic-resources"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": ["event_hook"],
+      "capabilities": ["read"],
+      "io_pattern": ["fs-heavy"],
+      "complexity": "medium",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "name": "custom-provider-anthropic/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/custom-provider-anthropic"
+      },
+      "runtime_tier": "provider-ext",
+      "interaction_tags": ["provider"],
+      "capabilities": ["http"],
+      "io_pattern": ["network-heavy"],
+      "complexity": "large",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "name": "custom-provider-qwen-cli/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/custom-provider-qwen-cli"
+      },
+      "runtime_tier": "provider-ext",
+      "interaction_tags": ["provider"],
+      "capabilities": ["exec", "http"],
+      "io_pattern": ["network-heavy"],
+      "complexity": "large",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "with-deps",
+      "name": "with-deps/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/with-deps"
+      },
+      "runtime_tier": "pkg-with-deps",
+      "interaction_tags": ["tool_only", "slash_command"],
+      "capabilities": ["read", "write"],
+      "io_pattern": ["fs-heavy"],
+      "complexity": "medium",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "subagent",
+      "name": "subagent/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/subagent"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": ["tool_only", "ui_integration"],
+      "capabilities": ["exec", "read"],
+      "io_pattern": ["cpu-heavy", "os-heavy"],
+      "complexity": "large",
+      "checksum": { "sha256": null }
+    },
+    {
+      "id": "git-checkpoint",
+      "name": "git-checkpoint.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+        "path": "packages/coding-agent/examples/extensions/git-checkpoint.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": ["event_hook"],
+      "capabilities": ["exec"],
+      "io_pattern": ["fs-heavy"],
+      "complexity": "medium",
+      "checksum": { "sha256": null }
+    }
+  ]
+}

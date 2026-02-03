@@ -851,6 +851,8 @@ impl PiApp {
 
         // Start processing
         self.agent_state = AgentState::Processing;
+        self.extension_streaming.store(true, Ordering::SeqCst);
+        self.extension_streaming.store(true, Ordering::SeqCst);
 
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();

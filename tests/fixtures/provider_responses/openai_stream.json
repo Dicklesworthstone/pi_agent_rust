@@ -1,0 +1,25 @@
+{
+  "version": "1.0",
+  "provider": "openai",
+  "cases": [
+    {
+      "name": "text_basic",
+      "events": [
+        { "choices": [{ "delta": {} }] },
+        { "choices": [{ "delta": { "content": "Hello " } }] },
+        { "choices": [{ "delta": { "content": "world" } }] },
+        {
+          "choices": [{ "delta": {}, "finish_reason": "stop" }],
+          "usage": { "prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7 }
+        },
+        "[DONE]"
+      ],
+      "expected": [
+        { "kind": "start" },
+        { "kind": "text_delta", "content_index": 0, "delta": "Hello " },
+        { "kind": "text_delta", "content_index": 0, "delta": "world" },
+        { "kind": "done", "reason": "stop" }
+      ]
+    }
+  ]
+}

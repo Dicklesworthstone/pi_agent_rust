@@ -1,0 +1,262 @@
+{
+  "version": "1.0",
+  "tool": "cli_flags",
+  "description": "CLI flag parsing conformance",
+  "cases": [
+    {
+      "name": "defaults",
+      "input": { "args": [] },
+      "expected": {
+        "details_exact": {
+          "version": false,
+          "print": false,
+          "no_session": false,
+          "no_tools": false,
+          "tools": "read,bash,edit,write",
+          "no_extensions": false,
+          "no_skills": false,
+          "no_prompt_templates": false,
+          "no_themes": false,
+          "command": null,
+          "list_models": null
+        }
+      }
+    },
+    {
+      "name": "model_flags",
+      "input": {
+        "args": [
+          "--provider",
+          "openai",
+          "--model",
+          "gpt-4o",
+          "--api-key",
+          "sk-test",
+          "--models",
+          "gpt*"
+        ]
+      },
+      "expected": {
+        "details_exact": {
+          "provider": "openai",
+          "model": "gpt-4o",
+          "api_key": "sk-test",
+          "models": "gpt*"
+        }
+      }
+    },
+    {
+      "name": "thinking_and_system",
+      "input": {
+        "args": [
+          "--thinking",
+          "high",
+          "--system-prompt",
+          "SYS",
+          "--append-system-prompt",
+          "APP"
+        ]
+      },
+      "expected": {
+        "details_exact": {
+          "thinking": "high",
+          "system_prompt": "SYS",
+          "append_system_prompt": "APP"
+        }
+      }
+    },
+    {
+      "name": "session_flags",
+      "input": {
+        "args": [
+          "-c",
+          "-r",
+          "--session",
+          "/tmp/s.jsonl",
+          "--session-dir",
+          "/tmp/sessions",
+          "--no-session"
+        ]
+      },
+      "expected": {
+        "details_exact": {
+          "continue": true,
+          "resume": true,
+          "session": "/tmp/s.jsonl",
+          "session_dir": "/tmp/sessions",
+          "no_session": true
+        }
+      }
+    },
+    {
+      "name": "mode_output",
+      "input": {
+        "args": ["--mode", "json", "--print", "--verbose"]
+      },
+      "expected": {
+        "details_exact": {
+          "mode": "json",
+          "print": true,
+          "verbose": true
+        }
+      }
+    },
+    {
+      "name": "tools_resources",
+      "input": {
+        "args": [
+          "--no-tools",
+          "--tools",
+          "read,grep",
+          "--extension",
+          "ext1",
+          "--extension",
+          "ext2",
+          "--no-extensions",
+          "--skill",
+          "skill1",
+          "--no-skills",
+          "--prompt-template",
+          "prompt1",
+          "--no-prompt-templates",
+          "--theme",
+          "theme1",
+          "--no-themes"
+        ]
+      },
+      "expected": {
+        "details_exact": {
+          "no_tools": true,
+          "tools": "read,grep",
+          "extension": ["ext1", "ext2"],
+          "no_extensions": true,
+          "skill": ["skill1"],
+          "no_skills": true,
+          "prompt_template": ["prompt1"],
+          "no_prompt_templates": true,
+          "theme": ["theme1"],
+          "no_themes": true
+        }
+      }
+    },
+    {
+      "name": "export_flag",
+      "input": { "args": ["--export", "/tmp/out.html"] },
+      "expected": {
+        "details_exact": {
+          "export": "/tmp/out.html"
+        }
+      }
+    },
+    {
+      "name": "list_models_pattern",
+      "input": { "args": ["--list-models", "gpt*"] },
+      "expected": {
+        "details_exact": {
+          "list_models": "gpt*"
+        }
+      }
+    },
+    {
+      "name": "list_models_all",
+      "input": { "args": ["--list-models"] },
+      "expected": {
+        "details_exact": {
+          "list_models": "all"
+        }
+      }
+    },
+    {
+      "name": "subcommand_install",
+      "input": { "args": ["install", "npm:pkg", "--local"] },
+      "expected": {
+        "details_exact": {
+          "command": {
+            "name": "install",
+            "source": "npm:pkg",
+            "local": true
+          }
+        }
+      }
+    },
+    {
+      "name": "subcommand_remove",
+      "input": { "args": ["remove", "npm:pkg", "-l"] },
+      "expected": {
+        "details_exact": {
+          "command": {
+            "name": "remove",
+            "source": "npm:pkg",
+            "local": true
+          }
+        }
+      }
+    },
+    {
+      "name": "subcommand_update",
+      "input": { "args": ["update", "npm:pkg"] },
+      "expected": {
+        "details_exact": {
+          "command": {
+            "name": "update",
+            "source": "npm:pkg"
+          }
+        }
+      }
+    },
+    {
+      "name": "subcommand_list",
+      "input": { "args": ["list"] },
+      "expected": {
+        "details_exact": {
+          "command": {
+            "name": "list"
+          }
+        }
+      }
+    },
+    {
+      "name": "subcommand_config",
+      "input": { "args": ["config"] },
+      "expected": {
+        "details_exact": {
+          "command": {
+            "name": "config"
+          }
+        }
+      }
+    },
+    {
+      "name": "file_message_args",
+      "input": { "args": ["@a.txt", "hello", "@b.md", "world"] },
+      "expected": {
+        "details_exact": {
+          "file_args": ["a.txt", "b.md"],
+          "message_args": ["hello", "world"]
+        }
+      }
+    },
+    {
+      "name": "help_output",
+      "input": { "args": ["--help"] },
+      "expected": {
+        "content_contains": [
+          "--provider",
+          "--model",
+          "--thinking",
+          "--no-session",
+          "--tools",
+          "--extension",
+          "--list-models"
+        ]
+      }
+    },
+    {
+      "name": "version_output",
+      "input": { "args": ["--version"] },
+      "expected": {
+        "content_contains": ["pi"]
+      }
+    }
+  ]
+}

@@ -3,10 +3,13 @@
 //! This module defines the versioned extension protocol and provides
 //! validation utilities plus a minimal WASM host scaffold.
 
+use crate::agent::AgentEvent;
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub const PROTOCOL_VERSION: &str = "1.0";
 pub const LOG_SCHEMA_VERSION: &str = "pi.ext.log.v1";
@@ -487,6 +490,114 @@ impl WasmExtensionHost {
         Err(Error::validation(
             "WASM host not enabled yet. Scaffold only.",
         ))
+    }
+}
+
+// ============================================================================
+// Extension Event System
+// ============================================================================
+
+/// Timeout for extension events in milliseconds.
+pub const EXTENSION_EVENT_TIMEOUT_MS: u64 = 5000;
+
+/// Event names for the extension lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtensionEventName {
+    /// Input from the user.
+    Input,
+    /// Before the agent starts processing.
+    BeforeAgentStart,
+    /// Agent started processing.
+    AgentStart,
+    /// Agent ended processing.
+    AgentEnd,
+    /// Session before switch.
+    SessionBeforeSwitch,
+    /// Session switched.
+    SessionSwitch,
+    /// Session before fork.
+    SessionBeforeFork,
+    /// Session forked.
+    SessionFork,
+    /// Session before compact.
+    SessionBeforeCompact,
+    /// Session compacted.
+    SessionCompact,
+}
+
+impl std::fmt::Display for ExtensionEventName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            Self::Input => "input",
+            Self::BeforeAgentStart => "before_agent_start",
+            Self::AgentStart => "agent_start",
+            Self::AgentEnd => "agent_end",
+            Self::SessionBeforeSwitch => "session_before_switch",
+            Self::SessionSwitch => "session_switch",
+            Self::SessionBeforeFork => "session_before_fork",
+            Self::SessionFork => "session_fork",
+            Self::SessionBeforeCompact => "session_before_compact",
+            Self::SessionCompact => "session_compact",
+        };
+        write!(f, "{name}")
+    }
+}
+
+/// Extension manager for handling loaded extensions.
+#[derive(Debug, Clone)]
+pub struct ExtensionManager {
+    inner: Arc<Mutex<ExtensionManagerInner>>,
+}
+
+#[derive(Debug, Default)]
+struct ExtensionManagerInner {
+    extensions: Vec<RegisterPayload>,
+}
+
+impl Default for ExtensionManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ExtensionManager {
+    /// Create a new extension manager.
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ExtensionManagerInner::default())),
+        }
+    }
+
+    /// Dispatch an event to all registered extensions.
+    pub async fn dispatch_event(
+        &self,
+        event: ExtensionEventName,
+        data: Option<Value>,
+    ) -> Result<()> {
+        let _ = (event, data); // Stub - extension runtime not yet implemented
+        Ok(())
+    }
+
+    /// Dispatch a cancellable event to all registered extensions.
+    pub async fn dispatch_cancellable_event(
+        &self,
+        event: ExtensionEventName,
+        data: Option<Value>,
+        _timeout_ms: u64,
+    ) -> Result<bool> {
+        let _ = (event, data); // Stub - extension runtime not yet implemented
+        Ok(false) // Not cancelled
+    }
+}
+
+/// Extract extension event information from an agent event.
+pub fn extension_event_from_agent(
+    event: &AgentEvent,
+) -> Option<(ExtensionEventName, Option<Value>)> {
+    match event {
+        AgentEvent::AgentStart => Some((ExtensionEventName::AgentStart, None)),
+        AgentEvent::AgentEnd { .. } => Some((ExtensionEventName::AgentEnd, None)),
+        _ => None,
     }
 }
 

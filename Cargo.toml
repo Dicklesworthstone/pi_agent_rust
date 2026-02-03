@@ -49,7 +49,7 @@ rich_rust = { path = "../rich_rust", features = ["full"] }
 crossterm = "0.29"
 
 # Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
-bubbletea = { path = "../charmed_rust/crates/bubbletea", features = ["async"] }
+bubbletea = { path = "../charmed_rust/crates/bubbletea" }
 lipgloss = { path = "../charmed_rust/crates/lipgloss" }
 bubbles = { path = "../charmed_rust/crates/bubbles" }
 glamour = { path = "../charmed_rust/crates/glamour" }
@@ -89,7 +89,6 @@ image = { version = "0.25", optional = true }
 vergen-gix = { version = "1", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
-tokio-test = "0.4"
 pretty_assertions = "1"
 tempfile = "3"
 criterion = { version = "0.7", features = ["html_reports"] }

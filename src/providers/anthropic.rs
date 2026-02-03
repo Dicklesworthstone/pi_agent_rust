@@ -747,6 +747,11 @@ fn convert_tool_to_anthropic(tool: &ToolDef) -> AnthropicTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use asupersync::runtime::RuntimeBuilder;
+    use futures::{StreamExt, stream};
+    use serde::{Deserialize, Serialize};
+    use serde_json::Value;
+    use std::path::PathBuf;
 
     #[test]
     fn test_convert_user_text_message() {
@@ -766,5 +771,166 @@ mod tests {
         assert_eq!(ThinkingLevel::Low.default_budget(), 2048);
         assert_eq!(ThinkingLevel::Medium.default_budget(), 8192);
         assert_eq!(ThinkingLevel::High.default_budget(), 16384);
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ProviderFixture {
+        cases: Vec<ProviderCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ProviderCase {
+        name: String,
+        events: Vec<Value>,
+        expected: Vec<EventSummary>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    struct EventSummary {
+        kind: String,
+        #[serde(default)]
+        content_index: Option<usize>,
+        #[serde(default)]
+        delta: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+
+    #[test]
+    fn test_stream_fixtures() {
+        let fixture = load_fixture("anthropic_stream.json");
+        for case in fixture.cases {
+            let events = collect_events(&case.events);
+            let summaries: Vec<EventSummary> = events.iter().map(summarize_event).collect();
+            assert_eq!(summaries, case.expected, "case {}", case.name);
+        }
+    }
+
+    fn load_fixture(file_name: &str) -> ProviderFixture {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/provider_responses")
+            .join(file_name);
+        let raw = std::fs::read_to_string(path).expect("fixture read");
+        serde_json::from_str(&raw).expect("fixture parse")
+    }
+
+    fn collect_events(events: &[Value]) -> Vec<StreamEvent> {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async move {
+            let bytes = events
+                .iter()
+                .map(|event| {
+                    let data = match event {
+                        Value::String(text) => text.clone(),
+                        _ => serde_json::to_string(event).expect("serialize event"),
+                    };
+                    format!("data: {data}\n\n").into_bytes()
+                })
+                .collect::<Vec<_>>();
+
+            let byte_stream = stream::iter(bytes.into_iter().map(Ok));
+            let event_source = crate::sse::SseStream::new(Box::pin(byte_stream));
+            let mut state = StreamState::new(
+                event_source,
+                "claude-test".to_string(),
+                "anthropic-messages".to_string(),
+                "anthropic".to_string(),
+            );
+            let mut out = Vec::new();
+
+            while let Some(item) = state.event_source.next().await {
+                let msg = match item {
+                    Ok(msg) => msg,
+                    Err(err) => panic!("SSE error: {err}"),
+                };
+                if msg.event == "ping" {
+                    continue;
+                }
+                match state.process_event(&msg.data) {
+                    Ok(Some(event)) => out.push(event),
+                    Ok(None) => {}
+                    Err(err) => panic!("process_event error: {err}"),
+                }
+            }
+
+            out
+        })
+    }
+
+    fn summarize_event(event: &StreamEvent) -> EventSummary {
+        match event {
+            StreamEvent::Start { .. } => EventSummary {
+                kind: "start".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextStart { content_index, .. } => EventSummary {
+                kind: "text_start".to_string(),
+                content_index: Some(*content_index),
+                delta: None,
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextDelta {
+                content_index,
+                delta,
+                ..
+            } => EventSummary {
+                kind: "text_delta".to_string(),
+                content_index: Some(*content_index),
+                delta: Some(delta.clone()),
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextEnd {
+                content_index,
+                content,
+                ..
+            } => EventSummary {
+                kind: "text_end".to_string(),
+                content_index: Some(*content_index),
+                delta: None,
+                content: Some(content.clone()),
+                reason: None,
+            },
+            StreamEvent::Done { reason, .. } => EventSummary {
+                kind: "done".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: Some(reason_to_string(reason)),
+            },
+            StreamEvent::Error { reason, .. } => EventSummary {
+                kind: "error".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: Some(reason_to_string(reason)),
+            },
+            _ => EventSummary {
+                kind: "other".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: None,
+            },
+        }
+    }
+
+    fn reason_to_string(reason: &StopReason) -> String {
+        match reason {
+            StopReason::Stop => "stop",
+            StopReason::Length => "length",
+            StopReason::ToolUse => "tool_use",
+            StopReason::Error => "error",
+            StopReason::Aborted => "aborted",
+        }
+        .to_string()
     }
 }

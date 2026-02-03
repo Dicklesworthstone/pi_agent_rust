@@ -181,7 +181,7 @@ dependencies = [
  "base64",
  "bincode",
  "crossbeam-queue",
- "getrandom 0.2.17",
+ "getrandom 0.3.4",
  "libc",
  "nix",
  "parking_lot",
@@ -388,11 +388,8 @@ version = "0.1.0"
 dependencies = [
  "bubbletea-macros",
  "crossterm",
- "futures",
  "parking_lot",
  "thiserror 2.0.18",
- "tokio",
- "tokio-util",
  "tracing",
 ]
 
@@ -3247,7 +3244,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
- "tokio-test",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
@@ -4539,17 +4535,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
-]
-
-[[package]]
 name = "tokio-util"
 version = "0.7.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4558,7 +4543,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "futures-util",
  "pin-project-lite",
  "tokio",
 ]

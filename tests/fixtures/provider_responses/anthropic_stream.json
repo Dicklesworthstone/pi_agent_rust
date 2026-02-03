@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "provider": "anthropic",
+  "cases": [
+    {
+      "name": "text_basic",
+      "events": [
+        { "type": "message_start", "message": { "usage": { "input_tokens": 5 } } },
+        { "type": "content_block_start", "index": 0, "content_block": { "type": "text" } },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": { "type": "text_delta", "text": "Hello " }
+        },
+        {
+          "type": "content_block_delta",
+          "index": 0,
+          "delta": { "type": "text_delta", "text": "world" }
+        },
+        { "type": "content_block_stop", "index": 0 },
+        {
+          "type": "message_delta",
+          "delta": { "stop_reason": "end_turn" },
+          "usage": { "output_tokens": 2 }
+        },
+        { "type": "message_stop" }
+      ],
+      "expected": [
+        { "kind": "start" },
+        { "kind": "text_start", "content_index": 0 },
+        { "kind": "text_delta", "content_index": 0, "delta": "Hello " },
+        { "kind": "text_delta", "content_index": 0, "delta": "world" },
+        { "kind": "text_end", "content_index": 0, "content": "Hello world" },
+        { "kind": "done", "reason": "stop" }
+      ]
+    }
+  ]
+}
