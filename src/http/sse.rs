@@ -2,6 +2,9 @@
 //!
 //! Implements the SSE protocol (text/event-stream) on top of asupersync's
 //! HTTP client for streaming LLM responses.
+//!
+//! NOTE: This file is currently legacy/unused. The canonical SSE implementation is
+//! `src/sse.rs`, and `src/http/mod.rs` re-exports it as `crate::http::sse::*`.
 
 use std::collections::VecDeque;
 use std::pin::Pin;

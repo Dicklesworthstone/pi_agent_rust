@@ -273,6 +273,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+    use futures::stream;
 
     #[test]
     fn test_simple_event() {
@@ -405,5 +407,59 @@ data: {"type":"message_stop"}
         assert!(events[2].data.contains("Hello"));
         assert_eq!(events[3].event, "content_block_stop");
         assert_eq!(events[4].event, "message_stop");
+    }
+
+    #[test]
+    fn test_stream_yields_multiple_events_from_one_chunk() {
+        let bytes = b"data: first\n\ndata: second\n\n".to_vec();
+        let mut stream = SseStream::new(stream::iter(vec![Ok(bytes)]));
+
+        futures::executor::block_on(async {
+            let first = stream.next().await.expect("first event").expect("ok");
+            assert_eq!(first.data, "first");
+
+            let second = stream.next().await.expect("second event").expect("ok");
+            assert_eq!(second.data, "second");
+
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn test_stream_handles_utf8_split_across_chunks() {
+        // Snowman is a 3-byte UTF-8 sequence: E2 98 83. Split it across chunks.
+        let chunks = vec![Ok(b"data: \xE2".to_vec()), Ok(b"\x98\x83\n\n".to_vec())];
+        let mut stream = SseStream::new(stream::iter(chunks));
+
+        futures::executor::block_on(async {
+            let event = stream.next().await.expect("event").expect("ok");
+            assert_eq!(event.data, "☃");
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn test_stream_flushes_pending_event_at_end() {
+        let mut stream = SseStream::new(stream::iter(vec![Ok(b"data: last".to_vec())]));
+
+        futures::executor::block_on(async {
+            let event = stream.next().await.expect("event").expect("ok");
+            assert_eq!(event.data, "last");
+            assert!(stream.next().await.is_none());
+        });
+    }
+
+    #[test]
+    fn test_stream_errors_on_incomplete_utf8_at_end() {
+        let mut stream = SseStream::new(stream::iter(vec![Ok(b"data: \xE2".to_vec())]));
+
+        futures::executor::block_on(async {
+            let err = stream
+                .next()
+                .await
+                .expect("expected a result")
+                .expect_err("expected utf8 error");
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        });
     }
 }

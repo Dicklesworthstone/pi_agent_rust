@@ -79,6 +79,7 @@ regex = "1"
 unicode-normalization = "0.1"
 similar = "2"
 sysinfo = "0.36"
+rquickjs = { version = "0.11", features = ["futures"] }
 
 # Image processing (optional)
 image = { version = "0.25", optional = true }

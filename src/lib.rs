@@ -27,6 +27,7 @@ pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod extensions;
+pub mod extensions_js;
 pub mod http;
 pub mod interactive;
 pub mod model;
