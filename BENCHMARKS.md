@@ -26,9 +26,30 @@ These are the target performance metrics. Regressions beyond these thresholds sh
 | truncate_head (10K lines) | <1ms | ~250μs | ✅ |
 | truncate_tail (10K lines) | <1ms | ~250μs | ✅ |
 | sse_parse (100 events) | <100μs | ~50μs | ✅ |
-| ext_hostcall_dispatch (single call) | <50μs | TBD | ⬜ |
+| ext_runtime_cold_start (no-op extension) | p95 < 200ms (p99 < 400ms) | TBD | ⬜ |
+| ext_runtime_warm_start (no-op extension) | p95 < 25ms (p99 < 50ms) | TBD | ⬜ |
+| ext_tool_hook_overhead (no-op extension) | p95 < 500μs (p99 < 1ms) | TBD | ⬜ |
+| ext_hostcall_dispatch (single call) | p95 < 50μs (p99 < 100μs) | TBD | ⬜ |
 | Binary startup | <100ms | 11.2ms (`pi --version`) | ✅ |
 | Binary size (release) | <20MB | 7.6MB | ✅ |
+
+### Extension Runtime Budget Definitions
+
+These budgets target **extension overhead**, not end-to-end LLM latency.
+
+- **Cold start:** first time an extension runtime is created/initialized for a process (cold caches).
+- **Warm start:** extension runtime is already initialized (warm caches); measures steady-state overhead.
+- **Hook overhead:** incremental latency added by routing a tool call through a no-op extension hook.
+- **Hostcall dispatch:** cost to invoke a single hostcall across the connector boundary (no-op payload).
+
+### Measurement Methodology (bd-1ii)
+
+- **Hardware class:** GitHub Actions `ubuntu-latest` runner (x86_64). Treat numbers as *CI budgets*; local machines will vary.
+- **Percentiles:** budgets are specified as **p95/p99** to avoid overfitting to median-only results on shared CI runners.
+- **Benchmarks:** extension benchmarks will live under `benches/extensions.rs` (planned) and should report:
+  - cold vs warm timings separately
+  - a baseline (no extension) vs no-op extension delta for hook overhead
+  - enough samples to make percentile reporting meaningful on CI
 
 ## Benchmark Results
 
