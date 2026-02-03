@@ -19,7 +19,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use pi::extensions::{LogComponent, LogCorrelation, LogLevel, LogPayload, LogSource};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,34 @@ struct LegacyFixtureOutputs {
 #[command(name = "pi_legacy_capture")]
 #[command(about = "Run legacy pi-mono RPC scenarios and record raw outputs", long_about = None)]
 struct Args {
+    /// View a `pi.ext.log.v1` JSONL file and render a human-readable trace (use "-" for stdin).
+    #[arg(long, value_name = "PATH")]
+    view_log: Option<PathBuf>,
+
+    /// Trace output format (pretty summary lines or raw JSONL).
+    #[arg(long, value_enum, default_value_t = TraceViewMode::Pretty)]
+    view_mode: TraceViewMode,
+
+    /// Minimum log level to display when viewing traces.
+    #[arg(long, value_enum, default_value_t = TraceViewLevel::Debug)]
+    view_min_level: TraceViewLevel,
+
+    /// Filter: only show these extension IDs (repeatable).
+    #[arg(long)]
+    view_extension_id: Vec<String>,
+
+    /// Filter: only show these scenario IDs (repeatable).
+    #[arg(long)]
+    view_scenario_id: Vec<String>,
+
+    /// Filter: only show events with these prefixes (repeatable).
+    #[arg(long)]
+    view_event_prefix: Vec<String>,
+
+    /// Suppress the summary footer when viewing traces.
+    #[arg(long, default_value_t = false)]
+    view_no_summary: bool,
+
     /// Path to `docs/extension-sample.json`
     #[arg(long, default_value = "docs/extension-sample.json")]
     manifest: PathBuf,
@@ -101,6 +129,275 @@ struct Args {
     /// Use `pi-test.sh --no-env` (recommended for deterministic/offline scenarios).
     #[arg(long, default_value_t = true)]
     no_env: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TraceViewMode {
+    Pretty,
+    Jsonl,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum TraceViewLevel {
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl TraceViewLevel {
+    fn allows(self, level: &LogLevel) -> bool {
+        level_rank(level) >= self.min_rank()
+    }
+
+    fn min_rank(self) -> u8 {
+        match self {
+            TraceViewLevel::Debug => 0,
+            TraceViewLevel::Info => 1,
+            TraceViewLevel::Warn => 2,
+            TraceViewLevel::Error => 3,
+        }
+    }
+}
+
+fn level_rank(level: &LogLevel) -> u8 {
+    match level {
+        LogLevel::Debug => 0,
+        LogLevel::Info => 1,
+        LogLevel::Warn => 2,
+        LogLevel::Error => 3,
+    }
+}
+
+fn level_label(level: &LogLevel) -> &'static str {
+    match level {
+        LogLevel::Debug => "debug",
+        LogLevel::Info => "info",
+        LogLevel::Warn => "warn",
+        LogLevel::Error => "error",
+    }
+}
+
+fn run_trace_viewer(args: &Args, input: &Path) -> Result<()> {
+    let mut reader: Box<dyn BufRead> = if input.as_os_str() == "-" {
+        Box::new(BufReader::new(std::io::stdin()))
+    } else {
+        let file =
+            File::open(input).with_context(|| format!("open trace log {}", input.display()))?;
+        Box::new(BufReader::new(file))
+    };
+
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+
+    let mut total: usize = 0;
+    let mut kept: usize = 0;
+    let mut levels: BTreeMap<String, usize> = BTreeMap::new();
+    let mut events: BTreeMap<String, usize> = BTreeMap::new();
+    let mut extensions: BTreeMap<String, usize> = BTreeMap::new();
+    let mut scenarios: BTreeMap<String, usize> = BTreeMap::new();
+
+    let mut line = String::new();
+    let mut line_idx: usize = 0;
+    loop {
+        line.clear();
+        let n = reader
+            .read_line(&mut line)
+            .with_context(|| format!("read trace log line {}", line_idx + 1))?;
+        if n == 0 {
+            break;
+        }
+        line_idx += 1;
+
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        total += 1;
+
+        let payload: LogPayload = serde_json::from_str(trimmed)
+            .with_context(|| format!("parse trace log JSON on line {}", line_idx))?;
+
+        if !args.view_min_level.allows(&payload.level) {
+            continue;
+        }
+        if !args.view_extension_id.is_empty()
+            && !args
+                .view_extension_id
+                .iter()
+                .any(|id| id == &payload.correlation.extension_id)
+        {
+            continue;
+        }
+        if !args.view_scenario_id.is_empty()
+            && !args
+                .view_scenario_id
+                .iter()
+                .any(|id| id == &payload.correlation.scenario_id)
+        {
+            continue;
+        }
+        if !args.view_event_prefix.is_empty()
+            && !args
+                .view_event_prefix
+                .iter()
+                .any(|prefix| payload.event.starts_with(prefix))
+        {
+            continue;
+        }
+
+        kept += 1;
+        *levels
+            .entry(level_label(&payload.level).to_string())
+            .or_default() += 1;
+        *events.entry(payload.event.clone()).or_default() += 1;
+        *extensions
+            .entry(payload.correlation.extension_id.clone())
+            .or_default() += 1;
+        *scenarios
+            .entry(payload.correlation.scenario_id.clone())
+            .or_default() += 1;
+
+        match args.view_mode {
+            TraceViewMode::Jsonl => {
+                writeln!(out, "{trimmed}")?;
+            }
+            TraceViewMode::Pretty => {
+                writeln!(out, "{}", format_trace_line(&payload))?;
+            }
+        }
+    }
+
+    if matches!(args.view_mode, TraceViewMode::Pretty) && !args.view_no_summary {
+        writeln!(out)?;
+        writeln!(out, "--- trace summary ---")?;
+        writeln!(out, "lines: {kept} (of {total})")?;
+        if !levels.is_empty() {
+            writeln!(out, "levels: {}", render_count_map(&levels))?;
+        }
+        if !extensions.is_empty() {
+            writeln!(out, "extensions: {}", render_count_map(&extensions))?;
+        }
+        if !scenarios.is_empty() {
+            writeln!(out, "scenarios: {}", render_count_map(&scenarios))?;
+        }
+        if !events.is_empty() {
+            writeln!(out, "events: {}", render_count_map(&events))?;
+        }
+    }
+
+    Ok(())
+}
+
+fn render_count_map(map: &BTreeMap<String, usize>) -> String {
+    let mut out = String::new();
+    for (idx, (key, value)) in map.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(key);
+        out.push('=');
+        out.push_str(&value.to_string());
+    }
+    out
+}
+
+fn format_trace_line(payload: &LogPayload) -> String {
+    let mut out = String::new();
+
+    out.push_str(&payload.ts);
+    out.push(' ');
+    out.push_str(level_label(&payload.level));
+    out.push(' ');
+    out.push_str(&payload.event);
+    if !payload.message.trim().is_empty() {
+        out.push(' ');
+        out.push_str(&payload.message);
+    }
+
+    out.push_str(" ext=");
+    out.push_str(&payload.correlation.extension_id);
+    out.push_str(" scn=");
+    out.push_str(&payload.correlation.scenario_id);
+
+    append_correlation_id(&mut out, "sess", payload.correlation.session_id.as_deref());
+    append_correlation_id(&mut out, "run", payload.correlation.run_id.as_deref());
+    append_correlation_id(&mut out, "art", payload.correlation.artifact_id.as_deref());
+    append_correlation_id(
+        &mut out,
+        "tool",
+        payload.correlation.tool_call_id.as_deref(),
+    );
+    append_correlation_id(
+        &mut out,
+        "cmd",
+        payload.correlation.slash_command_id.as_deref(),
+    );
+    append_correlation_id(&mut out, "evt", payload.correlation.event_id.as_deref());
+    append_correlation_id(
+        &mut out,
+        "host",
+        payload.correlation.host_call_id.as_deref(),
+    );
+    append_correlation_id(&mut out, "rpc", payload.correlation.rpc_id.as_deref());
+    append_correlation_id(&mut out, "trace", payload.correlation.trace_id.as_deref());
+    append_correlation_id(&mut out, "span", payload.correlation.span_id.as_deref());
+
+    if let Some(source) = &payload.source {
+        out.push_str(" src=");
+        out.push_str(match source.component {
+            LogComponent::Capture => "capture",
+            LogComponent::Harness => "harness",
+            LogComponent::Runtime => "runtime",
+            LogComponent::Extension => "extension",
+        });
+        if let Some(pid) = source.pid {
+            out.push_str(" pid=");
+            out.push_str(&pid.to_string());
+        }
+        if let Some(host) = source.host.as_deref() {
+            if !host.trim().is_empty() {
+                out.push_str(" host=");
+                out.push_str(host);
+            }
+        }
+    }
+
+    if let Some(data) = &payload.data {
+        if let Ok(text) = serde_json::to_string(data) {
+            let truncated = truncate_chars(&text, 200);
+            out.push_str(" data=");
+            out.push_str(&truncated);
+        }
+    }
+
+    out
+}
+
+fn append_correlation_id(out: &mut String, label: &str, value: Option<&str>) {
+    let Some(value) = value else {
+        return;
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    out.push(' ');
+    out.push_str(label);
+    out.push('=');
+    out.push_str(value);
+}
+
+fn truncate_chars(input: &str, max_len: usize) -> String {
+    if input.chars().count() <= max_len {
+        return input.to_string();
+    }
+    let mut out = String::new();
+    for ch in input.chars().take(max_len) {
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -1888,6 +2185,10 @@ child_process.spawn = (command, args, options) => {
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(input) = args.view_log.as_deref() {
+        return run_trace_viewer(&args, input);
+    }
+
     let ids = capture_ids();
 
     let manifest_bytes = std::fs::read(&args.manifest)
