@@ -71,6 +71,31 @@ pub struct ResolvedPaths {
     pub themes: Vec<ResolvedResource>,
 }
 
+/// Explicit roots for resource resolution (settings + auto-discovery base dirs).
+///
+/// This exists primarily to make `PackageManager::resolve()` testable without
+/// mutating process-wide environment variables (Rust 2024 makes `set_var` unsafe).
+#[derive(Debug, Clone)]
+pub struct ResolveRoots {
+    pub global_settings_path: PathBuf,
+    pub project_settings_path: PathBuf,
+    pub global_base_dir: PathBuf,
+    pub project_base_dir: PathBuf,
+}
+
+impl ResolveRoots {
+    /// Build roots using the default Pi settings locations (env + cwd).
+    #[must_use]
+    pub fn from_env(cwd: &Path) -> Self {
+        Self {
+            global_settings_path: global_settings_path(),
+            project_settings_path: project_settings_path(cwd),
+            global_base_dir: Config::global_dir(),
+            project_base_dir: cwd.join(Config::project_dir()),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PackageManager {
     cwd: PathBuf,
@@ -205,11 +230,13 @@ impl PackageManager {
     ///
     /// This matches pi-mono's `DefaultPackageManager.resolve()` semantics.
     pub async fn resolve(&self) -> Result<ResolvedPaths> {
-        let global = read_settings_snapshot(&global_settings_path())?;
-        let project = read_settings_snapshot(&project_settings_path(&self.cwd))?;
+        let roots = ResolveRoots::from_env(&self.cwd);
+        self.resolve_with_roots(&roots).await
+    }
 
-        let global_base_dir = Config::global_dir();
-        let project_base_dir = self.cwd.join(Config::project_dir());
+    pub async fn resolve_with_roots(&self, roots: &ResolveRoots) -> Result<ResolvedPaths> {
+        let global = read_settings_snapshot(&roots.global_settings_path)?;
+        let project = read_settings_snapshot(&roots.project_settings_path)?;
 
         let mut accumulator = ResourceAccumulator::new();
 
@@ -237,9 +264,9 @@ impl PackageManager {
                     source: "local".to_string(),
                     scope: PackageScope::User,
                     origin: ResourceOrigin::TopLevel,
-                    base_dir: Some(global_base_dir.clone()),
+                    base_dir: Some(roots.global_base_dir.clone()),
                 },
-                &global_base_dir,
+                &roots.global_base_dir,
             );
 
             Self::resolve_local_entries(
@@ -250,9 +277,9 @@ impl PackageManager {
                     source: "local".to_string(),
                     scope: PackageScope::Project,
                     origin: ResourceOrigin::TopLevel,
-                    base_dir: Some(project_base_dir.clone()),
+                    base_dir: Some(roots.project_base_dir.clone()),
                 },
-                &project_base_dir,
+                &roots.project_base_dir,
             );
         }
 
@@ -261,8 +288,8 @@ impl PackageManager {
             &mut accumulator,
             &global,
             &project,
-            &global_base_dir,
-            &project_base_dir,
+            &roots.global_base_dir,
+            &roots.project_base_dir,
         );
 
         Ok(accumulator.into_resolved_paths())

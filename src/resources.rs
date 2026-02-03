@@ -650,8 +650,12 @@ pub fn load_skills(options: LoadSkillsOptions) -> LoadSkillsResult {
     }
 
     diagnostics.extend(collisions);
+
+    let mut skills: Vec<Skill> = skill_map.into_values().collect();
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+
     LoadSkillsResult {
-        skills: skill_map.into_values().collect(),
+        skills,
         diagnostics,
     }
 }
@@ -1197,7 +1201,9 @@ fn build_path_source_label(path: &Path) -> String {
     format!("(path:{base})")
 }
 
-fn dedupe_prompts(prompts: Vec<PromptTemplate>) -> (Vec<PromptTemplate>, Vec<ResourceDiagnostic>) {
+pub fn dedupe_prompts(
+    prompts: Vec<PromptTemplate>,
+) -> (Vec<PromptTemplate>, Vec<ResourceDiagnostic>) {
     let mut seen: HashMap<String, PromptTemplate> = HashMap::new();
     let mut diagnostics = Vec::new();
 
@@ -1219,10 +1225,12 @@ fn dedupe_prompts(prompts: Vec<PromptTemplate>) -> (Vec<PromptTemplate>, Vec<Res
         seen.insert(prompt.name.clone(), prompt);
     }
 
-    (seen.into_values().collect(), diagnostics)
+    let mut prompts: Vec<PromptTemplate> = seen.into_values().collect();
+    prompts.sort_by(|a, b| a.name.cmp(&b.name));
+    (prompts, diagnostics)
 }
 
-fn dedupe_themes(themes: Vec<ThemeResource>) -> (Vec<ThemeResource>, Vec<ResourceDiagnostic>) {
+pub fn dedupe_themes(themes: Vec<ThemeResource>) -> (Vec<ThemeResource>, Vec<ResourceDiagnostic>) {
     let mut seen: HashMap<String, ThemeResource> = HashMap::new();
     let mut diagnostics = Vec::new();
 
@@ -1244,7 +1252,9 @@ fn dedupe_themes(themes: Vec<ThemeResource>) -> (Vec<ThemeResource>, Vec<Resourc
         seen.insert(theme.name.clone(), theme);
     }
 
-    (seen.into_values().collect(), diagnostics)
+    let mut themes: Vec<ThemeResource> = seen.into_values().collect();
+    themes.sort_by(|a, b| a.name.cmp(&b.name));
+    (themes, diagnostics)
 }
 
 pub fn parse_command_args(args: &str) -> Vec<String> {

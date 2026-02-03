@@ -118,4 +118,3 @@ Example capture command:
   `packages/coding-agent/examples/extensions/README.md`
 - For extension docs, see:  
   `packages/coding-agent/docs/extensions.md`
-

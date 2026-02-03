@@ -35,6 +35,14 @@ struct Args {
     #[arg(long, default_value = "target/legacy_capture")]
     out_dir: PathBuf,
 
+    /// Provider to select in legacy pi-mono (required for RPC mode even for slash-command-only scenarios)
+    #[arg(long, default_value = "openai")]
+    provider: String,
+
+    /// Model ID to select in legacy pi-mono (required for RPC mode even for slash-command-only scenarios)
+    #[arg(long, default_value = "gpt-4o-mini")]
+    model: String,
+
     /// Run only these scenario IDs (repeatable). If omitted, runs all supported headless scenarios.
     #[arg(long)]
     scenario_id: Vec<String>,
@@ -279,6 +287,8 @@ fn spawn_pi_mono_rpc(
     pi_mono_root: &Path,
     extension_path: &str,
     agent_dir: &Path,
+    provider: &str,
+    model: &str,
     no_env: bool,
 ) -> Result<Child> {
     let pi_test = pi_mono_root.join("pi-test.sh");
@@ -292,6 +302,10 @@ fn spawn_pi_mono_rpc(
         .arg("rpc")
         .arg("--extension")
         .arg(extension_path)
+        .arg("--provider")
+        .arg(provider)
+        .arg("--model")
+        .arg(model)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -526,6 +540,8 @@ fn main() -> Result<()> {
             "legacy_head": legacy_head.clone(),
             "node_version": node.clone(),
             "npm_version": npm.clone(),
+            "provider": args.provider.clone(),
+            "model": args.model.clone(),
         }));
         writer.write_capture_log(&payload)?;
 
@@ -535,6 +551,8 @@ fn main() -> Result<()> {
             &args.pi_mono_root,
             &item.source.path,
             &agent_dir,
+            &args.provider,
+            &args.model,
             args.no_env,
         )?;
         let mut stdin = child.stdin.take().context("take child stdin")?;
@@ -614,6 +632,8 @@ fn main() -> Result<()> {
             "finished_at": finished_at,
             "agent_dir": agent_dir.display().to_string(),
             "models_json": models_json_path.display().to_string(),
+            "provider": args.provider.clone(),
+            "model": args.model.clone(),
             "pi_mono": {
                 "root": args.pi_mono_root.display().to_string(),
                 "head": legacy_head.clone(),
