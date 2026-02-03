@@ -138,7 +138,7 @@ impl Provider for GeminiProvider {
         context: &Context,
         options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let api_key = options
+        let auth_value = options
             .api_key
             .clone()
             .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
@@ -146,7 +146,7 @@ impl Provider for GeminiProvider {
             .ok_or_else(|| Error::config("Missing Google/Gemini API key"))?;
 
         let request_body = self.build_request(context, options);
-        let url = self.streaming_url(&api_key);
+        let url = self.streaming_url(&auth_value);
 
         // Build request
         let mut request = self
