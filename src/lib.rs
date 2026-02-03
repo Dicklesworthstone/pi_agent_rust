@@ -43,5 +43,6 @@ pub mod session_picker;
 pub mod sse;
 pub mod tools;
 pub mod tui;
+pub mod vcr;
 
 pub use error::{Error, Result as PiResult};

@@ -9,18 +9,26 @@ use futures::StreamExt;
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
+use tracing::{debug, info, warn};
 
 pub const VCR_ENV_MODE: &str = "VCR_MODE";
 pub const VCR_ENV_DIR: &str = "VCR_CASSETTE_DIR";
 pub const DEFAULT_CASSETTE_DIR: &str = "tests/fixtures/vcr";
 const CASSETTE_VERSION: &str = "1.0";
 const REDACTED: &str = "[REDACTED]";
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RedactionSummary {
+    pub headers_redacted: usize,
+    pub json_fields_redacted: usize,
+}
 
 #[cfg(test)]
 static TEST_ENV_OVERRIDES: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -130,9 +138,15 @@ pub struct RecordedResponse {
 }
 
 impl RecordedResponse {
-    pub fn into_byte_stream(self) -> BoxStream<'static, std::result::Result<Vec<u8>, std::io::Error>>
-    {
-        stream::iter(self.body_chunks.into_iter().map(|chunk| Ok(chunk.into_bytes()))).boxed()
+    pub fn into_byte_stream(
+        self,
+    ) -> BoxStream<'static, std::result::Result<Vec<u8>, std::io::Error>> {
+        stream::iter(
+            self.body_chunks
+                .into_iter()
+                .map(|chunk| Ok(chunk.into_bytes())),
+        )
+        .boxed()
     }
 }
 
@@ -149,11 +163,18 @@ impl VcrRecorder {
             env_var(VCR_ENV_DIR).map_or_else(|| PathBuf::from(DEFAULT_CASSETTE_DIR), PathBuf::from);
         let cassette_name = sanitize_test_name(test_name);
         let cassette_path = cassette_dir.join(format!("{cassette_name}.json"));
-        Ok(Self {
+        let recorder = Self {
             cassette_path,
             mode,
             test_name: test_name.to_string(),
-        })
+        };
+        info!(
+            mode = ?recorder.mode,
+            cassette_path = %recorder.cassette_path.display(),
+            test_name = %recorder.test_name,
+            "VCR recorder initialized"
+        );
+        Ok(recorder)
     }
 
     pub fn new_with(test_name: &str, mode: VcrMode, cassette_dir: impl AsRef<Path>) -> Self {
@@ -184,13 +205,39 @@ impl VcrRecorder {
         Fut: std::future::Future<Output = Result<(u16, Vec<(String, String)>, S)>>,
         S: futures::Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
     {
+        let request_key = request_debug_key(&request);
+
         match self.mode {
-            VcrMode::Playback => self.playback(&request),
-            VcrMode::Record => self.record_streaming_with(request, send).await,
+            VcrMode::Playback => {
+                info!(
+                    cassette_path = %self.cassette_path.display(),
+                    request = %request_key,
+                    "VCR playback request"
+                );
+                self.playback(&request)
+            }
+            VcrMode::Record => {
+                info!(
+                    cassette_path = %self.cassette_path.display(),
+                    request = %request_key,
+                    "VCR recording request"
+                );
+                self.record_streaming_with(request, send).await
+            }
             VcrMode::Auto => {
                 if self.cassette_path.exists() {
+                    info!(
+                        cassette_path = %self.cassette_path.display(),
+                        request = %request_key,
+                        "VCR auto mode: cassette exists, using playback"
+                    );
                     self.playback(&request)
                 } else {
+                    info!(
+                        cassette_path = %self.cassette_path.display(),
+                        request = %request_key,
+                        "VCR auto mode: cassette missing, recording"
+                    );
                     self.record_streaming_with(request, send).await
                 }
             }
@@ -207,14 +254,21 @@ impl VcrRecorder {
         Fut: std::future::Future<Output = Result<(u16, Vec<(String, String)>, S)>>,
         S: futures::Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
     {
+        debug!(
+            cassette_path = %self.cassette_path.display(),
+            request = %request_debug_key(&request),
+            "VCR record: sending streaming HTTP request"
+        );
         let (status, headers, mut stream) = send().await?;
 
         let mut body_chunks = Vec::new();
+        let mut body_bytes = 0usize;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| Error::api(format!("HTTP stream read failed: {e}")))?;
             if chunk.is_empty() {
                 continue;
             }
+            body_bytes = body_bytes.saturating_add(chunk.len());
             body_chunks.push(String::from_utf8_lossy(&chunk).to_string());
         }
 
@@ -223,6 +277,15 @@ impl VcrRecorder {
             headers,
             body_chunks,
         };
+
+        info!(
+            cassette_path = %self.cassette_path.display(),
+            status = recorded.status,
+            header_count = recorded.headers.len(),
+            chunk_count = recorded.body_chunks.len(),
+            body_bytes,
+            "VCR record: captured streaming response"
+        );
 
         let mut cassette = Cassette {
             version: CASSETTE_VERSION.to_string(),
@@ -234,20 +297,63 @@ impl VcrRecorder {
             }],
         };
 
-        redact_cassette(&mut cassette);
+        let redaction = redact_cassette(&mut cassette);
+        info!(
+            cassette_path = %self.cassette_path.display(),
+            headers_redacted = redaction.headers_redacted,
+            json_fields_redacted = redaction.json_fields_redacted,
+            "VCR record: redacted sensitive data"
+        );
         save_cassette(&self.cassette_path, &cassette)?;
+        info!(
+            cassette_path = %self.cassette_path.display(),
+            "VCR record: saved cassette"
+        );
 
         Ok(recorded)
     }
 
     fn playback(&self, request: &RecordedRequest) -> Result<RecordedResponse> {
         let cassette = load_cassette(&self.cassette_path)?;
-        let interaction = find_interaction(&cassette, request).ok_or_else(|| {
-            Error::config(format!(
-                "No matching interaction found in cassette {}",
-                self.cassette_path.display()
-            ))
-        })?;
+        let Some(interaction) = find_interaction(&cassette, request) else {
+            let incoming_key = request_debug_key(request);
+            let recorded_keys: Vec<String> = cassette
+                .interactions
+                .iter()
+                .enumerate()
+                .map(|(idx, interaction)| {
+                    format!("[{idx}] {}", request_debug_key(&interaction.request))
+                })
+                .collect();
+
+            warn!(
+                cassette_path = %self.cassette_path.display(),
+                request = %incoming_key,
+                recorded_count = recorded_keys.len(),
+                "VCR playback: no matching interaction"
+            );
+
+            let mut message = format!(
+                "No matching interaction found in cassette {}.\nIncoming: {incoming_key}\nRecorded interactions ({}):\n",
+                self.cassette_path.display(),
+                recorded_keys.len()
+            );
+            for key in recorded_keys {
+                message.push_str("  ");
+                message.push_str(&key);
+                message.push('\n');
+            }
+            message.push_str(
+                "Match criteria: method + url + body + body_text (headers ignored). If the request changed, re-record with VCR_MODE=record.",
+            );
+            return Err(Error::config(message));
+        };
+
+        info!(
+            cassette_path = %self.cassette_path.display(),
+            request = %request_debug_key(request),
+            "VCR playback: matched interaction"
+        );
         Ok(interaction.response.clone())
     }
 }
@@ -313,6 +419,45 @@ fn find_interaction<'a>(
         .find(|interaction| request_matches(&interaction.request, request))
 }
 
+fn request_debug_key(request: &RecordedRequest) -> String {
+    use std::fmt::Write as _;
+
+    let method = request.method.to_ascii_uppercase();
+    let mut out = format!("{method} {}", request.url);
+
+    if let Some(body) = &request.body {
+        let body_bytes = serde_json::to_vec(body).unwrap_or_default();
+        let hash = short_sha256(&body_bytes);
+        let _ = write!(out, " body_sha256={hash}");
+    } else {
+        out.push_str(" body_sha256=<none>");
+    }
+
+    if let Some(body_text) = &request.body_text {
+        let hash = short_sha256(body_text.as_bytes());
+        let _ = write!(
+            out,
+            " body_text_sha256={hash} body_text_len={}",
+            body_text.len()
+        );
+    } else {
+        out.push_str(" body_text_sha256=<none>");
+    }
+
+    out
+}
+
+fn short_sha256(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(12);
+    for b in &digest[..6] {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 fn request_matches(recorded: &RecordedRequest, incoming: &RecordedRequest) -> bool {
     if !recorded.method.eq_ignore_ascii_case(&incoming.method) {
         return false;
@@ -320,28 +465,28 @@ fn request_matches(recorded: &RecordedRequest, incoming: &RecordedRequest) -> bo
     if recorded.url != incoming.url {
         return false;
     }
-    if let (Some(lhs), Some(rhs)) = (&recorded.body, &incoming.body) {
-        if lhs != rhs {
-            return false;
-        }
+    if recorded.body != incoming.body {
+        return false;
     }
-    if let (Some(lhs), Some(rhs)) = (&recorded.body_text, &incoming.body_text) {
-        if lhs != rhs {
-            return false;
-        }
+    if recorded.body_text != incoming.body_text {
+        return false;
     }
     true
 }
 
-pub fn redact_cassette(cassette: &mut Cassette) {
+pub fn redact_cassette(cassette: &mut Cassette) -> RedactionSummary {
     let sensitive_headers = sensitive_header_keys();
+    let mut summary = RedactionSummary::default();
     for interaction in &mut cassette.interactions {
-        redact_headers(&mut interaction.request.headers, &sensitive_headers);
-        redact_headers(&mut interaction.response.headers, &sensitive_headers);
+        summary.headers_redacted +=
+            redact_headers(&mut interaction.request.headers, &sensitive_headers);
+        summary.headers_redacted +=
+            redact_headers(&mut interaction.response.headers, &sensitive_headers);
         if let Some(body) = &mut interaction.request.body {
-            redact_json(body);
+            summary.json_fields_redacted += redact_json(body);
         }
     }
+    summary
 }
 
 fn sensitive_header_keys() -> HashSet<String> {
@@ -358,31 +503,39 @@ fn sensitive_header_keys() -> HashSet<String> {
     .collect()
 }
 
-fn redact_headers(headers: &mut Vec<(String, String)>, sensitive: &HashSet<String>) {
+fn redact_headers(headers: &mut Vec<(String, String)>, sensitive: &HashSet<String>) -> usize {
+    let mut count = 0usize;
     for (name, value) in headers {
         if sensitive.contains(&name.to_ascii_lowercase()) {
+            count += 1;
             *value = REDACTED.to_string();
         }
     }
+    count
 }
 
-fn redact_json(value: &mut Value) {
+fn redact_json(value: &mut Value) -> usize {
     match value {
         Value::Object(map) => {
+            let mut count = 0usize;
             for (key, entry) in map.iter_mut() {
                 if is_sensitive_key(key) {
                     *entry = Value::String(REDACTED.to_string());
+                    count += 1;
                 } else {
-                    redact_json(entry);
+                    count += redact_json(entry);
                 }
             }
+            count
         }
         Value::Array(items) => {
+            let mut count = 0usize;
             for item in items {
-                redact_json(item);
+                count += redact_json(item);
             }
+            count
         }
-        _ => {}
+        _ => 0usize,
     }
 }
 
@@ -400,6 +553,8 @@ fn is_sensitive_key(key: &str) -> bool {
 mod tests {
     use super::*;
     use std::future::Future;
+
+    type ByteStream = BoxStream<'static, std::result::Result<Vec<u8>, std::io::Error>>;
 
     #[test]
     fn cassette_round_trip() {
@@ -471,13 +626,15 @@ mod tests {
             }],
         };
 
-        redact_cassette(&mut cassette);
+        let summary = redact_cassette(&mut cassette);
 
         let request = &cassette.interactions[0].request;
         assert_eq!(request.headers[0].1, REDACTED);
         let body = request.body.as_ref().expect("body exists");
         assert_eq!(body["api_key"], REDACTED);
         assert_eq!(body["nested"]["token"], REDACTED);
+        assert_eq!(summary.headers_redacted, 2);
+        assert_eq!(summary.json_fields_redacted, 2);
     }
 
     #[test]
@@ -523,19 +680,15 @@ mod tests {
         assert_eq!(recorded.status, 200);
         assert_eq!(recorded.body_chunks.len(), 1);
 
-        let playback = run_async({
-            let cassette_dir = cassette_dir;
-            let request = request;
-            async move {
-                let recorder =
-                    VcrRecorder::new_with("record_playback", VcrMode::Playback, &cassette_dir);
-                recorder
-                    .request_streaming_with(request, || async {
-                        Err(Error::config("Unexpected record in playback mode"))
-                    })
-                    .await
-                    .expect("playback")
-            }
+        let playback = run_async(async move {
+            let recorder =
+                VcrRecorder::new_with("record_playback", VcrMode::Playback, &cassette_dir);
+            recorder
+                .request_streaming_with::<_, _, ByteStream>(request, || async {
+                    Err(Error::config("Unexpected record in playback mode"))
+                })
+                .await
+                .expect("playback")
         });
 
         assert_eq!(playback.body_chunks.len(), 1);
