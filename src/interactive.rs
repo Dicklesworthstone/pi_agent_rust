@@ -333,7 +333,7 @@ struct AutocompleteState {
 }
 
 impl AutocompleteState {
-    fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
+    const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
         Self {
             provider: AutocompleteProvider::new(cwd, catalog),
             open: false,
@@ -379,7 +379,7 @@ impl AutocompleteState {
     }
 
     /// Returns the scroll offset for the dropdown view.
-    fn scroll_offset(&self) -> usize {
+    const fn scroll_offset(&self) -> usize {
         if self.selected < self.max_visible {
             0
         } else {
@@ -1663,6 +1663,7 @@ impl PiApp {
     /// Open external editor with current input text.
     ///
     /// Uses $VISUAL if set, otherwise $EDITOR, otherwise "vi".
+    /// Supports editors with arguments like "code --wait" or "vim -u NONE".
     fn open_external_editor(&self) -> std::io::Result<String> {
         use std::io::Write;
 
@@ -1679,9 +1680,18 @@ impl PiApp {
 
         let temp_path = temp_file.path().to_path_buf();
 
-        // Spawn editor and wait for it to exit
-        let status = std::process::Command::new(&editor)
+        // Spawn editor via shell to handle EDITOR with arguments (e.g., "code --wait")
+        // The shell properly handles quoting, arguments, and PATH lookup
+        #[cfg(unix)]
+        let status = std::process::Command::new("sh")
+            .args(["-c", &format!("{editor} \"$1\"")])
+            .arg("--") // separator for positional args
             .arg(&temp_path)
+            .status()?;
+
+        #[cfg(not(unix))]
+        let status = std::process::Command::new("cmd")
+            .args(["/c", &format!("{} \"{}\"", editor, temp_path.display())])
             .status()?;
 
         if !status.success() {
@@ -1835,10 +1845,10 @@ impl PiApp {
                 #[cfg(unix)]
                 {
                     use std::process::Command;
-                    // Send SIGTSTP to our process group
-                    let _ = Command::new("kill")
-                        .args(["-TSTP", &std::process::id().to_string()])
-                        .status();
+                    // Send SIGTSTP to our process. When resumed via `fg`, status() returns
+                    // and we show the resumed message.
+                    let pid = std::process::id().to_string();
+                    let _ = Command::new("kill").args(["-TSTP", &pid]).status();
                     self.status_message = Some("Resumed from background".to_string());
                 }
                 #[cfg(not(unix))]
@@ -3497,7 +3507,7 @@ impl PiApp {
             InputMode::MultiLine => "Esc: single-line",
         };
         let footer = format!(
-            "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Esc: quit"
+            "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
         );
         format!("\n  {}\n", style.render(&footer))
     }
@@ -3666,7 +3676,7 @@ impl PiApp {
             let _ = write!(
                 output,
                 "\n  {}",
-                border_style.render(&format!("│{shown:^width$}│", width = width))
+                border_style.render(&format!("│{shown:^width$}│"))
             );
         }
 
