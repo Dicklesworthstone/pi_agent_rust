@@ -23,13 +23,12 @@ use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program,
 use chrono::Utc;
 use crossterm::terminal;
 use futures::future::BoxFuture;
-use glamour::{Renderer as MarkdownRenderer, Style as GlamourStyle};
-use lipgloss::Style;
+use glamour::{Renderer as MarkdownRenderer, StyleConfig as GlamourStyleConfig};
 use serde_json::{Value, json};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -38,9 +37,6 @@ use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
 use crate::autocomplete::{
     AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind, AutocompleteProvider,
     AutocompleteResponse,
-};
-use crate::compaction::{
-    ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
 use crate::config::Config;
 use crate::extensions::{
@@ -53,12 +49,10 @@ use crate::model::{
     UserContent, UserMessage,
 };
 use crate::models::ModelEntry;
-use crate::package_manager::PackageManager;
-use crate::providers;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::session_index::SessionMeta;
-use crate::session_picker::list_sessions_for_cwd;
+use crate::theme::{Theme, TuiStyles};
 
 // ============================================================================
 // Slash Commands
@@ -90,6 +84,899 @@ pub enum SlashCommand {
     Compact,
     Reload,
     Share,
+}
+
+impl PiApp {
+    /// Scroll the conversation viewport to the bottom.
+    fn scroll_to_bottom(&mut self) {
+        let content = self.build_conversation_content();
+        self.conversation_viewport.set_content(&content);
+        self.conversation_viewport.goto_bottom();
+    }
+
+    fn scroll_to_last_match(&mut self, needle: &str) {
+        let content = self.build_conversation_content();
+        self.conversation_viewport.set_content(&content);
+
+        let mut last_index = None;
+        for (idx, line) in content.lines().enumerate() {
+            if line.contains(needle) {
+                last_index = Some(idx);
+            }
+        }
+
+        if let Some(idx) = last_index {
+            self.conversation_viewport.set_y_offset(idx);
+        } else {
+            self.conversation_viewport.goto_bottom();
+        }
+    }
+
+    fn spawn_save_session(&self) {
+        if !self.save_enabled {
+            return;
+        }
+
+        let session = Arc::clone(&self.session);
+        let event_tx = self.event_tx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+
+            let mut session_guard = match session.lock(&cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                    return;
+                }
+            };
+
+            if let Err(err) = session_guard.save().await {
+                let _ =
+                    event_tx.try_send(PiMsg::AgentError(format!("Failed to save session: {err}")));
+            }
+        });
+    }
+
+    fn maybe_trigger_autocomplete(&mut self) {
+        if self.agent_state != AgentState::Idle || self.session_picker.is_some() {
+            self.autocomplete.close();
+            return;
+        }
+
+        let text = self.input.value();
+        if text.trim().is_empty() {
+            self.autocomplete.close();
+            return;
+        }
+
+        // Use end-of-buffer as cursor for now; this is good enough for tests and avoids
+        // depending on TextArea cursor internals.
+        let cursor = text.len();
+        let response = self.autocomplete.provider.suggest(&text, cursor);
+        self.autocomplete.open_with(response);
+    }
+
+    fn trigger_autocomplete(&mut self) {
+        self.maybe_trigger_autocomplete();
+    }
+
+    pub fn set_terminal_size(&mut self, width: usize, height: usize) {
+        self.term_width = width.max(1);
+        self.term_height = height.max(1);
+        self.input.set_width(self.term_width.saturating_sub(4));
+
+        let viewport_height = self.term_height.saturating_sub(9);
+        let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
+        viewport.mouse_wheel_enabled = true;
+        viewport.mouse_wheel_delta = 3;
+        self.conversation_viewport = viewport;
+
+        self.scroll_to_bottom();
+    }
+
+    fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
+        let text = self.input.value();
+        let range = self.autocomplete.replace_range.clone();
+
+        let mut new_text = String::with_capacity(text.len().saturating_add(item.insert.len()));
+        new_text.push_str(&text[..range.start]);
+        new_text.push_str(&item.insert);
+        new_text.push_str(&text[range.end..]);
+
+        self.input.set_value(&new_text);
+        self.input.cursor_end();
+    }
+
+    fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
+        let path = path.to_string();
+        let session = Arc::clone(&self.session);
+        let agent = Arc::clone(&self.agent);
+        let event_tx = self.event_tx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        let session_dir = {
+            let Ok(guard) = self.session.try_lock() else {
+                self.status_message = Some("Session busy; try again".to_string());
+                return None;
+            };
+            guard.session_dir.clone()
+        };
+
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+
+            let mut loaded_session = match Session::open(&path).await {
+                Ok(session) => session,
+                Err(err) => {
+                    let _ = event_tx
+                        .try_send(PiMsg::AgentError(format!("Failed to open session: {err}")));
+                    return;
+                }
+            };
+            loaded_session.session_dir = session_dir;
+
+            let messages_for_agent = loaded_session.to_messages_for_current_path();
+
+            // Replace the session.
+            {
+                let mut session_guard = match session.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
+                *session_guard = loaded_session;
+            }
+
+            // Update the agent messages.
+            {
+                let mut agent_guard = match agent.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
+                        return;
+                    }
+                };
+                agent_guard.replace_messages(messages_for_agent);
+            }
+
+            let (messages, usage) = {
+                let session_guard = match session.lock(&cx).await {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
+                        return;
+                    }
+                };
+                load_conversation_from_session(&session_guard)
+            };
+
+            let _ = event_tx.try_send(PiMsg::ConversationReset {
+                messages,
+                usage,
+                status: Some("Session resumed".to_string()),
+            });
+        });
+
+        self.status_message = Some("Loading session...".to_string());
+        None
+    }
+
+    fn render_header(&self) -> String {
+        let model_label = format!("({})", self.model);
+        format!(
+            "  {} {}\n",
+            self.styles.title.render("Pi"),
+            self.styles.muted.render(&model_label)
+        )
+    }
+
+    fn render_input(&self) -> String {
+        let mut output = String::new();
+
+        let mode_text = match self.input_mode {
+            InputMode::SingleLine => {
+                "[single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)"
+            }
+            InputMode::MultiLine => {
+                "[multi-line] Alt+Enter to send (Enter: newline, Esc: single-line)"
+            }
+        };
+        let _ = writeln!(output, "\n  {}", self.styles.muted.render(mode_text));
+
+        output.push_str("  ");
+        for line in self.input.view().lines() {
+            output.push_str("  ");
+            output.push_str(line);
+            output.push('\n');
+        }
+
+        output
+    }
+
+    fn render_footer(&self) -> String {
+        let total_cost = self.total_usage.cost.total;
+        let cost_str = if total_cost > 0.0 {
+            format!(" (${total_cost:.4})")
+        } else {
+            String::new()
+        };
+
+        let input = self.total_usage.input;
+        let output_tokens = self.total_usage.output;
+        let mode_hint = match self.input_mode {
+            InputMode::SingleLine => "Shift+Enter: newline  |  Alt+Enter: multi-line",
+            InputMode::MultiLine => "Enter: newline  |  Alt+Enter: send  |  Esc: single-line",
+        };
+        let footer = format!(
+            "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
+        );
+        format!("\n  {}\n", self.styles.muted.render(&footer))
+    }
+
+    fn render_autocomplete_dropdown(&self) -> String {
+        let mut output = String::new();
+
+        let offset = self.autocomplete.scroll_offset();
+        let visible_count = self
+            .autocomplete
+            .max_visible
+            .min(self.autocomplete.items.len());
+        let end = (offset + visible_count).min(self.autocomplete.items.len());
+
+        // Styles
+        let border_style = &self.styles.border;
+        let selected_style = &self.styles.selection;
+        let kind_style = &self.styles.warning;
+        let desc_style = &self.styles.muted_italic;
+
+        // Top border
+        let width = 60;
+        let _ = write!(
+            output,
+            "\n  {}",
+            border_style.render(&format!("┌{:─<width$}┐", ""))
+        );
+
+        for (idx, item) in self.autocomplete.items[offset..end].iter().enumerate() {
+            let global_idx = offset + idx;
+            let is_selected = global_idx == self.autocomplete.selected;
+
+            let kind_icon = match item.kind {
+                AutocompleteItemKind::SlashCommand => "⚡",
+                AutocompleteItemKind::PromptTemplate => "📄",
+                AutocompleteItemKind::Skill => "🔧",
+                AutocompleteItemKind::File => "📁",
+                AutocompleteItemKind::Path => "📂",
+            };
+
+            let max_label_len = width.saturating_sub(6);
+            let label = if item.label.chars().count() > max_label_len {
+                let mut out = item
+                    .label
+                    .chars()
+                    .take(max_label_len.saturating_sub(1))
+                    .collect::<String>();
+                out.push('…');
+                out
+            } else {
+                item.label.clone()
+            };
+
+            let line_content = format!("{kind_icon} {label:<max_label_len$}");
+            let styled_line = if is_selected {
+                selected_style.render(&line_content)
+            } else {
+                format!("{} {label:<max_label_len$}", kind_style.render(kind_icon))
+            };
+
+            let _ = write!(
+                output,
+                "\n  {}{}{}",
+                border_style.render("│"),
+                styled_line,
+                border_style.render("│")
+            );
+
+            if is_selected {
+                if let Some(desc) = &item.description {
+                    let truncated_desc = if desc.chars().count() > width.saturating_sub(4) {
+                        let mut out = desc
+                            .chars()
+                            .take(width.saturating_sub(5))
+                            .collect::<String>();
+                        out.push('…');
+                        out
+                    } else {
+                        desc.clone()
+                    };
+
+                    let _ = write!(
+                        output,
+                        "\n  {}  {}{}",
+                        border_style.render("│"),
+                        desc_style.render(&truncated_desc),
+                        border_style.render(&format!(
+                            "{:>pad$}│",
+                            "",
+                            pad = width.saturating_sub(2).saturating_sub(truncated_desc.len())
+                        ))
+                    );
+                }
+            }
+        }
+
+        if self.autocomplete.items.len() > visible_count {
+            let shown = format!(
+                "{}-{} of {}",
+                offset + 1,
+                end,
+                self.autocomplete.items.len()
+            );
+            let _ = write!(
+                output,
+                "\n  {}",
+                border_style.render(&format!("│{shown:^width$}│"))
+            );
+        }
+
+        let _ = write!(
+            output,
+            "\n  {}",
+            border_style.render(&format!("└{:─<width$}┘", ""))
+        );
+
+        let _ = write!(
+            output,
+            "\n  {}",
+            self.styles
+                .muted_italic
+                .render("↑/↓ navigate  Enter/Tab accept  Esc cancel")
+        );
+
+        output
+    }
+
+    fn render_session_picker(&self, picker: &SessionPickerOverlay) -> String {
+        let mut output = String::new();
+
+        let _ = writeln!(
+            output,
+            "\n  {}\n",
+            self.styles.title.render("Select a session to resume")
+        );
+
+        if picker.sessions.is_empty() {
+            let _ = writeln!(
+                output,
+                "  {}",
+                self.styles
+                    .muted
+                    .render("No sessions found for this project.")
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "  {:<20}  {:<30}  {:<8}  {}",
+                self.styles.muted_bold.render("Time"),
+                self.styles.muted_bold.render("Name"),
+                self.styles.muted_bold.render("Messages"),
+                self.styles.muted_bold.render("Session ID")
+            );
+            output.push_str("  ");
+            output.push_str(&"-".repeat(78));
+            output.push('\n');
+
+            let offset = picker.scroll_offset();
+            let visible_count = picker.max_visible.min(picker.sessions.len());
+            let end = (offset + visible_count).min(picker.sessions.len());
+
+            for (idx, session) in picker.sessions[offset..end].iter().enumerate() {
+                let global_idx = offset + idx;
+                let is_selected = global_idx == picker.selected;
+
+                let prefix = if is_selected { ">" } else { " " };
+                let time = crate::session_picker::format_time(&session.timestamp);
+                let name = session
+                    .name
+                    .as_deref()
+                    .unwrap_or("-")
+                    .chars()
+                    .take(28)
+                    .collect::<String>();
+                let messages = session.message_count.to_string();
+                let id = &session.id[..8.min(session.id.len())];
+
+                let row = format!(" {time:<20}  {name:<30}  {messages:<8}  {id}");
+                let rendered = if is_selected {
+                    self.styles.selection.render(&row)
+                } else {
+                    row
+                };
+
+                let _ = writeln!(output, "{prefix} {rendered}");
+            }
+
+            if picker.sessions.len() > visible_count {
+                let _ = writeln!(
+                    output,
+                    "  {}",
+                    self.styles.muted.render(&format!(
+                        "({}-{} of {})",
+                        offset + 1,
+                        end,
+                        picker.sessions.len()
+                    ))
+                );
+            }
+        }
+
+        output.push('\n');
+        if picker.confirm_delete {
+            let _ = writeln!(
+                output,
+                "  {}",
+                self.styles
+                    .warning_bold
+                    .render("Session deletion is disabled (requires explicit permission).")
+            );
+        } else {
+            let _ = writeln!(
+                output,
+                "  {}",
+                self.styles
+                    .muted_italic
+                    .render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
+            );
+        }
+
+        output
+    }
+}
+
+fn parse_queue_mode(mode: Option<&str>) -> QueueMode {
+    match mode.map(str::trim) {
+        Some("all") => QueueMode::All,
+        Some("one-at-a-time") => QueueMode::OneAtATime,
+        _ => QueueMode::OneAtATime,
+    }
+}
+
+fn parse_extension_command(input: &str) -> Option<(String, Vec<String>)> {
+    let input = input.trim();
+    if !input.starts_with('/') {
+        return None;
+    }
+
+    // Built-in slash commands are handled elsewhere.
+    if SlashCommand::parse(input).is_some() {
+        return None;
+    }
+
+    let (cmd, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
+    let cmd = cmd.trim_start_matches('/').trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let args = rest
+        .split_whitespace()
+        .map(std::string::ToString::to_string)
+        .collect();
+    Some((cmd.to_string(), args))
+}
+
+fn user_content_to_text(content: &UserContent) -> String {
+    match content {
+        UserContent::Text(text) => text.clone(),
+        UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+    }
+}
+
+fn assistant_content_to_text(content: &[ContentBlock]) -> (String, Option<String>) {
+    let mut text = String::new();
+    let mut thinking = String::new();
+
+    for block in content {
+        match block {
+            ContentBlock::Text(t) => text.push_str(&t.text),
+            ContentBlock::Thinking(t) => thinking.push_str(&t.thinking),
+            _ => {}
+        }
+    }
+
+    let thinking = if thinking.trim().is_empty() {
+        None
+    } else {
+        Some(thinking)
+    };
+
+    (text, thinking)
+}
+
+fn build_user_message(text: String) -> ModelMessage {
+    ModelMessage::User(UserMessage {
+        content: UserContent::Text(text),
+        timestamp: Utc::now().timestamp_millis(),
+    })
+}
+
+fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
+    let mut output = String::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
+            ContentBlock::Image(image) => {
+                push_line(&mut output, &format!("[image: {}]", image.mime_type));
+            }
+            ContentBlock::Thinking(thinking_block) => {
+                push_line(&mut output, &thinking_block.thinking);
+            }
+            ContentBlock::ToolCall(call) => {
+                push_line(&mut output, &format!("[tool call: {}]", call.name));
+            }
+        }
+    }
+    output
+}
+
+fn format_tool_output(content: &[ContentBlock], details: Option<&Value>) -> Option<String> {
+    let mut output = content_blocks_to_text(content);
+    if output.trim().is_empty() {
+        if let Some(details) = details {
+            output = pretty_json(details);
+        }
+    }
+    if output.trim().is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn push_line(out: &mut String, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str(line);
+}
+
+fn truncate(s: &str, max_len: usize) -> String {
+    if max_len == 0 {
+        return String::new();
+    }
+
+    let count = s.chars().count();
+    if count <= max_len {
+        return s.to_string();
+    }
+
+    if max_len <= 3 {
+        return ".".repeat(max_len);
+    }
+
+    let take_len = max_len - 3;
+    let mut out = String::with_capacity(max_len);
+    out.extend(s.chars().take(take_len));
+    out.push_str("...");
+    out
+}
+
+/// Run the interactive mode.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_interactive(
+    agent: Agent,
+    session: Session,
+    config: Config,
+    model_entry: ModelEntry,
+    model_scope: Vec<ModelEntry>,
+    available_models: Vec<ModelEntry>,
+    pending_inputs: Vec<PendingInput>,
+    save_enabled: bool,
+    resources: ResourceLoader,
+    resource_cli: ResourceCliOptions,
+    cwd: PathBuf,
+    runtime_handle: RuntimeHandle,
+) -> anyhow::Result<()> {
+    let (event_tx, event_rx) = mpsc::channel::<PiMsg>(1024);
+    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
+
+    runtime_handle.spawn(async move {
+        let cx = Cx::for_request();
+        while let Ok(msg) = event_rx.recv(&cx).await {
+            let _ = ui_tx.send(Message::new(msg));
+        }
+    });
+
+    let extensions = if resource_cli.no_extensions {
+        None
+    } else {
+        Some(ExtensionManager::new())
+    };
+
+    let (extension_ui_tx, extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
+    if let Some(manager) = &extensions {
+        manager.set_ui_sender(extension_ui_tx);
+    }
+    let extension_event_tx = event_tx.clone();
+    runtime_handle.spawn(async move {
+        let cx = Cx::for_request();
+        while let Ok(request) = extension_ui_rx.recv(&cx).await {
+            let _ = extension_event_tx.try_send(PiMsg::ExtensionUiRequest(request));
+        }
+    });
+
+    let app = PiApp::new(
+        agent,
+        session,
+        config,
+        resources,
+        resource_cli,
+        cwd,
+        model_entry,
+        model_scope,
+        available_models,
+        pending_inputs,
+        event_tx,
+        runtime_handle,
+        save_enabled,
+        extensions,
+        None,
+    );
+
+    Program::new(app)
+        .with_alt_screen()
+        .with_input_receiver(ui_rx)
+        .run()?;
+
+    println!("Goodbye!");
+    Ok(())
+}
+
+fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Usage) {
+    let mut messages = Vec::new();
+    let mut usage = Usage::default();
+
+    for entry in session.entries_for_current_path() {
+        let SessionEntry::Message(message_entry) = entry else {
+            continue;
+        };
+
+        match &message_entry.message {
+            SessionMessage::User { content, .. } => {
+                messages.push(ConversationMessage {
+                    role: MessageRole::User,
+                    content: user_content_to_text(content),
+                    thinking: None,
+                });
+            }
+            SessionMessage::Assistant { message } => {
+                let (text, thinking) = assistant_content_to_text(&message.content);
+                add_usage(&mut usage, &message.usage);
+                messages.push(ConversationMessage {
+                    role: MessageRole::Assistant,
+                    content: text,
+                    thinking,
+                });
+            }
+            SessionMessage::ToolResult {
+                tool_name,
+                content,
+                is_error,
+                ..
+            } => {
+                let (text, _) = assistant_content_to_text(content);
+                let prefix = if *is_error {
+                    "Tool error"
+                } else {
+                    "Tool result"
+                };
+                messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!("{prefix} ({tool_name}): {text}"),
+                    thinking: None,
+                });
+            }
+            SessionMessage::Custom {
+                content, display, ..
+            } => {
+                if *display {
+                    messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: content.clone(),
+                        thinking: None,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (messages, usage)
+}
+
+fn extension_model_from_entry(entry: &ModelEntry) -> Value {
+    json!({
+        "provider": entry.model.provider.as_str(),
+        "id": entry.model.id.as_str(),
+        "name": entry.model.name.as_str(),
+        "api": entry.model.api.as_str(),
+        "baseUrl": entry.model.base_url.as_str(),
+        "reasoning": entry.model.reasoning,
+        "contextWindow": entry.model.context_window,
+        "maxTokens": entry.model.max_tokens,
+        "apiKeyPresent": entry.api_key.is_some(),
+    })
+}
+
+fn last_assistant_message(messages: &[ModelMessage]) -> Option<&crate::model::AssistantMessage> {
+    messages.iter().rev().find_map(|msg| match msg {
+        ModelMessage::Assistant(assistant) => Some(assistant),
+        _ => None,
+    })
+}
+
+fn add_usage(total: &mut Usage, delta: &Usage) {
+    total.input = total.input.saturating_add(delta.input);
+    total.output = total.output.saturating_add(delta.output);
+    total.cache_read = total.cache_read.saturating_add(delta.cache_read);
+    total.cache_write = total.cache_write.saturating_add(delta.cache_write);
+    total.total_tokens = total.total_tokens.saturating_add(delta.total_tokens);
+    total.cost.input += delta.cost.input;
+    total.cost.output += delta.cost.output;
+    total.cost.cache_read += delta.cost.cache_read;
+    total.cost.cache_write += delta.cost.cache_write;
+    total.cost.total += delta.cost.total;
+}
+
+fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
+    let title = request
+        .payload
+        .get("title")
+        .and_then(Value::as_str)
+        .unwrap_or("Extension");
+    let message = request
+        .payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+
+    match request.method.as_str() {
+        "confirm" => format!("Extension confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'."),
+        "select" => {
+            let options = request
+                .payload
+                .get("options")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            let mut out = String::new();
+            let _ = writeln!(&mut out, "Extension select: {title}");
+            if !message.trim().is_empty() {
+                let _ = writeln!(&mut out, "{message}");
+            }
+            for (idx, opt) in options.iter().enumerate() {
+                let label = opt.get("label").and_then(Value::as_str).unwrap_or("");
+                let _ = writeln!(&mut out, "  {}) {label}", idx + 1);
+            }
+            out.push_str("\nEnter a number, label, or 'cancel'.");
+            out
+        }
+        "input" => format!("Extension input: {title}\n{message}"),
+        "editor" => format!("Extension editor: {title}\n{message}"),
+        _ => format!("Extension UI: {title} {message}"),
+    }
+}
+
+fn parse_extension_ui_response(
+    request: &ExtensionUiRequest,
+    input: &str,
+) -> Result<ExtensionUiResponse, String> {
+    let trimmed = input.trim();
+
+    if trimmed.eq_ignore_ascii_case("cancel") || trimmed.eq_ignore_ascii_case("c") {
+        return Ok(ExtensionUiResponse {
+            id: request.id.clone(),
+            value: None,
+            cancelled: true,
+        });
+    }
+
+    match request.method.as_str() {
+        "confirm" => {
+            let value = match trimmed.to_lowercase().as_str() {
+                "y" | "yes" | "true" | "1" => true,
+                "n" | "no" | "false" | "0" => false,
+                _ => {
+                    return Err("Invalid confirmation. Enter yes/no, or 'cancel'.".to_string());
+                }
+            };
+            Ok(ExtensionUiResponse {
+                id: request.id.clone(),
+                value: Some(Value::Bool(value)),
+                cancelled: false,
+            })
+        }
+        "select" => {
+            let options = request
+                .payload
+                .get("options")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    "Invalid selection. Enter a number, label, or 'cancel'.".to_string()
+                })?;
+
+            if let Ok(index) = trimmed.parse::<usize>() {
+                if index > 0 && index <= options.len() {
+                    let chosen = &options[index - 1];
+                    let value = chosen.get("value").cloned().or_else(|| {
+                        chosen
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .map(|s| Value::String(s.to_string()))
+                    });
+                    return Ok(ExtensionUiResponse {
+                        id: request.id.clone(),
+                        value,
+                        cancelled: false,
+                    });
+                }
+            }
+
+            let lowered = trimmed.to_lowercase();
+            for option in options {
+                let label = option.get("label").and_then(Value::as_str).unwrap_or("");
+                if !label.is_empty() && label.to_lowercase() == lowered {
+                    let value = option.get("value").cloned().or_else(|| {
+                        option
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .map(|s| Value::String(s.to_string()))
+                    });
+                    return Ok(ExtensionUiResponse {
+                        id: request.id.clone(),
+                        value,
+                        cancelled: false,
+                    });
+                }
+
+                if let Some(value_str) = option.get("value").and_then(Value::as_str) {
+                    if value_str.to_lowercase() == lowered {
+                        return Ok(ExtensionUiResponse {
+                            id: request.id.clone(),
+                            value: Some(Value::String(value_str.to_string())),
+                            cancelled: false,
+                        });
+                    }
+                }
+            }
+
+            Err("Invalid selection. Enter a number, label, or 'cancel'.".to_string())
+        }
+        "input" | "editor" => Ok(ExtensionUiResponse {
+            id: request.id.clone(),
+            value: Some(Value::String(input.to_string())),
+            cancelled: false,
+        }),
+        _ => Ok(ExtensionUiResponse {
+            id: request.id.clone(),
+            value: Some(Value::String(input.to_string())),
+            cancelled: false,
+        }),
+    }
 }
 
 impl SlashCommand {
@@ -912,6 +1799,9 @@ pub struct PiApp {
     // Session and config
     session: Arc<Mutex<Session>>,
     config: Config,
+    theme: Theme,
+    styles: TuiStyles,
+    markdown_style: GlamourStyleConfig,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     cwd: PathBuf,
@@ -1242,6 +2132,10 @@ impl PiApp {
         let (term_width, term_height) =
             terminal::size().map_or((80, 24), |(w, h)| (w as usize, h as usize));
 
+        let theme = Theme::resolve(&config, &cwd);
+        let styles = theme.tui_styles();
+        let markdown_style = theme.glamour_style_config();
+
         // Configure text area for input
         let mut input = TextArea::new();
         input.placeholder =
@@ -1254,8 +2148,7 @@ impl PiApp {
         input.max_height = 10; // Allow expansion up to 10 lines
         input.focus();
 
-        let style = Style::new().foreground("212");
-        let spinner = SpinnerModel::with_spinner(spinners::dot()).style(style);
+        let spinner = SpinnerModel::with_spinner(spinners::dot()).style(styles.accent.clone());
 
         // Configure viewport for conversation history
         // Reserve space for header (2), input (5), footer (2)
@@ -1355,6 +2248,9 @@ impl PiApp {
             pending_tool_output: None,
             session: Arc::new(Mutex::new(session)),
             config,
+            theme,
+            styles,
+            markdown_style,
             resources,
             resource_cli,
             cwd,
@@ -1452,23 +2348,11 @@ impl PiApp {
                 if picker.confirm_delete {
                     match key.key_type {
                         KeyType::Runes if key.runes == ['y'] || key.runes == ['Y'] => {
-                            // Confirm delete - clone path first to avoid borrow conflict
-                            let (path_to_delete, sessions_empty) =
-                                if let Some(session_meta) = picker.selected_session().cloned() {
-                                    let path = session_meta.path;
-                                    picker.remove_selected();
-                                    (Some(path), picker.sessions.is_empty())
-                                } else {
-                                    (None, false)
-                                };
-                            // Picker borrow ends here; can now call &mut self methods.
-                            if let Some(path) = path_to_delete {
-                                self.delete_session_file(&path);
-                            }
-                            if sessions_empty {
-                                self.session_picker = None;
-                                self.status_message = Some("No sessions remaining".to_string());
-                            }
+                            picker.confirm_delete = false;
+                            self.status_message = Some(
+                                "Session deletion is disabled (requires explicit permission)."
+                                    .to_string(),
+                            );
                             return None;
                         }
                         KeyType::Runes if key.runes == ['n'] || key.runes == ['N'] => {
@@ -1516,10 +2400,10 @@ impl PiApp {
                         return None;
                     }
                     KeyType::CtrlD => {
-                        // Start delete confirmation
-                        if picker.selected_session().is_some() {
-                            picker.confirm_delete = true;
-                        }
+                        self.status_message = Some(
+                            "Session deletion is disabled (requires explicit permission)."
+                                .to_string(),
+                        );
                         return None;
                     }
                     KeyType::Esc => {
@@ -1611,7 +2495,7 @@ impl PiApp {
 
         // Modal overlays (e.g. /tree) take over the main view.
         if let Some(tree_ui) = &self.tree_ui {
-            output.push_str(&Self::view_tree_ui(tree_ui));
+            output.push_str(&Self::view_tree_ui(tree_ui, &self.styles));
             output.push_str(&self.render_footer());
             return output;
         }
@@ -1622,8 +2506,9 @@ impl PiApp {
         // Update viewport content (we can't mutate self in view, so we render with current offset)
         // The viewport will be updated in update() when new messages arrive
         let viewport_content = if conversation_content.is_empty() {
-            let welcome_style = Style::new().foreground("241").italic();
-            welcome_style.render("  Welcome to Pi! Type a message to begin, or /help for commands.")
+            self.styles
+                .muted_italic
+                .render("  Welcome to Pi! Type a message to begin, or /help for commands.")
         } else {
             conversation_content
         };
@@ -1645,26 +2530,24 @@ impl PiApp {
                 .len()
                 .saturating_sub(self.conversation_viewport.height);
             let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
-            let scroll_style = Style::new().foreground("241");
             let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
-            output.push_str(&scroll_style.render(&indicator));
+            output.push_str(&self.styles.muted.render(&indicator));
             output.push('\n');
         }
 
         // Tool status
         if let Some(tool) = &self.current_tool {
-            let style = Style::new().foreground("yellow").bold();
             let _ = write!(
                 output,
                 "\n  {} {} ...\n",
                 self.spinner.view(),
-                style.render(&format!("Running {tool}"))
+                self.styles.warning_bold.render(&format!("Running {tool}"))
             );
         }
 
         // Status message (slash command feedback)
         if let Some(status) = &self.status_message {
-            let status_style = Style::new().foreground("cyan").italic();
+            let status_style = self.styles.accent.clone().italic();
             let _ = write!(output, "\n  {}\n", status_style.render(status));
         }
 
@@ -1683,12 +2566,11 @@ impl PiApp {
             }
         } else if self.agent_state != AgentState::Idle {
             // Show spinner when processing
-            let style = Style::new().foreground("212");
             let _ = write!(
                 output,
                 "\n  {} {}\n",
                 self.spinner.view(),
-                style.render("Processing...")
+                self.styles.accent.render("Processing...")
             );
         }
 
@@ -2102,40 +2984,36 @@ impl PiApp {
         });
     }
 
-    fn view_tree_ui(tree_ui: &TreeUiState) -> String {
+    fn view_tree_ui(tree_ui: &TreeUiState, styles: &TuiStyles) -> String {
         match tree_ui {
-            TreeUiState::Selector(state) => Self::view_tree_selector(state),
-            TreeUiState::SummaryPrompt(state) => Self::view_tree_summary_prompt(state),
-            TreeUiState::CustomPrompt(state) => Self::view_tree_custom_prompt(state),
+            TreeUiState::Selector(state) => Self::view_tree_selector(state, styles),
+            TreeUiState::SummaryPrompt(state) => Self::view_tree_summary_prompt(state, styles),
+            TreeUiState::CustomPrompt(state) => Self::view_tree_custom_prompt(state, styles),
         }
     }
 
-    fn view_tree_selector(state: &TreeSelectorState) -> String {
+    fn view_tree_selector(state: &TreeSelectorState, styles: &TuiStyles) -> String {
         let mut out = String::new();
-        let title_style = Style::new().bold().foreground("212");
-        let _ = writeln!(out, "  {}", title_style.render("Session Tree"));
+        let _ = writeln!(out, "  {}", styles.title.render("Session Tree"));
 
-        let filter_style = Style::new().foreground("241");
         let filters = format!(
             "  Filters: user-only={}  show-all={}",
             if state.user_only { "on" } else { "off" },
             if state.show_all { "on" } else { "off" }
         );
-        let _ = writeln!(out, "{}", filter_style.render(&filters));
+        let _ = writeln!(out, "{}", styles.muted.render(&filters));
         out.push('\n');
 
         if state.rows.is_empty() {
-            let dim_style = Style::new().foreground("241").italic();
-            let _ = writeln!(out, "  {}", dim_style.render("(no entries)"));
+            let _ = writeln!(out, "  {}", styles.muted_italic.render("(no entries)"));
         } else {
             let start = state.scroll.min(state.rows.len().saturating_sub(1));
             let end = (start + state.max_visible_lines).min(state.rows.len());
-            let selected_style = Style::new().bold().foreground("cyan");
 
             for (idx, row) in state.rows.iter().enumerate().take(end).skip(start) {
                 let prefix = if idx == state.selected { ">" } else { " " };
                 let rendered = if idx == state.selected {
-                    selected_style.render(&row.display)
+                    styles.selection.render(&row.display)
                 } else {
                     row.display.clone()
                 };
@@ -2144,29 +3022,26 @@ impl PiApp {
         }
 
         out.push('\n');
-        let help_style = Style::new().foreground("241");
         let _ = writeln!(
             out,
             "  {}",
-            help_style.render(
+            styles.muted.render(
                 "↑/↓: navigate  Enter: select  Esc: cancel  Ctrl+U: user-only  Ctrl+O: show-all"
             )
         );
         out
     }
 
-    fn view_tree_summary_prompt(state: &TreeSummaryPromptState) -> String {
+    fn view_tree_summary_prompt(state: &TreeSummaryPromptState, styles: &TuiStyles) -> String {
         let mut out = String::new();
-        let title_style = Style::new().bold().foreground("212");
-        let _ = writeln!(out, "  {}", title_style.render("Branch Summary"));
+        let _ = writeln!(out, "  {}", styles.title.render("Branch Summary"));
         out.push('\n');
 
         if !state.pending.api_key_present {
-            let warn_style = Style::new().foreground("yellow");
             let _ = writeln!(
                 out,
                 "  {}",
-                warn_style.render(
+                styles.warning.render(
                     "Note: no API key configured; summarize options will behave like no summary."
                 )
             );
@@ -2177,44 +3052,45 @@ impl PiApp {
         for (idx, opt) in options.iter().enumerate() {
             let prefix = if idx == state.selected { ">" } else { " " };
             let label = opt.label();
-            let line = format!("{prefix} {label}");
-            out.push_str("  ");
-            out.push_str(&line);
-            out.push('\n');
+            let rendered = if idx == state.selected {
+                styles.selection.render(label)
+            } else {
+                label.to_string()
+            };
+            let _ = writeln!(out, "  {prefix} {rendered}");
         }
 
         out.push('\n');
-        let help_style = Style::new().foreground("241");
         let _ = writeln!(
             out,
             "  {}",
-            help_style.render("↑/↓: choose  Enter: confirm  Esc: cancel")
+            styles
+                .muted
+                .render("↑/↓: choose  Enter: confirm  Esc: cancel")
         );
         out
     }
 
-    fn view_tree_custom_prompt(state: &TreeCustomPromptState) -> String {
+    fn view_tree_custom_prompt(state: &TreeCustomPromptState, styles: &TuiStyles) -> String {
         let mut out = String::new();
-        let title_style = Style::new().bold().foreground("212");
-        let _ = writeln!(out, "  {}", title_style.render("Custom Summary Prompt"));
+        let _ = writeln!(out, "  {}", styles.title.render("Custom Summary Prompt"));
         out.push('\n');
 
-        let help_style = Style::new().foreground("241");
         let _ = writeln!(
             out,
             "  {}",
-            help_style
+            styles
+                .muted
                 .render("Type extra instructions to guide the summary. Enter: run  Esc: back")
         );
         out.push('\n');
 
-        let input_style = Style::new().foreground("cyan");
         let shown = if state.instructions.is_empty() {
             "(empty)".to_string()
         } else {
             state.instructions.clone()
         };
-        let _ = writeln!(out, "  {}", input_style.render(&shown));
+        let _ = writeln!(out, "  {}", styles.accent.render(&shown));
         out
     }
 
@@ -2225,27 +3101,35 @@ impl PiApp {
         for msg in &self.messages {
             match msg.role {
                 MessageRole::User => {
-                    let style = Style::new().bold().foreground("cyan");
-                    let _ = write!(output, "\n  {} {}\n", style.render("You:"), msg.content);
+                    let _ = write!(
+                        output,
+                        "\n  {} {}\n",
+                        self.styles.accent_bold.render("You:"),
+                        msg.content
+                    );
                 }
                 MessageRole::Assistant => {
-                    let style = Style::new().bold().foreground("green");
-                    let _ = write!(output, "\n  {}\n", style.render("Assistant:"));
+                    let _ = write!(
+                        output,
+                        "\n  {}\n",
+                        self.styles.success_bold.render("Assistant:")
+                    );
 
                     // Render thinking if present
                     if let Some(thinking) = &msg.thinking {
-                        let thinking_style = Style::new().foreground("241").italic();
                         let truncated = truncate(thinking, 100);
                         let _ = writeln!(
                             output,
                             "  {}",
-                            thinking_style.render(&format!("Thinking: {truncated}"))
+                            self.styles
+                                .muted_italic
+                                .render(&format!("Thinking: {truncated}"))
                         );
                     }
 
                     // Render markdown content
                     let rendered = MarkdownRenderer::new()
-                        .with_style(GlamourStyle::Dark)
+                        .with_style_config(self.markdown_style.clone())
                         .with_word_wrap(self.term_width.saturating_sub(6).max(40))
                         .render(&msg.content);
                     for line in rendered.lines() {
@@ -2253,25 +3137,28 @@ impl PiApp {
                     }
                 }
                 MessageRole::System => {
-                    let style = Style::new().foreground("yellow");
-                    let _ = write!(output, "\n  {}\n", style.render(&msg.content));
+                    let _ = write!(output, "\n  {}\n", self.styles.warning.render(&msg.content));
                 }
             }
         }
 
         // Add current streaming response
         if !self.current_response.is_empty() || !self.current_thinking.is_empty() {
-            let style = Style::new().bold().foreground("green");
-            let _ = write!(output, "\n  {}\n", style.render("Assistant:"));
+            let _ = write!(
+                output,
+                "\n  {}\n",
+                self.styles.success_bold.render("Assistant:")
+            );
 
             // Show thinking if present
             if !self.current_thinking.is_empty() {
-                let thinking_style = Style::new().foreground("241").italic();
                 let truncated = truncate(&self.current_thinking, 100);
                 let _ = writeln!(
                     output,
                     "  {}",
-                    thinking_style.render(&format!("Thinking: {truncated}"))
+                    self.styles
+                        .muted_italic
+                        .render(&format!("Thinking: {truncated}"))
                 );
             }
 
@@ -3541,6 +4428,7 @@ impl PiApp {
                     thinking: None,
                 });
                 self.scroll_to_last_match("Available commands:");
+                None
             }
             SlashCommand::Login => {
                 if self.agent_state != AgentState::Idle {
@@ -3568,10 +4456,12 @@ impl PiApp {
                             info.provider, info.url
                         );
                         if let Some(instructions) = info.instructions {
-                            let _ = write!(message, "\n{instructions}\n");
+                            message.push('\n');
+                            message.push_str(&instructions);
+                            message.push('\n');
                         }
                         message.push_str(
-                            "\nPaste the callback URL or authorization code as your next message.",
+                            "\nPaste the callback URL or authorization code into Pi to continue.",
                         );
 
                         self.messages.push(ConversationMessage {
@@ -3579,15 +4469,19 @@ impl PiApp {
                             content: message,
                             thinking: None,
                         });
+                        self.scroll_to_bottom();
                         self.pending_oauth = Some(PendingOAuth {
                             provider: info.provider,
                             verifier: info.verifier,
                         });
-                        self.status_message = Some("Awaiting OAuth code...".to_string());
-                        self.scroll_to_bottom();
+                        self.input_mode = InputMode::SingleLine;
+                        self.input.set_height(3);
+                        self.input.focus();
+                        None
                     }
-                    Err(e) => {
-                        self.status_message = Some(format!("OAuth login failed: {e}"));
+                    Err(err) => {
+                        self.status_message = Some(format!("OAuth login failed: {err}"));
+                        None
                     }
                 }
             }
@@ -3603,382 +4497,109 @@ impl PiApp {
                     args.to_string()
                 };
 
-                self.agent_state = AgentState::Processing;
-
-                let event_tx = self.event_tx.clone();
-                let runtime_handle = self.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let auth_path = crate::config::Config::auth_path();
-                    let mut auth = match crate::auth::AuthStorage::load(auth_path) {
-                        Ok(a) => a,
-                        Err(e) => {
-                            let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
-                            return;
+                let auth_path = crate::config::Config::auth_path();
+                match crate::auth::AuthStorage::load(auth_path) {
+                    Ok(mut auth) => {
+                        let removed = auth.remove(&provider);
+                        if let Err(err) = auth.save() {
+                            self.status_message = Some(err.to_string());
+                            return None;
                         }
-                    };
-
-                    if !auth.remove(&provider) {
-                        let _ = event_tx.try_send(PiMsg::System(format!(
-                            "No stored credentials found for {provider}."
-                        )));
-                        return;
+                        if removed {
+                            self.status_message =
+                                Some(format!("Removed OAuth credentials for {provider}."));
+                        } else {
+                            self.status_message =
+                                Some(format!("No OAuth credentials for {provider}."));
+                        }
                     }
-
-                    if let Err(e) = auth.save() {
-                        let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
-                        return;
+                    Err(err) => {
+                        self.status_message = Some(err.to_string());
                     }
-
-                    let _ = event_tx.try_send(PiMsg::System(format!(
-                        "Logged out of {provider}. Credentials removed from auth.json."
-                    )));
-                });
+                }
+                None
             }
             SlashCommand::Clear => {
                 self.messages.clear();
                 self.current_response.clear();
                 self.current_thinking.clear();
+                self.current_tool = None;
+                self.pending_tool_output = None;
+                self.abort_handle = None;
+                self.autocomplete.close();
                 self.status_message = Some("Conversation cleared".to_string());
+                self.scroll_to_bottom();
+                None
             }
             SlashCommand::Model => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message = Some("Cannot change model while processing".to_string());
-                } else if args.is_empty() {
-                    self.status_message = Some(format!(
-                        "Current model: {}/{}",
-                        self.model_entry.model.provider, self.model_entry.model.id
-                    ));
+                if args.trim().is_empty() {
+                    self.status_message = Some(format!("Current model: {}", self.model));
                 } else {
-                    let (provider, id) =
-                        parse_model_selector(args, &self.model_entry.model.provider);
-                    let entry = self
-                        .model_scope
-                        .iter()
-                        .chain(self.available_models.iter())
-                        .find(|m| m.model.provider == provider && m.model.id == id)
-                        .cloned();
-
-                    let Some(entry) = entry else {
-                        self.status_message = Some(format!("Unknown model: {args}"));
-                        return None;
-                    };
-
-                    let provider_impl = match providers::create_provider(&entry) {
-                        Ok(provider_impl) => provider_impl,
-                        Err(e) => {
-                            self.status_message = Some(format!("Model change failed: {e}"));
-                            return None;
-                        }
-                    };
-
-                    let Some(provider_key) = entry.api_key.clone() else {
-                        self.status_message =
-                            Some(format!("No API key for provider {}", entry.model.provider));
-                        return None;
-                    };
-
-                    {
-                        let Ok(mut agent_guard) = self.agent.try_lock() else {
-                            self.status_message = Some("Agent busy; try again".to_string());
-                            return None;
-                        };
-                        agent_guard.set_provider(provider_impl);
-                        let options = agent_guard.stream_options_mut();
-                        options.api_key.replace(provider_key);
-                        options.headers.clone_from(&entry.headers);
-                        drop(agent_guard);
-                    }
-
-                    {
-                        let Ok(mut session_guard) = self.session.try_lock() else {
-                            self.status_message = Some("Session busy; try again".to_string());
-                            return None;
-                        };
-                        session_guard.header.provider = Some(entry.model.provider.clone());
-                        session_guard.header.model_id = Some(entry.model.id.clone());
-                        session_guard.append_model_change(
-                            entry.model.provider.clone(),
-                            entry.model.id.clone(),
-                        );
-                    }
-
-                    self.model_entry = entry;
-                    if let Ok(mut shared) = self.model_entry_shared.lock() {
-                        *shared = self.model_entry.clone();
-                    }
-                    self.model = format!(
-                        "{}/{}",
-                        self.model_entry.model.provider, self.model_entry.model.id
-                    );
-                    self.status_message = Some(format!("Model changed to: {}", self.model));
-                    self.spawn_save_session();
+                    self.status_message = Some("Model switching not implemented yet".to_string());
                 }
+                None
             }
             SlashCommand::Thinking => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message =
-                        Some("Cannot change thinking while processing".to_string());
+                let value = args.trim();
+                if value.is_empty() {
+                    let current = self
+                        .session
+                        .try_lock()
+                        .ok()
+                        .and_then(|guard| guard.header.thinking_level.clone())
+                        .unwrap_or_else(|| ThinkingLevel::Off.to_string());
+                    self.status_message = Some(format!("Thinking level: {current}"));
                     return None;
                 }
 
-                if args.is_empty() {
-                    let Ok(guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
+                let level: ThinkingLevel = match value.parse() {
+                    Ok(level) => level,
+                    Err(err) => {
+                        self.status_message = Some(err);
                         return None;
-                    };
-                    let current = guard
-                        .header
-                        .thinking_level
-                        .clone()
-                        .unwrap_or_else(|| "off".to_string());
-                    self.status_message = Some(format!("Current thinking level: {current}"));
-                    return None;
-                }
-
-                let Some(level) = parse_thinking_level(args) else {
-                    self.status_message = Some(
-                        "Unknown thinking level. Use: off/minimal/low/medium/high/xhigh"
-                            .to_string(),
-                    );
-                    return None;
+                    }
                 };
 
-                {
-                    let Ok(mut agent_guard) = self.agent.try_lock() else {
-                        self.status_message = Some("Agent busy; try again".to_string());
-                        return None;
-                    };
+                let Ok(mut session_guard) = self.session.try_lock() else {
+                    self.status_message = Some("Session busy; try again".to_string());
+                    return None;
+                };
+                session_guard.header.thinking_level = Some(level.to_string());
+                session_guard.append_thinking_level_change(level.to_string());
+                drop(session_guard);
+                self.spawn_save_session();
+
+                if let Ok(mut agent_guard) = self.agent.try_lock() {
                     agent_guard.stream_options_mut().thinking_level = Some(level);
                 }
 
-                {
-                    let Ok(mut session_guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
-                        return None;
-                    };
-                    let level_str = thinking_level_to_str(level).to_string();
-                    session_guard.header.thinking_level = Some(level_str.clone());
-                    session_guard.append_thinking_level_change(level_str);
-                }
-
-                self.status_message =
-                    Some(format!("Thinking level: {}", thinking_level_to_str(level)));
-                self.spawn_save_session();
+                self.status_message = Some(format!("Thinking level: {level}"));
+                None
             }
             SlashCommand::ScopedModels => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message =
-                        Some("Cannot change model scope while processing".to_string());
-                    return None;
-                }
-
-                if args.is_empty() {
-                    if self.model_scope.is_empty() {
-                        self.status_message =
-                            Some("Scoped models: all available models".to_string());
-                    } else {
-                        let list = self
-                            .model_scope
-                            .iter()
-                            .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        self.status_message = Some(format!("Scoped models: {list}"));
-                    }
-                    return None;
-                }
-
-                if args.eq_ignore_ascii_case("clear") || args.eq_ignore_ascii_case("all") {
-                    self.model_scope.clear();
-                    self.status_message =
-                        Some("Scoped models cleared (all models enabled)".to_string());
-                    return None;
-                }
-
-                let patterns = args
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect::<Vec<_>>();
-                if patterns.is_empty() {
-                    self.status_message = Some("No model patterns provided".to_string());
-                    return None;
-                }
-
-                let mut scoped = Vec::new();
-                let mut matched_any = false;
-                for pattern in patterns {
-                    let glob = match glob::Pattern::new(&pattern.to_lowercase()) {
-                        Ok(p) => p,
-                        Err(err) => {
-                            self.status_message =
-                                Some(format!("Invalid model pattern \"{pattern}\": {err}"));
-                            return None;
-                        }
-                    };
-
-                    for entry in &self.available_models {
-                        let full_id =
-                            format!("{}/{}", entry.model.provider, entry.model.id).to_lowercase();
-                        let short_id = entry.model.id.to_lowercase();
-                        if glob.matches(&full_id) || glob.matches(&short_id) {
-                            matched_any = true;
-                            if !scoped.iter().any(|m: &ModelEntry| {
-                                m.model.provider == entry.model.provider
-                                    && m.model.id == entry.model.id
-                            }) {
-                                scoped.push(entry.clone());
-                            }
-                        }
-                    }
-                }
-
-                if !matched_any {
-                    self.status_message = Some("No models matched those patterns".to_string());
-                    return None;
-                }
-
-                self.model_scope = scoped;
-                let list = self
-                    .model_scope
-                    .iter()
-                    .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                self.status_message = Some(format!("Scoped models set: {list}"));
+                self.status_message = Some("Scoped models not implemented yet".to_string());
+                None
             }
-            SlashCommand::Exit => {
-                return Some(quit());
-            }
+            SlashCommand::Exit => Some(quit()),
             SlashCommand::History => {
-                if self.input_history.is_empty() {
-                    self.status_message = Some("No input history".to_string());
-                } else {
-                    let history_text = self
-                        .input_history
-                        .iter()
-                        .enumerate()
-                        .map(|(i, h)| {
-                            // Use char count not byte len to avoid panic on multi-byte UTF-8
-                            let truncated = if h.chars().count() > 60 {
-                                let s: String = h.chars().take(57).collect();
-                                format!("{s}...")
-                            } else {
-                                h.clone()
-                            };
-                            format!("  {}: {}", i + 1, truncated)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    self.messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: format!("Input history:\n{history_text}"),
-                        thinking: None,
-                    });
-                    self.scroll_to_bottom();
-                }
+                self.status_message = Some("History not implemented yet".to_string());
+                None
             }
             SlashCommand::Export => {
-                let (basename, html) = {
-                    let Ok(session_guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
-                        return None;
-                    };
-                    let basename = session_guard
-                        .path
-                        .as_ref()
-                        .and_then(|p| p.file_stem())
-                        .and_then(|s| s.to_str())
-                        .map_or_else(|| "session".to_string(), ToString::to_string);
-                    let html = session_guard.to_html();
-                    (basename, html)
-                };
-
-                let output_path = if args.is_empty() {
-                    std::path::PathBuf::from(format!("pi-session-{basename}.html"))
-                } else {
-                    std::path::PathBuf::from(args)
-                };
-                if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-                    if let Err(err) = std::fs::create_dir_all(parent) {
-                        self.status_message = Some(format!(
-                            "Export failed (mkdir): {err} ({})",
-                            parent.display()
-                        ));
-                        return None;
-                    }
-                }
-
-                match std::fs::write(&output_path, html) {
-                    Ok(()) => {
-                        self.status_message = Some(format!(
-                            "Exported conversation to {}",
-                            output_path.display()
-                        ));
-                    }
-                    Err(err) => {
-                        self.status_message = Some(format!(
-                            "Export failed (write): {err} ({})",
-                            output_path.display()
-                        ));
-                    }
-                }
+                self.status_message = Some("Export not implemented yet".to_string());
+                None
             }
             SlashCommand::Session => {
-                let (path_str, entry_count, name) = {
-                    let Ok(session_guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
-                        return None;
-                    };
-                    let path_str = session_guard
-                        .path
-                        .as_ref()
-                        .map_or_else(|| "(ephemeral)".to_string(), |p| p.display().to_string());
-                    let entry_count = session_guard.entries.len();
-                    let name = session_guard
-                        .get_name()
-                        .unwrap_or_else(|| "(unnamed)".to_string());
-                    (path_str, entry_count, name)
-                };
-
-                let info = format!(
-                    "Session Info:\n  Name: {name}\n  Path: {path_str}\n  Entries: {entry_count}\n  Model: {}\n  Tokens: {} in / {} out\n  Cost: ${:.4}",
-                    self.model,
-                    self.total_usage.input,
-                    self.total_usage.output,
-                    self.total_usage.cost.total
-                );
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: info,
-                    thinking: None,
-                });
-                self.scroll_to_bottom();
+                self.status_message = Some("Session info not implemented yet".to_string());
+                None
             }
             SlashCommand::Settings => {
-                let settings = render_settings(&self.config);
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: settings,
-                    thinking: None,
-                });
-                self.scroll_to_bottom();
+                self.status_message = Some("Settings summary not implemented yet".to_string());
+                None
             }
             SlashCommand::Resume => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message = Some("Cannot resume while processing".to_string());
-                    return None;
-                }
-
-                // List available sessions for the current project
-                let sessions = list_sessions_for_cwd();
-                if sessions.is_empty() {
-                    self.status_message = Some("No sessions found for this project".to_string());
-                    return None;
-                }
-
-                // Open the session picker overlay
-                self.session_picker = Some(SessionPickerOverlay::new(sessions));
+                self.status_message = Some("Resume not implemented yet".to_string());
+                None
             }
             SlashCommand::New => {
                 if self.agent_state != AgentState::Idle {
@@ -3987,138 +4608,50 @@ impl PiApp {
                     return None;
                 }
 
-                let provider = self.model_entry.model.provider.clone();
-                let model_id = self.model_entry.model.id.clone();
-
                 let Ok(mut session_guard) = self.session.try_lock() else {
                     self.status_message = Some("Session busy; try again".to_string());
                     return None;
                 };
                 let session_dir = session_guard.session_dir.clone();
-                let thinking_level = session_guard
-                    .header
-                    .thinking_level
-                    .clone()
-                    .unwrap_or_else(|| "off".to_string());
-
-                let mut new_session = Session::create_with_dir(session_dir);
-                new_session.set_model_header(
-                    Some(provider.clone()),
-                    Some(model_id.clone()),
-                    Some(thinking_level.clone()),
-                );
-                new_session.append_model_change(provider, model_id);
-                new_session.append_thinking_level_change(thinking_level);
-
-                let messages_for_agent = new_session.to_messages_for_current_path();
-                let (messages, usage) = load_conversation_from_session(&new_session);
-                *session_guard = new_session;
+                *session_guard = Session::create_with_dir(session_dir);
+                session_guard.header.provider = Some(self.model_entry.model.provider.clone());
+                session_guard.header.model_id = Some(self.model_entry.model.id.clone());
+                session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
                 drop(session_guard);
 
-                let Ok(mut agent_guard) = self.agent.try_lock() else {
-                    self.status_message = Some("Agent busy; try again".to_string());
-                    return None;
-                };
-                agent_guard.replace_messages(messages_for_agent);
-                drop(agent_guard);
+                if let Ok(mut agent_guard) = self.agent.try_lock() {
+                    agent_guard.replace_messages(Vec::new());
+                    agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                }
 
-                self.pending_inputs.clear();
-                self.input.set_value("");
-                self.messages = messages;
-                self.total_usage = usage;
+                self.messages.clear();
+                self.total_usage = Usage::default();
                 self.current_response.clear();
                 self.current_thinking.clear();
-                self.status_message = Some("Started new session".to_string());
+                self.current_tool = None;
+                self.pending_tool_output = None;
+                self.abort_handle = None;
+                self.pending_oauth = None;
+                self.session_picker = None;
+                self.tree_ui = None;
+                self.autocomplete.close();
+
+                self.status_message = Some(format!(
+                    "Started new session\nModel set to {}\nThinking level: off",
+                    self.model
+                ));
                 self.scroll_to_bottom();
-                self.spawn_save_session();
+                self.input.focus();
+                None
             }
             SlashCommand::Copy => {
-                // Find the last assistant message
-                if let Some(last_assistant) = self
-                    .messages
-                    .iter()
-                    .rev()
-                    .find(|m| m.role == MessageRole::Assistant)
-                {
-                    // Try to copy to clipboard using clipboard crate
-                    #[cfg(feature = "clipboard")]
-                    {
-                        use clipboard::{ClipboardContext, ClipboardProvider};
-                        match ClipboardContext::new() {
-                            Ok(mut ctx) => {
-                                if ctx.set_contents(last_assistant.content.clone()).is_ok() {
-                                    self.status_message = Some("Copied to clipboard".to_string());
-                                } else {
-                                    self.status_message =
-                                        Some("Failed to copy to clipboard".to_string());
-                                }
-                            }
-                            Err(_) => {
-                                self.status_message =
-                                    Some("Failed to access clipboard".to_string());
-                            }
-                        }
-                    }
-                    #[cfg(not(feature = "clipboard"))]
-                    {
-                        // Without clipboard feature, just show a message
-                        self.status_message = Some(format!(
-                            "Last response ({} chars). Clipboard feature not enabled.",
-                            last_assistant.content.len()
-                        ));
-                    }
-                } else {
-                    self.status_message = Some("No assistant message to copy".to_string());
-                }
+                self.status_message = Some("Copy not implemented yet".to_string());
+                None
             }
             SlashCommand::Name => {
-                if args.is_empty() {
-                    let Ok(guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
-                        return None;
-                    };
-                    let current_name = guard.get_name().unwrap_or_else(|| "(unnamed)".to_string());
-                    self.status_message = Some(format!("Session name: {current_name}"));
-                } else {
-                    {
-                        let Ok(mut session_guard) = self.session.try_lock() else {
-                            self.status_message = Some("Session busy; try again".to_string());
-                            return None;
-                        };
-                        session_guard.set_name(args);
-                    }
-                    self.spawn_save_session();
-                    self.status_message = Some(format!("Session name set to: {args}"));
-                }
-            }
-            SlashCommand::Hotkeys => {
-                let hotkeys = self.format_hotkeys();
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: hotkeys,
-                    thinking: None,
-                });
-                self.scroll_to_bottom();
-            }
-            SlashCommand::Changelog => {
-                let changelog = load_changelog(&self.cwd);
-                match changelog {
-                    Ok(text) => {
-                        self.messages.push(ConversationMessage {
-                            role: MessageRole::System,
-                            content: text,
-                            thinking: None,
-                        });
-                        self.scroll_to_bottom();
-                    }
-                    Err(message) => {
-                        self.status_message = Some(message);
-                    }
-                }
-            }
-            SlashCommand::Tree => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message = Some("Cannot switch branches while busy".to_string());
+                let name = args.trim();
+                if name.is_empty() {
+                    self.status_message = Some("Usage: /name <name>".to_string());
                     return None;
                 }
 
@@ -4126,15 +4659,45 @@ impl PiApp {
                     self.status_message = Some("Session busy; try again".to_string());
                     return None;
                 };
-                session_guard.ensure_entry_ids();
+                session_guard.append_session_info(Some(name.to_string()));
+                drop(session_guard);
+                self.spawn_save_session();
+
+                self.status_message = Some(format!("Session name: {name}"));
+                None
+            }
+            SlashCommand::Hotkeys => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: self.format_hotkeys(),
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
+                None
+            }
+            SlashCommand::Changelog => {
+                self.status_message = Some("Changelog not implemented yet".to_string());
+                None
+            }
+            SlashCommand::Tree => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot open tree while processing".to_string());
+                    return None;
+                }
+
+                let Ok(session_guard) = self.session.try_lock() else {
+                    self.status_message = Some("Session busy; try again".to_string());
+                    return None;
+                };
                 let initial_selected_id = resolve_tree_selector_initial_id(&session_guard, args);
-                let state = TreeSelectorState::new(
+                let selector = TreeSelectorState::new(
                     &session_guard,
                     self.term_height,
                     initial_selected_id.as_deref(),
                 );
                 drop(session_guard);
-                self.tree_ui = Some(TreeUiState::Selector(state));
+                self.tree_ui = Some(TreeUiState::Selector(selector));
+                None
             }
             SlashCommand::Fork => {
                 if self.agent_state != AgentState::Idle {
@@ -4351,1633 +4914,20 @@ impl PiApp {
                             .await;
                     }
                 });
+                None
             }
             SlashCommand::Compact => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message =
-                        Some("Cannot compact while processing a request".to_string());
-                    return None;
-                }
-
-                let custom_instructions = if args.is_empty() {
-                    None
-                } else {
-                    Some(args.to_string())
-                };
-
-                let event_tx = self.event_tx.clone();
-                let session = Arc::clone(&self.session);
-                let agent = Arc::clone(&self.agent);
-                let extensions = self.extensions.clone();
-                let save_enabled = self.save_enabled;
-                let settings = ResolvedCompactionSettings {
-                    enabled: self.config.compaction_enabled(),
-                    reserve_tokens: self.config.compaction_reserve_tokens(),
-                    keep_recent_tokens: self.config.compaction_keep_recent_tokens(),
-                };
-
-                self.agent_state = AgentState::Processing;
-                self.status_message = Some("Compacting context...".to_string());
-
-                let runtime_handle = self.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let cx = Cx::for_request();
-                    let session_id = {
-                        let guard = match session.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock session: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        guard.header.id.clone()
-                    };
-
-                    if let Some(manager) = extensions.clone() {
-                        let cancelled = manager
-                            .dispatch_cancellable_event(
-                                ExtensionEventName::SessionBeforeCompact,
-                                Some(json!({
-                                    "instructions": custom_instructions.clone(),
-                                    "sessionId": session_id.clone(),
-                                })),
-                                EXTENSION_EVENT_TIMEOUT_MS,
-                            )
-                            .await
-                            .unwrap_or(false);
-                        if cancelled {
-                            let _ = event_tx.try_send(PiMsg::System(
-                                "Compaction cancelled by extension".to_string(),
-                            ));
-                            return;
-                        }
-                    }
-
-                    let path_entries = {
-                        let mut guard = match session.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock session: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        guard.ensure_entry_ids();
-                        guard
-                            .entries_for_current_path()
-                            .into_iter()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                    };
-
-                    let Some(prep) = prepare_compaction(&path_entries, settings) else {
-                        let _ = event_tx.try_send(PiMsg::System(
-                            "Compaction not available (already compacted or missing IDs)"
-                                .to_string(),
-                        ));
-                        return;
-                    };
-
-                    let (provider, maybe_provider_key) = {
-                        let agent_guard = match agent.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock agent: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        let key = agent_guard.stream_options().api_key.clone();
-                        (agent_guard.provider(), key)
-                    };
-
-                    let Some(provider_key) = maybe_provider_key else {
-                        let _ = event_tx.try_send(PiMsg::AgentError(
-                            "Missing API key for compaction".to_string(),
-                        ));
-                        return;
-                    };
-
-                    let result = match compact(
-                        prep,
-                        provider,
-                        &provider_key,
-                        custom_instructions.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(err) => {
-                            let _ = event_tx
-                                .try_send(PiMsg::AgentError(format!("Compaction failed: {err}")));
-                            return;
-                        }
-                    };
-
-                    let details_value = match compaction_details_to_value(&result.details) {
-                        Ok(value) => value,
-                        Err(err) => {
-                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                "Compaction details failed: {err}"
-                            )));
-                            return;
-                        }
-                    };
-
-                    let (messages, usage) = {
-                        let mut guard = match session.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock session: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        guard.append_compaction(
-                            result.summary.clone(),
-                            result.first_kept_entry_id.clone(),
-                            result.tokens_before,
-                            Some(details_value),
-                            None,
-                        );
-                        if save_enabled {
-                            if let Err(err) = guard.save().await {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to save session: {err}"
-                                )));
-                                return;
-                            }
-                        }
-                        let messages = guard.to_messages_for_current_path();
-                        drop(guard);
-
-                        let mut agent_guard = match agent.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock agent: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        agent_guard.replace_messages(messages);
-                        drop(agent_guard);
-
-                        let guard = match session.lock(&cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
-                                    "Failed to lock session: {err}"
-                                )));
-                                return;
-                            }
-                        };
-                        load_conversation_from_session(&guard)
-                    };
-
-                    let _ = event_tx.try_send(PiMsg::ConversationReset {
-                        messages,
-                        usage,
-                        status: Some("Compaction complete".to_string()),
-                    });
-
-                    if let Some(manager) = extensions {
-                        let _ = manager
-                            .dispatch_event(
-                                ExtensionEventName::SessionCompact,
-                                Some(json!({
-                                    "summary": result.summary,
-                                    "firstKeptEntryId": result.first_kept_entry_id,
-                                    "tokensBefore": result.tokens_before,
-                                    "sessionId": session_id,
-                                })),
-                            )
-                            .await;
-                    }
-                });
+                self.status_message = Some("Compact not implemented yet".to_string());
+                None
             }
             SlashCommand::Reload => {
-                if self.agent_state != AgentState::Idle {
-                    self.status_message = Some("Cannot reload while busy".to_string());
-                    return None;
-                }
-
-                let event_tx = self.event_tx.clone();
-                let config = self.config.clone();
-                let cwd = self.cwd.clone();
-                let resource_cli = self.resource_cli.clone();
-
-                self.agent_state = AgentState::Processing;
-                self.status_message = Some("Reloading resources...".to_string());
-
-                let runtime_handle = self.runtime_handle.clone();
-                runtime_handle.spawn(async move {
-                    let manager = PackageManager::new(cwd.clone());
-                    match Box::pin(ResourceLoader::load(&manager, &cwd, &config, &resource_cli))
-                        .await
-                    {
-                        Ok(resources) => {
-                            let status = format!(
-                                "Reloaded {} skills, {} prompts, {} themes",
-                                resources.skills().len(),
-                                resources.prompts().len(),
-                                resources.themes().len()
-                            );
-                            let _ =
-                                event_tx.try_send(PiMsg::ResourcesReloaded { resources, status });
-                        }
-                        Err(err) => {
-                            let _ = event_tx
-                                .try_send(PiMsg::AgentError(format!("Reload failed: {err}")));
-                        }
-                    }
-                });
+                self.status_message = Some("Reload not implemented yet".to_string());
+                None
             }
             SlashCommand::Share => {
-                let html = {
-                    let Ok(guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
-                        return None;
-                    };
-                    guard.to_html()
-                };
-                let path =
-                    std::env::temp_dir().join(format!("pi-share-{}.html", uuid::Uuid::new_v4()));
-                match std::fs::write(&path, html) {
-                    Ok(()) => {
-                        self.status_message =
-                            Some(format!("Shared HTML saved at {}", path.display()));
-                    }
-                    Err(err) => {
-                        self.status_message = Some(format!("Share failed: {err}"));
-                    }
-                }
+                self.status_message = Some("Share not implemented yet".to_string());
+                None
             }
         }
-
-        None
-    }
-
-    fn spawn_save_session(&self) {
-        if !self.save_enabled {
-            return;
-        }
-
-        let session = Arc::clone(&self.session);
-        let event_tx = self.event_tx.clone();
-        let runtime_handle = self.runtime_handle.clone();
-        runtime_handle.spawn(async move {
-            let cx = Cx::for_request();
-            let mut session_guard = match session.lock(&cx).await {
-                Ok(guard) => guard,
-                Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
-                    return;
-                }
-            };
-            if let Err(err) = session_guard.save().await {
-                let _ =
-                    event_tx.try_send(PiMsg::AgentError(format!("Failed to save session: {err}")));
-                return;
-            }
-            drop(session_guard);
-        });
-    }
-
-    /// Load a session from a path (used by /resume session picker).
-    fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
-        let path = path.to_string();
-        let session = Arc::clone(&self.session);
-        let agent = Arc::clone(&self.agent);
-        let event_tx = self.event_tx.clone();
-        let runtime_handle = self.runtime_handle.clone();
-
-        // Get the session_dir from current session to preserve it
-        let session_dir = {
-            let Ok(guard) = self.session.try_lock() else {
-                self.status_message = Some("Session busy; try again".to_string());
-                return None;
-            };
-            guard.session_dir.clone()
-        };
-
-        runtime_handle.spawn(async move {
-            let cx = Cx::for_request();
-
-            // Open the session from path
-            let mut loaded_session = match Session::open(&path).await {
-                Ok(s) => s,
-                Err(err) => {
-                    let _ = event_tx
-                        .try_send(PiMsg::AgentError(format!("Failed to open session: {err}")));
-                    return;
-                }
-            };
-
-            // Preserve the session_dir from the current session
-            loaded_session.session_dir = session_dir;
-
-            // Get messages for agent from the loaded session
-            let messages_for_agent = loaded_session.to_messages_for_current_path();
-
-            // Lock and replace the session
-            {
-                let mut session_guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
-                        return;
-                    }
-                };
-                *session_guard = loaded_session;
-            }
-
-            // Update the agent's messages
-            {
-                let mut agent_guard = match agent.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock agent: {err}")));
-                        return;
-                    }
-                };
-                agent_guard.replace_messages(messages_for_agent);
-            }
-
-            // Get the messages and usage for UI
-            let (messages, usage) = {
-                let session_guard = match session.lock(&cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = event_tx
-                            .try_send(PiMsg::AgentError(format!("Failed to lock session: {err}")));
-                        return;
-                    }
-                };
-                load_conversation_from_session(&session_guard)
-            };
-
-            // Notify UI to reset conversation
-            let _ = event_tx.try_send(PiMsg::ConversationReset {
-                messages,
-                usage,
-                status: Some("Session resumed".to_string()),
-            });
-        });
-
-        // Set loading state
-        self.status_message = Some("Loading session...".to_string());
-        None
-    }
-
-    /// Delete a session file, preferring `trash` CLI if available.
-    fn delete_session_file(&mut self, path: &str) {
-        use std::process::Command;
-
-        let path = PathBuf::from(path);
-
-        // Try to use trash CLI first for non-destructive deletion
-        let trash_result = Command::new("trash").arg(&path).output();
-
-        match trash_result {
-            Ok(output) if output.status.success() => {
-                self.status_message = Some("Session moved to trash".to_string());
-            }
-            _ => {
-                // Fallback to direct file removal
-                match std::fs::remove_file(&path) {
-                    Ok(()) => {
-                        self.status_message = Some("Session deleted".to_string());
-                    }
-                    Err(err) => {
-                        self.status_message = Some(format!("Failed to delete session: {err}"));
-                    }
-                }
-            }
-        }
-    }
-
-    /// Scroll the conversation viewport to the bottom.
-    fn scroll_to_bottom(&mut self) {
-        // Calculate total lines in conversation
-        let content = self.build_conversation_content();
-        let line_count = content.lines().count();
-        self.conversation_viewport.set_content(&content);
-        self.conversation_viewport.goto_bottom();
-        let _ = line_count; // Avoid unused warning
-    }
-
-    fn scroll_to_last_match(&mut self, needle: &str) {
-        let content = self.build_conversation_content();
-        self.conversation_viewport.set_content(&content);
-        let mut last_index = None;
-        for (idx, line) in content.lines().enumerate() {
-            if line.contains(needle) {
-                last_index = Some(idx);
-            }
-        }
-        if let Some(idx) = last_index {
-            self.conversation_viewport.set_y_offset(idx);
-        } else {
-            self.conversation_viewport.goto_bottom();
-        }
-    }
-
-    pub fn set_terminal_size(&mut self, width: usize, height: usize) {
-        self.term_width = width.max(1);
-        self.term_height = height.max(1);
-        self.input.set_width(self.term_width.saturating_sub(4));
-        let viewport_height = self.term_height.saturating_sub(9);
-        let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
-        viewport.mouse_wheel_enabled = true;
-        viewport.mouse_wheel_delta = 3;
-        self.conversation_viewport = viewport;
-        self.scroll_to_bottom();
-    }
-
-    /// Render the header.
-    fn render_header(&self) -> String {
-        let title_style = Style::new().bold().foreground("212");
-        let model_style = Style::new().foreground("241");
-        let model = &self.model;
-        let model_label = format!("({model})");
-
-        format!(
-            "  {} {}\n",
-            title_style.render("Pi"),
-            model_style.render(&model_label)
-        )
-    }
-
-    /// Render the conversation messages.
-    fn render_messages(&self) -> String {
-        let mut output = String::new();
-
-        for msg in &self.messages {
-            match msg.role {
-                MessageRole::User => {
-                    let style = Style::new().bold().foreground("cyan");
-                    let _ = write!(output, "\n  {} {}\n", style.render("You:"), msg.content);
-                }
-                MessageRole::Assistant => {
-                    let style = Style::new().bold().foreground("green");
-                    let _ = write!(output, "\n  {}\n", style.render("Assistant:"));
-
-                    // Render thinking if present
-                    if let Some(thinking) = &msg.thinking {
-                        let thinking_style = Style::new().foreground("241").italic();
-                        let truncated = truncate(thinking, 100);
-                        let _ = writeln!(
-                            output,
-                            "  {}",
-                            thinking_style.render(&format!("Thinking: {truncated}"))
-                        );
-                    }
-
-                    // Render markdown content
-                    let rendered = MarkdownRenderer::new()
-                        .with_style(GlamourStyle::Dark)
-                        .with_word_wrap(76)
-                        .render(&msg.content);
-                    for line in rendered.lines() {
-                        let _ = writeln!(output, "  {line}");
-                    }
-                }
-                MessageRole::System => {
-                    let style = Style::new().foreground("red");
-                    let _ = write!(output, "\n  {}\n", style.render(&msg.content));
-                }
-            }
-        }
-
-        output
-    }
-
-    /// Render the current streaming response.
-    fn render_current_response(&self) -> String {
-        let mut output = String::new();
-
-        let style = Style::new().bold().foreground("green");
-        let _ = write!(output, "\n  {}\n", style.render("Assistant:"));
-
-        // Show thinking if present
-        if !self.current_thinking.is_empty() {
-            let thinking_style = Style::new().foreground("241").italic();
-            let truncated = truncate(&self.current_thinking, 100);
-            let _ = writeln!(
-                output,
-                "  {}",
-                thinking_style.render(&format!("Thinking: {truncated}"))
-            );
-        }
-
-        // Show response (no markdown rendering while streaming)
-        if !self.current_response.is_empty() {
-            for line in self.current_response.lines() {
-                let _ = writeln!(output, "  {line}");
-            }
-        }
-
-        output
-    }
-
-    /// Render the input area.
-    fn render_input(&self) -> String {
-        let mut output = String::new();
-
-        // Mode indicator
-        let mode_style = Style::new().foreground("241");
-        let mode_text = match self.input_mode {
-            InputMode::SingleLine => {
-                "[single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)"
-            }
-            InputMode::MultiLine => {
-                "[multi-line] Alt+Enter to send (Enter: newline, Esc: single-line)"
-            }
-        };
-        let _ = writeln!(output, "\n  {}", mode_style.render(mode_text));
-
-        // Input area with textarea view
-        output.push_str("  ");
-        for line in self.input.view().lines() {
-            output.push_str("  ");
-            output.push_str(line);
-            output.push('\n');
-        }
-
-        output
-    }
-
-    /// Render the footer with usage stats.
-    fn render_footer(&self) -> String {
-        let style = Style::new().foreground("241");
-
-        let total_cost = self.total_usage.cost.total;
-        let cost_str = if total_cost > 0.0 {
-            format!(" (${total_cost:.4})")
-        } else {
-            String::new()
-        };
-
-        let input = self.total_usage.input;
-        let output_tokens = self.total_usage.output;
-        let mode_hint = match self.input_mode {
-            InputMode::SingleLine => "Shift+Enter: newline  |  Alt+Enter: multi-line",
-            InputMode::MultiLine => "Enter: newline  |  Alt+Enter: send  |  Esc: single-line",
-        };
-        let footer = format!(
-            "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
-        );
-        format!("\n  {}\n", style.render(&footer))
-    }
-
-    // =========================================================================
-    // Autocomplete helpers
-    // =========================================================================
-
-    /// Trigger autocomplete from Tab key press.
-    fn trigger_autocomplete(&mut self) {
-        let text = self.input.value();
-        // Use text length as cursor position (common case: typing at end).
-        // TODO: Expose cursor position from TextArea for proper mid-text autocomplete.
-        let cursor = text.len();
-        let response = self.autocomplete.provider.suggest(&text, cursor);
-        self.autocomplete.open_with(response);
-    }
-
-    /// Check if we should auto-trigger autocomplete after text input.
-    /// This is called after each keystroke to show suggestions for `/` and `@`.
-    fn maybe_trigger_autocomplete(&mut self) {
-        let text = self.input.value();
-        // Use text length as cursor position (common case: typing at end).
-        let cursor = text.len();
-
-        // Only trigger on `/` or `@` at the start of a token
-        let should_trigger = text
-            .get(..cursor)
-            .and_then(|before| before.chars().last())
-            .is_some_and(|c| c == '/' || c == '@');
-
-        if should_trigger {
-            let response = self.autocomplete.provider.suggest(&text, cursor);
-            self.autocomplete.open_with(response);
-        } else if self.autocomplete.open {
-            // Update suggestions as user types more
-            let response = self.autocomplete.provider.suggest(&text, cursor);
-            if response.items.is_empty() {
-                self.autocomplete.close();
-            } else {
-                self.autocomplete.items = response.items;
-                self.autocomplete.replace_range = response.replace;
-                // Keep selection in bounds
-                if self.autocomplete.selected >= self.autocomplete.items.len() {
-                    self.autocomplete.selected = 0;
-                }
-            }
-        }
-    }
-
-    /// Accept the selected autocomplete item by replacing text in the editor.
-    fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
-        let text = self.input.value();
-        let range = self.autocomplete.replace_range.clone();
-
-        // Build new text with the replacement
-        let mut new_text = String::with_capacity(text.len() + item.insert.len());
-        new_text.push_str(&text[..range.start]);
-        new_text.push_str(&item.insert);
-        new_text.push_str(&text[range.end..]);
-
-        // Update the text area (cursor moves to end after set_value)
-        self.input.set_value(&new_text);
-        // Move cursor to end (default behavior after insertion is acceptable)
-        self.input.cursor_end();
-    }
-
-    /// Render the autocomplete dropdown.
-    fn render_autocomplete_dropdown(&self) -> String {
-        let mut output = String::new();
-
-        let offset = self.autocomplete.scroll_offset();
-        let visible_count = self
-            .autocomplete
-            .max_visible
-            .min(self.autocomplete.items.len());
-        let end = (offset + visible_count).min(self.autocomplete.items.len());
-
-        // Styles
-        let border_style = Style::new().foreground("241");
-        let selected_style = Style::new().foreground("black").background("cyan");
-        let normal_style = Style::new();
-        let kind_style = Style::new().foreground("yellow");
-        let desc_style = Style::new().foreground("241").italic();
-
-        // Top border
-        let width = 60;
-        let _ = write!(
-            output,
-            "\n  {}",
-            border_style.render(&format!("┌{:─<width$}┐", ""))
-        );
-
-        for (idx, item) in self.autocomplete.items[offset..end].iter().enumerate() {
-            let global_idx = offset + idx;
-            let is_selected = global_idx == self.autocomplete.selected;
-
-            // Kind icon
-            let kind_icon = match item.kind {
-                AutocompleteItemKind::SlashCommand => "⚡",
-                AutocompleteItemKind::PromptTemplate => "📄",
-                AutocompleteItemKind::Skill => "🔧",
-                AutocompleteItemKind::File => "📁",
-                AutocompleteItemKind::Path => "📂",
-            };
-
-            // Truncate label if needed
-            let max_label_len = width - 6;
-            let label = if item.label.len() > max_label_len {
-                format!("{}…", &item.label[..max_label_len - 1])
-            } else {
-                item.label.clone()
-            };
-
-            // Format the line
-            let line_content = format!("{kind_icon} {label:<max_label_len$}");
-            let styled_line = if is_selected {
-                selected_style.render(&line_content)
-            } else {
-                format!(
-                    "{}{}",
-                    kind_style.render(kind_icon),
-                    normal_style.render(&format!(" {label}"))
-                )
-            };
-
-            let _ = write!(
-                output,
-                "\n  {}{}{}",
-                border_style.render("│"),
-                styled_line,
-                border_style.render("│")
-            );
-
-            // Show description for selected item
-            if is_selected {
-                if let Some(desc) = &item.description {
-                    let truncated_desc = if desc.len() > width - 4 {
-                        format!("{}…", &desc[..width - 5])
-                    } else {
-                        desc.clone()
-                    };
-                    let _ = write!(
-                        output,
-                        "\n  {}  {}{}",
-                        border_style.render("│"),
-                        desc_style.render(&truncated_desc),
-                        border_style.render(&format!(
-                            "{:>pad$}│",
-                            "",
-                            pad = width - 2 - truncated_desc.len()
-                        ))
-                    );
-                }
-            }
-        }
-
-        // Scroll indicator
-        if self.autocomplete.items.len() > visible_count {
-            let shown = format!(
-                "{}-{} of {}",
-                offset + 1,
-                end,
-                self.autocomplete.items.len()
-            );
-            let _ = write!(
-                output,
-                "\n  {}",
-                border_style.render(&format!("│{shown:^width$}│"))
-            );
-        }
-
-        // Bottom border
-        let _ = write!(
-            output,
-            "\n  {}",
-            border_style.render(&format!("└{:─<width$}┘", ""))
-        );
-
-        // Navigation hint
-        let hint_style = Style::new().foreground("241").italic();
-        let _ = write!(
-            output,
-            "\n  {}",
-            hint_style.render("↑/↓ navigate  Enter/Tab accept  Esc cancel")
-        );
-
-        output
-    }
-
-    /// Render the session picker overlay.
-    #[allow(clippy::unused_self)] // self kept for consistency with other render methods
-    fn render_session_picker(&self, picker: &SessionPickerOverlay) -> String {
-        let mut output = String::new();
-
-        // Styles
-        let title_style = Style::new().bold().foreground("212");
-        let border_style = Style::new().foreground("241");
-        let header_style = Style::new().foreground("241").bold();
-        let selected_style = Style::new().bold().foreground("cyan");
-        let normal_style = Style::new();
-        let hint_style = Style::new().foreground("241").italic();
-
-        // Header
-        let _ = writeln!(
-            output,
-            "\n  {}\n",
-            title_style.render("Select a session to resume")
-        );
-
-        if picker.sessions.is_empty() {
-            let dim_style = Style::new().foreground("241");
-            let _ = writeln!(
-                output,
-                "  {}",
-                dim_style.render("No sessions found for this project.")
-            );
-        } else {
-            // Column headers
-            let _ = writeln!(
-                output,
-                "  {:<20}  {:<30}  {:<8}  {}",
-                header_style.render("Time"),
-                header_style.render("Name"),
-                header_style.render("Messages"),
-                header_style.render("Session ID")
-            );
-            output.push_str("  ");
-            output.push_str(&"-".repeat(78));
-            output.push('\n');
-
-            // Calculate visible range with scrolling
-            let offset = picker.scroll_offset();
-            let visible_count = picker.max_visible.min(picker.sessions.len());
-            let end = (offset + visible_count).min(picker.sessions.len());
-
-            // Session rows
-            for (idx, session) in picker.sessions[offset..end].iter().enumerate() {
-                let global_idx = offset + idx;
-                let is_selected = global_idx == picker.selected;
-
-                let row_style = if is_selected {
-                    &selected_style
-                } else {
-                    &normal_style
-                };
-
-                let prefix = if is_selected { ">" } else { " " };
-                let time = crate::session_picker::format_time(&session.timestamp);
-                let name = session
-                    .name
-                    .as_deref()
-                    .unwrap_or("-")
-                    .chars()
-                    .take(28)
-                    .collect::<String>();
-                let messages = session.message_count.to_string();
-                let id = &session.id[..8.min(session.id.len())];
-
-                let _ = writeln!(
-                    output,
-                    "{prefix} {}",
-                    row_style.render(&format!(" {time:<20}  {name:<30}  {messages:<8}  {id}"))
-                );
-            }
-
-            // Scroll indicator
-            if picker.sessions.len() > visible_count {
-                let _ = writeln!(
-                    output,
-                    "  {}",
-                    border_style.render(&format!(
-                        "({}-{} of {})",
-                        offset + 1,
-                        end,
-                        picker.sessions.len()
-                    ))
-                );
-            }
-        }
-
-        // Delete confirmation or help text
-        output.push('\n');
-        if picker.confirm_delete {
-            if let Some(session) = picker.selected_session() {
-                let name = session.name.as_deref().unwrap_or(&session.id);
-                let warn_style = Style::new().foreground("yellow").bold();
-                let _ = writeln!(
-                    output,
-                    "  {}",
-                    warn_style.render(&format!("Delete session \"{name}\"? (y/n)"))
-                );
-            }
-        } else {
-            let _ = writeln!(
-                output,
-                "  {}",
-                hint_style
-                    .render("↑/↓/j/k: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel")
-            );
-        }
-
-        output
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Usage) {
-    let mut messages = Vec::new();
-    let mut total_usage = Usage::default();
-
-    for entry in session.entries_for_current_path() {
-        match entry {
-            SessionEntry::Message(entry) => match &entry.message {
-                SessionMessage::User { content, .. } => {
-                    let text = user_content_to_text(content);
-                    if !text.trim().is_empty() {
-                        messages.push(ConversationMessage {
-                            role: MessageRole::User,
-                            content: text,
-                            thinking: None,
-                        });
-                    }
-                }
-                SessionMessage::Assistant { message } => {
-                    let (text, thinking) = assistant_content_to_text(&message.content);
-                    if !text.trim().is_empty() || thinking.is_some() {
-                        messages.push(ConversationMessage {
-                            role: MessageRole::Assistant,
-                            content: text,
-                            thinking,
-                        });
-                    }
-                    add_usage(&mut total_usage, &message.usage);
-                }
-                SessionMessage::ToolResult {
-                    tool_name,
-                    content,
-                    details,
-                    is_error,
-                    ..
-                } => {
-                    if let Some(output) = format_tool_output(content, details.as_ref()) {
-                        let label = if *is_error {
-                            "Tool error"
-                        } else {
-                            "Tool result"
-                        };
-                        messages.push(ConversationMessage {
-                            role: MessageRole::System,
-                            content: format!("{label} ({tool_name}):\n{output}"),
-                            thinking: None,
-                        });
-                    }
-                }
-                SessionMessage::BashExecution {
-                    command,
-                    output,
-                    exit_code,
-                    ..
-                } => {
-                    let status = if *exit_code == 0 { "ok" } else { "error" };
-                    messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: format!("bash ({status}) {command}\n{output}"),
-                        thinking: None,
-                    });
-                }
-                SessionMessage::Custom {
-                    custom_type,
-                    content,
-                    display,
-                    details,
-                    ..
-                } => {
-                    if *display {
-                        let mut combined = content.clone();
-                        if let Some(details) = details {
-                            let details_text = pretty_json(details);
-                            if !details_text.is_empty() {
-                                combined.push('\n');
-                                combined.push_str(&details_text);
-                            }
-                        }
-                        messages.push(ConversationMessage {
-                            role: MessageRole::System,
-                            content: format!("{custom_type}: {combined}"),
-                            thinking: None,
-                        });
-                    }
-                }
-                SessionMessage::BranchSummary { summary, from_id } => {
-                    messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: format!("Branch summary from {from_id}: {summary}"),
-                        thinking: None,
-                    });
-                }
-                SessionMessage::CompactionSummary {
-                    summary,
-                    tokens_before,
-                } => {
-                    messages.push(ConversationMessage {
-                        role: MessageRole::System,
-                        content: format!("Compaction summary ({tokens_before} tokens): {summary}"),
-                        thinking: None,
-                    });
-                }
-            },
-            SessionEntry::ModelChange(change) => {
-                messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: format!("Model set to {}/{}", change.provider, change.model_id),
-                    thinking: None,
-                });
-            }
-            SessionEntry::ThinkingLevelChange(change) => {
-                messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: format!("Thinking level: {}", change.thinking_level),
-                    thinking: None,
-                });
-            }
-            _ => {}
-        }
-    }
-
-    (messages, total_usage)
-}
-
-#[derive(Debug, Clone)]
-struct ForkCandidate {
-    id: String,
-    summary: String,
-}
-
-fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
-    let mut candidates = Vec::new();
-    for entry in session.entries_for_current_path() {
-        let SessionEntry::Message(msg_entry) = entry else {
-            continue;
-        };
-        let SessionMessage::User { content, .. } = &msg_entry.message else {
-            continue;
-        };
-        let Some(id) = entry.base_id() else {
-            continue;
-        };
-        let raw = user_content_to_text(content);
-        let cleaned = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-        let summary = if cleaned.is_empty() {
-            "(empty)".to_string()
-        } else {
-            truncate(&cleaned, 60)
-        };
-        candidates.push(ForkCandidate {
-            id: id.clone(),
-            summary,
-        });
-    }
-    candidates
-}
-
-fn summarize_leaf(session: &Session, leaf_id: &str) -> Option<String> {
-    let path = session.get_path_to_entry(leaf_id);
-    for entry_id in path.into_iter().rev() {
-        let entry = session.get_entry(&entry_id)?;
-        if let SessionEntry::Message(msg_entry) = entry {
-            if let SessionMessage::User { content, .. } = &msg_entry.message {
-                let raw = user_content_to_text(content);
-                let cleaned = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-                if cleaned.is_empty() {
-                    return Some("(empty)".to_string());
-                }
-                return Some(truncate(&cleaned, 60));
-            }
-        }
-    }
-    None
-}
-
-fn render_settings(config: &Config) -> String {
-    let pretty = serde_json::to_string_pretty(config).unwrap_or_else(|_| "{}".to_string());
-    format!(
-        "Settings (merged):\n{}\n\nPaths:\n  Global: {}\n  Project: {}\n  Sessions: {}\n  Packages: {}\n  Auth: {}",
-        pretty,
-        Config::global_dir().display(),
-        Config::project_dir().display(),
-        Config::sessions_dir().display(),
-        Config::package_dir().display(),
-        Config::auth_path().display(),
-    )
-}
-
-fn load_changelog(cwd: &Path) -> Result<String, String> {
-    let candidates = [
-        cwd.join("CHANGELOG.md"),
-        Config::global_dir().join("CHANGELOG.md"),
-    ];
-    let path = candidates
-        .iter()
-        .find(|p| p.exists())
-        .ok_or_else(|| "No CHANGELOG.md found".to_string())?;
-    let raw =
-        std::fs::read_to_string(path).map_err(|err| format!("Failed to read changelog: {err}"))?;
-    let text = truncate_lines(&raw, 200);
-    Ok(format!("Changelog ({})\n{}", path.display(), text))
-}
-
-fn truncate_lines(text: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.len() <= max_lines {
-        return text.to_string();
-    }
-    let head = &lines[..max_lines];
-    let remaining = lines.len() - max_lines;
-    let mut out = head.join("\n");
-    let _ = write!(out, "\n... ({remaining} more lines truncated)");
-    out
-}
-
-fn add_usage(total: &mut Usage, usage: &Usage) {
-    total.input += usage.input;
-    total.output += usage.output;
-    total.cache_read += usage.cache_read;
-    total.cache_write += usage.cache_write;
-    total.total_tokens += usage.total_tokens;
-    total.cost.input += usage.cost.input;
-    total.cost.output += usage.cost.output;
-    total.cost.cache_read += usage.cost.cache_read;
-    total.cost.cache_write += usage.cost.cache_write;
-    total.cost.total += usage.cost.total;
-}
-
-fn parse_extension_command(input: &str) -> Option<(String, Vec<String>)> {
-    let trimmed = input.trim();
-    if !trimmed.starts_with('/') {
-        return None;
-    }
-    let mut parts = trimmed.split_whitespace();
-    let cmd = parts.next()?.trim_start_matches('/').trim();
-    if cmd.is_empty() {
-        return None;
-    }
-    let args = parts.map(ToString::to_string).collect::<Vec<_>>();
-    Some((cmd.to_string(), args))
-}
-
-fn parse_queue_mode(mode: Option<&str>) -> QueueMode {
-    match mode {
-        Some("all") => QueueMode::All,
-        _ => QueueMode::OneAtATime,
-    }
-}
-
-fn build_user_message(text: String) -> ModelMessage {
-    let timestamp = Utc::now().timestamp_millis();
-    ModelMessage::User(UserMessage {
-        content: UserContent::Text(text),
-        timestamp,
-    })
-}
-
-fn extension_model_from_entry(entry: &ModelEntry) -> Value {
-    let input = entry
-        .model
-        .input
-        .iter()
-        .map(|t| match t {
-            crate::provider::InputType::Text => "text",
-            crate::provider::InputType::Image => "image",
-        })
-        .collect::<Vec<_>>();
-
-    json!({
-        "id": entry.model.id,
-        "name": entry.model.name,
-        "api": entry.model.api,
-        "provider": entry.model.provider,
-        "baseUrl": entry.model.base_url,
-        "reasoning": entry.model.reasoning,
-        "input": input,
-        "contextWindow": entry.model.context_window,
-        "maxTokens": entry.model.max_tokens,
-        "cost": entry.model.cost,
-    })
-}
-
-fn extension_ui_options(payload: &Value) -> Vec<(String, Value)> {
-    payload
-        .get("options")
-        .and_then(Value::as_array)
-        .map(|options| {
-            options
-                .iter()
-                .filter_map(|option| {
-                    let label = option.get("label").and_then(Value::as_str)?;
-                    let value = option
-                        .get("value")
-                        .cloned()
-                        .unwrap_or_else(|| Value::String(label.to_string()));
-                    Some((label.to_string(), value))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default()
-}
-
-fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
-    let title = request
-        .payload
-        .get("title")
-        .and_then(Value::as_str)
-        .unwrap_or("Extension prompt");
-    let message = request
-        .payload
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let placeholder = request
-        .payload
-        .get("placeholder")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-
-    match request.method.as_str() {
-        "confirm" => {
-            let default = request.payload.get("default").and_then(Value::as_bool);
-            let default_hint = default
-                .map(|value| format!(" (default: {})", if value { "yes" } else { "no" }))
-                .unwrap_or_default();
-            format!("Extension confirm: {title}\n{message}{default_hint}")
-        }
-        "select" => {
-            let options = extension_ui_options(&request.payload);
-            let mut lines = vec![format!("Extension select: {title}")];
-            if !message.is_empty() {
-                lines.push(message.to_string());
-            }
-            for (idx, (label, _)) in options.iter().enumerate() {
-                lines.push(format!("  {}. {label}", idx + 1));
-            }
-            if let Some(default) = request.payload.get("default") {
-                lines.push(format!("Default: {default}"));
-            }
-            lines.join("\n")
-        }
-        "input" => {
-            let default = request
-                .payload
-                .get("default")
-                .cloned()
-                .unwrap_or(Value::Null);
-            format!("Extension input: {title}\n{message}\n{placeholder}\nDefault: {default}")
-        }
-        "editor" => {
-            let language = request
-                .payload
-                .get("language")
-                .and_then(Value::as_str)
-                .unwrap_or("text");
-            format!("Extension editor ({language}): {title}\n{message}")
-        }
-        _ => format!("Extension request: {title}\n{message}"),
-    }
-}
-
-fn parse_extension_ui_response(
-    request: &ExtensionUiRequest,
-    input: &str,
-) -> Result<ExtensionUiResponse, String> {
-    let trimmed = input.trim();
-    let cancelled = trimmed.eq_ignore_ascii_case("cancel");
-
-    match request.method.as_str() {
-        "confirm" => parse_confirm_response(request, trimmed, cancelled),
-        "select" => parse_select_response(request, trimmed, cancelled),
-        "input" | "editor" => Ok(parse_text_response(request, input, cancelled)),
-        _ => Err(format!(
-            "Unsupported extension UI method: {}",
-            request.method
-        )),
-    }
-}
-
-fn parse_confirm_response(
-    request: &ExtensionUiRequest,
-    input: &str,
-    cancelled: bool,
-) -> Result<ExtensionUiResponse, String> {
-    if cancelled {
-        return Ok(ExtensionUiResponse {
-            id: request.id.clone(),
-            value: None,
-            cancelled: true,
-        });
-    }
-
-    let value = if input.is_empty() {
-        request
-            .payload
-            .get("default")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    } else {
-        match input.to_ascii_lowercase().as_str() {
-            "y" | "yes" | "true" | "1" => true,
-            "n" | "no" | "false" | "0" => false,
-            _ => {
-                return Err("Enter yes/no (y/n) or 'cancel'".to_string());
-            }
-        }
-    };
-
-    Ok(ExtensionUiResponse {
-        id: request.id.clone(),
-        value: Some(json!(value)),
-        cancelled: false,
-    })
-}
-
-fn parse_select_response(
-    request: &ExtensionUiRequest,
-    input: &str,
-    cancelled: bool,
-) -> Result<ExtensionUiResponse, String> {
-    if cancelled {
-        return Ok(ExtensionUiResponse {
-            id: request.id.clone(),
-            value: None,
-            cancelled: true,
-        });
-    }
-
-    let options = extension_ui_options(&request.payload);
-    if options.is_empty() {
-        return Err("No options provided for select".to_string());
-    }
-
-    if input.is_empty() {
-        if let Some(default) = request.payload.get("default") {
-            return Ok(ExtensionUiResponse {
-                id: request.id.clone(),
-                value: Some(default.clone()),
-                cancelled: false,
-            });
-        }
-        return Ok(ExtensionUiResponse {
-            id: request.id.clone(),
-            value: None,
-            cancelled: true,
-        });
-    }
-
-    if let Ok(index) = input.parse::<usize>() {
-        if index > 0 && index <= options.len() {
-            let value = options[index - 1].1.clone();
-            return Ok(ExtensionUiResponse {
-                id: request.id.clone(),
-                value: Some(value),
-                cancelled: false,
-            });
-        }
-    }
-
-    for (label, value) in options {
-        if label.eq_ignore_ascii_case(input) {
-            return Ok(ExtensionUiResponse {
-                id: request.id.clone(),
-                value: Some(value),
-                cancelled: false,
-            });
-        }
-    }
-
-    Err("Invalid selection. Enter a number, label, or 'cancel'.".to_string())
-}
-
-fn parse_text_response(
-    request: &ExtensionUiRequest,
-    input: &str,
-    cancelled: bool,
-) -> ExtensionUiResponse {
-    if cancelled {
-        return ExtensionUiResponse {
-            id: request.id.clone(),
-            value: None,
-            cancelled: true,
-        };
-    }
-
-    let value = if input.trim().is_empty() {
-        request
-            .payload
-            .get("default")
-            .cloned()
-            .unwrap_or(Value::Null)
-    } else {
-        Value::String(input.to_string())
-    };
-
-    ExtensionUiResponse {
-        id: request.id.clone(),
-        value: Some(value),
-        cancelled: false,
-    }
-}
-
-fn user_content_to_text(content: &UserContent) -> String {
-    match content {
-        UserContent::Text(text) => text.clone(),
-        UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
-    }
-}
-
-fn last_assistant_message(messages: &[ModelMessage]) -> Option<crate::model::AssistantMessage> {
-    messages.iter().rev().find_map(|message| {
-        if let ModelMessage::Assistant(assistant) = message {
-            Some(assistant.clone())
-        } else {
-            None
-        }
-    })
-}
-
-fn assistant_content_to_text(blocks: &[ContentBlock]) -> (String, Option<String>) {
-    let mut text = String::new();
-    let mut thinking = String::new();
-
-    for block in blocks {
-        match block {
-            ContentBlock::Text(text_block) => push_line(&mut text, &text_block.text),
-            ContentBlock::Thinking(thinking_block) => {
-                push_line(&mut thinking, &thinking_block.thinking);
-            }
-            ContentBlock::Image(image) => {
-                push_line(&mut text, &format!("[image: {}]", image.mime_type));
-            }
-            ContentBlock::ToolCall(call) => {
-                push_line(&mut text, &format!("[tool call: {}]", call.name));
-            }
-        }
-    }
-
-    let thinking = if thinking.trim().is_empty() {
-        None
-    } else {
-        Some(thinking)
-    };
-
-    (text, thinking)
-}
-
-fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
-    let mut output = String::new();
-    for block in blocks {
-        match block {
-            ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
-            ContentBlock::Image(image) => {
-                push_line(&mut output, &format!("[image: {}]", image.mime_type));
-            }
-            ContentBlock::Thinking(thinking_block) => {
-                push_line(&mut output, &thinking_block.thinking);
-            }
-            ContentBlock::ToolCall(call) => {
-                push_line(&mut output, &format!("[tool call: {}]", call.name));
-            }
-        }
-    }
-    output
-}
-
-fn format_tool_output(content: &[ContentBlock], details: Option<&Value>) -> Option<String> {
-    let mut output = content_blocks_to_text(content);
-    if output.trim().is_empty() {
-        if let Some(details) = details {
-            output = pretty_json(details);
-        }
-    }
-    if output.trim().is_empty() {
-        None
-    } else {
-        Some(output)
-    }
-}
-
-fn pretty_json(value: &Value) -> String {
-    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-}
-
-fn parse_model_selector(input: &str, default_provider: &str) -> (String, String) {
-    let trimmed = input.trim();
-    if let Some((provider, model)) = trimmed.split_once(':') {
-        return (provider.trim().to_string(), model.trim().to_string());
-    }
-    if let Some((provider, model)) = trimmed.split_once('/') {
-        return (provider.trim().to_string(), model.trim().to_string());
-    }
-    (default_provider.to_string(), trimmed.to_string())
-}
-
-fn parse_thinking_level(input: &str) -> Option<ThinkingLevel> {
-    let normalized = input.trim().to_lowercase();
-    match normalized.as_str() {
-        "off" | "none" | "0" => Some(ThinkingLevel::Off),
-        "minimal" | "min" => Some(ThinkingLevel::Minimal),
-        "low" | "1" => Some(ThinkingLevel::Low),
-        "medium" | "med" | "2" => Some(ThinkingLevel::Medium),
-        "high" | "3" => Some(ThinkingLevel::High),
-        "xhigh" | "4" => Some(ThinkingLevel::XHigh),
-        _ => None,
-    }
-}
-
-const fn thinking_level_to_str(level: ThinkingLevel) -> &'static str {
-    match level {
-        ThinkingLevel::Off => "off",
-        ThinkingLevel::Minimal => "minimal",
-        ThinkingLevel::Low => "low",
-        ThinkingLevel::Medium => "medium",
-        ThinkingLevel::High => "high",
-        ThinkingLevel::XHigh => "xhigh",
-    }
-}
-
-fn push_line(buffer: &mut String, line: &str) {
-    if line.is_empty() {
-        return;
-    }
-    if !buffer.is_empty() {
-        buffer.push('\n');
-    }
-    buffer.push_str(line);
-}
-
-/// Truncate a string to max_len characters with ellipsis.
-fn truncate(s: &str, max_len: usize) -> String {
-    if max_len == 0 {
-        return String::new();
-    }
-
-    let count = s.chars().count();
-    if count <= max_len {
-        return s.to_string();
-    }
-
-    if max_len <= 3 {
-        return ".".repeat(max_len);
-    }
-
-    let take_len = max_len - 3;
-    let mut out = String::with_capacity(max_len);
-    out.extend(s.chars().take(take_len));
-    out.push_str("...");
-    out
-}
-
-/// Run the interactive mode.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_interactive(
-    agent: Agent,
-    session: Session,
-    config: Config,
-    model_entry: ModelEntry,
-    model_scope: Vec<ModelEntry>,
-    available_models: Vec<ModelEntry>,
-    pending_inputs: Vec<PendingInput>,
-    save_enabled: bool,
-    resources: ResourceLoader,
-    resource_cli: ResourceCliOptions,
-    cwd: PathBuf,
-    runtime_handle: RuntimeHandle,
-) -> anyhow::Result<()> {
-    let (event_tx, event_rx) = mpsc::channel::<PiMsg>(1024);
-    let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
-
-    runtime_handle.spawn(async move {
-        let cx = Cx::for_request();
-        while let Ok(msg) = event_rx.recv(&cx).await {
-            let _ = ui_tx.send(Message::new(msg));
-        }
-    });
-    let extensions = if resource_cli.no_extensions {
-        None
-    } else {
-        Some(ExtensionManager::new())
-    };
-
-    let (extension_ui_tx, extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
-    if let Some(manager) = &extensions {
-        manager.set_ui_sender(extension_ui_tx);
-    }
-    let extension_event_tx = event_tx.clone();
-    runtime_handle.spawn(async move {
-        let cx = Cx::for_request();
-        while let Ok(request) = extension_ui_rx.recv(&cx).await {
-            let _ = extension_event_tx.try_send(PiMsg::ExtensionUiRequest(request));
-        }
-    });
-
-    let app = PiApp::new(
-        agent,
-        session,
-        config,
-        resources,
-        resource_cli,
-        cwd,
-        model_entry,
-        model_scope,
-        available_models,
-        pending_inputs,
-        event_tx,
-        runtime_handle,
-        save_enabled,
-        extensions,
-        None,
-    );
-
-    // Run the TUI program
-    Program::new(app)
-        .with_alt_screen()
-        .with_input_receiver(ui_rx)
-        .run()?;
-
-    println!("Goodbye!");
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_truncate() {
-        assert_eq!(truncate("hello", 10), "hello");
-        assert_eq!(truncate("hello world", 8), "hello...");
-        assert_eq!(truncate("hi", 5), "hi");
-    }
-
-    #[test]
-    fn test_message_role() {
-        let user = MessageRole::User;
-        let assistant = MessageRole::Assistant;
-        assert_ne!(user, assistant);
     }
 }
