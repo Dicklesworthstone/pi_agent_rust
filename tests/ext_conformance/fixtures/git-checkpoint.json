@@ -1,0 +1,197 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "git-checkpoint",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/git-checkpoint.ts"
+    },
+    "checksum": {
+      "sha256": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-git-checkpoint-001",
+      "kind": "event",
+      "summary": "Offers to restore code state on fork and applies stash when user selects Yes (exec mocked)",
+      "event_name": "session_before_fork",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": null,
+      "setup": {
+        "mock_exec": [
+          {
+            "args": [
+              "stash",
+              "create"
+            ],
+            "code": 0,
+            "command": "git",
+            "stderr": "",
+            "stdout": "deadbeef\n"
+          },
+          {
+            "args": [
+              "stash",
+              "apply",
+              "deadbeef"
+            ],
+            "code": 0,
+            "command": "git",
+            "stderr": "",
+            "stdout": ""
+          }
+        ],
+        "session_leaf_entry": {
+          "id": "entry-1"
+        }
+      },
+      "steps": [
+        {
+          "type": "emit_event",
+          "event_name": "tool_result",
+          "event": null,
+          "ctx": null
+        },
+        {
+          "type": "emit_event",
+          "event_name": "turn_start",
+          "event": null,
+          "ctx": null
+        },
+        {
+          "type": "emit_event",
+          "event_name": "session_before_fork",
+          "event": {
+            "entryId": "entry-1"
+          },
+          "ctx": {
+            "has_ui": true,
+            "ui_responses": {
+              "select": "Yes, restore code to that point"
+            }
+          }
+        }
+      ],
+      "expect": {
+        "exec_called": [
+          [
+            "git",
+            [
+              "stash",
+              "create"
+            ]
+          ],
+          [
+            "git",
+            [
+              "stash",
+              "apply",
+              "deadbeef"
+            ]
+          ]
+        ],
+        "ui_notify_contains": [
+          "Code restored to checkpoint"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"command\":\"prompt\",\"id\":\"cmd-1\",\"success\":true,\"type\":\"response\"}",
+          "{\"type\":\"agent_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Checkpoint setup turn.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Checkpoint setup turn.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":true,\"messageCount\":2,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/seed_session.jsonl\",\"sessionId\":\"seed-session\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-1\",\"success\":true,\"type\":\"response\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"Calling tool read.\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"dummy.txt\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"toolcall_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"dummy.txt\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"dummy.txt\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolCall\":{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"type\":\"toolCall\"},\"type\":\"toolcall_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"dummy.txt\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"dummy.txt\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"args\":{\"path\":\"dummy.txt\"},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"read\",\"type\":\"tool_execution_start\"}",
+          "{\"isError\":false,\"result\":{\"content\":[{\"text\":\"hello\\n\",\"type\":\"text\"}]},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"read\",\"type\":\"tool_execution_end\"}",
+          "{\"message\":{\"content\":[{\"text\":\"hello\\n\",\"type\":\"text\"}],\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"read\"},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"hello\\n\",\"type\":\"text\"}],\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"read\"},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"dummy.txt\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[{\"content\":[{\"text\":\"hello\\n\",\"type\":\"text\"}],\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"read\"}],\"type\":\"turn_end\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":true,\"messageCount\":4,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/seed_session.jsonl\",\"sessionId\":\"seed-session\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-2\",\"success\":true,\"type\":\"response\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Checkpoint setup turn.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool read.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"path\":\"dummy.txt\"},\"id\":\"call_1|fc_1\",\"name\":\"read\",\"partialJson\":\"{\\\"path\\\":\\\"dummy.txt\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},{\"content\":[{\"text\":\"hello\\n\",\"type\":\"text\"}],\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"read\"},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":false,\"messageCount\":5,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/seed_session.jsonl\",\"sessionId\":\"seed-session\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-3\",\"success\":true,\"type\":\"response\"}",
+          "{\"command\":\"get_fork_messages\",\"data\":{\"messages\":[{\"entryId\":\"entry-1\",\"text\":\"seed\"},{\"entryId\":\"6e03da62\",\"text\":\"Checkpoint setup turn.\"}]},\"id\":\"cmd-2\",\"success\":true,\"type\":\"response\"}",
+          "{\"command\":\"prompt\",\"id\":\"cmd-3\",\"success\":true,\"type\":\"response\"}",
+          "{\"type\":\"agent_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Checkpoint snapshot turn.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Checkpoint snapshot turn.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":true,\"messageCount\":6,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/seed_session.jsonl\",\"sessionId\":\"seed-session\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-1\",\"success\":true,\"type\":\"response\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Checkpoint snapshot turn.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":false,\"messageCount\":7,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/seed_session.jsonl\",\"sessionId\":\"seed-session\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-2\",\"success\":true,\"type\":\"response\"}",
+          "{\"command\":\"fork\",\"data\":{\"cancelled\":false,\"text\":\"seed\"},\"id\":\"cmd-4\",\"success\":true,\"type\":\"response\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":false,\"messageCount\":0,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/2026-02-03T12-37-30-888Z_786ce96d-d8c6-4614-8fa0-2e6b2b4f70f7.jsonl\",\"sessionId\":\"<UUID>\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-1\",\"success\":true,\"type\":\"response\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": null,
+            "success": false
+          },
+          "extension_id": "git-checkpoint",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/agent/models.json",
+          "node_preload": "target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/node_preload.cjs",
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/git-checkpoint.ts",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": "session_before_fork",
+          "scenario_id": "scn-git-checkpoint-001",
+          "scenario_kind": "event",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": "target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/seed_session.jsonl",
+          "settings_json": "target/legacy_capture/scn-git-checkpoint-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"git-checkpoint\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-git-checkpoint-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/git-checkpoint.ts\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":\"session_before_fork\",\"scenario_kind\":\"event\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:28.540Z\"}",
+          "{\"correlation\":{\"extension_id\":\"git-checkpoint\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-git-checkpoint-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:30.932Z\"}"
+        ]
+      }
+    }
+  ]
+}

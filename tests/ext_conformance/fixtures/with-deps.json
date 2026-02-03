@@ -1,0 +1,112 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "with-deps",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/with-deps"
+    },
+    "checksum": {
+      "sha256": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-with-deps-001",
+      "kind": "tool",
+      "summary": "Uses an npm dependency (ms) to parse a duration string",
+      "event_name": null,
+      "tool_name": "parse_duration",
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "arguments": {
+          "duration": "1h"
+        }
+      },
+      "setup": null,
+      "steps": [],
+      "expect": {
+        "content_contains": [
+          "3600000"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"cwd\":\"<PI_MONO_ROOT>\",\"id\":\"<UUID>\",\"timestamp\":\"<TIMESTAMP>\",\"type\":\"session\",\"version\":3}",
+          "{\"type\":\"agent_start\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-with-deps-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-with-deps-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"Calling tool parse_duration.\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"{\\\"duration\\\":\\\"1h\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"toolcall_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"{\\\"duration\\\":\\\"1h\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"{\\\"duration\\\":\\\"1h\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolCall\":{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"type\":\"toolCall\"},\"type\":\"toolcall_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"{\\\"duration\\\":\\\"1h\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"{\\\"duration\\\":\\\"1h\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"args\":{\"duration\":\"1h\"},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"parse_duration\",\"type\":\"tool_execution_start\"}",
+          "{\"isError\":false,\"result\":{\"content\":[{\"text\":\"1h = 3600000 milliseconds\",\"type\":\"text\"}],\"details\":{}},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"parse_duration\",\"type\":\"tool_execution_end\"}",
+          "{\"message\":{\"content\":[{\"text\":\"1h = 3600000 milliseconds\",\"type\":\"text\"}],\"details\":{},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"parse_duration\"},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"1h = 3600000 milliseconds\",\"type\":\"text\"}],\"details\":{},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"parse_duration\"},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"{\\\"duration\\\":\\\"1h\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[{\"content\":[{\"text\":\"1h = 3600000 milliseconds\",\"type\":\"text\"}],\"details\":{},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"parse_duration\"}],\"type\":\"turn_end\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Run scenario scn-with-deps-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool parse_duration.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"duration\":\"1h\"},\"id\":\"call_1|fc_1\",\"name\":\"parse_duration\",\"partialJson\":\"{\\\"duration\\\":\\\"1h\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},{\"content\":[{\"text\":\"1h = 3600000 milliseconds\",\"type\":\"text\"}],\"details\":{},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"parse_duration\"},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-with-deps-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": 0,
+            "success": true
+          },
+          "extension_id": "with-deps",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-with-deps-001/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/with-deps",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-with-deps-001",
+          "scenario_kind": "tool",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-with-deps-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"with-deps\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-with-deps-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/with-deps\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":null,\"scenario_kind\":\"tool\",\"scenario_provider_id\":null,\"scenario_tool_name\":\"parse_duration\",\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:23.727Z\"}",
+          "{\"correlation\":{\"extension_id\":\"with-deps\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-with-deps-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:26.218Z\"}"
+        ]
+      }
+    }
+  ]
+}

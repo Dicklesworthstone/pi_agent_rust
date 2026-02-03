@@ -1,0 +1,205 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "plan-mode",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/plan-mode"
+    },
+    "checksum": {
+      "sha256": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-plan-mode-001",
+      "kind": "command",
+      "summary": "Enables plan mode and restricts tools to the read-only set",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": "plan",
+      "provider_id": null,
+      "input": {
+        "args": "",
+        "ctx": {
+          "has_ui": true
+        }
+      },
+      "setup": null,
+      "steps": [],
+      "expect": {
+        "active_tools": [
+          "read",
+          "bash",
+          "grep",
+          "find",
+          "ls",
+          "questionnaire"
+        ],
+        "ui_notify_contains": [
+          "Plan mode enabled"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"id\":\"<UUID>\",\"method\":\"setStatus\",\"statusKey\":\"plan-mode\",\"type\":\"extension_ui_request\"}",
+          "{\"id\":\"<UUID>\",\"method\":\"setWidget\",\"type\":\"extension_ui_request\",\"widgetKey\":\"plan-todos\"}",
+          "{\"id\":\"<UUID>\",\"message\":\"Plan mode enabled. Tools: read, bash, grep, find, ls, questionnaire\",\"method\":\"notify\",\"type\":\"extension_ui_request\"}",
+          "{\"id\":\"<UUID>\",\"method\":\"setStatus\",\"statusKey\":\"plan-mode\",\"statusText\":\"\\u001b[38;5;226m⏸ plan\\u001b[39m\",\"type\":\"extension_ui_request\"}",
+          "{\"id\":\"<UUID>\",\"method\":\"setWidget\",\"type\":\"extension_ui_request\",\"widgetKey\":\"plan-todos\"}",
+          "{\"command\":\"prompt\",\"id\":\"cmd-1\",\"success\":true,\"type\":\"response\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":false,\"messageCount\":0,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-plan-mode-001/<RUN_ID>/agent/sessions/--data-projects-pi_agent_rust-target-legacy_capture-scn-plan-mode-001-<RUN_ID>-workspace--/2026-02-03T12-36-55-059Z_50a2998a-de23-456c-9be5-1dc655f280b0.jsonl\",\"sessionId\":\"<UUID>\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-1\",\"success\":true,\"type\":\"response\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-plan-mode-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": null,
+            "success": false
+          },
+          "extension_id": "plan-mode",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-plan-mode-001/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/plan-mode",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-plan-mode-001",
+          "scenario_kind": "command",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-plan-mode-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"plan-mode\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-plan-mode-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/plan-mode\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":\"plan\",\"scenario_event_name\":null,\"scenario_kind\":\"command\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:52.954Z\"}",
+          "{\"correlation\":{\"extension_id\":\"plan-mode\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-plan-mode-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:55.120Z\"}"
+        ]
+      }
+    },
+    {
+      "id": "scn-plan-mode-002",
+      "kind": "event",
+      "summary": "Blocks non-allowlisted bash commands while plan mode is enabled",
+      "event_name": "tool_call",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": false
+        },
+        "event": {
+          "input": {
+            "command": "rm -rf /tmp/boom"
+          },
+          "toolName": "bash"
+        }
+      },
+      "setup": {
+        "state": {
+          "plan_mode_enabled": true
+        }
+      },
+      "steps": [],
+      "expect": {
+        "block": true,
+        "reason_contains": [
+          "Plan mode: command blocked"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"cwd\":\"<PI_MONO_ROOT>\",\"id\":\"<UUID>\",\"timestamp\":\"<TIMESTAMP>\",\"type\":\"session\",\"version\":3}",
+          "{\"type\":\"agent_start\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-plan-mode-002.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-plan-mode-002.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"message\":{\"content\":\"[PLAN MODE ACTIVE]\\nYou are in plan mode - a read-only exploration mode for safe code analysis.\\n\\nRestrictions:\\n- You can only use: read, bash, grep, find, ls, questionnaire\\n- You CANNOT use: edit, write (file modifications are disabled)\\n- Bash is restricted to an allowlist of read-only commands\\n\\nAsk clarifying questions using the questionnaire tool.\\nUse brave-search skill via bash for web research.\\n\\nCreate a detailed numbered plan under a \\\"Plan:\\\" header:\\n\\nPlan:\\n1. First step description\\n2. Second step description\\n...\\n\\nDo NOT attempt to make changes - just describe what you would do.\",\"customType\":\"plan-mode-context\",\"display\":false,\"role\":\"custom\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":\"[PLAN MODE ACTIVE]\\nYou are in plan mode - a read-only exploration mode for safe code analysis.\\n\\nRestrictions:\\n- You can only use: read, bash, grep, find, ls, questionnaire\\n- You CANNOT use: edit, write (file modifications are disabled)\\n- Bash is restricted to an allowlist of read-only commands\\n\\nAsk clarifying questions using the questionnaire tool.\\nUse brave-search skill via bash for web research.\\n\\nCreate a detailed numbered plan under a \\\"Plan:\\\" header:\\n\\nPlan:\\n1. First step description\\n2. Second step description\\n...\\n\\nDo NOT attempt to make changes - just describe what you would do.\",\"customType\":\"plan-mode-context\",\"display\":false,\"role\":\"custom\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"Calling tool bash.\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"{\\\"command\\\":\\\"rm -rf /tmp/boom\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"toolcall_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"{\\\"command\\\":\\\"rm -rf /tmp/boom\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"{\\\"command\\\":\\\"rm -rf /tmp/boom\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolCall\":{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"type\":\"toolCall\"},\"type\":\"toolcall_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"{\\\"command\\\":\\\"rm -rf /tmp/boom\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"{\\\"command\\\":\\\"rm -rf /tmp/boom\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"args\":{\"command\":\"rm -rf /tmp/boom\"},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"bash\",\"type\":\"tool_execution_start\"}",
+          "{\"isError\":true,\"result\":{\"content\":[{\"text\":\"Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\\nCommand: rm -rf /tmp/boom\",\"type\":\"text\"}],\"details\":{}},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"bash\",\"type\":\"tool_execution_end\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\\nCommand: rm -rf /tmp/boom\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"bash\"},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\\nCommand: rm -rf /tmp/boom\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"bash\"},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"{\\\"command\\\":\\\"rm -rf /tmp/boom\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[{\"content\":[{\"text\":\"Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\\nCommand: rm -rf /tmp/boom\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"bash\"}],\"type\":\"turn_end\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Run scenario scn-plan-mode-002.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"content\":\"[PLAN MODE ACTIVE]\\nYou are in plan mode - a read-only exploration mode for safe code analysis.\\n\\nRestrictions:\\n- You can only use: read, bash, grep, find, ls, questionnaire\\n- You CANNOT use: edit, write (file modifications are disabled)\\n- Bash is restricted to an allowlist of read-only commands\\n\\nAsk clarifying questions using the questionnaire tool.\\nUse brave-search skill via bash for web research.\\n\\nCreate a detailed numbered plan under a \\\"Plan:\\\" header:\\n\\nPlan:\\n1. First step description\\n2. Second step description\\n...\\n\\nDo NOT attempt to make changes - just describe what you would do.\",\"customType\":\"plan-mode-context\",\"display\":false,\"role\":\"custom\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool bash.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"command\":\"rm -rf /tmp/boom\"},\"id\":\"call_1|fc_1\",\"name\":\"bash\",\"partialJson\":\"{\\\"command\\\":\\\"rm -rf /tmp/boom\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},{\"content\":[{\"text\":\"Plan mode: command blocked (not allowlisted). Use /plan to disable plan mode first.\\nCommand: rm -rf /tmp/boom\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"bash\"},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-plan-mode-002/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": 0,
+            "success": true
+          },
+          "extension_id": "plan-mode",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-plan-mode-002/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/plan-mode",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": "tool_call",
+          "scenario_id": "scn-plan-mode-002",
+          "scenario_kind": "event",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-plan-mode-002/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"plan-mode\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-plan-mode-002\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/plan-mode\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":\"tool_call\",\"scenario_kind\":\"event\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:55.130Z\"}",
+          "{\"correlation\":{\"extension_id\":\"plan-mode\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-plan-mode-002\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:57.339Z\"}"
+        ]
+      }
+    }
+  ]
+}

@@ -1,11 +1,11 @@
-//! Legacy pi-mono capture runner (bd-3on).
+//! Legacy pi-mono capture runner (bd-16n).
 //!
 //! Runs a small subset of deterministic scenarios against the pinned legacy
 //! `pi-mono` implementation in print/json mode and records raw stdout/stderr plus a
 //! metadata blob for later normalization + conformance comparisons.
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::{TcpListener, TcpStream};
@@ -22,8 +22,45 @@ use anyhow::{Context as _, Result, bail};
 use clap::Parser;
 use pi::extensions::{LogComponent, LogCorrelation, LogLevel, LogPayload, LogSource};
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[derive(Debug, Serialize)]
+struct LegacyFixtureFile {
+    schema: String,
+    extension: ExtensionSampleItem,
+    legacy: LegacyFixtureLegacy,
+    capture: LegacyFixtureCapture,
+    scenarios: Vec<LegacyFixtureScenario>,
+}
+
+#[derive(Debug, Serialize)]
+struct LegacyFixtureLegacy {
+    pi_mono_head: Option<String>,
+    node_version: Option<String>,
+    npm_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct LegacyFixtureCapture {
+    provider: String,
+    model: String,
+    no_env: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct LegacyFixtureScenario {
+    #[serde(flatten)]
+    scenario: ScenarioSuiteScenario,
+    outputs: LegacyFixtureOutputs,
+}
+
+#[derive(Debug, Serialize)]
+struct LegacyFixtureOutputs {
+    stdout_normalized_jsonl: Vec<String>,
+    meta_normalized: Value,
+    capture_log_normalized_jsonl: Vec<String>,
+}
 
 #[derive(Debug, Parser)]
 #[command(name = "pi_legacy_capture")]
@@ -40,6 +77,10 @@ struct Args {
     /// Output directory for capture artifacts (defaults to target/ for git-ignore)
     #[arg(long, default_value = "target/legacy_capture")]
     out_dir: PathBuf,
+
+    /// Output directory for generated per-extension fixtures.
+    #[arg(long, default_value = "tests/ext_conformance/fixtures")]
+    fixtures_dir: PathBuf,
 
     /// Provider to select in legacy pi-mono (required for RPC mode even for slash-command-only scenarios)
     #[arg(long, default_value = "openai")]
@@ -68,7 +109,7 @@ struct ExtensionSampleManifest {
     scenario_suite: ScenarioSuite,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ExtensionSampleItem {
     id: String,
     source: ExtensionSource,
@@ -76,13 +117,13 @@ struct ExtensionSampleItem {
     checksum: Option<ExtensionChecksum>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ExtensionSource {
     commit: String,
     path: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ExtensionChecksum {
     sha256: String,
 }
@@ -99,16 +140,44 @@ struct ScenarioSuiteItem {
     scenarios: Vec<ScenarioSuiteScenario>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ScenarioStep {
+    EmitEvent {
+        event_name: String,
+        #[serde(default)]
+        event: Value,
+        #[serde(default)]
+        ctx: Value,
+    },
+    InvokeTool {
+        tool_name: String,
+        arguments: Value,
+    },
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
 struct ScenarioSuiteScenario {
     id: String,
     kind: String,
     #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
     event_name: Option<String>,
+    #[serde(default)]
+    tool_name: Option<String>,
+    #[serde(default)]
+    command_name: Option<String>,
+    #[serde(default)]
+    provider_id: Option<String>,
     #[serde(default)]
     input: Value,
     #[serde(default)]
     setup: Option<Value>,
+    #[serde(default)]
+    steps: Vec<ScenarioStep>,
+    #[serde(default)]
+    expect: Option<Value>,
 }
 
 #[derive(Debug)]
@@ -289,6 +358,7 @@ impl Drop for MockOpenAiServer {
 }
 
 const OPENAI_DONE_EVENT: &[u8] = b"data: [DONE]\n\n";
+const SEED_EPOCH_MS: u64 = 1_770_076_800_000;
 
 fn handle_openai_connection(mut stream: TcpStream, state: &MockOpenAiState) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
@@ -447,24 +517,45 @@ fn reorder_path_for_system_node() -> Option<String> {
     Some(parts.join(":"))
 }
 
-fn ensure_models_json(agent_dir: &Path, base_url: &str) -> Result<PathBuf> {
+fn ensure_models_json(agent_dir: &Path, base_url: &str, setup: Option<&Value>) -> Result<PathBuf> {
     std::fs::create_dir_all(agent_dir)
         .with_context(|| format!("create agent dir {}", agent_dir.display()))?;
 
     let path = agent_dir.join("models.json");
-    if path.is_file() {
-        return Ok(path);
+    let mut providers = serde_json::Map::new();
+
+    // Provide a dummy OpenAI provider config so legacy pi-mono has at least one available model.
+    // We point baseUrl at a local mock server for deterministic tool-call scenarios.
+    providers.insert(
+        "openai".to_string(),
+        json!({
+            "baseUrl": base_url,
+            "apiKey": "DUMMY",
+        }),
+    );
+
+    if let Some(mock_registry) = setup
+        .and_then(|value| value.pointer("/mock_model_registry"))
+        .and_then(Value::as_object)
+    {
+        for (provider, raw) in mock_registry {
+            let Some(api_key) = raw.as_str() else {
+                continue;
+            };
+            providers.insert(
+                provider.clone(),
+                json!({
+                    "baseUrl": "https://example.invalid",
+                    "apiKey": api_key,
+                }),
+            );
+        }
     }
 
-    let content = json!({
-        "providers": {
-            // Provide a dummy provider config so legacy pi-mono has at least one available model.
-            // We point baseUrl at a local mock server for deterministic tool-call scenarios.
-            "openai": {
-                "baseUrl": base_url,
-                "apiKey": "DUMMY"
-            }
-        }
+    let content = Value::Object({
+        let mut root = serde_json::Map::new();
+        root.insert("providers".to_string(), Value::Object(providers));
+        root
     });
     let text = serde_json::to_string_pretty(&content)?;
     std::fs::write(&path, format!("{text}\n"))
@@ -472,15 +563,23 @@ fn ensure_models_json(agent_dir: &Path, base_url: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+struct PiMonoSpawnConfig<'a> {
+    pi_mono_root: &'a Path,
+    cwd: &'a Path,
+    extension_path: &'a str,
+    agent_dir: &'a Path,
+    provider: &'a str,
+    model: &'a str,
+    no_env: bool,
+    node_preload: Option<&'a Path>,
+    extra_cli_args: &'a [String],
+}
+
 fn ensure_settings_json(agent_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(agent_dir)
         .with_context(|| format!("create agent dir {}", agent_dir.display()))?;
 
     let path = agent_dir.join("settings.json");
-    if path.is_file() {
-        return Ok(path);
-    }
-
     // Safety net: if a dangerous bash tool call ever slips past an extension gate,
     // the commandPrefix causes the shell to exit before running the command body.
     let content = json!({
@@ -492,41 +591,90 @@ fn ensure_settings_json(agent_dir: &Path) -> Result<PathBuf> {
     Ok(path)
 }
 
-fn spawn_pi_mono_print_json(
-    pi_mono_root: &Path,
-    extension_path: &str,
-    agent_dir: &Path,
-    provider: &str,
-    model: &str,
-    no_env: bool,
-    messages: &[String],
-) -> Result<Child> {
-    let pi_test = pi_mono_root.join("pi-test.sh");
-    if !pi_test.is_file() {
-        bail!("missing legacy runner: {}", pi_test.display());
+fn spawn_pi_mono_print_json(config: &PiMonoSpawnConfig<'_>, messages: &[String]) -> Result<Child> {
+    let pi_mono_root = config
+        .pi_mono_root
+        .canonicalize()
+        .unwrap_or_else(|_| config.pi_mono_root.to_path_buf());
+
+    let tsx_cli = pi_mono_root.join("node_modules/tsx/dist/cli.mjs");
+    if !tsx_cli.is_file() {
+        bail!("missing tsx runner: {}", tsx_cli.display());
     }
 
-    let agent_dir = agent_dir
-        .canonicalize()
-        .unwrap_or_else(|_| agent_dir.to_path_buf());
+    let cli = pi_mono_root.join("packages/coding-agent/src/cli.ts");
+    if !cli.is_file() {
+        bail!("missing legacy coding-agent CLI: {}", cli.display());
+    }
 
-    let mut cmd = Command::new("./pi-test.sh");
-    cmd.current_dir(pi_mono_root)
+    let extension_abs = pi_mono_root.join(config.extension_path);
+    if !extension_abs.exists() {
+        bail!("missing extension source: {}", extension_abs.display());
+    }
+
+    let agent_dir = config
+        .agent_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config.agent_dir.to_path_buf());
+
+    let mut cmd = Command::new("/usr/bin/node");
+    cmd.current_dir(config.cwd)
+        .arg(tsx_cli)
+        .arg(cli)
         .arg("--print")
         .arg("--mode")
         .arg("json")
         .arg("--extension")
-        .arg(extension_path)
+        .arg(extension_abs)
         .arg("--provider")
-        .arg(provider)
+        .arg(config.provider)
         .arg("--model")
-        .arg(model)
+        .arg(config.model)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    if no_env {
-        cmd.arg("--no-env");
+    if config.no_env {
+        // Mirror `pi-test.sh --no-env` by stripping known API key / cloud env vars.
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GROQ_API_KEY",
+            "CEREBRAS_API_KEY",
+            "XAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "ZAI_API_KEY",
+            "MISTRAL_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "AI_GATEWAY_API_KEY",
+            "OPENCODE_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_RESOURCE_NAME",
+        ] {
+            cmd.env_remove(var);
+        }
     }
+    cmd.args(config.extra_cli_args);
     cmd.args(messages);
 
     // Determinism: use UTC timestamps wherever possible.
@@ -535,8 +683,129 @@ fn spawn_pi_mono_print_json(
         cmd.env("PATH", path);
     }
     cmd.env("PI_CODING_AGENT_DIR", agent_dir);
+    if let Some(preload) = config.node_preload {
+        let preload = preload
+            .canonicalize()
+            .unwrap_or_else(|_| preload.to_path_buf());
+        let preload_opt = format!("--require {}", preload.display());
+        let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+        let combined = if existing.trim().is_empty() {
+            preload_opt
+        } else {
+            format!("{preload_opt} {existing}")
+        };
+        cmd.env("NODE_OPTIONS", combined);
+    }
 
     let child = cmd.spawn().context("spawn pi-mono print/json")?;
+    Ok(child)
+}
+
+fn spawn_pi_mono_rpc(config: &PiMonoSpawnConfig<'_>) -> Result<Child> {
+    let pi_mono_root = config
+        .pi_mono_root
+        .canonicalize()
+        .unwrap_or_else(|_| config.pi_mono_root.to_path_buf());
+
+    let tsx_cli = pi_mono_root.join("node_modules/tsx/dist/cli.mjs");
+    if !tsx_cli.is_file() {
+        bail!("missing tsx runner: {}", tsx_cli.display());
+    }
+
+    let cli = pi_mono_root.join("packages/coding-agent/src/cli.ts");
+    if !cli.is_file() {
+        bail!("missing legacy coding-agent CLI: {}", cli.display());
+    }
+
+    let extension_abs = pi_mono_root.join(config.extension_path);
+    if !extension_abs.exists() {
+        bail!("missing extension source: {}", extension_abs.display());
+    }
+
+    let agent_dir = config
+        .agent_dir
+        .canonicalize()
+        .unwrap_or_else(|_| config.agent_dir.to_path_buf());
+
+    let mut cmd = Command::new("/usr/bin/node");
+    cmd.current_dir(config.cwd)
+        .arg(tsx_cli)
+        .arg(cli)
+        .arg("--mode")
+        .arg("rpc")
+        .arg("--extension")
+        .arg(extension_abs)
+        .arg("--provider")
+        .arg(config.provider)
+        .arg("--model")
+        .arg(config.model)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    if config.no_env {
+        // Mirror `pi-test.sh --no-env` by stripping known API key / cloud env vars.
+        for var in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "OPENAI_API_KEY",
+            "GEMINI_API_KEY",
+            "GROQ_API_KEY",
+            "CEREBRAS_API_KEY",
+            "XAI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "ZAI_API_KEY",
+            "MISTRAL_API_KEY",
+            "MINIMAX_API_KEY",
+            "MINIMAX_CN_API_KEY",
+            "AI_GATEWAY_API_KEY",
+            "OPENCODE_API_KEY",
+            "COPILOT_GITHUB_TOKEN",
+            "GH_TOKEN",
+            "GITHUB_TOKEN",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GCLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+            "AWS_PROFILE",
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_BEARER_TOKEN_BEDROCK",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "AWS_WEB_IDENTITY_TOKEN_FILE",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_BASE_URL",
+            "AZURE_OPENAI_RESOURCE_NAME",
+        ] {
+            cmd.env_remove(var);
+        }
+    }
+    cmd.args(config.extra_cli_args);
+
+    cmd.env("TZ", "UTC");
+    if let Some(path) = reorder_path_for_system_node() {
+        cmd.env("PATH", path);
+    }
+    cmd.env("PI_CODING_AGENT_DIR", agent_dir);
+    if let Some(preload) = config.node_preload {
+        let preload = preload
+            .canonicalize()
+            .unwrap_or_else(|_| preload.to_path_buf());
+        let preload_opt = format!("--require {}", preload.display());
+        let existing = std::env::var("NODE_OPTIONS").unwrap_or_default();
+        let combined = if existing.trim().is_empty() {
+            preload_opt
+        } else {
+            format!("{preload_opt} {existing}")
+        };
+        cmd.env("NODE_OPTIONS", combined);
+    }
+
+    let child = cmd.spawn().context("spawn pi-mono rpc")?;
     Ok(child)
 }
 
@@ -547,11 +816,52 @@ fn extract_bool(input: &Value, pointer: &str, default: bool) -> bool {
         .unwrap_or(default)
 }
 
-fn extract_string(input: &Value, pointer: &str) -> Option<String> {
-    input
-        .pointer(pointer)
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
+fn scenario_has_ui(scenario: &ScenarioSuiteScenario) -> bool {
+    if extract_bool(&scenario.input, "/ctx/has_ui", false) {
+        return true;
+    }
+    scenario.steps.iter().any(|step| match step {
+        ScenarioStep::EmitEvent { ctx, .. } => extract_bool(ctx, "/has_ui", false),
+        ScenarioStep::InvokeTool { .. } => false,
+    })
+}
+
+fn setup_cli_args(setup: Option<&Value>) -> Vec<String> {
+    let Some(flags) = setup
+        .and_then(|value| value.pointer("/flags"))
+        .and_then(Value::as_object)
+    else {
+        return Vec::new();
+    };
+
+    let mut keys = flags.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+
+    let mut out = Vec::new();
+    for key in keys {
+        let Some(value) = flags.get(&key) else {
+            continue;
+        };
+        match value {
+            Value::Bool(true) => {
+                out.push(format!("--{key}"));
+            }
+            Value::Bool(false) | Value::Null => {}
+            Value::String(s) => {
+                out.push(format!("--{key}"));
+                out.push(s.clone());
+            }
+            Value::Number(n) => {
+                out.push(format!("--{key}"));
+                out.push(n.to_string());
+            }
+            other => {
+                out.push(format!("--{key}"));
+                out.push(other.to_string());
+            }
+        }
+    }
+    out
 }
 
 fn build_sse_body(events: &[Value]) -> Result<Vec<u8>> {
@@ -575,6 +885,14 @@ fn build_openai_tool_call_responses(
     let item_id = "fc_1";
     let response_id = "resp_1";
     let arguments = serde_json::to_string(tool_input)?;
+    let preface_text = format!("Calling tool {tool_name}.");
+    let message_item = json!({
+        "type": "message",
+        "id": "msg_0",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type":"output_text","text": preface_text, "annotations": []}]
+    });
     let tool_item_added = json!({
         "type": "function_call",
         "id": item_id,
@@ -593,17 +911,19 @@ fn build_openai_tool_call_responses(
     });
 
     let first = build_sse_body(&[
-        json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":tool_item_added}),
-        json!({"type":"response.function_call_arguments.done","sequence_number":2,"output_index":0,"item_id": item_id,"name": tool_name, "arguments": arguments}),
-        json!({"type":"response.output_item.done","sequence_number":3,"output_index":0,"item":tool_item_done}),
-        json!({"type":"response.completed","sequence_number":4,"response": {
+        json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":message_item}),
+        json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":message_item}),
+        json!({"type":"response.output_item.added","sequence_number":3,"output_index":1,"item":tool_item_added}),
+        json!({"type":"response.function_call_arguments.done","sequence_number":4,"output_index":1,"item_id": item_id,"name": tool_name, "arguments": arguments}),
+        json!({"type":"response.output_item.done","sequence_number":5,"output_index":1,"item":tool_item_done}),
+        json!({"type":"response.completed","sequence_number":6,"response": {
             "id": response_id,
             "object": "response",
             "created_at": 0,
             "model": model,
             "status": "completed",
-            "output": [tool_item_done],
-            "output_text": "",
+            "output": [message_item, tool_item_done],
+            "output_text": preface_text,
             "error": null,
             "incomplete_details": null,
             "instructions": null,
@@ -652,6 +972,42 @@ fn build_openai_tool_call_responses(
     Ok(vec![first, second])
 }
 
+fn build_openai_text_responses(model: &str, text: &str) -> Result<Vec<Vec<u8>>> {
+    let message_item = json!({
+        "type": "message",
+        "id": "msg_1",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type":"output_text","text": text, "annotations": []}]
+    });
+
+    let body = build_sse_body(&[
+        json!({"type":"response.output_item.added","sequence_number":1,"output_index":0,"item":message_item}),
+        json!({"type":"response.output_item.done","sequence_number":2,"output_index":0,"item":message_item}),
+        json!({"type":"response.completed","sequence_number":3,"response": {
+            "id": "resp_1",
+            "object": "response",
+            "created_at": 0,
+            "model": model,
+            "status": "completed",
+            "output": [message_item],
+            "output_text": text,
+            "error": null,
+            "incomplete_details": null,
+            "instructions": null,
+            "metadata": null,
+            "parallel_tool_calls": false,
+            "temperature": null,
+            "tool_choice": "auto",
+            "tools": [],
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "input_tokens_details": {"cached_tokens": 0}},
+            "service_tier": null
+        }}),
+    ])?;
+
+    Ok(vec![body])
+}
+
 fn run_pi_mono_to_completion(
     mut child: Child,
     stdout_rx: &Receiver<String>,
@@ -695,25 +1051,226 @@ fn run_pi_mono_to_completion(
     exit_status.map_or_else(|| child.wait().context("wait"), Ok)
 }
 
-fn scenario_is_supported_headless(scenario: &ScenarioSuiteScenario) -> bool {
-    let has_ui = extract_bool(&scenario.input, "/ctx/has_ui", false);
-    if has_ui {
-        return false;
+fn rpc_write_command(stdin: &mut std::process::ChildStdin, value: &Value) -> Result<()> {
+    let text = serde_json::to_string(value)?;
+    writeln!(stdin, "{text}")?;
+    stdin.flush().ok();
+    Ok(())
+}
+
+fn rpc_ui_response_value<'a>(scenario: &'a ScenarioSuiteScenario, key: &str) -> Option<&'a Value> {
+    if let Some(value) = scenario
+        .input
+        .pointer("/ctx/ui_responses")
+        .and_then(Value::as_object)
+        .and_then(|map| map.get(key))
+    {
+        return Some(value);
     }
 
-    match scenario.kind.as_str() {
-        "event" => {
-            if scenario.event_name.as_deref() != Some("tool_call") {
-                return false;
-            }
-            scenario
-                .input
-                .pointer("/event/toolName")
-                .and_then(Value::as_str)
-                == Some("bash")
+    for step in &scenario.steps {
+        let ScenarioStep::EmitEvent { ctx, .. } = step else {
+            continue;
+        };
+        if let Some(value) = ctx
+            .pointer("/ui_responses")
+            .and_then(Value::as_object)
+            .and_then(|map| map.get(key))
+        {
+            return Some(value);
         }
-        _ => false,
     }
+
+    None
+}
+
+fn rpc_handle_ui_request(
+    value: &Value,
+    scenario: &ScenarioSuiteScenario,
+    stdin: &mut std::process::ChildStdin,
+) -> Result<()> {
+    if value.get("type").and_then(Value::as_str) != Some("extension_ui_request") {
+        return Ok(());
+    }
+    let Some(id) = value.get("id").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let Some(method) = value.get("method").and_then(Value::as_str) else {
+        return Ok(());
+    };
+
+    match method {
+        "select" => {
+            let response = rpc_ui_response_value(scenario, "select")
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
+                    |choice| json!({"type":"extension_ui_response","id": id, "value": choice}),
+                );
+            rpc_write_command(stdin, &response)?;
+        }
+        "confirm" => {
+            let response = rpc_ui_response_value(scenario, "confirm")
+                .and_then(Value::as_bool)
+                .map_or_else(
+                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
+                    |confirmed| {
+                        json!({"type":"extension_ui_response","id": id, "confirmed": confirmed})
+                    },
+                );
+            rpc_write_command(stdin, &response)?;
+        }
+        "input" => {
+            let response = rpc_ui_response_value(scenario, "input")
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
+                    |text| json!({"type":"extension_ui_response","id": id, "value": text}),
+                );
+            rpc_write_command(stdin, &response)?;
+        }
+        "editor" => {
+            let response = rpc_ui_response_value(scenario, "editor")
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || json!({"type":"extension_ui_response","id": id, "cancelled": true}),
+                    |text| json!({"type":"extension_ui_response","id": id, "value": text}),
+                );
+            rpc_write_command(stdin, &response)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn rpc_recv_next(
+    stdout_rx: &Receiver<String>,
+    writer: &mut CaptureWriter,
+    scenario: &ScenarioSuiteScenario,
+    stdin: &mut std::process::ChildStdin,
+    timeout: Duration,
+) -> Result<Option<Value>> {
+    match stdout_rx.recv_timeout(timeout) {
+        Ok(line) => {
+            writer.write_stdout_line(&line)?;
+            let value = serde_json::from_str::<Value>(&line).ok();
+            if let Some(value) = value.as_ref() {
+                rpc_handle_ui_request(value, scenario, stdin)?;
+            }
+            Ok(value)
+        }
+        Err(
+            std::sync::mpsc::RecvTimeoutError::Timeout
+            | std::sync::mpsc::RecvTimeoutError::Disconnected,
+        ) => Ok(None),
+    }
+}
+
+fn rpc_wait_for_response_id(
+    stdout_rx: &Receiver<String>,
+    writer: &mut CaptureWriter,
+    scenario: &ScenarioSuiteScenario,
+    stdin: &mut std::process::ChildStdin,
+    id: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Instant::now() > deadline {
+            bail!("timed out waiting for rpc response id={id}");
+        }
+
+        let Some(value) = rpc_recv_next(
+            stdout_rx,
+            writer,
+            scenario,
+            stdin,
+            Duration::from_millis(50),
+        )?
+        else {
+            continue;
+        };
+        if value.get("type").and_then(Value::as_str) != Some("response") {
+            continue;
+        }
+        if value.get("id").and_then(Value::as_str) != Some(id) {
+            continue;
+        }
+        return Ok(value);
+    }
+}
+
+fn rpc_wait_for_idle(
+    stdout_rx: &Receiver<String>,
+    writer: &mut CaptureWriter,
+    scenario: &ScenarioSuiteScenario,
+    stdin: &mut std::process::ChildStdin,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut attempt = 0_u32;
+    loop {
+        if Instant::now() > deadline {
+            bail!("timed out waiting for rpc session idle");
+        }
+
+        attempt = attempt.saturating_add(1);
+        let id = format!("state-{attempt}");
+        let cmd = json!({"id": id, "type": "get_state"});
+        rpc_write_command(stdin, &cmd)?;
+
+        let response = rpc_wait_for_response_id(stdout_rx, writer, scenario, stdin, &id, timeout)?;
+        let Some(data) = response.get("data").and_then(Value::as_object) else {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        };
+        let is_streaming = data
+            .get("isStreaming")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let is_compacting = data
+            .get("isCompacting")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let pending = data
+            .get("pendingMessageCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        if !is_streaming && !is_compacting && pending == 0 {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn run_pi_mono_rpc_scenario(
+    mut child: Child,
+    stdout_rx: &Receiver<String>,
+    writer: &mut CaptureWriter,
+    _scenario: &ScenarioSuiteScenario,
+    _timeout: Duration,
+    run: impl FnOnce(&mut std::process::ChildStdin, &Receiver<String>, &mut CaptureWriter) -> Result<()>,
+) -> Result<ExitStatus> {
+    let mut stdin = child.stdin.take().context("take child stdin")?;
+    let run_result = run(&mut stdin, stdout_rx, writer);
+    // Always attempt to kill the process after the scripted interaction; rpc mode doesn't exit on its own.
+    let _ = stdin.flush();
+    drop(stdin);
+    let _ = child.kill();
+    let status = child.wait().context("wait rpc child")?;
+
+    // Best-effort drain of remaining stdout lines after killing.
+    let drain_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < drain_deadline {
+        match stdout_rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => writer.write_stdout_line(&line)?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    run_result?;
+    Ok(status)
 }
 
 // ============================================================================
@@ -858,6 +1415,476 @@ fn normalize_json_file(input: &Path, output: &Path, ctx: &NormalizationContext) 
     Ok(())
 }
 
+fn command_line_for_scenario(scenario: &ScenarioSuiteScenario) -> Option<String> {
+    let name = scenario.command_name.as_deref()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut cmd = format!("/{name}");
+
+    match scenario.input.get("args") {
+        Some(Value::String(s)) => {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                cmd.push(' ');
+                cmd.push_str(trimmed);
+            }
+        }
+        Some(Value::Array(args)) => {
+            let parts = args
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                cmd.push(' ');
+                cmd.push_str(&parts.join(" "));
+            }
+        }
+        _ => {}
+    }
+
+    Some(cmd)
+}
+
+fn scenario_requires_rpc(scenario: &ScenarioSuiteScenario) -> bool {
+    if scenario_has_ui(scenario) {
+        return true;
+    }
+    // Scenarios without an explicit UI flag may still need RPC to observe
+    // additional structured data (e.g., get_commands, provider registry).
+    if scenario.kind == "provider" {
+        return true;
+    }
+    if scenario.kind == "event" && scenario.event_name.as_deref() == Some("resources_discover") {
+        return true;
+    }
+    false
+}
+
+fn scenario_pre_messages(scenario: &ScenarioSuiteScenario) -> Vec<String> {
+    let mut out = Vec::new();
+    if scenario
+        .setup
+        .as_ref()
+        .and_then(|s| s.pointer("/state/plan_mode_enabled"))
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        // Plan mode is toggled via /plan command in the plan-mode extension.
+        out.push("/plan".to_string());
+    }
+    out
+}
+
+fn build_mock_openai_responses(
+    model: &str,
+    scenario: &ScenarioSuiteScenario,
+) -> Result<Vec<Vec<u8>>> {
+    match scenario.kind.as_str() {
+        "tool" => {
+            let Some(tool_name) = scenario.tool_name.as_deref() else {
+                // Some scenarios (e.g., sandbox-001) are metadata-only; keep the server alive.
+                return build_openai_text_responses(model, "ok");
+            };
+            let args = scenario
+                .input
+                .pointer("/arguments")
+                .cloned()
+                .unwrap_or(Value::Null);
+            build_openai_tool_call_responses(model, tool_name, &args)
+        }
+        "command" | "provider" => build_openai_text_responses(model, "ok"),
+        "event" => match scenario.event_name.as_deref().unwrap_or_default() {
+            "tool_call" => {
+                let tool_name = scenario
+                    .input
+                    .pointer("/event/toolName")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if tool_name.is_empty() {
+                    bail!("missing input.event.toolName for {}", scenario.id);
+                }
+                let args = scenario
+                    .input
+                    .pointer("/event/input")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                build_openai_tool_call_responses(model, tool_name, &args)
+            }
+            "input" | "turn_start" | "resources_discover" => {
+                build_openai_text_responses(model, "ok")
+            }
+            "session_start" => scenario
+                .steps
+                .iter()
+                .find_map(|step| match step {
+                    ScenarioStep::InvokeTool {
+                        tool_name,
+                        arguments,
+                    } => Some((tool_name, arguments)),
+                    ScenarioStep::EmitEvent { .. } => None,
+                })
+                .map_or_else(
+                    || build_openai_text_responses(model, "ok"),
+                    |step| build_openai_tool_call_responses(model, step.0, step.1),
+                ),
+            "session_before_fork" => {
+                // For git-checkpoint, we need at least one tool execution so the extension's
+                // tool_result handler can capture an entryId before turn_start snapshots.
+                build_openai_tool_call_responses(model, "read", &json!({"path": "dummy.txt"}))
+            }
+            other => bail!("unsupported event_name {other} for {}", scenario.id),
+        },
+        other => bail!("unsupported scenario kind {other} for {}", scenario.id),
+    }
+}
+
+fn maybe_write_seed_session_file(
+    scenario_dir: &Path,
+    cwd_for_header: &Path,
+    scenario: &ScenarioSuiteScenario,
+) -> Result<Option<PathBuf>> {
+    let Some(setup) = scenario.setup.as_ref() else {
+        return Ok(None);
+    };
+
+    let session_branch = setup.pointer("/session_branch").and_then(Value::as_array);
+    let leaf_entry_id = setup
+        .pointer("/session_leaf_entry/id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    if session_branch.is_none() && leaf_entry_id.is_none() {
+        return Ok(None);
+    }
+
+    let path = scenario_dir.join("seed_session.jsonl");
+    let mut out = File::create(&path).with_context(|| format!("create {}", path.display()))?;
+
+    write_seed_session_header(&mut out, cwd_for_header)?;
+
+    if let Some(branch) = session_branch {
+        write_seed_session_branch(&mut out, branch, leaf_entry_id)?;
+    } else if let Some(id) = leaf_entry_id {
+        write_seed_leaf_entry(&mut out, id)?;
+    }
+
+    Ok(Some(path))
+}
+
+fn write_seed_session_header(out: &mut File, cwd_for_header: &Path) -> Result<()> {
+    let header = json!({
+        "type": "session",
+        "version": 3,
+        "id": "seed-session",
+        "timestamp": "2026-02-03T00:00:00.000Z",
+        "cwd": cwd_for_header.display().to_string(),
+    });
+    writeln!(out, "{}", serde_json::to_string(&header)?)?;
+    Ok(())
+}
+
+fn write_seed_leaf_entry(out: &mut File, leaf_entry_id: &str) -> Result<()> {
+    let message_ts = SEED_EPOCH_MS.saturating_add(1);
+    let entry = json!({
+        "type": "message",
+        "id": leaf_entry_id,
+        "parentId": null,
+        "timestamp": "2026-02-03T00:00:00.001Z",
+        "message": { "role": "user", "content": "seed", "timestamp": message_ts }
+    });
+    writeln!(out, "{}", serde_json::to_string(&entry)?)?;
+    Ok(())
+}
+
+fn write_seed_session_branch(
+    out: &mut File,
+    branch: &[Value],
+    leaf_entry_id: Option<&str>,
+) -> Result<()> {
+    let mut parent_id: Option<String> = None;
+    let mut ts_ms = 1_u32;
+
+    for (idx, raw_entry) in branch.iter().enumerate() {
+        let entry_type = raw_entry
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("message");
+        let id = raw_entry
+            .get("id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .or_else(|| {
+                if idx + 1 == branch.len() {
+                    leaf_entry_id.map(ToString::to_string)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| format!("entry-{}", idx + 1));
+
+        let mut entry = serde_json::Map::new();
+        entry.insert("type".to_string(), Value::String(entry_type.to_string()));
+        entry.insert("id".to_string(), Value::String(id.clone()));
+        entry.insert(
+            "parentId".to_string(),
+            parent_id
+                .as_ref()
+                .map_or(Value::Null, |p| Value::String(p.clone())),
+        );
+        entry.insert(
+            "timestamp".to_string(),
+            Value::String(format!("2026-02-03T00:00:00.{ts_ms:03}Z")),
+        );
+
+        match entry_type {
+            "message" => {
+                let message_ts = SEED_EPOCH_MS.saturating_add(u64::from(ts_ms));
+                let raw_message = raw_entry.get("message").cloned().unwrap_or(Value::Null);
+                let message = normalize_seed_message(raw_message, message_ts, &id);
+                entry.insert("message".to_string(), message);
+            }
+            "custom" => {
+                if let Some(custom_type) = raw_entry.get("customType").cloned() {
+                    entry.insert("customType".to_string(), custom_type);
+                }
+                if let Some(data) = raw_entry.get("data").cloned() {
+                    entry.insert("data".to_string(), data);
+                }
+            }
+            other => {
+                if let Some(obj) = raw_entry.as_object() {
+                    for (k, v) in obj {
+                        if ["type", "id", "parentId", "timestamp"].contains(&k.as_str()) {
+                            continue;
+                        }
+                        entry.insert(k.clone(), v.clone());
+                    }
+                }
+                entry.insert(
+                    "note".to_string(),
+                    Value::String(format!("seeded entry type {other}")),
+                );
+            }
+        }
+
+        writeln!(out, "{}", serde_json::to_string(&Value::Object(entry))?)?;
+        parent_id = Some(id);
+        ts_ms = ts_ms.saturating_add(1);
+    }
+
+    Ok(())
+}
+
+fn normalize_seed_message(raw: Value, message_ts: u64, entry_id: &str) -> Value {
+    let Value::Object(mut message) = raw else {
+        return json!({
+            "role": "user",
+            "content": "seed",
+            "timestamp": message_ts,
+        });
+    };
+
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .map_or("user", str::trim);
+
+    match role {
+        "toolResult" => {
+            if message.get("toolCallId").and_then(Value::as_str).is_none() {
+                message.insert(
+                    "toolCallId".to_string(),
+                    Value::String(format!("seed-toolcall-{entry_id}")),
+                );
+            }
+            if message.get("toolName").and_then(Value::as_str).is_none() {
+                message.insert("toolName".to_string(), Value::String("unknown".to_string()));
+            }
+            if !message.get("content").is_some_and(Value::is_array) {
+                message.insert("content".to_string(), Value::Array(Vec::new()));
+            }
+            if message.get("isError").and_then(Value::as_bool).is_none() {
+                message.insert("isError".to_string(), Value::Bool(false));
+            }
+            if message.get("timestamp").and_then(Value::as_u64).is_none() {
+                message.insert("timestamp".to_string(), json!(message_ts));
+            }
+        }
+        "user" => {
+            if message.get("content").is_none() {
+                message.insert("content".to_string(), Value::String("seed".to_string()));
+            }
+            if message.get("timestamp").and_then(Value::as_u64).is_none() {
+                message.insert("timestamp".to_string(), json!(message_ts));
+            }
+        }
+        "assistant" => {
+            // Best-effort stabilization; seeded assistants are not expected for our fixtures.
+            if !message.get("content").is_some_and(Value::is_array) {
+                message.insert("content".to_string(), Value::Array(Vec::new()));
+            }
+            if message.get("api").is_none() {
+                message.insert(
+                    "api".to_string(),
+                    Value::String("openai-responses".to_string()),
+                );
+            }
+            if message.get("provider").is_none() {
+                message.insert("provider".to_string(), Value::String("openai".to_string()));
+            }
+            if message.get("model").is_none() {
+                message.insert("model".to_string(), Value::String("seed".to_string()));
+            }
+            if message.get("usage").is_none() {
+                message.insert(
+                    "usage".to_string(),
+                    json!({
+                        "input": 0,
+                        "output": 0,
+                        "cacheRead": 0,
+                        "cacheWrite": 0,
+                        "totalTokens": 0,
+                        "cost": {
+                            "input": 0,
+                            "output": 0,
+                            "cacheRead": 0,
+                            "cacheWrite": 0,
+                            "total": 0,
+                        }
+                    }),
+                );
+            }
+            if message.get("stopReason").is_none() {
+                message.insert("stopReason".to_string(), Value::String("stop".to_string()));
+            }
+            if message.get("timestamp").and_then(Value::as_u64).is_none() {
+                message.insert("timestamp".to_string(), json!(message_ts));
+            }
+        }
+        _ => {
+            if message.get("timestamp").and_then(Value::as_u64).is_none() {
+                message.insert("timestamp".to_string(), json!(message_ts));
+            }
+        }
+    }
+
+    Value::Object(message)
+}
+
+fn maybe_write_node_preload(
+    scenario_dir: &Path,
+    scenario: &ScenarioSuiteScenario,
+) -> Result<Option<PathBuf>> {
+    let setup = scenario.setup.as_ref();
+    let mock_exec = setup
+        .and_then(|value| value.pointer("/mock_exec"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let wants_fetch_stub = setup
+        .and_then(|value| value.pointer("/mock_http"))
+        .is_some_and(|v| !v.is_null());
+
+    if mock_exec.is_empty() && !wants_fetch_stub {
+        return Ok(None);
+    }
+
+    let path = scenario_dir.join("node_preload.cjs");
+    let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=";
+
+    let exec_specs = Value::Array(mock_exec);
+    let exec_json = serde_json::to_string(&exec_specs)?;
+
+    let mut script = String::new();
+    script.push_str("// Auto-generated by pi_legacy_capture\n");
+    script.push_str("'use strict';\n");
+    script.push_str("const child_process = require('node:child_process');\n");
+    script.push_str("const { PassThrough } = require('node:stream');\n");
+    script.push_str("const { EventEmitter } = require('node:events');\n");
+    script.push_str("const origSpawn = child_process.spawn.bind(child_process);\n");
+    script.push_str("const mockExec = ");
+    script.push_str(&exec_json);
+    script.push_str(";\n");
+    script.push_str(
+        r"
+function argsEqual(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return false;
+  if (expected.length !== actual.length) return false;
+  for (let i = 0; i < expected.length; i++) {
+    if (String(expected[i]) !== String(actual[i])) return false;
+  }
+  return true;
+}
+
+function makeMockProc(spec) {
+  const proc = new EventEmitter();
+  proc.stdout = new PassThrough();
+  proc.stderr = new PassThrough();
+  proc.killed = false;
+  proc.kill = (_signal) => {
+    proc.killed = true;
+    queueMicrotask(() => proc.emit('close', spec.code ?? 0));
+    return true;
+  };
+  queueMicrotask(() => {
+    if (spec.stdout) proc.stdout.write(String(spec.stdout));
+    if (spec.stderr) proc.stderr.write(String(spec.stderr));
+    proc.stdout.end();
+    proc.stderr.end();
+    proc.emit('close', spec.code ?? 0);
+  });
+  return proc;
+}
+
+child_process.spawn = (command, args, options) => {
+  for (const spec of mockExec) {
+    if (spec && spec.command === command && argsEqual(spec.args, args)) {
+      return makeMockProc(spec);
+    }
+  }
+  return origSpawn(command, args, options);
+};
+",
+    );
+
+    if wants_fetch_stub {
+        let chunk = json!({
+            "response": {
+                "candidates": [{
+                    "content": {
+                        "role": "model",
+                        "parts": [
+                            { "text": "stubbed image response" },
+                            { "inlineData": { "mimeType": "image/png", "data": png_base64 } }
+                        ]
+                    }
+                }]
+            }
+        });
+        let chunk_json = serde_json::to_string(&chunk)?;
+        script.push_str("const origFetch = globalThis.fetch;\n");
+        script.push_str("if (typeof origFetch === 'function') {\n");
+        script.push_str("  globalThis.fetch = async (url, init) => {\n");
+        script.push_str("    const u = typeof url === 'string' ? url : (url && url.url) ? url.url : String(url);\n");
+        script.push_str("    if (u.startsWith('https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:streamGenerateContent')) {\n");
+        script.push_str("      const body = 'data: ");
+        script.push_str(&chunk_json.replace('\\', "\\\\").replace('\'', "\\'"));
+        script.push_str("\\n\\n';\n");
+        script.push_str("      return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });\n");
+        script.push_str("    }\n");
+        script.push_str("    return origFetch(url, init);\n");
+        script.push_str("  };\n");
+        script.push_str("}\n");
+    }
+
+    std::fs::write(&path, script).with_context(|| format!("write {}", path.display()))?;
+    Ok(Some(path))
+}
+
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<()> {
     let args = Args::parse();
@@ -880,19 +1907,16 @@ fn main() -> Result<()> {
         by_id.insert(item.id.clone(), item);
     }
 
-    let mut targets = Vec::new();
+    let mut targets: Vec<(ExtensionSampleItem, ScenarioSuiteScenario)> = Vec::new();
     for entry in manifest.scenario_suite.items {
         let Some(item) = by_id.get(&entry.extension_id) else {
             continue;
         };
         for scenario in entry.scenarios {
-            if !scenario_is_supported_headless(&scenario) {
-                continue;
-            }
             if !args.scenario_id.is_empty() && !args.scenario_id.contains(&scenario.id) {
                 continue;
             }
-            targets.push((item, scenario));
+            targets.push((item.clone(), scenario));
         }
     }
 
@@ -904,12 +1928,10 @@ fn main() -> Result<()> {
     let node = node_version();
     let npm = npm_version();
 
-    for (item, scenario) in targets {
-        let command = extract_string(&scenario.input, "/event/input/command").unwrap_or_default();
-        if command.is_empty() {
-            bail!("missing event.input.command for {}", scenario.id);
-        }
+    let mut fixture_builders: BTreeMap<String, (ExtensionSampleItem, Vec<LegacyFixtureScenario>)> =
+        BTreeMap::new();
 
+    for (item, scenario) in targets {
         let started_at = now_rfc3339_millis_z();
         let scenario_dir = args.out_dir.join(&scenario.id).join(&ids.run_id);
         std::fs::create_dir_all(&scenario_dir)
@@ -940,52 +1962,235 @@ fn main() -> Result<()> {
             "npm_version": npm.clone(),
             "provider": args.provider.clone(),
             "model": args.model.clone(),
+            "scenario_kind": scenario.kind.clone(),
+            "scenario_event_name": scenario.event_name.clone(),
+            "scenario_tool_name": scenario.tool_name.clone(),
+            "scenario_command_name": scenario.command_name.clone(),
+            "scenario_provider_id": scenario.provider_id.clone(),
         }));
         writer.write_capture_log(&payload)?;
 
-        let mock_responses = build_openai_tool_call_responses(
-            &args.model,
-            "bash",
-            &json!({"command": command.clone()}),
-        )?;
+        let mock_responses = build_mock_openai_responses(&args.model, &scenario)?;
         let mock_server = MockOpenAiServer::start(mock_responses)?;
 
         let agent_dir = scenario_dir.join("agent");
-        let models_json_path = ensure_models_json(&agent_dir, mock_server.base_url())?;
+        let workspace_dir = scenario_dir.join("workspace");
+        std::fs::create_dir_all(&workspace_dir)
+            .with_context(|| format!("create {}", workspace_dir.display()))?;
+        let models_json_path =
+            ensure_models_json(&agent_dir, mock_server.base_url(), scenario.setup.as_ref())?;
         let settings_json_path = ensure_settings_json(&agent_dir)?;
 
-        let mut messages = Vec::<String>::new();
-        if scenario
-            .setup
-            .as_ref()
-            .and_then(|s| s.pointer("/state/plan_mode_enabled"))
-            .and_then(Value::as_bool)
-            == Some(true)
-        {
-            messages.push("/plan".to_string());
+        let mut extra_cli_args = setup_cli_args(scenario.setup.as_ref());
+
+        let session_path = maybe_write_seed_session_file(&scenario_dir, &workspace_dir, &scenario)?;
+        if let Some(path) = session_path.as_ref() {
+            let abs = path.canonicalize().unwrap_or_else(|_| path.clone());
+            extra_cli_args.push("--session".to_string());
+            extra_cli_args.push(abs.display().to_string());
         }
-        messages.push(format!(
-            "For test capture, call the bash tool with command: {command}"
-        ));
 
-        let mut child = spawn_pi_mono_print_json(
-            &args.pi_mono_root,
-            &item.source.path,
-            &agent_dir,
-            &args.provider,
-            &args.model,
-            args.no_env,
-            &messages,
-        )?;
-        let stdout_pipe = child.stdout.take().context("take child stdout")?;
-        let stderr_pipe = child.stderr.take().context("take child stderr")?;
+        if scenario.kind == "event" && scenario.event_name.as_deref() == Some("session_before_fork")
+        {
+            let dummy = workspace_dir.join("dummy.txt");
+            std::fs::write(&dummy, "hello\n")?;
+        }
 
-        // Stream stderr directly into stderr.txt.
-        child_stderr_thread(stderr_pipe, writer.stderr.try_clone()?);
-        let stdout_rx = child_stdout_thread(stdout_pipe);
+        let node_preload = maybe_write_node_preload(&scenario_dir, &scenario)?;
 
         let timeout = Duration::from_secs(args.timeout_secs);
-        let exit_status = run_pi_mono_to_completion(child, &stdout_rx, &mut writer, timeout)?;
+        let spawn_config = PiMonoSpawnConfig {
+            pi_mono_root: &args.pi_mono_root,
+            cwd: &workspace_dir,
+            extension_path: &item.source.path,
+            agent_dir: &agent_dir,
+            provider: &args.provider,
+            model: &args.model,
+            no_env: args.no_env,
+            node_preload: node_preload.as_deref(),
+            extra_cli_args: &extra_cli_args,
+        };
+        let exit_status = if scenario_requires_rpc(&scenario) {
+            let mut child = spawn_pi_mono_rpc(&spawn_config)?;
+            let stdout_pipe = child.stdout.take().context("take child stdout")?;
+            let stderr_pipe = child.stderr.take().context("take child stderr")?;
+
+            child_stderr_thread(stderr_pipe, writer.stderr.try_clone()?);
+            let stdout_rx = child_stdout_thread(stdout_pipe);
+
+            run_pi_mono_rpc_scenario(
+                child,
+                &stdout_rx,
+                &mut writer,
+                &scenario,
+                timeout,
+                |stdin, stdout_rx, writer| {
+                    match scenario.kind.as_str() {
+                        "provider" => {
+                            let id = "cmd-1";
+                            rpc_write_command(
+                                stdin,
+                                &json!({"id": id, "type": "get_available_models"}),
+                            )?;
+                            let _ = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                        }
+                        "event"
+                            if scenario.event_name.as_deref() == Some("session_before_fork")
+                                && scenario.id == "scn-git-checkpoint-001" =>
+                        {
+                            // 1) Trigger a turn with a tool call so git-checkpoint records an entryId.
+                            let id = "cmd-1";
+                            rpc_write_command(
+                                stdin,
+                                &json!({"id": id, "type": "prompt", "message": "Checkpoint setup turn."}),
+                            )?;
+                            let _ = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                            rpc_wait_for_idle(stdout_rx, writer, &scenario, stdin, timeout)?;
+
+                            // 2) Pick a fork candidate by text match.
+                            let id = "cmd-2";
+                            rpc_write_command(
+                                stdin,
+                                &json!({"id": id, "type": "get_fork_messages"}),
+                            )?;
+                            let response = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                            let messages = response
+                                .get("data")
+                                .and_then(|d| d.get("messages"))
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default();
+
+                            let mut chosen: Option<String> = None;
+                            for msg in &messages {
+                                let entry_id = msg
+                                    .get("entryId")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default();
+                                let text =
+                                    msg.get("text").and_then(Value::as_str).unwrap_or_default();
+                                if text.contains("Calling tool") && !entry_id.is_empty() {
+                                    chosen = Some(entry_id.to_string());
+                                    break;
+                                }
+                            }
+                            if chosen.is_none() {
+                                chosen = messages
+                                    .first()
+                                    .and_then(|msg| msg.get("entryId").and_then(Value::as_str))
+                                    .map(ToString::to_string);
+                            }
+                            let entry_id = chosen.ok_or_else(|| {
+                                anyhow::anyhow!("no fork messages available for {}", scenario.id)
+                            })?;
+
+                            // 3) Trigger another turn_start so the extension snapshots code state.
+                            let id = "cmd-3";
+                            rpc_write_command(
+                                stdin,
+                                &json!({"id": id, "type": "prompt", "message": "Checkpoint snapshot turn."}),
+                            )?;
+                            let _ = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                            rpc_wait_for_idle(stdout_rx, writer, &scenario, stdin, timeout)?;
+
+                            // 4) Fork from that entryId (should trigger session_before_fork).
+                            let id = "cmd-4";
+                            rpc_write_command(
+                                stdin,
+                                &json!({"id": id, "type": "fork", "entryId": entry_id}),
+                            )?;
+                            let _ = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                            rpc_wait_for_idle(stdout_rx, writer, &scenario, stdin, timeout)?;
+                        }
+                        "event" if scenario.event_name.as_deref() == Some("resources_discover") => {
+                            let id = "cmd-1";
+                            rpc_write_command(stdin, &json!({"id": id, "type": "get_commands"}))?;
+                            let _ = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                        }
+                        "command" => {
+                            let cmd = command_line_for_scenario(&scenario).ok_or_else(|| {
+                                anyhow::anyhow!("missing command_name for {}", scenario.id)
+                            })?;
+                            let id = "cmd-1";
+                            rpc_write_command(
+                                stdin,
+                                &json!({"id": id, "type": "prompt", "message": cmd}),
+                            )?;
+                            let _ = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                            rpc_wait_for_idle(stdout_rx, writer, &scenario, stdin, timeout)?;
+                        }
+                        "event" if scenario.event_name.as_deref() == Some("session_start") => {
+                            // session_start side effects happen at startup; no-op unless UI requires prompt.
+                        }
+                        _ => {
+                            // Default: send a single prompt to trigger a turn.
+                            let id = "cmd-1";
+                            let message = scenario
+                                .input
+                                .pointer("/event/text")
+                                .and_then(Value::as_str)
+                                .unwrap_or("Run scenario.");
+                            rpc_write_command(
+                                stdin,
+                                &json!({"id": id, "type": "prompt", "message": message}),
+                            )?;
+                            let _ = rpc_wait_for_response_id(
+                                stdout_rx, writer, &scenario, stdin, id, timeout,
+                            )?;
+                            rpc_wait_for_idle(stdout_rx, writer, &scenario, stdin, timeout)?;
+                        }
+                    }
+                    Ok(())
+                },
+            )?
+        } else {
+            let mut messages = scenario_pre_messages(&scenario);
+            match scenario.kind.as_str() {
+                "command" => {
+                    if let Some(cmd) = command_line_for_scenario(&scenario) {
+                        messages.push(cmd);
+                    } else {
+                        bail!("missing command_name for {}", scenario.id);
+                    }
+                }
+                "event" if scenario.event_name.as_deref() == Some("input") => {
+                    let text = scenario
+                        .input
+                        .pointer("/event/text")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if text.trim().is_empty() {
+                        bail!("missing input.event.text for {}", scenario.id);
+                    }
+                    messages.push(text.to_string());
+                }
+                _ => {
+                    messages.push(format!("Run scenario {}.", scenario.id));
+                }
+            }
+
+            let mut child = spawn_pi_mono_print_json(&spawn_config, &messages)?;
+            let stdout_pipe = child.stdout.take().context("take child stdout")?;
+            let stderr_pipe = child.stderr.take().context("take child stderr")?;
+
+            child_stderr_thread(stderr_pipe, writer.stderr.try_clone()?);
+            let stdout_rx = child_stdout_thread(stdout_pipe);
+            run_pi_mono_to_completion(child, &stdout_rx, &mut writer, timeout)?
+        };
 
         let finished_at = now_rfc3339_millis_z();
         let meta_value = json!({
@@ -993,11 +2198,15 @@ fn main() -> Result<()> {
             "run_id": ids.run_id.clone(),
             "extension_id": item.id.clone(),
             "scenario_id": scenario.id.clone(),
+            "scenario_kind": scenario.kind.clone(),
+            "scenario_event_name": scenario.event_name.clone(),
             "started_at": started_at,
             "finished_at": finished_at,
             "agent_dir": agent_dir.display().to_string(),
             "models_json": models_json_path.display().to_string(),
             "settings_json": settings_json_path.display().to_string(),
+            "seed_session": session_path.as_ref().map(|p| p.display().to_string()),
+            "node_preload": node_preload.as_ref().map(|p| p.display().to_string()),
             "provider": args.provider.clone(),
             "model": args.model.clone(),
             "exit": {
@@ -1043,6 +2252,63 @@ fn main() -> Result<()> {
             &scenario_dir.join("capture.normalized.log.jsonl"),
             &norm_ctx,
         )?;
+
+        let stdout_text = std::fs::read_to_string(scenario_dir.join("stdout.normalized.jsonl"))
+            .with_context(|| format!("read stdout.normalized.jsonl for {}", scenario.id))?;
+        let capture_text =
+            std::fs::read_to_string(scenario_dir.join("capture.normalized.log.jsonl"))
+                .with_context(|| {
+                    format!("read capture.normalized.log.jsonl for {}", scenario.id)
+                })?;
+        let meta_bytes = std::fs::read(scenario_dir.join("meta.normalized.json"))
+            .with_context(|| format!("read meta.normalized.json for {}", scenario.id))?;
+        let meta_normalized =
+            serde_json::from_slice::<Value>(&meta_bytes).context("parse meta.normalized.json")?;
+
+        let record = LegacyFixtureScenario {
+            scenario,
+            outputs: LegacyFixtureOutputs {
+                stdout_normalized_jsonl: stdout_text.lines().map(ToString::to_string).collect(),
+                meta_normalized,
+                capture_log_normalized_jsonl: capture_text
+                    .lines()
+                    .map(ToString::to_string)
+                    .collect(),
+            },
+        };
+
+        fixture_builders
+            .entry(item.id.clone())
+            .or_insert_with(|| (item.clone(), Vec::new()))
+            .1
+            .push(record);
+    }
+
+    std::fs::create_dir_all(&args.fixtures_dir)
+        .with_context(|| format!("create fixtures dir {}", args.fixtures_dir.display()))?;
+
+    for (extension_id, (item, mut scenarios)) in fixture_builders {
+        scenarios.sort_by(|a, b| a.scenario.id.cmp(&b.scenario.id));
+        let fixture = LegacyFixtureFile {
+            schema: "pi.ext.legacy_fixtures.v1".to_string(),
+            extension: item,
+            legacy: LegacyFixtureLegacy {
+                pi_mono_head: legacy_head.clone(),
+                node_version: node.clone(),
+                npm_version: npm.clone(),
+            },
+            capture: LegacyFixtureCapture {
+                provider: args.provider.clone(),
+                model: args.model.clone(),
+                no_env: args.no_env,
+            },
+            scenarios,
+        };
+
+        let json = serde_json::to_string_pretty(&fixture)?;
+        let path = args.fixtures_dir.join(format!("{extension_id}.json"));
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("write {}", path.display()))?;
     }
 
     Ok(())

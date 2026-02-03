@@ -1,0 +1,223 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "antigravity-image-gen",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/antigravity-image-gen.ts"
+    },
+    "checksum": {
+      "sha256": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-antigravity-image-gen-001",
+      "kind": "tool",
+      "summary": "Errors when Google Antigravity OAuth credentials are missing (no network required)",
+      "event_name": null,
+      "tool_name": "generate_image",
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "arguments": {
+          "prompt": "a red square",
+          "save": "none"
+        }
+      },
+      "setup": {
+        "mock_model_registry": {
+          "google-antigravity": null
+        }
+      },
+      "steps": [],
+      "expect": {
+        "error_contains": [
+          "Missing Google Antigravity OAuth credentials"
+        ],
+        "is_error": true
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"cwd\":\"<PI_MONO_ROOT>\",\"id\":\"<UUID>\",\"timestamp\":\"<TIMESTAMP>\",\"type\":\"session\",\"version\":3}",
+          "{\"type\":\"agent_start\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-antigravity-image-gen-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-antigravity-image-gen-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"Calling tool generate_image.\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"toolcall_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolCall\":{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"type\":\"toolCall\"},\"type\":\"toolcall_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"args\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\",\"type\":\"tool_execution_start\"}",
+          "{\"isError\":true,\"result\":{\"content\":[{\"text\":\"Missing Google Antigravity OAuth credentials. Run /login for google-antigravity.\",\"type\":\"text\"}],\"details\":{}},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\",\"type\":\"tool_execution_end\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Missing Google Antigravity OAuth credentials. Run /login for google-antigravity.\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Missing Google Antigravity OAuth credentials. Run /login for google-antigravity.\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[{\"content\":[{\"text\":\"Missing Google Antigravity OAuth credentials. Run /login for google-antigravity.\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"}],\"type\":\"turn_end\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Run scenario scn-antigravity-image-gen-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},{\"content\":[{\"text\":\"Missing Google Antigravity OAuth credentials. Run /login for google-antigravity.\",\"type\":\"text\"}],\"details\":{},\"isError\":true,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-antigravity-image-gen-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": 0,
+            "success": true
+          },
+          "extension_id": "antigravity-image-gen",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-antigravity-image-gen-001/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/antigravity-image-gen.ts",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-antigravity-image-gen-001",
+          "scenario_kind": "tool",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-antigravity-image-gen-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"antigravity-image-gen\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-antigravity-image-gen-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/antigravity-image-gen.ts\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":null,\"scenario_kind\":\"tool\",\"scenario_provider_id\":null,\"scenario_tool_name\":\"generate_image\",\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:47.850Z\"}",
+          "{\"correlation\":{\"extension_id\":\"antigravity-image-gen\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-antigravity-image-gen-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:50.429Z\"}"
+        ]
+      }
+    },
+    {
+      "id": "scn-antigravity-image-gen-002",
+      "kind": "tool",
+      "summary": "Happy-path: mocked SSE stream returns text + image blocks with saveMode=none",
+      "event_name": null,
+      "tool_name": "generate_image",
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "arguments": {
+          "aspectRatio": "1:1",
+          "prompt": "a red square",
+          "save": "none"
+        }
+      },
+      "setup": {
+        "mock_http": {
+          "mode": "vcr_or_stub",
+          "note": "Stub streamGenerateContent SSE with a single image chunk"
+        },
+        "mock_model_registry": {
+          "google-antigravity": "{\"token\":\"TOKEN\",\"projectId\":\"proj\"}"
+        }
+      },
+      "steps": [],
+      "expect": {
+        "content_types": [
+          "text",
+          "image"
+        ],
+        "details_contains_keys": [
+          "provider",
+          "model",
+          "aspectRatio",
+          "saveMode"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"cwd\":\"<PI_MONO_ROOT>\",\"id\":\"<UUID>\",\"timestamp\":\"<TIMESTAMP>\",\"type\":\"session\",\"version\":3}",
+          "{\"type\":\"agent_start\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-antigravity-image-gen-002.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-antigravity-image-gen-002.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"Calling tool generate_image.\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"aspectRatio\\\":\\\"1:1\\\",\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"toolcall_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"aspectRatio\\\":\\\"1:1\\\",\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":1,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"aspectRatio\\\":\\\"1:1\\\",\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolCall\":{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"type\":\"toolCall\"},\"type\":\"toolcall_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"aspectRatio\\\":\\\"1:1\\\",\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"aspectRatio\\\":\\\"1:1\\\",\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"args\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\",\"type\":\"tool_execution_start\"}",
+          "{\"args\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"partialResult\":{\"content\":[{\"text\":\"Requesting image from google-antigravity/gemini-3-pro-image...\",\"type\":\"text\"}],\"details\":{\"aspectRatio\":\"1:1\",\"model\":\"gemini-3-pro-image\",\"provider\":\"google-antigravity\"}},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\",\"type\":\"tool_execution_update\"}",
+          "{\"isError\":false,\"result\":{\"content\":[{\"text\":\"Generated image via google-antigravity/gemini-3-pro-image. Aspect ratio: 1:1. Model notes: stubbed image response\",\"type\":\"text\"},{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=\",\"mimeType\":\"image/png\",\"type\":\"image\"}],\"details\":{\"aspectRatio\":\"1:1\",\"model\":\"gemini-3-pro-image\",\"provider\":\"google-antigravity\",\"saveMode\":\"none\"}},\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\",\"type\":\"tool_execution_end\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Generated image via google-antigravity/gemini-3-pro-image. Aspect ratio: 1:1. Model notes: stubbed image response\",\"type\":\"text\"},{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=\",\"mimeType\":\"image/png\",\"type\":\"image\"}],\"details\":{\"aspectRatio\":\"1:1\",\"model\":\"gemini-3-pro-image\",\"provider\":\"google-antigravity\",\"saveMode\":\"none\"},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Generated image via google-antigravity/gemini-3-pro-image. Aspect ratio: 1:1. Model notes: stubbed image response\",\"type\":\"text\"},{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=\",\"mimeType\":\"image/png\",\"type\":\"image\"}],\"details\":{\"aspectRatio\":\"1:1\",\"model\":\"gemini-3-pro-image\",\"provider\":\"google-antigravity\",\"saveMode\":\"none\"},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"aspectRatio\\\":\\\"1:1\\\",\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[{\"content\":[{\"text\":\"Generated image via google-antigravity/gemini-3-pro-image. Aspect ratio: 1:1. Model notes: stubbed image response\",\"type\":\"text\"},{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=\",\"mimeType\":\"image/png\",\"type\":\"image\"}],\"details\":{\"aspectRatio\":\"1:1\",\"model\":\"gemini-3-pro-image\",\"provider\":\"google-antigravity\",\"saveMode\":\"none\"},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"}],\"type\":\"turn_end\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Run scenario scn-antigravity-image-gen-002.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"Calling tool generate_image.\",\"textSignature\":\"msg_0\",\"type\":\"text\"},{\"arguments\":{\"aspectRatio\":\"1:1\",\"prompt\":\"a red square\",\"save\":\"none\"},\"id\":\"call_1|fc_1\",\"name\":\"generate_image\",\"partialJson\":\"{\\\"aspectRatio\\\":\\\"1:1\\\",\\\"prompt\\\":\\\"a red square\\\",\\\"save\\\":\\\"none\\\"}\",\"type\":\"toolCall\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"toolUse\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},{\"content\":[{\"text\":\"Generated image via google-antigravity/gemini-3-pro-image. Aspect ratio: 1:1. Model notes: stubbed image response\",\"type\":\"text\"},{\"data\":\"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=\",\"mimeType\":\"image/png\",\"type\":\"image\"}],\"details\":{\"aspectRatio\":\"1:1\",\"model\":\"gemini-3-pro-image\",\"provider\":\"google-antigravity\",\"saveMode\":\"none\"},\"isError\":false,\"role\":\"toolResult\",\"timestamp\":0,\"toolCallId\":\"call_1|fc_1\",\"toolName\":\"generate_image\"},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-antigravity-image-gen-002/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": 0,
+            "success": true
+          },
+          "extension_id": "antigravity-image-gen",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-antigravity-image-gen-002/<RUN_ID>/agent/models.json",
+          "node_preload": "target/legacy_capture/scn-antigravity-image-gen-002/<RUN_ID>/node_preload.cjs",
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/antigravity-image-gen.ts",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-antigravity-image-gen-002",
+          "scenario_kind": "tool",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-antigravity-image-gen-002/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"antigravity-image-gen\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-antigravity-image-gen-002\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/antigravity-image-gen.ts\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":null,\"scenario_kind\":\"tool\",\"scenario_provider_id\":null,\"scenario_tool_name\":\"generate_image\",\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:50.450Z\"}",
+          "{\"correlation\":{\"extension_id\":\"antigravity-image-gen\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-antigravity-image-gen-002\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:52.942Z\"}"
+        ]
+      }
+    }
+  ]
+}

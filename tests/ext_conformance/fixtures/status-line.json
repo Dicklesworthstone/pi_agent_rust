@@ -1,0 +1,127 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "status-line",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/status-line.ts"
+    },
+    "checksum": {
+      "sha256": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-status-line-001",
+      "kind": "event",
+      "summary": "Updates footer status across session_start → turn_start → turn_end",
+      "event_name": "turn_start",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": true
+        }
+      },
+      "setup": null,
+      "steps": [
+        {
+          "type": "emit_event",
+          "event_name": "session_start",
+          "event": null,
+          "ctx": null
+        },
+        {
+          "type": "emit_event",
+          "event_name": "turn_start",
+          "event": null,
+          "ctx": null
+        },
+        {
+          "type": "emit_event",
+          "event_name": "turn_end",
+          "event": null,
+          "ctx": null
+        }
+      ],
+      "expect": {
+        "ui_status_contains_sequence": [
+          "Ready",
+          "Turn 1",
+          "complete"
+        ],
+        "ui_status_key": "status-demo"
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"id\":\"<UUID>\",\"method\":\"setStatus\",\"statusKey\":\"status-demo\",\"statusText\":\"\\u001b[38;5;241mReady\\u001b[39m\",\"type\":\"extension_ui_request\"}",
+          "{\"command\":\"prompt\",\"id\":\"cmd-1\",\"success\":true,\"type\":\"response\"}",
+          "{\"type\":\"agent_start\"}",
+          "{\"id\":\"<UUID>\",\"method\":\"setStatus\",\"statusKey\":\"status-demo\",\"statusText\":\"\\u001b[38;5;109m●\\u001b[39m\\u001b[38;5;241m Turn 1...\\u001b[39m\",\"type\":\"extension_ui_request\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":true,\"messageCount\":1,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-status-line-001/<RUN_ID>/agent/sessions/--data-projects-pi_agent_rust-target-legacy_capture-scn-status-line-001-<RUN_ID>-workspace--/2026-02-03T12-36-59-351Z_c5ba9fb9-6f20-44b6-aec3-2e02b2a41f72.jsonl\",\"sessionId\":\"<UUID>\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-1\",\"success\":true,\"type\":\"response\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"id\":\"<UUID>\",\"method\":\"setStatus\",\"statusKey\":\"status-demo\",\"statusText\":\"\\u001b[38;5;143m✓\\u001b[39m\\u001b[38;5;241m Turn 1 complete\\u001b[39m\",\"type\":\"extension_ui_request\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Run scenario.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":false,\"messageCount\":2,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-status-line-001/<RUN_ID>/agent/sessions/--data-projects-pi_agent_rust-target-legacy_capture-scn-status-line-001-<RUN_ID>-workspace--/2026-02-03T12-36-59-351Z_c5ba9fb9-6f20-44b6-aec3-2e02b2a41f72.jsonl\",\"sessionId\":\"<UUID>\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-2\",\"success\":true,\"type\":\"response\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-status-line-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": null,
+            "success": false
+          },
+          "extension_id": "status-line",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-status-line-001/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/status-line.ts",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": "turn_start",
+          "scenario_id": "scn-status-line-001",
+          "scenario_kind": "event",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-status-line-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"status-line\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-status-line-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/status-line.ts\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":\"turn_start\",\"scenario_kind\":\"event\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:57.349Z\"}",
+          "{\"correlation\":{\"extension_id\":\"status-line\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-status-line-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:59.693Z\"}"
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,233 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "sandbox",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/sandbox"
+    },
+    "checksum": {
+      "sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-sandbox-001",
+      "kind": "tool",
+      "summary": "Overrides the bash tool label to indicate sandboxing tier",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": null,
+      "setup": null,
+      "steps": [],
+      "expect": {
+        "tool_registered": {
+          "label": "bash (sandboxed)",
+          "name": "bash"
+        }
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"cwd\":\"<PI_MONO_ROOT>\",\"id\":\"<UUID>\",\"timestamp\":\"<TIMESTAMP>\",\"type\":\"session\",\"version\":3}",
+          "{\"type\":\"agent_start\"}",
+          "{\"type\":\"turn_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-sandbox-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_start\"}",
+          "{\"message\":{\"content\":[{\"text\":\"Run scenario scn-sandbox-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_start\"}",
+          "{\"assistantMessageEvent\":{\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_start\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"assistantMessageEvent\":{\"content\":\"ok\",\"contentIndex\":0,\"partial\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"text_end\"},\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_update\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"type\":\"message_end\"}",
+          "{\"message\":{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}},\"toolResults\":[],\"type\":\"turn_end\"}",
+          "{\"messages\":[{\"content\":[{\"text\":\"Run scenario scn-sandbox-001.\",\"type\":\"text\"}],\"role\":\"user\",\"timestamp\":0},{\"api\":\"openai-responses\",\"content\":[{\"text\":\"ok\",\"textSignature\":\"msg_1\",\"type\":\"text\"}],\"model\":\"gpt-4o-mini\",\"provider\":\"openai\",\"role\":\"assistant\",\"stopReason\":\"stop\",\"timestamp\":0,\"usage\":{\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":0,\"output\":0,\"total\":0},\"input\":0,\"output\":0,\"totalTokens\":0}}],\"type\":\"agent_end\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-sandbox-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": 0,
+            "success": true
+          },
+          "extension_id": "sandbox",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-sandbox-001/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/sandbox",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-sandbox-001",
+          "scenario_kind": "tool",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-sandbox-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"sandbox\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-sandbox-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/sandbox\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":null,\"scenario_kind\":\"tool\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:02.060Z\"}",
+          "{\"correlation\":{\"extension_id\":\"sandbox\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-sandbox-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:08.470Z\"}"
+        ]
+      }
+    },
+    {
+      "id": "scn-sandbox-002",
+      "kind": "command",
+      "summary": "When sandbox is disabled, /sandbox shows an informational notification",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": "sandbox",
+      "provider_id": null,
+      "input": {
+        "args": "",
+        "ctx": {
+          "has_ui": true
+        }
+      },
+      "setup": null,
+      "steps": [],
+      "expect": {
+        "ui_notify_contains": [
+          "Sandbox is disabled"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"id\":\"<UUID>\",\"message\":\"Sandbox initialization failed: Sandbox dependencies are not available on this system. Required: ripgrep (rg), bubblewrap (bwrap), and socat.\",\"method\":\"notify\",\"notifyType\":\"error\",\"type\":\"extension_ui_request\"}",
+          "{\"id\":\"<UUID>\",\"message\":\"Sandbox is disabled\",\"method\":\"notify\",\"notifyType\":\"info\",\"type\":\"extension_ui_request\"}",
+          "{\"command\":\"prompt\",\"id\":\"cmd-1\",\"success\":true,\"type\":\"response\"}",
+          "{\"command\":\"get_state\",\"data\":{\"autoCompactionEnabled\":true,\"followUpMode\":\"one-at-a-time\",\"isCompacting\":false,\"isStreaming\":false,\"messageCount\":0,\"model\":{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},\"pendingMessageCount\":0,\"sessionFile\":\"<PROJECT_ROOT>/target/legacy_capture/scn-sandbox-002/<RUN_ID>/agent/sessions/--data-projects-pi_agent_rust-target-legacy_capture-scn-sandbox-002-<RUN_ID>-workspace--/2026-02-03T12-37-14-387Z_723542d4-388a-4eef-95e5-9f6a745f0fe0.jsonl\",\"sessionId\":\"<UUID>\",\"steeringMode\":\"one-at-a-time\",\"thinkingLevel\":\"off\"},\"id\":\"state-1\",\"success\":true,\"type\":\"response\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-sandbox-002/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": null,
+            "success": false
+          },
+          "extension_id": "sandbox",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-sandbox-002/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/sandbox",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-sandbox-002",
+          "scenario_kind": "command",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-sandbox-002/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"sandbox\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-sandbox-002\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/sandbox\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":\"sandbox\",\"scenario_event_name\":null,\"scenario_kind\":\"command\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:08.476Z\"}",
+          "{\"correlation\":{\"extension_id\":\"sandbox\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-sandbox-002\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:14.491Z\"}"
+        ]
+      }
+    },
+    {
+      "id": "scn-sandbox-003",
+      "kind": "event",
+      "summary": "When --no-sandbox flag is set, disables sandboxing and warns the user",
+      "event_name": "session_start",
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": null,
+      "input": {
+        "ctx": {
+          "has_ui": true
+        }
+      },
+      "setup": {
+        "flags": {
+          "no-sandbox": true
+        }
+      },
+      "steps": [],
+      "expect": {
+        "ui_notify_contains": [
+          "Sandbox disabled via --no-sandbox"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-sandbox-003/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": null,
+            "success": false
+          },
+          "extension_id": "sandbox",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-sandbox-003/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/sandbox",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": "session_start",
+          "scenario_id": "scn-sandbox-003",
+          "scenario_kind": "event",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-sandbox-003/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"sandbox\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-sandbox-003\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/sandbox\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":\"session_start\",\"scenario_kind\":\"event\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:14.499Z\"}",
+          "{\"correlation\":{\"extension_id\":\"sandbox\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-sandbox-003\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:14.500Z\"}"
+        ]
+      }
+    }
+  ]
+}

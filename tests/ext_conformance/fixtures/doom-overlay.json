@@ -1,0 +1,91 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "doom-overlay",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/doom-overlay"
+    },
+    "checksum": {
+      "sha256": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-doom-overlay-001",
+      "kind": "command",
+      "summary": "Non-interactive invocation emits an error notification and does not attempt UI overlay",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": "doom-overlay",
+      "provider_id": null,
+      "input": {
+        "args": "",
+        "ctx": {
+          "has_ui": false
+        }
+      },
+      "setup": null,
+      "steps": [],
+      "expect": {
+        "ui_notify_contains": [
+          "DOOM requires interactive mode"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"cwd\":\"<PI_MONO_ROOT>\",\"id\":\"<UUID>\",\"timestamp\":\"<TIMESTAMP>\",\"type\":\"session\",\"version\":3}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-doom-overlay-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": 0,
+            "success": true
+          },
+          "extension_id": "doom-overlay",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-doom-overlay-001/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/doom-overlay",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-doom-overlay-001",
+          "scenario_kind": "command",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-doom-overlay-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"doom-overlay\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-doom-overlay-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/doom-overlay\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":\"doom-overlay\",\"scenario_event_name\":null,\"scenario_kind\":\"command\",\"scenario_provider_id\":null,\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:36:59.703Z\"}",
+          "{\"correlation\":{\"extension_id\":\"doom-overlay\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-doom-overlay-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:02.049Z\"}"
+        ]
+      }
+    }
+  ]
+}

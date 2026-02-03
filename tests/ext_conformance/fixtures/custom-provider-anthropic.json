@@ -1,0 +1,89 @@
+{
+  "schema": "pi.ext.legacy_fixtures.v1",
+  "extension": {
+    "id": "custom-provider-anthropic",
+    "source": {
+      "commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+      "path": "packages/coding-agent/examples/extensions/custom-provider-anthropic"
+    },
+    "checksum": {
+      "sha256": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68"
+    }
+  },
+  "legacy": {
+    "pi_mono_head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+    "node_version": "v20.19.4",
+    "npm_version": "9.2.0"
+  },
+  "capture": {
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "no_env": true
+  },
+  "scenarios": [
+    {
+      "id": "scn-custom-provider-anthropic-001",
+      "kind": "provider",
+      "summary": "Registers a custom Anthropic provider with models + OAuth hooks",
+      "event_name": null,
+      "tool_name": null,
+      "command_name": null,
+      "provider_id": "custom-anthropic",
+      "input": null,
+      "setup": null,
+      "steps": [],
+      "expect": {
+        "api": "custom-anthropic-api",
+        "api_key_env": "CUSTOM_ANTHROPIC_API_KEY",
+        "models_contains": [
+          "claude-opus-4-5",
+          "claude-sonnet-4-5"
+        ]
+      },
+      "outputs": {
+        "stdout_normalized_jsonl": [
+          "{\"command\":\"get_available_models\",\"data\":{\"models\":[{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0.375,\"cacheWrite\":0,\"input\":1.5,\"output\":6},\"id\":\"codex-mini-latest\",\"input\":[\"text\"],\"maxTokens\":100000,\"name\":\"Codex Mini\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":8192,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":30,\"output\":60},\"id\":\"gpt-4\",\"input\":[\"text\"],\"maxTokens\":8192,\"name\":\"GPT-4\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":10,\"output\":30},\"id\":\"gpt-4-turbo\",\"input\":[\"text\",\"image\"],\"maxTokens\":4096,\"name\":\"GPT-4 Turbo\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":1047576,\"cost\":{\"cacheRead\":0.5,\"cacheWrite\":0,\"input\":2,\"output\":8},\"id\":\"gpt-4.1\",\"input\":[\"text\",\"image\"],\"maxTokens\":32768,\"name\":\"GPT-4.1\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":1047576,\"cost\":{\"cacheRead\":0.1,\"cacheWrite\":0,\"input\":0.4,\"output\":1.6},\"id\":\"gpt-4.1-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":32768,\"name\":\"GPT-4.1 mini\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":1047576,\"cost\":{\"cacheRead\":0.03,\"cacheWrite\":0,\"input\":0.1,\"output\":0.4},\"id\":\"gpt-4.1-nano\",\"input\":[\"text\",\"image\"],\"maxTokens\":32768,\"name\":\"GPT-4.1 nano\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":1.25,\"cacheWrite\":0,\"input\":2.5,\"output\":10},\"id\":\"gpt-4o\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":5,\"output\":15},\"id\":\"gpt-4o-2024-05-13\",\"input\":[\"text\",\"image\"],\"maxTokens\":4096,\"name\":\"GPT-4o (2024-05-13)\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":1.25,\"cacheWrite\":0,\"input\":2.5,\"output\":10},\"id\":\"gpt-4o-2024-08-06\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o (2024-08-06)\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":1.25,\"cacheWrite\":0,\"input\":2.5,\"output\":10},\"id\":\"gpt-4o-2024-11-20\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o (2024-11-20)\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.08,\"cacheWrite\":0,\"input\":0.15,\"output\":0.6},\"id\":\"gpt-4o-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-4o mini\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.125,\"cacheWrite\":0,\"input\":1.25,\"output\":10},\"id\":\"gpt-5\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.125,\"cacheWrite\":0,\"input\":1.25,\"output\":10},\"id\":\"gpt-5-chat-latest\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-5 Chat Latest\",\"provider\":\"openai\",\"reasoning\":false},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.125,\"cacheWrite\":0,\"input\":1.25,\"output\":10},\"id\":\"gpt-5-codex\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5-Codex\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.025,\"cacheWrite\":0,\"input\":0.25,\"output\":2},\"id\":\"gpt-5-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5 Mini\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.005,\"cacheWrite\":0,\"input\":0.05,\"output\":0.4},\"id\":\"gpt-5-nano\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5 Nano\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":15,\"output\":120},\"id\":\"gpt-5-pro\",\"input\":[\"text\",\"image\"],\"maxTokens\":272000,\"name\":\"GPT-5 Pro\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.13,\"cacheWrite\":0,\"input\":1.25,\"output\":10},\"id\":\"gpt-5.1\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5.1\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.125,\"cacheWrite\":0,\"input\":1.25,\"output\":10},\"id\":\"gpt-5.1-chat-latest\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-5.1 Chat\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.125,\"cacheWrite\":0,\"input\":1.25,\"output\":10},\"id\":\"gpt-5.1-codex\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5.1 Codex\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.125,\"cacheWrite\":0,\"input\":1.25,\"output\":10},\"id\":\"gpt-5.1-codex-max\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5.1 Codex Max\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.025,\"cacheWrite\":0,\"input\":0.25,\"output\":2},\"id\":\"gpt-5.1-codex-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5.1 Codex mini\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.175,\"cacheWrite\":0,\"input\":1.75,\"output\":14},\"id\":\"gpt-5.2\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5.2\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":128000,\"cost\":{\"cacheRead\":0.175,\"cacheWrite\":0,\"input\":1.75,\"output\":14},\"id\":\"gpt-5.2-chat-latest\",\"input\":[\"text\",\"image\"],\"maxTokens\":16384,\"name\":\"GPT-5.2 Chat\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0.175,\"cacheWrite\":0,\"input\":1.75,\"output\":14},\"id\":\"gpt-5.2-codex\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5.2 Codex\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":400000,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":21,\"output\":168},\"id\":\"gpt-5.2-pro\",\"input\":[\"text\",\"image\"],\"maxTokens\":128000,\"name\":\"GPT-5.2 Pro\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":7.5,\"cacheWrite\":0,\"input\":15,\"output\":60},\"id\":\"o1\",\"input\":[\"text\",\"image\"],\"maxTokens\":100000,\"name\":\"o1\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":150,\"output\":600},\"id\":\"o1-pro\",\"input\":[\"text\",\"image\"],\"maxTokens\":100000,\"name\":\"o1-pro\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0.5,\"cacheWrite\":0,\"input\":2,\"output\":8},\"id\":\"o3\",\"input\":[\"text\",\"image\"],\"maxTokens\":100000,\"name\":\"o3\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":2.5,\"cacheWrite\":0,\"input\":10,\"output\":40},\"id\":\"o3-deep-research\",\"input\":[\"text\",\"image\"],\"maxTokens\":100000,\"name\":\"o3-deep-research\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0.55,\"cacheWrite\":0,\"input\":1.1,\"output\":4.4},\"id\":\"o3-mini\",\"input\":[\"text\"],\"maxTokens\":100000,\"name\":\"o3-mini\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0,\"cacheWrite\":0,\"input\":20,\"output\":80},\"id\":\"o3-pro\",\"input\":[\"text\",\"image\"],\"maxTokens\":100000,\"name\":\"o3-pro\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0.28,\"cacheWrite\":0,\"input\":1.1,\"output\":4.4},\"id\":\"o4-mini\",\"input\":[\"text\",\"image\"],\"maxTokens\":100000,\"name\":\"o4-mini\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"openai-responses\",\"baseUrl\":\"http://127.0.0.1:<PORT>/v1\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0.5,\"cacheWrite\":0,\"input\":2,\"output\":8},\"id\":\"o4-mini-deep-research\",\"input\":[\"text\",\"image\"],\"maxTokens\":100000,\"name\":\"o4-mini-deep-research\",\"provider\":\"openai\",\"reasoning\":true},{\"api\":\"custom-anthropic-api\",\"baseUrl\":\"https://api.anthropic.com\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0.5,\"cacheWrite\":6.25,\"input\":5,\"output\":25},\"id\":\"claude-opus-4-5\",\"input\":[\"text\",\"image\"],\"maxTokens\":64000,\"name\":\"Claude Opus 4.5 (Custom)\",\"provider\":\"custom-anthropic\",\"reasoning\":true},{\"api\":\"custom-anthropic-api\",\"baseUrl\":\"https://api.anthropic.com\",\"contextWindow\":200000,\"cost\":{\"cacheRead\":0.3,\"cacheWrite\":3.75,\"input\":3,\"output\":15},\"id\":\"claude-sonnet-4-5\",\"input\":[\"text\",\"image\"],\"maxTokens\":64000,\"name\":\"Claude Sonnet 4.5 (Custom)\",\"provider\":\"custom-anthropic\",\"reasoning\":true}]},\"id\":\"cmd-1\",\"success\":true,\"type\":\"response\"}"
+        ],
+        "meta_normalized": {
+          "agent_dir": "target/legacy_capture/scn-custom-provider-anthropic-001/<RUN_ID>/agent",
+          "env": {
+            "TZ": "UTC",
+            "no_env": true
+          },
+          "exit": {
+            "code": null,
+            "success": false
+          },
+          "extension_id": "custom-provider-anthropic",
+          "finished_at": "<TIMESTAMP>",
+          "mock_openai": {
+            "base_url": "http://127.0.0.1:<PORT>/v1"
+          },
+          "model": "gpt-4o-mini",
+          "models_json": "target/legacy_capture/scn-custom-provider-anthropic-001/<RUN_ID>/agent/models.json",
+          "node_preload": null,
+          "pi_mono": {
+            "extension_path": "packages/coding-agent/examples/extensions/custom-provider-anthropic",
+            "head": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "manifest_checksum_sha256": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68",
+            "manifest_commit": "df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5",
+            "root": "legacy_pi_mono_code/pi-mono"
+          },
+          "provider": "openai",
+          "run_id": "<RUN_ID>",
+          "scenario_event_name": null,
+          "scenario_id": "scn-custom-provider-anthropic-001",
+          "scenario_kind": "provider",
+          "schema": "pi.legacy_capture.v1",
+          "seed_session": null,
+          "settings_json": "target/legacy_capture/scn-custom-provider-anthropic-001/<RUN_ID>/agent/settings.json",
+          "started_at": "<TIMESTAMP>"
+        },
+        "capture_log_normalized_jsonl": [
+          "{\"correlation\":{\"extension_id\":\"custom-provider-anthropic\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-custom-provider-anthropic-001\"},\"data\":{\"extension_path\":\"packages/coding-agent/examples/extensions/custom-provider-anthropic\",\"legacy_head\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"manifest_checksum_sha256\":\"a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68\",\"manifest_commit\":\"df5b0f76c026b35fdd7f0fb78cb0dbaaf939c1b5\",\"model\":\"gpt-4o-mini\",\"node_version\":\"v20.19.4\",\"npm_version\":\"9.2.0\",\"pi_mono_root\":\"legacy_pi_mono_code/pi-mono\",\"provider\":\"openai\",\"scenario_command_name\":null,\"scenario_event_name\":null,\"scenario_kind\":\"provider\",\"scenario_provider_id\":\"custom-anthropic\",\"scenario_tool_name\":null,\"started_at\":\"<TIMESTAMP>\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.start\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:19.103Z\"}",
+          "{\"correlation\":{\"extension_id\":\"custom-provider-anthropic\",\"run_id\":\"<RUN_ID>\",\"scenario_id\":\"scn-custom-provider-anthropic-001\"},\"event\":\"capture\",\"level\":\"info\",\"message\":\"capture.finish\",\"schema\":\"pi.ext.log.v1\",\"source\":{\"component\":\"capture\",\"pid\":2999939},\"ts\":\"2026-02-03T12:37:21.460Z\"}"
+        ]
+      }
+    }
+  ]
+}
