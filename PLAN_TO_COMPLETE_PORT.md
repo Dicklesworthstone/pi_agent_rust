@@ -6,16 +6,24 @@
 
 ## Executive Summary
 
-**Current State:** ~45% complete
-- Core types, tools, Anthropic provider: ✅ Done
-- TUI, interactive mode, additional providers: ❌ Missing
+**Current State:** ~85-90% complete
+- Core types, tools, sessions, CLI, interactive TUI: ✅ Implemented
+- Multi-provider (Anthropic/OpenAI/Gemini/Azure): ✅ Implemented
+- RPC mode (stdin/stdout JSON protocol): ✅ Implemented (see `src/rpc.rs`, `tests/rpc_mode.rs`)
+- Conformance harness: ✅ Tools fixture suite + integration tests
+- Benchmarks: ✅ Truncation + SSE parsing baseline
 
 **Target State:** Production-ready CLI with:
 - Full interactive TUI using charmed_rust (Elm Architecture)
 - All streaming via asupersync (cancel-correct, structured concurrency)
 - Beautiful output via rich_rust (markup, tables, panels)
-- Comprehensive conformance test suite with Go/TypeScript reference capture
-- Benchmark harness proving performance targets
+- Comprehensive conformance test suite (tools + RPC + extensions) with TypeScript reference capture
+- Benchmark harness proving performance targets (including extension hostcall dispatch)
+
+**Primary Remaining Work:**
+1. **Extensions runtime** (connector dispatch, event loop, hostcalls) + conformance harness (`EXTENSIONS.md`, `CONFORMANCE.md`)
+2. **Themes discovery/hot reload** (resource pipeline + UI integration)
+3. **asupersync migration** (HTTP/TLS + task orchestration), then reduce/remove tokio usage
 
 ---
 
@@ -218,7 +226,7 @@ glamour = { path = "../charmed_rust/crates/glamour" }
 - [x] `/history` - Show input history
 - [x] `/clear` - Clear conversation
 - [x] `/quit` (`/exit`) - Exit application
-- [x] `/export` - Export to HTML (stub)
+- [x] `/export` - Export to HTML
 
 **3.5 Status Line**
 - [x] Current model/provider in header
@@ -236,9 +244,9 @@ glamour = { path = "../charmed_rust/crates/glamour" }
 ### Phase 4: HTTP Migration to asupersync (2-3 days)
 
 **4.1 Create HTTP Module**
-- [ ] `src/http/mod.rs` - HTTP client abstraction
-- [ ] `src/http/client.rs` - asupersync-based client
-- [ ] `src/http/sse.rs` - SSE streaming parser (reuse existing)
+- [x] `src/http/mod.rs` - HTTP client abstraction
+- [x] `src/http/client.rs` - asupersync-based client
+- [x] `src/http/sse.rs` - SSE streaming parser (reuse existing)
 
 **4.2 Migrate Anthropic Provider**
 - [ ] Replace reqwest with asupersync HTTP client

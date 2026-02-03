@@ -42,19 +42,19 @@ pub enum Error {
 
     /// IO errors
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] Box<std::io::Error>),
 
     /// JSON errors
     #[error("JSON error: {0}")]
-    Json(#[from] serde_json::Error),
+    Json(#[from] Box<serde_json::Error>),
 
     /// HTTP errors
     #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    Http(#[from] Box<reqwest::Error>),
 
     /// SQLite errors
     #[error("SQLite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(#[from] Box<sqlmodel_core::Error>),
 
     /// User aborted operation
     #[error("Operation aborted")]
@@ -110,5 +110,29 @@ impl Error {
     /// Create an API error.
     pub fn api(message: impl Into<String>) -> Self {
         Self::Api(message.into())
+    }
+}
+
+impl From<std::io::Error> for Error {
+    fn from(value: std::io::Error) -> Self {
+        Self::Io(Box::new(value))
+    }
+}
+
+impl From<serde_json::Error> for Error {
+    fn from(value: serde_json::Error) -> Self {
+        Self::Json(Box::new(value))
+    }
+}
+
+impl From<reqwest::Error> for Error {
+    fn from(value: reqwest::Error) -> Self {
+        Self::Http(Box::new(value))
+    }
+}
+
+impl From<sqlmodel_core::Error> for Error {
+    fn from(value: sqlmodel_core::Error) -> Self {
+        Self::Sqlite(Box::new(value))
     }
 }

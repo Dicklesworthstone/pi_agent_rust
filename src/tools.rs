@@ -45,12 +45,16 @@ pub trait Tool: Send + Sync {
 }
 
 /// Tool execution output.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolOutput {
     pub content: Vec<ContentBlock>,
     pub details: Option<serde_json::Value>,
 }
 
 /// Incremental update during tool execution.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolUpdate {
     pub content: Vec<ContentBlock>,
     pub details: Option<serde_json::Value>,
@@ -156,10 +160,6 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         }
 
         let line_bytes = line.len() + usize::from(i > 0); // +1 for newline
-        if line_count >= max_lines {
-            truncated_by = Some(TruncatedBy::Lines);
-            break;
-        }
 
         if byte_count + line_bytes > max_bytes {
             truncated_by = Some(TruncatedBy::Bytes);
@@ -468,10 +468,10 @@ pub fn process_file_arguments(
         let resolved = resolve_read_path(file_arg, cwd);
         let absolute_path = normalize_dot_segments(&resolved);
 
-        let meta = std::fs::metadata(&absolute_path).map_err(|_| {
+        let meta = std::fs::metadata(&absolute_path).map_err(|e| {
             Error::tool(
                 "read",
-                format!("File not found: {}", absolute_path.display()),
+                format!("Cannot access file {}: {e}", absolute_path.display()),
             )
         })?;
         if meta.len() == 0 {
@@ -1175,11 +1175,13 @@ impl Tool for BashTool {
         }
 
         let shell = self.shell_path.as_deref().unwrap_or_else(|| {
-            if Path::new("/bin/bash").exists() {
-                "/bin/bash"
-            } else {
-                "sh"
+            // Check common bash locations (varies by platform)
+            for path in ["/bin/bash", "/usr/bin/bash", "/usr/local/bin/bash"] {
+                if Path::new(path).exists() {
+                    return path;
+                }
             }
+            "sh"
         });
 
         // Spawn the bash process
@@ -1201,7 +1203,7 @@ impl Tool for BashTool {
             .take()
             .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
 
-        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
         tokio::spawn(pump_stream(stdout, tx.clone()));
         tokio::spawn(pump_stream(stderr, tx));
 
@@ -1274,7 +1276,16 @@ impl Tool for BashTool {
             return Err(Error::tool("bash", output));
         }
 
-        let truncation = truncate_tail(&full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let mut truncation = truncate_tail(&full_output, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        // Correct truncation metadata if we dropped data from the in-memory buffer.
+        // bash_output.chunks only holds the last ~100KB, so if total_bytes is larger,
+        // we have definitely truncated the head of the output.
+        if bash_output.total_bytes > bash_output.chunks_bytes {
+            truncation.truncated = true;
+            truncation.truncated_by = Some(TruncatedBy::Bytes);
+            truncation.total_bytes = bash_output.total_bytes;
+        }
+
         let mut output_text = if truncation.content.is_empty() {
             "(no output)".to_string()
         } else {
@@ -1422,7 +1433,75 @@ struct FuzzyMatchResult {
     content_for_replacement: String,
 }
 
+/// Build a mapping from normalized byte indices to original byte indices.
+/// Returns (normalized_string, Vec<original_byte_index_for_each_normalized_byte>).
+fn build_normalized_with_mapping(content: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::with_capacity(content.len());
+    let mut mapping = Vec::with_capacity(content.len());
+
+    // Process line by line to handle trailing whitespace normalization
+    let lines: Vec<&str> = content.split('\n').collect();
+    let last_line_idx = lines.len().saturating_sub(1);
+
+    let mut original_byte_offset = 0;
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        // Trim trailing whitespace for fuzzy matching
+        let trimmed_len = line.trim_end().len();
+
+        for (char_offset, c) in line.char_indices() {
+            // Skip trailing whitespace (chars beyond trimmed_len)
+            if char_offset >= trimmed_len {
+                continue;
+            }
+
+            let orig_byte_idx = original_byte_offset + char_offset;
+
+            // Normalize the character
+            let normalized_char = if is_special_unicode_space(c) {
+                ' '
+            } else if matches!(c, '\u{2018}' | '\u{2019}') {
+                '\''
+            } else if matches!(c, '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}') {
+                '"'
+            } else if matches!(
+                c,
+                '\u{2010}'
+                    | '\u{2011}'
+                    | '\u{2012}'
+                    | '\u{2013}'
+                    | '\u{2014}'
+                    | '\u{2015}'
+                    | '\u{2212}'
+            ) {
+                '-'
+            } else {
+                c
+            };
+
+            let char_len_in_normalized = normalized_char.len_utf8();
+            normalized.push(normalized_char);
+            for _ in 0..char_len_in_normalized {
+                mapping.push(orig_byte_idx);
+            }
+        }
+
+        // Move past this line in original content
+        original_byte_offset += line.len();
+
+        // Add newline if not the last line
+        if line_idx < last_line_idx {
+            normalized.push('\n');
+            mapping.push(original_byte_offset); // Points to the \n in original
+            original_byte_offset += 1; // Move past the \n
+        }
+    }
+
+    (normalized, mapping)
+}
+
 fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
+    // First, try exact match (fastest path)
     if let Some(index) = content.find(old_text) {
         return FuzzyMatchResult {
             found: true,
@@ -1432,14 +1511,40 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatchResult {
         };
     }
 
-    let fuzzy_content = normalize_for_fuzzy_match_text(content);
-    let fuzzy_old_text = normalize_for_fuzzy_match_text(old_text);
-    if let Some(index) = fuzzy_content.find(&fuzzy_old_text) {
+    // Build normalized versions with index mapping
+    let (normalized_content, content_mapping) = build_normalized_with_mapping(content);
+    let (normalized_old_text, _) = build_normalized_with_mapping(old_text);
+
+    // Try to find the normalized old_text in normalized content
+    if let Some(normalized_index) = normalized_content.find(&normalized_old_text) {
+        // Map the normalized index back to original content
+        let original_start = if normalized_index < content_mapping.len() {
+            content_mapping[normalized_index]
+        } else {
+            // Edge case: match at very end
+            content.len()
+        };
+
+        // Find the end position in original content
+        let normalized_end = normalized_index + normalized_old_text.len();
+        let original_end = if normalized_end < content_mapping.len() {
+            // Get the byte position after the match
+            // We need to find where the next character starts in original
+            content_mapping[normalized_end]
+        } else {
+            // Match goes to end of content
+            content.len()
+        };
+
+        // But we need the actual end including any trailing whitespace that was stripped
+        // Find the end of the matched region in original content by looking at line structure
+        let original_match_len = original_end - original_start;
+
         return FuzzyMatchResult {
             found: true,
-            index,
-            match_length: fuzzy_old_text.len(),
-            content_for_replacement: fuzzy_content,
+            index: original_start,
+            match_length: original_match_len,
+            content_for_replacement: content.to_string(),
         };
     }
 
@@ -1993,7 +2098,12 @@ impl Tool for GrepTool {
         let search_path = resolve_path(search_dir, &self.cwd);
 
         let is_directory = std::fs::metadata(&search_path)
-            .map_err(|_| Error::tool("grep", format!("Path not found: {}", search_path.display())))?
+            .map_err(|e| {
+                Error::tool(
+                    "grep",
+                    format!("Cannot access path {}: {e}", search_path.display()),
+                )
+            })?
             .is_dir();
 
         let context_value = input.context.unwrap_or(0);
@@ -2619,14 +2729,16 @@ fn rg_available() -> bool {
 
 async fn pump_stream<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
     mut reader: R,
-    tx: mpsc::UnboundedSender<Vec<u8>>,
+    tx: mpsc::Sender<Vec<u8>>,
 ) {
     let mut buf = vec![0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                let _ = tx.send(buf[..n].to_vec());
+                if tx.send(buf[..n].to_vec()).await.is_err() {
+                    break;
+                }
             }
         }
     }
@@ -2737,7 +2849,7 @@ fn kill_process_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     let root = sysinfo::Pid::from_u32(pid);
 
-    let mut sys = sysinfo::System::new_all();
+    let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
 
     let mut children_map: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();

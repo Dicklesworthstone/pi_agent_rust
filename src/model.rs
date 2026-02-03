@@ -232,6 +232,89 @@ pub enum StreamEvent {
 }
 
 // ============================================================================
+// Assistant Message Events (Streaming)
+// ============================================================================
+
+/// Streaming event emitted for assistant message updates.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub enum AssistantMessageEvent {
+    #[serde(rename = "start")]
+    Start { partial: AssistantMessage },
+    #[serde(rename = "text_start")]
+    TextStart {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "text_delta")]
+    TextDelta {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        delta: String,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "text_end")]
+    TextEnd {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        content: String,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "thinking_start")]
+    ThinkingStart {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        delta: String,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "thinking_end")]
+    ThinkingEnd {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        content: String,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "toolcall_start")]
+    ToolCallStart {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "toolcall_delta")]
+    ToolCallDelta {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        delta: String,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "toolcall_end")]
+    ToolCallEnd {
+        #[serde(rename = "contentIndex")]
+        content_index: usize,
+        #[serde(rename = "toolCall")]
+        tool_call: ToolCall,
+        partial: AssistantMessage,
+    },
+    #[serde(rename = "done")]
+    Done {
+        reason: StopReason,
+        message: AssistantMessage,
+    },
+    #[serde(rename = "error")]
+    Error {
+        reason: StopReason,
+        error: AssistantMessage,
+    },
+}
+
+// ============================================================================
 // Thinking Level
 // ============================================================================
 
@@ -275,5 +358,19 @@ impl ThinkingLevel {
             Self::High => 16384,
             Self::XHigh => u32::MAX, // Model max
         }
+    }
+}
+
+impl std::fmt::Display for ThinkingLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        };
+        write!(f, "{s}")
     }
 }

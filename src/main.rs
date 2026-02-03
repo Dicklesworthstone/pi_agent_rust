@@ -75,7 +75,8 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
         extension_paths: cli.extension.clone(),
         theme_paths: cli.theme.clone(),
     };
-    let resources = match ResourceLoader::load(&package_manager, &cwd, &config, &resource_cli) {
+    let resources = match ResourceLoader::load(&package_manager, &cwd, &config, &resource_cli).await
+    {
         Ok(resources) => resources,
         Err(err) => {
             eprintln!("Warning: Failed to load skills/prompts: {err}");
@@ -88,16 +89,6 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
-    }
-
-    // Auto-install packages from settings on startup
-    let package_manager = PackageManager::new(cwd.clone());
-    if let Ok(installed) = package_manager.ensure_packages_installed() {
-        if cli.verbose && !installed.is_empty() {
-            for entry in &installed {
-                eprintln!("Auto-installed: {}", entry.source);
-            }
-        }
     }
 
     if let Some(pattern) = &cli.list_models {
@@ -203,13 +194,30 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
         !cli.no_session,
     );
 
-    let history = agent_session.session.to_messages();
+    let history = agent_session.session.to_messages_for_current_path();
     if !history.is_empty() {
         agent_session.agent.replace_messages(history);
     }
 
     if mode == "rpc" {
-        return run_rpc_mode(&mut agent_session).await;
+        let available_models = model_registry.get_available();
+        let rpc_scoped_models = selection
+            .scoped_models
+            .iter()
+            .map(|sm| pi::rpc::RpcScopedModel {
+                model: sm.model.clone(),
+                thinking_level: sm.thinking_level,
+            })
+            .collect::<Vec<_>>();
+        return run_rpc_mode(
+            agent_session,
+            resources,
+            config.clone(),
+            available_models,
+            rpc_scoped_models,
+            auth.clone(),
+        )
+        .await;
     }
 
     if is_interactive {
@@ -230,6 +238,8 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
             available_models,
             !cli.no_session,
             resources,
+            resource_cli,
+            cwd.clone(),
         )
         .await;
     }
@@ -314,7 +324,7 @@ fn handle_package_list(manager: &PackageManager) -> Result<()> {
     for entry in entries {
         match entry.scope {
             PackageScope::User => user.push(entry),
-            PackageScope::Project => project.push(entry),
+            PackageScope::Project | PackageScope::Temporary => project.push(entry),
         }
     }
 
@@ -344,7 +354,7 @@ fn handle_package_list(manager: &PackageManager) -> Result<()> {
 }
 
 fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
-    let display = if entry.filtered {
+    let display = if entry.filter.is_some() {
         format!("{} (filtered)", entry.source)
     } else {
         entry.source.clone()
@@ -517,14 +527,34 @@ async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<P
     let output_path = output_path.map_or_else(|| default_export_path(input), PathBuf::from);
 
     if let Some(parent) = output_path.parent() {
-        std::fs::create_dir_all(parent)?;
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
     std::fs::write(&output_path, html)?;
     Ok(output_path)
 }
 
-async fn run_rpc_mode(_session: &mut AgentSession) -> Result<()> {
-    bail!("RPC mode not yet implemented");
+async fn run_rpc_mode(
+    session: AgentSession,
+    resources: ResourceLoader,
+    config: Config,
+    available_models: Vec<ModelEntry>,
+    scoped_models: Vec<pi::rpc::RpcScopedModel>,
+    auth: AuthStorage,
+) -> Result<()> {
+    pi::rpc::run_stdio(
+        session,
+        pi::rpc::RpcOptions {
+            config,
+            resources,
+            available_models,
+            scoped_models,
+            auth,
+        },
+    )
+    .await
+    .map_err(anyhow::Error::new)
 }
 
 async fn run_print_mode(
@@ -621,6 +651,8 @@ async fn run_interactive_mode(
     available_models: Vec<ModelEntry>,
     save_enabled: bool,
     resources: ResourceLoader,
+    resource_cli: ResourceCliOptions,
+    cwd: PathBuf,
 ) -> Result<()> {
     let mut pending = Vec::new();
     if let Some(initial) = initial {
@@ -643,6 +675,8 @@ async fn run_interactive_mode(
         pending,
         save_enabled,
         resources,
+        resource_cli,
+        cwd,
     )
     .await?;
     Ok(())
@@ -1491,6 +1525,7 @@ fn build_stream_options(
             low: budgets.low.unwrap_or(defaults.low),
             medium: budgets.medium.unwrap_or(defaults.medium),
             high: budgets.high.unwrap_or(defaults.high),
+            xhigh: budgets.xhigh.unwrap_or(defaults.xhigh),
         });
     }
 

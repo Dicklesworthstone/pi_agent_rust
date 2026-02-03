@@ -8,8 +8,9 @@
 //! - `truncate_tail_10k_lines`: <1ms
 //! - `sse_parse_100_events`: <100μs
 
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::fmt::Write as _;
+use std::hint::black_box;
 
 // ============================================================================
 // Test Data Builders

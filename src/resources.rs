@@ -7,8 +7,9 @@
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::package_manager::PackageManager;
-use serde_json::Value;
+use crate::package_manager::{PackageManager, ResolveExtensionSourcesOptions};
+use rich_rust::Theme;
+use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -102,6 +103,32 @@ pub struct LoadPromptTemplatesOptions {
 }
 
 // ============================================================================
+// Themes
+// ============================================================================
+
+#[derive(Debug, Clone)]
+pub struct ThemeResource {
+    pub name: String,
+    pub theme: Theme,
+    pub source: String,
+    pub file_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadThemesOptions {
+    pub cwd: PathBuf,
+    pub agent_dir: PathBuf,
+    pub theme_paths: Vec<PathBuf>,
+    pub include_defaults: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadThemesResult {
+    pub themes: Vec<ThemeResource>,
+    pub diagnostics: Vec<ResourceDiagnostic>,
+}
+
+// ============================================================================
 // Resource Loader
 // ============================================================================
 
@@ -132,6 +159,8 @@ pub struct ResourceLoader {
     skill_diagnostics: Vec<ResourceDiagnostic>,
     prompts: Vec<PromptTemplate>,
     prompt_diagnostics: Vec<ResourceDiagnostic>,
+    themes: Vec<ThemeResource>,
+    theme_diagnostics: Vec<ResourceDiagnostic>,
     enable_skill_commands: bool,
 }
 
@@ -142,63 +171,130 @@ impl ResourceLoader {
             skill_diagnostics: Vec::new(),
             prompts: Vec::new(),
             prompt_diagnostics: Vec::new(),
+            themes: Vec::new(),
+            theme_diagnostics: Vec::new(),
             enable_skill_commands,
         }
     }
 
-    pub fn load(
+    #[allow(clippy::too_many_lines)]
+    pub async fn load(
         manager: &PackageManager,
         cwd: &Path,
         config: &Config,
         cli: &ResourceCliOptions,
     ) -> Result<Self> {
-        let package_resources = discover_package_resources(manager)?;
-
         let enable_skill_commands = config.enable_skill_commands();
 
-        let include_skills = !cli.no_skills;
-        let include_prompts = !cli.no_prompt_templates;
+        // Resolve configured resources (settings + auto-discovery + packages) and CLI `-e` sources.
+        let resolved = manager.resolve().await?;
+        let cli_extensions = manager
+            .resolve_extension_sources(
+                &cli.extension_paths,
+                ResolveExtensionSourcesOptions {
+                    local: false,
+                    temporary: true,
+                },
+            )
+            .await?;
 
+        let resolved_skill_paths = resolved
+            .skills
+            .into_iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+        let resolved_prompt_paths = resolved
+            .prompts
+            .into_iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+        let resolved_theme_paths = resolved
+            .themes
+            .into_iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+
+        let cli_skill_paths = cli_extensions
+            .skills
+            .into_iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+        let cli_prompt_paths = cli_extensions
+            .prompts
+            .into_iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+        let cli_theme_paths = cli_extensions
+            .themes
+            .into_iter()
+            .filter(|r| r.enabled)
+            .map(|r| r.path)
+            .collect::<Vec<_>>();
+
+        // Merge paths with pi-mono semantics:
+        // - `--no-skills` disables configured + auto skills, but still loads CLI `-e` and explicit `--skill`
+        // - `--no-prompt-templates` disables configured + auto prompts, but still loads CLI `-e` and explicit `--prompt-template`
         let mut skill_paths = Vec::new();
-        if include_skills {
-            if let Some(paths) = &config.skills {
-                skill_paths.extend(paths.iter().map(|p| resolve_path(p, cwd)));
-            }
-            skill_paths.extend(package_resources.skills);
+        if !cli.no_skills {
+            skill_paths.extend(resolved_skill_paths);
         }
+        skill_paths.extend(cli_skill_paths);
         skill_paths.extend(cli.skill_paths.iter().map(|p| resolve_path(p, cwd)));
         let skill_paths = dedupe_paths(skill_paths);
 
         let mut prompt_paths = Vec::new();
-        if include_prompts {
-            if let Some(paths) = &config.prompts {
-                prompt_paths.extend(paths.iter().map(|p| resolve_path(p, cwd)));
-            }
-            prompt_paths.extend(package_resources.prompts);
+        if !cli.no_prompt_templates {
+            prompt_paths.extend(resolved_prompt_paths);
         }
+        prompt_paths.extend(cli_prompt_paths);
         prompt_paths.extend(cli.prompt_paths.iter().map(|p| resolve_path(p, cwd)));
         let prompt_paths = dedupe_paths(prompt_paths);
+
+        let mut theme_paths = Vec::new();
+        if !cli.no_themes {
+            theme_paths.extend(resolved_theme_paths);
+        }
+        theme_paths.extend(cli_theme_paths);
+        theme_paths.extend(cli.theme_paths.iter().map(|p| resolve_path(p, cwd)));
+        let theme_paths = dedupe_paths(theme_paths);
 
         let skills_result = load_skills(LoadSkillsOptions {
             cwd: cwd.to_path_buf(),
             agent_dir: Config::global_dir(),
             skill_paths,
-            include_defaults: include_skills,
+            include_defaults: false,
         });
 
         let prompt_templates = load_prompt_templates(LoadPromptTemplatesOptions {
             cwd: cwd.to_path_buf(),
             agent_dir: Config::global_dir(),
             prompt_paths,
-            include_defaults: include_prompts,
+            include_defaults: false,
         });
         let (prompts, prompt_diagnostics) = dedupe_prompts(prompt_templates);
+
+        let themes_result = load_themes(LoadThemesOptions {
+            cwd: cwd.to_path_buf(),
+            agent_dir: Config::global_dir(),
+            theme_paths,
+            include_defaults: false,
+        });
+        let (themes, theme_diagnostics) = dedupe_themes(themes_result.themes);
+        let mut theme_diags = themes_result.diagnostics;
+        theme_diags.extend(theme_diagnostics);
 
         Ok(Self {
             skills: skills_result.skills,
             skill_diagnostics: skills_result.diagnostics,
             prompts,
             prompt_diagnostics,
+            themes,
+            theme_diagnostics: theme_diags,
             enable_skill_commands,
         })
     }
@@ -219,12 +315,66 @@ impl ResourceLoader {
         &self.prompt_diagnostics
     }
 
+    pub fn themes(&self) -> &[ThemeResource] {
+        &self.themes
+    }
+
+    pub fn theme_diagnostics(&self) -> &[ResourceDiagnostic] {
+        &self.theme_diagnostics
+    }
+
+    pub fn resolve_theme(&self, selected: Option<&str>) -> Option<Theme> {
+        let selected = selected?;
+        let trimmed = selected.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let path = Path::new(trimmed);
+        if path.exists() {
+            if let Ok(theme) = Theme::read(path, true) {
+                return Some(theme);
+            }
+        }
+
+        self.themes
+            .iter()
+            .find(|theme| theme.name.eq_ignore_ascii_case(trimmed))
+            .map(|theme| theme.theme.clone())
+    }
+
     pub const fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands
     }
 
     pub fn format_skills_for_prompt(&self) -> String {
         format_skills_for_prompt(&self.skills)
+    }
+
+    pub fn list_commands(&self) -> Vec<Value> {
+        let mut commands = Vec::new();
+
+        for template in &self.prompts {
+            commands.push(json!({
+                "name": template.name,
+                "description": template.description,
+                "source": "template",
+                "location": template.source,
+                "path": template.file_path.display().to_string(),
+            }));
+        }
+
+        for skill in &self.skills {
+            commands.push(json!({
+                "name": format!("skill:{}", skill.name),
+                "description": skill.description,
+                "source": "skill",
+                "location": skill.source,
+                "path": skill.file_path.display().to_string(),
+            }));
+        }
+
+        commands
     }
 
     pub fn expand_input(&self, text: &str) -> String {
@@ -902,6 +1052,147 @@ fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<Pro
     })
 }
 
+// ============================================================================
+// Themes loader
+// ============================================================================
+
+pub fn load_themes(options: LoadThemesOptions) -> LoadThemesResult {
+    let mut themes = Vec::new();
+    let mut diagnostics = Vec::new();
+
+    let user_dir = options.agent_dir.join("themes");
+    let project_dir = options.cwd.join(Config::project_dir()).join("themes");
+
+    if options.include_defaults {
+        themes.extend(load_themes_from_dir(
+            &user_dir,
+            "user",
+            "(user)",
+            &mut diagnostics,
+        ));
+        themes.extend(load_themes_from_dir(
+            &project_dir,
+            "project",
+            "(project)",
+            &mut diagnostics,
+        ));
+    }
+
+    for path in options.theme_paths {
+        if !path.exists() {
+            continue;
+        }
+
+        let source_info = if options.include_defaults {
+            ("path", build_path_source_label(&path))
+        } else if is_under_path(&path, &user_dir) {
+            ("user", "(user)".to_string())
+        } else if is_under_path(&path, &project_dir) {
+            ("project", "(project)".to_string())
+        } else {
+            ("path", build_path_source_label(&path))
+        };
+
+        let (source, label) = source_info;
+
+        match fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => {
+                themes.extend(load_themes_from_dir(
+                    &path,
+                    source,
+                    &label,
+                    &mut diagnostics,
+                ));
+            }
+            Ok(meta) if meta.is_file() && is_theme_file(&path) => {
+                if let Some(theme) = load_theme_from_file(&path, source, &label, &mut diagnostics) {
+                    themes.push(theme);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    LoadThemesResult {
+        themes,
+        diagnostics,
+    }
+}
+
+fn load_themes_from_dir(
+    dir: &Path,
+    source: &str,
+    label: &str,
+    diagnostics: &mut Vec<ResourceDiagnostic>,
+) -> Vec<ThemeResource> {
+    let mut themes = Vec::new();
+    if !dir.exists() {
+        return themes;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return themes;
+    };
+
+    for entry in entries.flatten() {
+        let full_path = entry.path();
+        let file_type = entry.file_type();
+        let is_file = match file_type {
+            Ok(ft) if ft.is_symlink() => fs::metadata(&full_path).is_ok_and(|m| m.is_file()),
+            Ok(ft) => ft.is_file(),
+            Err(_) => false,
+        };
+
+        if is_file && is_theme_file(&full_path) {
+            if let Some(theme) = load_theme_from_file(&full_path, source, label, diagnostics) {
+                themes.push(theme);
+            }
+        }
+    }
+
+    themes
+}
+
+fn is_theme_file(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|ext| ext.to_str()),
+        Some("ini" | "theme")
+    )
+}
+
+fn load_theme_from_file(
+    path: &Path,
+    source: &str,
+    label: &str,
+    diagnostics: &mut Vec<ResourceDiagnostic>,
+) -> Option<ThemeResource> {
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("theme")
+        .to_string();
+
+    match Theme::read(path, true) {
+        Ok(theme) => Some(ThemeResource {
+            name,
+            theme,
+            source: format!("{source}:{label}"),
+            file_path: path.to_path_buf(),
+        }),
+        Err(err) => {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Warning,
+                message: format!(
+                    "Failed to load theme \"{name}\" ({}): {err}",
+                    path.display()
+                ),
+                path: path.to_path_buf(),
+                collision: None,
+            });
+            None
+        }
+    }
+}
+
 fn build_path_source_label(path: &Path) -> String {
     let base = path.file_stem().and_then(|s| s.to_str()).unwrap_or("path");
     format!("(path:{base})")
@@ -927,6 +1218,31 @@ fn dedupe_prompts(prompts: Vec<PromptTemplate>) -> (Vec<PromptTemplate>, Vec<Res
             continue;
         }
         seen.insert(prompt.name.clone(), prompt);
+    }
+
+    (seen.into_values().collect(), diagnostics)
+}
+
+fn dedupe_themes(themes: Vec<ThemeResource>) -> (Vec<ThemeResource>, Vec<ResourceDiagnostic>) {
+    let mut seen: HashMap<String, ThemeResource> = HashMap::new();
+    let mut diagnostics = Vec::new();
+
+    for theme in themes {
+        if let Some(existing) = seen.get(&theme.name) {
+            diagnostics.push(ResourceDiagnostic {
+                kind: DiagnosticKind::Collision,
+                message: format!("theme \"{}\" collision", theme.name),
+                path: theme.file_path.clone(),
+                collision: Some(CollisionInfo {
+                    resource_type: "theme".to_string(),
+                    name: theme.name.clone(),
+                    winner_path: existing.file_path.clone(),
+                    loser_path: theme.file_path.clone(),
+                }),
+            });
+            continue;
+        }
+        seen.insert(theme.name.clone(), theme);
     }
 
     (seen.into_values().collect(), diagnostics)

@@ -174,7 +174,7 @@ impl<S> SseStream<S> {
 
 impl<S> SseStream<S>
 where
-    S: asupersync::stream::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
+    S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
 {
     /// Poll for the next SSE event.
     pub fn poll_next_event(
@@ -256,6 +256,17 @@ where
                 }
             }
         }
+    }
+}
+
+impl<S> futures::Stream for SseStream<S>
+where
+    S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    type Item = Result<SseEvent, std::io::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.poll_next_event(cx)
     }
 }
 

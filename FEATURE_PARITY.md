@@ -1,7 +1,7 @@
 # Feature Parity: pi_agent_rust vs Pi Agent (TypeScript)
 
 > **Purpose:** Authoritative single-source-of-truth for implementation status.
-> **Last Updated:** 2026-02-02 (89 tests pass, read tool line numbers, all providers complete)
+> **Last Updated:** 2026-02-03 (RPC mode parity + session stats; clippy/tests green)
 
 ## Status Legend
 
@@ -23,7 +23,7 @@
 | **Tools (7 total)** | 7 | 0 | 0 | 0 | 7 |
 | **Agent Runtime** | 7 | 0 | 0 | 0 | 7 |
 | **Session Management** | 10 | 0 | 0 | 0 | 10 |
-| **CLI** | 9 | 0 | 0 | 1 | 10 |
+| **CLI** | 10 | 0 | 0 | 0 | 10 |
 | **Resources & Customization** | 6 | 0 | 2 | 0 | 8 |
 | **TUI** | 18 | 0 | 0 | 2 | 20 |
 | **Configuration** | 2 | 0 | 0 | 0 | 2 |
@@ -171,7 +171,7 @@
 | Model listing | ✅ | `src/main.rs` | - | Table output |
 | Session export | ✅ | `src/main.rs` | - | HTML export |
 | Print mode | ✅ | `src/main.rs` | - | Single-shot mode |
-| RPC mode | ⬜ | `src/main.rs` | - | Out of scope for v1 |
+| RPC mode | ✅ | `src/main.rs`, `src/rpc.rs` | `tests/rpc_mode.rs` | Headless stdin/stdout JSON protocol (prompt/steer/follow_up/state/stats/model/thinking/compact/bash/fork) |
 | Package management | ✅ | `src/package_manager.rs`, `src/main.rs` | Unit | install/remove/update/list + settings updates + startup auto-install + resource resolution |
 
 ---
@@ -186,7 +186,7 @@
 | Prompt template loader | ✅ | `src/resources.rs` | Unit | Global/project + explicit paths |
 | Prompt template expansion (`/name args`) | ✅ | `src/resources.rs`, `src/interactive.rs` | Unit | `$1`, `$@`, `$ARGUMENTS`, `${@:N}` |
 | Package resource discovery | ✅ | `src/resources.rs` | Unit | Reads `package.json` `pi` field or defaults |
-| Extension discovery/runtime | ❌ | `src/extensions.rs` | - | Protocol scaffold only |
+| Extension discovery/runtime | ❌ | `src/extensions.rs` | - | Protocol scaffold only (see `EXTENSIONS.md` for connector + event loop design) |
 | Themes discovery/hot reload | ❌ | - | - | Not yet implemented |
 
 ---
@@ -234,7 +234,7 @@
 | Keyboard navigation | ✅ | `src/interactive.rs` | - | Up/Down history, Esc quit |
 | Agent integration | ✅ | `src/interactive.rs` | - | Agent events wired; CLI interactive uses PiApp |
 | Multi-line editor | ✅ | `src/interactive.rs` | - | TextArea with line wrapping |
-| Slash command system | ✅ | `src/interactive.rs` | - | /help, /clear, /model, /thinking, /exit, /history, /export |
+| Slash command system | ✅ | `src/interactive.rs` | - | /help, /login, /logout, /clear, /model, /thinking, /exit, /history, /export, /session, /resume, /new, /copy, /name, /hotkeys |
 | Viewport scrolling | ✅ | `src/interactive.rs` | - | Viewport with scroll_to_bottom() |
 | Image display | ⬜ | - | - | Terminal dependent |
 | Autocomplete | ⬜ | - | - | Defer |
@@ -250,22 +250,22 @@
 | `/history` | ✅ | `src/interactive.rs` | Show input history |
 | `/export` | ✅ | `src/interactive.rs` | Export session to HTML |
 | `/exit` / `/quit` | ✅ | `src/interactive.rs` | Exit Pi |
-| `/login` | ❌ | - | OAuth login (Anthropic/Codex/Copilot/etc.) |
-| `/logout` | ❌ | - | Remove OAuth credentials |
-| `/scoped-models` | ❌ | - | Enable/disable models for Ctrl+P cycling |
-| `/settings` | ❌ | - | TUI settings (theme/thinking/delivery) |
-| `/resume` | ❌ | - | Pick from previous sessions |
-| `/new` | ❌ | - | Start a new session |
-| `/name <name>` | ❌ | - | Set session display name |
-| `/session` | ❌ | - | Show session info (path/tokens/cost) |
-| `/tree` | ❌ | - | Jump to any point in the session |
-| `/fork` | ❌ | - | Create new session from current branch |
-| `/compact [prompt]` | ❌ | - | Manual compaction |
-| `/copy` | ❌ | - | Copy last assistant message |
-| `/share` | ❌ | - | Share session (gist) |
-| `/reload` | ❌ | - | Reload extensions/skills/prompts/context |
-| `/hotkeys` | ❌ | - | Show keybindings |
-| `/changelog` | ❌ | - | Display version history |
+| `/login` | 🔶 | `src/interactive.rs`, `src/auth.rs` | OAuth login (Anthropic supported; others pending) |
+| `/logout` | ✅ | `src/interactive.rs`, `src/auth.rs` | Remove stored credentials |
+| `/session` | ✅ | `src/interactive.rs` | Show session info (path/tokens/cost) |
+| `/resume` | 🔶 | `src/interactive.rs` | Shows hint to use --resume flag |
+| `/new` | 🔶 | `src/interactive.rs` | Shows hint to restart Pi |
+| `/name <name>` | ✅ | `src/interactive.rs` | Set session display name |
+| `/copy` | 🔶 | `src/interactive.rs` | Clipboard feature not enabled (placeholder) |
+| `/hotkeys` | ✅ | `src/interactive.rs` | Show keybindings |
+| `/scoped-models` | 🔶 | `src/interactive.rs` | Scoped list stored; cycling keybind pending |
+| `/settings` | 🔶 | `src/interactive.rs` | Shows merged settings JSON (no editor UI) |
+| `/tree` | ✅ | `src/interactive.rs` | List leaves and switch branch by id/index |
+| `/fork` | ✅ | `src/interactive.rs` | Forks new session file from user message |
+| `/compact [prompt]` | ✅ | `src/interactive.rs`, `src/compaction.rs` | Manual compaction |
+| `/share` | 🔶 | `src/interactive.rs` | Saves HTML to temp file (no remote share) |
+| `/reload` | 🔶 | `src/interactive.rs`, `src/resources.rs` | Reloads skills/prompts (themes/extensions pending) |
+| `/changelog` | ✅ | `src/interactive.rs` | Display changelog entries |
 
 ---
 
@@ -279,8 +279,8 @@
 | File locking | ✅ | `src/auth.rs` | - | Exclusive lock with timeout |
 | Key resolution | ✅ | `src/auth.rs` | - | override > auth.json > env |
 | Multi-provider keys | ✅ | `src/auth.rs` | - | 12 providers supported |
-| OAuth flow | ❌ | - | - | Browser callback |
-| Token refresh | 🔶 | `src/auth.rs` | - | Expiry check exists, no refresh |
+| OAuth flow | 🔶 | `src/auth.rs`, `src/interactive.rs` | - | `/login` supports Anthropic OAuth (others pending) |
+| Token refresh | 🔶 | `src/auth.rs`, `src/main.rs` | - | Auto-refresh expired Anthropic OAuth tokens at startup |
 
 ---
 

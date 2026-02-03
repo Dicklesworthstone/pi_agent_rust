@@ -9,6 +9,7 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 pub const PROTOCOL_VERSION: &str = "1.0";
+pub const LOG_SCHEMA_VERSION: &str = "pi.ext.log.v1";
 
 // ============================================================================
 // Policy
@@ -42,6 +43,109 @@ impl Default for ExtensionPolicy {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyDecision {
+    Allow,
+    Prompt,
+    Deny,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolicyCheck {
+    pub decision: PolicyDecision,
+    pub capability: String,
+    pub reason: String,
+}
+
+impl ExtensionPolicy {
+    pub fn evaluate(&self, capability: &str) -> PolicyCheck {
+        let normalized = capability.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            return PolicyCheck {
+                decision: PolicyDecision::Deny,
+                capability: String::new(),
+                reason: "empty_capability".to_string(),
+            };
+        }
+
+        if self
+            .deny_caps
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case(&normalized))
+        {
+            return PolicyCheck {
+                decision: PolicyDecision::Deny,
+                capability: normalized,
+                reason: "deny_caps".to_string(),
+            };
+        }
+
+        let in_default_caps = self
+            .default_caps
+            .iter()
+            .any(|cap| cap.eq_ignore_ascii_case(&normalized));
+
+        match self.mode {
+            ExtensionPolicyMode::Strict => PolicyCheck {
+                decision: if in_default_caps {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::Deny
+                },
+                capability: normalized,
+                reason: if in_default_caps {
+                    "default_caps".to_string()
+                } else {
+                    "not_in_default_caps".to_string()
+                },
+            },
+            ExtensionPolicyMode::Prompt => PolicyCheck {
+                decision: if in_default_caps {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::Prompt
+                },
+                capability: normalized,
+                reason: if in_default_caps {
+                    "default_caps".to_string()
+                } else {
+                    "prompt_required".to_string()
+                },
+            },
+            ExtensionPolicyMode::Permissive => PolicyCheck {
+                decision: PolicyDecision::Allow,
+                capability: normalized,
+                reason: "permissive".to_string(),
+            },
+        }
+    }
+}
+
+pub fn required_capability_for_host_call(name: &str, input: &Value) -> Option<String> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "tool" => input
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|tool| tool_capability(tool).to_string()),
+        "exec" => Some("exec".to_string()),
+        "http" => Some("http".to_string()),
+        "session" => Some("session".to_string()),
+        "ui" => Some("ui".to_string()),
+        "log" => Some("log".to_string()),
+        _ => None,
+    }
+}
+
+fn tool_capability(tool_name: &str) -> &'static str {
+    match tool_name.trim().to_ascii_lowercase().as_str() {
+        "read" | "grep" | "find" | "ls" => "read",
+        "write" | "edit" => "write",
+        "bash" => "exec",
+        _ => "tool",
+    }
+}
+
 // ============================================================================
 // Protocol (v1)
 // ============================================================================
@@ -63,7 +167,9 @@ pub enum ExtensionBody {
     SlashCommand(SlashCommandPayload),
     SlashResult(SlashResultPayload),
     EventHook(EventHookPayload),
-    Log(LogPayload),
+    HostCall(HostCallPayload),
+    HostResult(HostResultPayload),
+    Log(Box<LogPayload>),
     Error(ErrorPayload),
 }
 
@@ -99,6 +205,24 @@ pub struct ToolResultPayload {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostCallPayload {
+    pub call_id: String,
+    pub name: String,
+    pub input: Value,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub context: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostResultPayload {
+    pub call_id: String,
+    pub output: Value,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlashCommandPayload {
     pub name: String,
     #[serde(default)]
@@ -122,10 +246,60 @@ pub struct EventHookPayload {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogPayload {
+    pub schema: String,
+    pub ts: String,
     pub level: LogLevel,
+    pub event: String,
     pub message: String,
+    pub correlation: LogCorrelation,
+    #[serde(default)]
+    pub source: Option<LogSource>,
     #[serde(default)]
     pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogCorrelation {
+    pub extension_id: String,
+    pub scenario_id: String,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub artifact_id: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub slash_command_id: Option<String>,
+    #[serde(default)]
+    pub event_id: Option<String>,
+    #[serde(default)]
+    pub host_call_id: Option<String>,
+    #[serde(default)]
+    pub rpc_id: Option<String>,
+    #[serde(default)]
+    pub trace_id: Option<String>,
+    #[serde(default)]
+    pub span_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogSource {
+    pub component: LogComponent,
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogComponent {
+    Capture,
+    Harness,
+    Runtime,
+    Extension,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +344,8 @@ impl ExtensionMessage {
             ExtensionBody::SlashCommand(payload) => validate_slash_command(payload),
             ExtensionBody::SlashResult(_) => Ok(()),
             ExtensionBody::EventHook(payload) => validate_event_hook(payload),
+            ExtensionBody::HostCall(payload) => validate_host_call(payload),
+            ExtensionBody::HostResult(payload) => validate_host_result(payload),
             ExtensionBody::Log(payload) => validate_log(payload),
             ExtensionBody::Error(payload) => validate_error(payload),
         }
@@ -206,6 +382,23 @@ fn validate_tool_result(payload: &ToolResultPayload) -> Result<()> {
     Ok(())
 }
 
+fn validate_host_call(payload: &HostCallPayload) -> Result<()> {
+    if payload.call_id.trim().is_empty() {
+        return Err(Error::validation("Host call_id is empty"));
+    }
+    if payload.name.trim().is_empty() {
+        return Err(Error::validation("Host call name is empty"));
+    }
+    Ok(())
+}
+
+fn validate_host_result(payload: &HostResultPayload) -> Result<()> {
+    if payload.call_id.trim().is_empty() {
+        return Err(Error::validation("Host result call_id is empty"));
+    }
+    Ok(())
+}
+
 fn validate_slash_command(payload: &SlashCommandPayload) -> Result<()> {
     if payload.name.trim().is_empty() {
         return Err(Error::validation("Slash command name is empty"));
@@ -221,8 +414,26 @@ fn validate_event_hook(payload: &EventHookPayload) -> Result<()> {
 }
 
 fn validate_log(payload: &LogPayload) -> Result<()> {
+    if payload.schema != LOG_SCHEMA_VERSION {
+        return Err(Error::validation(format!(
+            "Unsupported log schema: {}",
+            payload.schema
+        )));
+    }
+    if payload.ts.trim().is_empty() {
+        return Err(Error::validation("Log timestamp is empty"));
+    }
+    if payload.event.trim().is_empty() {
+        return Err(Error::validation("Log event is empty"));
+    }
     if payload.message.trim().is_empty() {
         return Err(Error::validation("Log message is empty"));
+    }
+    if payload.correlation.extension_id.trim().is_empty() {
+        return Err(Error::validation("Log correlation extension_id is empty"));
+    }
+    if payload.correlation.scenario_id.trim().is_empty() {
+        return Err(Error::validation("Log correlation scenario_id is empty"));
     }
     Ok(())
 }
@@ -309,11 +520,64 @@ mod tests {
           "id": "msg-2",
           "version": "2.0",
           "type": "log",
-          "payload": { "level": "info", "message": "hi" }
+          "payload": {
+            "schema": "pi.ext.log.v1",
+            "ts": "2026-02-03T03:01:02.123Z",
+            "level": "info",
+            "event": "tool_call.start",
+            "message": "hi",
+            "correlation": {
+              "extension_id": "ext.demo",
+              "scenario_id": "scn-001"
+            }
+          }
         }
         "#;
         let err = ExtensionMessage::parse_and_validate(json).unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("Unsupported extension protocol version"));
+    }
+
+    #[test]
+    fn parse_host_call_message() {
+        let json = r#"
+        {
+          "id": "msg-3",
+          "version": "1.0",
+          "type": "host_call",
+          "payload": {
+            "call_id": "call-1",
+            "name": "tool",
+            "input": { "name": "read", "input": { "path": "README.md" } },
+            "timeout_ms": 1000
+          }
+        }
+        "#;
+        let msg = ExtensionMessage::parse_and_validate(json).unwrap();
+        assert!(matches!(msg.body, ExtensionBody::HostCall(_)));
+    }
+
+    #[test]
+    fn parse_log_message() {
+        let json = r#"
+        {
+          "id": "msg-4",
+          "version": "1.0",
+          "type": "log",
+          "payload": {
+            "schema": "pi.ext.log.v1",
+            "ts": "2026-02-03T03:01:02.123Z",
+            "level": "info",
+            "event": "tool_call.start",
+            "message": "tool call dispatched",
+            "correlation": {
+              "extension_id": "ext.demo",
+              "scenario_id": "scn-001"
+            }
+          }
+        }
+        "#;
+        let msg = ExtensionMessage::parse_and_validate(json).unwrap();
+        assert!(matches!(msg.body, ExtensionBody::Log(_)));
     }
 }

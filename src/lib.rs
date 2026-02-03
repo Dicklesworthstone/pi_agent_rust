@@ -22,6 +22,7 @@
 pub mod agent;
 pub mod auth;
 pub mod cli;
+pub mod compaction;
 pub mod config;
 pub mod error;
 pub mod extensions;
@@ -32,6 +33,7 @@ pub mod package_manager;
 pub mod provider;
 pub mod providers;
 pub mod resources;
+pub mod rpc;
 pub mod session;
 pub mod session_index;
 pub mod session_picker;

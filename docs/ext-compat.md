@@ -6,6 +6,22 @@ actionable warnings where behavior diverges.
 
 ---
 
+## 0. Reality Check: Legacy Extensions Do Not Need Node APIs
+
+Legacy Pi extensions are *written in TS/JS*, but they mostly target the **Pi
+ExtensionAPI** (`@mariozechner/pi-coding-agent`), not Node’s `fs`/`net`/etc.
+
+In practice, the high-value extension behaviors are:
+- register tools/commands/flags
+- listen to Pi lifecycle events (turn/session/tool)
+- read session state and emit custom entries/messages
+- execute constrained commands (`pi.exec`) and use Pi tools (`read/write/edit/...`)
+
+This means we do **not** need to embed Node/Bun to reach compatibility. We need a
+Pi-shaped API surface with a small, capability-gated connector layer.
+
+---
+
 ## 1. Compatibility Tiers
 
 | Tier | Meaning | Action |
@@ -86,12 +102,13 @@ New:
 
 ## 5. Hostcall Surface (Legacy Shim)
 
-The compatibility layer provides:
-- `pi.read(path)`
-- `pi.write(path, content)`
-- `pi.exec(command, timeout_ms)`
-- `pi.http(request)`
-- `pi.log(level, message)`
+The compatibility layer provides a **Pi connector surface** (names illustrative):
+- `pi.tool(name, input)` → call a built-in tool (`read/write/edit/bash/grep/find/ls`)
+- `pi.exec(command, args, options)` → constrained process runner (timeout + cleanup)
+- `pi.http(request)` → constrained HTTP client (policy-controlled)
+- `pi.session.*` → session manager actions (append entry, set label/name, etc.)
+- `pi.ui.*` → UI requests (notifications/widgets via core rendering)
+- `pi.log({level, event, message, correlation, data?})` → structured logging (`ext.log.v1`)
 
 Each hostcall is capability‑gated.
 

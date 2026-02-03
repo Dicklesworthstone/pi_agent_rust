@@ -1189,6 +1189,286 @@ pi [options] [@files...] [messages...]
 
 ---
 
+## 11. RPC Mode Protocol (JSON over stdio)
+
+### 11.1 Start RPC Mode
+
+```bash
+pi --mode rpc [options]
+```
+
+Common options:
+- `--provider <name>`
+- `--model <id>`
+- `--no-session`
+- `--session-dir <path>`
+
+### 11.2 Protocol Overview
+
+- **Commands**: JSON objects sent to stdin, one per line.
+- **Responses**: JSON objects with `type: "response"` indicating success/failure.
+- **Events**: JSON objects streamed to stdout as JSON lines.
+- All commands support optional `id` for correlation; responses echo `id`.
+
+### 11.3 Commands
+
+#### Prompting
+
+**prompt**
+- Request: `{"id":"req-1","type":"prompt","message":"Hello"}`
+- Optional `images`: array of `ImageContent` objects (`type:"image"`, `source` = `{type:"base64", mediaType, data}`).
+- Optional `streamingBehavior`: `"steer"` or `"followUp"`.
+  - If agent is streaming and `streamingBehavior` is absent → error.
+  - `"steer"`: interrupt after current tool execution; remaining tool calls skipped.
+  - `"followUp"`: queue after agent finishes.
+- Extension commands (`/command`) execute immediately even during streaming.
+- Skill commands (`/skill:name`) and prompt templates (`/template`) expand before queueing.
+- Response: `{"type":"response","command":"prompt","success":true}`
+
+**steer**
+- Request: `{"type":"steer","message":"Stop and do this instead"}`
+- Same expansion rules; extension commands not allowed (use `prompt`).
+- Response: `{"type":"response","command":"steer","success":true}`
+
+**follow_up**
+- Request: `{"type":"follow_up","message":"After you're done, also do this"}`
+- Same expansion rules; extension commands not allowed.
+- Response: `{"type":"response","command":"follow_up","success":true}`
+
+**abort**
+- Request: `{"type":"abort"}`
+- Response: `{"type":"response","command":"abort","success":true}`
+
+**new_session**
+- Request: `{"type":"new_session"}` or `{"type":"new_session","parentSession":"/path/to/parent.jsonl"}`
+- Can be cancelled by `session_before_switch` extension handler.
+- Response: `{"type":"response","command":"new_session","success":true,"data":{"cancelled":false}}`
+
+#### State
+
+**get_state**
+- Request: `{"type":"get_state"}`
+- Response data:
+  - `model`: full `Model` or `null`
+  - `thinkingLevel`: `"off"|"minimal"|"low"|"medium"|"high"|"xhigh"`
+  - `isStreaming`: bool
+  - `isCompacting`: bool
+  - `steeringMode`: `"all"|"one-at-a-time"`
+  - `followUpMode`: `"all"|"one-at-a-time"`
+  - `sessionFile`: string | null
+  - `sessionId`: string
+  - `sessionName`: string | null
+  - `autoCompactionEnabled`: bool
+  - `messageCount`: number
+  - `pendingMessageCount`: number
+
+**get_messages**
+- Request: `{"type":"get_messages"}`
+- Response: `{"type":"response","command":"get_messages","success":true,"data":{"messages":[...]}}`
+- Messages are `AgentMessage` objects (User/Assistant/ToolResult/BashExecution).
+
+#### Model
+
+**set_model**
+- Request: `{"type":"set_model","provider":"anthropic","modelId":"claude-sonnet-4-20250514"}`
+- Response: `{"type":"response","command":"set_model","success":true,"data":<Model>}`
+
+**cycle_model**
+- Request: `{"type":"cycle_model"}`
+- Response: `{"type":"response","command":"cycle_model","success":true,"data":{"model":<Model>,"thinkingLevel":"medium","isScoped":false}}`
+- Returns `data: null` if only one model available.
+
+**get_available_models**
+- Request: `{"type":"get_available_models"}`
+- Response: `{"type":"response","command":"get_available_models","success":true,"data":{"models":[<Model>,...]}}`
+
+#### Thinking
+
+**set_thinking_level**
+- Request: `{"type":"set_thinking_level","level":"high"}`
+- Levels: `"off"|"minimal"|"low"|"medium"|"high"|"xhigh"`
+- Response: success true
+
+**cycle_thinking_level**
+- Request: `{"type":"cycle_thinking_level"}`
+- Response: `{"type":"response","command":"cycle_thinking_level","success":true,"data":{"level":"high"}}`
+- Returns `data: null` if model does not support thinking.
+
+#### Queue Modes
+
+**set_steering_mode**
+- Request: `{"type":"set_steering_mode","mode":"one-at-a-time"}`
+- Modes: `"all"` or `"one-at-a-time"` (default)
+- Response: success true
+
+**set_follow_up_mode**
+- Request: `{"type":"set_follow_up_mode","mode":"one-at-a-time"}`
+- Modes: `"all"` or `"one-at-a-time"` (default)
+- Response: success true
+
+#### Compaction
+
+**compact**
+- Request: `{"type":"compact"}` or `{"type":"compact","customInstructions":"Focus on code changes"}`
+- Response data: `{summary, firstKeptEntryId, tokensBefore, details}`
+
+**set_auto_compaction**
+- Request: `{"type":"set_auto_compaction","enabled":true}`
+- Response: success true
+
+#### Retry
+
+**set_auto_retry**
+- Request: `{"type":"set_auto_retry","enabled":true}`
+- Response: success true
+
+**abort_retry**
+- Request: `{"type":"abort_retry"}`
+- Response: success true
+
+#### Bash
+
+**bash**
+- Request: `{"type":"bash","command":"ls -la"}`
+- Response data:
+  - `output`: string
+  - `exitCode`: number
+  - `cancelled`: bool
+  - `truncated`: bool
+  - `fullOutputPath`: string | null (only when truncated)
+
+**abort_bash**
+- Request: `{"type":"abort_bash"}`
+- Response: success true
+
+#### Session
+
+**get_session_stats**
+- Request: `{"type":"get_session_stats"}`
+- Response data:
+  - `sessionFile`, `sessionId`
+  - `userMessages`, `assistantMessages`, `toolCalls`, `toolResults`, `totalMessages`
+  - `tokens`: `{input, output, cacheRead, cacheWrite, total}`
+  - `cost`: number (total $)
+
+**export_html**
+- Request: `{"type":"export_html"}` or `{"type":"export_html","outputPath":"/tmp/session.html"}`
+- Response data: `{path: "<output path>"}`
+
+**switch_session**
+- Request: `{"type":"switch_session","sessionPath":"/path/to/session.jsonl"}`
+- Can be cancelled by `session_before_switch` extension handler.
+- Response data: `{cancelled: false}`
+
+**fork**
+- Request: `{"type":"fork","entryId":"abc123"}`
+- `entryId` must be a user message entry.
+- Creates a new session (branched from parent of selected entry).
+- Response data: `{text:"<user message text>", cancelled:false}`
+- Can be cancelled by `session_before_fork` extension handler.
+
+**get_fork_messages**
+- Request: `{"type":"get_fork_messages"}`
+- Response data: `{messages:[{entryId, text}, ...]}`
+
+**get_last_assistant_text**
+- Request: `{"type":"get_last_assistant_text"}`
+- Response data: `{text: "<assistant text>"}` or `{text: null}`
+
+**set_session_name**
+- Request: `{"type":"set_session_name","name":"my-feature-work"}`
+- Response: success true
+
+#### Commands
+
+**get_commands**
+- Request: `{"type":"get_commands"}`
+- Response data: `{"commands":[{name, description?, source, location?, path?}, ...]}`
+  - `source`: `"extension"|"template"|"skill"`
+  - `location`: `"user"|"project"|"path"` (not present for extensions)
+
+### 11.4 Events
+
+| Event | Fields |
+|-------|--------|
+| `agent_start` | `{type:"agent_start"}` |
+| `agent_end` | `{type:"agent_end", messages:[AgentMessage], error?}` |
+| `turn_start` | `{type:"turn_start"}` |
+| `turn_end` | `{type:"turn_end", message:AgentMessage, toolResults:[AgentMessage]}` |
+| `message_start` | `{type:"message_start", message:AgentMessage}` |
+| `message_update` | `{type:"message_update", message:AgentMessage, assistantMessageEvent:<delta>}` |
+| `message_end` | `{type:"message_end", message:AgentMessage}` |
+| `tool_execution_start` | `{type:"tool_execution_start", toolCallId, toolName, args}` |
+| `tool_execution_update` | `{type:"tool_execution_update", toolCallId, toolName, args, partialResult}` |
+| `tool_execution_end` | `{type:"tool_execution_end", toolCallId, toolName, result, isError}` |
+| `auto_compaction_start` | `{type:"auto_compaction_start", reason:"threshold"|"overflow"}` |
+| `auto_compaction_end` | `{type:"auto_compaction_end", result, aborted, willRetry, errorMessage?}` |
+| `auto_retry_start` | `{type:"auto_retry_start", attempt, maxAttempts, delayMs, errorMessage}` |
+| `auto_retry_end` | `{type:"auto_retry_end", success, attempt, finalError?}` |
+| `extension_error` | `{type:"extension_error", extensionPath, event, error}` |
+
+**assistantMessageEvent delta types** (streaming):
+- `start`
+- `text_start`, `text_delta`, `text_end`
+- `thinking_start`, `thinking_delta`, `thinking_end`
+- `toolcall_start`, `toolcall_delta`, `toolcall_end` (includes full `toolCall`)
+- `done` (`reason`: `"stop"|"length"|"toolUse"`)
+- `error` (`reason`: `"aborted"|"error"`)
+
+### 11.5 Extension UI Protocol (RPC)
+
+**extension_ui_request** (stdout):
+- Base: `{type:"extension_ui_request", id, method, ...}`
+- Dialog methods block until response or timeout:
+  - `select`: `{title, options:[{label,value}], placeholder?, default?, timeout?}`
+  - `confirm`: `{title, message, default?, timeout?}`
+  - `input`: `{title, placeholder?, default?, password?, timeout?}`
+  - `editor`: `{title, language?, default?, readOnly?, timeout?}`
+- Fire-and-forget methods (no response expected):
+  - `notify`: `{title, message, level?}`
+  - `setStatus`: `{text}`
+  - `setWidget`: `{content}`
+  - `setTitle`: `{title}`
+  - `set_editor_text`: `{text}`
+- RPC limitations: `custom()` returns `undefined`; `setWorkingMessage`, `setFooter`, `setHeader`,
+  `setEditorComponent` are no-ops; `getEditorText()` returns `""`.
+
+**extension_ui_response** (stdin):
+- Base: `{type:"extension_ui_response", id, value?, cancelled?}`
+- Dialog responses:
+  - select/input/editor: `{value: <selected/entered>}`
+  - confirm: `{value: true|false}`
+  - cancellation: `{cancelled: true}`
+
+### 11.6 RPC Types
+
+**Model**
+- `id`, `name`, `api`, `provider`, `baseUrl`
+- `reasoning` (bool)
+- `input`: `["text","image"]`
+- `contextWindow`, `maxTokens`
+- `cost`: `{input, output, cacheRead, cacheWrite}`
+
+**UserMessage**
+- `{role:"user", content, timestamp, attachments:[]}`
+- `content` can be string or array of `TextContent`/`ImageContent`.
+
+**AssistantMessage**
+- `{role:"assistant", content:[...], api, provider, model, usage, stopReason, timestamp}`
+- `usage`: `{input, output, cacheRead, cacheWrite, cost:{input, output, cacheRead, cacheWrite, total}}`
+- `stopReason`: `"stop"|"length"|"toolUse"|"error"|"aborted"`
+
+**ToolResultMessage**
+- `{role:"toolResult", toolCallId, toolName, content, isError, timestamp}`
+
+**BashExecutionMessage**
+- `{role:"bashExecution", command, output, exitCode, cancelled, truncated, fullOutputPath, timestamp}`
+
+**Attachment**
+- `{id, type:"image", fileName, mimeType, size, content, extractedText, preview}`
+
+---
+
 ## Summary
 
 This specification covers:
@@ -1200,5 +1480,6 @@ This specification covers:
 - **Config:** Settings structure with precedence rules
 - **Auth:** Credential storage with OAuth refresh
 - **CLI:** Complete flag list with execution flow
+- **RPC:** JSON command protocol with events, types, and extension UI
 
 **After reading this document, you should NOT need to consult the legacy TypeScript code.**

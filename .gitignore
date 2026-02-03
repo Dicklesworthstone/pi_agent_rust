@@ -1,5 +1,6 @@
 /target/
 a.out
+rustc-ice-*.txt
 
 # bv (beads viewer) local config and caches
 .bv/

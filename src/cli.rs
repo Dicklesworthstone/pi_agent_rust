@@ -152,6 +152,47 @@ pub struct Cli {
     pub args: Vec<String>,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::Parser;
+
+    #[test]
+    fn parse_resource_flags_and_mode() {
+        let cli = Cli::parse_from([
+            "pi",
+            "--mode",
+            "rpc",
+            "--models",
+            "gpt-4*,claude*",
+            "--extension",
+            "ext1",
+            "--skill",
+            "skill.md",
+            "--prompt-template",
+            "prompt.md",
+            "--theme",
+            "dark.ini",
+            "--no-themes",
+        ]);
+
+        assert_eq!(cli.mode.as_deref(), Some("rpc"));
+        assert_eq!(cli.models.as_deref(), Some("gpt-4*,claude*"));
+        assert_eq!(cli.extension, vec!["ext1".to_string()]);
+        assert_eq!(cli.skill, vec!["skill.md".to_string()]);
+        assert_eq!(cli.prompt_template, vec!["prompt.md".to_string()]);
+        assert_eq!(cli.theme, vec!["dark.ini".to_string()]);
+        assert!(cli.no_themes);
+    }
+
+    #[test]
+    fn file_and_message_args_split() {
+        let cli = Cli::parse_from(["pi", "@a.txt", "hello", "@b.md", "world"]);
+        assert_eq!(cli.file_args(), vec!["a.txt", "b.md"]);
+        assert_eq!(cli.message_args(), vec!["hello", "world"]);
+    }
+}
+
 /// Package management subcommands
 #[derive(Subcommand, Debug)]
 pub enum Commands {

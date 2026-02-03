@@ -23,14 +23,23 @@ use tokio::sync::{Mutex, mpsc};
 
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::agent::{AbortHandle, Agent, AgentEvent};
+use crate::compaction::{
+    ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
+    summarize_entries,
+};
 use crate::config::Config;
-use crate::model::{ContentBlock, StopReason, ThinkingLevel, Usage, UserContent};
+use crate::model::{
+    AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, ThinkingLevel, Usage,
+    UserContent,
+};
 use crate::models::ModelEntry;
+use crate::package_manager::PackageManager;
 use crate::providers;
-use crate::resources::ResourceLoader;
+use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::session_index::SessionIndex;
 
@@ -47,9 +56,23 @@ pub enum SlashCommand {
     Clear,
     Model,
     Thinking,
+    ScopedModels,
     Exit,
     History,
     Export,
+    Session,
+    Settings,
+    Resume,
+    New,
+    Copy,
+    Name,
+    Hotkeys,
+    Changelog,
+    Tree,
+    Fork,
+    Compact,
+    Reload,
+    Share,
 }
 
 impl SlashCommand {
@@ -69,9 +92,23 @@ impl SlashCommand {
             "/clear" | "/cls" => Self::Clear,
             "/model" | "/m" => Self::Model,
             "/thinking" | "/think" | "/t" => Self::Thinking,
+            "/scoped-models" | "/scoped" => Self::ScopedModels,
             "/exit" | "/quit" | "/q" => Self::Exit,
             "/history" | "/hist" => Self::History,
             "/export" => Self::Export,
+            "/session" | "/info" => Self::Session,
+            "/settings" => Self::Settings,
+            "/resume" | "/r" => Self::Resume,
+            "/new" => Self::New,
+            "/copy" | "/cp" => Self::Copy,
+            "/name" => Self::Name,
+            "/hotkeys" | "/keys" | "/keybindings" => Self::Hotkeys,
+            "/changelog" => Self::Changelog,
+            "/tree" => Self::Tree,
+            "/fork" => Self::Fork,
+            "/compact" => Self::Compact,
+            "/reload" => Self::Reload,
+            "/share" => Self::Share,
             _ => return None,
         };
 
@@ -87,8 +124,22 @@ impl SlashCommand {
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Show or change the current model
   /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
+  /scoped-models [patterns|clear] - Show or set scoped models for cycling
   /history, /hist    - Show input history
   /export [path]     - Export conversation to HTML
+  /session, /info    - Show session info (path, tokens, cost)
+  /settings          - Show current settings summary
+  /resume, /r        - Pick and resume a previous session
+  /new               - Start a new session
+  /copy, /cp         - Copy last assistant message to clipboard
+  /name <name>       - Set session display name
+  /hotkeys, /keys    - Show keyboard shortcuts
+  /changelog         - Show changelog entries
+  /tree              - Show session branch tree summary
+  /fork [id|index]   - Branch from a previous user message
+  /compact [notes]   - Compact older context with optional instructions
+  /reload            - Reload skills/prompts from disk
+  /share             - Export to a temp HTML file and show path
   /exit, /quit, /q   - Exit Pi
 
 Tips:
@@ -130,11 +181,23 @@ pub enum PiMsg {
     AgentDone {
         usage: Option<Usage>,
         stop_reason: StopReason,
+        error_message: Option<String>,
     },
     /// Agent error.
     AgentError(String),
     /// Non-error system message.
     System(String),
+    /// Replace conversation state from session (compaction/fork).
+    ConversationReset {
+        messages: Vec<ConversationMessage>,
+        usage: Usage,
+        status: Option<String>,
+    },
+    /// Reloaded skills/prompts/themes/extensions.
+    ResourcesReloaded {
+        resources: ResourceLoader,
+        status: String,
+    },
 }
 
 /// State of the agent processing.
@@ -193,6 +256,8 @@ pub struct PiApp {
     session: Arc<Mutex<Session>>,
     config: Config,
     resources: ResourceLoader,
+    resource_cli: ResourceCliOptions,
+    cwd: PathBuf,
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
@@ -244,6 +309,8 @@ impl PiApp {
         session: Session,
         config: Config,
         resources: ResourceLoader,
+        resource_cli: ResourceCliOptions,
+        cwd: PathBuf,
         model_entry: ModelEntry,
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
@@ -305,6 +372,8 @@ impl PiApp {
             session: Arc::new(Mutex::new(session)),
             config,
             resources,
+            resource_cli,
+            cwd,
             model_entry,
             model_scope,
             available_models,
@@ -593,6 +662,7 @@ impl PiApp {
     }
 
     /// Handle custom Pi messages from the agent.
+    #[allow(clippy::too_many_lines)]
     fn handle_pi_message(&mut self, msg: PiMsg) -> Option<Cmd> {
         match msg {
             PiMsg::AgentStart => {
@@ -636,9 +706,14 @@ impl PiApp {
                     self.scroll_to_bottom();
                 }
             }
-            PiMsg::AgentDone { usage, stop_reason } => {
+            PiMsg::AgentDone {
+                usage,
+                stop_reason,
+                error_message,
+            } => {
                 // Finalize the response
-                if !self.current_response.is_empty() {
+                let had_response = !self.current_response.is_empty();
+                if had_response {
                     self.messages.push(ConversationMessage {
                         role: MessageRole::Assistant,
                         content: std::mem::take(&mut self.current_response),
@@ -664,6 +739,16 @@ impl PiApp {
 
                 if stop_reason == StopReason::Aborted {
                     self.status_message = Some("Request aborted".to_string());
+                } else if stop_reason == StopReason::Error {
+                    let message = error_message.unwrap_or_else(|| "Request failed".to_string());
+                    self.status_message = Some(message.clone());
+                    if !had_response {
+                        self.messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content: format!("Error: {message}"),
+                            thinking: None,
+                        });
+                    }
                 }
 
                 // Re-focus input
@@ -674,6 +759,8 @@ impl PiApp {
                 }
             }
             PiMsg::AgentError(error) => {
+                self.current_response.clear();
+                self.current_thinking.clear();
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content: format!("Error: {error}"),
@@ -703,6 +790,30 @@ impl PiApp {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
+            PiMsg::ConversationReset {
+                messages,
+                usage,
+                status,
+            } => {
+                self.messages = messages;
+                self.total_usage = usage;
+                self.current_response.clear();
+                self.current_thinking.clear();
+                self.agent_state = AgentState::Idle;
+                self.current_tool = None;
+                self.abort_handle = None;
+                self.status_message = status;
+                self.scroll_to_bottom();
+                self.input.focus();
+            }
+            PiMsg::ResourcesReloaded { resources, status } => {
+                self.resources = resources;
+                self.agent_state = AgentState::Idle;
+                self.current_tool = None;
+                self.abort_handle = None;
+                self.status_message = Some(status);
+                self.input.focus();
+            }
         }
         None
     }
@@ -718,6 +829,7 @@ impl PiApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn submit_content(&mut self, content: Vec<ContentBlock>) -> Option<Cmd> {
         if content.is_empty() {
             return None;
@@ -759,33 +871,66 @@ impl PiApp {
             let result = agent_guard
                 .run_with_content_with_abort(content_for_agent, Some(abort_signal), move |event| {
                     let mapped = match event {
-                        AgentEvent::RequestStart => Some(PiMsg::AgentStart),
-                        AgentEvent::TextDelta { text } => Some(PiMsg::TextDelta(text)),
-                        AgentEvent::ThinkingDelta { text } => Some(PiMsg::ThinkingDelta(text)),
-                        AgentEvent::ToolExecuteStart { name, id } => {
-                            Some(PiMsg::ToolStart { name, tool_id: id })
-                        }
-                        AgentEvent::ToolExecuteEnd { name, id, is_error } => Some(PiMsg::ToolEnd {
-                            name,
-                            tool_id: id,
+                        AgentEvent::AgentStart => Some(PiMsg::AgentStart),
+                        AgentEvent::MessageUpdate {
+                            assistant_message_event,
+                            ..
+                        } => match *assistant_message_event {
+                            AssistantMessageEvent::TextDelta { delta, .. } => {
+                                Some(PiMsg::TextDelta(delta))
+                            }
+                            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                                Some(PiMsg::ThinkingDelta(delta))
+                            }
+                            _ => None,
+                        },
+                        AgentEvent::ToolExecutionStart {
+                            tool_name,
+                            tool_call_id,
+                            ..
+                        } => Some(PiMsg::ToolStart {
+                            name: tool_name,
+                            tool_id: tool_call_id,
+                        }),
+                        AgentEvent::ToolExecutionUpdate {
+                            tool_name,
+                            tool_call_id,
+                            partial_result,
+                            ..
+                        } => Some(PiMsg::ToolUpdate {
+                            name: tool_name,
+                            tool_id: tool_call_id,
+                            content: partial_result.content,
+                            details: partial_result.details,
+                        }),
+                        AgentEvent::ToolExecutionEnd {
+                            tool_name,
+                            tool_call_id,
+                            is_error,
+                            ..
+                        } => Some(PiMsg::ToolEnd {
+                            name: tool_name,
+                            tool_id: tool_call_id,
                             is_error,
                         }),
-                        AgentEvent::ToolUpdate {
-                            name,
-                            id,
-                            content,
-                            details,
-                        } => Some(PiMsg::ToolUpdate {
-                            name,
-                            tool_id: id,
-                            content,
-                            details,
-                        }),
-                        AgentEvent::Done { final_message } => Some(PiMsg::AgentDone {
-                            usage: Some(final_message.usage),
-                            stop_reason: final_message.stop_reason,
-                        }),
-                        AgentEvent::Error { error } => Some(PiMsg::AgentError(error)),
+                        AgentEvent::AgentEnd { messages, .. } => {
+                            let last = last_assistant_message(&messages);
+                            let mut usage = Usage::default();
+                            for message in &messages {
+                                if let ModelMessage::Assistant(assistant) = message {
+                                    add_usage(&mut usage, &assistant.usage);
+                                }
+                            }
+                            Some(PiMsg::AgentDone {
+                                usage: Some(usage),
+                                stop_reason: last
+                                    .as_ref()
+                                    .map_or(StopReason::Stop, |msg| msg.stop_reason),
+                                error_message: last
+                                    .as_ref()
+                                    .and_then(|msg| msg.error_message.clone()),
+                            })
+                        }
                         _ => None,
                     };
 
@@ -834,6 +979,7 @@ impl PiApp {
     }
 
     /// Submit a message to the agent.
+    #[allow(clippy::too_many_lines)]
     fn submit_message(&mut self, message: &str) -> Option<Cmd> {
         let message = message.trim();
         if message.is_empty() {
@@ -889,33 +1035,66 @@ impl PiApp {
             let result = agent_guard
                 .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
                     let mapped = match event {
-                        AgentEvent::RequestStart => Some(PiMsg::AgentStart),
-                        AgentEvent::TextDelta { text } => Some(PiMsg::TextDelta(text)),
-                        AgentEvent::ThinkingDelta { text } => Some(PiMsg::ThinkingDelta(text)),
-                        AgentEvent::ToolExecuteStart { name, id } => {
-                            Some(PiMsg::ToolStart { name, tool_id: id })
-                        }
-                        AgentEvent::ToolExecuteEnd { name, id, is_error } => Some(PiMsg::ToolEnd {
-                            name,
-                            tool_id: id,
+                        AgentEvent::AgentStart => Some(PiMsg::AgentStart),
+                        AgentEvent::MessageUpdate {
+                            assistant_message_event,
+                            ..
+                        } => match *assistant_message_event {
+                            AssistantMessageEvent::TextDelta { delta, .. } => {
+                                Some(PiMsg::TextDelta(delta))
+                            }
+                            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                                Some(PiMsg::ThinkingDelta(delta))
+                            }
+                            _ => None,
+                        },
+                        AgentEvent::ToolExecutionStart {
+                            tool_name,
+                            tool_call_id,
+                            ..
+                        } => Some(PiMsg::ToolStart {
+                            name: tool_name,
+                            tool_id: tool_call_id,
+                        }),
+                        AgentEvent::ToolExecutionUpdate {
+                            tool_name,
+                            tool_call_id,
+                            partial_result,
+                            ..
+                        } => Some(PiMsg::ToolUpdate {
+                            name: tool_name,
+                            tool_id: tool_call_id,
+                            content: partial_result.content,
+                            details: partial_result.details,
+                        }),
+                        AgentEvent::ToolExecutionEnd {
+                            tool_name,
+                            tool_call_id,
+                            is_error,
+                            ..
+                        } => Some(PiMsg::ToolEnd {
+                            name: tool_name,
+                            tool_id: tool_call_id,
                             is_error,
                         }),
-                        AgentEvent::ToolUpdate {
-                            name,
-                            id,
-                            content,
-                            details,
-                        } => Some(PiMsg::ToolUpdate {
-                            name,
-                            tool_id: id,
-                            content,
-                            details,
-                        }),
-                        AgentEvent::Done { final_message } => Some(PiMsg::AgentDone {
-                            usage: Some(final_message.usage),
-                            stop_reason: final_message.stop_reason,
-                        }),
-                        AgentEvent::Error { error } => Some(PiMsg::AgentError(error)),
+                        AgentEvent::AgentEnd { messages, .. } => {
+                            let last = last_assistant_message(&messages);
+                            let mut usage = Usage::default();
+                            for message in &messages {
+                                if let ModelMessage::Assistant(assistant) = message {
+                                    add_usage(&mut usage, &assistant.usage);
+                                }
+                            }
+                            Some(PiMsg::AgentDone {
+                                usage: Some(usage),
+                                stop_reason: last
+                                    .as_ref()
+                                    .map_or(StopReason::Stop, |msg| msg.stop_reason),
+                                error_message: last
+                                    .as_ref()
+                                    .and_then(|msg| msg.error_message.clone()),
+                            })
+                        }
                         _ => None,
                     };
 
@@ -973,8 +1152,7 @@ impl PiApp {
         self.scroll_to_bottom();
 
         let event_tx = self.event_tx.clone();
-        let provider = pending.provider.clone();
-        let verifier = pending.verifier.clone();
+        let PendingOAuth { provider, verifier } = pending;
         let code_input = code_input.to_string();
 
         tokio::spawn(async move {
@@ -1089,9 +1267,11 @@ impl PiApp {
                             info.provider, info.url
                         );
                         if let Some(instructions) = info.instructions {
-                            message.push_str(&format!("\n{instructions}\n"));
+                            let _ = write!(message, "\n{instructions}\n");
                         }
-                        message.push_str("\nPaste the callback URL or authorization code as your next message.");
+                        message.push_str(
+                            "\nPaste the callback URL or authorization code as your next message.",
+                        );
 
                         self.messages.push(ConversationMessage {
                             role: MessageRole::System,
@@ -1266,6 +1446,88 @@ impl PiApp {
                     Some(format!("Thinking level: {}", thinking_level_to_str(level)));
                 self.spawn_save_session();
             }
+            SlashCommand::ScopedModels => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message =
+                        Some("Cannot change model scope while processing".to_string());
+                    return None;
+                }
+
+                if args.is_empty() {
+                    if self.model_scope.is_empty() {
+                        self.status_message =
+                            Some("Scoped models: all available models".to_string());
+                    } else {
+                        let list = self
+                            .model_scope
+                            .iter()
+                            .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        self.status_message = Some(format!("Scoped models: {list}"));
+                    }
+                    return None;
+                }
+
+                if args.eq_ignore_ascii_case("clear") || args.eq_ignore_ascii_case("all") {
+                    self.model_scope.clear();
+                    self.status_message =
+                        Some("Scoped models cleared (all models enabled)".to_string());
+                    return None;
+                }
+
+                let patterns = args
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>();
+                if patterns.is_empty() {
+                    self.status_message = Some("No model patterns provided".to_string());
+                    return None;
+                }
+
+                let mut scoped = Vec::new();
+                let mut matched_any = false;
+                for pattern in patterns {
+                    let glob = match glob::Pattern::new(&pattern.to_lowercase()) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            self.status_message =
+                                Some(format!("Invalid model pattern \"{pattern}\": {err}"));
+                            return None;
+                        }
+                    };
+
+                    for entry in &self.available_models {
+                        let full_id =
+                            format!("{}/{}", entry.model.provider, entry.model.id).to_lowercase();
+                        let short_id = entry.model.id.to_lowercase();
+                        if glob.matches(&full_id) || glob.matches(&short_id) {
+                            matched_any = true;
+                            if !scoped.iter().any(|m: &ModelEntry| {
+                                m.model.provider == entry.model.provider
+                                    && m.model.id == entry.model.id
+                            }) {
+                                scoped.push(entry.clone());
+                            }
+                        }
+                    }
+                }
+
+                if !matched_any {
+                    self.status_message = Some("No models matched those patterns".to_string());
+                    return None;
+                }
+
+                self.model_scope = scoped;
+                let list = self
+                    .model_scope
+                    .iter()
+                    .map(|entry| format!("{}/{}", entry.model.provider, entry.model.id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.status_message = Some(format!("Scoped models set: {list}"));
+            }
             SlashCommand::Exit => {
                 return Some(quit());
             }
@@ -1298,12 +1560,670 @@ impl PiApp {
                 }
             }
             SlashCommand::Export => {
-                let path = if args.is_empty() {
-                    "conversation.html"
+                let output_path = if args.is_empty() {
+                    let basename = {
+                        let session_guard = self.session.blocking_lock();
+                        session_guard
+                            .path
+                            .as_ref()
+                            .and_then(|p| p.file_stem())
+                            .and_then(|s| s.to_str())
+                            .map_or_else(|| "session".to_string(), ToString::to_string)
+                    };
+                    std::path::PathBuf::from(format!("pi-session-{basename}.html"))
                 } else {
-                    args
+                    std::path::PathBuf::from(args)
                 };
-                self.status_message = Some(format!("Export to '{path}' not yet implemented"));
+
+                let html = self.session.blocking_lock().to_html();
+                if let Some(parent) = output_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    if let Err(err) = std::fs::create_dir_all(parent) {
+                        self.status_message = Some(format!(
+                            "Export failed (mkdir): {err} ({})",
+                            parent.display()
+                        ));
+                        return None;
+                    }
+                }
+
+                match std::fs::write(&output_path, html) {
+                    Ok(()) => {
+                        self.status_message = Some(format!(
+                            "Exported conversation to {}",
+                            output_path.display()
+                        ));
+                    }
+                    Err(err) => {
+                        self.status_message = Some(format!(
+                            "Export failed (write): {err} ({})",
+                            output_path.display()
+                        ));
+                    }
+                }
+            }
+            SlashCommand::Session => {
+                let session_guard = self.session.blocking_lock();
+                let path_str = session_guard
+                    .path
+                    .as_ref()
+                    .map_or_else(|| "(ephemeral)".to_string(), |p| p.display().to_string());
+                let entry_count = session_guard.entries.len();
+                let name = session_guard
+                    .get_name()
+                    .unwrap_or_else(|| "(unnamed)".to_string());
+                drop(session_guard);
+
+                let info = format!(
+                    "Session Info:\n  Name: {name}\n  Path: {path_str}\n  Entries: {entry_count}\n  Model: {}\n  Tokens: {} in / {} out\n  Cost: ${:.4}",
+                    self.model,
+                    self.total_usage.input,
+                    self.total_usage.output,
+                    self.total_usage.cost.total
+                );
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: info,
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
+            }
+            SlashCommand::Settings => {
+                let settings = render_settings(&self.config);
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: settings,
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
+            }
+            SlashCommand::Resume => {
+                self.status_message = Some(
+                    "Resume session: use --resume flag on startup, or restart with `pi -r`"
+                        .to_string(),
+                );
+            }
+            SlashCommand::New => {
+                self.status_message = Some(
+                    "New session: restart Pi without --continue flag to start fresh".to_string(),
+                );
+            }
+            SlashCommand::Copy => {
+                // Find the last assistant message
+                if let Some(last_assistant) = self
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == MessageRole::Assistant)
+                {
+                    // Try to copy to clipboard using clipboard crate
+                    #[cfg(feature = "clipboard")]
+                    {
+                        use clipboard::{ClipboardContext, ClipboardProvider};
+                        match ClipboardContext::new() {
+                            Ok(mut ctx) => {
+                                if ctx.set_contents(last_assistant.content.clone()).is_ok() {
+                                    self.status_message = Some("Copied to clipboard".to_string());
+                                } else {
+                                    self.status_message =
+                                        Some("Failed to copy to clipboard".to_string());
+                                }
+                            }
+                            Err(_) => {
+                                self.status_message =
+                                    Some("Failed to access clipboard".to_string());
+                            }
+                        }
+                    }
+                    #[cfg(not(feature = "clipboard"))]
+                    {
+                        // Without clipboard feature, just show a message
+                        self.status_message = Some(format!(
+                            "Last response ({} chars). Clipboard feature not enabled.",
+                            last_assistant.content.len()
+                        ));
+                    }
+                } else {
+                    self.status_message = Some("No assistant message to copy".to_string());
+                }
+            }
+            SlashCommand::Name => {
+                if args.is_empty() {
+                    let current_name = self
+                        .session
+                        .blocking_lock()
+                        .get_name()
+                        .unwrap_or_else(|| "(unnamed)".to_string());
+                    self.status_message = Some(format!("Session name: {current_name}"));
+                } else {
+                    {
+                        let mut session_guard = self.session.blocking_lock();
+                        session_guard.set_name(args);
+                    }
+                    self.spawn_save_session();
+                    self.status_message = Some(format!("Session name set to: {args}"));
+                }
+            }
+            SlashCommand::Hotkeys => {
+                let hotkeys = r"Keyboard Shortcuts:
+  Enter             - Submit input (single line)
+  Alt+Enter         - Submit input (multi-line mode)
+  Ctrl+C            - Cancel current operation / clear input
+  Escape            - Quit (when idle) / cancel (when busy)
+  ↑/↓ or Ctrl+P/N   - Navigate input history
+  PageUp/PageDown   - Scroll conversation history
+  Home/End          - Jump to start/end of conversation
+  Ctrl+L            - Clear screen
+  Tab               - (reserved for future autocomplete)";
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: hotkeys.to_string(),
+                    thinking: None,
+                });
+                self.scroll_to_bottom();
+            }
+            SlashCommand::Changelog => {
+                let changelog = load_changelog(&self.cwd);
+                match changelog {
+                    Ok(text) => {
+                        self.messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content: text,
+                            thinking: None,
+                        });
+                        self.scroll_to_bottom();
+                    }
+                    Err(message) => {
+                        self.status_message = Some(message);
+                    }
+                }
+            }
+            SlashCommand::Tree => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot switch branches while busy".to_string());
+                    return None;
+                }
+
+                let mut session_guard = self.session.blocking_lock();
+                session_guard.ensure_entry_ids();
+                let info = session_guard.branch_summary();
+                let leaves = session_guard.list_leaves();
+
+                if args.is_empty() {
+                    let mut lines = Vec::new();
+                    let current = info
+                        .current_leaf
+                        .clone()
+                        .unwrap_or_else(|| "(none)".to_string());
+                    lines.push(format!(
+                        "Session tree: {} leaf/leaves, {} branch point(s). Current leaf: {current}",
+                        info.leaf_count, info.branch_point_count
+                    ));
+
+                    if leaves.is_empty() {
+                        lines.push("No branches yet.".to_string());
+                    } else {
+                        lines.push("Leaves:".to_string());
+                        for (idx, leaf_id) in leaves.iter().enumerate() {
+                            let summary = summarize_leaf(&session_guard, leaf_id)
+                                .unwrap_or_else(|| "(no user messages)".to_string());
+                            lines.push(format!("  {}. {} - {}", idx + 1, leaf_id, summary));
+                        }
+                        lines.push("Use /tree <id|index> to switch branches.".to_string());
+                    }
+
+                    // Drop the guard before mutating self
+                    drop(session_guard);
+
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: lines.join("\n"),
+                        thinking: None,
+                    });
+                    self.scroll_to_bottom();
+                    return None;
+                }
+
+                let target_id = if let Ok(index) = args.parse::<usize>() {
+                    if index == 0 || index > leaves.len() {
+                        drop(session_guard);
+                        self.status_message =
+                            Some(format!("Invalid leaf index: {index} (1-{})", leaves.len()));
+                        return None;
+                    }
+                    leaves[index - 1].clone()
+                } else if session_guard.get_entry(args).is_some() {
+                    args.to_string()
+                } else {
+                    drop(session_guard);
+                    self.status_message = Some(format!("Unknown entry id: {args}"));
+                    return None;
+                };
+
+                let Some(current_leaf) = session_guard.leaf_id.clone() else {
+                    drop(session_guard);
+                    self.status_message =
+                        Some("No current leaf available to switch from".to_string());
+                    return None;
+                };
+
+                if current_leaf == target_id {
+                    drop(session_guard);
+                    self.status_message = Some("Already on that branch".to_string());
+                    return None;
+                }
+
+                let current_path = session_guard.get_path_to_entry(&current_leaf);
+                let target_path = session_guard.get_path_to_entry(&target_id);
+                let mut lca_index = None;
+                for (idx, (a, b)) in current_path.iter().zip(target_path.iter()).enumerate() {
+                    if a == b {
+                        lca_index = Some(idx);
+                    } else {
+                        break;
+                    }
+                }
+
+                let from_id = lca_index
+                    .and_then(|idx| current_path.get(idx).cloned())
+                    .unwrap_or_else(|| "root".to_string());
+
+                let branch_ids = if let Some(idx) = lca_index {
+                    current_path.get(idx + 1..).unwrap_or_default().to_vec()
+                } else {
+                    current_path
+                };
+
+                let mut branch_entries = Vec::new();
+                for entry_id in branch_ids {
+                    if let Some(entry) = session_guard.get_entry(&entry_id) {
+                        branch_entries.push(entry.clone());
+                    }
+                }
+                drop(session_guard);
+
+                let event_tx = self.event_tx.clone();
+                let session = Arc::clone(&self.session);
+                let agent = Arc::clone(&self.agent);
+                let reserve_tokens = self.config.branch_summary_reserve_tokens();
+                let (provider, api_key) = {
+                    let agent_guard = self.agent.blocking_lock();
+                    (
+                        agent_guard.provider(),
+                        agent_guard.stream_options().api_key.clone(),
+                    )
+                };
+                let summary_skipped = !branch_entries.is_empty() && api_key.is_none();
+
+                self.agent_state = AgentState::Processing;
+                self.status_message = Some("Switching branches...".to_string());
+
+                tokio::spawn(async move {
+                    let summary = if branch_entries.is_empty() {
+                        None
+                    } else if let Some(api_key) = api_key {
+                        match summarize_entries(
+                            &branch_entries,
+                            provider,
+                            &api_key,
+                            reserve_tokens,
+                            None,
+                        )
+                        .await
+                        {
+                            Ok(summary) => summary,
+                            Err(err) => {
+                                let _ = event_tx.send(PiMsg::AgentError(format!(
+                                    "Branch summary failed: {err}"
+                                )));
+                                return;
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let messages_for_agent = {
+                        let mut guard = session.lock().await;
+                        if !guard.navigate_to(&target_id) {
+                            let _ = event_tx.send(PiMsg::AgentError(format!(
+                                "Branch target not found: {target_id}"
+                            )));
+                            return;
+                        }
+                        if let Some(summary) = summary {
+                            guard.append_branch_summary(from_id, summary, None, None);
+                        }
+                        let _ = guard.save().await;
+                        guard.to_messages_for_current_path()
+                    };
+
+                    {
+                        let mut agent_guard = agent.lock().await;
+                        agent_guard.replace_messages(messages_for_agent);
+                    }
+
+                    let (messages, usage) = {
+                        let guard = session.lock().await;
+                        load_conversation_from_session(&guard)
+                    };
+
+                    let status = if summary_skipped {
+                        Some(format!(
+                            "Switched to branch {target_id} (no summary: missing API key)"
+                        ))
+                    } else {
+                        Some(format!("Switched to branch {target_id}"))
+                    };
+
+                    let _ = event_tx.send(PiMsg::ConversationReset {
+                        messages,
+                        usage,
+                        status,
+                    });
+                });
+            }
+            SlashCommand::Fork => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message =
+                        Some("Cannot fork while processing a request".to_string());
+                    return None;
+                }
+
+                let session_guard = self.session.blocking_lock();
+                let candidates = fork_candidates(&session_guard);
+                drop(session_guard);
+                if candidates.is_empty() {
+                    self.status_message = Some("No user messages to fork from".to_string());
+                    return None;
+                }
+
+                if args.is_empty() {
+                    let list = candidates
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| format!("  {}. {} - {}", i + 1, c.id, c.summary))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: format!("Forkable user messages (use /fork <id|index>):\n{list}"),
+                        thinking: None,
+                    });
+                    self.scroll_to_bottom();
+                    return None;
+                }
+
+                let selection = if let Ok(index) = args.parse::<usize>() {
+                    if index == 0 || index > candidates.len() {
+                        self.status_message =
+                            Some(format!("Invalid index: {index} (1-{})", candidates.len()));
+                        return None;
+                    }
+                    candidates[index - 1].clone()
+                } else {
+                    let matches = candidates
+                        .iter()
+                        .filter(|c| c.id == args || c.id.starts_with(args))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if matches.is_empty() {
+                        self.status_message =
+                            Some(format!("No user message id matches \"{args}\""));
+                        return None;
+                    }
+                    if matches.len() > 1 {
+                        self.status_message = Some(format!(
+                            "Ambiguous id \"{args}\" (matches {})",
+                            matches.len()
+                        ));
+                        return None;
+                    }
+                    matches[0].clone()
+                };
+
+                let event_tx = self.event_tx.clone();
+                let session = Arc::clone(&self.session);
+                let agent = Arc::clone(&self.agent);
+                let model_provider = self.model_entry.model.provider.clone();
+                let model_id = self.model_entry.model.id.clone();
+                let thinking_level = self.session.blocking_lock().header.thinking_level.clone();
+
+                self.agent_state = AgentState::Processing;
+                self.status_message = Some("Forking session...".to_string());
+
+                tokio::spawn(async move {
+                    let (entries, parent_path, session_dir) = {
+                        let guard = session.lock().await;
+                        let path_ids = guard.get_path_to_entry(&selection.id);
+                        let mut entries = Vec::new();
+                        for entry_id in path_ids {
+                            if let Some(entry) = guard.get_entry(&entry_id) {
+                                entries.push(entry.clone());
+                            }
+                        }
+                        let parent_path = guard.path.as_ref().map(|p| p.display().to_string());
+                        let session_dir = guard.session_dir.clone();
+                        drop(guard);
+                        (entries, parent_path, session_dir)
+                    };
+
+                    if entries.is_empty() {
+                        let _ = event_tx.send(PiMsg::AgentError(
+                            "Failed to build fork (no entries found)".to_string(),
+                        ));
+                        return;
+                    }
+
+                    let mut new_session = Session::create_with_dir(session_dir);
+                    new_session.header.provider = Some(model_provider);
+                    new_session.header.model_id = Some(model_id);
+                    new_session.header.thinking_level = thinking_level;
+                    if let Some(parent_path) = parent_path {
+                        new_session.set_branched_from(Some(parent_path));
+                    }
+                    new_session.entries = entries;
+                    new_session.leaf_id = Some(selection.id.clone());
+                    new_session.ensure_entry_ids();
+
+                    if let Err(err) = new_session.save().await {
+                        let _ =
+                            event_tx.send(PiMsg::AgentError(format!("Failed to save fork: {err}")));
+                        return;
+                    }
+
+                    let index = SessionIndex::new();
+                    let _ = index.index_session(&new_session);
+
+                    let messages_for_agent = new_session.to_messages_for_current_path();
+                    {
+                        let mut agent_guard = agent.lock().await;
+                        agent_guard.replace_messages(messages_for_agent);
+                    }
+
+                    {
+                        let mut guard = session.lock().await;
+                        *guard = new_session;
+                    }
+
+                    let (messages, usage) = {
+                        let guard = session.lock().await;
+                        load_conversation_from_session(&guard)
+                    };
+
+                    let _ = event_tx.send(PiMsg::ConversationReset {
+                        messages,
+                        usage,
+                        status: Some(format!("Forked new session from {}", selection.summary)),
+                    });
+                });
+            }
+            SlashCommand::Compact => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message =
+                        Some("Cannot compact while processing a request".to_string());
+                    return None;
+                }
+
+                let custom_instructions = if args.is_empty() {
+                    None
+                } else {
+                    Some(args.to_string())
+                };
+
+                let event_tx = self.event_tx.clone();
+                let session = Arc::clone(&self.session);
+                let agent = Arc::clone(&self.agent);
+                let save_enabled = self.save_enabled;
+                let settings = ResolvedCompactionSettings {
+                    enabled: self.config.compaction_enabled(),
+                    reserve_tokens: self.config.compaction_reserve_tokens(),
+                    keep_recent_tokens: self.config.compaction_keep_recent_tokens(),
+                };
+
+                self.agent_state = AgentState::Processing;
+                self.status_message = Some("Compacting context...".to_string());
+
+                tokio::spawn(async move {
+                    let path_entries = {
+                        let mut guard = session.lock().await;
+                        guard.ensure_entry_ids();
+                        guard
+                            .entries_for_current_path()
+                            .into_iter()
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+
+                    let Some(prep) = prepare_compaction(&path_entries, settings) else {
+                        let _ = event_tx.send(PiMsg::System(
+                            "Compaction not available (already compacted or missing IDs)"
+                                .to_string(),
+                        ));
+                        return;
+                    };
+
+                    let (provider, api_key) = {
+                        let agent_guard = agent.lock().await;
+                        let api_key = agent_guard.stream_options().api_key.clone();
+                        (agent_guard.provider(), api_key)
+                    };
+
+                    let Some(api_key) = api_key else {
+                        let _ = event_tx.send(PiMsg::AgentError(
+                            "Missing API key for compaction".to_string(),
+                        ));
+                        return;
+                    };
+
+                    let result =
+                        match compact(prep, provider, &api_key, custom_instructions.as_deref())
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(err) => {
+                                let _ = event_tx
+                                    .send(PiMsg::AgentError(format!("Compaction failed: {err}")));
+                                return;
+                            }
+                        };
+
+                    let details_value = match compaction_details_to_value(&result.details) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            let _ = event_tx.send(PiMsg::AgentError(format!(
+                                "Compaction details failed: {err}"
+                            )));
+                            return;
+                        }
+                    };
+
+                    let (messages, usage) = {
+                        let mut guard = session.lock().await;
+                        guard.append_compaction(
+                            result.summary.clone(),
+                            result.first_kept_entry_id.clone(),
+                            result.tokens_before,
+                            Some(details_value),
+                            None,
+                        );
+                        if save_enabled {
+                            if let Err(err) = guard.save().await {
+                                let _ = event_tx.send(PiMsg::AgentError(format!(
+                                    "Failed to save session: {err}"
+                                )));
+                                return;
+                            }
+                            let index = SessionIndex::new();
+                            if let Err(err) = index.index_session(&guard) {
+                                let _ = event_tx.send(PiMsg::AgentError(format!(
+                                    "Failed to index session: {err}"
+                                )));
+                            }
+                        }
+                        let messages = guard.to_messages_for_current_path();
+                        drop(guard);
+
+                        let mut agent_guard = agent.lock().await;
+                        agent_guard.replace_messages(messages);
+                        drop(agent_guard);
+
+                        let guard = session.lock().await;
+                        load_conversation_from_session(&guard)
+                    };
+
+                    let _ = event_tx.send(PiMsg::ConversationReset {
+                        messages,
+                        usage,
+                        status: Some("Compaction complete".to_string()),
+                    });
+                });
+            }
+            SlashCommand::Reload => {
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot reload while busy".to_string());
+                    return None;
+                }
+
+                let event_tx = self.event_tx.clone();
+                let config = self.config.clone();
+                let cwd = self.cwd.clone();
+                let resource_cli = self.resource_cli.clone();
+
+                self.agent_state = AgentState::Processing;
+                self.status_message = Some("Reloading resources...".to_string());
+
+                tokio::spawn(async move {
+                    let manager = PackageManager::new(cwd.clone());
+                    match ResourceLoader::load(&manager, &cwd, &config, &resource_cli).await {
+                        Ok(resources) => {
+                            let status = format!(
+                                "Reloaded {} skills, {} prompts, {} themes",
+                                resources.skills().len(),
+                                resources.prompts().len(),
+                                resources.themes().len()
+                            );
+                            let _ = event_tx.send(PiMsg::ResourcesReloaded { resources, status });
+                        }
+                        Err(err) => {
+                            let _ =
+                                event_tx.send(PiMsg::AgentError(format!("Reload failed: {err}")));
+                        }
+                    }
+                });
+            }
+            SlashCommand::Share => {
+                let html = self.session.blocking_lock().to_html();
+                let path =
+                    std::env::temp_dir().join(format!("pi-share-{}.html", uuid::Uuid::new_v4()));
+                match std::fs::write(&path, html) {
+                    Ok(()) => {
+                        self.status_message =
+                            Some(format!("Shared HTML saved at {}", path.display()));
+                    }
+                    Err(err) => {
+                        self.status_message = Some(format!("Share failed: {err}"));
+                    }
+                }
             }
         }
 
@@ -1481,7 +2401,7 @@ fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage
     let mut messages = Vec::new();
     let mut total_usage = Usage::default();
 
-    for entry in &session.entries {
+    for entry in session.entries_for_current_path() {
         match entry {
             SessionEntry::Message(entry) => match &entry.message {
                 SessionMessage::User { content, .. } => {
@@ -1600,6 +2520,97 @@ fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage
     (messages, total_usage)
 }
 
+#[derive(Debug, Clone)]
+struct ForkCandidate {
+    id: String,
+    summary: String,
+}
+
+fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
+    let mut candidates = Vec::new();
+    for entry in session.entries_for_current_path() {
+        let SessionEntry::Message(msg_entry) = entry else {
+            continue;
+        };
+        let SessionMessage::User { content, .. } = &msg_entry.message else {
+            continue;
+        };
+        let Some(id) = entry.base_id() else {
+            continue;
+        };
+        let raw = user_content_to_text(content);
+        let cleaned = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+        let summary = if cleaned.is_empty() {
+            "(empty)".to_string()
+        } else {
+            truncate(&cleaned, 60)
+        };
+        candidates.push(ForkCandidate {
+            id: id.clone(),
+            summary,
+        });
+    }
+    candidates
+}
+
+fn summarize_leaf(session: &Session, leaf_id: &str) -> Option<String> {
+    let path = session.get_path_to_entry(leaf_id);
+    for entry_id in path.into_iter().rev() {
+        let entry = session.get_entry(&entry_id)?;
+        if let SessionEntry::Message(msg_entry) = entry {
+            if let SessionMessage::User { content, .. } = &msg_entry.message {
+                let raw = user_content_to_text(content);
+                let cleaned = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                if cleaned.is_empty() {
+                    return Some("(empty)".to_string());
+                }
+                return Some(truncate(&cleaned, 60));
+            }
+        }
+    }
+    None
+}
+
+fn render_settings(config: &Config) -> String {
+    let pretty = serde_json::to_string_pretty(config).unwrap_or_else(|_| "{}".to_string());
+    format!(
+        "Settings (merged):\n{}\n\nPaths:\n  Global: {}\n  Project: {}\n  Sessions: {}\n  Packages: {}\n  Auth: {}",
+        pretty,
+        Config::global_dir().display(),
+        Config::project_dir().display(),
+        Config::sessions_dir().display(),
+        Config::package_dir().display(),
+        Config::auth_path().display(),
+    )
+}
+
+fn load_changelog(cwd: &Path) -> Result<String, String> {
+    let candidates = [
+        cwd.join("CHANGELOG.md"),
+        Config::global_dir().join("CHANGELOG.md"),
+    ];
+    let path = candidates
+        .iter()
+        .find(|p| p.exists())
+        .ok_or_else(|| "No CHANGELOG.md found".to_string())?;
+    let raw =
+        std::fs::read_to_string(path).map_err(|err| format!("Failed to read changelog: {err}"))?;
+    let text = truncate_lines(&raw, 200);
+    Ok(format!("Changelog ({})\n{}", path.display(), text))
+}
+
+fn truncate_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        return text.to_string();
+    }
+    let head = &lines[..max_lines];
+    let remaining = lines.len() - max_lines;
+    let mut out = head.join("\n");
+    let _ = write!(out, "\n... ({remaining} more lines truncated)");
+    out
+}
+
 fn add_usage(total: &mut Usage, usage: &Usage) {
     total.input += usage.input;
     total.output += usage.output;
@@ -1618,6 +2629,16 @@ fn user_content_to_text(content: &UserContent) -> String {
         UserContent::Text(text) => text.clone(),
         UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
     }
+}
+
+fn last_assistant_message(messages: &[ModelMessage]) -> Option<crate::model::AssistantMessage> {
+    messages.iter().rev().find_map(|message| {
+        if let ModelMessage::Assistant(assistant) = message {
+            Some(assistant.clone())
+        } else {
+            None
+        }
+    })
 }
 
 fn assistant_content_to_text(blocks: &[ContentBlock]) -> (String, Option<String>) {
@@ -1764,6 +2785,8 @@ pub async fn run_interactive(
     pending_inputs: Vec<PendingInput>,
     save_enabled: bool,
     resources: ResourceLoader,
+    resource_cli: ResourceCliOptions,
+    cwd: PathBuf,
 ) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PiMsg>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
@@ -1779,6 +2802,8 @@ pub async fn run_interactive(
         session,
         config,
         resources,
+        resource_cli,
+        cwd,
         model_entry,
         model_scope,
         available_models,

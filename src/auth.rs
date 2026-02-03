@@ -269,15 +269,15 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
         return Err(Error::auth(format!("Token exchange failed: {text}")));
     }
 
-    let token = response
+    let oauth_response = response
         .json::<OAuthTokenResponse>()
         .await
         .map_err(|e| Error::auth(format!("Invalid token response: {e}")))?;
 
     Ok(AuthCredential::OAuth {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires: oauth_expires_at_ms(token.expires_in),
+        access_token: oauth_response.access_token,
+        refresh_token: oauth_response.refresh_token,
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
     })
 }
 
@@ -304,15 +304,15 @@ async fn refresh_anthropic_oauth_token(refresh_token: &str) -> Result<AuthCreden
         )));
     }
 
-    let token = response
+    let oauth_response = response
         .json::<OAuthTokenResponse>()
         .await
         .map_err(|e| Error::auth(format!("Invalid refresh response: {e}")))?;
 
     Ok(AuthCredential::OAuth {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        expires: oauth_expires_at_ms(token.expires_in),
+        access_token: oauth_response.access_token,
+        refresh_token: oauth_response.refresh_token,
+        expires: oauth_expires_at_ms(oauth_response.expires_in),
     })
 }
 
@@ -403,4 +403,78 @@ impl Drop for LockedFile {
 /// Convenience to load auth from default path.
 pub fn load_default_auth(path: &Path) -> Result<AuthStorage> {
     AuthStorage::load(path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_generate_pkce_is_base64url_no_pad() {
+        let (verifier, challenge) = generate_pkce();
+        assert!(!verifier.is_empty());
+        assert!(!challenge.is_empty());
+        assert!(!verifier.contains('+'));
+        assert!(!verifier.contains('/'));
+        assert!(!verifier.contains('='));
+        assert!(!challenge.contains('+'));
+        assert!(!challenge.contains('/'));
+        assert!(!challenge.contains('='));
+        assert_eq!(verifier.len(), 43);
+        assert_eq!(challenge.len(), 43);
+    }
+
+    #[test]
+    fn test_start_anthropic_oauth_url_contains_required_params() {
+        let info = start_anthropic_oauth().expect("start");
+        let url = reqwest::Url::parse(&info.url).expect("parse url");
+        assert_eq!(
+            url.as_str().split('?').next().unwrap(),
+            ANTHROPIC_OAUTH_AUTHORIZE_URL
+        );
+
+        let params: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            params.get("client_id").map(String::as_str),
+            Some(ANTHROPIC_OAUTH_CLIENT_ID)
+        );
+        assert_eq!(
+            params.get("response_type").map(String::as_str),
+            Some("code")
+        );
+        assert_eq!(
+            params.get("redirect_uri").map(String::as_str),
+            Some(ANTHROPIC_OAUTH_REDIRECT_URI)
+        );
+        assert_eq!(
+            params.get("scope").map(String::as_str),
+            Some(ANTHROPIC_OAUTH_SCOPES)
+        );
+        assert_eq!(
+            params.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert_eq!(
+            params.get("state").map(String::as_str),
+            Some(info.verifier.as_str())
+        );
+        assert!(params.contains_key("code_challenge"));
+    }
+
+    #[test]
+    fn test_parse_oauth_code_input_accepts_url_and_hash_formats() {
+        let (code, state) = parse_oauth_code_input(
+            "https://console.anthropic.com/oauth/code/callback?code=abc&state=def",
+        );
+        assert_eq!(code.as_deref(), Some("abc"));
+        assert_eq!(state.as_deref(), Some("def"));
+
+        let (code, state) = parse_oauth_code_input("abc#def");
+        assert_eq!(code.as_deref(), Some("abc"));
+        assert_eq!(state.as_deref(), Some("def"));
+
+        let (code, state) = parse_oauth_code_input("abc");
+        assert_eq!(code.as_deref(), Some("abc"));
+        assert!(state.is_none());
+    }
 }

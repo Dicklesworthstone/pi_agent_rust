@@ -9,13 +9,13 @@ use crate::model::{
     ThinkingLevel, ToolCall, Usage, UserContent,
 };
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
+use crate::sse::SseStream;
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::{self, Stream};
 use reqwest::Client;
-use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
-use tokio_stream::StreamExt;
 
 // ============================================================================
 // Constants
@@ -85,7 +85,8 @@ impl AnthropicProvider {
                         ThinkingLevel::Minimal => b.minimal,
                         ThinkingLevel::Low => b.low,
                         ThinkingLevel::Medium => b.medium,
-                        ThinkingLevel::High | ThinkingLevel::XHigh => b.high,
+                        ThinkingLevel::High => b.high,
+                        ThinkingLevel::XHigh => b.xhigh,
                     },
                 );
                 Some(AnthropicThinking {
@@ -140,6 +141,7 @@ impl Provider for AnthropicProvider {
             .client
             .post(&self.base_url)
             .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
             .header("X-API-Key", &api_key)
             .header("anthropic-version", ANTHROPIC_API_VERSION);
 
@@ -155,8 +157,26 @@ impl Provider for AnthropicProvider {
 
         let request = request.json(&request_body);
 
-        // Create event source for SSE streaming
-        let event_source = EventSource::new(request).map_err(|e| Error::api(e.to_string()))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("HTTP request failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::api(format!(
+                "Anthropic API error (HTTP {status}): {body}"
+            )));
+        }
+
+        let byte_stream = response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(std::io::Error::other)
+        });
+
+        // Create SSE stream for streaming responses.
+        let event_source = SseStream::new(Box::pin(byte_stream));
 
         // Create stream state
         let model = self.model.clone();
@@ -168,8 +188,7 @@ impl Provider for AnthropicProvider {
             |mut state| async move {
                 loop {
                     match state.event_source.next().await {
-                        Some(Ok(Event::Open)) => {}
-                        Some(Ok(Event::Message(msg))) => {
+                        Some(Ok(msg)) => {
                             if msg.event == "ping" {
                                 // Skip ping events
                             } else {
@@ -198,8 +217,11 @@ impl Provider for AnthropicProvider {
 // Stream State
 // ============================================================================
 
-struct StreamState {
-    event_source: EventSource,
+struct StreamState<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    event_source: SseStream<S>,
     partial: AssistantMessage,
     current_text: String,
     current_thinking: String,
@@ -208,8 +230,11 @@ struct StreamState {
     current_tool_name: Option<String>,
 }
 
-impl StreamState {
-    fn new(event_source: EventSource, model: String, api: String, provider: String) -> Self {
+impl<S> StreamState<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
         Self {
             event_source,
             partial: AssistantMessage {
@@ -411,7 +436,16 @@ impl StreamState {
             }
             Some(ContentBlock::ToolCall(tc)) => {
                 let arguments: serde_json::Value =
-                    serde_json::from_str(&self.current_tool_json).unwrap_or_default();
+                    match serde_json::from_str(&self.current_tool_json) {
+                        Ok(args) => args,
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: Failed to parse tool arguments as JSON: {e}. Raw: {}",
+                                &self.current_tool_json
+                            );
+                            serde_json::Value::Null
+                        }
+                    };
                 tc.arguments = arguments.clone();
 
                 let tool_call = ToolCall {

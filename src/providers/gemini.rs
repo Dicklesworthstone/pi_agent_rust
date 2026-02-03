@@ -9,13 +9,13 @@ use crate::model::{
     UserContent,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+use crate::sse::SseStream;
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::{self, Stream};
 use reqwest::Client;
-use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
-use tokio_stream::StreamExt;
 
 // ============================================================================
 // Constants
@@ -145,7 +145,8 @@ impl Provider for GeminiProvider {
         let mut request = self
             .client
             .post(&url)
-            .header("Content-Type", "application/json");
+            .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream");
 
         for (key, value) in &options.headers {
             request = request.header(key, value);
@@ -153,8 +154,26 @@ impl Provider for GeminiProvider {
 
         let request = request.json(&request_body);
 
-        // Create event source for SSE streaming
-        let event_source = EventSource::new(request).map_err(|e| Error::api(e.to_string()))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("HTTP request failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::api(format!(
+                "Gemini API error (HTTP {status}): {body}"
+            )));
+        }
+
+        let byte_stream = response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(std::io::Error::other)
+        });
+
+        // Create SSE stream for streaming responses.
+        let event_source = SseStream::new(Box::pin(byte_stream));
 
         // Create stream state
         let model = self.model.clone();
@@ -166,32 +185,18 @@ impl Provider for GeminiProvider {
             |mut state| async move {
                 loop {
                     match state.event_source.next().await {
-                        Some(Ok(Event::Open)) => {}
-                        Some(Ok(Event::Message(msg))) => match state.process_event(&msg.data) {
-                            Ok(Some(event)) => return Some((Ok(event), state)),
-                            Ok(None) => {}
-                            Err(e) => return Some((Err(e), state)),
-                        },
-                        Some(Err(e)) => {
-                            // Check if it's just the stream ending
-                            let err_str = e.to_string();
-                            if err_str.contains("end of stream")
-                                || err_str.contains("connection closed")
-                            {
-                                // Stream ended, emit final Done event
-                                if !state.finished {
-                                    state.finished = true;
-                                    state.finalize_content();
-                                    return Some((
-                                        Ok(StreamEvent::Done {
-                                            reason: state.partial.stop_reason,
-                                            message: state.partial.clone(),
-                                        }),
-                                        state,
-                                    ));
-                                }
-                                return None;
+                        Some(Ok(msg)) => {
+                            if msg.event == "ping" {
+                                continue;
                             }
+
+                            match state.process_event(&msg.data) {
+                                Ok(Some(event)) => return Some((Ok(event), state)),
+                                Ok(None) => {}
+                                Err(e) => return Some((Err(e), state)),
+                            }
+                        }
+                        Some(Err(e)) => {
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
                         }
@@ -223,8 +228,11 @@ impl Provider for GeminiProvider {
 // Stream State
 // ============================================================================
 
-struct StreamState {
-    event_source: EventSource,
+struct StreamState<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    event_source: SseStream<S>,
     partial: AssistantMessage,
     current_text: String,
     tool_calls: Vec<ToolCallState>,
@@ -238,8 +246,11 @@ struct ToolCallState {
     arguments: serde_json::Value,
 }
 
-impl StreamState {
-    fn new(event_source: EventSource, model: String, api: String, provider: String) -> Self {
+impl<S> StreamState<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
         Self {
             event_source,
             partial: AssistantMessage {

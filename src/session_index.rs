@@ -4,7 +4,8 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
 use fs4::fs_std::FileExt;
-use rusqlite::{Connection, params};
+use sqlmodel_core::Value;
+use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -42,7 +43,7 @@ impl SessionIndex {
         let meta = build_meta(path, &session.header, &session.entries)?;
         self.with_lock(|conn| {
             init_schema(conn)?;
-            conn.execute(
+            conn.execute_sync(
                 "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
                  ON CONFLICT(path) DO UPDATE SET
@@ -53,22 +54,23 @@ impl SessionIndex {
                    last_modified_ms=excluded.last_modified_ms,
                    size_bytes=excluded.size_bytes,
                    name=excluded.name",
-                params![
-                    meta.path,
-                    meta.id,
-                    meta.cwd,
-                    meta.timestamp,
-                    meta.message_count,
-                    meta.last_modified_ms,
-                    meta.size_bytes,
-                    meta.name,
+                &[
+                    Value::Text(meta.path),
+                    Value::Text(meta.id),
+                    Value::Text(meta.cwd),
+                    Value::Text(meta.timestamp),
+                    Value::BigInt(i64::try_from(meta.message_count).unwrap_or(i64::MAX)),
+                    Value::BigInt(meta.last_modified_ms),
+                    Value::BigInt(i64::try_from(meta.size_bytes).unwrap_or(i64::MAX)),
+                    meta.name.map_or(Value::Null, Value::Text),
                 ],
-            )?;
-            conn.execute(
+            ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
+
+            conn.execute_sync(
                 "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![current_epoch_ms()],
-            )?;
+                &[Value::Text(current_epoch_ms())],
+            ).map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
             Ok(())
         })
     }
@@ -76,27 +78,31 @@ impl SessionIndex {
     pub fn list_sessions(&self, cwd: Option<&str>) -> Result<Vec<SessionMeta>> {
         self.with_lock(|conn| {
             init_schema(conn)?;
-            let mut stmt = if cwd.is_some() {
-                conn.prepare(
-                    "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
-                     FROM sessions WHERE cwd=?1 ORDER BY last_modified_ms DESC",
-                )?
-            } else {
-                conn.prepare(
-                    "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
-                     FROM sessions ORDER BY last_modified_ms DESC",
-                )?
-            };
 
-            let rows = if let Some(cwd) = cwd {
-                stmt.query_map(params![cwd], row_to_meta)?
-            } else {
-                stmt.query_map([], row_to_meta)?
-            };
+            let (sql, params): (&str, Vec<Value>) = cwd.map_or_else(
+                || {
+                    (
+                        "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
+                         FROM sessions ORDER BY last_modified_ms DESC",
+                        vec![],
+                    )
+                },
+                |cwd| {
+                    (
+                        "SELECT path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name
+                         FROM sessions WHERE cwd=?1 ORDER BY last_modified_ms DESC",
+                        vec![Value::Text(cwd.to_string())],
+                    )
+                },
+            );
+
+            let rows = conn
+                .query_sync(sql, &params)
+                .map_err(|e| Error::session(format!("Query failed: {e}")))?;
 
             let mut result = Vec::new();
             for row in rows {
-                result.push(row?);
+                result.push(row_to_meta(&row)?);
             }
             Ok(result)
         })
@@ -118,33 +124,36 @@ impl SessionIndex {
 
         self.with_lock(|conn| {
             init_schema(conn)?;
-            conn.execute("DELETE FROM sessions", [])?;
+            conn.execute_sync("DELETE FROM sessions", &[])
+                .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+
             for meta in metas {
-                conn.execute(
+                conn.execute_sync(
                     "INSERT INTO sessions (path,id,cwd,timestamp,message_count,last_modified_ms,size_bytes,name)
                      VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                    params![
-                        meta.path,
-                        meta.id,
-                        meta.cwd,
-                        meta.timestamp,
-                        meta.message_count,
-                        meta.last_modified_ms,
-                        meta.size_bytes,
-                        meta.name,
+                    &[
+                        Value::Text(meta.path),
+                        Value::Text(meta.id),
+                        Value::Text(meta.cwd),
+                        Value::Text(meta.timestamp),
+                        Value::BigInt(i64::try_from(meta.message_count).unwrap_or(i64::MAX)),
+                        Value::BigInt(meta.last_modified_ms),
+                        Value::BigInt(i64::try_from(meta.size_bytes).unwrap_or(i64::MAX)),
+                        meta.name.map_or(Value::Null, Value::Text),
                     ],
-                )?;
+                ).map_err(|e| Error::session(format!("Insert failed: {e}")))?;
             }
-            conn.execute(
+
+            conn.execute_sync(
                 "INSERT INTO meta (key,value) VALUES ('last_sync_epoch_ms', ?1)
                  ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                params![current_epoch_ms()],
-            )?;
+                &[Value::Text(current_epoch_ms())],
+            ).map_err(|e| Error::session(format!("Meta update failed: {e}")))?;
             Ok(())
         })
     }
 
-    fn with_lock<T>(&self, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    fn with_lock<T>(&self, f: impl FnOnce(&SqliteConnection) -> Result<T>) -> Result<T> {
         if let Some(parent) = self.db_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -156,13 +165,23 @@ impl SessionIndex {
             .open(&self.lock_path)?;
         let _lock = lock_file_guard(&lock_file, Duration::from_secs(5))?;
 
-        let conn = Connection::open(&self.db_path)
+        let config = SqliteConfig::file(self.db_path.to_string_lossy())
+            .flags(OpenFlags::create_read_write())
+            .busy_timeout(5000);
+
+        let conn = SqliteConnection::open(&config)
             .map_err(|e| Error::session(format!("SQLite open: {e}")))?;
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "wal_autocheckpoint", 1000)?;
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        conn.busy_timeout(Duration::from_secs(5))?;
+
+        // Set pragmas for performance
+        conn.execute_raw("PRAGMA journal_mode = WAL")
+            .map_err(|e| Error::session(format!("PRAGMA journal_mode: {e}")))?;
+        conn.execute_raw("PRAGMA synchronous = NORMAL")
+            .map_err(|e| Error::session(format!("PRAGMA synchronous: {e}")))?;
+        conn.execute_raw("PRAGMA wal_autocheckpoint = 1000")
+            .map_err(|e| Error::session(format!("PRAGMA wal_autocheckpoint: {e}")))?;
+        conn.execute_raw("PRAGMA foreign_keys = ON")
+            .map_err(|e| Error::session(format!("PRAGMA foreign_keys: {e}")))?;
+
         f(&conn)
     }
 }
@@ -173,8 +192,8 @@ impl Default for SessionIndex {
     }
 }
 
-fn init_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
+fn init_schema(conn: &SqliteConnection) -> Result<()> {
+    conn.execute_raw(
         "CREATE TABLE IF NOT EXISTS sessions (
             path TEXT PRIMARY KEY,
             id TEXT NOT NULL,
@@ -184,25 +203,51 @@ fn init_schema(conn: &Connection) -> Result<()> {
             last_modified_ms INTEGER NOT NULL,
             size_bytes INTEGER NOT NULL,
             name TEXT
-        );
-        CREATE TABLE IF NOT EXISTS meta (
+        )",
+    )
+    .map_err(|e| Error::session(format!("Create sessions table: {e}")))?;
+
+    conn.execute_raw(
+        "CREATE TABLE IF NOT EXISTS meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
-        );",
-    )?;
+        )",
+    )
+    .map_err(|e| Error::session(format!("Create meta table: {e}")))?;
+
     Ok(())
 }
 
-fn row_to_meta(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
+fn row_to_meta(row: &sqlmodel_core::Row) -> Result<SessionMeta> {
     Ok(SessionMeta {
-        path: row.get(0)?,
-        id: row.get(1)?,
-        cwd: row.get(2)?,
-        timestamp: row.get(3)?,
-        message_count: row.get(4)?,
-        last_modified_ms: row.get(5)?,
-        size_bytes: row.get(6)?,
-        name: row.get(7)?,
+        path: row
+            .get_named("path")
+            .map_err(|e| Error::session(format!("get path: {e}")))?,
+        id: row
+            .get_named("id")
+            .map_err(|e| Error::session(format!("get id: {e}")))?,
+        cwd: row
+            .get_named("cwd")
+            .map_err(|e| Error::session(format!("get cwd: {e}")))?,
+        timestamp: row
+            .get_named("timestamp")
+            .map_err(|e| Error::session(format!("get timestamp: {e}")))?,
+        message_count: u64::try_from(
+            row.get_named::<i64>("message_count")
+                .map_err(|e| Error::session(format!("get message_count: {e}")))?,
+        )
+        .unwrap_or(0),
+        last_modified_ms: row
+            .get_named("last_modified_ms")
+            .map_err(|e| Error::session(format!("get last_modified_ms: {e}")))?,
+        size_bytes: u64::try_from(
+            row.get_named::<i64>("size_bytes")
+                .map_err(|e| Error::session(format!("get size_bytes: {e}")))?,
+        )
+        .unwrap_or(0),
+        name: row
+            .get_named::<Option<String>>("name")
+            .map_err(|e| Error::session(format!("get name: {e}")))?,
     })
 }
 

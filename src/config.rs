@@ -105,6 +105,7 @@ pub struct ThinkingBudgets {
     pub low: Option<u32>,
     pub medium: Option<u32>,
     pub high: Option<u32>,
+    pub xhigh: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +278,13 @@ impl Config {
             .unwrap_or(20000)
     }
 
+    pub fn branch_summary_reserve_tokens(&self) -> u32 {
+        self.branch_summary
+            .as_ref()
+            .and_then(|b| b.reserve_tokens)
+            .unwrap_or_else(|| self.compaction_reserve_tokens())
+    }
+
     pub fn retry_enabled(&self) -> bool {
         self.retry.as_ref().and_then(|r| r.enabled).unwrap_or(true)
     }
@@ -313,6 +321,7 @@ impl Config {
             "low" => budgets.and_then(|b| b.low).unwrap_or(2048),
             "medium" => budgets.and_then(|b| b.medium).unwrap_or(8192),
             "high" => budgets.and_then(|b| b.high).unwrap_or(16384),
+            "xhigh" => budgets.and_then(|b| b.xhigh).unwrap_or(u32::MAX),
             _ => 0,
         }
     }

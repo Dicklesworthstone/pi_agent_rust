@@ -88,6 +88,39 @@ Location: `tests/*.rs`
 
 **Purpose:** End-to-end testing of agent workflows.
 
+**Coverage (current):**
+- `tests/rpc_mode.rs`: RPC protocol sanity (get_state, prompt streaming events, get_session_stats counting tool calls/results)
+
+**Planned:**
+- Fixture-based RPC conformance harness comparing Rust RPC responses/events against the TypeScript reference (`legacy_pi_mono_code/pi-mono/packages/coding-agent/docs/rpc.md`).
+
+### 4. Extension Conformance (Planned)
+
+Location (planned): `tests/ext_conformance/`
+
+**Purpose:** Validate extension runtime behavior (registration/events/hostcalls) against the TypeScript reference.
+
+Initial fixture sources:
+- `legacy_pi_mono_code/pi-mono/.pi/extensions/*` (built-in reference extensions)
+- Minimal synthetic fixtures for connector calls (`exec`, `tool`, `http`, `session`)
+
+### Extension Logs (JSONL)
+
+All extension-related logs must conform to the **ext.log.v1** schema
+(see `EXTENSIONS.md`). The conformance harness records JSONL logs per scenario:
+
+- **Harness output:** `target/ext_conformance/logs/<scenario_id>.jsonl`
+- **Capture output:** `tests/ext_conformance/capture/<ext>/<scenario>/extension.log.jsonl`
+
+**Normalization for deterministic diffs:**
+- Replace `ts`, `pid`, `host`, `run_id`, `session_id`, `artifact_id`,
+  `trace_id`, `span_id` with placeholders.
+- Normalize absolute paths to `<cwd>/...`.
+
+**CI consumption:**
+- Archive `target/ext_conformance/logs/**` as CI artifacts.
+- Diffs should be grouped by `event` and `correlation` IDs to speed triage.
+
 ---
 
 ## Fixture Schema

@@ -9,6 +9,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs;
@@ -19,13 +20,55 @@ use std::process::{Command, Stdio};
 pub enum PackageScope {
     User,
     Project,
+    Temporary,
 }
 
 #[derive(Debug, Clone)]
 pub struct PackageEntry {
     pub scope: PackageScope,
     pub source: String,
-    pub filtered: bool,
+    pub filter: Option<PackageFilter>,
+}
+
+/// Optional per-resource filters for packages in settings.
+///
+/// Mirrors pi-mono's `PackageSource` object form:
+/// `{ source, extensions?, skills?, prompts?, themes? }`.
+#[derive(Debug, Clone, Default)]
+pub struct PackageFilter {
+    pub extensions: Option<Vec<String>>,
+    pub skills: Option<Vec<String>>,
+    pub prompts: Option<Vec<String>>,
+    pub themes: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PathMetadata {
+    pub source: String,
+    pub scope: PackageScope,
+    pub origin: ResourceOrigin,
+    pub base_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceOrigin {
+    Package,
+    TopLevel,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedResource {
+    pub path: PathBuf,
+    pub enabled: bool,
+    pub metadata: PathMetadata,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedPaths {
+    pub extensions: Vec<ResolvedResource>,
+    pub skills: Vec<ResolvedResource>,
+    pub prompts: Vec<ResolvedResource>,
+    pub themes: Vec<ResolvedResource>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,10 +182,6 @@ impl PackageManager {
         let mut installed = Vec::new();
 
         for entry in packages {
-            if entry.filtered {
-                continue;
-            }
-
             // Check if already installed
             if let Ok(Some(path)) = self.installed_path(&entry.source, entry.scope) {
                 if path.exists() {
@@ -159,70 +198,119 @@ impl PackageManager {
         Ok(installed)
     }
 
-    /// Resolve a package resource path.
-    /// Given a package source, returns paths to resources of the given type.
-    pub fn resolve_package_resources(
-        &self,
-        source: &str,
-        scope: PackageScope,
-        resource_type: &str,
-    ) -> Result<Vec<PathBuf>> {
-        let install_path = self
-            .installed_path(source, scope)?
-            .ok_or_else(|| Error::config(format!("Package not found: {source}")))?;
+    /// Resolve all resources (extensions/skills/prompts/themes) from:
+    /// - packages in global + project settings (deduped by identity; project wins)
+    /// - local resource entries from settings (with pattern filtering)
+    /// - auto-discovered resources from standard directories (with override patterns)
+    ///
+    /// This matches pi-mono's `DefaultPackageManager.resolve()` semantics.
+    pub async fn resolve(&self) -> Result<ResolvedPaths> {
+        let global = read_settings_snapshot(&global_settings_path())?;
+        let project = read_settings_snapshot(&project_settings_path(&self.cwd))?;
 
-        if !install_path.exists() {
-            return Ok(Vec::new());
+        let global_base_dir = Config::global_dir();
+        let project_base_dir = self.cwd.join(Config::project_dir());
+
+        let mut accumulator = ResourceAccumulator::new();
+
+        // 1) Package resources (global + project, deduped; project wins)
+        let mut all_packages: Vec<ScopedPackage> = Vec::new();
+        all_packages.extend(global.packages.iter().cloned().map(|pkg| ScopedPackage {
+            pkg,
+            scope: PackageScope::User,
+        }));
+        all_packages.extend(project.packages.iter().cloned().map(|pkg| ScopedPackage {
+            pkg,
+            scope: PackageScope::Project,
+        }));
+        let package_sources = self.dedupe_packages(all_packages);
+        self.resolve_package_sources(&package_sources, &mut accumulator)
+            .await?;
+
+        // 2) Local entries from settings (global and project)
+        for resource_type in ResourceType::all() {
+            let target = accumulator.target_mut(resource_type);
+            Self::resolve_local_entries(
+                global.entries_for(resource_type),
+                resource_type,
+                target,
+                &PathMetadata {
+                    source: "local".to_string(),
+                    scope: PackageScope::User,
+                    origin: ResourceOrigin::TopLevel,
+                    base_dir: Some(global_base_dir.clone()),
+                },
+                &global_base_dir,
+            );
+
+            Self::resolve_local_entries(
+                project.entries_for(resource_type),
+                resource_type,
+                target,
+                &PathMetadata {
+                    source: "local".to_string(),
+                    scope: PackageScope::Project,
+                    origin: ResourceOrigin::TopLevel,
+                    base_dir: Some(project_base_dir.clone()),
+                },
+                &project_base_dir,
+            );
         }
 
-        // Look for resources in standard locations
-        let candidates = [
-            install_path.join(resource_type),
-            install_path.join(format!("{resource_type}s")),
-            install_path.join("resources").join(resource_type),
-        ];
+        // 3) Auto-discovered resources from standard dirs (global and project)
+        self.add_auto_discovered_resources(
+            &mut accumulator,
+            &global,
+            &project,
+            &global_base_dir,
+            &project_base_dir,
+        );
 
-        let mut resources = Vec::new();
-        for candidate in candidates {
-            if candidate.is_dir() {
-                for entry in fs::read_dir(&candidate)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_file() || path.is_dir() {
-                        resources.push(path);
-                    }
-                }
-            } else if candidate.is_file() {
-                resources.push(candidate);
-            }
-        }
-
-        Ok(resources)
+        Ok(accumulator.into_resolved_paths())
     }
 
-    /// Get all resource paths of a given type from all installed packages.
-    pub fn all_package_resources(&self, resource_type: &str) -> Result<Vec<PathBuf>> {
-        let packages = self.list_packages()?;
-        let mut all_resources = Vec::new();
+    /// Resolve resources for extension sources specified via CLI `-e/--extension`.
+    ///
+    /// Mirrors pi-mono's `resolveExtensionSources(..., { temporary: true })`.
+    pub async fn resolve_extension_sources(
+        &self,
+        sources: &[String],
+        options: ResolveExtensionSourcesOptions,
+    ) -> Result<ResolvedPaths> {
+        let scope = if options.temporary {
+            PackageScope::Temporary
+        } else if options.local {
+            PackageScope::Project
+        } else {
+            PackageScope::User
+        };
 
-        for entry in packages {
-            if entry.filtered {
-                continue;
-            }
-            if let Ok(resources) =
-                self.resolve_package_resources(&entry.source, entry.scope, resource_type)
-            {
-                all_resources.extend(resources);
-            }
-        }
+        let mut accumulator = ResourceAccumulator::new();
+        let package_sources = sources
+            .iter()
+            .map(|source| ScopedPackage {
+                pkg: PackageSpec {
+                    source: source.clone(),
+                    filter: None,
+                },
+                scope,
+            })
+            .collect::<Vec<_>>();
 
-        Ok(all_resources)
+        self.resolve_package_sources(&package_sources, &mut accumulator)
+            .await?;
+        Ok(accumulator.into_resolved_paths())
     }
 
     pub fn add_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
         let path = match scope {
             PackageScope::User => global_settings_path(),
             PackageScope::Project => project_settings_path(&self.cwd),
+            PackageScope::Temporary => {
+                return Err(Error::config(
+                    "Temporary packages cannot be persisted to settings".to_string(),
+                ));
+            }
         };
         update_package_sources(&path, source, UpdateAction::Add)
     }
@@ -231,6 +319,11 @@ impl PackageManager {
         let path = match scope {
             PackageScope::User => global_settings_path(),
             PackageScope::Project => project_settings_path(&self.cwd),
+            PackageScope::Temporary => {
+                return Err(Error::config(
+                    "Temporary packages cannot be persisted to settings".to_string(),
+                ));
+            }
         };
         update_package_sources(&path, source, UpdateAction::Remove)
     }
@@ -284,30 +377,40 @@ impl PackageManager {
 
     fn npm_install_path(&self, name: &str, scope: PackageScope) -> Result<Option<PathBuf>> {
         Ok(match scope {
+            PackageScope::Temporary => {
+                Some(temporary_dir("npm", None).join("node_modules").join(name))
+            }
             PackageScope::Project => Some(self.project_npm_root().join("node_modules").join(name)),
             PackageScope::User => Some(self.global_npm_root()?.join(name)),
         })
     }
 
-    fn git_root(&self, scope: PackageScope) -> PathBuf {
+    fn git_root(&self, scope: PackageScope) -> Option<PathBuf> {
         match scope {
-            PackageScope::User => self.global_git_root(),
-            PackageScope::Project => self.project_git_root(),
+            PackageScope::Temporary => None,
+            PackageScope::User => Some(self.global_git_root()),
+            PackageScope::Project => Some(self.project_git_root()),
         }
     }
 
     fn git_install_path(&self, host: &str, repo_path: &str, scope: PackageScope) -> PathBuf {
-        self.git_root(scope).join(host).join(repo_path)
+        match scope {
+            PackageScope::Temporary => temporary_dir(&format!("git-{host}"), Some(repo_path)),
+            PackageScope::User => self.global_git_root().join(host).join(repo_path),
+            PackageScope::Project => self.project_git_root().join(host).join(repo_path),
+        }
     }
 
     fn install_npm(&self, spec: &str, scope: PackageScope) -> Result<()> {
         let (name, _) = parse_npm_spec(spec);
         match scope {
-            PackageScope::User => {
-                run_command("npm", ["install", "-g", spec], None)?;
-            }
-            PackageScope::Project => {
-                let install_root = self.project_npm_root();
+            PackageScope::User => run_command("npm", ["install", "-g", spec], None)?,
+            PackageScope::Project | PackageScope::Temporary => {
+                let install_root = match scope {
+                    PackageScope::Project => self.project_npm_root(),
+                    PackageScope::Temporary => temporary_dir("npm", None),
+                    PackageScope::User => unreachable!("handled above"),
+                };
                 ensure_npm_project(&install_root)?;
                 run_command(
                     "npm",
@@ -344,7 +447,11 @@ impl PackageManager {
             return Ok(());
         }
 
-        let install_root = self.project_npm_root();
+        let install_root = match scope {
+            PackageScope::Project => self.project_npm_root(),
+            PackageScope::Temporary => temporary_dir("npm", None),
+            PackageScope::User => unreachable!("handled above"),
+        };
         if !install_root.exists() {
             return Ok(());
         }
@@ -374,8 +481,9 @@ impl PackageManager {
             return Ok(());
         }
 
-        let root = self.git_root(scope);
-        ensure_git_ignore(&root)?;
+        if let Some(root) = self.git_root(scope) {
+            ensure_git_ignore(&root)?;
+        }
         if let Some(parent) = target_dir.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -410,6 +518,11 @@ impl PackageManager {
         repo_path: &str,
         scope: PackageScope,
     ) -> Result<()> {
+        if scope == PackageScope::Temporary {
+            // Temporary installs are ephemeral; callers should reinstall if needed.
+            return Ok(());
+        }
+
         let target_dir = self.git_install_path(host, repo_path, scope);
         if !target_dir.exists() {
             return self.install_git(repo, host, repo_path, None, scope);
@@ -433,9 +546,1259 @@ impl PackageManager {
         }
 
         fs::remove_dir_all(&target_dir)?;
-        prune_empty_git_parents(&target_dir, &self.git_root(scope));
+        if let Some(root) = self.git_root(scope) {
+            prune_empty_git_parents(&target_dir, &root);
+        }
         Ok(())
     }
+}
+
+// ============================================================================
+// Resource resolution (pi-mono parity)
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolveExtensionSourcesOptions {
+    pub local: bool,
+    pub temporary: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PackageSpec {
+    source: String,
+    filter: Option<PackageFilter>,
+}
+
+#[derive(Debug, Clone)]
+struct SettingsSnapshot {
+    packages: Vec<PackageSpec>,
+    extensions: Vec<String>,
+    skills: Vec<String>,
+    prompts: Vec<String>,
+    themes: Vec<String>,
+}
+
+impl SettingsSnapshot {
+    fn entries_for(&self, resource_type: ResourceType) -> &[String] {
+        match resource_type {
+            ResourceType::Extensions => &self.extensions,
+            ResourceType::Skills => &self.skills,
+            ResourceType::Prompts => &self.prompts,
+            ResourceType::Themes => &self.themes,
+        }
+    }
+}
+
+fn read_settings_snapshot(path: &Path) -> Result<SettingsSnapshot> {
+    let value = read_settings_json(path)?;
+    let packages_value = value
+        .get("packages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut packages = Vec::new();
+    for pkg in &packages_value {
+        if let Some(spec) = extract_package_spec(pkg) {
+            packages.push(spec);
+        }
+    }
+
+    Ok(SettingsSnapshot {
+        packages,
+        extensions: extract_string_array(value.get("extensions")),
+        skills: extract_string_array(value.get("skills")),
+        prompts: extract_string_array(value.get("prompts")),
+        themes: extract_string_array(value.get("themes")),
+    })
+}
+
+fn extract_string_array(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn extract_package_spec(value: &Value) -> Option<PackageSpec> {
+    if let Some(s) = value.as_str() {
+        return Some(PackageSpec {
+            source: s.to_string(),
+            filter: None,
+        });
+    }
+
+    let obj = value.as_object()?;
+    let source = obj.get("source")?.as_str()?.to_string();
+
+    let filter = PackageFilter {
+        extensions: extract_filter_field(obj, "extensions"),
+        skills: extract_filter_field(obj, "skills"),
+        prompts: extract_filter_field(obj, "prompts"),
+        themes: extract_filter_field(obj, "themes"),
+    };
+
+    Some(PackageSpec {
+        source,
+        filter: Some(filter),
+    })
+}
+
+fn extract_filter_field(obj: &serde_json::Map<String, Value>, key: &str) -> Option<Vec<String>> {
+    if !obj.contains_key(key) {
+        return None;
+    }
+
+    match obj.get(key) {
+        Some(Value::String(s)) => Some(vec![s.clone()]),
+        Some(Value::Array(arr)) => Some(
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        ),
+        _ => Some(Vec::new()),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ScopedPackage {
+    pkg: PackageSpec,
+    scope: PackageScope,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResourceType {
+    Extensions,
+    Skills,
+    Prompts,
+    Themes,
+}
+
+impl ResourceType {
+    const fn all() -> [Self; 4] {
+        [Self::Extensions, Self::Skills, Self::Prompts, Self::Themes]
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Extensions => "extensions",
+            Self::Skills => "skills",
+            Self::Prompts => "prompts",
+            Self::Themes => "themes",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResourceAccumulator {
+    extensions: ResourceList,
+    skills: ResourceList,
+    prompts: ResourceList,
+    themes: ResourceList,
+}
+
+impl ResourceAccumulator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[allow(clippy::missing_const_for_fn)] // const fn with &mut is unstable
+    fn target_mut(&mut self, resource_type: ResourceType) -> &mut ResourceList {
+        match resource_type {
+            ResourceType::Extensions => &mut self.extensions,
+            ResourceType::Skills => &mut self.skills,
+            ResourceType::Prompts => &mut self.prompts,
+            ResourceType::Themes => &mut self.themes,
+        }
+    }
+
+    fn into_resolved_paths(self) -> ResolvedPaths {
+        ResolvedPaths {
+            extensions: self.extensions.items,
+            skills: self.skills.items,
+            prompts: self.prompts.items,
+            themes: self.themes.items,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResourceList {
+    seen: std::collections::HashSet<String>,
+    items: Vec<ResolvedResource>,
+}
+
+impl ResourceList {
+    fn add(&mut self, path: PathBuf, metadata: &PathMetadata, enabled: bool) {
+        let key = path.to_string_lossy().to_string();
+        if !self.seen.insert(key) {
+            return;
+        }
+        self.items.push(ResolvedResource {
+            path,
+            enabled,
+            metadata: metadata.clone(),
+        });
+    }
+}
+
+impl PackageManager {
+    fn dedupe_packages(&self, packages: Vec<ScopedPackage>) -> Vec<ScopedPackage> {
+        let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut out: Vec<ScopedPackage> = Vec::new();
+
+        for entry in packages {
+            let identity = self.package_identity(&entry.pkg.source);
+            if let Some(&idx) = seen.get(&identity) {
+                let existing_scope = out[idx].scope;
+                if entry.scope == PackageScope::Project && existing_scope == PackageScope::User {
+                    out[idx] = entry;
+                }
+                continue;
+            }
+
+            seen.insert(identity, out.len());
+            out.push(entry);
+        }
+
+        out
+    }
+
+    async fn resolve_package_sources(
+        &self,
+        sources: &[ScopedPackage],
+        accumulator: &mut ResourceAccumulator,
+    ) -> Result<()> {
+        for entry in sources {
+            let source_str = entry.pkg.source.trim();
+            if source_str.is_empty() {
+                continue;
+            }
+
+            let parsed = parse_source(source_str, &self.cwd);
+            let mut metadata = PathMetadata {
+                source: source_str.to_string(),
+                scope: entry.scope,
+                origin: ResourceOrigin::Package,
+                base_dir: None,
+            };
+
+            match parsed {
+                ParsedSource::Local { path } => {
+                    Self::resolve_local_extension_source(
+                        &path,
+                        accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &mut metadata,
+                    );
+                }
+                ParsedSource::Npm { spec, name, pinned } => {
+                    let installed_path = self
+                        .npm_install_path(&name, entry.scope)?
+                        .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
+
+                    let needs_install = !installed_path.exists()
+                        || self.npm_needs_update(&spec, pinned, &installed_path).await;
+                    if needs_install {
+                        self.install(source_str, entry.scope)?;
+                    }
+
+                    metadata.base_dir = Some(installed_path.clone());
+                    Self::collect_package_resources(
+                        &installed_path,
+                        accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &metadata,
+                    );
+                }
+                ParsedSource::Git {
+                    repo: _,
+                    host,
+                    path,
+                    r#ref: _,
+                    ..
+                } => {
+                    let installed_path = self.git_install_path(&host, &path, entry.scope);
+                    if !installed_path.exists() {
+                        self.install(source_str, entry.scope)?;
+                    }
+
+                    metadata.base_dir = Some(installed_path.clone());
+                    Self::collect_package_resources(
+                        &installed_path,
+                        accumulator,
+                        entry.pkg.filter.as_ref(),
+                        &metadata,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn npm_needs_update(&self, spec: &str, pinned: bool, installed_path: &Path) -> bool {
+        let installed_version = read_installed_npm_version(installed_path);
+        let Some(installed_version) = installed_version else {
+            return true;
+        };
+
+        let (_, pinned_version) = parse_npm_spec(spec);
+        if pinned {
+            return pinned_version.is_some_and(|pv| pv != installed_version);
+        }
+
+        get_latest_npm_version(installed_path, spec)
+            .await
+            .is_ok_and(|latest| latest != installed_version)
+    }
+
+    fn resolve_local_extension_source(
+        resolved: &Path,
+        accumulator: &mut ResourceAccumulator,
+        filter: Option<&PackageFilter>,
+        metadata: &mut PathMetadata,
+    ) {
+        if !resolved.exists() {
+            return;
+        }
+
+        let Ok(stats) = fs::metadata(resolved) else {
+            return;
+        };
+
+        if stats.is_file() {
+            metadata.base_dir = resolved.parent().map(Path::to_path_buf);
+            accumulator
+                .extensions
+                .add(resolved.to_path_buf(), metadata, true);
+            return;
+        }
+
+        if !stats.is_dir() {
+            return;
+        }
+
+        metadata.base_dir = Some(resolved.to_path_buf());
+        let had_any = Self::collect_package_resources(resolved, accumulator, filter, metadata);
+        if !had_any {
+            accumulator
+                .extensions
+                .add(resolved.to_path_buf(), metadata, true);
+        }
+    }
+
+    fn resolve_local_entries(
+        entries: &[String],
+        resource_type: ResourceType,
+        target: &mut ResourceList,
+        metadata: &PathMetadata,
+        base_dir: &Path,
+    ) {
+        if entries.is_empty() {
+            return;
+        }
+
+        let (plain, patterns) = split_patterns(entries);
+        let resolved_plain = plain
+            .iter()
+            .map(|p| resolve_path_from_base(p, base_dir))
+            .collect::<Vec<_>>();
+        let all_files = collect_files_from_paths(&resolved_plain, resource_type);
+        let enabled_paths = apply_patterns(&all_files, &patterns, base_dir);
+
+        for f in all_files {
+            let enabled = enabled_paths.contains(&f);
+            target.add(f, metadata, enabled);
+        }
+    }
+
+    #[allow(clippy::unused_self)]
+    fn add_auto_discovered_resources(
+        &self,
+        accumulator: &mut ResourceAccumulator,
+        global: &SettingsSnapshot,
+        project: &SettingsSnapshot,
+        global_base_dir: &Path,
+        project_base_dir: &Path,
+    ) {
+        let user_metadata = PathMetadata {
+            source: "auto".to_string(),
+            scope: PackageScope::User,
+            origin: ResourceOrigin::TopLevel,
+            base_dir: Some(global_base_dir.to_path_buf()),
+        };
+        let project_metadata = PathMetadata {
+            source: "auto".to_string(),
+            scope: PackageScope::Project,
+            origin: ResourceOrigin::TopLevel,
+            base_dir: Some(project_base_dir.to_path_buf()),
+        };
+
+        let user_dirs = AutoDirs::new(global_base_dir);
+        let project_dirs = AutoDirs::new(project_base_dir);
+
+        for resource_type in ResourceType::all() {
+            let target = accumulator.target_mut(resource_type);
+            let (user_paths, user_overrides) = match resource_type {
+                ResourceType::Extensions => (
+                    collect_auto_extension_entries(&user_dirs.extensions),
+                    &global.extensions,
+                ),
+                ResourceType::Skills => (
+                    collect_auto_skill_entries(&user_dirs.skills),
+                    &global.skills,
+                ),
+                ResourceType::Prompts => (
+                    collect_auto_prompt_entries(&user_dirs.prompts),
+                    &global.prompts,
+                ),
+                ResourceType::Themes => (
+                    collect_auto_theme_entries(&user_dirs.themes),
+                    &global.themes,
+                ),
+            };
+            for path in user_paths {
+                let enabled = is_enabled_by_overrides(&path, user_overrides, global_base_dir);
+                target.add(path, &user_metadata, enabled);
+            }
+
+            let (project_paths, project_overrides) = match resource_type {
+                ResourceType::Extensions => (
+                    collect_auto_extension_entries(&project_dirs.extensions),
+                    &project.extensions,
+                ),
+                ResourceType::Skills => (
+                    collect_auto_skill_entries(&project_dirs.skills),
+                    &project.skills,
+                ),
+                ResourceType::Prompts => (
+                    collect_auto_prompt_entries(&project_dirs.prompts),
+                    &project.prompts,
+                ),
+                ResourceType::Themes => (
+                    collect_auto_theme_entries(&project_dirs.themes),
+                    &project.themes,
+                ),
+            };
+            for path in project_paths {
+                let enabled = is_enabled_by_overrides(&path, project_overrides, project_base_dir);
+                target.add(path, &project_metadata, enabled);
+            }
+        }
+    }
+
+    fn collect_package_resources(
+        package_root: &Path,
+        accumulator: &mut ResourceAccumulator,
+        filter: Option<&PackageFilter>,
+        metadata: &PathMetadata,
+    ) -> bool {
+        if let Some(filter) = filter {
+            for resource_type in ResourceType::all() {
+                let target = accumulator.target_mut(resource_type);
+                let patterns = match resource_type {
+                    ResourceType::Extensions => filter.extensions.as_ref(),
+                    ResourceType::Skills => filter.skills.as_ref(),
+                    ResourceType::Prompts => filter.prompts.as_ref(),
+                    ResourceType::Themes => filter.themes.as_ref(),
+                };
+
+                if let Some(patterns) = patterns {
+                    Self::apply_package_filter(
+                        package_root,
+                        patterns,
+                        resource_type,
+                        target,
+                        metadata,
+                    );
+                } else {
+                    Self::collect_default_resources(package_root, resource_type, target, metadata);
+                }
+            }
+            return true;
+        }
+
+        if let Some(manifest) = read_pi_manifest(package_root) {
+            for resource_type in ResourceType::all() {
+                let entries = manifest.entries_for(resource_type);
+                Self::add_manifest_entries(
+                    entries.as_deref(),
+                    package_root,
+                    resource_type,
+                    accumulator.target_mut(resource_type),
+                    metadata,
+                );
+            }
+            return true;
+        }
+
+        let mut has_any_dir = false;
+        for resource_type in ResourceType::all() {
+            let dir = package_root.join(resource_type.as_str());
+            if dir.exists() {
+                let files = collect_resource_files(&dir, resource_type);
+                let target = accumulator.target_mut(resource_type);
+                for f in files {
+                    target.add(f, metadata, true);
+                }
+                has_any_dir = true;
+            }
+        }
+
+        has_any_dir
+    }
+
+    fn collect_default_resources(
+        package_root: &Path,
+        resource_type: ResourceType,
+        target: &mut ResourceList,
+        metadata: &PathMetadata,
+    ) {
+        if let Some(manifest) = read_pi_manifest(package_root) {
+            let entries = manifest.entries_for(resource_type);
+            if entries.as_ref().is_some_and(|e| !e.is_empty()) {
+                Self::add_manifest_entries(
+                    entries.as_deref(),
+                    package_root,
+                    resource_type,
+                    target,
+                    metadata,
+                );
+                return;
+            }
+        }
+
+        let dir = package_root.join(resource_type.as_str());
+        if dir.exists() {
+            let files = collect_resource_files(&dir, resource_type);
+            for f in files {
+                target.add(f, metadata, true);
+            }
+        }
+    }
+
+    fn apply_package_filter(
+        package_root: &Path,
+        user_patterns: &[String],
+        resource_type: ResourceType,
+        target: &mut ResourceList,
+        metadata: &PathMetadata,
+    ) {
+        let (all_files, _) = Self::collect_manifest_files(package_root, resource_type);
+
+        if user_patterns.is_empty() {
+            for f in all_files {
+                target.add(f, metadata, false);
+            }
+            return;
+        }
+
+        let enabled_by_user = apply_patterns(&all_files, user_patterns, package_root);
+        for f in all_files {
+            let enabled = enabled_by_user.contains(&f);
+            target.add(f, metadata, enabled);
+        }
+    }
+
+    fn collect_manifest_files(
+        package_root: &Path,
+        resource_type: ResourceType,
+    ) -> (Vec<PathBuf>, std::collections::HashSet<PathBuf>) {
+        if let Some(manifest) = read_pi_manifest(package_root) {
+            let entries = manifest.entries_for(resource_type);
+            if let Some(entries) = entries {
+                if !entries.is_empty() {
+                    let all_files =
+                        collect_files_from_manifest_entries(&entries, package_root, resource_type);
+                    let patterns = entries
+                        .iter()
+                        .filter(|e| is_pattern(e))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let enabled_by_manifest = if patterns.is_empty() {
+                        all_files
+                            .iter()
+                            .cloned()
+                            .collect::<std::collections::HashSet<_>>()
+                    } else {
+                        apply_patterns(&all_files, &patterns, package_root)
+                    };
+                    let mut enabled_vec = enabled_by_manifest.iter().cloned().collect::<Vec<_>>();
+                    enabled_vec.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+                    return (enabled_vec, enabled_by_manifest);
+                }
+            }
+        }
+
+        let convention_dir = package_root.join(resource_type.as_str());
+        if !convention_dir.exists() {
+            return (Vec::new(), std::collections::HashSet::new());
+        }
+        let all_files = collect_resource_files(&convention_dir, resource_type);
+        let set = all_files.iter().cloned().collect();
+        (all_files, set)
+    }
+
+    fn add_manifest_entries(
+        entries: Option<&[String]>,
+        root: &Path,
+        resource_type: ResourceType,
+        target: &mut ResourceList,
+        metadata: &PathMetadata,
+    ) {
+        let Some(entries) = entries else {
+            return;
+        };
+        if entries.is_empty() {
+            return;
+        }
+
+        let all_files = collect_files_from_manifest_entries(entries, root, resource_type);
+        let patterns = entries
+            .iter()
+            .filter(|e| is_pattern(e))
+            .cloned()
+            .collect::<Vec<_>>();
+        let enabled_paths = apply_patterns(&all_files, &patterns, root);
+
+        for f in all_files {
+            if enabled_paths.contains(&f) {
+                target.add(f, metadata, true);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AutoDirs {
+    extensions: PathBuf,
+    skills: PathBuf,
+    prompts: PathBuf,
+    themes: PathBuf,
+}
+
+impl AutoDirs {
+    fn new(base_dir: &Path) -> Self {
+        Self {
+            extensions: base_dir.join("extensions"),
+            skills: base_dir.join("skills"),
+            prompts: base_dir.join("prompts"),
+            themes: base_dir.join("themes"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct PiManifest {
+    extensions: Option<Vec<String>>,
+    skills: Option<Vec<String>>,
+    prompts: Option<Vec<String>>,
+    themes: Option<Vec<String>>,
+}
+
+impl PiManifest {
+    fn entries_for(&self, resource_type: ResourceType) -> Option<Vec<String>> {
+        match resource_type {
+            ResourceType::Extensions => self.extensions.clone(),
+            ResourceType::Skills => self.skills.clone(),
+            ResourceType::Prompts => self.prompts.clone(),
+            ResourceType::Themes => self.themes.clone(),
+        }
+    }
+}
+
+fn read_pi_manifest(package_root: &Path) -> Option<PiManifest> {
+    let package_json = package_root.join("package.json");
+    if !package_json.exists() {
+        return None;
+    }
+    let raw = fs::read_to_string(package_json).ok()?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    let pi = json.get("pi")?;
+    let obj = pi.as_object()?;
+
+    Some(PiManifest {
+        extensions: obj.get("extensions").and_then(Value::as_array).map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }),
+        skills: obj.get("skills").and_then(Value::as_array).map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }),
+        prompts: obj.get("prompts").and_then(Value::as_array).map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }),
+        themes: obj.get("themes").and_then(Value::as_array).map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        }),
+    })
+}
+
+fn temporary_dir(prefix: &str, suffix: Option<&str>) -> PathBuf {
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{prefix}-{}", suffix.unwrap_or("")));
+    let digest = hasher.finalize();
+    let short = hex_encode(&digest)[..8].to_string();
+
+    let mut dir = std::env::temp_dir()
+        .join("pi-extensions")
+        .join(prefix)
+        .join(short);
+    if let Some(suffix) = suffix {
+        dir = dir.join(suffix);
+    }
+    dir
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const LUT: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(2));
+    for &b in bytes {
+        out.push(LUT[(b >> 4) as usize] as char);
+        out.push(LUT[(b & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn resolve_path_from_base(input: &str, base_dir: &Path) -> PathBuf {
+    let trimmed = input.trim();
+    if trimmed == "~" {
+        return dirs::home_dir().unwrap_or_else(|| base_dir.to_path_buf());
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        return dirs::home_dir()
+            .unwrap_or_else(|| base_dir.to_path_buf())
+            .join(rest);
+    }
+    if trimmed.starts_with('~') {
+        return dirs::home_dir()
+            .unwrap_or_else(|| base_dir.to_path_buf())
+            .join(trimmed.trim_start_matches('~'));
+    }
+
+    let p = Path::new(trimmed);
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    base_dir.join(p)
+}
+
+fn is_pattern(s: &str) -> bool {
+    s.starts_with('!')
+        || s.starts_with('+')
+        || s.starts_with('-')
+        || s.contains('*')
+        || s.contains('?')
+}
+
+fn split_patterns(entries: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut plain = Vec::new();
+    let mut patterns = Vec::new();
+    for entry in entries {
+        if is_pattern(entry) {
+            patterns.push(entry.clone());
+        } else {
+            plain.push(entry.clone());
+        }
+    }
+    (plain, patterns)
+}
+
+fn posix_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn relative_posix(base: &Path, path: &Path) -> String {
+    let base_components = base.components().collect::<Vec<_>>();
+    let path_components = path.components().collect::<Vec<_>>();
+
+    let mut i = 0usize;
+    while i < base_components.len()
+        && i < path_components.len()
+        && base_components[i] == path_components[i]
+    {
+        i += 1;
+    }
+
+    if i == 0 {
+        return posix_string(path);
+    }
+
+    let mut rel = PathBuf::new();
+    for _ in i..base_components.len() {
+        rel.push("..");
+    }
+    for comp in path_components.iter().skip(i) {
+        rel.push(comp.as_os_str());
+    }
+    posix_string(&rel)
+}
+
+fn normalize_exact_pattern(pattern: &str) -> &str {
+    pattern
+        .strip_prefix("./")
+        .or_else(|| pattern.strip_prefix(".\\"))
+        .unwrap_or(pattern)
+}
+
+fn pattern_matches(pattern: &str, candidate: &str) -> bool {
+    let normalized_pattern = pattern.replace('\\', "/");
+    let candidate = candidate.replace('\\', "/");
+    glob::Pattern::new(&normalized_pattern)
+        .ok()
+        .is_some_and(|p| p.matches(&candidate))
+}
+
+fn matches_any_pattern(file_path: &Path, patterns: &[String], base_dir: &Path) -> bool {
+    let rel = relative_posix(base_dir, file_path);
+    let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let file_str = posix_string(file_path);
+
+    let is_skill_file = name == "SKILL.md";
+    let parent_dir = is_skill_file.then(|| file_path.parent().unwrap_or_else(|| Path::new(".")));
+    let parent_dir_str = parent_dir.map(posix_string);
+    let parent_rel = parent_dir.map(|p| relative_posix(base_dir, p));
+    let parent_name = parent_dir
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str());
+
+    for pattern in patterns {
+        if pattern_matches(pattern, &rel)
+            || pattern_matches(pattern, name)
+            || pattern_matches(pattern, &file_str)
+        {
+            return true;
+        }
+        if !is_skill_file {
+            continue;
+        }
+        if parent_rel
+            .as_ref()
+            .is_some_and(|s| pattern_matches(pattern, s))
+        {
+            return true;
+        }
+        if parent_name.is_some_and(|s| pattern_matches(pattern, s)) {
+            return true;
+        }
+        if parent_dir_str
+            .as_ref()
+            .is_some_and(|s| pattern_matches(pattern, s))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn matches_any_exact_pattern(file_path: &Path, patterns: &[String], base_dir: &Path) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+
+    let rel = relative_posix(base_dir, file_path);
+    let file_str = posix_string(file_path);
+
+    let name = file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let is_skill_file = name == "SKILL.md";
+    let parent_dir = is_skill_file.then(|| file_path.parent().unwrap_or_else(|| Path::new(".")));
+    let parent_dir_str = parent_dir.map(posix_string);
+    let parent_rel = parent_dir.map(|p| relative_posix(base_dir, p));
+
+    patterns.iter().any(|pattern| {
+        let normalized = normalize_exact_pattern(pattern);
+        if normalized == rel || normalized == file_str {
+            return true;
+        }
+        if !is_skill_file {
+            return false;
+        }
+        parent_rel.as_ref().is_some_and(|p| normalized == p)
+            || parent_dir_str.as_ref().is_some_and(|p| normalized == p)
+    })
+}
+
+fn get_override_patterns(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|p| p.starts_with('!') || p.starts_with('+') || p.starts_with('-'))
+        .cloned()
+        .collect()
+}
+
+fn is_enabled_by_overrides(path: &Path, patterns: &[String], base_dir: &Path) -> bool {
+    let overrides = get_override_patterns(patterns);
+    let excludes = overrides
+        .iter()
+        .filter_map(|p| p.strip_prefix('!').map(str::to_string))
+        .collect::<Vec<_>>();
+    let force_includes = overrides
+        .iter()
+        .filter_map(|p| p.strip_prefix('+').map(str::to_string))
+        .collect::<Vec<_>>();
+    let force_excludes = overrides
+        .iter()
+        .filter_map(|p| p.strip_prefix('-').map(str::to_string))
+        .collect::<Vec<_>>();
+
+    // Priority: force_excludes > force_includes > excludes
+    if !force_excludes.is_empty() && matches_any_exact_pattern(path, &force_excludes, base_dir) {
+        false
+    } else if !force_includes.is_empty()
+        && matches_any_exact_pattern(path, &force_includes, base_dir)
+    {
+        true
+    } else {
+        excludes.is_empty() || !matches_any_pattern(path, &excludes, base_dir)
+    }
+}
+
+fn apply_patterns(
+    all_paths: &[PathBuf],
+    patterns: &[String],
+    base_dir: &Path,
+) -> std::collections::HashSet<PathBuf> {
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    let mut force_includes = Vec::new();
+    let mut force_excludes = Vec::new();
+
+    for p in patterns {
+        if let Some(rest) = p.strip_prefix('+') {
+            force_includes.push(rest.to_string());
+        } else if let Some(rest) = p.strip_prefix('-') {
+            force_excludes.push(rest.to_string());
+        } else if let Some(rest) = p.strip_prefix('!') {
+            excludes.push(rest.to_string());
+        } else {
+            includes.push(p.clone());
+        }
+    }
+
+    let mut result: Vec<PathBuf> = if includes.is_empty() {
+        all_paths.to_vec()
+    } else {
+        all_paths
+            .iter()
+            .filter(|p| matches_any_pattern(p, &includes, base_dir))
+            .cloned()
+            .collect()
+    };
+
+    if !excludes.is_empty() {
+        result.retain(|p| !matches_any_pattern(p, &excludes, base_dir));
+    }
+
+    if !force_includes.is_empty() {
+        for p in all_paths {
+            if !result.contains(p) && matches_any_exact_pattern(p, &force_includes, base_dir) {
+                result.push(p.clone());
+            }
+        }
+    }
+
+    if !force_excludes.is_empty() {
+        result.retain(|p| !matches_any_exact_pattern(p, &force_excludes, base_dir));
+    }
+
+    result.into_iter().collect()
+}
+
+fn collect_resource_files(dir: &Path, resource_type: ResourceType) -> Vec<PathBuf> {
+    match resource_type {
+        ResourceType::Skills => collect_skill_entries(dir),
+        ResourceType::Extensions => collect_auto_extension_entries(dir),
+        ResourceType::Prompts => collect_files_recursive(dir, "md"),
+        ResourceType::Themes => collect_files_recursive(dir, "json"),
+    }
+}
+
+fn collect_files_from_paths(paths: &[PathBuf], resource_type: ResourceType) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for p in paths {
+        if !p.exists() {
+            continue;
+        }
+        let Ok(stats) = fs::metadata(p) else {
+            continue;
+        };
+        if stats.is_file() {
+            out.push(p.clone());
+        } else if stats.is_dir() {
+            out.extend(collect_resource_files(p, resource_type));
+        }
+    }
+    out
+}
+
+fn collect_files_from_manifest_entries(
+    entries: &[String],
+    root: &Path,
+    resource_type: ResourceType,
+) -> Vec<PathBuf> {
+    let plain = entries
+        .iter()
+        .filter(|e| !is_pattern(e))
+        .cloned()
+        .collect::<Vec<_>>();
+    let resolved = plain
+        .iter()
+        .map(|entry| {
+            let p = Path::new(entry);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                root.join(entry)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    collect_files_from_paths(&resolved, resource_type)
+}
+
+fn collect_files_recursive(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let mut builder = ignore::WalkBuilder::new(dir);
+    builder
+        .hidden(true)
+        .follow_links(true)
+        .git_global(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(".fdignore")
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new("node_modules"));
+
+    let mut out = Vec::new();
+    for entry in builder.build().filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+        {
+            out.push(path.to_path_buf());
+        }
+    }
+    out
+}
+
+fn collect_skill_entries(dir: &Path) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let mut builder = ignore::WalkBuilder::new(dir);
+    builder
+        .hidden(true)
+        .follow_links(true)
+        .git_global(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(".fdignore")
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new("node_modules"));
+
+    let mut out = Vec::new();
+    for entry in builder.build().filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let rel = path.strip_prefix(dir).unwrap_or(path);
+        let depth = rel.components().count();
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+
+        if depth == 1 {
+            if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                out.push(path.to_path_buf());
+            }
+        } else if name == "SKILL.md" {
+            out.push(path.to_path_buf());
+        }
+    }
+    out
+}
+
+fn collect_auto_skill_entries(dir: &Path) -> Vec<PathBuf> {
+    collect_skill_entries(dir)
+}
+
+fn collect_auto_prompt_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return out;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "node_modules" {
+            continue;
+        }
+        let Ok(stats) = fs::metadata(&path) else {
+            continue;
+        };
+        if stats.is_file() && path.extension().and_then(|e| e.to_str()) == Some("md") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return out;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "node_modules" {
+            continue;
+        }
+        let Ok(stats) = fs::metadata(&path) else {
+            continue;
+        };
+        if stats.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json") {
+            out.push(path);
+        }
+    }
+    out
+}
+
+fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
+    let package_json_path = dir.join("package.json");
+    if package_json_path.exists() {
+        let manifest = read_pi_manifest(dir);
+        if let Some(manifest) = manifest {
+            if let Some(exts) = manifest.extensions {
+                let mut entries = Vec::new();
+                for ext_path in exts {
+                    let resolved = dir.join(ext_path);
+                    if resolved.exists() {
+                        entries.push(resolved);
+                    }
+                }
+                if !entries.is_empty() {
+                    return Some(entries);
+                }
+            }
+        }
+    }
+
+    let index_ts = dir.join("index.ts");
+    if index_ts.exists() {
+        return Some(vec![index_ts]);
+    }
+    let index_js = dir.join("index.js");
+    if index_js.exists() {
+        return Some(vec![index_js]);
+    }
+    None
+}
+
+fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return Vec::new();
+    }
+
+    let mut builder = ignore::WalkBuilder::new(dir);
+    builder
+        .hidden(true)
+        .follow_links(true)
+        .max_depth(Some(1))
+        .git_global(false)
+        .git_exclude(false)
+        .add_custom_ignore_filename(".fdignore")
+        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new("node_modules"));
+
+    let mut out = Vec::new();
+    for entry in builder.build().skip(1).filter_map(std::result::Result::ok) {
+        let path = entry.path().to_path_buf();
+        let Ok(stats) = fs::metadata(&path) else {
+            continue;
+        };
+        if stats.is_file() {
+            #[allow(clippy::case_sensitive_file_extension_comparisons)]
+            // .ts/.js are conventionally lowercase
+            let is_ext_file = path
+                .extension()
+                .is_some_and(|ext| ext == "ts" || ext == "js");
+            if is_ext_file {
+                out.push(path);
+            }
+            continue;
+        }
+        if stats.is_dir() {
+            if let Some(entries) = resolve_extension_entries(&path) {
+                out.extend(entries);
+            }
+        }
+    }
+    out
+}
+
+fn read_installed_npm_version(installed_path: &Path) -> Option<String> {
+    let package_json = installed_path.join("package.json");
+    let raw = fs::read_to_string(package_json).ok()?;
+    let json: Value = serde_json::from_str(&raw).ok()?;
+    json.get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+async fn get_latest_npm_version(installed_path: &Path, spec: &str) -> Result<String> {
+    let (name, _) = parse_npm_spec(spec);
+    let url = format!("https://registry.npmjs.org/{name}/latest");
+    let client = reqwest::Client::new();
+    let response = client.get(url).send().await.map_err(|e| {
+        Error::tool(
+            "npm",
+            format!(
+                "Failed to fetch npm registry for {}: {e}",
+                installed_path.display()
+            ),
+        )
+    })?;
+    let data: Value = response.json().await.map_err(|e| {
+        Error::tool(
+            "npm",
+            format!(
+                "Failed to parse npm registry response for {}: {e}",
+                installed_path.display()
+            ),
+        )
+    })?;
+    data.get("version")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| Error::tool("npm", "Registry response missing version"))
 }
 
 #[derive(Debug, Clone)]
@@ -693,11 +2056,11 @@ fn list_packages_in_settings(path: &Path) -> Result<Vec<PackageEntry>> {
 
     let mut out = Vec::new();
     for pkg in packages {
-        if let Some((source, filtered)) = extract_package_source(&pkg) {
+        if let Some(spec) = extract_package_spec(&pkg) {
             out.push(PackageEntry {
                 scope: PackageScope::User, // caller overrides
-                source,
-                filtered,
+                source: spec.source,
+                filter: spec.filter,
             });
         }
     }
@@ -835,7 +2198,9 @@ fn write_settings_json_atomic(path: &Path, value: &Value) -> Result<()> {
     let tmp = tempfile::NamedTempFile::new_in(parent)?;
     fs::write(tmp.path(), data)?;
     let tmp_path = tmp.into_temp_path();
-    tmp_path.persist(path).map_err(|e| Error::Io(e.error))?;
+    tmp_path
+        .persist(path)
+        .map_err(|e| Error::Io(Box::new(e.error)))?;
     Ok(())
 }
 

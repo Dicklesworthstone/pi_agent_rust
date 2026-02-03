@@ -170,9 +170,9 @@ impl<S> SseStream<S> {
     }
 }
 
-impl<S>
+impl<S> SseStream<S>
 where
-    S: asupersync::stream::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
+    S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
 {
     /// Poll for the next SSE event.
     pub fn poll_next_event(

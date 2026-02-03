@@ -14,15 +14,16 @@
 
 use crate::error::{Error, Result};
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ToolCall,
-    ToolResultMessage, Usage, UserContent, UserMessage,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, Message, StopReason, StreamEvent,
+    TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::Session;
 use crate::session_index::SessionIndex;
-use crate::tools::ToolRegistry;
+use crate::tools::{ToolOutput, ToolRegistry, ToolUpdate};
 use chrono::Utc;
 use futures::StreamExt;
+use futures::future::BoxFuture;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -54,51 +55,71 @@ impl Default for AgentConfig {
     }
 }
 
+/// Async fetcher for queued messages (steering or follow-up).
+pub type MessageFetcher = Arc<dyn Fn() -> BoxFuture<'static, Vec<Message>> + Send + Sync + 'static>;
+
 // ============================================================================
 // Agent Event
 // ============================================================================
 
 /// Events emitted by the agent during execution.
 #[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
-    /// Starting a new LLM request.
-    RequestStart,
-
-    /// Streaming text delta from the assistant.
-    TextDelta { text: String },
-
-    /// Streaming thinking delta from the assistant.
-    ThinkingDelta { text: String },
-
-    /// Tool call starting.
-    ToolCallStart { name: String, id: String },
-
-    /// Tool execution starting.
-    ToolExecuteStart { name: String, id: String },
-
-    /// Tool execution completed.
-    ToolExecuteEnd {
-        name: String,
-        id: String,
+    /// Agent lifecycle start.
+    AgentStart,
+    /// Agent lifecycle end with all new messages.
+    AgentEnd {
+        messages: Vec<Message>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// Turn lifecycle start (assistant response + tool calls).
+    TurnStart,
+    /// Turn lifecycle end with tool results.
+    TurnEnd {
+        message: Message,
+        #[serde(rename = "toolResults")]
+        tool_results: Vec<Message>,
+    },
+    /// Message lifecycle start (user, assistant, or tool result).
+    MessageStart { message: Message },
+    /// Message update (assistant streaming).
+    MessageUpdate {
+        message: Message,
+        #[serde(rename = "assistantMessageEvent")]
+        assistant_message_event: Box<AssistantMessageEvent>,
+    },
+    /// Message lifecycle end.
+    MessageEnd { message: Message },
+    /// Tool execution start.
+    ToolExecutionStart {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        args: serde_json::Value,
+    },
+    /// Tool execution update.
+    ToolExecutionUpdate {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        args: serde_json::Value,
+        #[serde(rename = "partialResult")]
+        partial_result: ToolOutput,
+    },
+    /// Tool execution end.
+    ToolExecutionEnd {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        #[serde(rename = "toolName")]
+        tool_name: String,
+        result: ToolOutput,
+        #[serde(rename = "isError")]
         is_error: bool,
     },
-
-    /// Tool execution update (streaming output).
-    ToolUpdate {
-        name: String,
-        id: String,
-        content: Vec<ContentBlock>,
-        details: Option<serde_json::Value>,
-    },
-
-    /// Assistant message completed.
-    AssistantDone { message: AssistantMessage },
-
-    /// Error during execution.
-    Error { error: String },
-
-    /// Agent loop completed.
-    Done { final_message: AssistantMessage },
 }
 
 // ============================================================================
@@ -166,6 +187,12 @@ pub struct Agent {
 
     /// Message history.
     messages: Vec<Message>,
+
+    /// Steering message fetcher (interrupt).
+    steering_fetcher: Option<MessageFetcher>,
+
+    /// Follow-up message fetcher (after idle).
+    follow_up_fetcher: Option<MessageFetcher>,
 }
 
 impl Agent {
@@ -176,6 +203,8 @@ impl Agent {
             tools,
             config,
             messages: Vec::new(),
+            steering_fetcher: None,
+            follow_up_fetcher: None,
         }
     }
 
@@ -203,6 +232,20 @@ impl Agent {
     /// Replace the provider implementation (used for model/provider switching).
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
         self.provider = provider;
+    }
+
+    /// Configure async fetchers for queued steering/follow-up messages.
+    pub fn set_message_fetchers(
+        &mut self,
+        steering: Option<MessageFetcher>,
+        follow_up: Option<MessageFetcher>,
+    ) {
+        self.steering_fetcher = steering;
+        self.follow_up_fetcher = follow_up;
+    }
+
+    pub fn provider(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.provider)
     }
 
     pub const fn stream_options(&self) -> &StreamOptions {
@@ -254,14 +297,14 @@ impl Agent {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         // Add user message
-        let user_message = UserMessage {
+        let user_message = Message::User(UserMessage {
             content: UserContent::Text(user_input.into()),
             timestamp: Utc::now().timestamp_millis(),
-        };
-        self.messages.push(Message::User(user_message));
+        });
 
         // Run the agent loop
-        self.run_loop(Arc::new(on_event), abort).await
+        self.run_loop(vec![user_message], Arc::new(on_event), abort)
+            .await
     }
 
     /// Run the agent with structured content (text + images).
@@ -282,14 +325,23 @@ impl Agent {
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
         // Add user message
-        let user_message = UserMessage {
+        let user_message = Message::User(UserMessage {
             content: UserContent::Blocks(content),
             timestamp: Utc::now().timestamp_millis(),
-        };
-        self.messages.push(Message::User(user_message));
+        });
 
         // Run the agent loop
-        self.run_loop(Arc::new(on_event), abort).await
+        self.run_loop(vec![user_message], Arc::new(on_event), abort)
+            .await
+    }
+
+    /// Continue the agent loop without adding a new prompt message (used for retries).
+    pub async fn run_continue_with_abort(
+        &mut self,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.run_loop(Vec::new(), Arc::new(on_event), abort).await
     }
 
     fn build_abort_message(&self, partial: Option<AssistantMessage>) -> AssistantMessage {
@@ -309,119 +361,204 @@ impl Agent {
         message
     }
 
-    fn finalize_abort(
-        &mut self,
-        on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-        partial: Option<AssistantMessage>,
-    ) -> AssistantMessage {
-        let message = self.build_abort_message(partial);
-        self.messages.push(Message::Assistant(message.clone()));
-        on_event(AgentEvent::AssistantDone {
-            message: message.clone(),
-        });
-        on_event(AgentEvent::Done {
-            final_message: message.clone(),
-        });
-        message
-    }
-
     /// The main agent loop.
+    #[allow(clippy::too_many_lines)]
     async fn run_loop(
         &mut self,
+        prompts: Vec<Message>,
         on_event: Arc<dyn Fn(AgentEvent) + Send + Sync>,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
-        let mut iterations = 0;
+        let mut iterations = 0usize;
+        let mut new_messages: Vec<Message> = Vec::new();
+        let mut last_assistant: Option<AssistantMessage> = None;
+
+        on_event(AgentEvent::AgentStart);
+        on_event(AgentEvent::TurnStart);
+
+        for prompt in prompts {
+            self.messages.push(prompt.clone());
+            new_messages.push(prompt.clone());
+            on_event(AgentEvent::MessageStart {
+                message: prompt.clone(),
+            });
+            on_event(AgentEvent::MessageEnd { message: prompt });
+        }
+
+        let mut pending_messages = self.fetch_messages(self.steering_fetcher.as_ref()).await;
+        let mut turn_started = true; // already emitted turn_start
 
         loop {
-            iterations += 1;
-            if iterations > self.config.max_tool_iterations {
-                return Err(Error::api(format!(
-                    "Maximum tool iterations ({}) exceeded",
-                    self.config.max_tool_iterations
-                )));
-            }
+            let mut has_more_tool_calls = true;
+            let mut steering_after_tools: Option<Vec<Message>> = None;
 
-            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
-                return Ok(self.finalize_abort(&on_event, None));
-            }
+            while has_more_tool_calls || !pending_messages.is_empty() {
+                if turn_started {
+                    turn_started = false;
+                } else {
+                    on_event(AgentEvent::TurnStart);
+                }
 
-            on_event(AgentEvent::RequestStart);
+                if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                    let abort_message = self.build_abort_message(last_assistant.clone());
+                    let message = Message::Assistant(abort_message.clone());
+                    if !matches!(self.messages.last(), Some(Message::Assistant(_))) {
+                        self.messages.push(message.clone());
+                        new_messages.push(message.clone());
+                        on_event(AgentEvent::MessageStart {
+                            message: message.clone(),
+                        });
+                    }
+                    on_event(AgentEvent::MessageEnd {
+                        message: message.clone(),
+                    });
+                    on_event(AgentEvent::TurnEnd {
+                        message,
+                        tool_results: Vec::new(),
+                    });
+                    on_event(AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                        error: Some(
+                            abort_message
+                                .error_message
+                                .clone()
+                                .unwrap_or_else(|| "Aborted".to_string()),
+                        ),
+                    });
+                    return Ok(abort_message);
+                }
 
-            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
-                return Ok(self.finalize_abort(&on_event, None));
-            }
+                for message in std::mem::take(&mut pending_messages) {
+                    self.messages.push(message.clone());
+                    new_messages.push(message.clone());
+                    on_event(AgentEvent::MessageStart {
+                        message: message.clone(),
+                    });
+                    on_event(AgentEvent::MessageEnd { message });
+                }
 
-            // Build context and stream completion
-            let context = self.build_context();
-            let mut stream = self
-                .provider
-                .stream(&context, &self.config.stream_options)
-                .await?;
+                let assistant_message = self
+                    .stream_assistant_response(&on_event, abort.clone())
+                    .await?;
+                last_assistant = Some(assistant_message.clone());
 
-            // Process stream events
-            let assistant_message = self
-                .process_stream(&mut stream, &on_event, abort.clone())
-                .await?;
+                let assistant_event_message = Message::Assistant(assistant_message.clone());
+                new_messages.push(assistant_event_message.clone());
 
-            // Add assistant message to history
-            self.messages
-                .push(Message::Assistant(assistant_message.clone()));
+                if matches!(
+                    assistant_message.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                ) {
+                    on_event(AgentEvent::TurnEnd {
+                        message: assistant_event_message.clone(),
+                        tool_results: Vec::new(),
+                    });
+                    on_event(AgentEvent::AgentEnd {
+                        messages: new_messages.clone(),
+                        error: assistant_message.error_message.clone(),
+                    });
+                    return Ok(assistant_message);
+                }
 
-            on_event(AgentEvent::AssistantDone {
-                message: assistant_message.clone(),
-            });
+                let tool_calls = extract_tool_calls(&assistant_message.content);
+                has_more_tool_calls = !tool_calls.is_empty();
 
-            // Check if we need to execute tools
-            let tool_calls = extract_tool_calls(&assistant_message.content);
+                let mut tool_results: Vec<ToolResultMessage> = Vec::new();
+                if has_more_tool_calls {
+                    iterations += 1;
+                    if iterations > self.config.max_tool_iterations {
+                        return Err(Error::api(format!(
+                            "Maximum tool iterations ({}) exceeded",
+                            self.config.max_tool_iterations
+                        )));
+                    }
 
-            if tool_calls.is_empty() || assistant_message.stop_reason != StopReason::ToolUse {
-                // No tool calls or not a tool use stop - we're done
-                on_event(AgentEvent::Done {
-                    final_message: assistant_message.clone(),
+                    let outcome = self
+                        .execute_tool_calls(
+                            &tool_calls,
+                            &on_event,
+                            &mut new_messages,
+                            abort.clone(),
+                        )
+                        .await?;
+                    tool_results = outcome.tool_results;
+                    steering_after_tools = outcome.steering_messages;
+                }
+
+                let tool_messages = tool_results
+                    .iter()
+                    .cloned()
+                    .map(Message::ToolResult)
+                    .collect::<Vec<_>>();
+
+                on_event(AgentEvent::TurnEnd {
+                    message: assistant_event_message.clone(),
+                    tool_results: tool_messages,
                 });
-                return Ok(assistant_message);
+
+                if let Some(steering) = steering_after_tools.take() {
+                    pending_messages = steering;
+                } else {
+                    pending_messages = self.fetch_messages(self.steering_fetcher.as_ref()).await;
+                }
             }
 
-            // Execute tool calls
-            for tool_call in tool_calls {
-                on_event(AgentEvent::ToolExecuteStart {
-                    name: tool_call.name.clone(),
-                    id: tool_call.id.clone(),
-                });
-
-                let tool_result = self.execute_tool(tool_call, &on_event).await;
-
-                let is_error = tool_result.is_error;
-                on_event(AgentEvent::ToolExecuteEnd {
-                    name: tool_call.name.clone(),
-                    id: tool_call.id.clone(),
-                    is_error,
-                });
-
-                // Add tool result to history
-                self.messages.push(Message::ToolResult(tool_result));
+            let follow_up = self.fetch_messages(self.follow_up_fetcher.as_ref()).await;
+            if follow_up.is_empty() {
+                break;
             }
+            pending_messages = follow_up;
+        }
 
-            // Continue loop to get next assistant response
+        let Some(final_message) = last_assistant else {
+            return Err(Error::api("Agent completed without assistant message"));
+        };
+
+        on_event(AgentEvent::AgentEnd {
+            messages: new_messages.clone(),
+            error: None,
+        });
+        Ok(final_message)
+    }
+
+    async fn fetch_messages(&self, fetcher: Option<&MessageFetcher>) -> Vec<Message> {
+        if let Some(fetcher) = fetcher {
+            (fetcher)().await
+        } else {
+            Vec::new()
         }
     }
 
-    /// Process a stream of events into an assistant message.
-    async fn process_stream(
-        &self,
-        stream: &mut std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent>> + Send>>,
+    /// Stream an assistant response and emit message events.
+    #[allow(clippy::too_many_lines)]
+    async fn stream_assistant_response(
+        &mut self,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
         mut abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
-        let mut final_message: Option<AssistantMessage> = None;
-        let mut last_partial: Option<AssistantMessage> = None;
+        // Build context and stream completion
+        let context = self.build_context();
+        let mut stream = self
+            .provider
+            .stream(&context, &self.config.stream_options)
+            .await?;
+
+        let mut partial_message: Option<AssistantMessage> = None;
+        let mut added_partial = false;
 
         loop {
             let event_result = if let Some(signal) = abort.as_mut() {
                 tokio::select! {
                     () = signal.wait() => {
-                        return Ok(self.build_abort_message(last_partial.take()));
+                        let abort_message = self.build_abort_message(partial_message.take());
+                        on_event(AgentEvent::MessageUpdate {
+                            message: Message::Assistant(abort_message.clone()),
+                            assistant_message_event: Box::new(AssistantMessageEvent::Error {
+                                reason: StopReason::Aborted,
+                                error: abort_message.clone(),
+                            }),
+                        });
+                        return Ok(self.finalize_assistant_message(abort_message, on_event, added_partial));
                     }
                     event = stream.next() => event,
                 }
@@ -435,88 +572,330 @@ impl Agent {
             let event = event_result?;
 
             match event {
-                StreamEvent::TextDelta { delta, partial, .. } => {
-                    last_partial = Some(partial);
-                    on_event(AgentEvent::TextDelta { text: delta });
-                }
-                StreamEvent::ThinkingDelta { delta, partial, .. } => {
-                    last_partial = Some(partial);
-                    on_event(AgentEvent::ThinkingDelta { text: delta });
-                }
-                StreamEvent::ToolCallStart { partial, .. } => {
-                    last_partial = Some(partial.clone());
-                    // Find the tool call being started
-                    if let Some(ContentBlock::ToolCall(tool_call)) = partial.content.last() {
-                        on_event(AgentEvent::ToolCallStart {
-                            name: tool_call.name.clone(),
-                            id: tool_call.id.clone(),
+                StreamEvent::Start { partial } => {
+                    partial_message = Some(partial.clone());
+                    self.messages.push(Message::Assistant(partial.clone()));
+                    added_partial = true;
+                    on_event(AgentEvent::MessageStart {
+                        message: Message::Assistant(partial),
+                    });
+                    if let Some(partial) = partial_message.clone() {
+                        on_event(AgentEvent::MessageUpdate {
+                            message: Message::Assistant(partial.clone()),
+                            assistant_message_event: Box::new(AssistantMessageEvent::Start {
+                                partial,
+                            }),
                         });
                     }
                 }
-                StreamEvent::Start { partial }
-                | StreamEvent::TextStart { partial, .. }
-                | StreamEvent::TextEnd { partial, .. }
-                | StreamEvent::ThinkingStart { partial, .. }
-                | StreamEvent::ThinkingEnd { partial, .. }
-                | StreamEvent::ToolCallDelta { partial, .. }
-                | StreamEvent::ToolCallEnd { partial, .. } => {
-                    last_partial = Some(partial);
-                }
-                StreamEvent::Done { message, .. } => {
-                    final_message = Some(message);
-                }
-                StreamEvent::Error { error, .. } => {
-                    let error_msg = error
-                        .error_message
-                        .unwrap_or_else(|| "Unknown error".to_string());
-                    on_event(AgentEvent::Error {
-                        error: error_msg.clone(),
+                StreamEvent::TextStart {
+                    content_index,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::TextStart {
+                            content_index,
+                            partial,
+                        }),
                     });
-                    return Err(Error::api(error_msg));
+                }
+                StreamEvent::TextDelta {
+                    content_index,
+                    delta,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
+                            content_index,
+                            delta,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::TextEnd {
+                    content_index,
+                    content,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::TextEnd {
+                            content_index,
+                            content,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::ThinkingStart {
+                    content_index,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::ThinkingStart {
+                            content_index,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::ThinkingDelta {
+                    content_index,
+                    delta,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::ThinkingDelta {
+                            content_index,
+                            delta,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::ThinkingEnd {
+                    content_index,
+                    content,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::ThinkingEnd {
+                            content_index,
+                            content,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::ToolCallStart {
+                    content_index,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::ToolCallStart {
+                            content_index,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::ToolCallDelta {
+                    content_index,
+                    delta,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::ToolCallDelta {
+                            content_index,
+                            delta,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::ToolCallEnd {
+                    content_index,
+                    tool_call,
+                    partial,
+                } => {
+                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(partial.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::ToolCallEnd {
+                            content_index,
+                            tool_call,
+                            partial,
+                        }),
+                    });
+                }
+                StreamEvent::Done { reason, message } => {
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(message.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::Done {
+                            reason,
+                            message: message.clone(),
+                        }),
+                    });
+                    return Ok(self.finalize_assistant_message(message, on_event, added_partial));
+                }
+                StreamEvent::Error { reason, error } => {
+                    on_event(AgentEvent::MessageUpdate {
+                        message: Message::Assistant(error.clone()),
+                        assistant_message_event: Box::new(AssistantMessageEvent::Error {
+                            reason,
+                            error: error.clone(),
+                        }),
+                    });
+                    return Ok(self.finalize_assistant_message(error, on_event, added_partial));
                 }
             }
         }
 
-        final_message.ok_or_else(|| Error::api("Stream ended without Done event"))
+        Err(Error::api("Stream ended without Done event"))
     }
 
-    /// Execute a tool call.
+    fn update_partial_message(
+        &mut self,
+        partial_message: &mut Option<AssistantMessage>,
+        partial: &AssistantMessage,
+        added_partial: bool,
+    ) {
+        *partial_message = Some(partial.clone());
+        if added_partial {
+            if let Some(last) = self.messages.last_mut() {
+                *last = Message::Assistant(partial.clone());
+            }
+        } else {
+            self.messages.push(Message::Assistant(partial.clone()));
+        }
+    }
+
+    fn finalize_assistant_message(
+        &mut self,
+        message: AssistantMessage,
+        on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
+        added_partial: bool,
+    ) -> AssistantMessage {
+        if added_partial {
+            if let Some(last) = self.messages.last_mut() {
+                *last = Message::Assistant(message.clone());
+            }
+        } else {
+            self.messages.push(Message::Assistant(message.clone()));
+            on_event(AgentEvent::MessageStart {
+                message: Message::Assistant(message.clone()),
+            });
+        }
+
+        on_event(AgentEvent::MessageEnd {
+            message: Message::Assistant(message.clone()),
+        });
+        message
+    }
+
+    async fn execute_tool_calls(
+        &mut self,
+        tool_calls: &[ToolCall],
+        on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
+        new_messages: &mut Vec<Message>,
+        abort: Option<AbortSignal>,
+    ) -> Result<ToolExecutionOutcome> {
+        let mut results = Vec::new();
+        let mut steering_messages: Option<Vec<Message>> = None;
+
+        for (index, tool_call) in tool_calls.iter().enumerate() {
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                break;
+            }
+
+            on_event(AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+            });
+
+            let (output, is_error) = self.execute_tool(tool_call, on_event).await;
+
+            // Emit a final update so UIs can render tool output even if the tool
+            // doesn't stream incremental updates.
+            on_event(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+                partial_result: output.clone(),
+            });
+
+            on_event(AgentEvent::ToolExecutionEnd {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                result: output.clone(),
+                is_error,
+            });
+
+            let tool_result = ToolResultMessage {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                content: output.content.clone(),
+                details: output.details.clone(),
+                is_error,
+                timestamp: Utc::now().timestamp_millis(),
+            };
+
+            self.messages.push(Message::ToolResult(tool_result.clone()));
+            new_messages.push(Message::ToolResult(tool_result.clone()));
+
+            on_event(AgentEvent::MessageStart {
+                message: Message::ToolResult(tool_result.clone()),
+            });
+            on_event(AgentEvent::MessageEnd {
+                message: Message::ToolResult(tool_result.clone()),
+            });
+
+            results.push(tool_result);
+
+            // Check for steering messages after each tool
+            let steering = self.fetch_messages(self.steering_fetcher.as_ref()).await;
+            if !steering.is_empty() {
+                steering_messages = Some(steering);
+
+                // Skip remaining tool calls
+                for skipped in tool_calls.iter().skip(index + 1) {
+                    let skipped_result = self.skip_tool_call(skipped, on_event, new_messages);
+                    results.push(skipped_result);
+                }
+                break;
+            }
+        }
+
+        Ok(ToolExecutionOutcome {
+            tool_results: results,
+            steering_messages,
+        })
+    }
+
     async fn execute_tool(
         &self,
         tool_call: &ToolCall,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
-    ) -> ToolResultMessage {
-        let timestamp = Utc::now().timestamp_millis();
-
+    ) -> (ToolOutput, bool) {
         // Find the tool
         let Some(tool) = self.tools.get(&tool_call.name) else {
-            return ToolResultMessage {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                content: vec![ContentBlock::Text(TextContent::new(format!(
-                    "Error: Tool '{}' not found",
-                    tool_call.name
-                )))],
-                details: None,
-                is_error: true,
-                timestamp,
-            };
+            return (
+                ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(format!(
+                        "Error: Tool '{}' not found",
+                        tool_call.name
+                    )))],
+                    details: None,
+                },
+                true,
+            );
         };
 
-        // Execute the tool
         let tool_name = tool_call.name.clone();
         let tool_id = tool_call.id.clone();
+        let tool_args = tool_call.arguments.clone();
         let on_event = Arc::clone(on_event);
 
-        let update_callback = {
-            move |update: crate::tools::ToolUpdate| {
-                on_event(AgentEvent::ToolUpdate {
-                    name: tool_name.clone(),
-                    id: tool_id.clone(),
+        let update_callback = move |update: ToolUpdate| {
+            on_event(AgentEvent::ToolExecutionUpdate {
+                tool_call_id: tool_id.clone(),
+                tool_name: tool_name.clone(),
+                args: tool_args.clone(),
+                partial_result: ToolOutput {
                     content: update.content,
                     details: update.details,
-                });
-            }
+                },
+            });
         };
 
         match tool
@@ -527,29 +906,79 @@ impl Agent {
             )
             .await
         {
-            Ok(output) => ToolResultMessage {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                content: output.content,
-                details: output.details,
-                is_error: false,
-                timestamp,
-            },
-            Err(e) => ToolResultMessage {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                content: vec![ContentBlock::Text(TextContent::new(format!("Error: {e}")))],
-                details: None,
-                is_error: true,
-                timestamp,
-            },
+            Ok(output) => (output, false),
+            Err(e) => (
+                ToolOutput {
+                    content: vec![ContentBlock::Text(TextContent::new(format!("Error: {e}")))],
+                    details: None,
+                },
+                true,
+            ),
         }
+    }
+
+    fn skip_tool_call(
+        &mut self,
+        tool_call: &ToolCall,
+        on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
+        new_messages: &mut Vec<Message>,
+    ) -> ToolResultMessage {
+        let output = ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Skipped due to queued user message.",
+            ))],
+            details: None,
+        };
+
+        on_event(AgentEvent::ToolExecutionStart {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            args: tool_call.arguments.clone(),
+        });
+        on_event(AgentEvent::ToolExecutionUpdate {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            args: tool_call.arguments.clone(),
+            partial_result: output.clone(),
+        });
+        on_event(AgentEvent::ToolExecutionEnd {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            result: output.clone(),
+            is_error: true,
+        });
+
+        let tool_result = ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: output.content,
+            details: output.details,
+            is_error: true,
+            timestamp: Utc::now().timestamp_millis(),
+        };
+
+        self.messages.push(Message::ToolResult(tool_result.clone()));
+        new_messages.push(Message::ToolResult(tool_result.clone()));
+
+        on_event(AgentEvent::MessageStart {
+            message: Message::ToolResult(tool_result.clone()),
+        });
+        on_event(AgentEvent::MessageEnd {
+            message: Message::ToolResult(tool_result.clone()),
+        });
+
+        tool_result
     }
 }
 
 // ============================================================================
 // Agent Session (Agent + Session persistence)
 // ============================================================================
+
+struct ToolExecutionOutcome {
+    tool_results: Vec<ToolResultMessage>,
+    steering_messages: Option<Vec<Message>>,
+}
 
 pub struct AgentSession {
     pub agent: Agent,
@@ -573,6 +1002,31 @@ impl AgentSession {
         }
     }
 
+    pub const fn save_enabled(&self) -> bool {
+        self.save_enabled
+    }
+
+    pub async fn save_and_index(&mut self) -> Result<()> {
+        if self.save_enabled {
+            self.session.save().await?;
+            if let Some(index) = &self.session_index {
+                index.index_session(&self.session)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn persist_session(&mut self) -> Result<()> {
+        if !self.save_enabled {
+            return Ok(());
+        }
+        self.session.save().await?;
+        if let Some(index) = &self.session_index {
+            index.index_session(&self.session)?;
+        }
+        Ok(())
+    }
+
     pub async fn run_text(
         &mut self,
         input: String,
@@ -587,6 +1041,8 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.agent
+            .replace_messages(self.session.to_messages_for_current_path());
         let start_len = self.agent.messages().len();
         let result = self.agent.run_with_abort(input, abort, on_event).await?;
         self.persist_new_messages(start_len).await?;
@@ -608,6 +1064,8 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.agent
+            .replace_messages(self.session.to_messages_for_current_path());
         let start_len = self.agent.messages().len();
         let result = self
             .agent
@@ -618,16 +1076,15 @@ impl AgentSession {
     }
 
     async fn persist_new_messages(&mut self, start_len: usize) -> Result<()> {
-        if !self.save_enabled {
-            return Ok(());
-        }
         let new_messages = self.agent.messages()[start_len..].to_vec();
         for message in new_messages {
             self.session.append_model_message(message);
         }
-        self.session.save().await?;
-        if let Some(index) = &self.session_index {
-            index.index_session(&self.session)?;
+        if self.save_enabled {
+            self.session.save().await?;
+            if let Some(index) = &self.session_index {
+                index.index_session(&self.session)?;
+            }
         }
         Ok(())
     }
@@ -638,12 +1095,12 @@ impl AgentSession {
 // ============================================================================
 
 /// Extract tool calls from content blocks.
-fn extract_tool_calls(content: &[ContentBlock]) -> Vec<&ToolCall> {
+fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
     content
         .iter()
         .filter_map(|block| {
             if let ContentBlock::ToolCall(tc) = block {
-                Some(tc)
+                Some(tc.clone())
             } else {
                 None
             }

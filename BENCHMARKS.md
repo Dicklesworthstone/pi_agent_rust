@@ -26,6 +26,7 @@ These are the target performance metrics. Regressions beyond these thresholds sh
 | truncate_head (10K lines) | <1ms | ~250μs | ✅ |
 | truncate_tail (10K lines) | <1ms | ~250μs | ✅ |
 | sse_parse (100 events) | <100μs | ~50μs | ✅ |
+| ext_hostcall_dispatch (single call) | <50μs | TBD | ⬜ |
 | Binary startup | <100ms | 11.2ms (`pi --version`) | ✅ |
 | Binary size (release) | <20MB | 7.6MB | ✅ |
 
@@ -69,6 +70,12 @@ benches/
 └── tools.rs          # Core operation benchmarks
     ├── truncation    # Text truncation (head/tail)
     └── sse_parsing   # SSE event parsing
+```
+
+Planned:
+```
+benches/
+└── extensions.rs     # Connector dispatch + event-loop overhead
 ```
 
 ## Adding New Benchmarks

@@ -189,6 +189,13 @@ Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
 - **Prompt templates**: Markdown files under `~/.pi/agent/prompts/` or `.pi/prompts/`; invoke via `/<template> [args]`.
 - **Packages**: Share bundles with `pi install npm:@org/pi-packages` (skills, prompts, themes, extensions).
 
+### Extensions (Planned)
+
+Pi’s extension runtime is designed to be **Node/Bun-free**:
+- **Default:** WASM components (portable, sandboxed) via WIT hostcalls
+- **JS compatibility:** compiled JS → QuickJS bytecode (or JS→WASM), with a tiny Pi event loop + capability-gated connectors
+- **Security:** no ambient OS access; extensions call explicit host connectors (`tool/exec/http/session/ui`) with audit logging
+
 ---
 
 ## Installation
@@ -306,6 +313,9 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
 | Variable | Description |
 |----------|-------------|
 | `ANTHROPIC_API_KEY` | Anthropic API key |
+| `OPENAI_API_KEY` | OpenAI API key |
+| `GOOGLE_API_KEY` | Google Gemini API key |
+| `AZURE_OPENAI_API_KEY` | Azure OpenAI API key |
 | `PI_CONFIG_PATH` | Custom config file path |
 | `PI_CODING_AGENT_DIR` | Override the global config directory |
 | `PI_PACKAGE_DIR` | Override the packages directory |
@@ -329,8 +339,9 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
 ┌────────────▼────────────┐              ┌───────────▼────────────┐
 │    Provider Layer       │              │    Tool Registry       │
 │  • Anthropic (SSE)      │              │  • read    • bash      │
-│  • OpenAI (planned)     │              │  • write   • grep      │
-│  • Gemini (planned)     │              │  • edit    • find      │
+│  • OpenAI               │              │  • write   • grep      │
+│  • Gemini               │              │  • edit    • find      │
+│  • Azure OpenAI         │              │                        │
 └────────────┬────────────┘              │  • ls                  │
              │                           └───────────┬────────────┘
 ┌────────────▼─────────────────────────────────────▼─────────────┐
@@ -735,7 +746,7 @@ Pi is honest about what it doesn't do:
 
 | Limitation | Workaround |
 |------------|------------|
-| **Anthropic-only** | OpenAI/Gemini providers planned |
+| **Not all legacy providers** | Anthropic/OpenAI/Gemini/Azure supported; others TBD |
 | **No web browsing** | Use bash with curl |
 | **No GUI** | Terminal-only by design |
 | **No plugins** | Fork and extend directly |
@@ -825,7 +836,7 @@ A: This is an authorized Rust port of [Pi Agent](https://github.com/badlogic/pi)
 A: Startup time matters when you're in a terminal all day. Rust gives us <100ms startup vs 500ms+ for Node.js. Plus, no runtime dependencies to manage.
 
 **Q: Can I use OpenAI/Gemini models?**
-A: Not yet. Anthropic is the only supported provider currently. OpenAI support is planned.
+A: Yes. Set `OPENAI_API_KEY` or `GOOGLE_API_KEY` and use `--provider`/`--model` (e.g. `--provider openai --model gpt-4o`).
 
 **Q: How do sessions work?**
 A: Each session is a JSONL file with message entries. Sessions are per-project (based on working directory) and support branching via parent references.

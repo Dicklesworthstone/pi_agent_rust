@@ -91,6 +91,7 @@ pub struct ThinkingBudgets {
     pub low: u32,
     pub medium: u32,
     pub high: u32,
+    pub xhigh: u32,
 }
 
 impl Default for ThinkingBudgets {
@@ -100,6 +101,7 @@ impl Default for ThinkingBudgets {
             low: 2048,
             medium: 8192,
             high: 16384,
+            xhigh: 32768, // Default to double high, or model max? Let's pick a reasonable default.
         }
     }
 }
@@ -109,7 +111,7 @@ impl Default for ThinkingBudgets {
 // ============================================================================
 
 /// A model definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Model {
     pub id: String,
     pub name: String,
@@ -125,7 +127,8 @@ pub struct Model {
 }
 
 /// Input types supported by a model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum InputType {
     Text,
     Image,

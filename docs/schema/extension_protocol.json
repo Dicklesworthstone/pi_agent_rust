@@ -15,6 +15,8 @@
         "slash_command",
         "slash_result",
         "event_hook",
+        "host_call",
+        "host_result",
         "log",
         "error"
       ]
@@ -45,6 +47,14 @@
     {
       "if": { "properties": { "type": { "const": "event_hook" } } },
       "then": { "properties": { "payload": { "$ref": "#/$defs/event_hook" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "host_call" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/host_call" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "host_result" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/host_result" } } }
     },
     {
       "if": { "properties": { "type": { "const": "log" } } },
@@ -88,6 +98,26 @@
         "is_error": { "type": "boolean" }
       }
     },
+    "host_call": {
+      "type": "object",
+      "required": ["call_id", "name", "input"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "name": { "type": "string", "description": "Connector call name (e.g., tool, exec, http, session, ui)" },
+        "input": { "type": "object" },
+        "timeout_ms": { "type": "integer", "minimum": 0 },
+        "context": { "type": "object" }
+      }
+    },
+    "host_result": {
+      "type": "object",
+      "required": ["call_id", "output", "is_error"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "output": { "type": "object" },
+        "is_error": { "type": "boolean" }
+      }
+    },
     "slash_command": {
       "type": "object",
       "required": ["name"],
@@ -115,11 +145,46 @@
     },
     "log": {
       "type": "object",
-      "required": ["level", "message"],
+      "required": ["schema", "ts", "level", "event", "message", "correlation"],
       "properties": {
+        "schema": { "type": "string", "enum": ["pi.ext.log.v1"] },
+        "ts": { "type": "string", "format": "date-time" },
         "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
+        "event": { "type": "string" },
         "message": { "type": "string" },
+        "correlation": { "$ref": "#/$defs/log_correlation" },
+        "source": { "$ref": "#/$defs/log_source" },
         "data": { "type": "object" }
+      }
+    },
+    "log_correlation": {
+      "type": "object",
+      "required": ["extension_id", "scenario_id"],
+      "properties": {
+        "extension_id": { "type": "string" },
+        "scenario_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "run_id": { "type": "string" },
+        "artifact_id": { "type": "string" },
+        "tool_call_id": { "type": "string" },
+        "slash_command_id": { "type": "string" },
+        "event_id": { "type": "string" },
+        "host_call_id": { "type": "string" },
+        "rpc_id": { "type": "string" },
+        "trace_id": { "type": "string" },
+        "span_id": { "type": "string" }
+      }
+    },
+    "log_source": {
+      "type": "object",
+      "required": ["component"],
+      "properties": {
+        "component": {
+          "type": "string",
+          "enum": ["capture", "harness", "runtime", "extension"]
+        },
+        "host": { "type": "string" },
+        "pid": { "type": "integer", "minimum": 0 }
       }
     },
     "error": {

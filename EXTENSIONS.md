@@ -39,6 +39,61 @@ Non‑goals:
 
 ---
 
+## 1A. Node/Bun‑Free Runtime: Connectors + Event Loop
+
+Mario’s critique is correct in the narrow sense: **QuickJS is just a JS engine**.
+It intentionally does **not** ship a Node/Bun‑style OS API surface or a full
+general-purpose event loop.
+
+Our answer is: **great** — we don’t want the Node/Bun surface area.
+
+Instead, Pi provides a tiny, capability‑gated **connector layer** and an explicit
+event loop that is *tailored to Pi’s extension needs* (not the entire web/Node
+ecosystem).
+
+### 1A.1 The “Connector” Model (Minimal OS Surface)
+
+Extensions do not get raw OS access (no `fs`, no `child_process`, no arbitrary
+sockets). They get a **small set of hostcalls** that map to Pi’s already-audited
+operations (tools + session/ui actions).
+
+Core examples (names illustrative):
+- `pi.tool(name, input)` → delegates to the built-in tool registry (read/write/edit/bash/grep/find/ls)
+- `pi.exec(command, args, options)` → a constrained process runner (timeout + process-tree cleanup)
+- `pi.fs.*` → a *capability filesystem* rooted at project/cwd (no path escape)
+- `pi.http(request)` → a constrained HTTP client (policy-controlled)
+- `pi.session.*`, `pi.ui.*`, `pi.events.*` → Pi-internal APIs (no OS exposure)
+
+This is strictly smaller than Node/Bun, and it is auditable: every connector call
+is an explicit, logged capability check.
+
+### 1A.2 The Event Loop Bridge (Promises Without Node)
+
+QuickJS supports Promises/microtasks; it just needs a host to **drive** them.
+
+We provide a tiny “Pi event loop”:
+- Drain the QuickJS job queue (microtasks)
+- Poll outstanding host operations (Rust futures via tokio/asupersync)
+- Resolve/reject the corresponding JS Promises
+- Repeat until idle (or until a deadline/timer fires)
+
+In other words: Node’s event loop is a *product*; ours is a *proof obligation*:
+it only implements what Pi needs, with deterministic testing hooks.
+
+### 1A.3 Why This Is Better (Security + Performance)
+
+**Security:** Node/Bun expose an enormous ambient-authority surface by default.
+Our connector layer is capability-based and narrow by construction.
+
+**Performance:** Node/Bun pay startup/memory costs for massive compatibility.
+We precompile JS to bytecode (or WASM) and the runtime only contains:
+1) a JS engine + 2) a small dispatcher + 3) our connectors.
+
+**Determinism:** With asupersync (LabRuntime) we can test extension async + time
+deterministically (no “real time” flakiness).
+
+---
+
 ## 2. Artifact Pipeline (Legacy → Optimized)
 
 **Inputs**
@@ -72,9 +127,88 @@ Core message types:
 - `tool_call` / `tool_result`
 - `slash_command` / `slash_result`
 - `event_hook`
+- `host_call` / `host_result` (extension → core connector calls)
 - `log` / `error`
 
 WASM components use the **WIT interface** in `docs/wit/extension.wit`.
+
+---
+
+### 3.1 Structured Logging (ext.log.v1)
+
+All extension-related logs across **capture**, **harness**, and **runtime** must
+use the same JSONL schema. The protocol `log` message payload matches this
+schema exactly. One log entry per line.
+
+**Log entry schema (required fields marked \*):**
+```json
+{
+  "schema": "pi.ext.log.v1",          // *
+  "ts": "2026-02-03T03:01:02.123Z",   // * RFC3339
+  "level": "info",                    // * debug|info|warn|error
+  "event": "tool_call.start",         // * stable event name
+  "message": "tool call dispatched",  // * human summary
+  "correlation": {                    // * IDs for joining logs
+    "extension_id": "ext.my_ext",     // *
+    "scenario_id": "scn-001",         // *
+    "session_id": "sess-abc123",
+    "run_id": "run-20260203-0001",
+    "artifact_id": "sha256:...",
+    "tool_call_id": "tool-42",
+    "slash_command_id": "slash-7",
+    "event_id": "evt-9",
+    "host_call_id": "host-13",
+    "rpc_id": "rpc-55",
+    "trace_id": "trace-...",
+    "span_id": "span-..."
+  },
+  "source": {                         // optional emitter info
+    "component": "runtime",           // capture|harness|runtime|extension
+    "host": "host.name",
+    "pid": 4242
+  },
+  "data": { "duration_ms": 12 }
+}
+```
+
+**Event naming (examples):**
+- `extension.register`, `extension.ready`
+- `tool_call.start`, `tool_call.end`
+- `slash_command.start`, `slash_command.end`
+- `event_hook.start`, `event_hook.end`
+- `host_call.start`, `host_call.end`
+- `policy.decision`, `compat.warning`
+
+**Correlation rules:**
+- `extension_id` + `scenario_id` are **required** for all extension logs.
+- Populate the most specific ID available (`tool_call_id`, `slash_command_id`,
+  `event_id`, `host_call_id`, `rpc_id`).
+- `trace_id`/`span_id` are optional but recommended for long chains.
+
+**Redaction rules (mandatory):**
+- Replace secrets/credentials with `"[REDACTED]"`.
+- Always redact keys matching (case-insensitive):
+  `api_key`, `token`, `authorization`, `cookie`, `password`, `secret`,
+  `private_key`, `credential`, `bearer`.
+- For PII (email/phone/address), either redact or hash.
+- Never log full file contents; log only sizes/paths/summary.
+
+**Normalization for fixtures (deterministic diffs):**
+- Replace `ts`, `pid`, `host`, `run_id`, `session_id`, `artifact_id`,
+  `trace_id`, `span_id` with placeholders.
+- Normalize absolute paths to `<cwd>/...`.
+- Stable IDs (like `scenario_id`) must be deterministic and **not** randomized.
+
+**Log sinks (documented contract):**
+- **Runtime:** `~/.pi/agent/logs/extensions/<session_id>.jsonl`
+  (override with `PI_EXTENSION_LOG_DIR`).
+- **Capture:** `tests/ext_conformance/capture/<ext>/<scenario>/extension.log.jsonl`
+- **Harness:** `target/ext_conformance/logs/<scenario_id>.jsonl`
+
+**CI consumption:**
+- CI should archive `target/ext_conformance/logs/**` as artifacts.
+- Harness compares normalized logs to fixtures; diffs are triaged by `event`
+  and `correlation` IDs.
 
 ---
 
@@ -172,6 +306,7 @@ The system always **tries to run** with warnings unless `strict` is set.
 ## 9. Next Implementation Steps
 
 1. Implement the protocol structs + JSON schema validation.
-2. Add the WASM host scaffold + capability checks.
-3. Build the SWC‑based `extc` pipeline + cache.
-4. Create conformance fixtures from legacy Pi extensions.
+2. Implement the connector dispatcher + capability checks (works for JS/WASM/MCP).
+3. Add the WASM host scaffold (component model) using the same connector layer.
+4. Build the SWC‑based `extc` pipeline + cache.
+5. Create conformance fixtures from legacy Pi extensions.

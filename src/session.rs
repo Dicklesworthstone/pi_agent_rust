@@ -7,10 +7,12 @@ use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, ToolResultMessage, UserContent, UserMessage,
+    AssistantMessage, ContentBlock, Message, TextContent, ToolResultMessage, UserContent,
+    UserMessage,
 };
 use crate::session_index::SessionIndex;
 use crate::tui::PiConsole;
+use rich_rust::Theme;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -66,7 +68,7 @@ impl Session {
     }
 
     /// Resume a session by prompting the user to select from recent sessions.
-    pub async fn resume_with_picker(override_dir: Option<&Path>, _config: &Config) -> Result<Self> {
+    pub async fn resume_with_picker(override_dir: Option<&Path>, config: &Config) -> Result<Self> {
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             if let Some(session) = crate::session_picker::pick_session(override_dir).await {
                 return Ok(session);
@@ -108,7 +110,8 @@ impl Session {
         let max_entries = 20usize.min(entries.len());
         let entries = entries.into_iter().take(max_entries).collect::<Vec<_>>();
 
-        let console = PiConsole::new();
+        let theme = Self::resolve_console_theme(config, &cwd);
+        let console = PiConsole::new_with_theme(theme);
         console.render_info("Select a session to resume:");
 
         let mut rows: Vec<Vec<String>> = Vec::new();
@@ -163,6 +166,35 @@ impl Session {
         }
     }
 
+    fn resolve_console_theme(config: &Config, cwd: &Path) -> Option<Theme> {
+        let name = config.theme.as_deref()?;
+        if name.trim().is_empty() {
+            return None;
+        }
+
+        let direct_path = Path::new(name);
+        if direct_path.exists() {
+            if let Ok(theme) = Theme::read(direct_path, true) {
+                return Some(theme);
+            }
+        }
+
+        let project_dir = cwd.join(Config::project_dir()).join("themes");
+        let global_dir = Config::global_dir().join("themes");
+        for base in [project_dir, global_dir] {
+            for ext in ["ini", "theme"] {
+                let path = base.join(format!("{name}.{ext}"));
+                if path.exists() {
+                    if let Ok(theme) = Theme::read(&path, true) {
+                        return Some(theme);
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
     /// Create an in-memory (ephemeral) session.
     pub fn in_memory() -> Self {
         Self {
@@ -212,10 +244,22 @@ impl Session {
 
         // Parse entries
         let mut entries = Vec::new();
-        for line in lines {
-            if let Ok(entry) = serde_json::from_str::<SessionEntry>(line) {
-                entries.push(entry);
+        let mut skipped_entries = 0usize;
+        for (line_num, line) in lines.enumerate() {
+            match serde_json::from_str::<SessionEntry>(line) {
+                Ok(entry) => entries.push(entry),
+                Err(e) => {
+                    // Log the error but continue - sessions may have partial corruption
+                    eprintln!(
+                        "Warning: Skipping corrupted entry at line {} in session file: {e}",
+                        line_num + 2 // +2 for 1-based indexing and header line
+                    );
+                    skipped_entries += 1;
+                }
             }
+        }
+        if skipped_entries > 0 {
+            eprintln!("Warning: Skipped {skipped_entries} corrupted entries while loading session");
         }
 
         ensure_entry_ids(&mut entries);
@@ -305,7 +349,7 @@ impl Session {
 
         temp_file
             .persist(path)
-            .map_err(|e| crate::Error::Io(e.error))?;
+            .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
         Ok(())
     }
 
@@ -356,6 +400,99 @@ impl Session {
         self.leaf_id = Some(id.clone());
         self.entries.push(entry);
         id
+    }
+
+    pub fn append_bash_execution(
+        &mut self,
+        command: String,
+        output: String,
+        exit_code: i32,
+        cancelled: bool,
+        truncated: bool,
+        full_output_path: Option<String>,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::Message(MessageEntry {
+            base,
+            message: SessionMessage::BashExecution {
+                command,
+                output,
+                exit_code,
+                cancelled: Some(cancelled),
+                truncated: Some(truncated),
+                full_output_path,
+                timestamp: Some(chrono::Utc::now().timestamp_millis()),
+                extra: HashMap::new(),
+            },
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        id
+    }
+
+    /// Get the current session name from the most recent SessionInfo entry.
+    pub fn get_name(&self) -> Option<String> {
+        self.entries.iter().rev().find_map(|entry| {
+            if let SessionEntry::SessionInfo(info) = entry {
+                info.name.clone()
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Set the session name by appending a SessionInfo entry.
+    pub fn set_name(&mut self, name: &str) -> String {
+        self.append_session_info(Some(name.to_string()))
+    }
+
+    pub fn append_compaction(
+        &mut self,
+        summary: String,
+        first_kept_entry_id: String,
+        tokens_before: u64,
+        details: Option<Value>,
+        from_hook: Option<bool>,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::Compaction(CompactionEntry {
+            base,
+            summary,
+            first_kept_entry_id,
+            tokens_before,
+            details,
+            from_hook,
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        id
+    }
+
+    pub fn append_branch_summary(
+        &mut self,
+        from_id: String,
+        summary: String,
+        details: Option<Value>,
+        from_hook: Option<bool>,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::BranchSummary(BranchSummaryEntry {
+            base,
+            from_id,
+            summary,
+            details,
+            from_hook,
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        id
+    }
+
+    pub fn ensure_entry_ids(&mut self) {
+        ensure_entry_ids(&mut self.entries);
     }
 
     /// Convert session entries to model messages (for provider context).
@@ -596,27 +733,101 @@ impl Session {
             .find(|e| e.base_id().is_some_and(|id| id == entry_id))
     }
 
-    /// Convert session entries along the current path to model messages.
-    /// This follows parent_id links from leaf_id back to root.
-    pub fn to_messages_for_current_path(&self) -> Vec<Message> {
+    /// Entries along the current leaf path, in chronological order.
+    pub fn entries_for_current_path(&self) -> Vec<&SessionEntry> {
         let Some(leaf_id) = &self.leaf_id else {
-            // No leaf, return all messages (linear history)
-            return self.to_messages();
+            return self.entries.iter().collect();
         };
 
         let path = self.get_path_to_entry(leaf_id);
         let path_set: HashSet<&str> = path.iter().map(String::as_str).collect();
 
-        let mut messages = Vec::new();
-        for entry in &self.entries {
-            if let Some(id) = entry.base_id() {
-                if path_set.contains(id.as_str()) {
-                    if let SessionEntry::Message(msg_entry) = entry {
+        self.entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .base_id()
+                    .is_some_and(|id| path_set.contains(id.as_str()))
+            })
+            .collect()
+    }
+
+    /// Convert session entries along the current path to model messages.
+    /// This follows parent_id links from leaf_id back to root.
+    pub fn to_messages_for_current_path(&self) -> Vec<Message> {
+        let path_entries = self.entries_for_current_path();
+
+        // If the current path contains a compaction entry, omit older messages
+        // and insert the compaction summary before the kept region.
+        let last_compaction = path_entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::Compaction(compaction) => Some(compaction),
+            _ => None,
+        });
+
+        if let Some(compaction) = last_compaction {
+            let mut messages = Vec::new();
+
+            let summary_message = SessionMessage::CompactionSummary {
+                summary: compaction.summary.clone(),
+                tokens_before: compaction.tokens_before,
+            };
+            if let Some(message) = session_message_to_model(&summary_message) {
+                messages.push(message);
+            }
+
+            let mut keep = false;
+            for entry in path_entries {
+                if !keep {
+                    if entry
+                        .base_id()
+                        .is_some_and(|id| id == &compaction.first_kept_entry_id)
+                    {
+                        keep = true;
+                    } else {
+                        continue;
+                    }
+                }
+
+                match entry {
+                    SessionEntry::Message(msg_entry) => {
                         if let Some(message) = session_message_to_model(&msg_entry.message) {
                             messages.push(message);
                         }
                     }
+                    SessionEntry::BranchSummary(summary) => {
+                        let summary_message = SessionMessage::BranchSummary {
+                            summary: summary.summary.clone(),
+                            from_id: summary.from_id.clone(),
+                        };
+                        if let Some(message) = session_message_to_model(&summary_message) {
+                            messages.push(message);
+                        }
+                    }
+                    _ => {}
                 }
+            }
+
+            return messages;
+        }
+
+        let mut messages = Vec::new();
+        for entry in path_entries {
+            match entry {
+                SessionEntry::Message(msg_entry) => {
+                    if let Some(message) = session_message_to_model(&msg_entry.message) {
+                        messages.push(message);
+                    }
+                }
+                SessionEntry::BranchSummary(summary) => {
+                    let summary_message = SessionMessage::BranchSummary {
+                        summary: summary.summary.clone(),
+                        from_id: summary.from_id.clone(),
+                    };
+                    if let Some(message) = session_message_to_model(&summary_message) {
+                        messages.push(message);
+                    }
+                }
+                _ => {}
             }
         }
         messages
@@ -1071,7 +1282,7 @@ pub fn encode_cwd(path: &std::path::Path) -> String {
     format!("--{s}--")
 }
 
-fn session_message_to_model(message: &SessionMessage) -> Option<Message> {
+pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Message> {
     match message {
         SessionMessage::User { content, timestamp } => Some(Message::User(UserMessage {
             content: content.clone(),
@@ -1093,8 +1304,95 @@ fn session_message_to_model(message: &SessionMessage) -> Option<Message> {
             is_error: *is_error,
             timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
         })),
-        _ => None,
+        SessionMessage::Custom { content, .. } => Some(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(content))]),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        })),
+        SessionMessage::BashExecution {
+            command,
+            output,
+            exit_code,
+            cancelled,
+            truncated,
+            full_output_path,
+            timestamp,
+            extra,
+        } => {
+            if extra
+                .get("excludeFromContext")
+                .and_then(Value::as_bool)
+                .is_some_and(|v| v)
+            {
+                return None;
+            }
+            let text = bash_execution_to_text(
+                command,
+                output,
+                *exit_code,
+                cancelled.unwrap_or(false),
+                truncated.unwrap_or(false),
+                full_output_path.as_deref(),
+            );
+            Some(Message::User(UserMessage {
+                content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(text))]),
+                timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
+            }))
+        }
+        SessionMessage::BranchSummary { summary, .. } => Some(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(format!(
+                "{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"
+            )))]),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        })),
+        SessionMessage::CompactionSummary { summary, .. } => Some(Message::User(UserMessage {
+            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(format!(
+                "{COMPACTION_SUMMARY_PREFIX}{summary}{COMPACTION_SUMMARY_SUFFIX}"
+            )))]),
+            timestamp: chrono::Utc::now().timestamp_millis(),
+        })),
     }
+}
+
+const COMPACTION_SUMMARY_PREFIX: &str = "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
+const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
+
+const BRANCH_SUMMARY_PREFIX: &str =
+    "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+const BRANCH_SUMMARY_SUFFIX: &str = "</summary>";
+
+fn bash_execution_to_text(
+    command: &str,
+    output: &str,
+    exit_code: i32,
+    cancelled: bool,
+    truncated: bool,
+    full_output_path: Option<&str>,
+) -> String {
+    let mut text = format!("Ran `{command}`\n");
+    if output.is_empty() {
+        text.push_str("(no output)");
+    } else {
+        text.push_str("```\n");
+        text.push_str(output);
+        if !output.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("```");
+    }
+
+    if cancelled {
+        text.push_str("\n\n(command cancelled)");
+    } else if exit_code != 0 {
+        let _ = write!(text, "\n\nCommand exited with code {exit_code}");
+    }
+
+    if truncated {
+        if let Some(path) = full_output_path {
+            let _ = write!(text, "\n\n[Output truncated. Full output: {path}]");
+        }
+    }
+
+    text
 }
 
 fn render_session_message(message: &SessionMessage) -> String {
@@ -1273,6 +1571,7 @@ fn generate_entry_id(existing: &HashSet<String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{StopReason, Usage};
 
     fn make_test_message(text: &str) -> SessionMessage {
         SessionMessage::User {
@@ -1400,6 +1699,57 @@ mod tests {
         assert_eq!(info.branch_point_count, 1);
         assert!(info.branch_points.contains(&id_a));
         assert!(info.leaves.contains(&id_b));
+    }
+
+    #[tokio::test]
+    async fn test_session_jsonl_serialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.header.provider = Some("anthropic".to_string());
+        session.header.model_id = Some("claude-test".to_string());
+        session.header.thinking_level = Some("medium".to_string());
+
+        let user_id = session.append_message(make_test_message("Hello"));
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("Hi!"))],
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        session.append_message(SessionMessage::Assistant { message: assistant });
+        session.append_model_change("anthropic".to_string(), "claude-test".to_string());
+        session.append_thinking_level_change("high".to_string());
+        session.append_compaction("summary".to_string(), user_id.clone(), 123, None, None);
+        session.append_branch_summary(user_id.clone(), "branch".to_string(), None, None);
+        session.append_session_info(Some("my-session".to_string()));
+
+        session.save().await.unwrap();
+
+        let path = session.path.clone().unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        let mut lines = contents.lines();
+
+        let header: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        assert_eq!(header["type"], "session");
+        assert_eq!(header["version"], SESSION_VERSION);
+
+        let mut types = Vec::new();
+        for line in lines {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let entry_type = value["type"].as_str().unwrap_or_default().to_string();
+            types.push(entry_type);
+        }
+
+        assert!(types.contains(&"message".to_string()));
+        assert!(types.contains(&"model_change".to_string()));
+        assert!(types.contains(&"thinking_level_change".to_string()));
+        assert!(types.contains(&"compaction".to_string()));
+        assert!(types.contains(&"branch_summary".to_string()));
+        assert!(types.contains(&"session_info".to_string()));
     }
 
     #[test]

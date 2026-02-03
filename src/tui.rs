@@ -5,6 +5,7 @@
 
 use std::io::{self, IsTerminal, Write};
 
+use rich_rust::Theme;
 use rich_rust::prelude::*;
 
 /// Pi's console wrapper providing styled terminal output.
@@ -16,8 +17,17 @@ pub struct PiConsole {
 impl PiConsole {
     /// Create a new Pi console with auto-detected terminal capabilities.
     pub fn new() -> Self {
+        Self::new_with_theme(None)
+    }
+
+    /// Create a new Pi console with an optional rich_rust theme.
+    pub fn new_with_theme(theme: Option<Theme>) -> Self {
         let is_tty = io::stdout().is_terminal();
-        let console = Console::builder().markup(is_tty).emoji(is_tty).build();
+        let mut builder = Console::builder().markup(is_tty).emoji(is_tty);
+        if let Some(theme) = theme {
+            builder = builder.theme(theme);
+        }
+        let console = builder.build();
 
         Self { console, is_tty }
     }

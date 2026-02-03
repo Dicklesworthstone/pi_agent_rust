@@ -234,8 +234,7 @@ mod bash_tool {
         let err = tool
             .execute("test-id", input, None)
             .await
-            .err()
-            .expect("should error");
+            .expect_err("should error");
         assert!(err.to_string().contains("Command exited with code 42"));
     }
 

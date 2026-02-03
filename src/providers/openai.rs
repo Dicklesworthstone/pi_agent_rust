@@ -12,13 +12,13 @@ use crate::model::{
     UserContent,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+use crate::sse::SseStream;
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::{self, Stream};
 use reqwest::Client;
-use reqwest_eventsource::{Event, EventSource};
 use serde::{Deserialize, Serialize};
 use std::pin::Pin;
-use tokio_stream::StreamExt;
 
 // ============================================================================
 // Constants
@@ -133,6 +133,7 @@ impl Provider for OpenAIProvider {
             .client
             .post(&self.base_url)
             .header("Content-Type", "application/json")
+            .header("Accept", "text/event-stream")
             .header("Authorization", format!("Bearer {api_key}"));
 
         for (key, value) in &options.headers {
@@ -141,8 +142,26 @@ impl Provider for OpenAIProvider {
 
         let request = request.json(&request_body);
 
-        // Create event source for SSE streaming
-        let event_source = EventSource::new(request).map_err(|e| Error::api(e.to_string()))?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| Error::api(format!("HTTP request failed: {e}")))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(Error::api(format!(
+                "OpenAI API error (HTTP {status}): {body}"
+            )));
+        }
+
+        let byte_stream = response.bytes_stream().map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(std::io::Error::other)
+        });
+
+        // Create SSE stream for streaming responses.
+        let event_source = SseStream::new(Box::pin(byte_stream));
 
         // Create stream state
         let model = self.model.clone();
@@ -154,8 +173,7 @@ impl Provider for OpenAIProvider {
             |mut state| async move {
                 loop {
                     match state.event_source.next().await {
-                        Some(Ok(Event::Open)) => {}
-                        Some(Ok(Event::Message(msg))) => {
+                        Some(Ok(msg)) => {
                             // OpenAI sends "[DONE]" as final message
                             if msg.data == "[DONE]" {
                                 let reason = state.partial.stop_reason;
@@ -192,8 +210,11 @@ impl Provider for OpenAIProvider {
 // Stream State
 // ============================================================================
 
-struct StreamState {
-    event_source: EventSource,
+struct StreamState<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    event_source: SseStream<S>,
     partial: AssistantMessage,
     current_text: String,
     tool_calls: Vec<ToolCallState>,
@@ -207,8 +228,11 @@ struct ToolCallState {
     arguments: String,
 }
 
-impl StreamState {
-    fn new(event_source: EventSource, model: String, api: String, provider: String) -> Self {
+impl<S> StreamState<S>
+where
+    S: Stream<Item = std::result::Result<Vec<u8>, std::io::Error>> + Unpin,
+{
+    fn new(event_source: SseStream<S>, model: String, api: String, provider: String) -> Self {
         Self {
             event_source,
             partial: AssistantMessage {
@@ -265,8 +289,16 @@ impl StreamState {
 
             // Finalize any pending tool calls
             for tc in &self.tool_calls {
-                let arguments: serde_json::Value =
-                    serde_json::from_str(&tc.arguments).unwrap_or(serde_json::Value::Null);
+                let arguments: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+                    Ok(args) => args,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: Failed to parse tool arguments as JSON: {e}. Raw: {}",
+                            &tc.arguments
+                        );
+                        serde_json::Value::Null
+                    }
+                };
                 self.partial.content.push(ContentBlock::ToolCall(ToolCall {
                     id: tc.id.clone(),
                     name: tc.name.clone(),
