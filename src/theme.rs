@@ -6,9 +6,27 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
+use glamour::{Style as GlamourStyle, StyleConfig as GlamourStyleConfig};
+use lipgloss::Style as LipglossStyle;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone)]
+pub struct TuiStyles {
+    pub title: LipglossStyle,
+    pub muted: LipglossStyle,
+    pub muted_bold: LipglossStyle,
+    pub muted_italic: LipglossStyle,
+    pub accent: LipglossStyle,
+    pub accent_bold: LipglossStyle,
+    pub success_bold: LipglossStyle,
+    pub warning: LipglossStyle,
+    pub warning_bold: LipglossStyle,
+    pub error_bold: LipglossStyle,
+    pub border: LipglossStyle,
+    pub selection: LipglossStyle,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Theme {
@@ -64,6 +82,101 @@ impl ThemeRoots {
 }
 
 impl Theme {
+    /// Resolve the active theme for the given config/cwd.
+    ///
+    /// - If `config.theme` is unset/empty, defaults to [`Theme::dark`].
+    /// - If set to `dark` or `light`, uses built-in defaults.
+    /// - Otherwise, attempts to load a theme JSON by name, falling back to dark on error.
+    #[must_use]
+    pub fn resolve(config: &Config, cwd: &Path) -> Self {
+        let Some(name) = config.theme.as_deref() else {
+            return Self::dark();
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Self::dark();
+        }
+        if name.eq_ignore_ascii_case("dark") {
+            return Self::dark();
+        }
+        if name.eq_ignore_ascii_case("light") {
+            return Self::light();
+        }
+
+        match Self::load_by_name(name, cwd) {
+            Ok(theme) => theme,
+            Err(err) => {
+                tracing::warn!("Failed to load theme '{name}': {err}");
+                Self::dark()
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn is_light(&self) -> bool {
+        let Some((r, g, b)) = parse_hex_color(&self.colors.background) else {
+            return false;
+        };
+        // Relative luminance (sRGB) without gamma correction is sufficient here.
+        // Treat anything above mid-gray as light.
+        let luma = (0.2126 * (r as f64)) + (0.7152 * (g as f64)) + (0.0722 * (b as f64));
+        luma >= 128.0
+    }
+
+    #[must_use]
+    pub fn tui_styles(&self) -> TuiStyles {
+        let title = LipglossStyle::new()
+            .bold()
+            .foreground(self.colors.accent.as_str());
+        let muted = LipglossStyle::new().foreground(self.colors.muted.as_str());
+
+        TuiStyles {
+            title,
+            muted: muted.clone(),
+            muted_bold: muted.clone().bold(),
+            muted_italic: muted.clone().italic(),
+            accent: LipglossStyle::new().foreground(self.colors.accent.as_str()),
+            accent_bold: LipglossStyle::new()
+                .foreground(self.colors.accent.as_str())
+                .bold(),
+            success_bold: LipglossStyle::new()
+                .foreground(self.colors.success.as_str())
+                .bold(),
+            warning: LipglossStyle::new().foreground(self.colors.warning.as_str()),
+            warning_bold: LipglossStyle::new()
+                .foreground(self.colors.warning.as_str())
+                .bold(),
+            error_bold: LipglossStyle::new()
+                .foreground(self.colors.error.as_str())
+                .bold(),
+            border: LipglossStyle::new().foreground(self.ui.border.as_str()),
+            selection: LipglossStyle::new()
+                .foreground(self.colors.foreground.as_str())
+                .background(self.ui.selection.as_str())
+                .bold(),
+        }
+    }
+
+    #[must_use]
+    pub fn glamour_style_config(&self) -> GlamourStyleConfig {
+        let mut config = if self.is_light() {
+            GlamourStyle::Light.config()
+        } else {
+            GlamourStyle::Dark.config()
+        };
+
+        config.document.style.color = Some(self.colors.foreground.clone());
+        config.heading.style.color = Some(self.colors.accent.clone());
+        config.link.color = Some(self.colors.accent.clone());
+        config.link_text.color = Some(self.colors.accent.clone());
+
+        // Basic code styling (syntax-highlighting is controlled by glamour feature flags).
+        config.code.style.color = Some(self.syntax.string.clone());
+        config.code_block.block.style.color = Some(self.syntax.string.clone());
+
+        config
+    }
+
     /// Discover available theme JSON files.
     #[must_use]
     pub fn discover_themes(cwd: &Path) -> Vec<PathBuf> {
@@ -238,6 +351,19 @@ fn glob_json(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
+    let value = value.trim();
+    let hex = value.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some((r, g, b))
 }
 
 #[cfg(test)]

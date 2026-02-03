@@ -9,11 +9,11 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Program, quit};
-use lipgloss::Style;
 
 use crate::config::Config;
 use crate::session::{Session, SessionEntry, SessionHeader, encode_cwd};
 use crate::session_index::{SessionIndex, SessionMeta};
+use crate::theme::{Theme, TuiStyles};
 
 /// Format a timestamp for display.
 pub fn format_time(timestamp: &str) -> String {
@@ -30,6 +30,7 @@ pub struct SessionPicker {
     selected: usize,
     chosen: Option<usize>,
     cancelled: bool,
+    styles: TuiStyles,
 }
 
 impl SessionPicker {
@@ -37,11 +38,26 @@ impl SessionPicker {
     #[allow(clippy::missing_const_for_fn)] // sessions: Vec cannot be const
     #[must_use]
     pub fn new(sessions: Vec<SessionMeta>) -> Self {
+        let theme = Theme::dark();
+        let styles = theme.tui_styles();
         Self {
             sessions,
             selected: 0,
             chosen: None,
             cancelled: false,
+            styles,
+        }
+    }
+
+    #[must_use]
+    pub fn with_theme(sessions: Vec<SessionMeta>, theme: Theme) -> Self {
+        let styles = theme.tui_styles();
+        Self {
+            sessions,
+            selected: 0,
+            chosen: None,
+            cancelled: false,
+            styles,
         }
     }
 
@@ -110,30 +126,29 @@ impl SessionPicker {
         let mut output = String::new();
 
         // Header
-        let title_style = Style::new().bold().foreground("212");
         let _ = writeln!(
             output,
             "\n  {}\n",
-            title_style.render("Select a session to resume")
+            self.styles.title.render("Select a session to resume")
         );
 
         if self.sessions.is_empty() {
-            let dim_style = Style::new().foreground("241");
             let _ = writeln!(
                 output,
                 "  {}",
-                dim_style.render("No sessions found for this project.")
+                self.styles
+                    .muted
+                    .render("No sessions found for this project.")
             );
         } else {
             // Column headers
-            let header_style = Style::new().foreground("241").bold();
             let _ = writeln!(
                 output,
                 "  {:<20}  {:<30}  {:<8}  {}",
-                header_style.render("Time"),
-                header_style.render("Name"),
-                header_style.render("Messages"),
-                header_style.render("Session ID")
+                self.styles.muted_bold.render("Time"),
+                self.styles.muted_bold.render("Name"),
+                self.styles.muted_bold.render("Messages"),
+                self.styles.muted_bold.render("Session ID")
             );
             output.push_str("  ");
             output.push_str(&"-".repeat(78));
@@ -142,12 +157,6 @@ impl SessionPicker {
             // Session rows
             for (i, session) in self.sessions.iter().enumerate() {
                 let is_selected = i == self.selected;
-
-                let row_style = if is_selected {
-                    Style::new().bold().foreground("cyan")
-                } else {
-                    Style::new()
-                };
 
                 let prefix = if is_selected { ">" } else { " " };
                 let time = format_time(&session.timestamp);
@@ -164,18 +173,25 @@ impl SessionPicker {
                 let _ = writeln!(
                     output,
                     "{prefix} {}",
-                    row_style.render(&format!(" {time:<20}  {name:<30}  {messages:<8}  {id}"))
+                    if is_selected {
+                        self.styles
+                            .selection
+                            .render(&format!(" {time:<20}  {name:<30}  {messages:<8}  {id}"))
+                    } else {
+                        format!(" {time:<20}  {name:<30}  {messages:<8}  {id}")
+                    }
                 );
             }
         }
 
         // Help text
         output.push('\n');
-        let help_style = Style::new().foreground("241");
         let _ = writeln!(
             output,
             "  {}",
-            help_style.render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
+            self.styles
+                .muted
+                .render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
         );
 
         output
@@ -207,7 +223,9 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
         return Some(session);
     }
 
-    let picker = SessionPicker::new(sessions);
+    let config = Config::load().unwrap_or_default();
+    let theme = Theme::resolve(&config, &cwd);
+    let picker = SessionPicker::with_theme(sessions, theme);
 
     // Run the TUI
     let result = Program::new(picker).with_alt_screen().run();
