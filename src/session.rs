@@ -511,7 +511,7 @@ impl Session {
 
         while let Some(id) = current {
             path.push(id.clone());
-            current = parent_map.get(&id).and_then(|p| p.clone());
+            current = parent_map.get(&id).and_then(Clone::clone);
         }
 
         path.reverse();
@@ -640,9 +640,7 @@ impl Session {
     /// Add a label to an entry.
     pub fn add_label(&mut self, target_id: &str, label: Option<String>) -> Option<String> {
         // Verify target exists
-        if self.get_entry(target_id).is_none() {
-            return None;
-        }
+        self.get_entry(target_id)?;
 
         let id = self.next_entry_id();
         let base = EntryBase::new(self.leaf_id.clone(), id.clone());
@@ -740,10 +738,11 @@ fn load_session_meta(path: &Path) -> Result<SessionPickEntry> {
     let modified = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
+    #[allow(clippy::cast_possible_truncation)]
     let last_modified_ms = modified
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis() as i64;
+        .as_millis() as i64; // i64::MAX ms = ~292 million years, so truncation is safe
 
     Ok(SessionPickEntry {
         path: path.to_path_buf(),
@@ -1280,7 +1279,7 @@ mod tests {
 
         // Check path from last entry
         let path = session.get_path_to_entry(&id3);
-        assert_eq!(path, vec![id1.clone(), id2.clone(), id3.clone()]);
+        assert_eq!(path, vec![id1.as_str(), id2.as_str(), id3.as_str()]);
 
         // Check only one leaf
         let leaves = session.list_leaves();
@@ -1309,11 +1308,11 @@ mod tests {
 
         // Path to D should be A -> B -> D
         let path_to_d = session.get_path_to_entry(&id_d);
-        assert_eq!(path_to_d, vec![id_a.clone(), id_b.clone(), id_d.clone()]);
+        assert_eq!(path_to_d, vec![id_a.as_str(), id_b.as_str(), id_d.as_str()]);
 
         // Path to C should be A -> B -> C
         let path_to_c = session.get_path_to_entry(&id_c);
-        assert_eq!(path_to_c, vec![id_a.clone(), id_b.clone(), id_c.clone()]);
+        assert_eq!(path_to_c, vec![id_a.as_str(), id_b.as_str(), id_c.as_str()]);
     }
 
     #[test]
@@ -1392,8 +1391,9 @@ mod tests {
     fn test_to_messages_for_current_path() {
         let mut session = Session::in_memory();
 
+        // Tree structure:
         // A -> B -> C
-        //   -> D
+        //       \-> D  (D branches from B)
         let _id_a = session.append_message(make_test_message("A"));
         let id_b = session.append_message(make_test_message("B"));
         let _id_c = session.append_message(make_test_message("C"));

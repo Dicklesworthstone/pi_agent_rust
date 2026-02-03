@@ -29,8 +29,6 @@ use pi::provider::{InputType, StreamOptions, ThinkingBudgets};
 use pi::providers::{anthropic::AnthropicProvider, openai::OpenAIProvider};
 use pi::session::Session;
 use pi::tools::{ToolRegistry, process_file_arguments};
-use pi::tui::PiConsole;
-use tokio::io::AsyncBufReadExt;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -128,14 +126,8 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
 
     let mut session = Session::new(&cli, &config).await?;
 
-    let selection = select_model_and_thinking(
-        &cli,
-        &config,
-        &session,
-        &model_registry,
-        &scoped_models,
-        is_interactive,
-    )?;
+    let selection =
+        select_model_and_thinking(&cli, &config, &session, &model_registry, &scoped_models)?;
 
     update_session_for_selection(&mut session, &selection);
 
@@ -187,7 +179,15 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
             println!("Model scope: {model_list} (Ctrl+P to cycle)");
         }
 
-        return run_interactive_mode(&mut agent_session, initial, messages).await;
+        return run_interactive_mode(
+            agent_session,
+            initial,
+            messages,
+            config.clone(),
+            selection.model_entry.model.id.clone(),
+            !cli.no_session,
+        )
+        .await;
     }
 
     run_print_mode(&mut agent_session, &mode, initial, messages).await
@@ -398,51 +398,26 @@ async fn run_print_mode(
 }
 
 async fn run_interactive_mode(
-    session: &mut AgentSession,
+    mut session: AgentSession,
     initial: Option<InitialMessage>,
     messages: Vec<String>,
+    config: Config,
+    model: String,
+    save_enabled: bool,
 ) -> Result<()> {
-    let console = Arc::new(PiConsole::new());
+    let ignore_event = |_event: AgentEvent| {};
 
     if let Some(initial) = initial {
         let content = build_initial_content(&initial);
-        let console = console.clone();
-        session
-            .run_with_content(content, move |event| render_agent_event(&console, event))
-            .await?;
+        session.run_with_content(content, ignore_event).await?;
     }
 
     for message in messages {
-        let console = console.clone();
-        session
-            .run_text(message, move |event| render_agent_event(&console, event))
-            .await?;
+        session.run_text(message, ignore_event).await?;
     }
 
-    let stdin = tokio::io::stdin();
-    let mut reader = tokio::io::BufReader::new(stdin);
-    let mut line = String::new();
-
-    loop {
-        console.render_prompt();
-        line.clear();
-        let read = reader.read_line(&mut line).await?;
-        if read == 0 {
-            break;
-        }
-        let input = line.trim();
-        if input.is_empty() {
-            continue;
-        }
-        console.render_user_message(input);
-        let console = console.clone();
-        session
-            .run_text(input.to_string(), move |event| {
-                render_agent_event(&console, event);
-            })
-            .await?;
-    }
-
+    let AgentSession { agent, session, .. } = session;
+    pi::interactive::run_interactive(agent, session, config, model, save_enabled).await?;
     Ok(())
 }
 
@@ -482,43 +457,6 @@ struct ContextFile {
 struct RestoreResult {
     model: Option<ModelEntry>,
     fallback_message: Option<String>,
-}
-
-fn render_agent_event(console: &PiConsole, event: AgentEvent) {
-    match event {
-        AgentEvent::RequestStart => console.render_assistant_start(),
-        AgentEvent::TextDelta { text } => console.render_text_delta(&text),
-        AgentEvent::ThinkingDelta { text } => console.render_thinking_delta(&text),
-        AgentEvent::ToolExecuteStart { name, .. } => console.render_tool_start(&name, ""),
-        AgentEvent::ToolExecuteEnd { name, is_error, .. } => {
-            console.render_tool_end(&name, is_error);
-        }
-        AgentEvent::ToolUpdate {
-            content, details, ..
-        } => {
-            let mut lines = Vec::new();
-            for block in &content {
-                if let ContentBlock::Text(text) = block {
-                    lines.push(text.text.clone());
-                }
-            }
-            if lines.is_empty() {
-                if let Some(details) = details {
-                    if let Ok(serialized) = serde_json::to_string_pretty(&details) {
-                        lines.push(serialized);
-                    }
-                }
-            }
-            if !lines.is_empty() {
-                println!("\n{}", lines.join("\n"));
-            }
-        }
-        AgentEvent::Error { error } => console.render_error(&error),
-        AgentEvent::Done { .. } => {
-            println!();
-        }
-        _ => {}
-    }
 }
 
 fn read_piped_stdin() -> Result<Option<String>> {
@@ -1018,7 +956,6 @@ fn select_model_and_thinking(
     session: &Session,
     registry: &ModelRegistry,
     scoped_models: &[ScopedModel],
-    is_interactive: bool,
 ) -> Result<ModelSelection> {
     let is_continuing = cli.r#continue || cli.resume || cli.session.is_some();
     let mut selected_model: Option<ModelEntry> = None;
@@ -1152,8 +1089,6 @@ fn select_model_and_thinking(
         thinking_level.unwrap_or(model::ThinkingLevel::Medium),
         &model_entry,
     );
-
-    let _ = is_interactive;
 
     Ok(ModelSelection {
         model_entry,

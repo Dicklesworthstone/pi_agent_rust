@@ -323,6 +323,70 @@
         "content_exact": "Successfully replaced text in test.txt.",
         "details_contains": ["diff"]
       }
+    },
+    {
+      "name": "edit_fuzzy_trailing_whitespace",
+      "description": "Fuzzy match: trailing whitespace on lines is tolerated",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "Hello World  \nSecond line  "}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "Hello World\nSecond line",
+        "newText": "Hello Rust\nModified line"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
+    },
+    {
+      "name": "edit_fuzzy_smart_quotes",
+      "description": "Fuzzy match: smart quotes normalized to ASCII quotes",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "He said \u201cHello\u201d and she said \u2018Hi\u2019"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "He said \"Hello\" and she said 'Hi'",
+        "newText": "They greeted each other"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
+    },
+    {
+      "name": "edit_fuzzy_dashes",
+      "description": "Fuzzy match: various Unicode dashes normalized to ASCII hyphen",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "Range: 10\u201320 items\u2014more or less"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "Range: 10-20 items-more or less",
+        "newText": "Range: 15-25 items or so"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
+    },
+    {
+      "name": "edit_fuzzy_nbsp",
+      "description": "Fuzzy match: non-breaking spaces normalized to regular spaces",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "100\u00a0USD per\u00a0item"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "100 USD per item",
+        "newText": "99 EUR per unit"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
     }
   ]
 }

@@ -1,0 +1,22 @@
+package pi:extension;
+
+interface extension {
+  /// Initialize the extension and return its registration payload (JSON).
+  init: func(manifest_json: string) -> result<string, string>;
+
+  /// Handle a tool call. Returns tool_result JSON.
+  handle-tool: func(name: string, input_json: string) -> result<string, string>;
+
+  /// Handle a slash command. Returns slash_result JSON.
+  handle-slash: func(command: string, args: list<string>, input_json: string) -> result<string, string>;
+
+  /// Handle an event hook. Returns optional event response JSON.
+  handle-event: func(event_json: string) -> result<string, string>;
+
+  /// Clean shutdown (optional).
+  shutdown: func();
+}
+
+world pi-extension {
+  export extension;
+}

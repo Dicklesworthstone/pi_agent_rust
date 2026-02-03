@@ -1,0 +1,135 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pi Extension Protocol",
+  "type": "object",
+  "required": ["id", "version", "type", "payload"],
+  "properties": {
+    "id": { "type": "string", "description": "Correlation id for request/response" },
+    "version": { "type": "string", "enum": ["1.0"] },
+    "type": {
+      "type": "string",
+      "enum": [
+        "register",
+        "tool_call",
+        "tool_result",
+        "slash_command",
+        "slash_result",
+        "event_hook",
+        "log",
+        "error"
+      ]
+    },
+    "payload": { "type": "object" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "register" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/register" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "tool_call" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/tool_call" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "tool_result" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/tool_result" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "slash_command" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/slash_command" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "slash_result" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/slash_result" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "event_hook" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/event_hook" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "log" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/log" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "error" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/error" } } }
+    }
+  ],
+  "$defs": {
+    "register": {
+      "type": "object",
+      "required": ["name", "version", "api_version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" },
+        "api_version": { "type": "string" },
+        "capabilities": { "type": "array", "items": { "type": "string" } },
+        "tools": { "type": "array", "items": { "type": "object" } },
+        "slash_commands": { "type": "array", "items": { "type": "object" } },
+        "event_hooks": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "tool_call": {
+      "type": "object",
+      "required": ["call_id", "name", "input"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "name": { "type": "string" },
+        "input": { "type": "object" },
+        "context": { "type": "object" }
+      }
+    },
+    "tool_result": {
+      "type": "object",
+      "required": ["call_id", "output", "is_error"],
+      "properties": {
+        "call_id": { "type": "string" },
+        "output": { "type": "object" },
+        "is_error": { "type": "boolean" }
+      }
+    },
+    "slash_command": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "input": { "type": "object" }
+      }
+    },
+    "slash_result": {
+      "type": "object",
+      "required": ["output", "is_error"],
+      "properties": {
+        "output": { "type": "object" },
+        "is_error": { "type": "boolean" }
+      }
+    },
+    "event_hook": {
+      "type": "object",
+      "required": ["event"],
+      "properties": {
+        "event": { "type": "string" },
+        "data": { "type": "object" }
+      }
+    },
+    "log": {
+      "type": "object",
+      "required": ["level", "message"],
+      "properties": {
+        "level": { "type": "string", "enum": ["debug", "info", "warn", "error"] },
+        "message": { "type": "string" },
+        "data": { "type": "object" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": { "type": "string" },
+        "message": { "type": "string" },
+        "details": { "type": "object" }
+      }
+    }
+  }
+}

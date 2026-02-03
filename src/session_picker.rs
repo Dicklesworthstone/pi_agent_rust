@@ -12,11 +12,10 @@ use crate::session_index::{SessionIndex, SessionMeta};
 
 /// Format a timestamp for display.
 fn format_time(timestamp: &str) -> String {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(timestamp) {
-        dt.format("%Y-%m-%d %H:%M").to_string()
-    } else {
-        timestamp.to_string()
-    }
+    chrono::DateTime::parse_from_rfc3339(timestamp).map_or_else(
+        |_| timestamp.to_string(),
+        |dt| dt.format("%Y-%m-%d %H:%M").to_string(),
+    )
 }
 
 /// The session picker TUI model.
@@ -30,6 +29,8 @@ pub struct SessionPicker {
 
 impl SessionPicker {
     /// Create a new session picker.
+    #[allow(clippy::missing_const_for_fn)] // sessions: Vec cannot be const
+    #[must_use]
     pub fn new(sessions: Vec<SessionMeta>) -> Self {
         Self {
             sessions,
@@ -51,10 +52,12 @@ impl SessionPicker {
         self.cancelled
     }
 
+    #[allow(clippy::unused_self, clippy::missing_const_for_fn)]
     fn init(&self) -> Option<Cmd> {
         None
     }
 
+    #[allow(clippy::needless_pass_by_value)] // Required by Model trait
     fn update(&mut self, msg: Message) -> Option<Cmd> {
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
             match key.key_type {
@@ -156,9 +159,7 @@ impl SessionPicker {
                 let _ = writeln!(
                     output,
                     "{prefix} {}",
-                    row_style.render(&format!(
-                        " {time:<20}  {name:<30}  {messages:<8}  {id}"
-                    ))
+                    row_style.render(&format!(" {time:<20}  {name:<30}  {messages:<8}  {id}"))
                 );
             }
         }

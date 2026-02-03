@@ -18,6 +18,7 @@ use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program,
 use crossterm::terminal;
 use glamour::{Renderer as MarkdownRenderer, Style as GlamourStyle};
 use lipgloss::Style;
+use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 
 use std::fmt::Write as _;
@@ -25,8 +26,9 @@ use std::sync::Arc;
 
 use crate::agent::{Agent, AgentEvent};
 use crate::config::Config;
-use crate::model::Usage;
-use crate::session::Session;
+use crate::model::{ContentBlock, Usage, UserContent};
+use crate::session::{Session, SessionEntry, SessionMessage};
+use crate::session_index::SessionIndex;
 
 // ============================================================================
 // Slash Commands
@@ -81,7 +83,7 @@ impl SlashCommand {
 
 Tips:
   • Use ↑/↓ arrows or Ctrl+P/N to navigate input history
-  • Use Ctrl+Enter to submit multi-line input
+  • Use Alt+Enter to submit multi-line input
   • Use PageUp/PageDown to scroll conversation history
   • Use Escape to cancel current input"
     }
@@ -98,6 +100,13 @@ pub enum PiMsg {
     ThinkingDelta(String),
     /// Tool execution started.
     ToolStart { name: String, tool_id: String },
+    /// Tool execution update (streaming output).
+    ToolUpdate {
+        name: String,
+        tool_id: String,
+        content: Vec<ContentBlock>,
+        details: Option<Value>,
+    },
     /// Tool execution ended.
     ToolEnd {
         name: String,
@@ -126,7 +135,7 @@ pub enum AgentState {
 pub enum InputMode {
     /// Single-line input mode (default).
     SingleLine,
-    /// Multi-line input mode (activated with Ctrl+Enter or \).
+    /// Multi-line input mode (activated with Alt+Enter or \).
     MultiLine,
 }
 
@@ -159,6 +168,7 @@ pub struct PiApp {
     config: Config,
     model: String,
     agent: Arc<Mutex<Agent>>,
+    save_enabled: bool,
 
     // Token tracking
     total_usage: Usage,
@@ -194,6 +204,7 @@ impl PiApp {
         config: Config,
         model: String,
         event_tx: mpsc::UnboundedSender<PiMsg>,
+        save_enabled: bool,
     ) -> Self {
         // Get terminal size
         let (term_width, term_height) =
@@ -202,7 +213,7 @@ impl PiApp {
         // Configure text area for input
         let mut input = TextArea::new();
         input.placeholder =
-            "Type your message... (Enter to send, Ctrl+Enter for multi-line, Esc to quit)"
+            "Type your message... (Enter to send, Alt+Enter for multi-line, Esc to quit)"
                 .to_string();
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
@@ -222,7 +233,9 @@ impl PiApp {
         conversation_viewport.mouse_wheel_enabled = true;
         conversation_viewport.mouse_wheel_delta = 3;
 
-        Self {
+        let (messages, total_usage) = load_conversation_from_session(&session);
+
+        let mut app = Self {
             input,
             input_history: Vec::new(),
             history_index: None,
@@ -232,7 +245,7 @@ impl PiApp {
             agent_state: AgentState::Idle,
             term_width,
             term_height,
-            messages: Vec::new(),
+            messages,
             current_response: String::new(),
             current_thinking: String::new(),
             current_tool: None,
@@ -240,10 +253,14 @@ impl PiApp {
             config,
             model,
             agent: Arc::new(Mutex::new(agent)),
-            total_usage: Usage::default(),
+            total_usage,
             event_tx,
             status_message: None,
-        }
+            save_enabled,
+        };
+
+        app.scroll_to_bottom();
+        app
     }
 
     /// Initialize the application.
@@ -269,7 +286,7 @@ impl PiApp {
             self.status_message = None;
 
             match key.key_type {
-                // Ctrl+Enter: Toggle multi-line mode or submit in multi-line mode
+                // Alt+Enter: Toggle multi-line mode or submit in multi-line mode
                 KeyType::Enter if key.alt => {
                     if self.agent_state == AgentState::Idle {
                         if self.input_mode == InputMode::MultiLine {
@@ -520,6 +537,21 @@ impl PiApp {
                 self.agent_state = AgentState::ToolRunning;
                 self.current_tool = Some(name);
             }
+            PiMsg::ToolUpdate {
+                name,
+                content,
+                details,
+                ..
+            } => {
+                if let Some(output) = format_tool_output(&content, details.as_ref()) {
+                    self.messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: format!("Tool {name} output:\n{output}"),
+                        thinking: None,
+                    });
+                    self.scroll_to_bottom();
+                }
+            }
             PiMsg::ToolEnd { .. } => {
                 self.agent_state = AgentState::Processing;
                 self.current_tool = None;
@@ -583,6 +615,7 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
+        let save_enabled = self.save_enabled;
 
         // Add to history
         self.input_history.push(message_owned.clone());
@@ -626,6 +659,17 @@ impl PiApp {
                             tool_id: id,
                             is_error,
                         }),
+                        AgentEvent::ToolUpdate {
+                            name,
+                            id,
+                            content,
+                            details,
+                        } => Some(PiMsg::ToolUpdate {
+                            name,
+                            tool_id: id,
+                            content,
+                            details,
+                        }),
                         AgentEvent::Done { final_message } => Some(PiMsg::AgentDone {
                             usage: Some(final_message.usage),
                         }),
@@ -647,10 +691,26 @@ impl PiApp {
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
-            let save_result = session_guard.save().await;
+            let mut save_error = None;
+            let mut index_error = None;
+
+            if save_enabled {
+                if let Err(err) = session_guard.save().await {
+                    save_error = Some(format!("Failed to save session: {err}"));
+                } else {
+                    let index = SessionIndex::new();
+                    if let Err(err) = index.index_session(&session_guard) {
+                        index_error = Some(format!("Failed to index session: {err}"));
+                    }
+                }
+            }
             drop(session_guard);
-            if let Err(err) = save_result {
-                let _ = event_tx.send(PiMsg::AgentError(format!("Failed to save session: {err}")));
+
+            if let Some(err) = save_error {
+                let _ = event_tx.send(PiMsg::AgentError(err));
+            }
+            if let Some(err) = index_error {
+                let _ = event_tx.send(PiMsg::AgentError(err));
             }
 
             if let Err(err) = result {
@@ -747,8 +807,10 @@ impl PiApp {
                         .iter()
                         .enumerate()
                         .map(|(i, h)| {
-                            let truncated = if h.len() > 60 {
-                                format!("{}...", &h[..57])
+                            // Use char count not byte len to avoid panic on multi-byte UTF-8
+                            let truncated = if h.chars().count() > 60 {
+                                let s: String = h.chars().take(57).collect();
+                                format!("{s}...")
                             } else {
                                 h.clone()
                             };
@@ -920,6 +982,225 @@ impl PiApp {
     }
 }
 
+#[allow(clippy::too_many_lines)]
+fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Usage) {
+    let mut messages = Vec::new();
+    let mut total_usage = Usage::default();
+
+    for entry in &session.entries {
+        match entry {
+            SessionEntry::Message(entry) => match &entry.message {
+                SessionMessage::User { content, .. } => {
+                    let text = user_content_to_text(content);
+                    if !text.trim().is_empty() {
+                        messages.push(ConversationMessage {
+                            role: MessageRole::User,
+                            content: text,
+                            thinking: None,
+                        });
+                    }
+                }
+                SessionMessage::Assistant { message } => {
+                    let (text, thinking) = assistant_content_to_text(&message.content);
+                    if !text.trim().is_empty() || thinking.is_some() {
+                        messages.push(ConversationMessage {
+                            role: MessageRole::Assistant,
+                            content: text,
+                            thinking,
+                        });
+                    }
+                    add_usage(&mut total_usage, &message.usage);
+                }
+                SessionMessage::ToolResult {
+                    tool_name,
+                    content,
+                    details,
+                    is_error,
+                    ..
+                } => {
+                    if let Some(output) = format_tool_output(content, details.as_ref()) {
+                        let label = if *is_error {
+                            "Tool error"
+                        } else {
+                            "Tool result"
+                        };
+                        messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content: format!("{label} ({tool_name}):\n{output}"),
+                            thinking: None,
+                        });
+                    }
+                }
+                SessionMessage::BashExecution {
+                    command,
+                    output,
+                    exit_code,
+                    ..
+                } => {
+                    let status = if *exit_code == 0 { "ok" } else { "error" };
+                    messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: format!("bash ({status}) {command}\n{output}"),
+                        thinking: None,
+                    });
+                }
+                SessionMessage::Custom {
+                    custom_type,
+                    content,
+                    display,
+                    details,
+                    ..
+                } => {
+                    if *display {
+                        let mut combined = content.clone();
+                        if let Some(details) = details {
+                            let details_text = pretty_json(details);
+                            if !details_text.is_empty() {
+                                combined.push('\n');
+                                combined.push_str(&details_text);
+                            }
+                        }
+                        messages.push(ConversationMessage {
+                            role: MessageRole::System,
+                            content: format!("{custom_type}: {combined}"),
+                            thinking: None,
+                        });
+                    }
+                }
+                SessionMessage::BranchSummary { summary, from_id } => {
+                    messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: format!("Branch summary from {from_id}: {summary}"),
+                        thinking: None,
+                    });
+                }
+                SessionMessage::CompactionSummary {
+                    summary,
+                    tokens_before,
+                } => {
+                    messages.push(ConversationMessage {
+                        role: MessageRole::System,
+                        content: format!("Compaction summary ({tokens_before} tokens): {summary}"),
+                        thinking: None,
+                    });
+                }
+            },
+            SessionEntry::ModelChange(change) => {
+                messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!("Model set to {}/{}", change.provider, change.model_id),
+                    thinking: None,
+                });
+            }
+            SessionEntry::ThinkingLevelChange(change) => {
+                messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: format!("Thinking level: {}", change.thinking_level),
+                    thinking: None,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    (messages, total_usage)
+}
+
+fn add_usage(total: &mut Usage, usage: &Usage) {
+    total.input += usage.input;
+    total.output += usage.output;
+    total.cache_read += usage.cache_read;
+    total.cache_write += usage.cache_write;
+    total.total_tokens += usage.total_tokens;
+    total.cost.input += usage.cost.input;
+    total.cost.output += usage.cost.output;
+    total.cost.cache_read += usage.cost.cache_read;
+    total.cost.cache_write += usage.cost.cache_write;
+    total.cost.total += usage.cost.total;
+}
+
+fn user_content_to_text(content: &UserContent) -> String {
+    match content {
+        UserContent::Text(text) => text.clone(),
+        UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+    }
+}
+
+fn assistant_content_to_text(blocks: &[ContentBlock]) -> (String, Option<String>) {
+    let mut text = String::new();
+    let mut thinking = String::new();
+
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text_block) => push_line(&mut text, &text_block.text),
+            ContentBlock::Thinking(thinking_block) => {
+                push_line(&mut thinking, &thinking_block.thinking);
+            }
+            ContentBlock::Image(image) => {
+                push_line(&mut text, &format!("[image: {}]", image.mime_type));
+            }
+            ContentBlock::ToolCall(call) => {
+                push_line(&mut text, &format!("[tool call: {}]", call.name));
+            }
+        }
+    }
+
+    let thinking = if thinking.trim().is_empty() {
+        None
+    } else {
+        Some(thinking)
+    };
+
+    (text, thinking)
+}
+
+fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
+    let mut output = String::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
+            ContentBlock::Image(image) => {
+                push_line(&mut output, &format!("[image: {}]", image.mime_type));
+            }
+            ContentBlock::Thinking(thinking_block) => {
+                push_line(&mut output, &thinking_block.thinking);
+            }
+            ContentBlock::ToolCall(call) => {
+                push_line(&mut output, &format!("[tool call: {}]", call.name));
+            }
+        }
+    }
+    output
+}
+
+fn format_tool_output(content: &[ContentBlock], details: Option<&Value>) -> Option<String> {
+    let mut output = content_blocks_to_text(content);
+    if output.trim().is_empty() {
+        if let Some(details) = details {
+            output = pretty_json(details);
+        }
+    }
+    if output.trim().is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn push_line(buffer: &mut String, line: &str) {
+    if line.is_empty() {
+        return;
+    }
+    if !buffer.is_empty() {
+        buffer.push('\n');
+    }
+    buffer.push_str(line);
+}
+
 /// Truncate a string to max_len characters with ellipsis.
 fn truncate(s: &str, max_len: usize) -> String {
     if max_len == 0 {
@@ -948,6 +1229,7 @@ pub async fn run_interactive(
     session: Session,
     config: Config,
     model: String,
+    save_enabled: bool,
 ) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PiMsg>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
@@ -958,7 +1240,7 @@ pub async fn run_interactive(
         }
     });
 
-    let app = PiApp::new(agent, session, config, model, event_tx);
+    let app = PiApp::new(agent, session, config, model, event_tx, save_enabled);
 
     // Run the TUI program
     Program::new(app)

@@ -1,7 +1,7 @@
 # Feature Parity: pi_agent_rust vs Pi Agent (TypeScript)
 
 > **Purpose:** Authoritative single-source-of-truth for implementation status.
-> **Last Updated:** 2026-02-02 (46 lib tests pass, session branching implemented)
+> **Last Updated:** 2026-02-03 (50+ tests pass, Azure provider complete, TUI multi-line/slash commands)
 
 ## Status Legend
 
@@ -19,7 +19,7 @@
 | Category | Implemented | Partial | Missing | Out of Scope | Total |
 |----------|-------------|---------|---------|--------------|-------|
 | **Core Types** | 8 | 0 | 0 | 0 | 8 |
-| **Provider Layer** | 3 | 1 | 1 | 10+ | 15+ |
+| **Provider Layer** | 4 | 1 | 0 | 10+ | 15+ |
 | **Tools (7 total)** | 7 | 0 | 0 | 0 | 7 |
 | **Agent Runtime** | 1 | 1 | 0 | 0 | 2 |
 | **Session Management** | 10 | 0 | 0 | 0 | 10 |
@@ -66,7 +66,7 @@
 | **Anthropic** | ✅ | `src/providers/anthropic.rs` | Unit | Full streaming + thinking + tools |
 | **OpenAI** | ✅ | `src/providers/openai.rs` | Unit | Full streaming + tool use |
 | **Google Gemini** | ✅ | `src/providers/gemini.rs` | 4 | Full streaming + tool use |
-| Azure OpenAI | ❌ | - | - | Planned for Phase 3 |
+| **Azure OpenAI** | ✅ | `src/providers/azure.rs` | 4 | Full streaming + tool use |
 | Amazon Bedrock | ⬜ | - | - | Low priority |
 | Google Vertex | ⬜ | - | - | Low priority |
 | GitHub Copilot | ⬜ | - | - | OAuth complexity |
@@ -112,6 +112,7 @@
 | Image support | ✅ | - | - | - | - | - | - |
 | Streaming updates | - | ✅ | - | - | - | - | - |
 | Line numbers | ❌ | - | - | - | ✅ | - | - |
+| Fuzzy matching | - | - | ✅ | - | - | - | - |
 | Path resolution | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | ~ expansion | ✅ | - | ✅ | ✅ | ✅ | ✅ | ✅ |
 | macOS screenshot paths | ✅ | - | - | - | - | - | - |
@@ -215,7 +216,7 @@
 | Spinner animation | ✅ | `src/interactive.rs` | - | bubbles spinner |
 | Tool status display | ✅ | `src/interactive.rs` | - | Running tool indicator |
 | Keyboard navigation | ✅ | `src/interactive.rs` | - | Up/Down history, Esc quit |
-| Agent integration | ✅ | `src/interactive.rs` | - | Agent events wired |
+| Agent integration | ✅ | `src/interactive.rs` | - | Agent events wired; CLI interactive uses PiApp |
 | Multi-line editor | ✅ | `src/interactive.rs` | - | TextArea with line wrapping |
 | Slash command system | ✅ | `src/interactive.rs` | - | /help, /clear, /model, /thinking, /exit, /history, /export |
 | Viewport scrolling | ✅ | `src/interactive.rs` | - | Viewport with scroll_to_bottom() |
@@ -262,6 +263,7 @@
 | Provider (Anthropic) | 2 | 0 | 0 | 2 |
 | Provider (OpenAI) | 3 | 0 | 0 | 3 |
 | Provider (Gemini) | 4 | 0 | 0 | 4 |
+| Provider (Azure) | 4 | 0 | 0 | 4 |
 | SSE parser | 11 | 0 | 0 | 11 |
 | Tools | 5 | 20 | 67 | 92 |
 | TUI (rich_rust) | 3 | 0 | 0 | 3 |
@@ -270,9 +272,9 @@
 | Session (branching) | 7 | 0 | 0 | 7 |
 | Agent | 2 | 0 | 0 | 2 |
 | Conformance infra | 6 | 0 | 0 | 6 |
-| **Total** | **46** | **20** | **67** | **133** |
+| **Total** | **50** | **20** | **67** | **137** |
 
-**All tests pass** (46 unit + 15 fixture wrappers + 20 integration)
+**All tests pass** (50 unit + 15 fixture wrappers + 20 integration)
 
 ---
 
@@ -282,7 +284,7 @@
 |-----------|-------------------|--------------|-------|--------|
 | read tool | ✅ Yes | `read_tool.json` | 23 | ✅ All pass |
 | write tool | ✅ Yes | `write_tool.json` | 7 | ✅ All pass |
-| edit tool | ✅ Yes | `edit_tool.json` | 19 | ✅ All pass |
+| edit tool | ✅ Yes | `edit_tool.json` | 23 | ✅ All pass |
 | bash tool | ✅ Yes | `bash_tool.json` | 34 | ✅ All pass |
 | grep tool | ✅ Yes | `grep_tool.json` | 12 | ✅ All pass |
 | find tool | ✅ Yes | `find_tool.json` | 6 | ✅ All pass |
@@ -291,7 +293,7 @@
 | Session format | ❌ No | - | - | - |
 | Provider responses | ❌ No | - | - | - |
 | CLI flags | ❌ No | - | - | - |
-| **Total** | **8/11** | - | **118** | ✅ |
+| **Total** | **8/11** | - | **122** | ✅ |
 
 ### Fixture Schema
 
