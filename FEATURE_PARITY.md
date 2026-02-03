@@ -1,7 +1,7 @@
 # Feature Parity: pi_agent_rust vs Pi Agent (TypeScript)
 
 > **Purpose:** Authoritative single-source-of-truth for implementation status.
-> **Last Updated:** 2026-02-02 (39 lib tests pass, slash commands implemented)
+> **Last Updated:** 2026-02-02 (46 lib tests pass, session branching implemented)
 
 ## Status Legend
 
@@ -22,7 +22,7 @@
 | **Provider Layer** | 3 | 1 | 1 | 10+ | 15+ |
 | **Tools (7 total)** | 7 | 0 | 0 | 0 | 7 |
 | **Agent Runtime** | 1 | 1 | 0 | 0 | 2 |
-| **Session Management** | 1 | 1 | 2 | 0 | 4 |
+| **Session Management** | 10 | 0 | 0 | 0 | 10 |
 | **CLI** | 7 | 1 | 0 | 2 | 10 |
 | **TUI** | 16 | 1 | 0 | 2 | 19 |
 | **Configuration** | 2 | 0 | 0 | 0 | 2 |
@@ -148,12 +148,12 @@
 | SessionHeader | ✅ | `src/session.rs` | - | Version 3 |
 | JSONL persistence | ✅ | `src/session.rs` | - | Save/load |
 | Entry types (7) | ✅ | `src/session.rs` | - | Message, ModelChange, etc. |
-| Tree structure | 🔶 | `src/session.rs` | - | Basic; no navigation yet |
-| CWD encoding | ✅ | `src/session.rs` | - | Session directory naming |
+| Tree structure | ✅ | `src/session.rs` | 7 | Full parent/child navigation |
+| CWD encoding | ✅ | `src/session.rs` | 1 | Session directory naming |
 | Entry ID generation | ✅ | `src/session.rs` | - | 8-char hex |
 | Continue previous | ✅ | `src/session.rs` | - | Most recent by mtime |
 | Session picker UI | ✅ | `src/session_picker.rs` | 3 | TUI picker with bubbletea |
-| Branching/navigation | ❌ | - | - | Needs implementation |
+| Branching/navigation | ✅ | `src/session.rs` | 7 | navigate_to, create_branch_from, list_leaves, branch_summary |
 
 ---
 
@@ -267,11 +267,12 @@
 | TUI (rich_rust) | 3 | 0 | 0 | 3 |
 | TUI (interactive) | 2 | 0 | 0 | 2 |
 | TUI (session picker) | 3 | 0 | 0 | 3 |
+| Session (branching) | 7 | 0 | 0 | 7 |
 | Agent | 2 | 0 | 0 | 2 |
 | Conformance infra | 6 | 0 | 0 | 6 |
-| **Total** | **39** | **20** | **67** | **126** |
+| **Total** | **46** | **20** | **67** | **133** |
 
-**All tests pass** (39 unit + 15 fixture wrappers + 20 integration)
+**All tests pass** (46 unit + 15 fixture wrappers + 20 integration)
 
 ---
 
@@ -279,10 +280,10 @@
 
 | Component | Has Fixture Tests | Fixture File | Cases | Status |
 |-----------|-------------------|--------------|-------|--------|
-| read tool | ✅ Yes | `read_tool.json` | 9 | ✅ All pass |
+| read tool | ✅ Yes | `read_tool.json` | 23 | ✅ All pass |
 | write tool | ✅ Yes | `write_tool.json` | 7 | ✅ All pass |
-| edit tool | ✅ Yes | `edit_tool.json` | 7 | ✅ All pass |
-| bash tool | ✅ Yes | `bash_tool.json` | 9 | ✅ All pass |
+| edit tool | ✅ Yes | `edit_tool.json` | 19 | ✅ All pass |
+| bash tool | ✅ Yes | `bash_tool.json` | 34 | ✅ All pass |
 | grep tool | ✅ Yes | `grep_tool.json` | 12 | ✅ All pass |
 | find tool | ✅ Yes | `find_tool.json` | 6 | ✅ All pass |
 | ls tool | ✅ Yes | `ls_tool.json` | 8 | ✅ All pass |
@@ -290,6 +291,7 @@
 | Session format | ❌ No | - | - | - |
 | Provider responses | ❌ No | - | - | - |
 | CLI flags | ❌ No | - | - | - |
+| **Total** | **8/11** | - | **118** | ✅ |
 
 ### Fixture Schema
 
@@ -333,6 +335,6 @@ Fixtures are JSON files in `tests/conformance/fixtures/` with this structure:
 2. ~~**Add OpenAI provider** - Second provider implementation~~ ✅ Done
 3. ~~**Implement auth.json** - Credential storage~~ ✅ Done (src/auth.rs)
 4. ~~**Session picker UI** - Basic TUI for --resume~~ ✅ Done (src/session_picker.rs)
-5. **Branching/navigation** - Tree operations
+5. ~~**Branching/navigation** - Tree operations~~ ✅ Done (src/session.rs)
 6. ~~**Benchmark harness** - Performance validation~~ ✅ Done (benches/tools.rs, BENCHMARKS.md)
 7. ~~**Conformance fixtures** - TypeScript reference capture~~ ✅ Done (tests/conformance/)

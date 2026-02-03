@@ -2,6 +2,8 @@
 //!
 //! Provides an interactive list for choosing which session to resume.
 
+use std::fmt::Write;
+
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Program, quit};
 use lipgloss::Style;
 
@@ -101,27 +103,30 @@ impl SessionPicker {
 
         // Header
         let title_style = Style::new().bold().foreground("212");
-        output.push_str(&format!(
-            "\n  {}\n\n",
+        let _ = writeln!(
+            output,
+            "\n  {}\n",
             title_style.render("Select a session to resume")
-        ));
+        );
 
         if self.sessions.is_empty() {
             let dim_style = Style::new().foreground("241");
-            output.push_str(&format!(
-                "  {}\n",
+            let _ = writeln!(
+                output,
+                "  {}",
                 dim_style.render("No sessions found for this project.")
-            ));
+            );
         } else {
             // Column headers
             let header_style = Style::new().foreground("241").bold();
-            output.push_str(&format!(
-                "  {}  {}  {}  {}\n",
-                header_style.render(&format!("{:<20}", "Time")),
-                header_style.render(&format!("{:<30}", "Name")),
-                header_style.render(&format!("{:<8}", "Messages")),
-                header_style.render("Session ID"),
-            ));
+            let _ = writeln!(
+                output,
+                "  {:<20}  {:<30}  {:<8}  {}",
+                header_style.render("Time"),
+                header_style.render("Name"),
+                header_style.render("Messages"),
+                header_style.render("Session ID")
+            );
             output.push_str("  ");
             output.push_str(&"-".repeat(78));
             output.push('\n');
@@ -148,24 +153,24 @@ impl SessionPicker {
                 let messages = session.message_count.to_string();
                 let id = &session.id[..8.min(session.id.len())];
 
-                output.push_str(&format!(
-                    "{} {}\n",
-                    prefix,
+                let _ = writeln!(
+                    output,
+                    "{prefix} {}",
                     row_style.render(&format!(
-                        " {:<20}  {:<30}  {:<8}  {}",
-                        time, name, messages, id
+                        " {time:<20}  {name:<30}  {messages:<8}  {id}"
                     ))
-                ));
+                );
             }
         }
 
         // Help text
         output.push('\n');
         let help_style = Style::new().foreground("241");
-        output.push_str(&format!(
-            "  {}\n",
+        let _ = writeln!(
+            output,
+            "  {}",
             help_style.render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
-        ));
+        );
 
         output
     }
@@ -173,9 +178,8 @@ impl SessionPicker {
 
 /// List sessions for the current working directory using the session index.
 pub fn list_sessions_for_cwd() -> Vec<SessionMeta> {
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
-        Err(_) => return Vec::new(),
+    let Ok(cwd) = std::env::current_dir() else {
+        return Vec::new();
     };
 
     let index = SessionIndex::new();
@@ -183,10 +187,9 @@ pub fn list_sessions_for_cwd() -> Vec<SessionMeta> {
     // Try to reindex if needed (this is a no-op if already indexed)
     let _ = index.reindex_all();
 
-    match index.list_sessions(Some(&cwd.display().to_string())) {
-        Ok(sessions) => sessions,
-        Err(_) => Vec::new(),
-    }
+    index
+        .list_sessions(Some(&cwd.display().to_string()))
+        .unwrap_or_default()
 }
 
 /// Run the session picker and return the selected session.

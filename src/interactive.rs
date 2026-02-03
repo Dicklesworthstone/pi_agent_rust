@@ -52,9 +52,7 @@ impl SlashCommand {
             return None;
         }
 
-        let (cmd, args) = input
-            .split_once(char::is_whitespace)
-            .unwrap_or((input, ""));
+        let (cmd, args) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
 
         let command = match cmd.to_lowercase().as_str() {
             "/help" | "/h" | "/?" => Self::Help,
@@ -198,12 +196,14 @@ impl PiApp {
         event_tx: mpsc::UnboundedSender<PiMsg>,
     ) -> Self {
         // Get terminal size
-        let (term_width, term_height) = terminal::size()
-            .map_or((80, 24), |(w, h)| (w as usize, h as usize));
+        let (term_width, term_height) =
+            terminal::size().map_or((80, 24), |(w, h)| (w as usize, h as usize));
 
         // Configure text area for input
         let mut input = TextArea::new();
-        input.placeholder = "Type your message... (Enter to send, Ctrl+Enter for multi-line, Esc to quit)".to_string();
+        input.placeholder =
+            "Type your message... (Enter to send, Ctrl+Enter for multi-line, Esc to quit)"
+                .to_string();
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
         input.set_height(3); // Start with 3 lines
@@ -217,7 +217,8 @@ impl PiApp {
         // Configure viewport for conversation history
         // Reserve space for header (2), input (5), footer (2)
         let viewport_height = term_height.saturating_sub(9);
-        let mut conversation_viewport = Viewport::new(term_width.saturating_sub(2), viewport_height);
+        let mut conversation_viewport =
+            Viewport::new(term_width.saturating_sub(2), viewport_height);
         conversation_viewport.mouse_wheel_enabled = true;
         conversation_viewport.mouse_wheel_delta = 3;
 
@@ -281,7 +282,8 @@ impl PiApp {
                             // Switch to multi-line mode
                             self.input_mode = InputMode::MultiLine;
                             self.input.set_height(6);
-                            self.status_message = Some("Multi-line mode: Alt+Enter to submit".to_string());
+                            self.status_message =
+                                Some("Multi-line mode: Alt+Enter to submit".to_string());
                         }
                     }
                     return None;
@@ -315,12 +317,18 @@ impl PiApp {
                     // Ctrl+N handled by TextArea as line_next
                 }
                 // Up arrow for history in single-line mode only
-                KeyType::Up if self.agent_state == AgentState::Idle && self.input_mode == InputMode::SingleLine => {
+                KeyType::Up
+                    if self.agent_state == AgentState::Idle
+                        && self.input_mode == InputMode::SingleLine =>
+                {
                     self.navigate_history_back();
                     return None;
                 }
                 // Down arrow for history in single-line mode only
-                KeyType::Down if self.agent_state == AgentState::Idle && self.input_mode == InputMode::SingleLine => {
+                KeyType::Down
+                    if self.agent_state == AgentState::Idle
+                        && self.input_mode == InputMode::SingleLine =>
+                {
                     self.navigate_history_forward();
                     return None;
                 }
@@ -368,7 +376,10 @@ impl PiApp {
 
         // Render conversation area (scrollable)
         let conversation_lines: Vec<&str> = viewport_content.lines().collect();
-        let start = self.conversation_viewport.y_offset().min(conversation_lines.len().saturating_sub(1));
+        let start = self
+            .conversation_viewport
+            .y_offset()
+            .min(conversation_lines.len().saturating_sub(1));
         let end = (start + self.conversation_viewport.height).min(conversation_lines.len());
         let visible_lines = conversation_lines.get(start..end).unwrap_or(&[]);
         output.push_str(&visible_lines.join("\n"));
@@ -376,12 +387,10 @@ impl PiApp {
 
         // Scroll indicator
         if conversation_lines.len() > self.conversation_viewport.height {
-            let total = conversation_lines.len().saturating_sub(self.conversation_viewport.height);
-            let percent = if total == 0 {
-                100
-            } else {
-                ((start * 100) / total).min(100)
-            };
+            let total = conversation_lines
+                .len()
+                .saturating_sub(self.conversation_viewport.height);
+            let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
             let scroll_style = Style::new().foreground("241");
             let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
             output.push_str(&scroll_style.render(&indicator));
@@ -904,7 +913,9 @@ impl PiApp {
             InputMode::SingleLine => "Alt+Enter: multi-line",
             InputMode::MultiLine => "Esc: single-line",
         };
-        let footer = format!("Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Esc: quit");
+        let footer = format!(
+            "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Esc: quit"
+        );
         format!("\n  {}\n", style.render(&footer))
     }
 }

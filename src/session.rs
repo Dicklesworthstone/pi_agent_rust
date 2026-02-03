@@ -66,9 +66,7 @@ impl Session {
 
     /// Resume a session by prompting the user to select from recent sessions.
     pub async fn resume_with_picker(override_dir: Option<&Path>, _config: &Config) -> Result<Self> {
-        let base_dir = override_dir
-            .map(PathBuf::from)
-            .unwrap_or_else(Config::sessions_dir);
+        let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let cwd = std::env::current_dir()?;
         let encoded_cwd = encode_cwd(&cwd);
         let project_session_dir = base_dir.join(&encoded_cwd);
@@ -79,13 +77,14 @@ impl Session {
 
         let mut entries = if override_dir.is_none() {
             let index = SessionIndex::new();
-            match index.list_sessions(Some(&cwd.display().to_string())) {
-                Ok(list) => list
-                    .into_iter()
-                    .filter_map(SessionPickEntry::from_meta)
-                    .collect(),
-                Err(_) => Vec::new(),
-            }
+            index
+                .list_sessions(Some(&cwd.display().to_string()))
+                .map(|list| {
+                    list.into_iter()
+                        .filter_map(SessionPickEntry::from_meta)
+                        .collect()
+                })
+                .unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -473,6 +472,200 @@ impl Session {
         let existing = entry_id_set(&self.entries);
         generate_entry_id(&existing)
     }
+
+    // ========================================================================
+    // Tree Navigation
+    // ========================================================================
+
+    /// Build a map from entry ID to its parent ID.
+    fn build_parent_map(&self) -> HashMap<String, Option<String>> {
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                e.base_id()
+                    .map(|id| (id.clone(), e.base().parent_id.clone()))
+            })
+            .collect()
+    }
+
+    /// Build a map from parent ID to children IDs.
+    fn build_children_map(&self) -> HashMap<Option<String>, Vec<String>> {
+        let mut children: HashMap<Option<String>, Vec<String>> = HashMap::new();
+        for entry in &self.entries {
+            if let Some(id) = entry.base_id() {
+                children
+                    .entry(entry.base().parent_id.clone())
+                    .or_default()
+                    .push(id.clone());
+            }
+        }
+        children
+    }
+
+    /// Get the path from an entry back to the root (inclusive).
+    /// Returns entry IDs in order from root to the specified entry.
+    pub fn get_path_to_entry(&self, entry_id: &str) -> Vec<String> {
+        let parent_map = self.build_parent_map();
+        let mut path = Vec::new();
+        let mut current = Some(entry_id.to_string());
+
+        while let Some(id) = current {
+            path.push(id.clone());
+            current = parent_map.get(&id).and_then(|p| p.clone());
+        }
+
+        path.reverse();
+        path
+    }
+
+    /// Get direct children of an entry.
+    pub fn get_children(&self, entry_id: Option<&str>) -> Vec<String> {
+        let children_map = self.build_children_map();
+        let key = entry_id.map(String::from);
+        children_map.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// List all leaf nodes (entries with no children).
+    pub fn list_leaves(&self) -> Vec<String> {
+        let children_map = self.build_children_map();
+        self.entries
+            .iter()
+            .filter_map(|e| {
+                let id = e.base_id()?;
+                // An entry is a leaf if it has no children
+                if children_map
+                    .get(&Some(id.clone()))
+                    .is_none_or(Vec::is_empty)
+                {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Navigate to a specific entry, making it the current leaf.
+    /// Returns true if the entry exists.
+    pub fn navigate_to(&mut self, entry_id: &str) -> bool {
+        let exists = self
+            .entries
+            .iter()
+            .any(|e| e.base_id().is_some_and(|id| id == entry_id));
+        if exists {
+            self.leaf_id = Some(entry_id.to_string());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Create a new branch starting from a specific entry.
+    /// Sets the leaf_id to the specified entry so new entries branch from there.
+    /// Returns true if the entry exists.
+    pub fn create_branch_from(&mut self, entry_id: &str) -> bool {
+        self.navigate_to(entry_id)
+    }
+
+    /// Get the entry at a specific ID.
+    pub fn get_entry(&self, entry_id: &str) -> Option<&SessionEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.base_id().is_some_and(|id| id == entry_id))
+    }
+
+    /// Get the entry at a specific ID (mutable).
+    pub fn get_entry_mut(&mut self, entry_id: &str) -> Option<&mut SessionEntry> {
+        self.entries
+            .iter_mut()
+            .find(|e| e.base_id().is_some_and(|id| id == entry_id))
+    }
+
+    /// Convert session entries along the current path to model messages.
+    /// This follows parent_id links from leaf_id back to root.
+    pub fn to_messages_for_current_path(&self) -> Vec<Message> {
+        let Some(leaf_id) = &self.leaf_id else {
+            // No leaf, return all messages (linear history)
+            return self.to_messages();
+        };
+
+        let path = self.get_path_to_entry(leaf_id);
+        let path_set: HashSet<&str> = path.iter().map(String::as_str).collect();
+
+        let mut messages = Vec::new();
+        for entry in &self.entries {
+            if let Some(id) = entry.base_id() {
+                if path_set.contains(id.as_str()) {
+                    if let SessionEntry::Message(msg_entry) = entry {
+                        if let Some(message) = session_message_to_model(&msg_entry.message) {
+                            messages.push(message);
+                        }
+                    }
+                }
+            }
+        }
+        messages
+    }
+
+    /// Get a summary of branches in this session.
+    pub fn branch_summary(&self) -> BranchInfo {
+        let leaves = self.list_leaves();
+        let children_map = self.build_children_map();
+
+        // Find branch points (entries with multiple children)
+        let branch_points: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|e| {
+                let id = e.base_id()?;
+                let children = children_map.get(&Some(id.clone()))?;
+                if children.len() > 1 {
+                    Some(id.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        BranchInfo {
+            total_entries: self.entries.len(),
+            leaf_count: leaves.len(),
+            branch_point_count: branch_points.len(),
+            current_leaf: self.leaf_id.clone(),
+            leaves,
+            branch_points,
+        }
+    }
+
+    /// Add a label to an entry.
+    pub fn add_label(&mut self, target_id: &str, label: Option<String>) -> Option<String> {
+        // Verify target exists
+        if self.get_entry(target_id).is_none() {
+            return None;
+        }
+
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::Label(LabelEntry {
+            base,
+            target_id: target_id.to_string(),
+            label,
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        Some(id)
+    }
+}
+
+/// Summary of branches in a session.
+#[derive(Debug, Clone)]
+pub struct BranchInfo {
+    pub total_entries: usize,
+    pub leaf_count: usize,
+    pub branch_point_count: usize,
+    pub current_leaf: Option<String>,
+    pub leaves: Vec<String>,
+    pub branch_points: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1061,4 +1254,178 @@ fn generate_entry_id(existing: &HashSet<String>) -> String {
         }
     }
     uuid::Uuid::new_v4().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_message(text: &str) -> SessionMessage {
+        SessionMessage::User {
+            content: UserContent::Text(text.to_string()),
+            timestamp: Some(0),
+        }
+    }
+
+    #[test]
+    fn test_session_linear_history() {
+        let mut session = Session::in_memory();
+
+        let id1 = session.append_message(make_test_message("Hello"));
+        let id2 = session.append_message(make_test_message("World"));
+        let id3 = session.append_message(make_test_message("Test"));
+
+        // Check leaf is the last entry
+        assert_eq!(session.leaf_id.as_deref(), Some(id3.as_str()));
+
+        // Check path from last entry
+        let path = session.get_path_to_entry(&id3);
+        assert_eq!(path, vec![id1.clone(), id2.clone(), id3.clone()]);
+
+        // Check only one leaf
+        let leaves = session.list_leaves();
+        assert_eq!(leaves.len(), 1);
+        assert_eq!(leaves[0], id3);
+    }
+
+    #[test]
+    fn test_session_branching() {
+        let mut session = Session::in_memory();
+
+        // Create linear history: A -> B -> C
+        let id_a = session.append_message(make_test_message("A"));
+        let id_b = session.append_message(make_test_message("B"));
+        let id_c = session.append_message(make_test_message("C"));
+
+        // Now branch from B: A -> B -> D
+        assert!(session.create_branch_from(&id_b));
+        let id_d = session.append_message(make_test_message("D"));
+
+        // Should have 2 leaves: C and D
+        let leaves = session.list_leaves();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.contains(&id_c));
+        assert!(leaves.contains(&id_d));
+
+        // Path to D should be A -> B -> D
+        let path_to_d = session.get_path_to_entry(&id_d);
+        assert_eq!(path_to_d, vec![id_a.clone(), id_b.clone(), id_d.clone()]);
+
+        // Path to C should be A -> B -> C
+        let path_to_c = session.get_path_to_entry(&id_c);
+        assert_eq!(path_to_c, vec![id_a.clone(), id_b.clone(), id_c.clone()]);
+    }
+
+    #[test]
+    fn test_session_navigation() {
+        let mut session = Session::in_memory();
+
+        let id1 = session.append_message(make_test_message("First"));
+        let id2 = session.append_message(make_test_message("Second"));
+
+        // Navigate to first entry
+        assert!(session.navigate_to(&id1));
+        assert_eq!(session.leaf_id.as_deref(), Some(id1.as_str()));
+
+        // Navigate to non-existent entry
+        assert!(!session.navigate_to("nonexistent"));
+        // leaf_id unchanged
+        assert_eq!(session.leaf_id.as_deref(), Some(id1.as_str()));
+
+        // Navigate back to second
+        assert!(session.navigate_to(&id2));
+        assert_eq!(session.leaf_id.as_deref(), Some(id2.as_str()));
+    }
+
+    #[test]
+    fn test_session_get_children() {
+        let mut session = Session::in_memory();
+
+        // A -> B -> C
+        //   -> D
+        let id_a = session.append_message(make_test_message("A"));
+        let id_b = session.append_message(make_test_message("B"));
+        let _id_c = session.append_message(make_test_message("C"));
+
+        // Branch from A
+        session.create_branch_from(&id_a);
+        let id_d = session.append_message(make_test_message("D"));
+
+        // A should have 2 children: B and D
+        let children_a = session.get_children(Some(&id_a));
+        assert_eq!(children_a.len(), 2);
+        assert!(children_a.contains(&id_b));
+        assert!(children_a.contains(&id_d));
+
+        // Root (None) should have 1 child: A
+        let root_children = session.get_children(None);
+        assert_eq!(root_children.len(), 1);
+        assert_eq!(root_children[0], id_a);
+    }
+
+    #[test]
+    fn test_branch_summary() {
+        let mut session = Session::in_memory();
+
+        // Linear: A -> B
+        let id_a = session.append_message(make_test_message("A"));
+        let id_b = session.append_message(make_test_message("B"));
+
+        let info = session.branch_summary();
+        assert_eq!(info.total_entries, 2);
+        assert_eq!(info.leaf_count, 1);
+        assert_eq!(info.branch_point_count, 0);
+
+        // Create branch: A -> B, A -> C
+        session.create_branch_from(&id_a);
+        let _id_c = session.append_message(make_test_message("C"));
+
+        let info = session.branch_summary();
+        assert_eq!(info.total_entries, 3);
+        assert_eq!(info.leaf_count, 2);
+        assert_eq!(info.branch_point_count, 1);
+        assert!(info.branch_points.contains(&id_a));
+        assert!(info.leaves.contains(&id_b));
+    }
+
+    #[test]
+    fn test_to_messages_for_current_path() {
+        let mut session = Session::in_memory();
+
+        // A -> B -> C
+        //   -> D
+        let _id_a = session.append_message(make_test_message("A"));
+        let id_b = session.append_message(make_test_message("B"));
+        let _id_c = session.append_message(make_test_message("C"));
+
+        // Navigate to B and add D
+        session.create_branch_from(&id_b);
+        let id_d = session.append_message(make_test_message("D"));
+
+        // Current path should be A -> B -> D
+        session.navigate_to(&id_d);
+        let messages = session.to_messages_for_current_path();
+        assert_eq!(messages.len(), 3);
+
+        // Verify content
+        if let Message::User(user) = &messages[0] {
+            if let UserContent::Text(text) = &user.content {
+                assert_eq!(text, "A");
+            }
+        }
+        if let Message::User(user) = &messages[2] {
+            if let UserContent::Text(text) = &user.content {
+                assert_eq!(text, "D");
+            }
+        }
+    }
+
+    #[test]
+    fn test_encode_cwd() {
+        let path = std::path::Path::new("/home/user/project");
+        let encoded = encode_cwd(path);
+        assert!(encoded.starts_with("--"));
+        assert!(encoded.ends_with("--"));
+        assert!(encoded.contains("home-user-project"));
+    }
 }

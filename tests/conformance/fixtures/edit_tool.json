@@ -120,6 +120,209 @@
           "firstChangedLine": 1
         }
       }
+    },
+    {
+      "name": "edit_delete_text",
+      "description": "Edit with empty newText deletes the oldText",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "Hello, World!"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": ", World",
+        "newText": ""
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_exact": {
+          "diff": "-1 Hello, World!\n+1 Hello!",
+          "firstChangedLine": 1
+        }
+      }
+    },
+    {
+      "name": "edit_insert_newline",
+      "description": "Insert newline in the middle",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "HelloWorld"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "HelloWorld",
+        "newText": "Hello\nWorld"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["-1 HelloWorld", "+1 Hello", "+2 World"]
+      }
+    },
+    {
+      "name": "edit_remove_newline",
+      "description": "Remove newline to join lines",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "Hello\nWorld"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "Hello\nWorld",
+        "newText": "HelloWorld"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
+    },
+    {
+      "name": "edit_at_beginning",
+      "description": "Edit text at the beginning of file",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "First line\nSecond line"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "First",
+        "newText": "Modified"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_exact": {
+          "diff": "-1 First line\n+1 Modified line\n 2 Second line",
+          "firstChangedLine": 1
+        }
+      }
+    },
+    {
+      "name": "edit_at_end",
+      "description": "Edit text at the end of file",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "First line\nSecond line"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "Second line",
+        "newText": "Last line"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_exact": {
+          "diff": " 1 First line\n-2 Second line\n+2 Last line",
+          "firstChangedLine": 2
+        }
+      }
+    },
+    {
+      "name": "edit_nested_file",
+      "description": "Edit file in nested directory",
+      "setup": [
+        {"type": "create_file", "path": "a/b/c/deep.txt", "content": "deep content"}
+      ],
+      "input": {
+        "path": "a/b/c/deep.txt",
+        "oldText": "deep",
+        "newText": "modified"
+      },
+      "expected": {
+        "content_contains": ["Successfully replaced text in a/b/c/deep.txt"],
+        "details_contains": ["diff"]
+      }
+    },
+    {
+      "name": "edit_whitespace",
+      "description": "Edit preserves surrounding whitespace",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "  indented  "}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "indented",
+        "newText": "modified"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["+1   modified  "]
+      }
+    },
+    {
+      "name": "edit_empty_file",
+      "description": "Edit empty file should error (nothing to replace)",
+      "setup": [
+        {"type": "create_file", "path": "empty.txt", "content": ""}
+      ],
+      "input": {
+        "path": "empty.txt",
+        "oldText": "anything",
+        "newText": "new"
+      },
+      "expect_error": true,
+      "error_contains": "Could not find",
+      "expected": {}
+    },
+    {
+      "name": "edit_entire_file",
+      "description": "Replace entire file content",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "old content"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "old content",
+        "newText": "new content"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_exact": {
+          "diff": "-1 old content\n+1 new content",
+          "firstChangedLine": 1
+        }
+      }
+    },
+    {
+      "name": "edit_regex_chars",
+      "description": "Edit text with regex special characters",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "price is $100.00 (USD)"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "$100.00 (USD)",
+        "newText": "€85.00 (EUR)"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
+    },
+    {
+      "name": "edit_tabs",
+      "description": "Edit preserves tabs",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "first\tsecond\tthird"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "second",
+        "newText": "SECOND"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
+    },
+    {
+      "name": "edit_multiline_block",
+      "description": "Replace a multiline block",
+      "setup": [
+        {"type": "create_file", "path": "test.txt", "content": "start\nold line 1\nold line 2\nend"}
+      ],
+      "input": {
+        "path": "test.txt",
+        "oldText": "old line 1\nold line 2",
+        "newText": "new line 1\nnew line 2\nnew line 3"
+      },
+      "expected": {
+        "content_exact": "Successfully replaced text in test.txt.",
+        "details_contains": ["diff"]
+      }
     }
   ]
 }

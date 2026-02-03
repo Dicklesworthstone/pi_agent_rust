@@ -82,6 +82,229 @@
         "content_regex": "^/",
         "details_none": true
       }
+    },
+    {
+      "name": "bash_exit_code_1",
+      "description": "Exit code 1 should error",
+      "input": {"command": "exit 1"},
+      "expect_error": true,
+      "error_contains": "exited with code 1",
+      "expected": {}
+    },
+    {
+      "name": "bash_false_command",
+      "description": "false command returns exit code 1",
+      "input": {"command": "false"},
+      "expect_error": true,
+      "error_contains": "exited with code 1",
+      "expected": {}
+    },
+    {
+      "name": "bash_exit_code_255",
+      "description": "Exit code 255 should error",
+      "input": {"command": "exit 255"},
+      "expect_error": true,
+      "error_contains": "exited with code 255",
+      "expected": {}
+    },
+    {
+      "name": "bash_command_not_found",
+      "description": "Nonexistent command should error",
+      "input": {"command": "nonexistent_command_xyz123"},
+      "expect_error": true,
+      "error_contains": "not found",
+      "expected": {}
+    },
+    {
+      "name": "bash_single_quotes",
+      "description": "Single quotes preserve literal text",
+      "input": {"command": "echo 'hello $HOME world'"},
+      "expected": {
+        "content_contains": ["hello $HOME world"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_double_quotes",
+      "description": "Double quotes expand variables",
+      "input": {"command": "echo \"hello $USER\""},
+      "expected": {
+        "content_regex": "^hello ",
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_unicode_output",
+      "description": "Unicode characters in output",
+      "input": {"command": "echo '世界 🎉 こんにちは'"},
+      "expected": {
+        "content_contains": ["世界", "🎉", "こんにちは"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_backslash_escape",
+      "description": "Backslash escaping works",
+      "input": {"command": "echo 'a\\nb'"},
+      "expected": {
+        "content_contains": ["a\\nb"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_tab_character",
+      "description": "Tab character in output",
+      "input": {"command": "echo -e 'a\\tb'"},
+      "expected": {
+        "content_contains": ["a\tb"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_arithmetic",
+      "description": "Arithmetic expansion works",
+      "input": {"command": "echo $((2 + 3 * 4))"},
+      "expected": {
+        "content_contains": ["14"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_redirect_stdin",
+      "description": "Heredoc works",
+      "input": {"command": "cat << 'EOF'\nhello\nworld\nEOF"},
+      "expected": {
+        "content_contains": ["hello", "world"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_and_chain_success",
+      "description": "AND chain both succeed",
+      "input": {"command": "true && echo success"},
+      "expected": {
+        "content_contains": ["success"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_and_chain_first_fails",
+      "description": "AND chain first fails stops execution",
+      "input": {"command": "false && echo should_not_print"},
+      "expect_error": true,
+      "expected": {}
+    },
+    {
+      "name": "bash_or_chain",
+      "description": "OR chain fallback works",
+      "input": {"command": "false || echo fallback"},
+      "expected": {
+        "content_contains": ["fallback"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_semicolon_chain",
+      "description": "Semicolon chain continues after failure",
+      "input": {"command": "false; echo continued"},
+      "expected": {
+        "content_contains": ["continued"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_glob_expansion",
+      "description": "Glob patterns work",
+      "setup": [
+        {"type": "create_file", "path": "test1.txt", "content": ""},
+        {"type": "create_file", "path": "test2.txt", "content": ""}
+      ],
+      "input": {"command": "ls *.txt"},
+      "expected": {
+        "content_contains": ["test1.txt", "test2.txt"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_for_loop",
+      "description": "For loop works",
+      "input": {"command": "for i in 1 2 3; do echo $i; done"},
+      "expected": {
+        "content_contains": ["1", "2", "3"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_if_statement",
+      "description": "If statement works",
+      "input": {"command": "if true; then echo yes; else echo no; fi"},
+      "expected": {
+        "content_contains": ["yes"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_pwd",
+      "description": "Working directory is accessible",
+      "input": {"command": "pwd"},
+      "expected": {
+        "content_regex": "^/",
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_date",
+      "description": "Date command works",
+      "input": {"command": "date +%Y"},
+      "expected": {
+        "content_regex": "20[0-9]{2}",
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_head_command",
+      "description": "Head command on input",
+      "input": {"command": "echo -e 'line1\\nline2\\nline3' | head -1"},
+      "expected": {
+        "content_contains": ["line1"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_tail_command",
+      "description": "Tail command on input",
+      "input": {"command": "echo -e 'line1\\nline2\\nline3' | tail -1"},
+      "expected": {
+        "content_contains": ["line3"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_wc_command",
+      "description": "Word count command",
+      "input": {"command": "echo 'one two three' | wc -w"},
+      "expected": {
+        "content_regex": "3",
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_sort_command",
+      "description": "Sort command works",
+      "input": {"command": "echo -e 'c\\na\\nb' | sort"},
+      "expected": {
+        "content_contains": ["a", "b", "c"],
+        "details_none": true
+      }
+    },
+    {
+      "name": "bash_uniq_command",
+      "description": "Uniq command removes duplicates",
+      "input": {"command": "echo -e 'a\\na\\nb' | uniq"},
+      "expected": {
+        "content_contains": ["a", "b"],
+        "details_none": true
+      }
     }
   ]
 }

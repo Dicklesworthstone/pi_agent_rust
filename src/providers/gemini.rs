@@ -61,6 +61,7 @@ impl GeminiProvider {
     }
 
     /// Build the request body for the Gemini API.
+    #[allow(clippy::unused_self)]
     fn build_request(&self, context: &Context, options: &StreamOptions) -> GeminiRequest {
         let contents = Self::build_contents(context);
         let system_instruction = context.system_prompt.as_ref().map(|s| GeminiContent {
@@ -162,13 +163,11 @@ impl Provider for GeminiProvider {
                 loop {
                     match state.event_source.next().await {
                         Some(Ok(Event::Open)) => {}
-                        Some(Ok(Event::Message(msg))) => {
-                            match state.process_event(&msg.data) {
-                                Ok(Some(event)) => return Some((Ok(event), state)),
-                                Ok(None) => {}
-                                Err(e) => return Some((Err(e), state)),
-                            }
-                        }
+                        Some(Ok(Event::Message(msg))) => match state.process_event(&msg.data) {
+                            Ok(Some(event)) => return Some((Ok(event), state)),
+                            Ok(None) => {}
+                            Err(e) => return Some((Err(e), state)),
+                        },
                         Some(Err(e)) => {
                             // Check if it's just the stream ending
                             let err_str = e.to_string();
@@ -277,13 +276,14 @@ impl StreamState {
         Ok(None)
     }
 
+    #[allow(clippy::unnecessary_wraps)]
     fn process_candidate(&mut self, candidate: GeminiCandidate) -> Result<Option<StreamEvent>> {
         // Handle finish reason
         if let Some(reason) = candidate.finish_reason {
             self.partial.stop_reason = match reason.as_str() {
                 "MAX_TOKENS" => StopReason::Length,
-                "STOP" => StopReason::Stop,
                 "SAFETY" | "RECITATION" | "OTHER" => StopReason::Error,
+                // STOP and any other reason treated as normal stop
                 _ => StopReason::Stop,
             };
         }
@@ -317,7 +317,7 @@ impl StreamState {
                             .unwrap_or_else(|_| "{}".to_string());
 
                         self.tool_calls.push(ToolCallState {
-                            id: id.clone(),
+                            id,
                             name: function_call.name.clone(),
                             arguments: function_call.args,
                         });
@@ -493,6 +493,7 @@ struct GeminiCandidate {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(clippy::struct_field_names)]
 struct GeminiUsageMetadata {
     #[serde(default)]
     prompt_token_count: Option<u64>,
@@ -579,23 +580,21 @@ fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
 fn convert_user_content_to_parts(content: &UserContent) -> Vec<GeminiPart> {
     match content {
         UserContent::Text(text) => vec![GeminiPart::Text { text: text.clone() }],
-        UserContent::Blocks(blocks) => {
-            blocks
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(t) => Some(GeminiPart::Text {
-                        text: t.text.clone(),
-                    }),
-                    ContentBlock::Image(img) => Some(GeminiPart::InlineData {
-                        inline_data: GeminiBlob {
-                            mime_type: img.mime_type.clone(),
-                            data: img.data.clone(),
-                        },
-                    }),
-                    _ => None,
-                })
-                .collect()
-        }
+        UserContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(t) => Some(GeminiPart::Text {
+                    text: t.text.clone(),
+                }),
+                ContentBlock::Image(img) => Some(GeminiPart::InlineData {
+                    inline_data: GeminiBlob {
+                        mime_type: img.mime_type.clone(),
+                        data: img.data.clone(),
+                    },
+                }),
+                _ => None,
+            })
+            .collect(),
     }
 }
 
