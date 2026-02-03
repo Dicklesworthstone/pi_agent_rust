@@ -31,6 +31,7 @@ pub mod models;
 pub mod package_manager;
 pub mod provider;
 pub mod providers;
+pub mod resources;
 pub mod session;
 pub mod session_index;
 pub mod session_picker;

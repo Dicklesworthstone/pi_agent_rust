@@ -157,6 +157,7 @@ pub struct SseStream<S> {
     inner: S,
     parser: SseParser,
     pending_events: VecDeque<SseEvent>,
+    utf8_buffer: Vec<u8>,
 }
 
 impl<S> SseStream<S> {
@@ -166,6 +167,7 @@ impl<S> SseStream<S> {
             inner,
             parser: SseParser::new(),
             pending_events: VecDeque::new(),
+            utf8_buffer: Vec::new(),
         }
     }
 }
@@ -188,32 +190,62 @@ where
         loop {
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    // Parse the bytes as UTF-8
-                    let text = match std::str::from_utf8(&bytes) {
-                        Ok(s) => s,
+                    let mut buffer = std::mem::take(&mut self.utf8_buffer);
+                    buffer.extend_from_slice(&bytes);
+
+                    // Extract valid UTF-8 string and remaining bytes
+                    let (valid_string, remaining_bytes) = match std::str::from_utf8(&buffer) {
+                        Ok(s) => (s.to_string(), Vec::new()),
                         Err(e) => {
-                            return Poll::Ready(Some(Err(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                e,
-                            ))));
+                            if e.error_len().is_some() {
+                                // Invalid UTF-8 sequence encountered
+                                return Poll::Ready(Some(Err(std::io::Error::new(
+                                    std::io::ErrorKind::InvalidData,
+                                    e,
+                                ))));
+                            }
+                            // Incomplete UTF-8 sequence at the end
+                            let valid_len = e.valid_up_to();
+                            // valid_up_to() guarantees this range is valid UTF-8
+                            let s = std::str::from_utf8(&buffer[..valid_len])
+                                .expect("valid_up_to guarantees valid UTF-8")
+                                .to_string();
+                            let remaining = buffer[valid_len..].to_vec();
+                            (s, remaining)
                         }
                     };
 
-                    // Feed to parser
-                    let events = self.parser.feed(text);
-                    if !events.is_empty() {
-                        self.pending_events = events.into_iter().collect();
-                        if let Some(event) = self.pending_events.pop_front() {
-                            return Poll::Ready(Some(Ok(event)));
+                    // Update buffer with remaining bytes first to release borrow
+                    self.utf8_buffer = remaining_bytes;
+
+                    // Feed valid text to parser (now safe since buffer borrow is released)
+                    if !valid_string.is_empty() {
+                        let events = self.parser.feed(&valid_string);
+                        if !events.is_empty() {
+                            self.pending_events = events.into_iter().collect();
                         }
                     }
-                    // No complete events yet, continue polling
+
+                    // If we have pending events, return the first one
+                    if let Some(event) = self.pending_events.pop_front() {
+                        return Poll::Ready(Some(Ok(event)));
+                    }
+                    // Otherwise continue polling
                 }
                 Poll::Ready(Some(Err(e))) => {
                     return Poll::Ready(Some(Err(e)));
                 }
                 Poll::Ready(None) => {
-                    // Stream ended, flush any pending event
+                    // Stream ended
+                    // If we have incomplete bytes in buffer, that's an error
+                    if !self.utf8_buffer.is_empty() {
+                        return Poll::Ready(Some(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "Stream ended with incomplete UTF-8 sequence",
+                        ))));
+                    }
+
+                    // Flush any pending event
                     if let Some(event) = self.parser.flush() {
                         return Poll::Ready(Some(Ok(event)));
                     }

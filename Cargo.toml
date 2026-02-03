@@ -26,7 +26,7 @@ clap_complete = "4"
 # Async runtime
 # Note: asupersync provides structured concurrency and cancel-correctness.
 # Tokio retained for now during gradual migration.
-asupersync = { path = "../asupersync", features = ["tls"] }
+asupersync = { path = "../asupersync", features = ["tls", "tls-native-roots", "sqlite"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 futures = "0.3"
@@ -62,7 +62,7 @@ tempfile = "3"
 fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }

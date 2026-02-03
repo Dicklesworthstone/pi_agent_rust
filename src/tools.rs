@@ -965,6 +965,14 @@ impl Tool for ReadTool {
 
         let text_content = String::from_utf8_lossy(&bytes).to_string();
 
+        // Handle empty file specially - return empty content
+        if text_content.is_empty() {
+            return Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new(""))],
+                details: None,
+            });
+        }
+
         let all_lines: Vec<&str> = text_content.split('\n').collect();
         let total_file_lines = all_lines.len();
 

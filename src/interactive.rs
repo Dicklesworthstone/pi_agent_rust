@@ -30,6 +30,7 @@ use crate::config::Config;
 use crate::model::{ContentBlock, StopReason, ThinkingLevel, Usage, UserContent};
 use crate::models::ModelEntry;
 use crate::providers;
+use crate::resources::ResourceLoader;
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::session_index::SessionIndex;
 
@@ -88,7 +89,8 @@ Tips:
   • Use ↑/↓ arrows or Ctrl+P/N to navigate input history
   • Use Alt+Enter to submit multi-line input
   • Use PageUp/PageDown to scroll conversation history
-  • Use Escape to cancel current input"
+  • Use Escape to cancel current input
+  • Use /skill:name or /template to expand resources"
     }
 }
 
@@ -182,6 +184,7 @@ pub struct PiApp {
     // Session and config
     session: Arc<Mutex<Session>>,
     config: Config,
+    resources: ResourceLoader,
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
@@ -223,6 +226,7 @@ impl PiApp {
         agent: Agent,
         session: Session,
         config: Config,
+        resources: ResourceLoader,
         model_entry: ModelEntry,
         model_scope: Vec<ModelEntry>,
         available_models: Vec<ModelEntry>,
@@ -283,6 +287,7 @@ impl PiApp {
             pending_tool_output: None,
             session: Arc::new(Mutex::new(session)),
             config,
+            resources,
             model_entry,
             model_scope,
             available_models,
@@ -808,7 +813,7 @@ impl PiApp {
         }
 
         let message_owned = message.to_string();
-        let message_for_agent = message_owned.clone();
+        let message_for_agent = self.resources.expand_input(&message_owned);
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
@@ -817,13 +822,13 @@ impl PiApp {
         self.abort_handle = Some(abort_handle);
 
         // Add to history
-        self.input_history.push(message_owned.clone());
+        self.input_history.push(message_owned);
         self.history_index = None;
 
         // Add user message to display
         self.messages.push(ConversationMessage {
             role: MessageRole::User,
-            content: message_owned,
+            content: message_for_agent.clone(),
             thinking: None,
         });
 
@@ -1579,6 +1584,7 @@ pub async fn run_interactive(
     available_models: Vec<ModelEntry>,
     pending_inputs: Vec<PendingInput>,
     save_enabled: bool,
+    resources: ResourceLoader,
 ) -> anyhow::Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel::<PiMsg>();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
@@ -1593,6 +1599,7 @@ pub async fn run_interactive(
         agent,
         session,
         config,
+        resources,
         model_entry,
         model_scope,
         available_models,

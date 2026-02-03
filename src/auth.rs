@@ -3,12 +3,21 @@
 //! Auth file: ~/.pi/agent/auth.json
 
 use crate::error::{Error, Result};
+use base64::Engine as _;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
+use sha2::Digest as _;
 use std::collections::HashMap;
 use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const ANTHROPIC_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+const ANTHROPIC_OAUTH_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
+const ANTHROPIC_OAUTH_REDIRECT_URI: &str = "https://console.anthropic.com/oauth/code/callback";
+const ANTHROPIC_OAUTH_SCOPES: &str = "org:create_api_key user:profile user:inference";
 
 /// Credentials stored in auth.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,8 +51,10 @@ impl AuthStorage {
     pub fn load(path: PathBuf) -> Result<Self> {
         let entries = if path.exists() {
             let file = File::open(&path).map_err(|e| Error::auth(format!("auth.json: {e}")))?;
-            let _lock = lock_file(&file, Duration::from_secs(30))?;
-            let content = fs::read_to_string(&path)?;
+            let mut locked = lock_file(file, Duration::from_secs(30))?;
+            // Read from the locked file handle, not a new handle
+            let mut content = String::new();
+            locked.as_file_mut().read_to_string(&mut content)?;
             let parsed: AuthFile = serde_json::from_str(&content).unwrap_or_default();
             parsed.entries
         } else {
@@ -65,12 +76,18 @@ impl AuthStorage {
             .create(true)
             .truncate(false)
             .open(&self.path)?;
-        let _lock = lock_file(&file, Duration::from_secs(30))?;
+        let mut locked = lock_file(file, Duration::from_secs(30))?;
 
         let data = serde_json::to_string_pretty(&AuthFile {
             entries: self.entries.clone(),
         })?;
-        fs::write(&self.path, data)?;
+
+        // Write to the locked file handle, not a new handle
+        let f = locked.as_file_mut();
+        f.seek(SeekFrom::Start(0))?;
+        f.set_len(0)?; // Truncate after seeking to avoid data loss
+        f.write_all(data.as_bytes())?;
+        f.flush()?;
 
         #[cfg(unix)]
         {
@@ -85,6 +102,16 @@ impl AuthStorage {
     /// Get raw credential.
     pub fn get(&self, provider: &str) -> Option<&AuthCredential> {
         self.entries.get(provider)
+    }
+
+    /// Insert or replace a credential for a provider.
+    pub fn set(&mut self, provider: impl Into<String>, credential: AuthCredential) {
+        self.entries.insert(provider.into(), credential);
+    }
+
+    /// Remove a credential for a provider.
+    pub fn remove(&mut self, provider: &str) -> bool {
+        self.entries.remove(provider).is_some()
     }
 
     /// Get API key for provider from auth.json.
@@ -121,6 +148,39 @@ impl AuthStorage {
             .and_then(|var| std::env::var(var).ok())
             .filter(|v| !v.is_empty())
     }
+
+    /// Refresh any expired OAuth tokens that this binary knows how to refresh.
+    ///
+    /// This keeps startup behavior predictable: models that rely on OAuth credentials remain
+    /// available after restart without requiring the user to re-login.
+    pub async fn refresh_expired_oauth_tokens(&mut self) -> Result<()> {
+        let now = chrono::Utc::now().timestamp_millis();
+        let mut refreshes = Vec::new();
+
+        for (provider, cred) in &self.entries {
+            if let AuthCredential::OAuth {
+                refresh_token,
+                expires,
+                ..
+            } = cred
+            {
+                if *expires <= now {
+                    refreshes.push((provider.clone(), refresh_token.clone()));
+                }
+            }
+        }
+
+        for (provider, refresh_token) in refreshes {
+            let refreshed = match provider.as_str() {
+                "anthropic" => refresh_anthropic_oauth_token(&refresh_token).await?,
+                _ => continue,
+            };
+            self.entries.insert(provider, refreshed);
+            self.save()?;
+        }
+
+        Ok(())
+    }
 }
 
 fn env_key_for_provider(provider: &str) -> Option<&'static str> {
@@ -141,11 +201,181 @@ fn env_key_for_provider(provider: &str) -> Option<&'static str> {
     }
 }
 
-fn lock_file(file: &File, timeout: Duration) -> Result<LockGuard<'_>> {
+#[derive(Debug, Clone)]
+pub struct OAuthStartInfo {
+    pub provider: String,
+    pub url: String,
+    pub verifier: String,
+    pub instructions: Option<String>,
+}
+
+/// Start Anthropic OAuth by generating an authorization URL and PKCE verifier.
+pub fn start_anthropic_oauth() -> Result<OAuthStartInfo> {
+    let (verifier, challenge) = generate_pkce();
+
+    let mut url =
+        reqwest::Url::parse(ANTHROPIC_OAUTH_AUTHORIZE_URL).map_err(|e| Error::auth(e.to_string()))?;
+    url.query_pairs_mut()
+        .append_pair("code", "true")
+        .append_pair("client_id", ANTHROPIC_OAUTH_CLIENT_ID)
+        .append_pair("response_type", "code")
+        .append_pair("redirect_uri", ANTHROPIC_OAUTH_REDIRECT_URI)
+        .append_pair("scope", ANTHROPIC_OAUTH_SCOPES)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", &verifier);
+
+    Ok(OAuthStartInfo {
+        provider: "anthropic".to_string(),
+        url: url.to_string(),
+        verifier,
+        instructions: Some(
+            "Open the URL, complete login, then paste the callback URL or authorization code."
+                .to_string(),
+        ),
+    })
+}
+
+/// Complete Anthropic OAuth by exchanging an authorization code for access/refresh tokens.
+pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Result<AuthCredential> {
+    let (code, state) = parse_oauth_code_input(code_input);
+
+    let Some(code) = code else {
+        return Err(Error::auth("Missing authorization code".to_string()));
+    };
+
+    let state = state.unwrap_or_else(|| verifier.to_string());
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(ANTHROPIC_OAUTH_TOKEN_URL)
+        .json(&serde_json::json!({
+            "grant_type": "authorization_code",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "code": code,
+            "state": state,
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "code_verifier": verifier,
+        }))
+        .send()
+        .await
+        .map_err(|e| Error::auth(format!("Token exchange failed: {e}")))?;
+
+    if !response.status().is_success() {
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read body>".to_string());
+        return Err(Error::auth(format!("Token exchange failed: {text}")));
+    }
+
+    let token = response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|e| Error::auth(format!("Invalid token response: {e}")))?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires: oauth_expires_at_ms(token.expires_in),
+    })
+}
+
+async fn refresh_anthropic_oauth_token(refresh_token: &str) -> Result<AuthCredential> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(ANTHROPIC_OAUTH_TOKEN_URL)
+        .json(&serde_json::json!({
+            "grant_type": "refresh_token",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "refresh_token": refresh_token,
+        }))
+        .send()
+        .await
+        .map_err(|e| Error::auth(format!("Anthropic token refresh failed: {e}")))?;
+
+    if !response.status().is_success() {
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read body>".to_string());
+        return Err(Error::auth(format!(
+            "Anthropic token refresh failed: {text}"
+        )));
+    }
+
+    let token = response
+        .json::<OAuthTokenResponse>()
+        .await
+        .map_err(|e| Error::auth(format!("Invalid refresh response: {e}")))?;
+
+    Ok(AuthCredential::OAuth {
+        access_token: token.access_token,
+        refresh_token: token.refresh_token,
+        expires: oauth_expires_at_ms(token.expires_in),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
+    refresh_token: String,
+    expires_in: i64,
+}
+
+fn oauth_expires_at_ms(expires_in_seconds: i64) -> i64 {
+    chrono::Utc::now().timestamp_millis()
+        + expires_in_seconds.saturating_mul(1000)
+        - 5 * 60 * 1000
+}
+
+fn generate_pkce() -> (String, String) {
+    let uuid1 = uuid::Uuid::new_v4();
+    let uuid2 = uuid::Uuid::new_v4();
+    let mut random = [0u8; 32];
+    random[..16].copy_from_slice(uuid1.as_bytes());
+    random[16..].copy_from_slice(uuid2.as_bytes());
+
+    let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random);
+    let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(
+        verifier.as_bytes(),
+    ));
+    (verifier, challenge)
+}
+
+fn parse_oauth_code_input(input: &str) -> (Option<String>, Option<String>) {
+    let value = input.trim();
+    if value.is_empty() {
+        return (None, None);
+    }
+
+    if let Ok(url) = reqwest::Url::parse(value) {
+        let code = url
+            .query_pairs()
+            .find_map(|(k, v)| (k == "code").then_some(v.into_owned()));
+        let state = url
+            .query_pairs()
+            .find_map(|(k, v)| (k == "state").then_some(v.into_owned()));
+        return (code, state);
+    }
+
+    if let Some((code, state)) = value.split_once('#') {
+        let code = code.trim();
+        let state = state.trim();
+        return (
+            (!code.is_empty()).then(|| code.to_string()),
+            (!state.is_empty()).then(|| state.to_string()),
+        );
+    }
+
+    (Some(value.to_string()), None)
+}
+
+fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
     let start = Instant::now();
     loop {
-        if matches!(FileExt::try_lock_exclusive(file), Ok(true)) {
-            return Ok(LockGuard { file });
+        if matches!(FileExt::try_lock_exclusive(&file), Ok(true)) {
+            return Ok(LockedFile { file });
         }
 
         if start.elapsed() >= timeout {
@@ -156,13 +386,20 @@ fn lock_file(file: &File, timeout: Duration) -> Result<LockGuard<'_>> {
     }
 }
 
-struct LockGuard<'a> {
-    file: &'a File,
+/// A file handle with an exclusive lock. Unlocks on drop.
+struct LockedFile {
+    file: File,
 }
 
-impl Drop for LockGuard<'_> {
+impl LockedFile {
+    const fn as_file_mut(&mut self) -> &mut File {
+        &mut self.file
+    }
+}
+
+impl Drop for LockedFile {
     fn drop(&mut self) {
-        let _ = FileExt::unlock(self.file);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 

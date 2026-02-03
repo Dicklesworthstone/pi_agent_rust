@@ -27,6 +27,7 @@ use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{PackageEntry, PackageManager, PackageScope};
 use pi::provider::{InputType, StreamOptions, ThinkingBudgets};
 use pi::providers;
+use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::tools::{ToolRegistry, process_file_arguments};
 use tracing_subscriber::EnvFilter;
@@ -63,6 +64,24 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
     }
 
     let config = Config::load()?;
+    let package_manager = PackageManager::new(cwd.clone());
+    let resource_cli = ResourceCliOptions {
+        no_skills: cli.no_skills,
+        no_prompt_templates: cli.no_prompt_templates,
+        no_extensions: cli.no_extensions,
+        no_themes: cli.no_themes,
+        skill_paths: cli.skill.clone(),
+        prompt_paths: cli.prompt_template.clone(),
+        extension_paths: cli.extension.clone(),
+        theme_paths: cli.theme.clone(),
+    };
+    let resources = match ResourceLoader::load(&package_manager, &cwd, &config, &resource_cli) {
+        Ok(resources) => resources,
+        Err(err) => {
+            eprintln!("Warning: Failed to load skills/prompts: {err}");
+            ResourceLoader::empty(config.enable_skill_commands())
+        }
+    };
     let auth = AuthStorage::load(Config::auth_path())?;
     let models_path = default_models_path(&Config::global_dir());
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
@@ -152,7 +171,21 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
 
     let api_key = resolve_api_key(&auth, &cli, &selection.model_entry)?;
 
-    let system_prompt = build_system_prompt(&cli, &cwd, &enabled_tools);
+    let skills_prompt = if enabled_tools.contains(&"read") {
+        resources.format_skills_for_prompt()
+    } else {
+        String::new()
+    };
+    let system_prompt = build_system_prompt(
+        &cli,
+        &cwd,
+        &enabled_tools,
+        if skills_prompt.is_empty() {
+            None
+        } else {
+            Some(skills_prompt.as_str())
+        },
+    );
     let provider =
         providers::create_provider(&selection.model_entry).map_err(anyhow::Error::new)?;
     let stream_options = build_stream_options(&config, api_key, &selection, &session);
@@ -195,11 +228,12 @@ async fn run(mut cli: cli::Cli) -> Result<()> {
             model_scope,
             available_models,
             !cli.no_session,
+            resources,
         )
         .await;
     }
 
-    run_print_mode(&mut agent_session, &mode, initial, messages).await
+    run_print_mode(&mut agent_session, &mode, initial, messages, &resources).await
 }
 
 async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
@@ -497,6 +531,7 @@ async fn run_print_mode(
     mode: &str,
     initial: Option<InitialMessage>,
     messages: Vec<String>,
+    resources: &ResourceLoader,
 ) -> Result<()> {
     if mode != "text" && mode != "json" {
         bail!("Unknown mode: {mode}");
@@ -524,6 +559,16 @@ async fn run_print_mode(
         let _ = tokio::signal::ctrl_c().await;
         abort_listener.abort();
     });
+
+    let mut initial = initial;
+    if let Some(ref mut initial) = initial {
+        initial.text = resources.expand_input(&initial.text);
+    }
+
+    let messages = messages
+        .into_iter()
+        .map(|message| resources.expand_input(&message))
+        .collect::<Vec<_>>();
 
     if let Some(initial) = initial {
         let content = build_initial_content(&initial);
@@ -574,6 +619,7 @@ async fn run_interactive_mode(
     model_scope: Vec<ModelEntry>,
     available_models: Vec<ModelEntry>,
     save_enabled: bool,
+    resources: ResourceLoader,
 ) -> Result<()> {
     let mut pending = Vec::new();
     if let Some(initial) = initial {
@@ -595,6 +641,7 @@ async fn run_interactive_mode(
         available_models,
         pending,
         save_enabled,
+        resources,
     )
     .await?;
     Ok(())
@@ -688,7 +735,12 @@ fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
     content
 }
 
-fn build_system_prompt(cli: &cli::Cli, cwd: &Path, enabled_tools: &[&str]) -> String {
+fn build_system_prompt(
+    cli: &cli::Cli,
+    cwd: &Path,
+    enabled_tools: &[&str],
+    skills_prompt: Option<&str>,
+) -> String {
     use std::fmt::Write as _;
 
     let custom_prompt = resolve_prompt_input(cli.system_prompt.as_deref(), "system prompt");
@@ -709,6 +761,10 @@ fn build_system_prompt(cli: &cli::Cli, cwd: &Path, enabled_tools: &[&str]) -> St
         for file in &context_files {
             let _ = write!(prompt, "## {}\n\n{}\n\n", file.path, file.content);
         }
+    }
+
+    if let Some(skills_prompt) = skills_prompt {
+        prompt.push_str(skills_prompt);
     }
 
     let date_time = format_current_datetime();

@@ -297,7 +297,15 @@ impl Session {
             content.push('\n');
         }
 
-        tokio::fs::write(path, content).await?;
+        // Atomic write using tempfile
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+
+        tokio::fs::write(temp_file.path(), content).await?;
+
+        temp_file
+            .persist(path)
+            .map_err(|e| crate::Error::Io(e.error))?;
         Ok(())
     }
 
