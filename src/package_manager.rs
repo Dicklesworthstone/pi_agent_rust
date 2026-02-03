@@ -209,7 +209,9 @@ impl PackageManager {
             if entry.filtered {
                 continue;
             }
-            if let Ok(resources) = self.resolve_package_resources(&entry.source, entry.scope, resource_type) {
+            if let Ok(resources) =
+                self.resolve_package_resources(&entry.source, entry.scope, resource_type)
+            {
                 all_resources.extend(resources);
             }
         }
