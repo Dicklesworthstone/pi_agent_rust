@@ -119,7 +119,10 @@ impl Theme {
         };
         // Relative luminance (sRGB) without gamma correction is sufficient here.
         // Treat anything above mid-gray as light.
-        let luma = (0.2126 * (r as f64)) + (0.7152 * (g as f64)) + (0.0722 * (b as f64));
+        let r = f64::from(r);
+        let g = f64::from(g);
+        let b = f64::from(b);
+        let luma = 0.0722_f64.mul_add(b, 0.2126_f64.mul_add(r, 0.7152 * g));
         luma >= 128.0
     }
 
@@ -129,12 +132,14 @@ impl Theme {
             .bold()
             .foreground(self.colors.accent.as_str());
         let muted = LipglossStyle::new().foreground(self.colors.muted.as_str());
+        let muted_bold = muted.clone().bold();
+        let muted_italic = muted.clone().italic();
 
         TuiStyles {
             title,
-            muted: muted.clone(),
-            muted_bold: muted.clone().bold(),
-            muted_italic: muted.clone().italic(),
+            muted,
+            muted_bold,
+            muted_italic,
             accent: LipglossStyle::new().foreground(self.colors.accent.as_str()),
             accent_bold: LipglossStyle::new()
                 .foreground(self.colors.accent.as_str())
@@ -412,10 +417,10 @@ mod tests {
         let path = dir.path().join("broken.json");
         fs::write(&path, "{this is not json").unwrap();
         let err = Theme::load(&path).unwrap_err();
-        match err {
-            Error::Json(_) => {}
-            other => panic!("expected json error, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Error::Json(_)),
+            "expected json error, got {err:?}"
+        );
     }
 
     #[test]
@@ -450,10 +455,10 @@ mod tests {
         fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
 
         let err = Theme::load(&path).unwrap_err();
-        match err {
-            Error::Validation(_) => {}
-            other => panic!("expected validation error, got {other:?}"),
-        }
+        assert!(
+            matches!(&err, Error::Validation(_)),
+            "expected validation error, got {err:?}"
+        );
     }
 
     #[test]

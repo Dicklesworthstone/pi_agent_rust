@@ -50,7 +50,7 @@ impl SessionPicker {
     }
 
     #[must_use]
-    pub fn with_theme(sessions: Vec<SessionMeta>, theme: Theme) -> Self {
+    pub fn with_theme(sessions: Vec<SessionMeta>, theme: &Theme) -> Self {
         let styles = theme.tui_styles();
         Self {
             sessions,
@@ -225,7 +225,7 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
 
     let config = Config::load().unwrap_or_default();
     let theme = Theme::resolve(&config, &cwd);
-    let picker = SessionPicker::with_theme(sessions, theme);
+    let picker = SessionPicker::with_theme(sessions, &theme);
 
     // Run the TUI
     let result = Program::new(picker).with_alt_screen().run();

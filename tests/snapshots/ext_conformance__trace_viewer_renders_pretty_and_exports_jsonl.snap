@@ -1,0 +1,15 @@
+---
+source: tests/ext_conformance.rs
+assertion_line: 362
+expression: pretty_stdout
+---
+2026-02-03T03:01:02.123Z info capture capture.start ext=ext.demo scn=scn-001 run=run-123 src=capture pid=42 data={"model":"gpt-4o-mini","provider":"openai","started_at":"2026-02-03T03:01:02.123Z"}
+2026-02-03T03:01:02.456Z debug tool_call.start read.start ext=ext.demo scn=scn-001 tool=tool-42 src=runtime pid=4242 data={"path":"/repo/README.md","tool":"read"}
+2026-02-03T03:01:02.999Z error hostcall.error capability denied ext=ext.demo scn=scn-001 host=host-7 trace=trace-xyz src=runtime pid=4242 data={"capability":"fs.read","hint":"Add fs.read capability to manifest.","scope":"repo"}
+
+--- trace summary ---
+lines: 3 (of 3)
+levels: debug=1, error=1, info=1
+extensions: ext.demo=3
+scenarios: scn-001=3
+events: capture=1, hostcall.error=1, tool_call.start=1

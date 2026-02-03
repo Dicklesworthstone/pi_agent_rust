@@ -56,7 +56,7 @@ fn main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
     let runtime_handle = handle.clone();
-    let join = handle.spawn(async move { run(cli, runtime_handle).await });
+    let join = handle.spawn(Box::pin(run(cli, runtime_handle)));
     runtime.block_on(join)
 }
 
@@ -180,7 +180,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         eprintln!("Warning: {message}");
     }
 
-    let api_key = pi::app::resolve_api_key(&auth, &cli, &selection.model_entry)?;
+    let resolved_key = pi::app::resolve_api_key(&auth, &cli, &selection.model_entry)?;
 
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
@@ -199,7 +199,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     );
     let provider =
         providers::create_provider(&selection.model_entry).map_err(anyhow::Error::new)?;
-    let stream_options = build_stream_options(&config, api_key, &selection, &session);
+    let stream_options = build_stream_options(&config, resolved_key, &selection, &session);
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
         max_tool_iterations: 50,
@@ -1370,9 +1370,9 @@ fn restore_model_from_session(
     registry: &ModelRegistry,
 ) -> RestoreResult {
     let restored = registry.find(saved_provider, saved_model_id);
-    let has_api_key = restored.as_ref().and_then(|m| m.api_key.clone()).is_some();
+    let has_key = restored.as_ref().and_then(|m| m.api_key.clone()).is_some();
 
-    if restored.is_some() && has_api_key {
+    if restored.is_some() && has_key {
         return RestoreResult {
             model: restored,
             fallback_message: None,

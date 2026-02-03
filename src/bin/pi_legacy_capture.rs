@@ -146,21 +146,21 @@ enum TraceViewLevel {
 }
 
 impl TraceViewLevel {
-    fn allows(self, level: &LogLevel) -> bool {
+    const fn allows(self, level: &LogLevel) -> bool {
         level_rank(level) >= self.min_rank()
     }
 
-    fn min_rank(self) -> u8 {
+    const fn min_rank(self) -> u8 {
         match self {
-            TraceViewLevel::Debug => 0,
-            TraceViewLevel::Info => 1,
-            TraceViewLevel::Warn => 2,
-            TraceViewLevel::Error => 3,
+            Self::Debug => 0,
+            Self::Info => 1,
+            Self::Warn => 2,
+            Self::Error => 3,
         }
     }
 }
 
-fn level_rank(level: &LogLevel) -> u8 {
+const fn level_rank(level: &LogLevel) -> u8 {
     match level {
         LogLevel::Debug => 0,
         LogLevel::Info => 1,
@@ -169,7 +169,7 @@ fn level_rank(level: &LogLevel) -> u8 {
     }
 }
 
-fn level_label(level: &LogLevel) -> &'static str {
+const fn level_label(level: &LogLevel) -> &'static str {
     match level {
         LogLevel::Debug => "debug",
         LogLevel::Info => "info",
@@ -216,7 +216,7 @@ fn run_trace_viewer(args: &Args, input: &Path) -> Result<()> {
         total += 1;
 
         let payload: LogPayload = serde_json::from_str(trimmed)
-            .with_context(|| format!("parse trace log JSON on line {}", line_idx))?;
+            .with_context(|| format!("parse trace log JSON on line {line_idx}"))?;
 
         if !args.view_min_level.allows(&payload.level) {
             continue;

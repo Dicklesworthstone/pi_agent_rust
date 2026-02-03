@@ -320,6 +320,7 @@ impl PiApp {
         format!("\n  {}\n", self.styles.muted.render(&footer))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_autocomplete_dropdown(&self) -> String {
         let mut output = String::new();
 
@@ -543,7 +544,6 @@ impl PiApp {
 fn parse_queue_mode(mode: Option<&str>) -> QueueMode {
     match mode.map(str::trim) {
         Some("all") => QueueMode::All,
-        Some("one-at-a-time") => QueueMode::OneAtATime,
         _ => QueueMode::OneAtATime,
     }
 }
@@ -807,6 +807,49 @@ fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage
     (messages, usage)
 }
 
+#[derive(Debug, Clone)]
+struct ForkCandidate {
+    id: String,
+    summary: String,
+}
+
+fn fork_candidates(session: &Session) -> Vec<ForkCandidate> {
+    let mut out = Vec::new();
+
+    for entry in session.entries_for_current_path() {
+        let SessionEntry::Message(message_entry) = entry else {
+            continue;
+        };
+
+        let Some(id) = message_entry.base.id.as_ref() else {
+            continue;
+        };
+
+        let SessionMessage::User { content, .. } = &message_entry.message else {
+            continue;
+        };
+
+        let text = user_content_to_text(content);
+        let first_line = text
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        let summary = if first_line.is_empty() {
+            "(empty)".to_string()
+        } else {
+            truncate(first_line, 80)
+        };
+
+        out.push(ForkCandidate {
+            id: id.clone(),
+            summary,
+        });
+    }
+
+    out
+}
+
 fn extension_model_from_entry(entry: &ModelEntry) -> Value {
     json!({
         "provider": entry.model.provider.as_str(),
@@ -966,11 +1009,6 @@ fn parse_extension_ui_response(
 
             Err("Invalid selection. Enter a number, label, or 'cancel'.".to_string())
         }
-        "input" | "editor" => Ok(ExtensionUiResponse {
-            id: request.id.clone(),
-            value: Some(Value::String(input.to_string())),
-            cancelled: false,
-        }),
         _ => Ok(ExtensionUiResponse {
             id: request.id.clone(),
             value: Some(Value::String(input.to_string())),
@@ -2421,7 +2459,9 @@ impl PiApp {
                 }
             }
 
-            // Handle autocomplete navigation when dropdown is open
+            // Handle autocomplete navigation when dropdown is open.
+            //
+            // IMPORTANT: Enter submits the current editor contents; Tab accepts autocomplete.
             if self.autocomplete.open {
                 match key.key_type {
                     KeyType::Up => {
@@ -2432,7 +2472,7 @@ impl PiApp {
                         self.autocomplete.select_next();
                         return None;
                     }
-                    KeyType::Tab | KeyType::Enter => {
+                    KeyType::Tab => {
                         // Accept the selected item
                         if let Some(item) = self.autocomplete.selected_item().cloned() {
                             self.accept_autocomplete(&item);
@@ -2829,7 +2869,7 @@ impl PiApp {
             return;
         };
         let provider = agent_guard.provider();
-        let api_key = agent_guard.stream_options().api_key.clone();
+        let key_opt = agent_guard.stream_options().api_key.clone();
 
         self.tree_ui = None;
         self.agent_state = AgentState::Processing;
@@ -2869,14 +2909,14 @@ impl PiApp {
             }
 
             let summary_skipped =
-                summary_requested && api_key.is_none() && !pending.entries_to_summarize.is_empty();
+                summary_requested && key_opt.is_none() && !pending.entries_to_summarize.is_empty();
             let summary_text = if !summary_requested || pending.entries_to_summarize.is_empty() {
                 None
-            } else if let Some(api_key) = api_key.as_deref() {
+            } else if let Some(key) = key_opt.as_deref() {
                 match crate::compaction::summarize_entries(
                     &pending.entries_to_summarize,
                     provider,
-                    api_key,
+                    key,
                     reserve_tokens,
                     custom_instructions.as_deref(),
                 )
