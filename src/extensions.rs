@@ -26,7 +26,7 @@ use sha2::Digest as _;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -1771,6 +1771,20 @@ pub struct ExtensionUiResponse {
     pub cancelled: bool,
 }
 
+/// Host-side event dispatched by extensions (via `pi.events(...)`).
+#[derive(Debug, Clone)]
+pub enum ExtensionHostEvent {
+    SendMessage {
+        extension_id: String,
+        message: SessionMessage,
+        trigger_turn: bool,
+    },
+    SendUserMessage {
+        extension_id: String,
+        text: String,
+    },
+}
+
 /// Minimal session access for extensions (hostcalls).
 #[async_trait]
 pub trait ExtensionSession: Send + Sync {
@@ -1779,6 +1793,7 @@ pub trait ExtensionSession: Send + Sync {
     async fn get_entries(&self) -> Vec<Value>;
     async fn get_branch(&self) -> Vec<Value>;
     async fn set_name(&self, name: String) -> Result<()>;
+    async fn append_message(&self, message: SessionMessage) -> Result<()>;
     async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()>;
 }
 
@@ -3430,11 +3445,12 @@ async fn dispatch_hostcall_events(
                 None => String::new(),
             };
 
-            let deliver_as = options
-                .get("deliverAs")
-                .and_then(Value::as_str)
-                .or_else(|| options.get("deliver_as").and_then(Value::as_str))
-                .and_then(ExtensionDeliverAs::parse);
+            let deliver_as = ExtensionDeliverAs::parse(
+                options
+                    .get("deliverAs")
+                    .and_then(Value::as_str)
+                    .or_else(|| options.get("deliver_as").and_then(Value::as_str)),
+            );
             let trigger_turn = options
                 .get("triggerTurn")
                 .and_then(Value::as_bool)
@@ -3484,11 +3500,12 @@ async fn dispatch_hostcall_events(
             }
 
             let options = payload.get("options").cloned().unwrap_or(Value::Null);
-            let deliver_as = options
-                .get("deliverAs")
-                .and_then(Value::as_str)
-                .or_else(|| options.get("deliver_as").and_then(Value::as_str))
-                .and_then(ExtensionDeliverAs::parse);
+            let deliver_as = ExtensionDeliverAs::parse(
+                options
+                    .get("deliverAs")
+                    .and_then(Value::as_str)
+                    .or_else(|| options.get("deliver_as").and_then(Value::as_str)),
+            );
 
             let msg = ExtensionSendUserMessage {
                 extension_id,
