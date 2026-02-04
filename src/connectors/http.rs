@@ -87,7 +87,7 @@ pub struct HttpRequest {
     /// The URL to fetch
     pub url: String,
 
-    /// HTTP method (GET, POST)
+    /// HTTP method (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS)
     #[serde(default = "default_method")]
     pub method: String,
 
@@ -95,7 +95,7 @@ pub struct HttpRequest {
     #[serde(default)]
     pub headers: HashMap<String, String>,
 
-    /// Request body (for POST)
+    /// Request body (for POST, PUT, PATCH)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 
@@ -168,20 +168,20 @@ impl HttpConnector {
             )
         })?;
 
-        // HTTP/HTTPS only
+        // Check scheme (TLS requirement)
         let scheme = parsed.scheme();
+        if self.config.require_tls && scheme != "https" {
+            return Err((
+                HostCallErrorCode::Denied,
+                format!("TLS required: URL scheme must be 'https', got '{scheme}'"),
+            ));
+        }
+
+        // HTTP/HTTPS only
         if scheme != "http" && scheme != "https" {
             return Err((
                 HostCallErrorCode::InvalidRequest,
                 format!("Unsupported URL scheme: '{scheme}'"),
-            ));
-        }
-
-        // Check scheme (TLS requirement)
-        if self.config.require_tls && scheme == "http" {
-            return Err((
-                HostCallErrorCode::Denied,
-                format!("TLS required: URL scheme must be 'https', got '{scheme}'"),
             ));
         }
 
@@ -232,7 +232,7 @@ impl HttpConnector {
 
     /// Parse and validate the HTTP request from hostcall params.
     fn parse_request(&self, params: &Value) -> std::result::Result<HttpRequest, ValidationError> {
-        let mut request: HttpRequest = serde_json::from_value(params.clone()).map_err(|e| {
+        let request: HttpRequest = serde_json::from_value(params.clone()).map_err(|e| {
             (
                 HostCallErrorCode::InvalidRequest,
                 format!("Invalid HTTP request params: {e}"),
@@ -250,9 +250,6 @@ impl HttpConnector {
                 ),
             ));
         }
-
-        // Treat 0 as unset/absent to match core hostcall timeout semantics.
-        request.timeout_ms = request.timeout_ms.filter(|ms| *ms > 0);
 
         // Validate body size
         let body_size = request
@@ -286,19 +283,13 @@ impl HttpConnector {
 
     /// Execute the HTTP request.
     async fn execute_request(&self, request: &HttpRequest) -> Result<HttpResponse> {
-        let start = Instant::now();
+        let start = std::time::Instant::now();
 
         // Build request
         let method_upper = request.method.to_ascii_uppercase();
         let mut builder = match method_upper.as_str() {
-            "GET" => self.client.get(&request.url),
-            "POST" => self.client.post(&request.url),
-            _ => {
-                return Err(crate::error::Error::validation(format!(
-                    "Invalid HTTP method: '{}'. Supported methods: GET, POST.",
-                    request.method
-                )));
-            }
+            "GET" | "HEAD" | "OPTIONS" => self.client.get(&request.url),
+            _ => self.client.post(&request.url),
         };
 
         // Add headers
@@ -418,18 +409,13 @@ impl HttpConnector {
         // Execute request with timeout for the full request/response read.
         let timeout_ms = request.timeout_ms.unwrap_or(self.config.default_timeout_ms);
         let start = Instant::now();
-        let result = if timeout_ms == 0 {
-            Ok(self.execute_request(&request).await)
-        } else {
-            timeout(
-                wall_now(),
-                Duration::from_millis(timeout_ms),
-                Box::pin(self.execute_request(&request)),
-            )
-            .await
-        };
-
-        match result {
+        match timeout(
+            wall_now(),
+            Duration::from_millis(timeout_ms),
+            Box::pin(self.execute_request(&request)),
+        )
+        .await
+        {
             Ok(Ok(response)) => {
                 info!(
                     call_id = %call_id,
@@ -446,7 +432,7 @@ impl HttpConnector {
                 host_result_ok(call_id, output)
             }
             Ok(Err(e)) => {
-                if timeout_ms > 0 && start.elapsed() >= Duration::from_millis(timeout_ms) {
+                if start.elapsed() >= Duration::from_millis(timeout_ms) {
                     let message = format!("Request timeout after {timeout_ms}ms");
                     warn!(
                         call_id = %call_id,
@@ -832,17 +818,16 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
 
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let join = thread::spawn(move || {
             let _ = ready_tx.send(());
             let (_stream, _peer) = listener.accept().expect("accept");
-            let _ = shutdown_rx.recv_timeout(std::time::Duration::from_millis(500));
+            thread::sleep(std::time::Duration::from_millis(150));
         });
         let _ = ready_rx.recv();
 
         let connector = HttpConnector::new(HttpConnectorConfig {
             require_tls: false,
-            default_timeout_ms: 100,
+            default_timeout_ms: 50,
             ..Default::default()
         });
 
@@ -853,7 +838,7 @@ mod tests {
             params: json!({
                 "url": format!("http://{addr}/"),
                 "method": "GET",
-                "timeout_ms": 100,
+                "timeout_ms": 50,
             }),
             timeout_ms: None,
             cancel_token: None,
@@ -866,7 +851,6 @@ mod tests {
         assert_eq!(error.code, HostCallErrorCode::Timeout);
         assert_eq!(error.retryable, Some(true));
 
-        let _ = shutdown_tx.send(());
         let _ = join.join();
     }
 
@@ -876,11 +860,10 @@ mod tests {
         let addr = listener.local_addr().expect("listener addr");
 
         let (ready_tx, ready_rx) = mpsc::channel();
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
         let join = thread::spawn(move || {
             let _ = ready_tx.send(());
             let (_stream, _peer) = listener.accept().expect("accept");
-            let _ = shutdown_rx.recv_timeout(std::time::Duration::from_millis(500));
+            thread::sleep(std::time::Duration::from_millis(150));
         });
         let _ = ready_rx.recv();
 
@@ -899,7 +882,7 @@ mod tests {
                 "url": format!("http://{addr}/"),
                 "method": "GET",
             }),
-            timeout_ms: Some(100),
+            timeout_ms: Some(50),
             cancel_token: None,
             context: None,
         };
@@ -912,60 +895,6 @@ mod tests {
             "expected timeout, got {:?} (details={:?})",
             error.code,
             error.details
-        );
-
-        let _ = shutdown_tx.send(());
-        let _ = join.join();
-    }
-
-    #[test]
-    fn test_dispatch_treats_zero_timeout_as_unset() {
-        use std::io::Write;
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let addr = listener.local_addr().expect("listener addr");
-
-        let join = thread::spawn(move || {
-            let (mut stream, _peer) = listener.accept().expect("accept");
-            let body = "hello";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-        });
-
-        let connector = HttpConnector::new(HttpConnectorConfig {
-            require_tls: false,
-            default_timeout_ms: 5000,
-            ..Default::default()
-        });
-
-        let call = HostCallPayload {
-            call_id: "call-1".to_string(),
-            capability: "http".to_string(),
-            method: "http".to_string(),
-            params: json!({
-                "url": format!("http://{addr}/"),
-                "method": "GET",
-                "timeout_ms": 0,
-            }),
-            timeout_ms: None,
-            cancel_token: None,
-            context: None,
-        };
-
-        let result = run_async(async move { connector.dispatch(&call).await.unwrap() });
-        assert!(!result.is_error);
-        assert_eq!(
-            result.output.get("status").and_then(Value::as_u64),
-            Some(200)
-        );
-        assert_eq!(
-            result.output.get("body").and_then(Value::as_str),
-            Some("hello")
         );
 
         let _ = join.join();

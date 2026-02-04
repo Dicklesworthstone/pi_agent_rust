@@ -2137,10 +2137,9 @@ mod wasm_host {
             self.fs = FsConnector::new(&self.cwd, self.policy.clone(), fs_scopes)?;
 
             let http_allowlist = Self::http_allowlist_from_manifest(manifest);
-            self.http = HttpConnector::new(HttpConnectorConfig {
-                allowlist: http_allowlist,
-                ..Default::default()
-            });
+            let mut http_config = HttpConnectorConfig::default();
+            http_config.allowlist = http_allowlist;
+            self.http = HttpConnector::new(http_config);
 
             Ok(())
         }
@@ -2190,7 +2189,7 @@ mod wasm_host {
 
             if tool_name.eq_ignore_ascii_case("bash") && input.get("timeout").is_none() {
                 if let Some(timeout_ms) = call_timeout_ms {
-                    let timeout_secs = timeout_ms.div_ceil(1000);
+                    let timeout_secs = (timeout_ms + 999) / 1000;
                     if let Some(obj) = input.as_object_mut() {
                         obj.insert("timeout".to_string(), json!(timeout_secs));
                     }
@@ -2534,7 +2533,6 @@ mod wasm_host {
     }
 
     impl host::Host for HostState {
-        #[allow(clippy::too_many_lines)]
         async fn call(
             &mut self,
             name: String,
@@ -2627,7 +2625,18 @@ mod wasm_host {
             }
 
             let method = payload.method.trim().to_ascii_lowercase();
-            let outcome = if policy_check.decision == PolicyDecision::Allow {
+            let outcome = if policy_check.decision != PolicyDecision::Allow {
+                Err(Self::host_error_json(
+                    HostCallErrorCode::Denied,
+                    "Capability denied by policy",
+                    Some(json!({
+                        "capability": policy_check.capability,
+                        "decision": format!("{:?}", policy_check.decision),
+                        "reason": policy_check.reason,
+                    })),
+                    None,
+                ))
+            } else {
                 let dispatch = async {
                     match method.as_str() {
                         "tool" => self.dispatch_tool(&payload).await,
@@ -2644,34 +2653,25 @@ mod wasm_host {
                     }
                 };
 
-                match call_timeout_ms {
-                    Some(timeout_ms) => timeout(
+                if let Some(timeout_ms) = call_timeout_ms {
+                    match timeout(
                         wall_now(),
                         Duration::from_millis(timeout_ms),
                         Box::pin(dispatch),
                     )
                     .await
-                    .unwrap_or_else(|_| {
-                        Err(Self::host_error_json(
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(Self::host_error_json(
                             HostCallErrorCode::Timeout,
                             format!("Hostcall timed out after {timeout_ms}ms"),
                             Some(json!({ "capability": required, "method": method })),
                             Some(true),
-                        ))
-                    }),
-                    None => dispatch.await,
+                        )),
+                    }
+                } else {
+                    dispatch.await
                 }
-            } else {
-                Err(Self::host_error_json(
-                    HostCallErrorCode::Denied,
-                    "Capability denied by policy",
-                    Some(json!({
-                        "capability": policy_check.capability,
-                        "decision": format!("{:?}", policy_check.decision),
-                        "reason": policy_check.reason,
-                    })),
-                    None,
-                ))
             };
 
             let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -3006,10 +3006,7 @@ mod wasm_host {
             (result, capture.snapshot())
         }
 
-        fn find_policy_decisions<'a>(
-            events: &'a [CapturedEvent],
-            call_id: &str,
-        ) -> Vec<&'a CapturedEvent> {
+        fn find_policy_decisions(events: &[CapturedEvent], call_id: &str) -> Vec<&CapturedEvent> {
             events
                 .iter()
                 .filter(|event| {
@@ -3060,15 +3057,15 @@ mod wasm_host {
 
         #[async_trait]
         impl Tool for SleepTool {
-            fn name(&self) -> &'static str {
+            fn name(&self) -> &str {
                 "sleep"
             }
 
-            fn label(&self) -> &'static str {
+            fn label(&self) -> &str {
                 "sleep"
             }
 
-            fn description(&self) -> &'static str {
+            fn description(&self) -> &str {
                 "sleep tool"
             }
 
@@ -3163,7 +3160,7 @@ mod wasm_host {
                 context: None,
             };
 
-            let ((outcome, ()), events) = capture_tracing_events(|| {
+            let ((outcome, _), events) = capture_tracing_events(|| {
                 let json = serde_json::to_string(&call).expect("serialize hostcall");
                 let outcome = run_async(async {
                     host::Host::call(&mut state, "env".to_string(), json).await
@@ -3230,7 +3227,7 @@ mod wasm_host {
             let dir = tempdir().expect("tempdir");
             let cwd = dir.path().to_path_buf();
 
-            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            let mut state = HostState::new(permissive_policy(), cwd.clone()).expect("host state");
             state
                 .apply_registration(&registration_payload_with_write_scope())
                 .expect("apply registration");
@@ -3245,7 +3242,7 @@ mod wasm_host {
                 context: None,
             };
 
-            let ((out, ()), events) = capture_tracing_events(|| {
+            let ((out, _), events) = capture_tracing_events(|| {
                 let json = serde_json::to_string(&call).expect("serialize hostcall");
                 let out =
                     run_async(async { host::Host::call(&mut state, "fs".to_string(), json).await })
@@ -3283,7 +3280,7 @@ mod wasm_host {
                 context: None,
             };
 
-            let ((outcome, ()), events) = capture_tracing_events(|| {
+            let ((outcome, _), events) = capture_tracing_events(|| {
                 let json = serde_json::to_string(&call).expect("serialize hostcall");
                 let outcome = run_async(async {
                     host::Host::call(&mut state, "tool".to_string(), json).await
@@ -3317,7 +3314,7 @@ mod wasm_host {
                 context: None,
             };
 
-            let ((outcome, ()), events) = capture_tracing_events(|| {
+            let ((outcome, _), events) = capture_tracing_events(|| {
                 let json = serde_json::to_string(&call).expect("serialize hostcall");
                 let outcome = run_async(async {
                     host::Host::call(&mut state, "exec".to_string(), json).await

@@ -404,7 +404,6 @@ fn lock_file_guard(file: &File, timeout: Duration) -> Result<LockGuard<'_>> {
     }
 }
 
-#[derive(Debug)]
 struct LockGuard<'a> {
     file: &'a File,
 }
@@ -813,8 +812,9 @@ mod tests {
             .expect("open file2");
 
         let guard1 = lock_file_guard(&file1, Duration::from_millis(50)).expect("acquire lock");
-        let err =
-            lock_file_guard(&file2, Duration::from_millis(50)).expect_err("expected lock timeout");
+        let err = lock_file_guard(&file2, Duration::from_millis(50))
+            .err()
+            .expect("expected lock timeout");
         drop(guard1);
 
         assert!(
