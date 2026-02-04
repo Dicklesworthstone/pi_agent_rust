@@ -9,3 +9,6 @@ rustc-ice-*.txt
 
 # br local history backups
 .beads/.br_history/
+
+# local Pi agent config (may contain API keys)
+.pi/
