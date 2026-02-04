@@ -1678,11 +1678,12 @@ fn resolve_scoped_model_entries(
     patterns: &[String],
     available_models: &[ModelEntry],
 ) -> Result<Vec<ModelEntry>, String> {
-    let mut resolved = Vec::new();
+    let mut resolved: Vec<ModelEntry> = Vec::new();
 
     for pattern in patterns {
         let raw_pattern = strip_thinking_level_suffix(pattern);
-        let is_glob = raw_pattern.contains('*') || raw_pattern.contains('?') || raw_pattern.contains('[');
+        let is_glob =
+            raw_pattern.contains('*') || raw_pattern.contains('?') || raw_pattern.contains('[');
 
         if is_glob {
             let glob = Pattern::new(&raw_pattern.to_lowercase())
@@ -1694,8 +1695,11 @@ fn resolve_scoped_model_entries(
                 let id_lower = entry.model.id.to_lowercase();
 
                 if glob.matches(&full_id_lower) || glob.matches(&id_lower) {
-                    if !resolved.iter().any(|existing| {
-                        existing.model.provider.eq_ignore_ascii_case(&entry.model.provider)
+                    if !resolved.iter().any(|existing: &ModelEntry| {
+                        existing
+                            .model
+                            .provider
+                            .eq_ignore_ascii_case(&entry.model.provider)
                             && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
                     }) {
                         resolved.push(entry.clone());
@@ -1707,9 +1711,14 @@ fn resolve_scoped_model_entries(
 
         for entry in available_models {
             let full_id = format!("{}/{}", entry.model.provider, entry.model.id);
-            if raw_pattern.eq_ignore_ascii_case(&full_id) || raw_pattern.eq_ignore_ascii_case(&entry.model.id) {
-                if !resolved.iter().any(|existing| {
-                    existing.model.provider.eq_ignore_ascii_case(&entry.model.provider)
+            if raw_pattern.eq_ignore_ascii_case(&full_id)
+                || raw_pattern.eq_ignore_ascii_case(&entry.model.id)
+            {
+                if !resolved.iter().any(|existing: &ModelEntry| {
+                    existing
+                        .model
+                        .provider
+                        .eq_ignore_ascii_case(&entry.model.provider)
                         && existing.model.id.eq_ignore_ascii_case(&entry.model.id)
                 }) {
                     resolved.push(entry.clone());
@@ -6535,7 +6544,7 @@ impl PiApp {
                     self.model_scope.clear();
 
                     let global_dir = Config::global_dir();
-                    let patch = json!({ "enabled_models": [] as [String; 0] });
+                    let patch = json!({ "enabled_models": [] });
                     if let Err(err) = Config::patch_settings_with_roots(
                         SettingsScope::Project,
                         &global_dir,
@@ -6584,7 +6593,8 @@ impl PiApp {
                         "Scoped models updated: {match_count} matched (not saved: {err})"
                     ));
                 } else {
-                    self.status_message = Some(format!("Scoped models updated: {match_count} matched"));
+                    self.status_message =
+                        Some(format!("Scoped models updated: {match_count} matched"));
                 }
                 None
             }

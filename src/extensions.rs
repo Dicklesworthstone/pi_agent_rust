@@ -2444,6 +2444,22 @@ pub enum ExtensionEventName {
     AgentStart,
     /// Agent ended processing.
     AgentEnd,
+    /// Turn lifecycle start.
+    TurnStart,
+    /// Turn lifecycle end.
+    TurnEnd,
+    /// Message lifecycle start.
+    MessageStart,
+    /// Message lifecycle update (assistant streaming).
+    MessageUpdate,
+    /// Message lifecycle end.
+    MessageEnd,
+    /// Tool execution start.
+    ToolExecutionStart,
+    /// Tool execution update.
+    ToolExecutionUpdate,
+    /// Tool execution end.
+    ToolExecutionEnd,
     /// Session before switch.
     SessionBeforeSwitch,
     /// Session switched.
@@ -2465,6 +2481,14 @@ impl std::fmt::Display for ExtensionEventName {
             Self::BeforeAgentStart => "before_agent_start",
             Self::AgentStart => "agent_start",
             Self::AgentEnd => "agent_end",
+            Self::TurnStart => "turn_start",
+            Self::TurnEnd => "turn_end",
+            Self::MessageStart => "message_start",
+            Self::MessageUpdate => "message_update",
+            Self::MessageEnd => "message_end",
+            Self::ToolExecutionStart => "tool_execution_start",
+            Self::ToolExecutionUpdate => "tool_execution_update",
+            Self::ToolExecutionEnd => "tool_execution_end",
             Self::SessionBeforeSwitch => "session_before_switch",
             Self::SessionSwitch => "session_switch",
             Self::SessionBeforeFork => "session_before_fork",
@@ -3733,14 +3757,24 @@ impl ExtensionManager {
 }
 
 /// Extract extension event information from an agent event.
-pub const fn extension_event_from_agent(
+pub fn extension_event_from_agent(
     event: &AgentEvent,
 ) -> Option<(ExtensionEventName, Option<Value>)> {
-    match event {
-        AgentEvent::AgentStart => Some((ExtensionEventName::AgentStart, None)),
-        AgentEvent::AgentEnd { .. } => Some((ExtensionEventName::AgentEnd, None)),
-        _ => None,
-    }
+    let name = match event {
+        AgentEvent::AgentStart => ExtensionEventName::AgentStart,
+        AgentEvent::AgentEnd { .. } => ExtensionEventName::AgentEnd,
+        AgentEvent::TurnStart => ExtensionEventName::TurnStart,
+        AgentEvent::TurnEnd { .. } => ExtensionEventName::TurnEnd,
+        AgentEvent::MessageStart { .. } => ExtensionEventName::MessageStart,
+        AgentEvent::MessageUpdate { .. } => ExtensionEventName::MessageUpdate,
+        AgentEvent::MessageEnd { .. } => ExtensionEventName::MessageEnd,
+        AgentEvent::ToolExecutionStart { .. } => ExtensionEventName::ToolExecutionStart,
+        AgentEvent::ToolExecutionUpdate { .. } => ExtensionEventName::ToolExecutionUpdate,
+        AgentEvent::ToolExecutionEnd { .. } => ExtensionEventName::ToolExecutionEnd,
+    };
+
+    let payload = serde_json::to_value(event).ok();
+    Some((name, payload))
 }
 
 fn extract_slash_command_name(value: &Value) -> Option<String> {
@@ -4413,8 +4447,8 @@ mod tests {
             }],
         };
         let scopes = FsScopes::from_manifest(Some(&manifest), &project).expect("scopes");
-        let connector = FsConnector::new(&project, ExtensionPolicy::default(), scopes)
-            .expect("connector");
+        let connector =
+            FsConnector::new(&project, ExtensionPolicy::default(), scopes).expect("connector");
 
         let call = HostCallPayload {
             call_id: "call-scope-deny".to_string(),
@@ -4474,7 +4508,10 @@ mod tests {
 
     fn hostcall_ledger_start_data(call: &HostCallPayload) -> Value {
         let mut data = serde_json::Map::new();
-        data.insert("capability".to_string(), Value::String(call.capability.clone()));
+        data.insert(
+            "capability".to_string(),
+            Value::String(call.capability.clone()),
+        );
         data.insert("method".to_string(), Value::String(call.method.clone()));
         data.insert(
             "params_hash".to_string(),
@@ -4486,9 +4523,16 @@ mod tests {
         Value::Object(data)
     }
 
-    fn hostcall_ledger_end_data(call: &HostCallPayload, duration_ms: u64, result: &HostResultPayload) -> Value {
+    fn hostcall_ledger_end_data(
+        call: &HostCallPayload,
+        duration_ms: u64,
+        result: &HostResultPayload,
+    ) -> Value {
         let mut data = serde_json::Map::new();
-        data.insert("capability".to_string(), Value::String(call.capability.clone()));
+        data.insert(
+            "capability".to_string(),
+            Value::String(call.capability.clone()),
+        );
         data.insert("method".to_string(), Value::String(call.method.clone()));
         data.insert(
             "params_hash".to_string(),

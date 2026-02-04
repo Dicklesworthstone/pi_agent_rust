@@ -214,6 +214,12 @@ fn build_app_with_models(
     app
 }
 
+fn read_project_settings_json(harness: &TestHarness) -> serde_json::Value {
+    let path = harness.temp_dir().join(".pi/settings.json");
+    let content = std::fs::read_to_string(&path).expect("read settings.json");
+    serde_json::from_str(&content).expect("parse settings.json")
+}
+
 #[allow(dead_code)]
 fn build_app_with_session_and_events(
     harness: &TestHarness,
@@ -1499,6 +1505,102 @@ fn tui_state_slash_model_no_args_reports_current_model() {
 }
 
 #[test]
+fn tui_state_slash_scoped_models_set_persists_and_scopes_ctrlp() {
+    let harness = TestHarness::new("tui_state_slash_scoped_models_set_persists_and_scopes_ctrlp");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let model_scope = Vec::new();
+    let available_models = vec![anthropic.clone(), openai, google];
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    type_text(&harness, &mut app, "/scoped-models openai/*");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Scoped models updated: 1 matched");
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(
+        settings
+            .get("enabled_models")
+            .and_then(|value| value.as_array())
+            .map(|array| { array.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>() }),
+        Some(vec!["openai/*"])
+    );
+
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
+}
+
+#[test]
+fn tui_state_slash_scoped_models_clear_persists_and_restores_all_models() {
+    let harness =
+        TestHarness::new("tui_state_slash_scoped_models_clear_persists_and_restores_all_models");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let model_scope = Vec::new();
+    let available_models = vec![anthropic.clone(), openai, google];
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    type_text(&harness, &mut app, "/scoped-models openai/*");
+    press_enter(&harness, &mut app);
+
+    type_text(&harness, &mut app, "/scoped-models clear");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Scoped models cleared");
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(
+        settings
+            .get("enabled_models")
+            .and_then(|value| value.as_array())
+            .map(|array| array.len()),
+        Some(0)
+    );
+
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched model: google/gemini-a");
+}
+
+#[test]
 fn tui_state_ctrlp_cycles_models_with_scope_and_updates_session_header() {
     let harness =
         TestHarness::new("tui_state_ctrlp_cycles_models_with_scope_and_updates_session_header");
@@ -2168,7 +2270,7 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
             PiMsg::ConversationReset { .. } => reset_msg = Some(msg),
             PiMsg::SetEditorText(_) => editor_msg = Some(msg),
             PiMsg::AgentError(err) => {
-                panic!("Unexpected fork error: {err}");
+                assert!(false, "Unexpected fork error: {err}");
             }
             _ => {}
         }
