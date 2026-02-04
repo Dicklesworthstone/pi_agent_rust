@@ -18,7 +18,7 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Validation error with error code and message.
@@ -408,6 +408,7 @@ impl HttpConnector {
 
         // Execute request with timeout for the full request/response read.
         let timeout_ms = request.timeout_ms.unwrap_or(self.config.default_timeout_ms);
+        let start = Instant::now();
         match timeout(
             wall_now(),
             Duration::from_millis(timeout_ms),
@@ -431,6 +432,24 @@ impl HttpConnector {
                 host_result_ok(call_id, output)
             }
             Ok(Err(e)) => {
+                if start.elapsed() >= Duration::from_millis(timeout_ms) {
+                    let message = format!("Request timeout after {timeout_ms}ms");
+                    warn!(
+                        call_id = %call_id,
+                        url = %log_url,
+                        error = %message,
+                        "HTTP connector: request timed out"
+                    );
+
+                    return host_result_err_with_details(
+                        call_id,
+                        HostCallErrorCode::Timeout,
+                        &message,
+                        Self::request_details(&request, timeout_ms),
+                        Some(true),
+                    );
+                }
+
                 let message = e.to_string();
                 let code = match e {
                     crate::error::Error::Validation(_) => HostCallErrorCode::InvalidRequest,
