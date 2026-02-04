@@ -42,6 +42,7 @@ pub mod error;
 pub mod error_hints;
 pub mod extension_dispatcher;
 pub mod extension_events;
+pub mod extension_tools;
 pub mod extensions;
 pub mod extensions_js;
 pub mod http;

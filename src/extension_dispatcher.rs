@@ -80,10 +80,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             HostcallKind::Exec { cmd } => self.dispatch_exec(&call_id, &cmd, payload).await,
             HostcallKind::Http => self.dispatch_http(&call_id, payload).await,
             HostcallKind::Session { op } => self.dispatch_session(&call_id, &op, payload).await,
-            other => HostcallOutcome::Error {
-                code: "invalid_request".to_string(),
-                message: format!("Unsupported hostcall kind: {other:?}"),
-            },
+            HostcallKind::Ui { op } => self.dispatch_ui(&call_id, &op, payload).await,
+            HostcallKind::Events { op } => self.dispatch_events(&call_id, &op, payload).await,
         };
 
         self.runtime.complete_hostcall(call_id, outcome);
@@ -381,6 +379,33 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             },
         }
     }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_ui(&self, call_id: &str, op: &str, payload: Value) -> HostcallOutcome {
+        let request = ExtensionUiRequest {
+            id: call_id.to_string(),
+            method: op.to_string(),
+            payload,
+            timeout_ms: None,
+        };
+
+        match self.ui_handler.request_ui(request).await {
+            Ok(Some(response)) => HostcallOutcome::Success(response.value.unwrap_or(Value::Null)),
+            Ok(None) => HostcallOutcome::Success(Value::Null),
+            Err(err) => HostcallOutcome::Error {
+                code: "io".to_string(),
+                message: err.to_string(),
+            },
+        }
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_events(&self, _call_id: &str, op: &str, _payload: Value) -> HostcallOutcome {
+        HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: format!("Unsupported events op: {op}"),
+        }
+    }
 }
 
 const fn hostcall_code_to_str(code: crate::connectors::HostCallErrorCode) -> &'static str {
@@ -472,45 +497,83 @@ mod tests {
         }
     }
 
+    struct TestUiHandler {
+        captured: Arc<Mutex<Vec<ExtensionUiRequest>>>,
+        response_value: Value,
+    }
+
+    #[async_trait]
+    impl ExtensionUiHandler for TestUiHandler {
+        async fn request_ui(
+            &self,
+            request: ExtensionUiRequest,
+        ) -> Result<Option<ExtensionUiResponse>> {
+            self.captured.lock().unwrap().push(request.clone());
+            Ok(Some(ExtensionUiResponse {
+                id: request.id,
+                value: Some(self.response_value.clone()),
+                cancelled: false,
+            }))
+        }
+    }
+
+    type CustomEntry = (String, Option<Value>);
+    type CustomEntries = Arc<Mutex<Vec<CustomEntry>>>;
+
     struct TestSession {
-        state: Value,
+        state: Arc<Mutex<Value>>,
+        messages: Arc<Mutex<Vec<SessionMessage>>>,
+        entries: Arc<Mutex<Vec<Value>>>,
+        branch: Arc<Mutex<Vec<Value>>>,
         name: Arc<Mutex<Option<String>>>,
+        custom_entries: CustomEntries,
     }
 
     #[async_trait]
     impl ExtensionSession for TestSession {
         async fn get_state(&self) -> Value {
-            self.state.clone()
+            self.state.lock().unwrap().clone()
         }
 
         async fn get_messages(&self) -> Vec<SessionMessage> {
-            Vec::new()
+            self.messages.lock().unwrap().clone()
         }
 
         async fn get_entries(&self) -> Vec<Value> {
-            Vec::new()
+            self.entries.lock().unwrap().clone()
         }
 
         async fn get_branch(&self) -> Vec<Value> {
-            Vec::new()
+            self.branch.lock().unwrap().clone()
         }
 
         async fn set_name(&self, name: String) -> Result<()> {
-            let mut guard = self.name.lock().unwrap();
-            *guard = Some(name);
-            drop(guard);
+            {
+                let mut guard = self.name.lock().unwrap();
+                *guard = Some(name.clone());
+            }
+            let mut state = self.state.lock().unwrap();
+            if let Value::Object(ref mut map) = *state {
+                map.insert("sessionName".to_string(), Value::String(name));
+            }
+            drop(state);
             Ok(())
         }
 
-        async fn append_message(&self, _message: SessionMessage) -> Result<()> {
+        async fn append_message(&self, message: SessionMessage) -> Result<()> {
+            self.messages.lock().unwrap().push(message);
             Ok(())
         }
 
         async fn append_custom_entry(
             &self,
-            _custom_type: String,
-            _data: Option<Value>,
+            custom_type: String,
+            data: Option<Value>,
         ) -> Result<()> {
+            self.custom_entries
+                .lock()
+                .unwrap()
+                .push((custom_type, data));
             Ok(())
         }
     }
@@ -721,12 +784,17 @@ mod tests {
             assert_eq!(requests.len(), 4);
 
             let name = Arc::new(Mutex::new(None));
+            let state = Arc::new(Mutex::new(serde_json::json!({
+                "sessionFile": "/tmp/session.jsonl",
+                "sessionName": "demo",
+            })));
             let session = Arc::new(TestSession {
-                state: serde_json::json!({
-                    "sessionFile": "/tmp/session.jsonl",
-                    "sessionName": "demo",
-                }),
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
                 name: Arc::clone(&name),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
             });
 
             let dispatcher = ExtensionDispatcher::new(
@@ -775,6 +843,299 @@ mod tests {
 
             let name_value = name.lock().unwrap().clone();
             assert_eq!(name_value.as_deref(), Some("hello"));
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_hostcall_get_messages_entries_branch() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.messages = null;
+                    globalThis.entries = null;
+                    globalThis.branch = null;
+                    pi.session("get_messages", {}).then((r) => { globalThis.messages = r; });
+                    pi.session("get_entries", {}).then((r) => { globalThis.entries = r; });
+                    pi.session("get_branch", {}).then((r) => { globalThis.branch = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 3);
+
+            let message = SessionMessage::Custom {
+                custom_type: "note".to_string(),
+                content: "hello".to_string(),
+                display: true,
+                details: None,
+            };
+            let entries = vec![serde_json::json!({ "id": "entry-1", "type": "custom" })];
+            let branch = vec![serde_json::json!({ "id": "entry-2", "type": "branch" })];
+
+            let session = Arc::new(TestSession {
+                state: Arc::new(Mutex::new(Value::Null)),
+                messages: Arc::new(Mutex::new(vec![message.clone()])),
+                entries: Arc::new(Mutex::new(entries.clone())),
+                branch: Arc::new(Mutex::new(branch.clone())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let (messages_value, entries_value, branch_value) = runtime
+                .with_ctx(|ctx| {
+                    let global = ctx.globals();
+                    let messages_js: rquickjs::Value<'_> = global.get("messages")?;
+                    let entries_js: rquickjs::Value<'_> = global.get("entries")?;
+                    let branch_js: rquickjs::Value<'_> = global.get("branch")?;
+                    Ok((
+                        crate::extensions_js::js_to_json(&messages_js)?,
+                        crate::extensions_js::js_to_json(&entries_js)?,
+                        crate::extensions_js::js_to_json(&branch_js)?,
+                    ))
+                })
+                .await
+                .expect("read globals");
+
+            let messages_array = messages_value.as_array().expect("messages array");
+            assert_eq!(messages_array.len(), 1);
+            assert_eq!(
+                messages_array[0]
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "custom"
+            );
+            assert_eq!(
+                messages_array[0]
+                    .get("customType")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                "note"
+            );
+            assert_eq!(entries_value, Value::Array(entries));
+            assert_eq!(branch_value, Value::Array(branch));
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_hostcall_append_message_and_entry() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.messageAppended = false;
+                    globalThis.entryAppended = false;
+                    pi.session("append_message", {
+                        message: { role: "custom", customType: "note", content: "hi", display: true }
+                    }).then(() => { globalThis.messageAppended = true; });
+                    pi.session("append_entry", {
+                        customType: "meta",
+                        data: { ok: true }
+                    }).then(() => { globalThis.entryAppended = true; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 2);
+
+            let session = Arc::new(TestSession {
+                state: Arc::new(Mutex::new(Value::Null)),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                {
+                    let session_handle: Arc<dyn ExtensionSession + Send + Sync> = session.clone();
+                    session_handle
+                },
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let (message_appended, entry_appended) = runtime
+                .with_ctx(|ctx| {
+                    let global = ctx.globals();
+                    let message_js: rquickjs::Value<'_> = global.get("messageAppended")?;
+                    let entry_js: rquickjs::Value<'_> = global.get("entryAppended")?;
+                    Ok((
+                        crate::extensions_js::js_to_json(&message_js)?,
+                        crate::extensions_js::js_to_json(&entry_js)?,
+                    ))
+                })
+                .await
+                .expect("read globals");
+
+            assert_eq!(message_appended, Value::Bool(true));
+            assert_eq!(entry_appended, Value::Bool(true));
+
+            {
+                let messages = session.messages.lock().unwrap().clone();
+                assert_eq!(messages.len(), 1);
+                match &messages[0] {
+                    SessionMessage::Custom {
+                        custom_type,
+                        content,
+                        display,
+                        ..
+                    } => {
+                        assert_eq!(custom_type, "note");
+                        assert_eq!(content, "hi");
+                        assert!(*display);
+                    }
+                    other => panic!("Unexpected message: {other:?}"),
+                }
+            }
+
+            {
+                let expected = Some(serde_json::json!({ "ok": true }));
+                let custom_entries = session.custom_entries.lock().unwrap().clone();
+                assert_eq!(custom_entries.len(), 1);
+                assert_eq!(custom_entries[0].0, "meta");
+                assert_eq!(custom_entries[0].1, expected);
+                drop(custom_entries);
+            }
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_hostcall_unknown_op_rejects_promise() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.session("nope", {}).catch((e) => { globalThis.err = e.code; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let err_value = runtime
+                .with_ctx(|ctx| {
+                    let global = ctx.globals();
+                    let err_js: rquickjs::Value<'_> = global.get("err")?;
+                    crate::extensions_js::js_to_json(&err_js)
+                })
+                .await
+                .expect("read globals");
+
+            assert_eq!(err_value, Value::String("invalid_request".to_string()));
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_hostcall_append_message_invalid_rejects_promise() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.session("append_message", { message: { nope: 1 } })
+                        .catch((e) => { globalThis.err = e.code; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let err_value = runtime
+                .with_ctx(|ctx| {
+                    let global = ctx.globals();
+                    let err_js: rquickjs::Value<'_> = global.get("err")?;
+                    crate::extensions_js::js_to_json(&err_js)
+                })
+                .await
+                .expect("read globals");
+
+            assert_eq!(err_value, Value::String("invalid_request".to_string()));
         });
     }
 
@@ -970,6 +1331,108 @@ mod tests {
                 PathBuf::from("."),
             );
 
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err !== "invalid_request") {
+                        throw new Error("Wrong error code: " + globalThis.err);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify error");
+        });
+    }
+
+    #[test]
+    fn dispatcher_ui_hostcall_executes_and_resolves_promise() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.uiResult = null;
+                    pi.ui("confirm", { title: "Confirm?" }).then((r) => { globalThis.uiResult = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(TestUiHandler {
+                    captured: Arc::clone(&captured),
+                    response_value: serde_json::json!({ "ok": true }),
+                }),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.uiResult || globalThis.uiResult.ok !== true) {
+                        throw new Error("Wrong UI result: " + JSON.stringify(globalThis.uiResult));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify result");
+
+            let seen = captured.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].method, "confirm");
+        });
+    }
+
+    #[test]
+    fn dispatcher_events_hostcall_rejects_promise() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.events("setActiveTools", { tools: ["read"] })
+                        .catch((e) => { globalThis.err = e.code; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
             for request in requests {
                 dispatcher.dispatch_and_complete(request).await;
             }

@@ -5877,4 +5877,373 @@ mod tests {
             .expect("error object");
         assert_eq!(error.get("code").and_then(Value::as_str), Some("denied"));
     }
+
+    #[derive(Debug, Clone)]
+    struct CapturedEvent {
+        level: tracing::Level,
+        fields: std::collections::BTreeMap<String, String>,
+    }
+
+    #[derive(Clone, Default)]
+    struct CaptureLayer {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl CaptureLayer {
+        fn snapshot(&self) -> Vec<CapturedEvent> {
+            self.events.lock().expect("events mutex").clone()
+        }
+    }
+
+    struct FieldVisitor<'a> {
+        fields: &'a mut std::collections::BTreeMap<String, String>,
+    }
+
+    impl tracing::field::Visit for FieldVisitor<'_> {
+        fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.fields
+                .insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for CaptureLayer
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let mut fields = std::collections::BTreeMap::new();
+            let mut visitor = FieldVisitor {
+                fields: &mut fields,
+            };
+            event.record(&mut visitor);
+            self.events
+                .lock()
+                .expect("events mutex")
+                .push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    fields,
+                });
+        }
+    }
+
+    fn capture_tracing_events<T>(f: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let capture = CaptureLayer::default();
+        let subscriber = tracing_subscriber::registry().with(capture.clone());
+        let result = tracing::subscriber::with_default(subscriber, f);
+        (result, capture.snapshot())
+    }
+
+    fn run_async<T, Fut>(future: Fut) -> T
+    where
+        Fut: std::future::Future<Output = T>,
+    {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build asupersync runtime");
+        runtime.block_on(future)
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+
+        let manager = ExtensionManager::new();
+        let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(8);
+        manager.set_ui_sender(ui_tx);
+
+        let manager_for_ui = manager.clone();
+        let ui_join = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build asupersync runtime");
+            runtime.block_on(async move {
+                let cx = asupersync::Cx::for_request();
+                let request = ui_rx.recv(&cx).await.expect("ui request");
+                assert_eq!(request.method, "confirm");
+
+                assert!(
+                    manager_for_ui.respond_ui(ExtensionUiResponse {
+                        id: request.id,
+                        value: Some(serde_json::Value::Bool(true)),
+                        cancelled: false,
+                    }),
+                    "respond_ui"
+                );
+            });
+        });
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+            manager,
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Prompt,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+            },
+        };
+
+        let request = crate::extensions_js::HostcallRequest {
+            call_id: "hostcall-1".to_string(),
+            kind: crate::extensions_js::HostcallKind::Tool {
+                name: "custom_tool".to_string(),
+            },
+            payload: serde_json::json!({
+                "token": "supersecret",
+                "nested": { "apiKey": "sk-ant-SECRET" }
+            }),
+            trace_id: 0,
+            extension_id: Some("ext-1".to_string()),
+        };
+
+        let request_cached = crate::extensions_js::HostcallRequest {
+            call_id: "hostcall-2".to_string(),
+            kind: crate::extensions_js::HostcallKind::Tool {
+                name: "custom_tool".to_string(),
+            },
+            payload: serde_json::json!({ "token": "supersecret" }),
+            trace_id: 0,
+            extension_id: Some("ext-1".to_string()),
+        };
+
+        let ((first, second), events) = capture_tracing_events(|| {
+            run_async(async {
+                let first = super::dispatch_hostcall(&host, request).await;
+                let second = super::dispatch_hostcall(&host, request_cached).await;
+                (first, second)
+            })
+        });
+
+        ui_join.join().expect("ui thread join");
+
+        assert!(matches!(first, HostcallOutcome::Error { code, .. } if code == "invalid_request"));
+        assert!(matches!(second, HostcallOutcome::Error { code, .. } if code == "invalid_request"));
+
+        let decision_events = events
+            .iter()
+            .filter(|event| {
+                event
+                    .fields
+                    .get("event")
+                    .is_some_and(|value| value.contains("policy.decision"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decision_events.len(), 2);
+        assert!(
+            decision_events[0]
+                .fields
+                .get("reason")
+                .is_some_and(|value| value.contains("prompt_user_allow")),
+            "expected prompt_user_allow reason, got {:?}",
+            decision_events[0].fields
+        );
+        assert!(
+            decision_events[1]
+                .fields
+                .get("reason")
+                .is_some_and(|value| value.contains("prompt_cache_allow")),
+            "expected prompt_cache_allow reason, got {:?}",
+            decision_events[1].fields
+        );
+
+        for event in &events {
+            for value in event.fields.values() {
+                assert!(
+                    !value.contains("supersecret"),
+                    "secret leaked into logs: {value}"
+                );
+                assert!(
+                    !value.contains("sk-ant-SECRET"),
+                    "api key leaked into logs: {value}"
+                );
+            }
+        }
+
+        let params_hash = decision_events[0]
+            .fields
+            .get("params_hash")
+            .expect("params_hash");
+        let params_hash = params_hash.trim_matches('"');
+        assert_eq!(params_hash.len(), 64);
+        assert!(params_hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn js_hostcall_strict_policy_denies_and_logs_reason() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+            manager: ExtensionManager::new(),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: vec!["read".to_string()],
+                deny_caps: Vec::new(),
+            },
+        };
+
+        let request = crate::extensions_js::HostcallRequest {
+            call_id: "hostcall-strict-1".to_string(),
+            kind: crate::extensions_js::HostcallKind::Exec {
+                cmd: "does-not-run".to_string(),
+            },
+            payload: serde_json::json!({}),
+            trace_id: 0,
+            extension_id: Some("ext-1".to_string()),
+        };
+
+        let (outcome, events) = capture_tracing_events(|| {
+            run_async(async { super::dispatch_hostcall(&host, request).await })
+        });
+
+        assert!(matches!(outcome, HostcallOutcome::Error { code, .. } if code == "denied"));
+
+        let decision = events.iter().find(|event| {
+            event
+                .fields
+                .get("event")
+                .is_some_and(|value| value.contains("policy.decision"))
+        });
+        let decision = decision.expect("policy.decision event");
+        assert_eq!(decision.level, tracing::Level::WARN);
+        assert!(
+            decision
+                .fields
+                .get("reason")
+                .is_some_and(|value| value.contains("not_in_default_caps"))
+        );
+        assert!(
+            decision
+                .fields
+                .get("call_id")
+                .is_some_and(|value| value.contains("hostcall-strict-1"))
+        );
+    }
+
+    #[test]
+    fn js_hostcall_routes_write_and_read_tools_when_allowed() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(
+                &["read", "write"],
+                &cwd,
+                None,
+            )),
+            manager: ExtensionManager::new(),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: vec!["read".to_string(), "write".to_string()],
+                deny_caps: Vec::new(),
+            },
+        };
+
+        let write_request = crate::extensions_js::HostcallRequest {
+            call_id: "hostcall-write".to_string(),
+            kind: crate::extensions_js::HostcallKind::Tool {
+                name: "write".to_string(),
+            },
+            payload: serde_json::json!({
+                "path": "note.txt",
+                "content": "hello"
+            }),
+            trace_id: 0,
+            extension_id: Some("ext-1".to_string()),
+        };
+
+        let read_request = crate::extensions_js::HostcallRequest {
+            call_id: "hostcall-read".to_string(),
+            kind: crate::extensions_js::HostcallKind::Tool {
+                name: "read".to_string(),
+            },
+            payload: serde_json::json!({ "path": "note.txt" }),
+            trace_id: 0,
+            extension_id: Some("ext-1".to_string()),
+        };
+
+        let ((write_outcome, read_outcome), events) = capture_tracing_events(|| {
+            run_async(async {
+                let write_outcome = super::dispatch_hostcall(&host, write_request).await;
+                let read_outcome = super::dispatch_hostcall(&host, read_request).await;
+                (write_outcome, read_outcome)
+            })
+        });
+
+        assert!(matches!(write_outcome, HostcallOutcome::Success(_)));
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("note.txt")).expect("read note.txt"),
+            "hello"
+        );
+
+        match read_outcome {
+            HostcallOutcome::Success(value) => {
+                let encoded = serde_json::to_string(&value).expect("serialize read output");
+                assert!(encoded.contains("hello"));
+            }
+            other @ HostcallOutcome::Error { .. } => {
+                panic!("expected read success, got {other:?}")
+            }
+        }
+
+        let decisions = events
+            .iter()
+            .filter(|event| {
+                event
+                    .fields
+                    .get("event")
+                    .is_some_and(|value| value.contains("policy.decision"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decisions.len(), 2);
+        for decision in decisions {
+            assert_eq!(decision.level, tracing::Level::INFO);
+            assert!(
+                decision
+                    .fields
+                    .get("reason")
+                    .is_some_and(|value| value.contains("default_caps"))
+            );
+        }
+    }
 }
