@@ -602,6 +602,10 @@ pub async fn run(
                         })
                         .collect::<Vec<_>>()
                 };
+                let messages = messages
+                    .into_iter()
+                    .map(rpc_session_message_value)
+                    .collect::<Vec<_>>();
                 let _ = out_tx.send(response_ok(
                     id,
                     "get_messages",
@@ -1467,6 +1471,41 @@ fn response_error(id: Option<String>, command: &str, error: impl Into<String>) -
 
 fn event(value: &Value) -> String {
     value.to_string()
+}
+
+fn rpc_session_message_value(message: SessionMessage) -> Value {
+    let mut value =
+        serde_json::to_value(message).expect("SessionMessage should always serialize to JSON");
+    rpc_flatten_content_blocks(&mut value);
+    value
+}
+
+fn rpc_flatten_content_blocks(value: &mut Value) {
+    let Value::Object(message_obj) = value else {
+        return;
+    };
+    let Some(content) = message_obj.get_mut("content") else {
+        return;
+    };
+    let Value::Array(blocks) = content else {
+        return;
+    };
+
+    for block in blocks {
+        let Value::Object(block_obj) = block else {
+            continue;
+        };
+        let Some(inner) = block_obj.remove("0") else {
+            continue;
+        };
+        let Value::Object(inner_obj) = inner else {
+            block_obj.insert("0".to_string(), inner);
+            continue;
+        };
+        for (key, value) in inner_obj {
+            block_obj.entry(key).or_insert(value);
+        }
+    }
 }
 
 fn retry_delay_ms(config: &Config, attempt: u32) -> u32 {

@@ -27,12 +27,14 @@ The root object contains a `providers` map.
 | Field | Type | Description |
 |-------|------|-------------|
 | `baseUrl` | string | Base API URL (e.g. `https://api.openai.com/v1`) |
-| `api` | string | Protocol adapter (`openai`, `anthropic`, `google`) |
-| `apiKey` | string | API key or command (see Secret Resolution) |
-| `models` | object[] | List of models. If omitted, overrides built-in provider settings. |
+| `api` | string | Protocol adapter (e.g. `openai-completions`, `openai-responses`, `anthropic-messages`, `google-generative-ai`, `google-vertex`) |
+| `apiKey` | string | API key, env var name, or shell command (see Secret Resolution) |
+| `models` | object[] | List of models. If omitted, provider settings override built-in config for that provider. |
 | `headers` | object | Custom HTTP headers |
 | `authHeader` | boolean | If true, sends key in `Authorization: Bearer <key>` |
 | `compat` | object | Compatibility flags |
+
+If `models` is provided, built-in models for that provider are replaced with the list in `models.json`.
 
 ### Model Config
 
@@ -50,9 +52,13 @@ The root object contains a `providers` map.
 
 | Field | Description |
 |-------|-------------|
+| `supportsStore` | Enable OpenAI `store` parameter (where supported) |
 | `supportsDeveloperRole` | Use `developer` role instead of `system` (OpenAI o1/o3) |
 | `supportsReasoningEffort` | Send `reasoning_effort` param (OpenAI) |
+| `supportsUsageInStreaming` | Expect usage fields in streaming responses |
 | `maxTokensField` | Override param name (e.g., `max_completion_tokens`) |
+| `openRouterRouting` | OpenRouter routing metadata (JSON object) |
+| `vercelGatewayRouting` | Vercel gateway routing metadata (JSON object) |
 
 ## Examples
 
@@ -126,7 +132,7 @@ Azure requires resource-specific URLs and `api-key` header instead of Bearer tok
 
 API keys can be plain strings, environment variables, or shell commands.
 
-- **Environment Variable**: If the string matches a known env var (e.g. `OPENAI_API_KEY`), it is resolved.
+- **Environment Variable**: If the string matches an env var name (e.g. `OPENAI_API_KEY`), it is resolved.
 - **Shell Command**: Prefix with `!` to execute a command.
 
 ```json
@@ -138,3 +144,5 @@ API keys can be plain strings, environment variables, or shell commands.
   }
 }
 ```
+
+Shell commands run via `sh -c` on Unix and `cmd /C` on Windows.

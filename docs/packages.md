@@ -89,4 +89,30 @@ You can manually configure packages in `settings.json`:
 }
 ```
 
-The object form allows filtering which resources are loaded (allowlisting). If a field is omitted, all resources of that type are loaded.
+The object form allows filtering which resources are loaded (allowlisting). If a field is omitted,
+all resources of that type are loaded. If a field is present but empty, **no** resources of that
+type are enabled.
+
+### Filter Patterns
+
+Filter values can be strings or arrays. They accept glob-like patterns relative to the package
+root, with optional prefixes:
+
+- `pattern` → include matches (if any include patterns exist)
+- `!pattern` → exclude matches
+- `+pattern` → **force include** (exact path match)
+- `-pattern` → **force exclude** (exact path match)
+
+Example:
+
+```json
+{
+  "packages": [
+    {
+      "source": "git:github.com/org/repo",
+      "extensions": ["dist/*.js", "!dist/experimental.js"],
+      "skills": []
+    }
+  ]
+}
+```

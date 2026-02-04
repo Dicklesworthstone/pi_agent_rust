@@ -30,10 +30,11 @@ You are an expert SQL developer. When writing queries:
 
 | Field | Description |
 |-------|-------------|
-| `name` | Skill ID (must match directory name if in a subdir) |
-| `description` | Short description used for selection |
+| `name` | Skill ID (must match directory name if in a subdir; mismatches emit a warning). |
+| `description` | **Required.** Short description used for selection; empty descriptions are skipped. |
 | `disable-model-invocation` | If `true`, the skill is not shown to the model in the system prompt. |
-| `allowed-tools` | List of tools this skill is allowed to use (optional enforcement) |
+
+If `name` is omitted, the parent directory name is used.
 
 ## Usage
 
@@ -53,4 +54,4 @@ This effectively wraps your prompt with the skill's instructions.
 
 ## Configuration
 
-To disable the `/skill:` slash commands, set `enableSkillCommands` to `false` in `settings.json`.
+To disable the `/skill:` slash commands, set `enable_skill_commands` to `false` in `settings.json`.

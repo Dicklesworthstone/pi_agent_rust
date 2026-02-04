@@ -3126,6 +3126,8 @@ const pi = {
     // Extension API (legacy-compatible subset)
     registerTool: __pi_register_tool,
     registerCommand: __pi_register_command,
+    registerProvider: __pi_register_provider,
+    registerShortcut: __pi_register_shortcut,
     on: __pi_register_hook,
     registerFlag: __pi_register_flag,
     getFlag: __pi_get_flag,

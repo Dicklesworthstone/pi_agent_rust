@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/assets/pi-logo.svg" alt="Pi Logo" width="200"/>
+  <img src="pi_agent_rust_illustration.webp" alt="Pi Agent Rust" width="600"/>
 </p>
 
 <h1 align="center">pi_agent_rust</h1>

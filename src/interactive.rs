@@ -41,7 +41,7 @@ use crate::autocomplete::{
     AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind, AutocompleteProvider,
     AutocompleteResponse,
 };
-use crate::config::Config;
+use crate::config::{Config, SettingsScope};
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionSession,
     ExtensionUiRequest, ExtensionUiResponse, extension_event_from_agent,
@@ -183,6 +183,68 @@ impl PiApp {
         }
         std::fs::write(settings_path, serde_json::to_string_pretty(&settings)?)?;
         Ok(())
+    }
+
+    fn apply_queue_modes(&self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
+        if let Ok(mut queue) = self.message_queue.lock() {
+            queue.set_modes(steering_mode, follow_up_mode);
+        }
+
+        if let Ok(mut agent_guard) = self.agent.try_lock() {
+            agent_guard.set_queue_modes(steering_mode, follow_up_mode);
+            return;
+        }
+
+        let agent = Arc::clone(&self.agent);
+        let runtime_handle = self.runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            if let Ok(mut agent_guard) = agent.lock(&cx).await {
+                agent_guard.set_queue_modes(steering_mode, follow_up_mode);
+            }
+        });
+    }
+
+    fn toggle_queue_mode_setting(&mut self, entry: SettingsUiEntry) {
+        let (key, current) = match entry {
+            SettingsUiEntry::SteeringMode => ("steeringMode", self.config.steering_queue_mode()),
+            SettingsUiEntry::FollowUpMode => ("followUpMode", self.config.follow_up_queue_mode()),
+            _ => return,
+        };
+
+        let next = match current {
+            QueueMode::All => QueueMode::OneAtATime,
+            QueueMode::OneAtATime => QueueMode::All,
+        };
+
+        let patch = match entry {
+            SettingsUiEntry::SteeringMode => json!({ "steeringMode": next.as_str() }),
+            SettingsUiEntry::FollowUpMode => json!({ "followUpMode": next.as_str() }),
+            _ => json!({}),
+        };
+
+        let global_dir = Config::global_dir();
+        if let Err(err) =
+            Config::patch_settings_with_roots(SettingsScope::Project, &global_dir, &self.cwd, patch)
+        {
+            self.status_message = Some(format!("Failed to update {key}: {err}"));
+            return;
+        }
+
+        match entry {
+            SettingsUiEntry::SteeringMode => {
+                self.config.steering_mode = Some(next.as_str().to_string());
+            }
+            SettingsUiEntry::FollowUpMode => {
+                self.config.follow_up_mode = Some(next.as_str().to_string());
+            }
+            _ => {}
+        }
+
+        let steering_mode = self.config.steering_queue_mode();
+        let follow_up_mode = self.config.follow_up_queue_mode();
+        self.apply_queue_modes(steering_mode, follow_up_mode);
+        self.status_message = Some(format!("Updated {key}: {}", next.as_str()));
     }
 
     fn format_input_history(&self) -> String {
@@ -888,7 +950,19 @@ impl PiApp {
                 let is_selected = global_idx == settings_ui.selected;
 
                 let prefix = if is_selected { ">" } else { " " };
-                let row = format!(" {entry}");
+                let label = match *entry {
+                    SettingsUiEntry::Summary => "Summary".to_string(),
+                    SettingsUiEntry::Theme => "Theme".to_string(),
+                    SettingsUiEntry::SteeringMode => format!(
+                        "steeringMode: {}",
+                        self.config.steering_queue_mode().as_str()
+                    ),
+                    SettingsUiEntry::FollowUpMode => format!(
+                        "followUpMode: {}",
+                        self.config.follow_up_queue_mode().as_str()
+                    ),
+                };
+                let row = format!(" {label}");
                 let rendered = if is_selected {
                     self.styles.selection.render(&row)
                 } else {
@@ -2560,9 +2634,17 @@ struct SessionPickerOverlay {
 }
 
 /// Settings selector overlay state for /settings command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsUiEntry {
+    Summary,
+    Theme,
+    SteeringMode,
+    FollowUpMode,
+}
+
 #[derive(Debug)]
 struct SettingsUiState {
-    entries: Vec<&'static str>,
+    entries: Vec<SettingsUiEntry>,
     selected: usize,
     max_visible: usize,
 }
@@ -2570,7 +2652,12 @@ struct SettingsUiState {
 impl SettingsUiState {
     fn new() -> Self {
         Self {
-            entries: vec!["Summary", "Theme"],
+            entries: vec![
+                SettingsUiEntry::Summary,
+                SettingsUiEntry::Theme,
+                SettingsUiEntry::SteeringMode,
+                SettingsUiEntry::FollowUpMode,
+            ],
             selected: 0,
             max_visible: 10,
         }
@@ -2591,7 +2678,7 @@ impl SettingsUiState {
         }
     }
 
-    fn selected_entry(&self) -> Option<&'static str> {
+    fn selected_entry(&self) -> Option<SettingsUiEntry> {
         self.entries.get(self.selected).copied()
     }
 
@@ -2794,6 +2881,23 @@ impl ExtensionSession for InteractiveExtensionSession {
                 crate::error::Error::session(format!("session lock failed: {err}"))
             })?;
         guard.set_name(&name);
+        if self.save_enabled {
+            guard.save().await?;
+        }
+        Ok(())
+    }
+
+    async fn append_custom_entry(
+        &self,
+        custom_type: String,
+        data: Option<Value>,
+    ) -> crate::error::Result<()> {
+        let cx = Cx::for_request();
+        let mut guard =
+            self.session.lock(&cx).await.map_err(|err| {
+                crate::error::Error::session(format!("session lock failed: {err}"))
+            })?;
+        guard.append_custom_entry(custom_type, data);
         if self.save_enabled {
             guard.save().await?;
         }
@@ -3095,7 +3199,7 @@ impl PiApp {
                     KeyType::Enter => {
                         if let Some(selected) = settings_ui.selected_entry() {
                             match selected {
-                                "Summary" => {
+                                SettingsUiEntry::Summary => {
                                     self.messages.push(ConversationMessage {
                                         role: MessageRole::System,
                                         content: self.format_settings_summary(),
@@ -3105,9 +3209,12 @@ impl PiApp {
                                     self.status_message =
                                         Some("Selected setting: Summary".to_string());
                                 }
-                                other => {
+                                SettingsUiEntry::Theme => {
                                     self.status_message =
-                                        Some(format!("Selected setting: {other}"));
+                                        Some("Selected setting: Theme".to_string());
+                                }
+                                SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
+                                    self.toggle_queue_mode_setting(selected);
                                 }
                             }
                         }

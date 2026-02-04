@@ -62,6 +62,7 @@ impl TestHarness {
         let name = name.into();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let logger = Arc::new(TestLogger::new());
+        logger.set_normalization_root(temp_dir.path());
 
         logger
             .as_ref()
@@ -301,6 +302,12 @@ impl Drop for TestHarness {
             if let Ok(path) = env::var("TEST_LOG_PATH") {
                 if let Err(err) = self.logger.as_ref().write_dump_to_path(&path) {
                     eprintln!("Failed to write test log to {path}: {err}");
+                }
+            }
+
+            if let Ok(path) = env::var("TEST_LOG_JSONL_PATH") {
+                if let Err(err) = self.logger.as_ref().write_jsonl_to_path(&path) {
+                    eprintln!("Failed to write JSONL test log to {path}: {err}");
                 }
             }
         }

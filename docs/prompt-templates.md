@@ -34,6 +34,12 @@ Call templates using `/` followed by the name:
 /review src/main.rs
 ```
 
+Arguments are split on spaces; single or double quotes keep arguments together:
+
+```bash
+/review "src/main.rs src/lib.rs" --strict
+```
+
 ## Expansion Syntax
 
 Templates support bash-like variable expansion:
@@ -44,6 +50,8 @@ Templates support bash-like variable expansion:
 | `$@`, `$ARGUMENTS` | All arguments joined by spaces |
 | `${@:N}` | Arguments from index N onwards (1-based) |
 | `${@:N:L}` | Slice of L arguments starting at N |
+
+Missing positional arguments expand to an empty string.
 
 ### Example: Commit Message
 

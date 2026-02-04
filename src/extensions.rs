@@ -5,23 +5,34 @@
 
 use crate::agent::AgentEvent;
 use crate::error::{Error, Result};
+use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig};
+use crate::http::client::Client as HttpClient;
+use crate::scheduler::{HostcallOutcome, WallClock};
 use crate::session::SessionMessage;
+use crate::tools::ToolRegistry;
 use asupersync::Cx;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::time::{timeout, wall_now};
 use async_trait::async_trait;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use futures::executor::block_on;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest as _;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
+use std::sync::mpsc as std_mpsc;
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 use uuid::Uuid;
 
 pub const PROTOCOL_VERSION: &str = "1.0";
@@ -1769,6 +1780,7 @@ pub trait ExtensionSession: Send + Sync {
     async fn get_entries(&self) -> Vec<Value>;
     async fn get_branch(&self) -> Vec<Value>;
     async fn set_name(&self, name: String) -> Result<()>;
+    async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()>;
 }
 
 impl ExtensionMessage {
@@ -2058,6 +2070,7 @@ struct ExtensionManagerInner {
     ui_sender: Option<mpsc::Sender<ExtensionUiRequest>>,
     pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
     session: Option<Arc<dyn ExtensionSession>>,
+    active_tools: Option<Vec<String>>,
 }
 
 impl std::fmt::Debug for ExtensionManager {

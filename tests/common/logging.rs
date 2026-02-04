@@ -26,11 +26,15 @@
 
 #![allow(dead_code)]
 
+use regex::Regex;
+use serde::Serialize;
+use serde_json::Value;
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Instant, SystemTime};
 
 const REDACTED_VALUE: &str = "[REDACTED]";
 const REDACTION_KEYS: [&str; 10] = [
@@ -45,6 +49,20 @@ const REDACTION_KEYS: [&str; 10] = [
     "secret",
     "token",
 ];
+
+const TEST_LOG_SCHEMA: &str = "pi.test.log.v1";
+const TEST_ARTIFACT_SCHEMA: &str = "pi.test.artifact.v1";
+const PLACEHOLDER_TIMESTAMP: &str = "<TIMESTAMP>";
+const PLACEHOLDER_PROJECT_ROOT: &str = "<PROJECT_ROOT>";
+const PLACEHOLDER_TEST_ROOT: &str = "<TEST_ROOT>";
+const PLACEHOLDER_RUN_ID: &str = "<RUN_ID>";
+const PLACEHOLDER_UUID: &str = "<UUID>";
+const PLACEHOLDER_PORT: &str = "<PORT>";
+
+static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
+static RUN_ID_REGEX: OnceLock<Regex> = OnceLock::new();
+static UUID_REGEX: OnceLock<Regex> = OnceLock::new();
+static LOCAL_PORT_REGEX: OnceLock<Regex> = OnceLock::new();
 
 /// Log entry severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +95,15 @@ impl LogLevel {
             Self::Info => "\x1b[32m",  // Green
             Self::Warn => "\x1b[33m",  // Yellow
             Self::Error => "\x1b[31m", // Red
+        }
+    }
+
+    pub const fn as_json_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
         }
     }
 }
@@ -157,6 +184,61 @@ impl ArtifactEntry {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct TestLogJsonRecord {
+    schema: &'static str,
+    #[serde(rename = "type")]
+    record_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test: Option<String>,
+    seq: usize,
+    ts: String,
+    t_ms: u64,
+    level: &'static str,
+    category: String,
+    message: String,
+    context: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TestArtifactJsonRecord {
+    schema: &'static str,
+    #[serde(rename = "type")]
+    record_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    test: Option<String>,
+    seq: usize,
+    ts: String,
+    t_ms: u64,
+    name: String,
+    path: String,
+    size_bytes: Option<u64>,
+    sha256: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizationContext {
+    project_root: String,
+    test_root: Option<String>,
+}
+
+impl NormalizationContext {
+    fn new(test_root: Option<&Path>) -> Self {
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf())
+            .display()
+            .to_string();
+        let test_root = test_root
+            .and_then(|root| root.canonicalize().ok())
+            .map(|root| root.display().to_string());
+        Self {
+            project_root,
+            test_root,
+        }
+    }
+}
+
 /// Thread-safe test logger that captures all log entries.
 ///
 /// Entries are stored in memory and can be dumped on test failure.
@@ -168,8 +250,14 @@ pub struct TestLogger {
     artifacts: Mutex<Vec<ArtifactEntry>>,
     /// Timestamp when the logger was created.
     start: Instant,
+    /// Wall-clock timestamp when the logger was created.
+    start_wall: SystemTime,
     /// Minimum log level to capture (entries below this are ignored).
     min_level: LogLevel,
+    /// Optional test name for JSONL output.
+    test_name: Mutex<Option<String>>,
+    /// Optional root path to normalize in JSONL dumps (e.g. harness temp dir).
+    normalize_root: Mutex<Option<String>>,
 }
 
 impl Default for TestLogger {
@@ -188,7 +276,10 @@ impl TestLogger {
             entries: Mutex::new(Vec::with_capacity(256)),
             artifacts: Mutex::new(Vec::with_capacity(16)),
             start: Instant::now(),
+            start_wall: SystemTime::now(),
             min_level: LogLevel::Debug,
+            test_name: Mutex::new(None),
+            normalize_root: Mutex::new(None),
         }
     }
 
@@ -199,8 +290,25 @@ impl TestLogger {
             entries: Mutex::new(Vec::with_capacity(256)),
             artifacts: Mutex::new(Vec::with_capacity(16)),
             start: Instant::now(),
+            start_wall: SystemTime::now(),
             min_level,
+            test_name: Mutex::new(None),
+            normalize_root: Mutex::new(None),
         }
+    }
+
+    /// Configure a root path for normalization in JSONL dumps.
+    ///
+    /// This is intended for deterministic, portable artifacts (e.g. CI logs) where
+    /// temp directories should not leak into diffs.
+    pub fn set_normalization_root(&self, root: impl AsRef<Path>) {
+        let root = root.as_ref().display().to_string();
+        *self.normalize_root.lock().unwrap() = Some(root);
+    }
+
+    /// Set the test name for JSONL output.
+    pub fn set_test_name(&self, name: impl Into<String>) {
+        *self.test_name.lock().unwrap() = Some(name.into());
     }
 
     /// Log an entry with the given level and category.
@@ -374,6 +482,87 @@ impl TestLogger {
         fs::write(path, output)
     }
 
+    /// Dump logs and artifacts as stable JSONL (one JSON object per line).
+    ///
+    /// This output is intended for machine parsing and deterministic diffs. It:
+    /// - uses elapsed milliseconds (no wall clock)
+    /// - redacts sensitive context values (same rules as text)
+    /// - optionally normalizes paths under a configured root (`set_normalization_root`)
+    pub fn dump_jsonl(&self) -> String {
+        #[derive(Debug, serde::Serialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
+        enum JsonlRecord<'a> {
+            Log {
+                t_ms: u64,
+                level: &'a str,
+                category: &'a str,
+                message: &'a str,
+                #[serde(skip_serializing_if = "Option::is_none")]
+                context: Option<&'a [(String, String)]>,
+            },
+            Artifact {
+                t_ms: u64,
+                name: &'a str,
+                path: &'a str,
+            },
+        }
+
+        let normalize_root = self.normalize_root.lock().unwrap().clone();
+        let entries = self.entries.lock().unwrap();
+        let artifacts = self.artifacts.lock().unwrap();
+
+        let mut out = String::with_capacity((entries.len() + artifacts.len()).saturating_mul(128));
+
+        for entry in entries.iter() {
+            let ctx = if entry.context.is_empty() {
+                None
+            } else {
+                Some(entry.context.as_slice())
+            };
+            let record = JsonlRecord::Log {
+                t_ms: (entry.elapsed_secs * 1000.0).round() as u64,
+                level: entry.level.as_str().trim(),
+                category: &entry.category,
+                message: &entry.message,
+                context: ctx,
+            };
+            let mut line =
+                serde_json::to_string(&record).unwrap_or_else(|_| "{\"type\":\"log\"}".to_string());
+            normalize_jsonl_line_in_place(&mut line, normalize_root.as_deref());
+            out.push_str(&line);
+            out.push('\n');
+        }
+
+        for artifact in artifacts.iter() {
+            let record = JsonlRecord::Artifact {
+                t_ms: (artifact.elapsed_secs * 1000.0).round() as u64,
+                name: &artifact.name,
+                path: &artifact.path,
+            };
+            let mut line = serde_json::to_string(&record)
+                .unwrap_or_else(|_| "{\"type\":\"artifact\"}".to_string());
+            normalize_jsonl_line_in_place(&mut line, normalize_root.as_deref());
+            out.push_str(&line);
+            out.push('\n');
+        }
+
+        drop(artifacts);
+        drop(entries);
+
+        out
+    }
+
+    /// Write JSONL dump to a file path.
+    pub fn write_jsonl_to_path(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        fs::write(path, self.dump_jsonl())
+    }
+
     /// Clear all log entries.
     #[allow(dead_code)]
     pub fn clear(&self) {
@@ -384,6 +573,11 @@ impl TestLogger {
     /// Get a copy of all entries (useful for assertions).
     pub fn entries(&self) -> Vec<LogEntry> {
         self.entries.lock().unwrap().clone()
+    }
+
+    /// Get a copy of all artifacts (useful for assertions).
+    pub fn artifacts(&self) -> Vec<ArtifactEntry> {
+        self.artifacts.lock().unwrap().clone()
     }
 
     /// Check if any error-level entries were logged.
@@ -418,6 +612,14 @@ fn redact_context(context: &mut [(String, String)]) {
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.trim().to_ascii_lowercase();
     REDACTION_KEYS.iter().any(|needle| key.contains(needle))
+}
+
+fn normalize_jsonl_line_in_place(line: &mut String, normalize_root: Option<&str>) {
+    if let Some(root) = normalize_root {
+        if !root.is_empty() {
+            *line = line.replace(root, "<root>");
+        }
+    }
 }
 
 /// Macro for logging with automatic context capture.
@@ -544,5 +746,22 @@ mod tests {
         let artifacts = logger.dump_artifacts();
         assert!(artifacts.contains("trace"));
         assert!(artifacts.contains("/tmp/trace.json"));
+    }
+
+    #[test]
+    fn jsonl_dump_includes_logs_and_artifacts_with_normalization() {
+        let logger = TestLogger::new();
+        logger.set_normalization_root("/tmp/my-root");
+
+        logger.info_ctx("harness", "created", |ctx| {
+            ctx.push(("path".into(), "/tmp/my-root/work.txt".into()));
+        });
+        logger.record_artifact("log", "/tmp/my-root/log.txt");
+
+        let jsonl = logger.dump_jsonl();
+        assert!(jsonl.contains("\"type\":\"log\""));
+        assert!(jsonl.contains("\"type\":\"artifact\""));
+        assert!(jsonl.contains("<root>/work.txt"));
+        assert!(jsonl.contains("<root>/log.txt"));
     }
 }

@@ -1365,11 +1365,25 @@ fn tui_state_slash_settings_opens_selector_and_restores_editor() {
     assert_after_contains(&harness, &step, "Summary");
     assert_after_not_contains(&harness, &step, "[single-line]");
 
-    // Navigate and confirm selection (scaffold: returns to editor, does not mutate settings).
+    // Navigate and confirm selection (scaffold: returns to editor).
     press_down(&harness, &mut app);
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Selected setting: Theme");
     assert_after_contains(&harness, &step, "[single-line]");
+
+    // Reopen and toggle a delivery mode (should persist to .pi/settings.json).
+    type_text(&harness, &mut app, "/settings");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "steeringMode:");
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Updated steeringMode: all");
+
+    let settings_path = harness.temp_dir().join(".pi/settings.json");
+    let content = std::fs::read_to_string(&settings_path).expect("read settings.json");
+    let value: serde_json::Value = serde_json::from_str(&content).expect("parse settings.json");
+    assert_eq!(value["steeringMode"], "all");
 
     // Reopen and cancel to ensure editor is restored.
     type_text(&harness, &mut app, "/settings");

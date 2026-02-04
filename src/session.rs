@@ -498,6 +498,24 @@ impl Session {
         id
     }
 
+    /// Append a custom entry (extension state, etc).
+    pub fn append_custom_entry(
+        &mut self,
+        custom_type: String,
+        data: Option<serde_json::Value>,
+    ) -> String {
+        let id = self.next_entry_id();
+        let base = EntryBase::new(self.leaf_id.clone(), id.clone());
+        let entry = SessionEntry::Custom(CustomEntry {
+            base,
+            custom_type,
+            data,
+        });
+        self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
+        id
+    }
+
     pub fn append_bash_execution(
         &mut self,
         command: String,
