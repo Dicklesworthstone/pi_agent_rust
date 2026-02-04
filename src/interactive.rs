@@ -247,6 +247,146 @@ impl PiApp {
         self.status_message = Some(format!("Updated {key}: {}", next.as_str()));
     }
 
+    fn persist_project_settings_patch(&mut self, key: &str, patch: Value) -> bool {
+        let global_dir = Config::global_dir();
+        if let Err(err) =
+            Config::patch_settings_with_roots(SettingsScope::Project, &global_dir, &self.cwd, patch)
+        {
+            self.status_message = Some(format!("Failed to update {key}: {err}"));
+            return false;
+        }
+        true
+    }
+
+    fn effective_show_hardware_cursor(&self) -> bool {
+        self.config.show_hardware_cursor.unwrap_or_else(|| {
+            std::env::var("PI_HARDWARE_CURSOR")
+                .ok()
+                .is_some_and(|val| val == "1")
+        })
+    }
+
+    fn apply_hardware_cursor(show: bool) {
+        let mut stdout = std::io::stdout();
+        if show {
+            let _ = crossterm::execute!(stdout, cursor::Show);
+        } else {
+            let _ = crossterm::execute!(stdout, cursor::Hide);
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn toggle_settings_entry(&mut self, entry: SettingsUiEntry) {
+        match entry {
+            SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
+                self.toggle_queue_mode_setting(entry);
+            }
+            SettingsUiEntry::QuietStartup => {
+                let next = !self.config.quiet_startup.unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "quietStartup",
+                    json!({ "quiet_startup": next }),
+                ) {
+                    self.config.quiet_startup = Some(next);
+                    self.status_message =
+                        Some(format!("Updated quietStartup: {}", bool_label(next)));
+                }
+            }
+            SettingsUiEntry::CollapseChangelog => {
+                let next = !self.config.collapse_changelog.unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "collapseChangelog",
+                    json!({ "collapse_changelog": next }),
+                ) {
+                    self.config.collapse_changelog = Some(next);
+                    self.status_message =
+                        Some(format!("Updated collapseChangelog: {}", bool_label(next)));
+                }
+            }
+            SettingsUiEntry::HideThinkingBlock => {
+                let next = !self.config.hide_thinking_block.unwrap_or(false);
+                if self.persist_project_settings_patch(
+                    "hideThinkingBlock",
+                    json!({ "hide_thinking_block": next }),
+                ) {
+                    self.config.hide_thinking_block = Some(next);
+                    self.thinking_visible = !next;
+                    self.scroll_to_bottom();
+                    self.status_message =
+                        Some(format!("Updated hideThinkingBlock: {}", bool_label(next)));
+                }
+            }
+            SettingsUiEntry::ShowHardwareCursor => {
+                let next = !self.effective_show_hardware_cursor();
+                if self.persist_project_settings_patch(
+                    "showHardwareCursor",
+                    json!({ "show_hardware_cursor": next }),
+                ) {
+                    self.config.show_hardware_cursor = Some(next);
+                    Self::apply_hardware_cursor(next);
+                    self.status_message =
+                        Some(format!("Updated showHardwareCursor: {}", bool_label(next)));
+                }
+            }
+            SettingsUiEntry::DoubleEscapeAction => {
+                let current = self
+                    .config
+                    .double_escape_action
+                    .as_deref()
+                    .unwrap_or("tree");
+                let next = if current.eq_ignore_ascii_case("tree") {
+                    "fork"
+                } else {
+                    "tree"
+                };
+                if self.persist_project_settings_patch(
+                    "doubleEscapeAction",
+                    json!({ "double_escape_action": next }),
+                ) {
+                    self.config.double_escape_action = Some(next.to_string());
+                    self.status_message = Some(format!("Updated doubleEscapeAction: {next}"));
+                }
+            }
+            SettingsUiEntry::EditorPaddingX => {
+                let current = self.editor_padding_x.min(3);
+                let next = match current {
+                    0 => 1,
+                    1 => 2,
+                    2 => 3,
+                    _ => 0,
+                };
+                if self.persist_project_settings_patch(
+                    "editorPaddingX",
+                    json!({ "editor_padding_x": next }),
+                ) {
+                    self.config.editor_padding_x = u32::try_from(next).ok();
+                    self.editor_padding_x = next;
+                    self.input
+                        .set_width(self.term_width.saturating_sub(4 + self.editor_padding_x));
+                    self.scroll_to_bottom();
+                    self.status_message = Some(format!("Updated editorPaddingX: {next}"));
+                }
+            }
+            SettingsUiEntry::AutocompleteMaxVisible => {
+                let cycle = [3usize, 5, 8, 10, 12, 15, 20];
+                let current = self.autocomplete.max_visible;
+                let next = cycle
+                    .iter()
+                    .position(|value| *value == current)
+                    .map_or(cycle[0], |idx| cycle[(idx + 1) % cycle.len()]);
+                if self.persist_project_settings_patch(
+                    "autocompleteMaxVisible",
+                    json!({ "autocomplete_max_visible": next }),
+                ) {
+                    self.config.autocomplete_max_visible = u32::try_from(next).ok();
+                    self.autocomplete.max_visible = next;
+                    self.status_message = Some(format!("Updated autocompleteMaxVisible: {next}"));
+                }
+            }
+            SettingsUiEntry::Summary | SettingsUiEntry::Theme => {}
+        }
+    }
+
     fn format_input_history(&self) -> String {
         if self.input_history.is_empty() {
             return "No input history yet.".to_string();
@@ -318,6 +458,15 @@ impl PiApp {
         let keep_recent = self.config.compaction_keep_recent_tokens();
         let steering = self.config.steering_queue_mode();
         let follow_up = self.config.follow_up_queue_mode();
+        let quiet_startup = self.config.quiet_startup.unwrap_or(false);
+        let collapse_changelog = self.config.collapse_changelog.unwrap_or(false);
+        let hide_thinking_block = self.config.hide_thinking_block.unwrap_or(false);
+        let show_hardware_cursor = self.effective_show_hardware_cursor();
+        let double_escape_action = self
+            .config
+            .double_escape_action
+            .as_deref()
+            .unwrap_or("tree");
 
         let mut output = String::new();
         let _ = writeln!(output, "Settings:");
@@ -333,6 +482,29 @@ impl PiApp {
         );
         let _ = writeln!(output, "  steeringMode: {}", steering.as_str());
         let _ = writeln!(output, "  followUpMode: {}", follow_up.as_str());
+        let _ = writeln!(output, "  quietStartup: {}", bool_label(quiet_startup));
+        let _ = writeln!(
+            output,
+            "  collapseChangelog: {}",
+            bool_label(collapse_changelog)
+        );
+        let _ = writeln!(
+            output,
+            "  hideThinkingBlock: {}",
+            bool_label(hide_thinking_block)
+        );
+        let _ = writeln!(
+            output,
+            "  showHardwareCursor: {}",
+            bool_label(show_hardware_cursor)
+        );
+        let _ = writeln!(output, "  doubleEscapeAction: {double_escape_action}");
+        let _ = writeln!(output, "  editorPaddingX: {}", self.editor_padding_x);
+        let _ = writeln!(
+            output,
+            "  autocompleteMaxVisible: {}",
+            self.autocomplete.max_visible
+        );
         let _ = writeln!(
             output,
             "  skillCommands: {}",
@@ -961,6 +1133,35 @@ impl PiApp {
                         "followUpMode: {}",
                         self.config.follow_up_queue_mode().as_str()
                     ),
+                    SettingsUiEntry::QuietStartup => format!(
+                        "quietStartup: {}",
+                        bool_label(self.config.quiet_startup.unwrap_or(false))
+                    ),
+                    SettingsUiEntry::CollapseChangelog => format!(
+                        "collapseChangelog: {}",
+                        bool_label(self.config.collapse_changelog.unwrap_or(false))
+                    ),
+                    SettingsUiEntry::HideThinkingBlock => format!(
+                        "hideThinkingBlock: {}",
+                        bool_label(self.config.hide_thinking_block.unwrap_or(false))
+                    ),
+                    SettingsUiEntry::ShowHardwareCursor => format!(
+                        "showHardwareCursor: {}",
+                        bool_label(self.effective_show_hardware_cursor())
+                    ),
+                    SettingsUiEntry::DoubleEscapeAction => format!(
+                        "doubleEscapeAction: {}",
+                        self.config
+                            .double_escape_action
+                            .as_deref()
+                            .unwrap_or("tree")
+                    ),
+                    SettingsUiEntry::EditorPaddingX => {
+                        format!("editorPaddingX: {}", self.editor_padding_x)
+                    }
+                    SettingsUiEntry::AutocompleteMaxVisible => {
+                        format!("autocompleteMaxVisible: {}", self.autocomplete.max_visible)
+                    }
                 };
                 let row = format!(" {label}");
                 let rendered = if is_selected {
@@ -997,6 +1198,10 @@ impl PiApp {
 
         output
     }
+}
+
+const fn bool_label(value: bool) -> &'static str {
+    if value { "on" } else { "off" }
 }
 
 async fn run_command_output(
@@ -1045,8 +1250,8 @@ async fn run_command_output(
 
 fn parse_gist_url_and_id(output: &str) -> Option<(String, String)> {
     for raw in output.split_whitespace() {
-        let token = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
-        let Ok(url) = Url::parse(token) else {
+        let candidate_url = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
+        let Ok(url) = Url::parse(candidate_url) else {
             continue;
         };
         if url.host_str()? != "gist.github.com" {
@@ -1056,7 +1261,7 @@ fn parse_gist_url_and_id(output: &str) -> Option<(String, String)> {
         if gist_id.is_empty() {
             continue;
         }
-        return Some((token.to_string(), gist_id));
+        return Some((candidate_url.to_string(), gist_id));
     }
     None
 }
@@ -1725,7 +1930,9 @@ impl SlashCommand {
   /exit, /quit, /q   - Exit Pi
 
   Tips:
-    • Use ↑/↓ arrows or Ctrl+P/N to navigate input history
+    • Use ↑/↓ arrows to navigate input history
+    • Use Ctrl+L to open model selector
+    • Use Ctrl+P to cycle scoped models
     • Use Shift+Enter (Ctrl+Enter on Windows) to insert a newline
     • Use PageUp/PageDown to scroll conversation history
     • Use Escape to cancel current input
@@ -2640,6 +2847,13 @@ enum SettingsUiEntry {
     Theme,
     SteeringMode,
     FollowUpMode,
+    QuietStartup,
+    CollapseChangelog,
+    HideThinkingBlock,
+    ShowHardwareCursor,
+    DoubleEscapeAction,
+    EditorPaddingX,
+    AutocompleteMaxVisible,
 }
 
 #[derive(Debug)]
@@ -2657,6 +2871,13 @@ impl SettingsUiState {
                 SettingsUiEntry::Theme,
                 SettingsUiEntry::SteeringMode,
                 SettingsUiEntry::FollowUpMode,
+                SettingsUiEntry::QuietStartup,
+                SettingsUiEntry::CollapseChangelog,
+                SettingsUiEntry::HideThinkingBlock,
+                SettingsUiEntry::ShowHardwareCursor,
+                SettingsUiEntry::DoubleEscapeAction,
+                SettingsUiEntry::EditorPaddingX,
+                SettingsUiEntry::AutocompleteMaxVisible,
             ],
             selected: 0,
             max_visible: 10,
@@ -3213,8 +3434,8 @@ impl PiApp {
                                     self.status_message =
                                         Some("Selected setting: Theme".to_string());
                                 }
-                                SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
-                                    self.toggle_queue_mode_setting(selected);
+                                _ => {
+                                    self.toggle_settings_entry(selected);
                                 }
                             }
                         }

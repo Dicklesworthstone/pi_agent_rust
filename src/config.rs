@@ -14,7 +14,9 @@ use tempfile::NamedTempFile;
 pub struct Config {
     // Appearance
     pub theme: Option<String>,
+    #[serde(alias = "hideThinkingBlock")]
     pub hide_thinking_block: Option<bool>,
+    #[serde(alias = "showHardwareCursor")]
     pub show_hardware_cursor: Option<bool>,
 
     // Model Configuration
@@ -30,11 +32,15 @@ pub struct Config {
     pub follow_up_mode: Option<String>,
 
     // Terminal Behavior
+    #[serde(alias = "quietStartup")]
     pub quiet_startup: Option<bool>,
+    #[serde(alias = "collapseChangelog")]
     pub collapse_changelog: Option<bool>,
     #[serde(alias = "doubleEscapeAction")]
     pub double_escape_action: Option<String>,
+    #[serde(alias = "editorPaddingX")]
     pub editor_padding_x: Option<u32>,
+    #[serde(alias = "autocompleteMaxVisible")]
     pub autocomplete_max_visible: Option<u32>,
     /// Non-interactive session picker selection (1-based index).
     #[serde(alias = "sessionPickerInput")]

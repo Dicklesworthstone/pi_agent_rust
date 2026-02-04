@@ -4,11 +4,12 @@
 //! interactive agent loop.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use chrono::{Datelike, Local};
 use glob::Pattern;
+use thiserror::Error;
 
 use crate::auth::AuthStorage;
 use crate::cli;
@@ -46,6 +47,14 @@ pub struct ModelSelection {
     pub fallback_message: Option<String>,
 }
 
+#[derive(Debug, Error)]
+pub enum StartupError {
+    #[error("No models available. Set API keys in environment variables or create {models_path}")]
+    NoModelsAvailable { models_path: PathBuf },
+    #[error("No API key found for provider {provider}. Set env var or use --api-key.")]
+    MissingApiKey { provider: String },
+}
+
 #[derive(Debug, Clone)]
 struct ContextFile {
     path: String,
@@ -55,6 +64,27 @@ struct ContextFile {
 struct RestoreResult {
     model: Option<ModelEntry>,
     fallback_message: Option<String>,
+}
+
+pub fn apply_piped_stdin(cli: &mut cli::Cli, stdin_content: Option<String>) {
+    if let Some(stdin_content) = stdin_content {
+        cli.print = true;
+        cli.args.insert(0, stdin_content);
+    }
+}
+
+#[allow(clippy::missing_const_for_fn)]
+pub fn normalize_cli(cli: &mut cli::Cli) {
+    if cli.print {
+        cli.no_session = true;
+    }
+}
+
+pub fn validate_rpc_args(cli: &cli::Cli) -> Result<()> {
+    if cli.mode.as_deref() == Some("rpc") && !cli.file_args().is_empty() {
+        bail!("Error: @file arguments are not supported in RPC mode");
+    }
+    Ok(())
 }
 
 pub fn prepare_initial_message(
@@ -410,10 +440,7 @@ pub fn select_model_and_thinking(
 
     let Some(model_entry) = selected_model else {
         let models_path = default_models_path(global_dir);
-        bail!(
-            "No models available. Set API keys in environment variables or create {}",
-            models_path.display()
-        );
+        return Err(StartupError::NoModelsAvailable { models_path }.into());
     };
 
     let mut thinking_level: Option<model::ThinkingLevel> = None;
@@ -514,9 +541,8 @@ fn restore_model_from_session(
     registry: &ModelRegistry,
 ) -> RestoreResult {
     let restored = registry.find(saved_provider, saved_model_id);
-    let has_api_key = restored.as_ref().and_then(|m| m.api_key.clone()).is_some();
 
-    if restored.is_some() && has_api_key {
+    if restored.as_ref().is_some_and(|m| m.api_key.is_some()) {
         return RestoreResult {
             model: restored,
             fallback_message: None,
@@ -580,10 +606,10 @@ pub fn resolve_api_key(auth: &AuthStorage, cli: &cli::Cli, entry: &ModelEntry) -
     auth.resolve_api_key(&entry.model.provider, cli.api_key.as_deref())
         .or_else(|| entry.api_key.clone())
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No API key found for provider {}. Set env var or use --api-key.",
-                entry.model.provider
-            )
+            StartupError::MissingApiKey {
+                provider: entry.model.provider.clone(),
+            }
+            .into()
         })
 }
 

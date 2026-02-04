@@ -26,15 +26,17 @@
 
 #![allow(dead_code)]
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use regex::Regex;
 use serde::Serialize;
-use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Read as _;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const REDACTED_VALUE: &str = "[REDACTED]";
 const REDACTION_KEYS: [&str; 10] = [
@@ -63,6 +65,27 @@ static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
 static RUN_ID_REGEX: OnceLock<Regex> = OnceLock::new();
 static UUID_REGEX: OnceLock<Regex> = OnceLock::new();
 static LOCAL_PORT_REGEX: OnceLock<Regex> = OnceLock::new();
+
+fn ansi_regex() -> &'static Regex {
+    ANSI_REGEX.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("ansi regex"))
+}
+
+fn run_id_regex() -> &'static Regex {
+    RUN_ID_REGEX.get_or_init(|| Regex::new(r"\brun-[0-9a-fA-F-]{36}\b").expect("run id regex"))
+}
+
+fn uuid_regex() -> &'static Regex {
+    UUID_REGEX.get_or_init(|| {
+        Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .expect("uuid regex")
+    })
+}
+
+fn local_port_regex() -> &'static Regex {
+    LOCAL_PORT_REGEX.get_or_init(|| Regex::new(r"http://127\\.0\\.0\\.1:\\d+").expect("port regex"))
+}
 
 /// Log entry severity level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,8 +134,8 @@ impl LogLevel {
 /// A single log entry with timestamp, level, category, message, and context.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
-    /// Elapsed time from logger creation.
-    pub elapsed_secs: f64,
+    /// Elapsed milliseconds from logger creation.
+    pub elapsed_ms: u64,
     /// Severity level.
     pub level: LogLevel,
     /// Category tag (e.g., "setup", "action", "verify").
@@ -126,9 +149,9 @@ pub struct LogEntry {
 impl LogEntry {
     /// Format this entry as a string (without colors).
     pub fn format(&self) -> String {
+        let elapsed = format_elapsed_ms(self.elapsed_ms);
         let mut output = format!(
-            "[{:>8.3}s] {} [{}] {}\n",
-            self.elapsed_secs,
+            "[{elapsed}s] {} [{}] {}\n",
             self.level.as_str(),
             self.category,
             self.message
@@ -146,9 +169,9 @@ impl LogEntry {
         const RESET: &str = "\x1b[0m";
         const DIM: &str = "\x1b[2m";
 
+        let elapsed = format_elapsed_ms(self.elapsed_ms);
         let mut output = format!(
-            "{DIM}[{:>8.3}s]{RESET} {}{}{RESET} {DIM}[{}]{RESET} {}\n",
-            self.elapsed_secs,
+            "{DIM}[{elapsed}s]{RESET} {}{}{RESET} {DIM}[{}]{RESET} {}\n",
             self.level.color_code(),
             self.level.as_str(),
             self.category,
@@ -166,8 +189,8 @@ impl LogEntry {
 /// Artifact entry captured during a test run.
 #[derive(Debug, Clone)]
 pub struct ArtifactEntry {
-    /// Elapsed time from logger creation.
-    pub elapsed_secs: f64,
+    /// Elapsed milliseconds from logger creation.
+    pub elapsed_ms: u64,
     /// Logical name of the artifact.
     pub name: String,
     /// Path to the artifact on disk.
@@ -177,11 +200,16 @@ pub struct ArtifactEntry {
 impl ArtifactEntry {
     /// Format this artifact entry as a string.
     pub fn format(&self) -> String {
-        format!(
-            "[{:>8.3}s] {} -> {}\n",
-            self.elapsed_secs, self.name, self.path
-        )
+        let elapsed = format_elapsed_ms(self.elapsed_ms);
+        format!("[{elapsed}s] {} -> {}\n", self.name, self.path)
     }
+}
+
+fn format_elapsed_ms(elapsed_ms: u64) -> String {
+    let secs = elapsed_ms / 1000;
+    let millis = elapsed_ms % 1000;
+    let raw = format!("{secs}.{millis:03}");
+    format!("{raw:>8}")
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -197,6 +225,7 @@ struct TestLogJsonRecord {
     level: &'static str,
     category: String,
     message: String,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     context: BTreeMap<String, String>,
 }
 
@@ -212,7 +241,9 @@ struct TestArtifactJsonRecord {
     t_ms: u64,
     name: String,
     path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     sha256: Option<String>,
 }
 
@@ -229,14 +260,48 @@ impl NormalizationContext {
             .unwrap_or_else(|_| Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf())
             .display()
             .to_string();
-        let test_root = test_root
-            .and_then(|root| root.canonicalize().ok())
-            .map(|root| root.display().to_string());
+        let test_root = test_root.map(|root| {
+            root.canonicalize()
+                .unwrap_or_else(|_| root.to_path_buf())
+                .display()
+                .to_string()
+        });
         Self {
             project_root,
             test_root,
         }
     }
+
+    fn normalize_string(&self, input: &str) -> String {
+        let without_ansi = ansi_regex().replace_all(input, "");
+        let mut out =
+            replace_path_variants(&without_ansi, &self.project_root, PLACEHOLDER_PROJECT_ROOT);
+        if let Some(test_root) = &self.test_root {
+            out = replace_path_variants(&out, test_root, PLACEHOLDER_TEST_ROOT);
+        }
+        out = run_id_regex()
+            .replace_all(&out, PLACEHOLDER_RUN_ID)
+            .into_owned();
+        out = uuid_regex()
+            .replace_all(&out, PLACEHOLDER_UUID)
+            .into_owned();
+        out = local_port_regex()
+            .replace_all(&out, format!("http://127.0.0.1:{PLACEHOLDER_PORT}"))
+            .into_owned();
+        out
+    }
+}
+
+fn replace_path_variants(input: &str, path: &str, placeholder: &str) -> String {
+    if path.is_empty() {
+        return input.to_string();
+    }
+    let mut out = input.replace(path, placeholder);
+    let path_backslashes = path.replace('/', "\\");
+    if path_backslashes != path {
+        out = out.replace(&path_backslashes, placeholder);
+    }
+    out
 }
 
 /// Thread-safe test logger that captures all log entries.
@@ -311,6 +376,10 @@ impl TestLogger {
         *self.test_name.lock().unwrap() = Some(name.into());
     }
 
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
     /// Log an entry with the given level and category.
     pub fn log(&self, level: LogLevel, category: &str, message: impl Into<String>) {
         if (level as u8) < (self.min_level as u8) {
@@ -318,7 +387,7 @@ impl TestLogger {
         }
 
         let entry = LogEntry {
-            elapsed_secs: self.start.elapsed().as_secs_f64(),
+            elapsed_ms: self.elapsed_ms(),
             level,
             category: category.to_string(),
             message: message.into(),
@@ -374,7 +443,7 @@ impl TestLogger {
         redact_context(&mut context);
 
         let entry = LogEntry {
-            elapsed_secs: self.start.elapsed().as_secs_f64(),
+            elapsed_ms: self.elapsed_ms(),
             level,
             category: category.to_string(),
             message: message.into(),
@@ -440,7 +509,7 @@ impl TestLogger {
     /// Record an artifact produced during the test (e.g. exported files).
     pub fn record_artifact(&self, name: impl Into<String>, path: impl AsRef<Path>) {
         let entry = ArtifactEntry {
-            elapsed_secs: self.start.elapsed().as_secs_f64(),
+            elapsed_ms: self.elapsed_ms(),
             name: name.into(),
             path: path.as_ref().display().to_string(),
         };
@@ -482,66 +551,94 @@ impl TestLogger {
         fs::write(path, output)
     }
 
-    /// Dump logs and artifacts as stable JSONL (one JSON object per line).
+    /// Dump logs and artifacts as JSONL (one JSON object per line).
     ///
     /// This output is intended for machine parsing and deterministic diffs. It:
-    /// - uses elapsed milliseconds (no wall clock)
-    /// - redacts sensitive context values (same rules as text)
-    /// - optionally normalizes paths under a configured root (`set_normalization_root`)
+    /// - includes a schema tag (`pi.test.log.v1` / `pi.test.artifact.v1`)
+    /// - includes sequence numbers + ISO-8601 timestamps
+    /// - uses elapsed milliseconds for ordering
+    ///
+    /// Use `dump_jsonl_normalized()` for deterministic placeholder normalization.
     pub fn dump_jsonl(&self) -> String {
-        #[derive(Debug, serde::Serialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
-        enum JsonlRecord<'a> {
-            Log {
-                t_ms: u64,
-                level: &'a str,
-                category: &'a str,
-                message: &'a str,
-                #[serde(skip_serializing_if = "Option::is_none")]
-                context: Option<&'a [(String, String)]>,
-            },
-            Artifact {
-                t_ms: u64,
-                name: &'a str,
-                path: &'a str,
-            },
-        }
-
         let normalize_root = self.normalize_root.lock().unwrap().clone();
+        let test_name = self.test_name.lock().unwrap().clone();
+        self.dump_jsonl_internal(true, false, test_name.as_deref(), normalize_root.as_deref())
+    }
+
+    /// Dump normalized log records as JSONL (deterministic placeholders).
+    pub fn dump_jsonl_normalized(&self) -> String {
+        let normalize_root = self.normalize_root.lock().unwrap().clone();
+        let test_name = self.test_name.lock().unwrap().clone();
+        self.dump_jsonl_internal(true, true, test_name.as_deref(), normalize_root.as_deref())
+    }
+
+    /// Dump only artifact index records as JSONL.
+    pub fn dump_artifact_index_jsonl(&self) -> String {
+        let normalize_root = self.normalize_root.lock().unwrap().clone();
+        let test_name = self.test_name.lock().unwrap().clone();
+        self.dump_jsonl_internal(
+            false,
+            false,
+            test_name.as_deref(),
+            normalize_root.as_deref(),
+        )
+    }
+
+    /// Dump normalized artifact index records as JSONL.
+    pub fn dump_artifact_index_jsonl_normalized(&self) -> String {
+        let normalize_root = self.normalize_root.lock().unwrap().clone();
+        let test_name = self.test_name.lock().unwrap().clone();
+        self.dump_jsonl_internal(false, true, test_name.as_deref(), normalize_root.as_deref())
+    }
+
+    fn dump_jsonl_internal(
+        &self,
+        include_logs: bool,
+        normalized: bool,
+        test_name: Option<&str>,
+        normalize_root: Option<&str>,
+    ) -> String {
         let entries = self.entries.lock().unwrap();
         let artifacts = self.artifacts.lock().unwrap();
 
-        let mut out = String::with_capacity((entries.len() + artifacts.len()).saturating_mul(128));
+        let mut out = String::with_capacity((entries.len() + artifacts.len()).saturating_mul(160));
+        let ctx = if normalized {
+            Some(NormalizationContext::new(normalize_root.map(Path::new)))
+        } else {
+            None
+        };
 
-        for entry in entries.iter() {
-            let ctx = if entry.context.is_empty() {
-                None
-            } else {
-                Some(entry.context.as_slice())
-            };
-            let record = JsonlRecord::Log {
-                t_ms: (entry.elapsed_secs * 1000.0).round() as u64,
-                level: entry.level.as_str().trim(),
-                category: &entry.category,
-                message: &entry.message,
-                context: ctx,
-            };
-            let mut line =
-                serde_json::to_string(&record).unwrap_or_else(|_| "{\"type\":\"log\"}".to_string());
-            normalize_jsonl_line_in_place(&mut line, normalize_root.as_deref());
-            out.push_str(&line);
-            out.push('\n');
+        let mut seq: usize = 1;
+        if include_logs {
+            for entry in entries.iter() {
+                let record = build_log_record(
+                    entry,
+                    seq,
+                    test_name,
+                    ctx.as_ref(),
+                    self.start_wall,
+                    normalized,
+                );
+                seq = seq.saturating_add(1);
+                let line = serde_json::to_string(&record)
+                    .unwrap_or_else(|_| "{\"schema\":\"pi.test.log.v1\"}".to_string());
+                out.push_str(&line);
+                out.push('\n');
+            }
         }
 
         for artifact in artifacts.iter() {
-            let record = JsonlRecord::Artifact {
-                t_ms: (artifact.elapsed_secs * 1000.0).round() as u64,
-                name: &artifact.name,
-                path: &artifact.path,
-            };
-            let mut line = serde_json::to_string(&record)
-                .unwrap_or_else(|_| "{\"type\":\"artifact\"}".to_string());
-            normalize_jsonl_line_in_place(&mut line, normalize_root.as_deref());
+            let record = build_artifact_record(
+                artifact,
+                seq,
+                test_name,
+                ctx.as_ref(),
+                self.start_wall,
+                normalized,
+            );
+            seq = seq.saturating_add(1);
+            let line = serde_json::to_string(&record)
+                .unwrap_or_else(|_| "{\"schema\":\"pi.test.artifact.v1\"}".to_string());
             out.push_str(&line);
             out.push('\n');
         }
@@ -554,13 +651,28 @@ impl TestLogger {
 
     /// Write JSONL dump to a file path.
     pub fn write_jsonl_to_path(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-        fs::write(path, self.dump_jsonl())
+        write_string_to_path(path.as_ref(), &self.dump_jsonl())
+    }
+
+    /// Write normalized JSONL dump to a file path.
+    pub fn write_jsonl_normalized_to_path(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        write_string_to_path(path.as_ref(), &self.dump_jsonl_normalized())
+    }
+
+    /// Write artifact index JSONL to a file path.
+    pub fn write_artifact_index_jsonl_to_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<()> {
+        write_string_to_path(path.as_ref(), &self.dump_artifact_index_jsonl())
+    }
+
+    /// Write normalized artifact index JSONL to a file path.
+    pub fn write_artifact_index_jsonl_normalized_to_path(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<()> {
+        write_string_to_path(path.as_ref(), &self.dump_artifact_index_jsonl_normalized())
     }
 
     /// Clear all log entries.
@@ -614,12 +726,136 @@ fn is_sensitive_key(key: &str) -> bool {
     REDACTION_KEYS.iter().any(|needle| key.contains(needle))
 }
 
-fn normalize_jsonl_line_in_place(line: &mut String, normalize_root: Option<&str>) {
-    if let Some(root) = normalize_root {
-        if !root.is_empty() {
-            *line = line.replace(root, "<root>");
+fn build_log_record(
+    entry: &LogEntry,
+    seq: usize,
+    test_name: Option<&str>,
+    ctx: Option<&NormalizationContext>,
+    start_wall: SystemTime,
+    normalized: bool,
+) -> TestLogJsonRecord {
+    let (ts, t_ms) = if normalized {
+        (PLACEHOLDER_TIMESTAMP.to_string(), 0)
+    } else {
+        (
+            format_timestamp(start_wall, entry.elapsed_ms),
+            entry.elapsed_ms,
+        )
+    };
+
+    let message = ctx.map_or_else(
+        || entry.message.clone(),
+        |ctx| ctx.normalize_string(&entry.message),
+    );
+    let category = ctx.map_or_else(
+        || entry.category.clone(),
+        |ctx| ctx.normalize_string(&entry.category),
+    );
+
+    let mut context = BTreeMap::new();
+    for (key, value) in &entry.context {
+        let value = ctx.map_or_else(|| value.clone(), |ctx| ctx.normalize_string(value));
+        context.insert(key.clone(), value);
+    }
+
+    TestLogJsonRecord {
+        schema: TEST_LOG_SCHEMA,
+        record_type: "log",
+        test: test_name.map(ToString::to_string),
+        seq,
+        ts,
+        t_ms,
+        level: entry.level.as_json_str(),
+        category,
+        message,
+        context,
+    }
+}
+
+fn build_artifact_record(
+    artifact: &ArtifactEntry,
+    seq: usize,
+    test_name: Option<&str>,
+    ctx: Option<&NormalizationContext>,
+    start_wall: SystemTime,
+    normalized: bool,
+) -> TestArtifactJsonRecord {
+    let (ts, t_ms) = if normalized {
+        (PLACEHOLDER_TIMESTAMP.to_string(), 0)
+    } else {
+        (
+            format_timestamp(start_wall, artifact.elapsed_ms),
+            artifact.elapsed_ms,
+        )
+    };
+    let path = ctx.map_or_else(
+        || artifact.path.clone(),
+        |ctx| ctx.normalize_string(&artifact.path),
+    );
+    let name = ctx.map_or_else(
+        || artifact.name.clone(),
+        |ctx| ctx.normalize_string(&artifact.name),
+    );
+    let (size_bytes, sha256) = artifact_metadata(Path::new(&artifact.path));
+
+    TestArtifactJsonRecord {
+        schema: TEST_ARTIFACT_SCHEMA,
+        record_type: "artifact",
+        test: test_name.map(ToString::to_string),
+        seq,
+        ts,
+        t_ms,
+        name,
+        path,
+        size_bytes,
+        sha256,
+    }
+}
+
+fn format_timestamp(start_wall: SystemTime, elapsed_ms: u64) -> String {
+    let ts = start_wall
+        .checked_add(Duration::from_millis(elapsed_ms))
+        .unwrap_or(start_wall);
+    let ts: DateTime<Utc> = ts.into();
+    ts.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn artifact_metadata(path: &Path) -> (Option<u64>, Option<String>) {
+    let size_bytes = fs::metadata(path).map(|meta| meta.len()).ok();
+    let sha256 = sha256_file(path).ok();
+    (size_bytes, sha256)
+}
+
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = file.read(&mut buf)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buf[..read]);
+    }
+    let digest = hasher.finalize();
+    Ok(to_hex(&digest))
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn write_string_to_path(path: &Path, contents: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
         }
     }
+    fs::write(path, contents)
 }
 
 /// Macro for logging with automatic context capture.
@@ -758,10 +994,19 @@ mod tests {
         });
         logger.record_artifact("log", "/tmp/my-root/log.txt");
 
-        let jsonl = logger.dump_jsonl();
-        assert!(jsonl.contains("\"type\":\"log\""));
-        assert!(jsonl.contains("\"type\":\"artifact\""));
-        assert!(jsonl.contains("<root>/work.txt"));
-        assert!(jsonl.contains("<root>/log.txt"));
+        let jsonl = logger.dump_jsonl_normalized();
+        let mut lines = jsonl.lines();
+        let first: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+        let second: serde_json::Value = serde_json::from_str(lines.next().unwrap()).unwrap();
+
+        assert_eq!(first["schema"], TEST_LOG_SCHEMA);
+        assert_eq!(second["schema"], TEST_ARTIFACT_SCHEMA);
+        assert_eq!(first["type"], "log");
+        assert_eq!(second["type"], "artifact");
+        assert_eq!(first["seq"], 1);
+        assert_eq!(second["seq"], 2);
+        assert_eq!(first["ts"], PLACEHOLDER_TIMESTAMP);
+        assert_eq!(second["ts"], PLACEHOLDER_TIMESTAMP);
+        assert!(jsonl.contains(PLACEHOLDER_TEST_ROOT));
     }
 }

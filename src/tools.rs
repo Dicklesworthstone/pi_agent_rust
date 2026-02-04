@@ -976,6 +976,10 @@ impl Tool for ReadTool {
             });
         }
 
+        // Split on '\n' (preserving trailing empty line) to match conformance fixtures:
+        // a file ending with a newline has an extra final empty line.
+        //
+        // We still trim a trailing '\r' from each line on render to support CRLF.
         let all_lines: Vec<&str> = text_content.split('\n').collect();
         let total_file_lines = all_lines.len();
 
@@ -1018,6 +1022,7 @@ impl Tool for ReadTool {
             .enumerate()
             .map(|(i, line)| {
                 let line_num = start_line + i + 1;
+                let line = line.strip_suffix('\r').unwrap_or(line);
                 format!("{line_num:>line_num_width$}→{line}")
             })
             .collect::<Vec<_>>()
@@ -1030,6 +1035,7 @@ impl Tool for ReadTool {
 
         if truncation.first_line_exceeds_limit {
             let first_line = all_lines.get(start_line).copied().unwrap_or("");
+            let first_line = first_line.strip_suffix('\r').unwrap_or(first_line);
             let first_line_size = format_size(first_line.len());
             output_text = format!(
                 "[Line {start_line_display} is {first_line_size}, exceeds {} limit. Use bash: sed -n '{start_line_display}p' {} | head -c {DEFAULT_MAX_BYTES}]",

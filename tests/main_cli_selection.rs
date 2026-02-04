@@ -7,8 +7,9 @@ use base64::Engine as _;
 use clap::Parser;
 use common::TestHarness;
 use pi::app::{
-    build_initial_content, build_system_prompt, prepare_initial_message, resolve_api_key,
-    resolve_model_scope, select_model_and_thinking,
+    apply_piped_stdin, build_initial_content, build_system_prompt, normalize_cli,
+    prepare_initial_message, resolve_api_key, resolve_model_scope, select_model_and_thinking,
+    validate_rpc_args,
 };
 use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
@@ -17,6 +18,7 @@ use pi::model::{ContentBlock, ThinkingLevel};
 use pi::models::{ModelEntry, ModelRegistry};
 use pi::provider::{InputType, Model, ModelCost};
 use pi::session::{EntryBase, ModelChangeEntry, Session, SessionEntry, ThinkingLevelChangeEntry};
+use pi::tools::process_file_arguments;
 use std::collections::HashMap;
 
 fn make_registry(harness: &TestHarness, creds: &[(&str, &str)]) -> ModelRegistry {
@@ -397,6 +399,21 @@ fn prepare_initial_message_wraps_files_and_appends_first_message() {
 }
 
 #[test]
+fn prepare_initial_message_leaves_remaining_messages() {
+    let harness = TestHarness::new("prepare_initial_message_leaves_remaining_messages");
+    let file_path = harness.create_file("a.txt", "hello\n");
+    let mut messages = vec!["first".to_string(), "second".to_string()];
+    let file_args = vec![file_path.to_string_lossy().to_string()];
+
+    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
+        .expect("prepare initial")
+        .expect("initial message present");
+
+    assert_eq!(messages, vec!["second".to_string()]);
+    assert!(initial.text.contains("first"));
+}
+
+#[test]
 fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
     let harness =
         TestHarness::new("prepare_initial_message_attaches_images_and_builds_content_blocks");
@@ -434,6 +451,83 @@ fn prepare_initial_message_attaches_images_and_builds_content_blocks() {
     assert_eq!(blocks.len(), 2);
     assert!(matches!(&blocks[0], ContentBlock::Text(_)));
     assert!(matches!(&blocks[1], ContentBlock::Image(_)));
+}
+
+#[test]
+fn process_file_arguments_missing_file_reports_error() {
+    let harness = TestHarness::new("process_file_arguments_missing_file_reports_error");
+    let args = vec!["missing.txt".to_string()];
+    let err = process_file_arguments(&args, harness.temp_dir(), false)
+        .expect_err("missing file should error");
+    assert!(err.to_string().contains("Cannot access file"));
+}
+
+#[test]
+fn process_file_arguments_small_image_respects_auto_resize_flag() {
+    let harness = TestHarness::new("process_file_arguments_small_image_respects_auto_resize_flag");
+    let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAA7x2FoAAAAASUVORK5CYII=";
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(png_base64)
+        .expect("decode png");
+    let image_path = harness.create_file("image.png", &bytes);
+    let args = vec![image_path.to_string_lossy().to_string()];
+
+    let processed =
+        process_file_arguments(&args, harness.temp_dir(), true).expect("process file arguments");
+    assert_eq!(processed.images.len(), 1);
+    assert!(
+        processed
+            .text
+            .contains(&format!("<file name=\"{}\"></file>", image_path.display()))
+    );
+}
+
+#[test]
+fn apply_piped_stdin_inserts_message_and_sets_print() {
+    let mut cli = cli::Cli::parse_from(["pi", "hello", "world"]);
+    apply_piped_stdin(&mut cli, Some("stdin".to_string()));
+
+    assert!(cli.print);
+    let messages = cli.message_args();
+    assert_eq!(messages, vec!["stdin", "hello", "world"]);
+}
+
+#[test]
+fn apply_piped_stdin_none_keeps_args() {
+    let mut cli = cli::Cli::parse_from(["pi", "hello"]);
+    apply_piped_stdin(&mut cli, None);
+    assert!(!cli.print);
+    assert_eq!(cli.message_args(), vec!["hello"]);
+}
+
+#[test]
+fn normalize_cli_sets_no_session_for_print_mode() {
+    let mut cli = cli::Cli::parse_from(["pi", "-p", "hello"]);
+    assert!(!cli.no_session);
+    normalize_cli(&mut cli);
+    assert!(cli.no_session);
+}
+
+#[test]
+fn validate_rpc_args_rejects_file_args() {
+    let cli = cli::Cli::parse_from(["pi", "--mode", "rpc", "@file.txt"]);
+    let err = validate_rpc_args(&cli).expect_err("rpc should reject file args");
+    assert!(
+        err.to_string()
+            .contains("@file arguments are not supported")
+    );
+}
+
+#[test]
+fn session_no_session_flag_creates_in_memory_session() {
+    asupersync::test_utils::run_test(|| async {
+        let mut cli = cli::Cli::parse_from(["pi", "-p", "hello"]);
+        normalize_cli(&mut cli);
+        let session = Box::pin(Session::new(&cli, &Config::default()))
+            .await
+            .expect("session");
+        assert!(session.path.is_none());
+    });
 }
 
 #[test]

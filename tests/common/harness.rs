@@ -62,6 +62,7 @@ impl TestHarness {
         let name = name.into();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let logger = Arc::new(TestLogger::new());
+        logger.set_test_name(&name);
         logger.set_normalization_root(temp_dir.path());
 
         logger
@@ -208,6 +209,33 @@ impl TestHarness {
         self.logger.as_ref().record_artifact(name, path);
     }
 
+    /// Write test logs as JSONL.
+    pub fn write_jsonl_logs(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.logger.as_ref().write_jsonl_to_path(path)
+    }
+
+    /// Write normalized test logs as JSONL.
+    pub fn write_jsonl_logs_normalized(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.logger.as_ref().write_jsonl_normalized_to_path(path)
+    }
+
+    /// Write artifact index as JSONL.
+    pub fn write_artifact_index_jsonl(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        self.logger
+            .as_ref()
+            .write_artifact_index_jsonl_to_path(path)
+    }
+
+    /// Write normalized artifact index as JSONL.
+    pub fn write_artifact_index_jsonl_normalized(
+        &self,
+        path: impl AsRef<Path>,
+    ) -> std::io::Result<()> {
+        self.logger
+            .as_ref()
+            .write_artifact_index_jsonl_normalized_to_path(path)
+    }
+
     /// Derive a stable per-test seed for deterministic harness behavior.
     ///
     /// This is intended for tests and harness utilities, not cryptography.
@@ -282,6 +310,44 @@ impl Drop for TestHarness {
                 ));
             });
 
+        if let Ok(path) = env::var("TEST_LOG_JSONL_PATH") {
+            if let Err(err) = self.logger.as_ref().write_jsonl_to_path(&path) {
+                eprintln!("Failed to write JSONL test log to {path}: {err}");
+            }
+            let normalized_path = normalized_jsonl_path(Path::new(&path));
+            if let Err(err) = self
+                .logger
+                .as_ref()
+                .write_jsonl_normalized_to_path(&normalized_path)
+            {
+                eprintln!(
+                    "Failed to write normalized JSONL test log to {}: {err}",
+                    normalized_path.display()
+                );
+            }
+        }
+
+        if let Ok(path) = env::var("TEST_ARTIFACT_INDEX_PATH") {
+            if let Err(err) = self
+                .logger
+                .as_ref()
+                .write_artifact_index_jsonl_to_path(&path)
+            {
+                eprintln!("Failed to write artifact index JSONL to {path}: {err}");
+            }
+            let normalized_path = normalized_jsonl_path(Path::new(&path));
+            if let Err(err) = self
+                .logger
+                .as_ref()
+                .write_artifact_index_jsonl_normalized_to_path(&normalized_path)
+            {
+                eprintln!(
+                    "Failed to write normalized artifact index JSONL to {}: {err}",
+                    normalized_path.display()
+                );
+            }
+        }
+
         // Dump logs if we're panicking (test failure)
         if std::thread::panicking() {
             let header = format!("\n=== TEST FAILED: {} ===\n", self.name);
@@ -304,14 +370,19 @@ impl Drop for TestHarness {
                     eprintln!("Failed to write test log to {path}: {err}");
                 }
             }
-
-            if let Ok(path) = env::var("TEST_LOG_JSONL_PATH") {
-                if let Err(err) = self.logger.as_ref().write_jsonl_to_path(&path) {
-                    eprintln!("Failed to write JSONL test log to {path}: {err}");
-                }
-            }
         }
     }
+}
+
+fn normalized_jsonl_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("log.jsonl");
+    file_name.strip_suffix(".jsonl").map_or_else(
+        || path.with_file_name(format!("{file_name}.normalized.jsonl")),
+        |stripped| path.with_file_name(format!("{stripped}.normalized.jsonl")),
+    )
 }
 
 /// Builder for configuring test harnesses.
@@ -348,6 +419,8 @@ impl TestHarnessBuilder {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
         let logger = Arc::new(TestLogger::with_min_level(self.min_log_level));
         let name = self.name;
+        logger.set_test_name(&name);
+        logger.set_normalization_root(temp_dir.path());
 
         logger
             .as_ref()

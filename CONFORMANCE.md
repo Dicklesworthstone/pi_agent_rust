@@ -141,24 +141,25 @@ Each log entry is one JSON object per line:
 ```json
 {
   "schema": "pi.test.log.v1",
+  "type": "log",
+  "test": "e2e_cli_help_flag",
+  "seq": 1,
   "ts": "2026-02-03T03:01:02.123Z",
-  "elapsed_ms": 123,
+  "t_ms": 123,
   "level": "info",
   "category": "setup",
   "message": "Created test directory",
   "context": {
     "path": "/tmp/pi-test-123/workspace",
     "size": "42 bytes"
-  },
-  "test": { "name": "e2e_cli_help_flag" },
-  "source": { "component": "test_harness", "pid": 1234, "thread": "main" }
+  }
 }
 ```
 
 **Field notes:**
-- `ts` is ISO-8601 UTC; `elapsed_ms` is relative to harness start.
+- `ts` is ISO-8601 UTC; `t_ms` is relative to harness start.
+- `test` is optional; when present it is a single string.
 - `context` is a flat string map (redacted for sensitive keys).
-- `source` provides process metadata for debugging.
 
 ### Artifact Index Schema: `pi.test.artifact.v1`
 
@@ -167,13 +168,15 @@ Each artifact entry is one JSON object per line:
 ```json
 {
   "schema": "pi.test.artifact.v1",
+  "type": "artifact",
+  "test": "e2e_cli_help_flag",
+  "seq": 1,
   "ts": "2026-02-03T03:01:05.000Z",
-  "elapsed_ms": 3000,
+  "t_ms": 3000,
   "name": "stdout.txt",
   "path": "/tmp/pi-test-123/stdout.txt",
   "size_bytes": 2048,
-  "sha256": "sha256:deadbeef...",
-  "test": { "name": "e2e_cli_help_flag" }
+  "sha256": "sha256:deadbeef..."
 }
 ```
 
@@ -181,10 +184,11 @@ Each artifact entry is one JSON object per line:
 
 Normalized JSONL replaces non-deterministic values so diffs are stable:
 - `ts` → `<TIMESTAMP>`
-- `elapsed_ms` → `0`
-- `pid` → `0`
-- absolute temp paths → `<TEMP_DIR>/...`
+- `t_ms` → `0`
+- absolute project paths → `<PROJECT_ROOT>/...`
+- temp/test paths → `<TEST_ROOT>/...`
 - UUIDs/run IDs → `<UUID>` / `<RUN_ID>` when present in strings
+- local ports in URLs → `<PORT>`
 
 Normalized outputs are written alongside raw logs with a `.normalized.jsonl` suffix.
 

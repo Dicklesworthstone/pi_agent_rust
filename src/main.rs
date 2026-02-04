@@ -18,7 +18,8 @@ use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use clap::Parser;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
-use pi::auth::AuthStorage;
+use pi::app::StartupError;
+use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
 use pi::config::Config;
 use pi::model::{AssistantMessage, StopReason};
@@ -30,6 +31,7 @@ use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
 use pi::tools::ToolRegistry;
+use pi::tui::PiConsole;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
@@ -96,7 +98,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     let global_dir = Config::global_dir();
     let package_dir = Config::package_dir();
     let models_path = default_models_path(&global_dir);
-    let model_registry = ModelRegistry::load(&auth, Some(models_path));
+    let mut model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
     }
@@ -107,11 +109,10 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     }
 
     if cli.mode.as_deref() != Some("rpc") {
-        if let Some(stdin_content) = read_piped_stdin()? {
-            cli.print = true;
-            cli.args.insert(0, stdin_content);
-        }
+        let stdin_content = read_piped_stdin()?;
+        pi::app::apply_piped_stdin(&mut cli, stdin_content);
     }
+    pi::app::normalize_cli(&mut cli);
 
     if let Some(export_path) = cli.export.clone() {
         let output = cli.message_args().first().map(ToString::to_string);
@@ -120,9 +121,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         return Ok(());
     }
 
-    if cli.mode.as_deref() == Some("rpc") && !cli.file_args().is_empty() {
-        bail!("Error: @file arguments are not supported in RPC mode");
-    }
+    pi::app::validate_rpc_args(&cli)?;
 
     let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
     let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
@@ -139,14 +138,13 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
 
     let is_interactive = !cli.print && cli.mode.is_none();
     let mode = cli.mode.clone().unwrap_or_else(|| "text".to_string());
-    let enabled_tools = cli.enabled_tools();
 
     let scoped_patterns = if let Some(models_arg) = &cli.models {
         pi::app::parse_models_arg(models_arg)
     } else {
         config.enabled_models.clone().unwrap_or_default()
     };
-    let scoped_models = if scoped_patterns.is_empty() {
+    let mut scoped_models = if scoped_patterns.is_empty() {
         Vec::new()
     } else {
         pi::app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
@@ -162,14 +160,58 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
 
     let mut session = Box::pin(Session::new(&cli, &config)).await?;
 
-    let selection = pi::app::select_model_and_thinking(
-        &cli,
-        &config,
-        &session,
-        &model_registry,
-        &scoped_models,
-        &global_dir,
-    )?;
+    let (selection, resolved_key) = loop {
+        scoped_models = if scoped_patterns.is_empty() {
+            Vec::new()
+        } else {
+            pi::app::resolve_model_scope(&scoped_patterns, &model_registry, cli.api_key.is_some())
+        };
+
+        let selection = match pi::app::select_model_and_thinking(
+            &cli,
+            &config,
+            &session,
+            &model_registry,
+            &scoped_models,
+            &global_dir,
+        ) {
+            Ok(selection) => selection,
+            Err(err) => {
+                if let Some(startup) = err.downcast_ref::<StartupError>() {
+                    if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                        if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
+                            model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+                            if let Some(error) = model_registry.error() {
+                                eprintln!("Warning: models.json error: {error}");
+                            }
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                }
+                return Err(err);
+            }
+        };
+
+        match pi::app::resolve_api_key(&auth, &cli, &selection.model_entry) {
+            Ok(key) => break (selection, key),
+            Err(err) => {
+                if let Some(startup) = err.downcast_ref::<StartupError>() {
+                    if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
+                        if run_first_time_setup(startup, &mut auth, &mut cli, &models_path).await? {
+                            model_registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+                            if let Some(error) = model_registry.error() {
+                                eprintln!("Warning: models.json error: {error}");
+                            }
+                            continue;
+                        }
+                        return Ok(());
+                    }
+                }
+                return Err(err);
+            }
+        }
+    };
 
     pi::app::update_session_for_selection(&mut session, &selection);
 
@@ -177,8 +219,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         eprintln!("Warning: {message}");
     }
 
-    let resolved_key = pi::app::resolve_api_key(&auth, &cli, &selection.model_entry)?;
-
+    let enabled_tools = cli.enabled_tools();
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
     } else {
@@ -461,6 +502,148 @@ fn list_models(registry: &ModelRegistry, pattern: Option<&str>) {
     print_model_table(&rows);
 }
 
+#[derive(Clone, Copy)]
+struct ProviderChoice {
+    id: &'static str,
+    label: &'static str,
+    env: &'static str,
+}
+
+const PROVIDER_CHOICES: [ProviderChoice; 3] = [
+    ProviderChoice {
+        id: "anthropic",
+        label: "Anthropic (Claude)",
+        env: "ANTHROPIC_API_KEY",
+    },
+    ProviderChoice {
+        id: "openai",
+        label: "OpenAI",
+        env: "OPENAI_API_KEY",
+    },
+    ProviderChoice {
+        id: "google",
+        label: "Google Gemini",
+        env: "GOOGLE_API_KEY",
+    },
+];
+
+fn provider_from_token(token: &str) -> Option<ProviderChoice> {
+    let normalized = token.trim().to_lowercase();
+    match normalized.as_str() {
+        "1" | "anthropic" | "claude" => Some(PROVIDER_CHOICES[0]),
+        "2" | "openai" | "gpt" => Some(PROVIDER_CHOICES[1]),
+        "3" | "google" | "gemini" => Some(PROVIDER_CHOICES[2]),
+        _ => None,
+    }
+}
+
+async fn run_first_time_setup(
+    startup_error: &StartupError,
+    auth: &mut AuthStorage,
+    cli: &mut cli::Cli,
+    models_path: &Path,
+) -> Result<bool> {
+    let console = PiConsole::new();
+
+    console.render_rule(Some("Welcome to Pi"));
+    match startup_error {
+        StartupError::NoModelsAvailable { .. } => {
+            console.print_markup("[bold]No models are configured yet.[/]\n");
+        }
+        StartupError::MissingApiKey { provider } => {
+            console.print_markup(&format!(
+                "[bold]Missing API key for provider:[/] {provider}\n"
+            ));
+        }
+    }
+    console.print_markup("Let’s add your first API key.\n\n");
+
+    let provider_hint = match startup_error {
+        StartupError::MissingApiKey { provider } => provider_from_token(provider),
+        StartupError::NoModelsAvailable { .. } => None,
+    };
+
+    console.print_markup("[bold]Choose a provider:[/]\n");
+    for (idx, provider) in PROVIDER_CHOICES.iter().enumerate() {
+        let is_default = provider_hint.is_some_and(|hint| hint.id == provider.id);
+        let default_marker = if is_default { " [dim](default)[/]" } else { "" };
+        console.print_markup(&format!(
+            "  [cyan]{})[/] {}  [dim]{}[/]{}\n",
+            idx + 1,
+            provider.label,
+            provider.env,
+            default_marker
+        ));
+    }
+    console.print_markup("  [cyan]4)[/] Custom provider via models.json\n");
+    console.print_markup("  [cyan]5)[/] Exit setup\n\n");
+
+    let provider = loop {
+        let prompt = provider_hint.map_or_else(
+            || "Select 1-5: ".to_string(),
+            |default_provider| format!("Select 1-5 (Enter for {}): ", default_provider.label),
+        );
+        let Some(input) = prompt_line(&prompt)? else {
+            console.render_warning("Setup cancelled (no input).");
+            return Ok(false);
+        };
+        let normalized = input.trim().to_lowercase();
+        if normalized.is_empty() {
+            if let Some(default_provider) = provider_hint {
+                break default_provider;
+            }
+            continue;
+        }
+        if normalized == "4" || normalized == "custom" || normalized == "models" {
+            console.render_info(&format!(
+                "Create models.json at {} and restart Pi.",
+                models_path.display()
+            ));
+            return Ok(false);
+        }
+        if normalized == "5" || normalized == "q" || normalized == "quit" || normalized == "exit" {
+            console.render_warning("Setup cancelled.");
+            return Ok(false);
+        }
+        if let Some(provider) = provider_from_token(&normalized) {
+            break provider;
+        }
+        console.render_warning("Unrecognized choice. Please try again.");
+    };
+
+    console.print_markup("Paste your API key (input will be visible):\n");
+    let Some(raw_key) = prompt_line("API key: ")? else {
+        console.render_warning("Setup cancelled (no input).");
+        return Ok(false);
+    };
+    let key = raw_key.trim();
+    if key.is_empty() {
+        console.render_warning("No API key entered. Setup cancelled.");
+        return Ok(false);
+    }
+
+    auth.set(
+        provider.id,
+        AuthCredential::ApiKey {
+            key: key.to_string(),
+        },
+    );
+    auth.save_async().await?;
+
+    if cli.provider.as_deref() != Some(provider.id) {
+        cli.provider = Some(provider.id.to_string());
+        cli.model = None;
+    }
+
+    console.render_success(&format!(
+        "Saved {label} API key to {path}",
+        label = provider.label,
+        path = Config::auth_path().display()
+    ));
+    console.render_info("Continuing startup...");
+    Ok(true)
+}
+
 fn filter_models_by_pattern(models: Vec<ModelEntry>, pattern: &str) -> Vec<ModelEntry> {
     models
         .into_iter()
@@ -547,6 +730,17 @@ fn print_model_table(rows: &[(String, String, String, String, String, String)]) 
             "{provider:<provider_w$}  {model:<model_w$}  {context:<context_w$}  {max_out:<max_out_w$}  {thinking:<thinking_w$}  {images:<images_w$}"
         );
     }
+}
+
+fn prompt_line(prompt: &str) -> Result<Option<String>> {
+    print!("{prompt}");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    let bytes = io::stdin().read_line(&mut input)?;
+    if bytes == 0 {
+        return Ok(None);
+    }
+    Ok(Some(input.trim().to_string()))
 }
 
 async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<PathBuf> {

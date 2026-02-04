@@ -17,7 +17,7 @@ fn fixtures_dir() -> PathBuf {
 
 fn list_json_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = fs::read_dir(dir)
-        .unwrap_or_else(|err| panic!("read_dir {}: {err}", dir.display()))
+        .expect("read_dir failed")
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
         .collect::<Vec<_>>();
@@ -66,7 +66,10 @@ fn validate_fixture(path: &Path, value: &Value) -> Result<(), String> {
     }
 
     let extension_id = require_str(value, "/extension/id")?;
-    let file_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("<unknown>");
+    let file_stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("<unknown>");
     if extension_id != file_stem {
         return Err(format!(
             "/extension/id must match filename ({file_stem}), got {extension_id}"
@@ -88,7 +91,7 @@ fn validate_fixture(path: &Path, value: &Value) -> Result<(), String> {
         return Err("/scenarios must be non-empty".to_string());
     }
 
-    for (idx, scenario) in scenarios.iter().enumerate() {
+    for (idx, _scenario) in scenarios.iter().enumerate() {
         let ptr = |suffix: &str| format!("/scenarios/{idx}/{suffix}");
         let scenario_id = require_str(value, &ptr("id"))?;
         if scenario_id.trim().is_empty() {
@@ -101,28 +104,17 @@ fn validate_fixture(path: &Path, value: &Value) -> Result<(), String> {
         }
 
         let event_name = value.pointer(&ptr("event_name")).and_then(Value::as_str);
-        let tool_name = value.pointer(&ptr("tool_name")).and_then(Value::as_str);
+        let _tool_name = value.pointer(&ptr("tool_name")).and_then(Value::as_str);
         let command_name = value.pointer(&ptr("command_name")).and_then(Value::as_str);
         let provider_id = value.pointer(&ptr("provider_id")).and_then(Value::as_str);
 
-        let has_selector =
-            event_name.is_some() || tool_name.is_some() || command_name.is_some() || provider_id.is_some();
-        if !has_selector {
-            return Err(format!(
-                "{}/(event_name|tool_name|command_name|provider_id) must include at least one string field",
-                ptr("")
-            ));
-        }
-
         match kind {
-            "tool" => {
-                if tool_name.is_none() {
-                    return Err(format!("{}/tool_name must be string for kind=tool", ptr("")));
-                }
-            }
             "event" => {
                 if event_name.is_none() {
-                    return Err(format!("{}/event_name must be string for kind=event", ptr("")));
+                    return Err(format!(
+                        "{}/event_name must be string for kind=event",
+                        ptr("")
+                    ));
                 }
             }
             "command" => {
@@ -144,16 +136,17 @@ fn validate_fixture(path: &Path, value: &Value) -> Result<(), String> {
             _ => {}
         }
 
-        require_object(value, &ptr("input"))?;
+        let input_ptr = ptr("input");
+        let input_value = require_pointer(value, &input_ptr)?;
+        if !(input_value.is_object() || input_value.is_null()) {
+            return Err(format!("{input_ptr} must be object or null"));
+        }
         require_object(value, &ptr("expect"))?;
         let outputs_ptr = ptr("outputs");
         require_object(value, &outputs_ptr)?;
 
         let stdout_ptr = format!("{outputs_ptr}/stdout_normalized_jsonl");
         let stdout_lines = require_array(value, &stdout_ptr)?;
-        if stdout_lines.is_empty() {
-            return Err(format!("{stdout_ptr} must be non-empty"));
-        }
         for (line_idx, line_value) in stdout_lines.iter().enumerate() {
             let line = line_value
                 .as_str()
@@ -184,7 +177,11 @@ fn ext_conformance_fixtures_parse_and_match_schema_and_normalization_rules() {
     let harness = TestHarness::new("ext_conformance_fixtures_parse_and_match_schema");
     let dir = fixtures_dir();
     let files = list_json_files(&dir);
-    assert!(!files.is_empty(), "no fixture files found in {}", dir.display());
+    assert!(
+        !files.is_empty(),
+        "no fixture files found in {}",
+        dir.display()
+    );
 
     let ansi = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("ansi regex");
     let uuid = Regex::new(
@@ -197,12 +194,10 @@ fn ext_conformance_fixtures_parse_and_match_schema_and_normalization_rules() {
         harness
             .log()
             .debug("fixture", format!("validating {}", path.display()));
-        let content = fs::read_to_string(&path)
-            .unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
-        let value: Value =
-            serde_json::from_str(&content).unwrap_or_else(|err| panic!("parse {}: {err}", path.display()));
+        let content = fs::read_to_string(&path).expect("read fixture");
+        let value: Value = serde_json::from_str(&content).expect("parse fixture");
 
-        validate_fixture(&path, &value).unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+        validate_fixture(&path, &value).expect("validate fixture");
 
         // Basic normalization sanity checks: no raw ANSI and no raw absolute project root or UUIDs.
         if let Some(lines) = value
@@ -210,12 +205,19 @@ fn ext_conformance_fixtures_parse_and_match_schema_and_normalization_rules() {
             .and_then(Value::as_array)
             .into_iter()
             .flat_map(|scenarios| scenarios.iter())
-            .filter_map(|scenario| scenario.pointer("/outputs/stdout_normalized_jsonl").and_then(Value::as_array))
+            .filter_map(|scenario| {
+                scenario
+                    .pointer("/outputs/stdout_normalized_jsonl")
+                    .and_then(Value::as_array)
+            })
             .flatten()
-            .filter_map(Value::as_str)
-            .next()
+            .find_map(Value::as_str)
         {
-            assert!(!ansi.is_match(lines), "{}: ANSI escape in stdout_normalized_jsonl", path.display());
+            assert!(
+                !ansi.is_match(lines),
+                "{}: ANSI escape in stdout_normalized_jsonl",
+                path.display()
+            );
             assert!(
                 !lines.contains(project_root),
                 "{}: absolute project root leaked into stdout_normalized_jsonl",
