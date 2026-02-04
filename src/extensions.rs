@@ -3694,9 +3694,10 @@ async fn prompt_capability_once(
 #[allow(clippy::future_not_send)]
 async fn resolve_js_hostcall_policy_decision(
     host: &JsRuntimeHost,
-    extension_key: &str,
+    extension_id: Option<&str>,
     required: &str,
 ) -> (PolicyDecision, String, String) {
+    const UNKNOWN_EXTENSION_ID: &str = "<unknown>";
     let PolicyCheck {
         mut decision,
         capability,
@@ -3707,26 +3708,31 @@ async fn resolve_js_hostcall_policy_decision(
         return (decision, reason, capability);
     }
 
-    if let Some(allow) = host
-        .manager
-        .cached_policy_prompt_decision(extension_key, &capability)
-    {
-        decision = if allow {
-            PolicyDecision::Allow
-        } else {
-            PolicyDecision::Deny
-        };
-        reason = if allow {
-            "prompt_cache_allow".to_string()
-        } else {
-            "prompt_cache_deny".to_string()
-        };
-        return (decision, reason, capability);
+    if let Some(extension_id) = extension_id {
+        if let Some(allow) = host
+            .manager
+            .cached_policy_prompt_decision(extension_id, &capability)
+        {
+            decision = if allow {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            };
+            reason = if allow {
+                "prompt_cache_allow".to_string()
+            } else {
+                "prompt_cache_deny".to_string()
+            };
+            return (decision, reason, capability);
+        }
     }
 
-    let allow = prompt_capability_once(&host.manager, extension_key, &capability).await;
-    host.manager
-        .cache_policy_prompt_decision(extension_key, &capability, allow);
+    let prompt_extension_id = extension_id.unwrap_or(UNKNOWN_EXTENSION_ID);
+    let allow = prompt_capability_once(&host.manager, prompt_extension_id, &capability).await;
+    if let Some(extension_id) = extension_id {
+        host.manager
+            .cache_policy_prompt_decision(extension_id, &capability, allow);
+    }
     decision = if allow {
         PolicyDecision::Allow
     } else {
@@ -3874,11 +3880,8 @@ async fn dispatch_hostcall_allowed(
 
 #[allow(clippy::future_not_send)]
 async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
-    const UNKNOWN_EXTENSION_ID: &str = "<unknown>";
-
     let call_id = request.call_id.clone();
     let extension_id = request.extension_id.clone();
-    let extension_key = extension_id.as_deref().unwrap_or(UNKNOWN_EXTENSION_ID);
     let method = request.method();
     let required = request.required_capability();
     let params_hash = request.params_hash();
@@ -3895,7 +3898,7 @@ async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> Ho
     );
 
     let (decision, reason, capability) =
-        resolve_js_hostcall_policy_decision(host, extension_key, &required).await;
+        resolve_js_hostcall_policy_decision(host, extension_id.as_deref(), &required).await;
     log_js_policy_decision(
         &call_id,
         extension_id.as_deref(),
@@ -4150,6 +4153,24 @@ async fn dispatch_hostcall_session(
             .map_err(|err| Error::extension(format!("Serialize entries: {err}"))),
         "get_branch" | "getbranch" => serde_json::to_value(session.get_branch().await)
             .map_err(|err| Error::extension(format!("Serialize branch: {err}"))),
+        "get_file" | "getfile" => {
+            let state = session.get_state().await;
+            let file = state
+                .get("sessionFile")
+                .or_else(|| state.get("session_file"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(file)
+        }
+        "get_name" | "getname" => {
+            let state = session.get_state().await;
+            let name = state
+                .get("sessionName")
+                .or_else(|| state.get("session_name"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(name)
+        }
         "set_name" | "setname" => {
             let name = payload
                 .get("name")
@@ -4157,6 +4178,13 @@ async fn dispatch_hostcall_session(
                 .unwrap_or_default()
                 .to_string();
             session.set_name(name).await.map(|()| Value::Null)
+        }
+        "append_message" | "appendmessage" => {
+            let message_value = payload.get("message").cloned().unwrap_or(payload);
+            match serde_json::from_value(message_value) {
+                Ok(message) => session.append_message(message).await.map(|()| Value::Null),
+                Err(err) => Err(Error::extension(format!("Parse message: {err}"))),
+            }
         }
         "append_entry" | "appendentry" => {
             let custom_type = payload
