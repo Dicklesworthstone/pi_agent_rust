@@ -3692,74 +3692,89 @@ async fn prompt_capability_once(
 }
 
 #[allow(clippy::future_not_send)]
-#[allow(clippy::too_many_lines)]
-async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
-    const UNKNOWN_EXTENSION_ID: &str = "<unknown>";
+async fn resolve_js_hostcall_policy_decision(
+    host: &JsRuntimeHost,
+    extension_key: &str,
+    required: &str,
+) -> (PolicyDecision, String, String) {
+    let PolicyCheck {
+        mut decision,
+        capability,
+        mut reason,
+    } = host.policy.evaluate(required);
 
-    let call_id = request.call_id.clone();
-    let extension_id = request.extension_id.clone();
-    let extension_key = extension_id.as_deref().unwrap_or(UNKNOWN_EXTENSION_ID);
-    let method = request.method();
-    let required = request.required_capability();
-    let params_hash = request.params_hash();
-    let call_timeout_ms = js_hostcall_timeout_ms(&request);
-    let started_at = Instant::now();
+    if decision != PolicyDecision::Prompt {
+        return (decision, reason, capability);
+    }
 
+    if let Some(allow) = host
+        .manager
+        .cached_policy_prompt_decision(extension_key, &capability)
+    {
+        decision = if allow {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny
+        };
+        reason = if allow {
+            "prompt_cache_allow".to_string()
+        } else {
+            "prompt_cache_deny".to_string()
+        };
+        return (decision, reason, capability);
+    }
+
+    let allow = prompt_capability_once(&host.manager, extension_key, &capability).await;
+    host.manager
+        .cache_policy_prompt_decision(extension_key, &capability, allow);
+    decision = if allow {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::Deny
+    };
+    reason = if allow {
+        "prompt_user_allow".to_string()
+    } else {
+        "prompt_user_deny".to_string()
+    };
+    (decision, reason, capability)
+}
+
+fn log_js_hostcall_start(
+    call_id: &str,
+    extension_id: Option<&str>,
+    required: &str,
+    method: &str,
+    params_hash: &str,
+    call_timeout_ms: Option<u64>,
+) {
     tracing::info!(
         event = "host_call.start",
         runtime = "js",
         call_id = %call_id,
-        extension_id = ?extension_id.as_deref(),
+        extension_id = ?extension_id,
         capability = %required,
         method = %method,
         params_hash = %params_hash,
         timeout_ms = call_timeout_ms,
         "Hostcall start"
     );
+}
 
-    let policy_check = host.policy.evaluate(&required);
-    let mut decision = policy_check.decision.clone();
-    let mut reason = policy_check.reason.clone();
-    let capability = policy_check.capability;
-
-    if decision == PolicyDecision::Prompt {
-        if let Some(allow) = host
-            .manager
-            .cached_policy_prompt_decision(extension_key, &capability)
-        {
-            decision = if allow {
-                PolicyDecision::Allow
-            } else {
-                PolicyDecision::Deny
-            };
-            reason = if allow {
-                "prompt_cache_allow".to_string()
-            } else {
-                "prompt_cache_deny".to_string()
-            };
-        } else {
-            let allow = prompt_capability_once(&host.manager, extension_key, &capability).await;
-            host.manager
-                .cache_policy_prompt_decision(extension_key, &capability, allow);
-            decision = if allow {
-                PolicyDecision::Allow
-            } else {
-                PolicyDecision::Deny
-            };
-            reason = if allow {
-                "prompt_user_allow".to_string()
-            } else {
-                "prompt_user_deny".to_string()
-            };
-        }
-    }
-
-    if decision == PolicyDecision::Allow {
+fn log_js_policy_decision(
+    call_id: &str,
+    extension_id: Option<&str>,
+    capability: &str,
+    decision: &PolicyDecision,
+    reason: &str,
+    params_hash: &str,
+) {
+    if *decision == PolicyDecision::Allow {
         tracing::info!(
             event = "policy.decision",
             runtime = "js",
             call_id = %call_id,
-            extension_id = ?extension_id.as_deref(),
+            extension_id = ?extension_id,
             capability = %capability,
             decision = ?decision,
             reason = %reason,
@@ -3771,7 +3786,7 @@ async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> Ho
             event = "policy.decision",
             runtime = "js",
             call_id = %call_id,
-            extension_id = ?extension_id.as_deref(),
+            extension_id = ?extension_id,
             capability = %capability,
             decision = ?decision,
             reason = %reason,
@@ -3779,44 +3794,18 @@ async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> Ho
             "Hostcall denied by policy"
         );
     }
+}
 
-    let outcome = if decision == PolicyDecision::Allow {
-        let HostcallRequest {
-            call_id: request_call_id,
-            kind,
-            payload,
-            ..
-        } = request;
-
-        match kind {
-            HostcallKind::Tool { name } => {
-                dispatch_hostcall_tool(&host.tools, &request_call_id, &name, payload).await
-            }
-            HostcallKind::Exec { cmd } => {
-                dispatch_hostcall_exec(&request_call_id, &cmd, payload).await
-            }
-            HostcallKind::Http => {
-                dispatch_hostcall_http(&request_call_id, &host.http, payload).await
-            }
-            HostcallKind::Session { op } => {
-                dispatch_hostcall_session(&request_call_id, &host.manager, &op, payload).await
-            }
-            HostcallKind::Ui { op } => {
-                dispatch_hostcall_ui(&request_call_id, &host.manager, &op, payload).await
-            }
-            HostcallKind::Events { op } => {
-                dispatch_hostcall_events(&request_call_id, &host.manager, &op, payload).await
-            }
-        }
-    } else {
-        HostcallOutcome::Error {
-            code: "denied".to_string(),
-            message: format!("Capability '{capability}' denied by policy ({reason})"),
-        }
-    };
-
-    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let (is_error, error_code) = match &outcome {
+fn log_js_hostcall_end(
+    call_id: &str,
+    extension_id: Option<&str>,
+    required: &str,
+    method: &str,
+    params_hash: &str,
+    duration_ms: u64,
+    outcome: &HostcallOutcome,
+) {
+    let (is_error, error_code) = match outcome {
         HostcallOutcome::Success(_) => (false, None),
         HostcallOutcome::Error { code, .. } => (true, Some(code.as_str())),
     };
@@ -3826,7 +3815,7 @@ async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> Ho
             event = "host_call.end",
             runtime = "js",
             call_id = %call_id,
-            extension_id = ?extension_id.as_deref(),
+            extension_id = ?extension_id,
             capability = %required,
             method = %method,
             params_hash = %params_hash,
@@ -3839,7 +3828,7 @@ async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> Ho
             event = "host_call.end",
             runtime = "js",
             call_id = %call_id,
-            extension_id = ?extension_id.as_deref(),
+            extension_id = ?extension_id,
             capability = %required,
             method = %method,
             params_hash = %params_hash,
@@ -3847,6 +3836,94 @@ async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> Ho
             "Hostcall end (success)"
         );
     }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall_allowed(
+    host: &JsRuntimeHost,
+    request: HostcallRequest,
+) -> HostcallOutcome {
+    let HostcallRequest {
+        call_id,
+        kind,
+        payload,
+        ..
+    } = request;
+
+    match (kind, payload) {
+        (HostcallKind::Tool { name }, payload) => {
+            dispatch_hostcall_tool(&host.tools, &call_id, &name, payload).await
+        }
+        (HostcallKind::Exec { cmd }, payload) => {
+            dispatch_hostcall_exec(&call_id, &cmd, payload).await
+        }
+        (HostcallKind::Http, payload) => {
+            dispatch_hostcall_http(&call_id, &host.http, payload).await
+        }
+        (HostcallKind::Session { op }, payload) => {
+            dispatch_hostcall_session(&call_id, &host.manager, &op, payload).await
+        }
+        (HostcallKind::Ui { op }, payload) => {
+            dispatch_hostcall_ui(&call_id, &host.manager, &op, payload).await
+        }
+        (HostcallKind::Events { op }, payload) => {
+            dispatch_hostcall_events(&call_id, &host.manager, &op, payload).await
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
+    const UNKNOWN_EXTENSION_ID: &str = "<unknown>";
+
+    let call_id = request.call_id.clone();
+    let extension_id = request.extension_id.clone();
+    let extension_key = extension_id.as_deref().unwrap_or(UNKNOWN_EXTENSION_ID);
+    let method = request.method();
+    let required = request.required_capability();
+    let params_hash = request.params_hash();
+    let call_timeout_ms = js_hostcall_timeout_ms(&request);
+    let started_at = Instant::now();
+
+    log_js_hostcall_start(
+        &call_id,
+        extension_id.as_deref(),
+        &required,
+        method,
+        &params_hash,
+        call_timeout_ms,
+    );
+
+    let (decision, reason, capability) =
+        resolve_js_hostcall_policy_decision(host, extension_key, &required).await;
+    log_js_policy_decision(
+        &call_id,
+        extension_id.as_deref(),
+        &capability,
+        &decision,
+        &reason,
+        &params_hash,
+    );
+
+    let outcome = if decision == PolicyDecision::Allow {
+        dispatch_hostcall_allowed(host, request).await
+    } else {
+        HostcallOutcome::Error {
+            code: "denied".to_string(),
+            message: format!("Capability '{capability}' denied by policy ({reason})"),
+        }
+    };
+
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    log_js_hostcall_end(
+        &call_id,
+        extension_id.as_deref(),
+        &required,
+        method,
+        &params_hash,
+        duration_ms,
+        &outcome,
+    );
 
     outcome
 }
