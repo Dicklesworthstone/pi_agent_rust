@@ -20,6 +20,12 @@
   <img src="https://img.shields.io/badge/rust-2024%20edition-orange?logo=rust" alt="Rust 2024">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT">
   <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen" alt="No Unsafe Code">
+  <a href="https://github.com/Dicklesworthstone/pi_agent_rust/actions/workflows/ci.yml">
+    <img src="https://github.com/Dicklesworthstone/pi_agent_rust/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI">
+  </a>
+  <a href="https://github.com/Dicklesworthstone/pi_agent_rust/actions/workflows/bench.yml">
+    <img src="https://github.com/Dicklesworthstone/pi_agent_rust/actions/workflows/bench.yml/badge.svg?branch=main" alt="Bench">
+  </a>
 </p>
 
 ---

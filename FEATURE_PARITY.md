@@ -1,7 +1,7 @@
 # Feature Parity: pi_agent_rust vs Pi Agent (TypeScript)
 
 > **Purpose:** Authoritative single-source-of-truth for implementation status.
-> **Last Updated:** 2026-02-03 (RPC mode parity + session stats; clippy/tests green)
+> **Last Updated:** 2026-02-04 (Extensions runtime audit; docs refreshed)
 
 ## Status Legend
 
@@ -25,7 +25,7 @@
 | **Session Management** | 10 | 0 | 0 | 0 | 10 |
 | **CLI** | 10 | 0 | 0 | 0 | 10 |
 | **Resources & Customization** | 6 | 1 | 1 | 0 | 8 |
-| **Extensions Runtime** | 0 | 4 | 8 | 0 | 12 |
+| **Extensions Runtime** | 8 | 3 | 1 | 0 | 12 |
 | **TUI** | 18 | 0 | 0 | 2 | 20 |
 | **Configuration** | 2 | 0 | 0 | 0 | 2 |
 | **Authentication** | 6 | 1 | 1 | 0 | 8 |
@@ -194,18 +194,18 @@
 
 | Feature | Status | Rust Location | Tests | Notes |
 |---------|--------|---------------|-------|-------|
-| Extension discovery | 🔶 | `src/extensions.rs` | 2 | Protocol scaffold only (`bd-1e0`) |
-| PiJS runtime (QuickJS) | ❌ | - | - | Runtime tracked in `bd-btq` (see `EXTENSIONS.md`) |
-| registerTool API | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
-| registerCommand API | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
-| Event handlers (onXxx) | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
-| ctx.ui dialogs (select/confirm/input/editor) | 🔶 | `src/rpc.rs` | - | RPC protocol exists; runtime missing (`bd-btq`) |
-| ctx.ui updates (notify/setStatus/setWidget) | 🔶 | `src/rpc.rs` | - | RPC protocol exists; runtime missing (`bd-btq`) |
-| ctx.session access | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
-| Extension logging | ❌ | - | - | Blocked by PiJS runtime (`bd-btq`) |
-| Hostcall ABI (host_call/host_result) | ❌ | - | - | Spec in `EXTENSIONS.md` (`bd-37z`); impl blocked by PiJS runtime (`bd-btq`) |
-| Capability manifest + policy | 🔶 | `src/extensions.rs` | 2 | Parsing + policy eval implemented; modes/audit logging tracked in `bd-34f` |
-| MCP server support (Tier C) | ❌ | - | - | Deferred; prioritize PiJS runtime (`bd-btq`) |
+| Extension discovery (paths + packages) | ✅ | `src/package_manager.rs`, `src/resources.rs` | Unit | Resolves `extensions/` sources from settings/auto-discovery/packages/CLI |
+| Extension protocol (v1) + JSON schema | ✅ | `src/extensions.rs`, `docs/schema/extension_protocol.json` | Unit + `tests/extensions_manifest.rs` | `ExtensionMessage::parse_and_validate` + schema compilation tests |
+| Compatibility scanner (Node API audit) | ✅ | `src/extensions.rs`, `src/package_manager.rs` | `tests/ext_conformance_artifacts.rs` | Emits compat ledgers when `PI_EXT_COMPAT_SCAN` is enabled |
+| Capability manifest + policy | ✅ | `src/extensions.rs` | Unit + `tests/extensions_manifest.rs` | `strict/prompt/permissive` + scoped manifests (`pi.ext.cap.v1`) |
+| FS connector (scoped, anti-escape) | ✅ | `src/extensions.rs` | Unit | Path traversal + symlink escape hardening |
+| HTTP connector (policy-gated) | ✅ | `src/connectors/http.rs` | Unit | TLS/allowlist/denylist/size/timeouts |
+| PiJS runtime (QuickJS) | ✅ | `src/extensions_js.rs` | Unit + `tests/event_loop_conformance.rs` | Deterministic scheduler + Promise bridge + budgets/timeouts |
+| Promise hostcall bridge (pi.* → queue → completion) | ✅ | `src/extensions_js.rs` | Unit | `pi.tool/exec/http/session/ui/events` + `setTimeout/clearTimeout` |
+| Hostcall ABI (host_call/host_result protocol) | 🔶 | `src/extensions.rs` | Unit | Protocol types + validation exist; end-to-end dispatch wiring still pending |
+| Extension UI bridge (select/confirm/input/editor) | 🔶 | `src/extensions.rs`, `src/interactive.rs`, `src/rpc.rs` | Unit | UI request/response plumbing exists; runtime dispatch still pending |
+| Extension session API (get_state/messages/set_name) | 🔶 | `src/extensions.rs`, `src/interactive.rs` | - | Trait + interactive impl exist; runtime dispatch still pending |
+| JS extension execution + registration (tools/commands/hooks) | ❌ | - | - | Loader + `registerTool`/slash command execution/event hooks not implemented yet |
 
 ---
 

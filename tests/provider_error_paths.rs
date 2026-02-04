@@ -23,9 +23,10 @@ fn context_for(prompt: &str) -> Context {
 }
 
 fn options_with_key(key: &str) -> StreamOptions {
-    let mut options = StreamOptions::default();
-    options.api_key = Some(key.to_string());
-    options
+    StreamOptions {
+        api_key: Some(key.to_string()),
+        ..Default::default()
+    }
 }
 
 #[test]

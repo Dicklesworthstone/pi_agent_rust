@@ -1494,6 +1494,7 @@ mod retry_tests {
     }
 
     #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
     impl Provider for FlakyProvider {
         fn name(&self) -> &str {
             "test-provider"

@@ -29,6 +29,7 @@ pub struct Config {
     // Terminal Behavior
     pub quiet_startup: Option<bool>,
     pub collapse_changelog: Option<bool>,
+    #[serde(alias = "doubleEscapeAction")]
     pub double_escape_action: Option<String>,
     pub editor_padding_x: Option<u32>,
     pub autocomplete_max_visible: Option<u32>,

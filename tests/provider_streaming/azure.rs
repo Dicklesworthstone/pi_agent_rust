@@ -65,11 +65,12 @@ fn build_context(scenario: &Scenario) -> Context {
 }
 
 fn build_options(scenario: &Scenario, api_key: String) -> StreamOptions {
-    let mut options = StreamOptions::default();
-    options.api_key = Some(api_key);
-    options.max_tokens = Some(scenario.options.max_tokens);
-    options.temperature = scenario.options.temperature;
-    options
+    StreamOptions {
+        api_key: Some(api_key),
+        max_tokens: Some(scenario.options.max_tokens),
+        temperature: scenario.options.temperature,
+        ..Default::default()
+    }
 }
 
 async fn run_scenario(scenario: Scenario) {

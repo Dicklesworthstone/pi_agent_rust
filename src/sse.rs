@@ -275,6 +275,119 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use futures::stream;
+    use proptest::prelude::*;
+
+    #[derive(Debug, Clone)]
+    struct GeneratedEvent {
+        event: Option<String>,
+        id: Option<String>,
+        retry: Option<u32>,
+        data: Vec<String>,
+        comment: Option<String>,
+    }
+
+    impl GeneratedEvent {
+        fn render(&self) -> String {
+            let mut out = String::new();
+            if let Some(comment) = &self.comment {
+                out.push(':');
+                out.push_str(comment);
+                out.push('\n');
+            }
+            if let Some(event) = &self.event {
+                out.push_str("event: ");
+                out.push_str(event);
+                out.push('\n');
+            }
+            if let Some(id) = &self.id {
+                out.push_str("id: ");
+                out.push_str(id);
+                out.push('\n');
+            }
+            if let Some(retry) = &self.retry {
+                out.push_str("retry: ");
+                out.push_str(&retry.to_string());
+                out.push('\n');
+            }
+            for line in &self.data {
+                out.push_str("data: ");
+                out.push_str(line);
+                out.push('\n');
+            }
+            out.push('\n');
+            out
+        }
+    }
+
+    fn ascii_line() -> impl Strategy<Value = String> {
+        // ASCII printable range (no CR/LF), keeps chunking safe with byte splits.
+        "[ -~]{0,24}".prop_map(|s| s)
+    }
+
+    fn event_strategy() -> impl Strategy<Value = GeneratedEvent> {
+        (
+            prop::option::of("[a-z_]{1,12}"),
+            prop::option::of("[0-9]{1,8}"),
+            prop::option::of(0u32..5000),
+            prop::collection::vec(ascii_line(), 1..4),
+            prop::option::of(ascii_line()),
+        )
+            .prop_map(|(event, id, retry, data, comment)| GeneratedEvent {
+                event,
+                id,
+                retry,
+                data,
+                comment,
+            })
+    }
+
+    fn render_stream(events: &[GeneratedEvent], terminal_delimiter: bool) -> String {
+        let mut out = String::new();
+        for event in events {
+            out.push_str(&event.render());
+        }
+        if !terminal_delimiter && out.ends_with('\n') {
+            out.pop();
+        }
+        out
+    }
+
+    fn parse_all(input: &str) -> Vec<SseEvent> {
+        let mut parser = SseParser::new();
+        let mut events = parser.feed(input);
+        if let Some(event) = parser.flush() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn parse_chunked(input: &str, chunk_sizes: &[usize]) -> Vec<SseEvent> {
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        let bytes = input.as_bytes();
+        let mut start = 0usize;
+
+        for &size in chunk_sizes {
+            if start >= bytes.len() {
+                break;
+            }
+            let end = (start + size).min(bytes.len());
+            let chunk = std::str::from_utf8(&bytes[start..end]).expect("ascii chunks");
+            events.extend(parser.feed(chunk));
+            start = end;
+        }
+
+        if start < bytes.len() {
+            let chunk = std::str::from_utf8(&bytes[start..]).expect("ascii remainder");
+            events.extend(parser.feed(chunk));
+        }
+
+        if let Some(event) = parser.flush() {
+            events.push(event);
+        }
+
+        events
+    }
 
     #[test]
     fn test_simple_event() {
@@ -461,5 +574,25 @@ data: {"type":"message_stop"}
                 .expect_err("expected utf8 error");
             assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         });
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 64,
+            max_shrink_iters: 200,
+            .. ProptestConfig::default()
+        })]
+
+        #[test]
+        fn sse_chunking_invariant(
+            events in prop::collection::vec(event_strategy(), 1..10),
+            chunk_sizes in prop::collection::vec(1usize..32, 0..20),
+            terminal_delimiter in any::<bool>(),
+        ) {
+            let input = render_stream(&events, terminal_delimiter);
+            let expected = parse_all(&input);
+            let actual = parse_chunked(&input, &chunk_sizes);
+            prop_assert_eq!(actual, expected);
+        }
     }
 }

@@ -25,6 +25,28 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// Current session file format version.
 pub const SESSION_VERSION: u8 = 3;
 
+/// Default base URL for the Pi session share viewer.
+pub const DEFAULT_SHARE_VIEWER_URL: &str = "https://buildwithpi.ai/session/";
+
+fn build_share_viewer_url(base_url: Option<&str>, gist_id: &str) -> String {
+    let base_url = base_url
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_SHARE_VIEWER_URL);
+    format!("{base_url}#{gist_id}")
+}
+
+/// Get the share viewer URL for a gist ID.
+///
+/// Matches legacy Pi Agent semantics:
+/// - Use `PI_SHARE_VIEWER_URL` env var when set and non-empty
+/// - Otherwise fall back to `DEFAULT_SHARE_VIEWER_URL`
+/// - Final URL is `{base}#{gist_id}` (no trailing-slash normalization)
+#[must_use]
+pub fn get_share_viewer_url(gist_id: &str) -> String {
+    let base_url = std::env::var("PI_SHARE_VIEWER_URL").ok();
+    build_share_viewer_url(base_url.as_deref(), gist_id)
+}
+
 // ============================================================================
 // Session
 // ============================================================================
@@ -1711,6 +1733,28 @@ mod tests {
             content: UserContent::Text(text.to_string()),
             timestamp: Some(0),
         }
+    }
+
+    #[test]
+    fn test_get_share_viewer_url_matches_legacy() {
+        assert_eq!(
+            build_share_viewer_url(None, "gist-123"),
+            "https://buildwithpi.ai/session/#gist-123"
+        );
+        assert_eq!(
+            build_share_viewer_url(Some("https://example.com/session/"), "gist-123"),
+            "https://example.com/session/#gist-123"
+        );
+        assert_eq!(
+            build_share_viewer_url(Some("https://example.com/session"), "gist-123"),
+            "https://example.com/session#gist-123"
+        );
+        // Legacy JS uses `process.env.PI_SHARE_VIEWER_URL || DEFAULT`, so empty-string should
+        // fall back to default.
+        assert_eq!(
+            build_share_viewer_url(Some(""), "gist-123"),
+            "https://buildwithpi.ai/session/#gist-123"
+        );
     }
 
     #[test]

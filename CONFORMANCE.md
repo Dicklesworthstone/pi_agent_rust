@@ -89,20 +89,25 @@ Location: `tests/*.rs`
 **Purpose:** End-to-end testing of agent workflows.
 
 **Coverage (current):**
-- `tests/rpc_mode.rs`: RPC protocol sanity (get_state, prompt streaming events, get_session_stats counting tool calls/results)
+- `tests/rpc_mode.rs`: RPC protocol sanity (get_state, prompt streaming events, get_session_stats)
+- `tests/e2e_cli.rs`: headless CLI smoke (print mode, selection paths)
+- `tests/provider_streaming.rs`: VCR-backed provider streaming playback (Anthropic/OpenAI/Gemini/Azure)
+- `tests/compaction.rs`: compaction engine behavior with scripted provider
 
 **Planned:**
 - Fixture-based RPC conformance harness comparing Rust RPC responses/events against the TypeScript reference (`legacy_pi_mono_code/pi-mono/packages/coding-agent/docs/rpc.md`).
 
-### 4. Extension Conformance (Planned)
+### 4. Extension Conformance (Partial)
 
-Location (planned): `tests/ext_conformance/`
+Location: `tests/ext_conformance/` + legacy capture tool `src/bin/pi_legacy_capture.rs`
 
 **Purpose:** Validate extension runtime behavior (registration/events/hostcalls) against the TypeScript reference.
 
-Initial fixture sources:
-- `legacy_pi_mono_code/pi-mono/.pi/extensions/*` (built-in reference extensions)
-- Minimal synthetic fixtures for connector calls (`exec`, `tool`, `http`, `session`)
+Current building blocks:
+- Pinned legacy sample set + vendored artifacts (`tests/ext_conformance/artifacts/*`) with checksum enforcement (`tests/ext_conformance_artifacts.rs`)
+- Legacy capture runner that generates golden fixtures (`src/bin/pi_legacy_capture.rs`)
+- Normalization + diff triage utilities for extension logs (`tests/ext_conformance.rs`)
+- Deterministic PiJS scheduler conformance fixtures (`tests/event_loop_conformance.rs`)
 
 ### Extension Logs (JSONL)
 

@@ -21,7 +21,7 @@ use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, Program, batch, quit};
 use chrono::Utc;
-use crossterm::terminal;
+use crossterm::{cursor, terminal};
 use futures::future::BoxFuture;
 use glamour::{Renderer as MarkdownRenderer, StyleConfig as GlamourStyleConfig};
 use serde_json::{Value, json};
@@ -381,7 +381,8 @@ impl PiApp {
     pub fn set_terminal_size(&mut self, width: usize, height: usize) {
         self.term_width = width.max(1);
         self.term_height = height.max(1);
-        self.input.set_width(self.term_width.saturating_sub(4));
+        self.input
+            .set_width(self.term_width.saturating_sub(4 + self.editor_padding_x));
 
         let viewport_height = self.term_height.saturating_sub(9);
         let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
@@ -549,9 +550,11 @@ impl PiApp {
         };
         let _ = writeln!(output, "\n  {}", self.styles.muted.render(mode_text));
 
+        let padding = " ".repeat(self.editor_padding_x);
+        let line_prefix = format!("  {padding}");
         output.push_str("  ");
         for line in self.input.view().lines() {
-            output.push_str("  ");
+            output.push_str(&line_prefix);
             output.push_str(line);
             output.push('\n');
         }
@@ -1075,6 +1078,18 @@ pub async fn run_interactive(
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
+    let show_hardware_cursor = config.show_hardware_cursor.unwrap_or_else(|| {
+        std::env::var("PI_HARDWARE_CURSOR")
+            .ok()
+            .is_some_and(|val| val == "1")
+    });
+    let mut stdout = std::io::stdout();
+    if show_hardware_cursor {
+        let _ = crossterm::execute!(stdout, cursor::Show);
+    } else {
+        let _ = crossterm::execute!(stdout, cursor::Hide);
+    }
+
     let (event_tx, event_rx) = mpsc::channel::<PiMsg>(1024);
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
 
@@ -1126,6 +1141,7 @@ pub async fn run_interactive(
         .with_input_receiver(ui_rx)
         .run()?;
 
+    let _ = crossterm::execute!(std::io::stdout(), cursor::Show);
     println!("Goodbye!");
     Ok(())
 }
@@ -2238,6 +2254,7 @@ pub struct PiApp {
     // Terminal dimensions
     term_width: usize,
     term_height: usize,
+    editor_padding_x: usize,
 
     // Conversation state
     messages: Vec<ConversationMessage>,
@@ -2292,6 +2309,8 @@ pub struct PiApp {
 
     // Track last Ctrl+C time for double-tap quit detection
     last_ctrlc_time: Option<std::time::Instant>,
+    // Track last Escape time for double-tap tree/fork
+    last_escape_time: Option<std::time::Instant>,
 
     // Autocomplete state
     autocomplete: AutocompleteState,
@@ -2586,6 +2605,9 @@ impl PiApp {
         let theme = Theme::resolve(&config, &cwd);
         let styles = theme.tui_styles();
         let markdown_style = theme.glamour_style_config();
+        let editor_padding_x = config.editor_padding_x.unwrap_or(0).min(3) as usize;
+        let autocomplete_max_visible =
+            config.autocomplete_max_visible.unwrap_or(5).clamp(3, 20) as usize;
 
         // Configure text area for input
         let mut input = TextArea::new();
@@ -2595,7 +2617,7 @@ impl PiApp {
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
         input.set_height(3); // Start with 3 lines
-        input.set_width(term_width.saturating_sub(4));
+        input.set_width(term_width.saturating_sub(4 + editor_padding_x));
         input.max_height = 10; // Allow expansion up to 10 lines
         input.focus();
 
@@ -2678,7 +2700,8 @@ impl PiApp {
 
         // Initialize autocomplete with catalog from resources
         let autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
-        let autocomplete = AutocompleteState::new(cwd.clone(), autocomplete_catalog);
+        let mut autocomplete = AutocompleteState::new(cwd.clone(), autocomplete_catalog);
+        autocomplete.max_visible = autocomplete_max_visible;
 
         let mut app = Self {
             input,
@@ -2692,6 +2715,7 @@ impl PiApp {
             agent_state: AgentState::Idle,
             term_width,
             term_height,
+            editor_padding_x,
             messages,
             current_response: String::new(),
             current_thinking: String::new(),
@@ -2726,6 +2750,7 @@ impl PiApp {
             extensions,
             keybindings,
             last_ctrlc_time: None,
+            last_escape_time: None,
             autocomplete,
             session_picker: None,
             tree_ui: None,
@@ -2788,6 +2813,9 @@ impl PiApp {
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
             // Clear status message on any key press
             self.status_message = None;
+            if key.key_type != KeyType::Esc {
+                self.last_escape_time = None;
+            }
 
             // /tree modal captures all input while active.
             if self.tree_ui.is_some() {
@@ -4785,6 +4813,38 @@ impl PiApp {
         Some(first)
     }
 
+    fn handle_double_escape_action(&mut self) -> (bool, Option<Cmd>) {
+        let now = std::time::Instant::now();
+        if let Some(last_time) = self.last_escape_time {
+            if now.duration_since(last_time) < std::time::Duration::from_millis(500) {
+                self.last_escape_time = None;
+                return (true, self.trigger_double_escape_action());
+            }
+        }
+        self.last_escape_time = Some(now);
+        (false, None)
+    }
+
+    fn trigger_double_escape_action(&mut self) -> Option<Cmd> {
+        let raw_action = self
+            .config
+            .double_escape_action
+            .as_deref()
+            .unwrap_or("tree")
+            .trim();
+        let action = raw_action.to_ascii_lowercase();
+        match action.as_str() {
+            "tree" => self.handle_slash_command(SlashCommand::Tree, ""),
+            "fork" => self.handle_slash_command(SlashCommand::Fork, ""),
+            _ => {
+                self.status_message = Some(format!(
+                    "Unknown doubleEscapeAction: {raw_action} (expected tree or fork)"
+                ));
+                self.handle_slash_command(SlashCommand::Tree, "")
+            }
+        }
+    }
+
     /// Handle an action dispatched from the keybindings layer.
     ///
     /// Returns `Some(Cmd)` if a command should be executed,
@@ -4798,6 +4858,7 @@ impl PiApp {
             AppAction::Interrupt => {
                 // Escape: Abort if processing, otherwise context-dependent
                 if self.agent_state != AgentState::Idle {
+                    self.last_escape_time = None;
                     let restored = self.restore_queued_messages_to_editor(true);
                     if restored > 0 {
                         self.status_message = Some(format!(
@@ -4808,6 +4869,12 @@ impl PiApp {
                         self.status_message = Some("Aborting request...".to_string());
                     }
                     return None;
+                }
+                if key.key_type == KeyType::Esc {
+                    let (triggered, cmd) = self.handle_double_escape_action();
+                    if triggered {
+                        return cmd;
+                    }
                 }
                 // When idle, Escape exits multi-line mode (but does NOT quit)
                 if key.key_type == KeyType::Esc && self.input_mode == InputMode::MultiLine {
@@ -5553,27 +5620,55 @@ impl PiApp {
                     .map(|m| m.content.clone());
 
                 let Some(text) = text else {
-                    self.status_message = Some("No assistant message to copy".to_string());
+                    self.status_message = Some("No agent messages to copy yet.".to_string());
                     return None;
+                };
+
+                let write_fallback = |text: &str| -> std::io::Result<std::path::PathBuf> {
+                    let dir = std::env::temp_dir();
+                    let filename = format!("pi_copy_{}.txt", Utc::now().timestamp_millis());
+                    let path = dir.join(filename);
+                    std::fs::write(&path, text)?;
+                    Ok(path)
                 };
 
                 #[cfg(feature = "clipboard")]
                 {
                     match ClipboardProvider::new()
-                        .and_then(|mut ctx: ClipboardContext| ctx.set_contents(text))
+                        .and_then(|mut ctx: ClipboardContext| ctx.set_contents(text.clone()))
                     {
                         Ok(()) => self.status_message = Some("Copied to clipboard".to_string()),
-                        Err(err) => self.status_message = Some(format!("Clipboard error: {err}")),
+                        Err(err) => match write_fallback(&text) {
+                            Ok(path) => {
+                                self.status_message = Some(format!(
+                                    "Clipboard unavailable ({err}). Wrote to {}",
+                                    path.display()
+                                ));
+                            }
+                            Err(io_err) => {
+                                self.status_message = Some(format!(
+                                    "Clipboard unavailable ({err}); also failed to write fallback file: {io_err}"
+                                ));
+                            }
+                        },
                     }
                 }
 
                 #[cfg(not(feature = "clipboard"))]
                 {
-                    let _ = text;
-                    self.status_message = Some(
-                        "Clipboard support is disabled. Build with: cargo build --features clipboard"
-                            .to_string(),
-                    );
+                    match write_fallback(&text) {
+                        Ok(path) => {
+                            self.status_message = Some(format!(
+                                "Clipboard support not available in this build. Wrote to {}",
+                                path.display()
+                            ));
+                        }
+                        Err(err) => {
+                            self.status_message = Some(format!(
+                                "Clipboard support not available in this build; failed to write fallback file: {err}"
+                            ));
+                        }
+                    }
                 }
 
                 None

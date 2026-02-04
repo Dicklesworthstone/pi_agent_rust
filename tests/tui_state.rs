@@ -453,6 +453,21 @@ fn tui_state_escape_does_nothing_when_idle_single_line() {
 }
 
 #[test]
+fn tui_state_double_escape_opens_tree_by_default() {
+    let harness = TestHarness::new("tui_state_double_escape_opens_tree_by_default");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let step = press_esc(&harness, &mut app);
+    assert!(
+        step.cmd.is_none(),
+        "First Escape should not produce a command"
+    );
+    let step = press_esc(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Session Tree");
+}
+
+#[test]
 fn tui_state_escape_exits_multiline_instead_of_quit() {
     let harness = TestHarness::new("tui_state_escape_exits_multiline_instead_of_quit");
     let mut app = build_app(&harness, Vec::new());
@@ -1237,6 +1252,7 @@ fn tui_state_slash_copy_reports_clipboard_unavailable_or_success() {
     let step = press_enter(&harness, &mut app);
     if !step.after.contains("Copied to clipboard")
         && !step.after.contains("Clipboard support is disabled")
+        && !step.after.contains("Clipboard unavailable")
     {
         fail_step(
             &harness,

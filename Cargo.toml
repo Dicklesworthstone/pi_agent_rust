@@ -108,7 +108,7 @@ name = "system"
 harness = false
 
 [features]
-default = ["image-resize"]
+default = ["image-resize", "clipboard"]
 image-resize = ["image"]
 clipboard = ["dep:clipboard"]
 

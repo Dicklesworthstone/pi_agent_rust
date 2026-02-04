@@ -759,7 +759,7 @@ impl InterruptBudget {
     const fn new(configured: Option<u64>) -> Self {
         Self {
             configured,
-            remaining: std::cell::Cell::new(configured),
+            remaining: std::cell::Cell::new(None),
             tripped: std::cell::Cell::new(false),
         }
     }
@@ -960,7 +960,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             self.interrupt_budget.clear_trip();
             return Error::extension("PiJS execution budget exceeded".to_string());
         }
-        map_js_error(&err)
+        map_js_error(err)
     }
 
     fn map_quickjs_job_error<E: std::fmt::Display>(&self, err: E) -> Error {

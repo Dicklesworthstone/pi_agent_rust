@@ -2966,6 +2966,7 @@ fn find_fd_binary() -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_truncate_head() {
@@ -3064,5 +3065,76 @@ mod tests {
         let result = truncate_line(&long, 500);
         assert!(result.was_truncated);
         assert!(result.text.ends_with("... [truncated]"));
+    }
+
+    fn arbitrary_text() -> impl Strategy<Value = String> {
+        prop::collection::vec(any::<u8>(), 0..512)
+            .prop_map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 64, .. ProptestConfig::default() })]
+
+        #[test]
+        fn proptest_truncate_head_invariants(
+            input in arbitrary_text(),
+            max_lines in 0usize..32,
+            max_bytes in 0usize..256,
+        ) {
+            let result = truncate_head(&input, max_lines, max_bytes);
+
+            prop_assert!(result.output_lines <= max_lines);
+            prop_assert!(result.output_bytes <= max_bytes);
+            prop_assert_eq!(result.output_bytes, result.content.len());
+
+            prop_assert_eq!(result.truncated, result.truncated_by.is_some());
+            prop_assert!(input.starts_with(&result.content));
+
+            let repeat = truncate_head(&result.content, max_lines, max_bytes);
+            prop_assert_eq!(&repeat.content, &result.content);
+
+            if result.truncated {
+                prop_assert!(result.total_lines > max_lines || result.total_bytes > max_bytes);
+            } else {
+                prop_assert_eq!(&result.content, &input);
+                prop_assert!(result.total_lines <= max_lines);
+                prop_assert!(result.total_bytes <= max_bytes);
+            }
+
+            if result.first_line_exceeds_limit {
+                prop_assert!(result.truncated);
+                prop_assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+                prop_assert!(result.content.is_empty());
+            }
+        }
+
+        #[test]
+        fn proptest_truncate_tail_invariants(
+            input in arbitrary_text(),
+            max_lines in 0usize..32,
+            max_bytes in 0usize..256,
+        ) {
+            let result = truncate_tail(&input, max_lines, max_bytes);
+
+            prop_assert!(result.output_lines <= max_lines);
+            prop_assert!(result.output_bytes <= max_bytes);
+            prop_assert_eq!(result.output_bytes, result.content.len());
+
+            prop_assert_eq!(result.truncated, result.truncated_by.is_some());
+            prop_assert!(input.ends_with(&result.content));
+
+            let repeat = truncate_tail(&result.content, max_lines, max_bytes);
+            prop_assert_eq!(&repeat.content, &result.content);
+
+            if result.last_line_partial {
+                prop_assert!(result.truncated);
+                prop_assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
+                prop_assert_eq!(result.output_lines, 1);
+                prop_assert!(input
+                    .split('\n')
+                    .next_back()
+                    .is_some_and(|line| line.ends_with(&result.content)));
+            }
+        }
     }
 }
