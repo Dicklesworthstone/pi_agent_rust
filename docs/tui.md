@@ -41,6 +41,40 @@ Displays session statistics and status.
 Use `/hotkeys` to see the current shortcut list (including any user overrides
 from `~/.pi/agent/keybindings.json`).
 
+## Slash commands
+
+Type a slash command into the editor (prefix with `/`) and press Enter.
+
+`/help` is the authoritative, in-app list. This section documents the current
+command surface implemented in `src/interactive.rs`.
+
+| Command | Description |
+|---------|-------------|
+| `/help` (`/h`, `/?`) | Show help text and shortcut tips. |
+| `/login [provider]` | OAuth login (currently: anthropic). |
+| `/logout [provider]` | Remove stored OAuth credentials. |
+| `/clear` (`/cls`) | Clear conversation view/history. |
+| `/model [id|provider/id]` (`/m`) | Show or change the current model. |
+| `/thinking [level]` (`/think`, `/t`) | Set thinking level (`off|minimal|low|medium|high|xhigh`). |
+| `/scoped-models [patterns\|clear]` (`/scoped`) | Show or set model patterns used for Ctrl+P cycling. |
+| `/history` (`/hist`) | Show input history. |
+| `/export [path]` | Export conversation to HTML. |
+| `/session` (`/info`) | Show session info (path, tokens, cost). |
+| `/settings` | Open settings selector UI. |
+| `/theme [name]` | List or switch themes (see `docs/themes.md`). |
+| `/resume` (`/r`) | Pick and resume a previous session. |
+| `/new` | Start a new session. |
+| `/copy` (`/cp`) | Copy last assistant message to clipboard. |
+| `/name <name>` | Set session display name. |
+| `/hotkeys` (`/keys`, `/keybindings`) | Show keyboard shortcuts. |
+| `/changelog` | Show changelog entries. |
+| `/tree` | Show session branch tree summary. |
+| `/fork [id\|index]` | Fork from a user message (default: last on current path). |
+| `/compact [notes]` | Compact older context with optional instructions. |
+| `/reload` | Reload skills/prompts from disk. |
+| `/share` | Upload session HTML to a secret GitHub gist and show URL. |
+| `/exit` (`/quit`, `/q`) | Exit Pi. |
+
 ### Model selection
 - Use `/model` to switch models (by `provider/id` or fuzzy match).
 - Some builds also define shortcuts like `Ctrl+L` (model selector) and `Ctrl+P`

@@ -7,12 +7,12 @@ expression: view
 
   Welcome to Pi! Type a message to begin, or /help for commands.
 
-  [multi-line] Alt+Enter to send (Enter: newline, Esc: single-line)
-    > first line
-  > second line
-  >
-  >
-  >
-  >
+  [multi-line] Alt+Enter to send (Enter: newline, Esc: single-line)  [thinking: off]
+  │ > first line
+  │ > second line
+  │ >
+  │ >
+  │ >
+  │ >
 
   Tokens: 0 in / 0 out  |  Enter: newline  |  Alt+Enter: send  |  Esc: single-line  |  /help  |  Ctrl+C: quit

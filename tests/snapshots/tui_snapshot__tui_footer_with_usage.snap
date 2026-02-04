@@ -12,9 +12,9 @@ expression: view
 
 
 
-  [single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)
-    > Type your message... (Enter to send, Shift+Enter for newline, Ctrl+C twice to quit)
-  >
-  >
+  [single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)  [thinking: off]
+  │ > Type your message... (Enter to send, Shift+Enter for newline, Ctrl+C twice to quit)
+  │ >
+  │ >
 
   Tokens: 120 in / 45 out ($0.0030)  |  Shift+Enter: newline  |  Alt+Enter: multi-line  |  /help  |  Ctrl+C: quit

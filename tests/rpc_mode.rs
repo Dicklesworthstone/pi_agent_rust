@@ -2,6 +2,10 @@
 #![allow(clippy::unnecessary_literal_bound)]
 #![allow(clippy::too_many_lines)]
 
+mod common;
+
+use common::logging::TestLogger;
+use common::{TestEnv, TestHarness};
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::auth::AuthStorage;
 use pi::config::Config;
@@ -15,6 +19,7 @@ use pi::session::{Session, SessionMessage};
 use pi::tools::ToolRegistry;
 use pi::vcr::{VcrMode, VcrRecorder};
 use std::env;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -62,6 +67,44 @@ fn openai_auth_header(mode: VcrMode) -> String {
     format!("Bearer {key}")
 }
 
+fn log_vcr_context(
+    logger: &TestLogger,
+    mode: VcrMode,
+    cassette_dir: &Path,
+    cassette_name: &str,
+) -> PathBuf {
+    let cassette_path = cassette_dir.join(format!("{cassette_name}.json"));
+    logger.info_ctx("vcr", "RPC VCR context", |ctx| {
+        ctx.push(("mode".into(), format!("{mode:?}")));
+        ctx.push(("cassette".into(), cassette_name.to_string()));
+        ctx.push(("cassette_path".into(), cassette_path.display().to_string()));
+    });
+    logger.record_artifact(format!("vcr_cassette:{cassette_name}"), &cassette_path);
+
+    let mut env = TestEnv::new();
+    env.set("VCR_MODE", format!("{mode:?}"));
+    env.set("VCR_CASSETTE_DIR", cassette_dir.display().to_string());
+    env.set("OPENAI_TEST_MODEL", openai_test_model());
+    env.log(logger, "env", "RPC test environment");
+
+    cassette_path
+}
+
+fn assert_json_eq(
+    logger: &TestLogger,
+    label: &str,
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+) {
+    if actual != expected {
+        logger.error_ctx("assert", label, |ctx| {
+            ctx.push(("expected".into(), expected.to_string()));
+            ctx.push(("actual".into(), actual.to_string()));
+        });
+    }
+    assert_eq!(actual, expected, "{label}");
+}
+
 async fn recv_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<String, String> {
     let start = Instant::now();
     loop {
@@ -89,13 +132,16 @@ async fn recv_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<Str
 #[test]
 #[allow(clippy::too_many_lines)]
 fn rpc_get_state_and_prompt() {
+    let harness = TestHarness::new("rpc_get_state_and_prompt");
+    let logger = harness.log();
     let cassette_dir = cassette_root();
     let mode = vcr_mode();
-    let cassette_path = cassette_dir.join("rpc_prompt.json");
+    let cassette_name = "rpc_prompt";
+    let cassette_path = log_vcr_context(logger, mode, &cassette_dir, cassette_name);
     if mode == VcrMode::Playback && !cassette_path.exists() {
         let message = format!("Missing cassette {}", cassette_path.display());
         assert!(!vcr_strict(), "{message}");
-        eprintln!("{message}");
+        logger.warn("vcr", message);
         return;
     }
 
@@ -107,7 +153,7 @@ fn rpc_get_state_and_prompt() {
     runtime.block_on(async move {
         let model = openai_test_model();
         let auth_header = openai_auth_header(mode);
-        let recorder = VcrRecorder::new_with("rpc_prompt", mode, &cassette_dir);
+        let recorder = VcrRecorder::new_with(cassette_name, mode, &cassette_dir);
         let client = Client::new().with_vcr(recorder);
         let provider: Arc<dyn Provider> =
             Arc::new(OpenAIProvider::new(model.clone()).with_client(client));
@@ -155,9 +201,30 @@ fn rpc_get_state_and_prompt() {
             .await
             .expect("recv get_state response");
         let get_state_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(get_state_response["type"], "response");
-        assert_eq!(get_state_response["command"], "get_state");
-        assert_eq!(get_state_response["success"], true);
+        let expected_response = serde_json::Value::String("response".to_string());
+        let expected_get_state = serde_json::Value::String("get_state".to_string());
+        let expected_prompt = serde_json::Value::String("prompt".to_string());
+        let expected_stats = serde_json::Value::String("get_session_stats".to_string());
+        let expected_true = serde_json::Value::Bool(true);
+
+        assert_json_eq(
+            logger,
+            "get_state.type",
+            &get_state_response["type"],
+            &expected_response,
+        );
+        assert_json_eq(
+            logger,
+            "get_state.command",
+            &get_state_response["command"],
+            &expected_get_state,
+        );
+        assert_json_eq(
+            logger,
+            "get_state.success",
+            &get_state_response["success"],
+            &expected_true,
+        );
         let get_state_data = get_state_response["data"].as_object().unwrap();
         assert!(get_state_data.get("sessionFile").is_some());
         assert!(get_state_response["data"]["sessionFile"].is_null());
@@ -179,19 +246,38 @@ fn rpc_get_state_and_prompt() {
             .await
             .expect("recv prompt response");
         let prompt_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(prompt_resp["type"], "response");
-        assert_eq!(prompt_resp["command"], "prompt");
-        assert_eq!(prompt_resp["success"], true);
+        assert_json_eq(
+            logger,
+            "prompt.type",
+            &prompt_resp["type"],
+            &expected_response,
+        );
+        assert_json_eq(
+            logger,
+            "prompt.command",
+            &prompt_resp["command"],
+            &expected_prompt,
+        );
+        assert_json_eq(
+            logger,
+            "prompt.success",
+            &prompt_resp["success"],
+            &expected_true,
+        );
 
         // Collect events until agent_end.
         let mut saw_agent_end = false;
         let mut message_end_count = 0usize;
+        let mut event_timeline = Vec::new();
         let log_events = env_truthy("RPC_TEST_LOG");
         for _ in 0..100 {
             let line = recv_line(&out_rx, "event stream")
                 .await
                 .expect("recv event stream");
             let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            if let Some(event_type) = event["type"].as_str() {
+                event_timeline.push(event_type.to_string());
+            }
             if log_events {
                 if event["type"] == "auto_retry_start" {
                     eprintln!(
@@ -217,6 +303,10 @@ fn rpc_get_state_and_prompt() {
             message_end_count >= 2,
             "expected at least user+assistant message_end events"
         );
+        logger.info_ctx("rpc", "Event timeline", |ctx| {
+            ctx.push(("events".into(), event_timeline.join(", ")));
+            ctx.push(("message_end_count".into(), message_end_count.to_string()));
+        });
 
         // get_session_stats
         in_tx
@@ -231,12 +321,61 @@ fn rpc_get_state_and_prompt() {
         if log_events {
             eprintln!("get_session_stats response: {get_stats_response}");
         }
-        assert_eq!(get_stats_response["type"], "response");
-        assert_eq!(get_stats_response["command"], "get_session_stats");
-        assert_eq!(get_stats_response["success"], true);
+        assert_json_eq(
+            logger,
+            "get_session_stats.type",
+            &get_stats_response["type"],
+            &expected_response,
+        );
+        assert_json_eq(
+            logger,
+            "get_session_stats.command",
+            &get_stats_response["command"],
+            &expected_stats,
+        );
+        assert_json_eq(
+            logger,
+            "get_session_stats.success",
+            &get_stats_response["success"],
+            &expected_true,
+        );
         let get_stats_data = get_stats_response["data"].as_object().unwrap();
         assert!(get_stats_data.get("sessionFile").is_some());
         assert!(get_stats_response["data"]["sessionFile"].is_null());
+        logger.info_ctx("rpc", "Session stats values", |ctx| {
+            ctx.push((
+                "userMessages".into(),
+                get_stats_response["data"]["userMessages"].to_string(),
+            ));
+            ctx.push((
+                "assistantMessages".into(),
+                get_stats_response["data"]["assistantMessages"].to_string(),
+            ));
+            ctx.push((
+                "toolCalls".into(),
+                get_stats_response["data"]["toolCalls"].to_string(),
+            ));
+            ctx.push((
+                "toolResults".into(),
+                get_stats_response["data"]["toolResults"].to_string(),
+            ));
+            ctx.push((
+                "totalMessages".into(),
+                get_stats_response["data"]["totalMessages"].to_string(),
+            ));
+            ctx.push((
+                "tokens.input".into(),
+                get_stats_response["data"]["tokens"]["input"].to_string(),
+            ));
+            ctx.push((
+                "tokens.output".into(),
+                get_stats_response["data"]["tokens"]["output"].to_string(),
+            ));
+            ctx.push((
+                "tokens.total".into(),
+                get_stats_response["data"]["tokens"]["total"].to_string(),
+            ));
+        });
         assert_eq!(get_stats_response["data"]["userMessages"], 1);
         assert_eq!(get_stats_response["data"]["assistantMessages"], 1);
         assert_eq!(get_stats_response["data"]["toolCalls"], 0);
@@ -255,8 +394,18 @@ fn rpc_get_state_and_prompt() {
 
 #[test]
 fn rpc_session_stats_counts_tool_calls_and_results() {
+    let harness = TestHarness::new("rpc_session_stats_counts_tool_calls_and_results");
+    let logger = harness.log();
     let cassette_dir = cassette_root();
     let mode = vcr_mode();
+    let cassette_name = "rpc_session_stats";
+    let cassette_path = log_vcr_context(logger, mode, &cassette_dir, cassette_name);
+    if mode == VcrMode::Playback && !cassette_path.exists() {
+        let message = format!("Missing cassette {}", cassette_path.display());
+        assert!(!vcr_strict(), "{message}");
+        logger.warn("vcr", message);
+        return;
+    }
     let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
         .build()
         .expect("build test runtime");
@@ -265,7 +414,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
     runtime.block_on(async move {
         let model = openai_test_model();
         let auth_header = openai_auth_header(mode);
-        let recorder = VcrRecorder::new_with("rpc_session_stats", mode, &cassette_dir);
+        let recorder = VcrRecorder::new_with(cassette_name, mode, &cassette_dir);
         let client = Client::new().with_vcr(recorder);
         let provider: Arc<dyn Provider> =
             Arc::new(OpenAIProvider::new(model.clone()).with_client(client));
@@ -347,12 +496,57 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
             .await
             .expect("recv get_session_stats response");
         let stats_resp: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(stats_resp["type"], "response");
-        assert_eq!(stats_resp["command"], "get_session_stats");
-        assert_eq!(stats_resp["success"], true);
+        let expected_response = serde_json::Value::String("response".to_string());
+        let expected_stats = serde_json::Value::String("get_session_stats".to_string());
+        let expected_true = serde_json::Value::Bool(true);
+
+        assert_json_eq(
+            logger,
+            "get_session_stats.type",
+            &stats_resp["type"],
+            &expected_response,
+        );
+        assert_json_eq(
+            logger,
+            "get_session_stats.command",
+            &stats_resp["command"],
+            &expected_stats,
+        );
+        assert_json_eq(
+            logger,
+            "get_session_stats.success",
+            &stats_resp["success"],
+            &expected_true,
+        );
         let stats_data = stats_resp["data"].as_object().unwrap();
         assert!(stats_data.get("sessionFile").is_some());
         assert!(stats_resp["data"]["sessionFile"].is_null());
+        logger.info_ctx("rpc", "Session stats values", |ctx| {
+            ctx.push((
+                "userMessages".into(),
+                stats_resp["data"]["userMessages"].to_string(),
+            ));
+            ctx.push((
+                "assistantMessages".into(),
+                stats_resp["data"]["assistantMessages"].to_string(),
+            ));
+            ctx.push((
+                "toolCalls".into(),
+                stats_resp["data"]["toolCalls"].to_string(),
+            ));
+            ctx.push((
+                "toolResults".into(),
+                stats_resp["data"]["toolResults"].to_string(),
+            ));
+            ctx.push((
+                "totalMessages".into(),
+                stats_resp["data"]["totalMessages"].to_string(),
+            ));
+            ctx.push((
+                "tokens.total".into(),
+                stats_resp["data"]["tokens"]["total"].to_string(),
+            ));
+        });
         assert_eq!(stats_resp["data"]["userMessages"], 1);
         assert_eq!(stats_resp["data"]["assistantMessages"], 1);
         assert_eq!(stats_resp["data"]["toolCalls"], 1);

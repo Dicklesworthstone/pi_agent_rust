@@ -16,8 +16,50 @@ env:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: asupersync
+          fetch-depth: 1
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: rich_rust
+          fetch-depth: 1
+
+      - name: Checkout charmed_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/charmed_rust
+          path: charmed_rust
+          fetch-depth: 1
+
+      - name: Checkout sqlmodel_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/sqlmodel_rust
+          path: sqlmodel_rust
+          fetch-depth: 1
+
+      - name: Install system deps (bc, fd, rg) [linux]
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y bc fd-find ripgrep
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
@@ -30,7 +72,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
+            pi_agent_rust/target
           key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-bench-
@@ -93,7 +135,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-${{ github.sha }}
-          path: target/criterion/
+          path: pi_agent_rust/target/criterion/
           retention-days: 30
 
   # Compare with main branch baseline (only on PRs)
@@ -101,7 +143,38 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     needs: benchmark
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: asupersync
+          fetch-depth: 1
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: rich_rust
+          fetch-depth: 1
+
+      - name: Checkout charmed_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/charmed_rust
+          path: charmed_rust
+          fetch-depth: 1
+
+      - name: Checkout sqlmodel_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/sqlmodel_rust
+          path: sqlmodel_rust
+          fetch-depth: 1
+
       - uses: actions/checkout@v4
         with:
           ref: main
@@ -127,6 +200,15 @@ jobs:
         run: |
           cargo build --release
           cargo bench --bench tools -- --noplot --save-baseline main 2>/dev/null || true
+
+      - name: Copy main baseline to PR target dir
+        run: |
+          set -euxo pipefail
+          if [ -d "main-branch/target/criterion" ]; then
+            mkdir -p pr-branch/target
+            mkdir -p pr-branch/target/criterion
+            cp -R main-branch/target/criterion/. pr-branch/target/criterion/
+          fi
 
       - name: Build and benchmark PR
         working-directory: pr-branch

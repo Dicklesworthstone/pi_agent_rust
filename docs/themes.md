@@ -1,86 +1,93 @@
 # Themes
 
-Pi supports JSON-based themes to customize the terminal UI colors.
+Pi’s interactive TUI supports **JSON theme files** plus a few built-in themes.
 
-## Usage
+If something described here doesn’t match what you see, check `src/theme.rs` and the theme workstream (`bd-22p`) — the theme UX is still evolving.
 
-Use `/theme` to switch themes interactively, or set the `theme` option in `settings.json`.
+## Built-in themes
 
-```bash
-# In interactive mode
-/theme ocean-dark
-```
+- `dark`
+- `light`
+- `solarized`
 
-Theme selection is also exposed via `/settings` (choose the **Theme** entry).
+## Theme discovery (custom themes)
+
+Pi discovers custom themes by scanning these directories for `*.json` files:
+
+- Global: `~/.pi/agent/themes/`
+- Project: `<cwd>/.pi/themes/`
+
+Discovery is by file extension only; Pi loads each JSON file and uses the `name` field inside it.
+
+## Selecting a theme
+
+### Interactive command
+
+- ` /theme ` (no args): list discovered themes
+- ` /theme <name> `: switch themes
+
+Note: `/settings` currently has a Theme entry but the picker UI is not wired up yet (tracked under `bd-22p`). Use `/theme` or edit `settings.json` manually.
+
+### Settings file
+
+Set `theme` in your settings JSON:
+
+- Global: `~/.pi/agent/settings.json`
+- Project: `<cwd>/.pi/settings.json`
+
+Example:
 
 ```json
-// settings.json
 {
-  "theme": "ocean-dark"
+  "theme": "solarized"
 }
 ```
 
-## Discovery
+If a configured theme can’t be loaded, Pi falls back to `dark` and logs a warning.
 
-Pi searches for themes in the following locations:
+## Theme file format (JSON)
 
-1. **Global**: `~/.pi/agent/themes/*.json`
-2. **Project**: `.pi/themes/*.json`
+Theme JSON files are validated on load. All colors are **hex strings** in `#RRGGBB` format.
 
-## File Format
-
-A theme is a JSON file defining colors for UI elements and syntax highlighting. All colors must be 6-digit hex codes (`#RRGGBB`).
-
-### Schema
+Minimal example:
 
 ```json
 {
-  "name": "ocean-dark",
+  "name": "my-theme",
   "version": "1.0",
   "colors": {
-    "foreground": "#d4d4d4",
-    "background": "#1e1e1e",
-    "accent": "#007acc",
-    "success": "#4ec9b0",
-    "warning": "#ce9178",
-    "error": "#f44747",
-    "muted": "#6a6a6a"
+    "foreground": "#e6e6e6",
+    "background": "#0b0f14",
+    "accent": "#38bdf8",
+    "success": "#22c55e",
+    "warning": "#f59e0b",
+    "error": "#ef4444",
+    "muted": "#94a3b8"
   },
   "syntax": {
-    "keyword": "#569cd6",
-    "string": "#ce9178",
-    "number": "#b5cea8",
-    "comment": "#6a9955",
-    "function": "#dcdcaa"
+    "keyword": "#38bdf8",
+    "string": "#22c55e",
+    "number": "#a78bfa",
+    "comment": "#94a3b8",
+    "function": "#f59e0b"
   },
   "ui": {
-    "border": "#3c3c3c",
-    "selection": "#264f78",
-    "cursor": "#aeafad"
+    "border": "#1f2937",
+    "selection": "#111827",
+    "cursor": "#e6e6e6"
   }
 }
 ```
 
-### Fields
+### Field meanings (high level)
 
-- **name**: Display name (used in `/theme` command).
-- **colors**:
-  - `foreground`: Primary text color.
-  - `background`: Terminal background color.
-  - `accent`: User input, links, and highlights.
-  - `success`: Success messages.
-  - `warning`: Warnings.
-  - `error`: Error messages.
-  - `muted`: Thinking blocks, secondary text.
-- **syntax**: Used for Markdown code blocks.
-- **ui**:
-  - `border`: Panel borders.
-  - `selection`: Selected item background in lists/pickers.
-  - `cursor`: Editor cursor color.
+- `colors.*`: primary UI colors (text/background + semantic colors)
+- `syntax.*`: colors used for code/markup rendering
+- `ui.*`: frame/selection/cursor colors
 
-## Built-in Themes
+## Current gaps vs legacy pi-mono
 
-Pi includes built-in themes:
-- `dark` (default)
-- `light`
-- `solarized`
+Legacy pi-mono supports additional theme discovery mechanisms (packages, `themes[]` settings paths, CLI `--theme`, hot reload, many more tokens). The Rust port is intentionally smaller right now.
+
+Track progress in `bd-22p`.
+

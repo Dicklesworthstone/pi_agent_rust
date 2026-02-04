@@ -3,6 +3,7 @@
 //! Sessions are stored as JSONL files with a tree structure that enables
 //! branching and history navigation.
 
+use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -12,7 +13,6 @@ use crate::model::{
 };
 use crate::session_index::SessionIndex;
 use crate::tui::PiConsole;
-use asupersync::Cx;
 use asupersync::channel::oneshot;
 use rich_rust::Theme;
 use serde::{Deserialize, Serialize};
@@ -484,12 +484,12 @@ impl Session {
                 }
                 Ok(())
             }();
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| crate::Error::session("Save task cancelled"))??;
         Ok(())

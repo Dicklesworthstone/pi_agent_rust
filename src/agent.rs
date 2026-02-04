@@ -1061,6 +1061,7 @@ impl Agent {
                                 "Tool execution aborted",
                             ))],
                             details: None,
+                            is_error: true,
                         };
                         (output, true)
                     }
@@ -1144,6 +1145,7 @@ impl Agent {
                         tool_call.name
                     )))],
                     details: None,
+                    is_error: true,
                 },
                 true,
             );
@@ -1162,6 +1164,7 @@ impl Agent {
                 partial_result: ToolOutput {
                     content: update.content,
                     details: update.details,
+                    is_error: false,
                 },
             });
         };
@@ -1174,11 +1177,15 @@ impl Agent {
             )
             .await
         {
-            Ok(output) => (output, false),
+            Ok(output) => {
+                let is_error = output.is_error;
+                (output, is_error)
+            }
             Err(e) => (
                 ToolOutput {
                     content: vec![ContentBlock::Text(TextContent::new(format!("Error: {e}")))],
                     details: None,
+                    is_error: true,
                 },
                 true,
             ),
@@ -1196,6 +1203,7 @@ impl Agent {
                 "Skipped due to queued user message.",
             ))],
             details: None,
+            is_error: true,
         };
 
         on_event(AgentEvent::ToolExecutionStart {

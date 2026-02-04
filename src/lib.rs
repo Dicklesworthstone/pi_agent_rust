@@ -30,6 +30,7 @@
 )]
 
 pub mod agent;
+pub mod agent_cx;
 pub mod app;
 pub mod auth;
 pub mod autocomplete;

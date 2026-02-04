@@ -31,13 +31,13 @@ use uuid::Uuid;
 #[async_trait]
 pub trait Tool: Send + Sync {
     /// Get the tool name.
-    fn name(&self) -> &'static str;
+    fn name(&self) -> &str;
 
     /// Get the tool label (display name).
-    fn label(&self) -> &'static str;
+    fn label(&self) -> &str;
 
     /// Get the tool description.
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
 
     /// Get the tool parameters as JSON Schema.
     fn parameters(&self) -> serde_json::Value;
@@ -56,11 +56,18 @@ pub trait Tool: Send + Sync {
 }
 
 /// Tool execution output.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolOutput {
     pub content: Vec<ContentBlock>,
     pub details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub is_error: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde requires `fn(&bool) -> bool` for `skip_serializing_if`
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Incremental update during tool execution.
@@ -833,6 +840,29 @@ impl ToolRegistry {
         Self { tools }
     }
 
+    /// Construct a registry from a pre-built tool list.
+    pub fn from_tools(tools: Vec<Box<dyn Tool>>) -> Self {
+        Self { tools }
+    }
+
+    /// Convert the registry into the owned tool list.
+    pub fn into_tools(self) -> Vec<Box<dyn Tool>> {
+        self.tools
+    }
+
+    /// Append a tool.
+    pub fn push(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
+    /// Extend the registry with additional tools.
+    pub fn extend<I>(&mut self, tools: I)
+    where
+        I: IntoIterator<Item = Box<dyn Tool>>,
+    {
+        self.tools.extend(tools);
+    }
+
     /// Get all tools.
     pub fn tools(&self) -> &[Box<dyn Tool>] {
         &self.tools
@@ -885,14 +915,15 @@ impl ReadTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for ReadTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "read"
     }
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "read"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
     }
 
@@ -975,6 +1006,7 @@ impl Tool for ReadTool {
                     }),
                 ],
                 details: None,
+                is_error: false,
             });
         }
 
@@ -985,6 +1017,7 @@ impl Tool for ReadTool {
             return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new(""))],
                 details: None,
+                is_error: false,
             });
         }
 
@@ -1091,6 +1124,7 @@ impl Tool for ReadTool {
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(output_text))],
             details,
+            is_error: false,
         })
     }
 }
@@ -1336,14 +1370,15 @@ impl BashTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for BashTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "bash"
     }
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "bash"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds."
     }
 
@@ -1408,6 +1443,7 @@ impl Tool for BashTool {
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(result.output))],
             details,
+            is_error: false,
         })
     }
 }
@@ -1768,14 +1804,15 @@ fn generate_diff_string(old_content: &str, new_content: &str) -> (String, Option
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for EditTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "edit"
     }
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "edit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits."
     }
 
@@ -1926,6 +1963,7 @@ impl Tool for EditTool {
                 input.path
             )))],
             details: Some(serde_json::Value::Object(details)),
+            is_error: false,
         })
     }
 }
@@ -1955,14 +1993,15 @@ impl WriteTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for WriteTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "write"
     }
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
     }
 
@@ -2025,6 +2064,7 @@ impl Tool for WriteTool {
                 bytes_written, input.path
             )))],
             details: None,
+            is_error: false,
         })
     }
 }
@@ -2085,14 +2125,15 @@ fn truncate_line(line: &str, max_chars: usize) -> TruncateLineResult {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for GrepTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "grep"
     }
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "grep"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars."
     }
 
@@ -2312,6 +2353,7 @@ impl Tool for GrepTool {
             return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("No matches found"))],
                 details: None,
+                is_error: false,
             });
         }
 
@@ -2401,6 +2443,7 @@ impl Tool for GrepTool {
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(output))],
             details,
+            is_error: false,
         })
     }
 }
@@ -2431,14 +2474,15 @@ impl FindTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for FindTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "find"
     }
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "find"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Search for files by glob pattern. Returns matching file paths relative to the search directory. Respects .gitignore. Output is truncated to 1000 results or 50KB (whichever is hit first)."
     }
 
@@ -2606,6 +2650,7 @@ impl Tool for FindTool {
                     "No files found matching pattern",
                 ))],
                 details: None,
+                is_error: false,
             });
         }
 
@@ -2643,6 +2688,7 @@ impl Tool for FindTool {
                     "No files found matching pattern",
                 ))],
                 details: None,
+                is_error: false,
             });
         }
 
@@ -2683,6 +2729,7 @@ impl Tool for FindTool {
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(result_output))],
             details,
+            is_error: false,
         })
     }
 }
@@ -2712,14 +2759,15 @@ impl LsTool {
 }
 
 #[async_trait]
+#[allow(clippy::unnecessary_literal_bound)]
 impl Tool for LsTool {
-    fn name(&self) -> &'static str {
+    fn name(&self) -> &str {
         "ls"
     }
-    fn label(&self) -> &'static str {
+    fn label(&self) -> &str {
         "ls"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "List directory contents. Returns entries sorted alphabetically, with '/' suffix for directories. Includes dotfiles. Output is truncated to 500 entries or 50KB (whichever is hit first)."
     }
 
@@ -2807,6 +2855,7 @@ impl Tool for LsTool {
             return Ok(ToolOutput {
                 content: vec![ContentBlock::Text(TextContent::new("(empty directory)"))],
                 details: None,
+                is_error: false,
             });
         }
 
@@ -2847,6 +2896,7 @@ impl Tool for LsTool {
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(output))],
             details,
+            is_error: false,
         })
     }
 }

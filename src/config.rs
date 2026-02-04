@@ -37,6 +37,8 @@ pub struct Config {
     pub quiet_startup: Option<bool>,
     #[serde(alias = "collapseChangelog")]
     pub collapse_changelog: Option<bool>,
+    #[serde(alias = "lastChangelogVersion")]
+    pub last_changelog_version: Option<String>,
     #[serde(alias = "doubleEscapeAction")]
     pub double_escape_action: Option<String>,
     #[serde(alias = "editorPaddingX")]
@@ -287,6 +289,7 @@ impl Config {
             // Terminal Behavior
             quiet_startup: other.quiet_startup.or(base.quiet_startup),
             collapse_changelog: other.collapse_changelog.or(base.collapse_changelog),
+            last_changelog_version: other.last_changelog_version.or(base.last_changelog_version),
             double_escape_action: other.double_escape_action.or(base.double_escape_action),
             editor_padding_x: other.editor_padding_x.or(base.editor_padding_x),
             autocomplete_max_visible: other

@@ -455,6 +455,18 @@ fn tui_snapshot_input_single_line_text() {
 }
 
 #[test]
+fn tui_snapshot_input_bash_mode() {
+    let harness = TestHarness::new("tui_snapshot_input_bash_mode");
+    let mut app = build_app(&harness);
+    set_input_text(&mut app, "!ls -la");
+    let context = vec![
+        ("scenario".to_string(), "input-bash-mode".to_string()),
+        ("input".to_string(), "!ls -la".to_string()),
+    ];
+    snapshot(&harness, "tui_input_bash_mode", &app, &context);
+}
+
+#[test]
 fn tui_snapshot_input_multi_line_text() {
     let harness = TestHarness::new("tui_snapshot_input_multi_line_text");
     let mut app = build_app(&harness);

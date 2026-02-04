@@ -1118,6 +1118,57 @@ fn tui_state_tool_end_appends_tool_output_message() {
 }
 
 #[test]
+fn tui_state_expand_tools_toggles_tool_output_visibility() {
+    let harness = TestHarness::new("tui_state_expand_tools_toggles_tool_output_visibility");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read)",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "file contents");
+    assert_after_not_contains(&harness, &step, "(collapsed)");
+
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "(collapsed)");
+    assert_after_not_contains(&harness, &step, "file contents");
+
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Tool read output:");
+    assert_after_contains(&harness, &step, "file contents");
+    assert_after_not_contains(&harness, &step, "(collapsed)");
+}
+
+#[test]
 fn tui_state_terminal_show_images_false_hides_images_in_tool_output() {
     let harness =
         TestHarness::new("tui_state_terminal_show_images_false_hides_images_in_tool_output");
@@ -1871,7 +1922,7 @@ fn tui_state_slash_share_reports_error_when_gh_missing() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Sharing session...");
 
-    let events = wait_for_pi_msgs(&event_rx, Duration::from_millis(500), |msgs| {
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
     });
     let error = events

@@ -64,6 +64,8 @@ use crate::session_picker::delete_session_file;
 use crate::theme::{Theme, TuiStyles};
 use crate::tools::{process_file_arguments, resolve_read_path};
 
+#[cfg(all(feature = "clipboard", feature = "image-resize"))]
+use arboard::Clipboard as ArboardClipboard;
 #[cfg(feature = "clipboard")]
 use clipboard::{ClipboardContext, ClipboardProvider};
 
@@ -718,17 +720,21 @@ impl PiApp {
             let ch = message[idx..].chars().next().unwrap_or(' ');
             if ch == '@' && is_file_ref_boundary(message, idx) {
                 let token_start = idx + ch.len_utf8();
-                let (token, token_end) = next_non_whitespace_token(message, token_start);
-                let (path, trailing) = split_trailing_punct(token);
+                let parsed = parse_quoted_file_ref(message, token_start);
+                let (path, trailing, token_end) = parsed.unwrap_or_else(|| {
+                    let (token, token_end) = next_non_whitespace_token(message, token_start);
+                    let (path, trailing) = split_trailing_punct(token);
+                    (path.to_string(), trailing.to_string(), token_end)
+                });
 
                 if !path.is_empty() {
                     let resolved =
                         self.autocomplete
                             .provider
-                            .resolve_file_ref(path)
+                            .resolve_file_ref(&path)
                             .or_else(|| {
-                                let resolved_path = resolve_read_path(path, &self.cwd);
-                                resolved_path.exists().then(|| path.to_string())
+                                let resolved_path = resolve_read_path(&path, &self.cwd);
+                                resolved_path.exists().then(|| path.clone())
                             });
 
                     if let Some(resolved) = resolved {
@@ -738,7 +744,7 @@ impl PiApp {
                         {
                             cleaned.pop();
                         }
-                        cleaned.push_str(trailing);
+                        cleaned.push_str(&trailing);
                         idx = token_end;
                         continue;
                     }
@@ -750,6 +756,120 @@ impl PiApp {
         }
 
         (cleaned, file_args)
+    }
+
+    fn handle_paste_event(&mut self, key: &KeyMsg) -> bool {
+        if key.key_type != KeyType::Runes || key.runes.is_empty() {
+            return false;
+        }
+
+        let pasted: String = key.runes.iter().collect();
+        let Some((insert, count)) = self.normalize_pasted_paths(&pasted) else {
+            return false;
+        };
+
+        self.input.insert_string(&insert);
+        if count > 0 {
+            self.status_message = Some(format!(
+                "Attached {} file{}",
+                count,
+                if count == 1 { "" } else { "s" }
+            ));
+        }
+        true
+    }
+
+    fn normalize_pasted_paths(&self, pasted: &str) -> Option<(String, usize)> {
+        let mut refs = Vec::new();
+        for line in pasted.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let path = self.normalize_pasted_path(trimmed)?;
+            refs.push(path);
+        }
+
+        if refs.is_empty() {
+            return None;
+        }
+
+        let mut insert = refs
+            .iter()
+            .map(|path| format_file_ref(path))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !insert.ends_with(' ') {
+            insert.push(' ');
+        }
+
+        Some((insert, refs.len()))
+    }
+
+    fn normalize_pasted_path(&self, raw: &str) -> Option<String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.starts_with('@') {
+            return None;
+        }
+
+        let unquoted = strip_wrapping_quotes(trimmed);
+        let unescaped = unescape_dragged_path(unquoted);
+        let path = file_url_to_path(&unescaped).unwrap_or_else(|| PathBuf::from(&unescaped));
+        let resolved = resolve_read_path(path.to_string_lossy().as_ref(), &self.cwd);
+        if !resolved.exists() {
+            return None;
+        }
+
+        Some(path_for_display(&resolved, &self.cwd))
+    }
+
+    fn insert_file_ref_path(&mut self, path: &Path) {
+        let display = path_for_display(path, &self.cwd);
+        let mut token = format_file_ref(&display);
+        if !token.ends_with(' ') {
+            token.push(' ');
+        }
+        self.input.insert_string(&token);
+    }
+
+    fn paste_image_from_clipboard() -> Option<PathBuf> {
+        #[cfg(all(feature = "clipboard", feature = "image-resize"))]
+        {
+            use image::ImageEncoder;
+
+            let mut clipboard = ArboardClipboard::new().ok()?;
+            let image = clipboard.get_image().ok()?;
+
+            let width = u32::try_from(image.width).ok()?;
+            let height = u32::try_from(image.height).ok()?;
+            let bytes = image.bytes.into_owned();
+            let width_usize = usize::try_from(width).ok()?;
+            let height_usize = usize::try_from(height).ok()?;
+            let expected = width_usize.checked_mul(height_usize)?.checked_mul(4)?;
+            if bytes.len() != expected {
+                return None;
+            }
+
+            let mut temp_file = tempfile::Builder::new()
+                .prefix("pi-paste-")
+                .suffix(".png")
+                .tempfile()
+                .ok()?;
+            let encoder = image::codecs::png::PngEncoder::new(&mut temp_file);
+            if encoder
+                .write_image(&bytes, width, height, image::ExtendedColorType::Rgba8)
+                .is_err()
+            {
+                return None;
+            }
+            let (_file, path) = temp_file.keep().ok()?;
+            Some(path)
+        }
+
+        #[cfg(not(all(feature = "clipboard", feature = "image-resize")))]
+        {
+            None
+        }
     }
 
     fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
@@ -843,6 +963,59 @@ impl PiApp {
     fn render_input(&self) -> String {
         let mut output = String::new();
 
+        let thinking_level = self
+            .session
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.header.thinking_level.clone())
+            .and_then(|level| level.parse::<ThinkingLevel>().ok())
+            .or_else(|| {
+                self.config
+                    .default_thinking_level
+                    .as_deref()
+                    .and_then(|level| level.parse::<ThinkingLevel>().ok())
+            })
+            .unwrap_or(ThinkingLevel::Off);
+
+        let input_text = self.input.value();
+        let is_bash_mode = parse_bash_command(&input_text).is_some();
+
+        let (thinking_label, thinking_style, thinking_border_style) = match thinking_level {
+            ThinkingLevel::Off => (
+                "off",
+                self.styles.muted_bold.clone(),
+                self.styles.border.clone(),
+            ),
+            ThinkingLevel::Minimal => (
+                "minimal",
+                self.styles.accent.clone(),
+                self.styles.accent.clone(),
+            ),
+            ThinkingLevel::Low => (
+                "low",
+                self.styles.accent.clone(),
+                self.styles.accent.clone(),
+            ),
+            ThinkingLevel::Medium => (
+                "medium",
+                self.styles.accent_bold.clone(),
+                self.styles.accent.clone(),
+            ),
+            ThinkingLevel::High => (
+                "high",
+                self.styles.warning_bold.clone(),
+                self.styles.warning.clone(),
+            ),
+            ThinkingLevel::XHigh => (
+                "xhigh",
+                self.styles.error_bold.clone(),
+                self.styles.error_bold.clone(),
+            ),
+        };
+
+        let thinking_badge = thinking_style.render(&format!("[thinking: {thinking_label}]"));
+        let bash_badge = is_bash_mode.then(|| self.styles.warning_bold.render("[bash]"));
+
         let mode_text = match self.input_mode {
             InputMode::SingleLine => {
                 "[single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)"
@@ -851,13 +1024,28 @@ impl PiApp {
                 "[multi-line] Alt+Enter to send (Enter: newline, Esc: single-line)"
             }
         };
-        let _ = writeln!(output, "\n  {}", self.styles.muted.render(mode_text));
+        let mut header_line = String::new();
+        header_line.push_str(&self.styles.muted.render(mode_text));
+        header_line.push_str("  ");
+        header_line.push_str(&thinking_badge);
+        if let Some(bash_badge) = bash_badge {
+            header_line.push_str("  ");
+            header_line.push_str(&bash_badge);
+        }
+        let _ = writeln!(output, "\n  {header_line}");
 
         let padding = " ".repeat(self.editor_padding_x);
         let line_prefix = format!("  {padding}");
-        output.push_str("  ");
+        let border_style = if is_bash_mode {
+            self.styles.warning_bold.clone()
+        } else {
+            thinking_border_style
+        };
+        let border = border_style.render("│");
         for line in self.input.view().lines() {
             output.push_str(&line_prefix);
+            output.push_str(&border);
+            output.push(' ');
             output.push_str(line);
             output.push('\n');
         }
@@ -1458,6 +1646,120 @@ fn next_non_whitespace_token(text: &str, start: usize) -> (&str, usize) {
     (&text[start..end], end)
 }
 
+fn parse_quoted_file_ref(text: &str, start: usize) -> Option<(String, String, usize)> {
+    let mut chars = text[start..].chars();
+    let quote = chars.next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+
+    let mut path = String::new();
+    let mut escaped = false;
+    let mut end = None;
+    let after_quote = start + quote.len_utf8();
+
+    for (offset, ch) in text[after_quote..].char_indices() {
+        if escaped {
+            path.push(ch);
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == quote {
+            end = Some(after_quote + offset);
+            break;
+        }
+        path.push(ch);
+    }
+
+    let end = end?;
+    let mut trailing = String::new();
+    let mut token_end = end + quote.len_utf8();
+    for ch in text[token_end..].chars() {
+        if is_trailing_punct(ch) {
+            trailing.push(ch);
+            token_end += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+
+    Some((path, trailing, token_end))
+}
+
+fn strip_wrapping_quotes(input: &str) -> &str {
+    let bytes = input.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &input[1..bytes.len() - 1];
+        }
+    }
+    input
+}
+
+fn looks_like_windows_path(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    (bytes.len() >= 2 && bytes[1] == b':') || input.starts_with("\\\\")
+}
+
+fn unescape_dragged_path(input: &str) -> String {
+    if looks_like_windows_path(input) {
+        return input.to_string();
+    }
+
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            if let Some(next) = chars.peek().copied() {
+                if matches!(
+                    next,
+                    ' ' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '\\'
+                ) {
+                    out.push(next);
+                    chars.next();
+                    continue;
+                }
+            }
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn file_url_to_path(input: &str) -> Option<PathBuf> {
+    if !input.starts_with("file://") {
+        return None;
+    }
+    Url::parse(input).ok()?.to_file_path().ok()
+}
+
+fn path_for_display(path: &Path, cwd: &Path) -> String {
+    path.strip_prefix(cwd).map_or_else(
+        |_| path.to_string_lossy().to_string(),
+        |p| p.to_string_lossy().to_string(),
+    )
+}
+
+fn format_file_ref(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        if !path.contains('"') {
+            format!("@\"{path}\"")
+        } else if !path.contains('\'') {
+            format!("@'{path}'")
+        } else {
+            format!("@\"{}\"", path.replace('"', "\\\""))
+        }
+    } else {
+        format!("@{path}")
+    }
+}
+
 fn split_trailing_punct(token: &str) -> (&str, &str) {
     let mut split = token.len();
     for (idx, ch) in token.char_indices().rev() {
@@ -1872,7 +2174,7 @@ fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage
                     "Tool result"
                 };
                 messages.push(ConversationMessage {
-                    role: MessageRole::System,
+                    role: MessageRole::Tool,
                     content: format!("{prefix} ({tool_name}): {text}"),
                     thinking: None,
                 });
@@ -1892,7 +2194,7 @@ fn load_conversation_from_session(session: &Session) -> (Vec<ConversationMessage
                     text.push_str("\n\n[Output excluded from model context]");
                 }
                 messages.push(ConversationMessage {
-                    role: MessageRole::System,
+                    role: MessageRole::Tool,
                     content: text,
                     thinking: None,
                 });
@@ -2926,6 +3228,7 @@ impl InteractiveMessageQueue {
 }
 
 /// The main interactive TUI application model.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(bubbletea::Model)]
 pub struct PiApp {
     // Input state
@@ -2951,6 +3254,7 @@ pub struct PiApp {
     current_response: String,
     current_thinking: String,
     thinking_visible: bool,
+    tools_expanded: bool,
     current_tool: Option<String>,
     pending_tool_output: Option<String>,
 
@@ -3418,6 +3722,7 @@ pub struct ConversationMessage {
 pub enum MessageRole {
     User,
     Assistant,
+    Tool,
     System,
 }
 
@@ -3565,6 +3870,7 @@ impl PiApp {
             current_response: String::new(),
             current_thinking: String::new(),
             thinking_visible,
+            tools_expanded: true,
             current_tool: None,
             pending_tool_output: None,
             session: Arc::new(Mutex::new(session)),
@@ -3870,6 +4176,11 @@ impl PiApp {
                 }
             }
 
+            // Handle bracketed paste (drag/drop paths, etc.) before keybindings.
+            if key.paste && self.handle_paste_event(key) {
+                return None;
+            }
+
             // Convert KeyMsg to KeyBinding and resolve action
             if let Some(binding) = KeyBinding::from_bubbletea_key(key) {
                 let candidates = self.keybindings.matching_actions(&binding);
@@ -4008,7 +4319,7 @@ impl PiApp {
         // Footer with usage stats
         output.push_str(&self.render_footer());
 
-        output
+        normalize_raw_terminal_newlines(output)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4569,6 +4880,17 @@ impl PiApp {
                         let _ = writeln!(output, "  {line}");
                     }
                 }
+                MessageRole::Tool => {
+                    if self.tools_expanded {
+                        let rendered = self.styles.muted.render(&msg.content);
+                        let _ = write!(output, "\n  {rendered}\n");
+                    } else {
+                        let header = msg.content.lines().next().unwrap_or("Tool output");
+                        let collapsed = format!("{} (collapsed)", header.trim_end());
+                        let rendered = self.styles.muted_italic.render(&collapsed);
+                        let _ = write!(output, "\n  {rendered}\n");
+                    }
+                }
                 MessageRole::System => {
                     let _ = write!(output, "\n  {}\n", self.styles.warning.render(&msg.content));
                 }
@@ -4649,7 +4971,7 @@ impl PiApp {
                 self.current_tool = None;
                 if let Some(output) = self.pending_tool_output.take() {
                     self.messages.push(ConversationMessage {
-                        role: MessageRole::System,
+                        role: MessageRole::Tool,
                         content: output,
                         thinking: None,
                     });
@@ -5994,6 +6316,13 @@ impl PiApp {
                 self.status_message = Some("Press Ctrl+C again to quit".to_string());
                 None
             }
+            AppAction::PasteImage => {
+                if let Some(path) = Self::paste_image_from_clipboard() {
+                    self.insert_file_ref_path(&path);
+                    self.status_message = Some("Image attached".to_string());
+                }
+                None
+            }
             AppAction::Exit => {
                 // Ctrl+D: Exit only when editor is empty (legacy behavior)
                 if self.agent_state == AgentState::Idle && self.input.value().is_empty() {
@@ -6197,6 +6526,17 @@ impl PiApp {
                 });
                 None
             }
+            AppAction::ExpandTools => {
+                self.tools_expanded = !self.tools_expanded;
+                let content = self.build_conversation_content();
+                self.conversation_viewport.set_content(&content);
+                self.status_message = Some(if self.tools_expanded {
+                    "Tool output expanded".to_string()
+                } else {
+                    "Tool output collapsed".to_string()
+                });
+                None
+            }
 
             // =========================================================
             // Actions not yet implemented - let through to component
@@ -6237,6 +6577,7 @@ impl PiApp {
             | AppAction::CycleModelForward
             | AppAction::CycleModelBackward
             | AppAction::ToggleThinking
+            | AppAction::ExpandTools
             | AppAction::FollowUp
             | AppAction::NewLine
             | AppAction::Submit
@@ -6244,6 +6585,7 @@ impl PiApp {
             | AppAction::Interrupt
             | AppAction::Clear
             | AppAction::Copy
+            | AppAction::PasteImage
             | AppAction::Suspend
             | AppAction::ExternalEditor
             | AppAction::Tab => true,
@@ -7536,4 +7878,26 @@ impl PiApp {
             }
         }
     }
+}
+
+fn normalize_raw_terminal_newlines(input: String) -> String {
+    if !input.contains('\n') {
+        return input;
+    }
+
+    let mut out = String::with_capacity(input.len() + 16);
+    let mut prev_was_cr = false;
+    for ch in input.chars() {
+        if ch == '\n' {
+            if !prev_was_cr {
+                out.push('\r');
+            }
+            out.push('\n');
+            prev_was_cr = false;
+        } else {
+            prev_was_cr = ch == '\r';
+            out.push(ch);
+        }
+    }
+    out
 }

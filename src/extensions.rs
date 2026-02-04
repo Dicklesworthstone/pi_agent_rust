@@ -3650,6 +3650,7 @@ struct ExtensionManagerInner {
     pending_ui: HashMap<String, oneshot::Sender<ExtensionUiResponse>>,
     session: Option<Arc<dyn ExtensionSession>>,
     active_tools: Option<Vec<String>>,
+    providers: Vec<Value>,
     cwd: Option<String>,
     model_registry_values: HashMap<String, String>,
     host_actions: Option<Arc<dyn ExtensionHostActions>>,

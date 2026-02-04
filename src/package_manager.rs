@@ -6,6 +6,7 @@
 //! - Global npm installs use `npm install -g` (npm-managed global root)
 //! - Git installs are under Pi's agent/project directories (`~/.pi/agent/git`, `./.pi/git`)
 
+use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::CompatibilityScanner;
@@ -132,12 +133,12 @@ impl PackageManager {
 
         thread::spawn(move || {
             let res = this.install_sync(&source, scope);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Install task cancelled"))?
     }
@@ -153,9 +154,16 @@ impl PackageManager {
                 r#ref,
                 ..
             } => self.install_git(&repo, &host, &path, r#ref.as_deref(), scope),
-            ParsedSource::Local { .. } => Err(Error::config(format!(
-                "Unsupported install source: {source}"
-            ))),
+            ParsedSource::Local { path } => {
+                if path.exists() {
+                    Ok(())
+                } else {
+                    Err(Error::config(format!(
+                        "Local package path does not exist: {}",
+                        path.display()
+                    )))
+                }
+            }
         }
     }
 
@@ -166,12 +174,12 @@ impl PackageManager {
 
         thread::spawn(move || {
             let res = this.remove_sync(&source, scope);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Remove task cancelled"))?
     }
@@ -181,9 +189,7 @@ impl PackageManager {
         match parsed {
             ParsedSource::Npm { name, .. } => self.uninstall_npm(&name, scope),
             ParsedSource::Git { host, path, .. } => self.remove_git(&host, &path, scope),
-            ParsedSource::Local { .. } => Err(Error::config(format!(
-                "Unsupported remove source: {source}"
-            ))),
+            ParsedSource::Local { .. } => Ok(()),
         }
     }
 
@@ -194,12 +200,12 @@ impl PackageManager {
 
         thread::spawn(move || {
             let res = this.update_source_sync(&source, scope);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Update task cancelled"))?
     }
@@ -240,12 +246,12 @@ impl PackageManager {
 
         thread::spawn(move || {
             let res = this.installed_path_sync(&source, scope);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Installed path lookup cancelled"))?
     }
@@ -267,12 +273,12 @@ impl PackageManager {
 
         thread::spawn(move || {
             let res = this.list_packages_sync();
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "List packages task cancelled"))?
     }
@@ -358,13 +364,13 @@ impl PackageManager {
             })(
             );
 
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
         let (global, project, package_sources) = rx
-            .recv(&cx)
+            .recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Resolve setup task cancelled"))??;
 
@@ -424,12 +430,12 @@ impl PackageManager {
             let resolved = accumulator.clone().into_resolved_paths();
             drop(accumulator);
             maybe_emit_compat_ledgers(&resolved.extensions);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, Ok(resolved));
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), Ok(resolved));
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Resolve processing task cancelled"))?
     }
@@ -473,12 +479,12 @@ impl PackageManager {
                 accumulator.clone().into_resolved_paths()
             };
             maybe_emit_compat_ledgers(&resolved.extensions);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, Ok(resolved));
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), Ok(resolved));
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Resolve extensions task cancelled"))?
     }
@@ -490,12 +496,12 @@ impl PackageManager {
 
         thread::spawn(move || {
             let res = this.add_package_source_sync(&source, scope);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Add source task cancelled"))?
     }

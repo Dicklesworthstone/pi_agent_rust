@@ -8,9 +8,9 @@ expression: view
 
   System notice: configuration loaded.
 
-  [single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)
-    > Type your message... (Enter to send, Shift+Enter for newline, Ctrl+C twice to quit)
-  >
-  >
+  [single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)  [thinking: off]
+  │ > Type your message... (Enter to send, Shift+Enter for newline, Ctrl+C twice to quit)
+  │ >
+  │ >
 
   Tokens: 0 in / 0 out  |  Shift+Enter: newline  |  Alt+Enter: multi-line  |  /help  |  Ctrl+C: quit

@@ -448,13 +448,11 @@ impl<C: Clock> Scheduler<C> {
     /// Get the deadline of the next timer, if any.
     #[must_use]
     pub fn next_timer_deadline(&self) -> Option<u64> {
-        // Skip cancelled timers when peeking
-        for entry in &self.timer_heap {
-            if !self.cancelled_timers.contains(&entry.timer_id) {
-                return Some(entry.deadline_ms);
-            }
-        }
-        None
+        self.timer_heap
+            .iter()
+            .filter(|entry| !self.cancelled_timers.contains(&entry.timer_id))
+            .map(|entry| entry.deadline_ms)
+            .min()
     }
 
     /// Get the time until the next timer fires, if any.
@@ -747,6 +745,20 @@ mod tests {
 
         sched.clock.advance(50);
         assert_eq!(sched.time_until_next_timer(), Some(50));
+    }
+
+    #[test]
+    fn scheduler_next_timer_skips_cancelled_timers() {
+        let clock = DeterministicClock::new(0);
+        let mut sched = Scheduler::with_clock(clock);
+
+        let t1 = sched.set_timeout(100);
+        let _t2 = sched.set_timeout(200);
+        let _t3 = sched.set_timeout(300);
+
+        assert!(sched.clear_timeout(t1));
+        assert_eq!(sched.next_timer_deadline(), Some(200));
+        assert_eq!(sched.time_until_next_timer(), Some(200));
     }
 
     #[test]

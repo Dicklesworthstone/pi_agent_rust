@@ -1860,3 +1860,265 @@ This specification covers:
 - **Resources:** Skills, prompts, and themes discovery and expansion
 
 **After reading this document, you should NOT need to consult the legacy TypeScript code.**
+
+---
+
+## Appendix A: Complete Extension API Reference (Extracted 2026-02-04)
+
+This appendix provides the complete, detailed Extension API extracted from the legacy pi-mono codebase.
+
+### A.1 Extension Factory Pattern
+
+Extensions export a default factory function receiving the `ExtensionAPI` object:
+
+```typescript
+export default function (pi: ExtensionAPI) {
+  // Register handlers, tools, commands
+}
+
+// Or async:
+export default async function (pi: ExtensionAPI) {
+  // Async initialization
+}
+```
+
+### A.2 Complete Event Types (20+)
+
+| Event | Can Modify | Can Cancel | Payload |
+|-------|-----------|------------|---------|
+| `resources_discover` | Yes | No | `{}` |
+| `session_start` | No | No | `{}` |
+| `session_before_switch` | No | Yes | `{}` |
+| `session_switch` | No | No | `{reason, previousSessionFile?}` |
+| `session_before_fork` | No | Yes | `{}` |
+| `session_fork` | No | No | `{previousSessionFile?}` |
+| `session_before_compact` | Yes | Yes | `{preparation, branchEntries, signal}` |
+| `session_compact` | No | No | `{compactionEntry, fromExtension}` |
+| `session_before_tree` | Yes | Yes | `{preparation, signal}` |
+| `session_tree` | No | No | `{newLeafId, oldLeafId, summaryEntry?}` |
+| `session_shutdown` | No | No | `{}` |
+| `context` | Yes | No | `{messages}` |
+| `before_agent_start` | Yes | No | `{prompt, images?, systemPrompt}` |
+| `agent_start` | No | No | `{}` |
+| `agent_end` | No | No | `{messages}` |
+| `turn_start` | No | No | `{turnIndex, timestamp}` |
+| `turn_end` | No | No | `{turnIndex, message, toolResults}` |
+| `model_select` | No | No | `{model, previousModel?, source}` |
+| `tool_call` | No | Yes (block) | `{toolName, input, toolCallId}` |
+| `tool_result` | Yes | No | `{toolName, input, content, isError}` |
+| `user_bash` | Yes | No | `{command, excludeFromContext, cwd}` |
+| `input` | Yes | Yes (handled) | `{text, images?, source}` |
+
+### A.3 Registration APIs
+
+**Tool Registration:**
+```typescript
+pi.registerTool({
+  name: string,
+  label: string,
+  description: string,
+  parameters: TypeBoxSchema,
+  execute: (toolCallId, params, signal, onUpdate, ctx) => Promise<ToolOutput>,
+  renderCall?: (args, theme) => Component,
+  renderResult?: (result, options, theme) => Component,
+});
+```
+
+**Command Registration:**
+```typescript
+pi.registerCommand(name, {
+  description: string,
+  handler: (args, ctx) => Promise<void>,
+  getArgumentCompletions?: (prefix) => CompletionItem[],
+});
+```
+
+**Shortcut Registration:**
+```typescript
+pi.registerShortcut(key, {
+  description: string,
+  handler: (ctx) => Promise<void>,
+});
+```
+
+**Flag Registration:**
+```typescript
+pi.registerFlag(name, {
+  description: string,
+  type: "boolean" | "string",
+  default?: boolean | string,
+});
+```
+
+**Provider Registration:**
+```typescript
+pi.registerProvider(name, {
+  baseUrl: string,
+  apiKey: string,  // env var name
+  api: "anthropic-messages" | "openai-responses",
+  models: Model[],
+  streamSimple?: StreamHandler,
+  oauth?: OAuthConfig,
+});
+```
+
+### A.4 Message APIs
+
+```typescript
+// Custom message (not for LLM)
+pi.sendMessage({
+  customType: string,
+  content: string,
+  display?: boolean,
+  details?: unknown,
+}, {
+  triggerTurn?: boolean,
+  deliverAs?: "steer" | "followUp" | "nextTurn",
+});
+
+// User message (triggers LLM turn)
+pi.sendUserMessage(content, {
+  deliverAs?: "steer" | "followUp",
+});
+
+// Session entry (not sent to LLM)
+pi.appendEntry(customType, data);
+```
+
+### A.5 Session & Model APIs
+
+```typescript
+// Session metadata
+pi.setSessionName(name);
+pi.getSessionName();
+pi.setLabel(entryId, label);
+
+// Tool management
+pi.getActiveTools();
+pi.getAllTools();
+pi.setActiveTools(toolNames);
+
+// Model control
+await pi.setModel(model);
+pi.getThinkingLevel();
+pi.setThinkingLevel(level);
+
+// Execution
+await pi.exec(command, args, options);
+
+// Inter-extension events
+pi.events.emit(eventName, data);
+pi.events.on(eventName, handler);
+```
+
+### A.6 UI Context Methods
+
+**Dialogs (blocking):**
+```typescript
+await ctx.ui.select(title, options, opts);
+await ctx.ui.confirm(title, message, opts);
+await ctx.ui.input(title, placeholder?, opts);
+await ctx.ui.editor(title, prefill?);
+```
+
+**Non-blocking:**
+```typescript
+ctx.ui.notify(message, type?);
+ctx.ui.setStatus(key, text);
+ctx.ui.setWorkingMessage(message?);
+ctx.ui.setWidget(key, content, options?);
+ctx.ui.setFooter(factory?);
+ctx.ui.setHeader(factory?);
+ctx.ui.setTitle(title);
+```
+
+**Editor:**
+```typescript
+ctx.ui.setEditorText(text);
+ctx.ui.getEditorText();
+ctx.ui.setEditorComponent(factory?);
+```
+
+**Theme:**
+```typescript
+ctx.ui.theme;
+ctx.ui.getAllThemes();
+ctx.ui.getTheme(name);
+ctx.ui.setTheme(theme);
+```
+
+### A.7 Extension Context Properties
+
+```typescript
+interface ExtensionContext {
+  ui: ExtensionUIContext;
+  hasUI: boolean;
+  cwd: string;
+  sessionManager: ReadonlySessionManager;
+  modelRegistry: ModelRegistry;
+  model: Model | undefined;
+
+  isIdle(): boolean;
+  abort(): void;
+  hasPendingMessages(): boolean;
+  shutdown(): void;
+  getContextUsage(): ContextUsage | undefined;
+  compact(options?): void;
+  getSystemPrompt(): string;
+}
+
+interface ExtensionCommandContext extends ExtensionContext {
+  waitForIdle(): Promise<void>;
+  newSession(options?): Promise<{cancelled: boolean}>;
+  fork(entryId): Promise<{cancelled: boolean}>;
+  navigateTree(targetId, options?): Promise<{cancelled: boolean}>;
+  switchSession(sessionPath): Promise<{cancelled: boolean}>;
+}
+```
+
+---
+
+## Appendix B: Library Integration Requirements
+
+### B.1 asupersync Requirements
+
+**Currently Used:**
+- `Cx` capability context
+- `mpsc` / `oneshot` channels
+- `Mutex` / `Notify` synchronization
+- `timeout` / `sleep` time operations
+
+**Should Use:**
+- `Cx::region()` for structured concurrency (extension lifecycle)
+- `database::sqlite` for session indexing (optional)
+- Two-phase channel semantics for atomic message delivery
+- Cancellation budgets for bounded cleanup
+- `LabRuntime` for deterministic testing
+
+### B.2 rich_rust Requirements
+
+**Currently Used:**
+- `Console` with markup
+- `Panel` for boxed content
+- `Table` for data
+- `Rule` for dividers
+
+**Should Enable:**
+- `markdown` feature for assistant response rendering
+- `syntax` feature for code block highlighting
+- `json` feature for pretty-printed JSON output
+
+### B.3 charmed_rust Requirements
+
+**Currently Used:**
+- `bubbletea::Model` for Elm Architecture
+- `bubbles::TextArea` for input
+- `bubbles::Viewport` for scrolling
+- `bubbles::Spinner` for loading
+- `glamour::Renderer` for markdown
+
+**Should Use:**
+- `lipgloss::Style` for direct styling
+- `bubbles::List` for history navigation
+- `bubbles::Table` for structured output
+- Custom glamour theme matching Pi visual style
