@@ -1,0 +1,233 @@
+name: Release (GitHub binaries)
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.1.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+    steps:
+      - name: Determine and validate tag
+        id: tag
+        run: |
+          set -euxo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+          fi
+          VERSION="${TAG#v}"
+
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
+            echo "Error: Version '$VERSION' does not match semver format"
+            exit 1
+          fi
+
+          if echo "$TAG" | grep -q -- '-'; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="false"
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.target }})
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            exe: ""
+          - os: macos-14
+            target: aarch64-apple-darwin
+            exe: ""
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            exe: ".exe"
+    runs-on: ${{ matrix.os }}
+    env:
+      CI: "true"
+      RUST_BACKTRACE: "1"
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+          ref: ${{ needs.plan.outputs.tag }}
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: asupersync
+          fetch-depth: 1
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: rich_rust
+          fetch-depth: 1
+
+      - name: Checkout charmed_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/charmed_rust
+          path: charmed_rust
+          fetch-depth: 1
+
+      - name: Checkout sqlmodel_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/sqlmodel_rust
+          path: sqlmodel_rust
+          fetch-depth: 1
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Add target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin pi --target "${{ matrix.target }}"
+
+      - name: Prepare artifacts
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+
+          BIN_SRC="target/${{ matrix.target }}/release/pi${{ matrix.exe }}"
+          BIN_DST="dist/pi-${{ needs.plan.outputs.tag }}-${{ matrix.target }}${{ matrix.exe }}"
+          cp "$BIN_SRC" "$BIN_DST"
+
+          PI_SHA="$(git rev-parse HEAD)"
+          ASUPERSYNC_SHA="$(git -C ../asupersync rev-parse HEAD)"
+          RICH_RUST_SHA="$(git -C ../rich_rust rev-parse HEAD)"
+          CHARMED_RUST_SHA="$(git -C ../charmed_rust rev-parse HEAD)"
+          SQLMODEL_RUST_SHA="$(git -C ../sqlmodel_rust rev-parse HEAD)"
+          RUSTC="$(rustc -Vv | tr '\n' ' ' | sed 's/\"/\\\\\"/g')"
+
+          cat > "dist/build-manifest-${{ needs.plan.outputs.tag }}-${{ matrix.target }}.json" <<EOF
+          {
+            "tag": "${{ needs.plan.outputs.tag }}",
+            "version": "${{ needs.plan.outputs.version }}",
+            "target": "${{ matrix.target }}",
+            "runner_os": "${{ runner.os }}",
+            "pi_agent_rust": "$PI_SHA",
+            "deps": {
+              "asupersync": "$ASUPERSYNC_SHA",
+              "rich_rust": "$RICH_RUST_SHA",
+              "charmed_rust": "$CHARMED_RUST_SHA",
+              "sqlmodel_rust": "$SQLMODEL_RUST_SHA"
+            },
+            "rustc": "$RUSTC"
+          }
+          EOF
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: |
+            pi_agent_rust/dist/*
+
+  release:
+    name: Create GitHub Release
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Prepare release directory
+        run: |
+          set -euxo pipefail
+          mkdir -p release
+          find dist -maxdepth 2 -type f -print0 | xargs -0 -I{} cp {} release/
+
+      - name: Generate SHA256SUMS
+        run: |
+          set -euxo pipefail
+          cd release
+          # Stable ordering for reproducible checksums file.
+          ls -1 | LC_ALL=C sort | while read -r f; do
+            sha256sum "$f"
+          done > SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG.md (best-effort)
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+          ref: ${{ needs.plan.outputs.tag }}
+
+      - name: Build release notes
+        run: |
+          set -euxo pipefail
+          VERSION="${{ needs.plan.outputs.version }}"
+          CHANGELOG="pi_agent_rust/CHANGELOG.md"
+
+          # Extract the section whose header contains the version (with or without 'v').
+          awk -v ver="$VERSION" '
+            BEGIN{found=0}
+            /^## /{
+              if(found){exit}
+              if($0 ~ ver){found=1}
+            }
+            { if(found) print }
+          ' "$CHANGELOG" > RELEASE_NOTES.md
+
+          if [ ! -s RELEASE_NOTES.md ]; then
+            cat > RELEASE_NOTES.md <<EOF
+          Release v$VERSION
+
+          See CHANGELOG.md for details.
+          EOF
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.plan.outputs.tag }}
+          name: ${{ needs.plan.outputs.tag }}
+          prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            release/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
