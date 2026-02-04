@@ -3385,6 +3385,125 @@ async fn dispatch_hostcall_events(
                 },
             }
         }
+        "sendmessage" | "send_message" => {
+            let Some(actions) = manager.host_actions() else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "No host actions configured".to_string(),
+                };
+            };
+
+            let extension_id = payload
+                .get("extensionId")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("extension_id").and_then(Value::as_str))
+                .map(ToString::to_string);
+
+            let message = payload.get("message").cloned().unwrap_or(Value::Null);
+            let options = payload.get("options").cloned().unwrap_or(Value::Null);
+
+            let custom_type = message
+                .get("customType")
+                .and_then(Value::as_str)
+                .or_else(|| message.get("custom_type").and_then(Value::as_str))
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if custom_type.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "sendMessage: message.customType is required".to_string(),
+                };
+            }
+
+            let display = message
+                .get("display")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let details = message.get("details").cloned();
+
+            let content = match message.get("content") {
+                Some(Value::String(s)) => s.clone(),
+                Some(other) => {
+                    serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string())
+                }
+                None => String::new(),
+            };
+
+            let deliver_as = options
+                .get("deliverAs")
+                .and_then(Value::as_str)
+                .or_else(|| options.get("deliver_as").and_then(Value::as_str))
+                .and_then(ExtensionDeliverAs::parse);
+            let trigger_turn = options
+                .get("triggerTurn")
+                .and_then(Value::as_bool)
+                .or_else(|| options.get("trigger_turn").and_then(Value::as_bool))
+                .unwrap_or(false);
+
+            let msg = ExtensionSendMessage {
+                extension_id,
+                custom_type,
+                content,
+                display,
+                details,
+                deliver_as,
+                trigger_turn,
+            };
+
+            match actions.send_message(msg).await {
+                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Err(err) => HostcallOutcome::Error {
+                    code: "io".to_string(),
+                    message: err.to_string(),
+                },
+            }
+        }
+        "sendusermessage" | "send_user_message" => {
+            let Some(actions) = manager.host_actions() else {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "No host actions configured".to_string(),
+                };
+            };
+
+            let extension_id = payload
+                .get("extensionId")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("extension_id").and_then(Value::as_str))
+                .map(ToString::to_string);
+
+            let text = payload
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                return HostcallOutcome::Success(Value::Null);
+            }
+
+            let options = payload.get("options").cloned().unwrap_or(Value::Null);
+            let deliver_as = options
+                .get("deliverAs")
+                .and_then(Value::as_str)
+                .or_else(|| options.get("deliver_as").and_then(Value::as_str))
+                .and_then(ExtensionDeliverAs::parse);
+
+            let msg = ExtensionSendUserMessage {
+                extension_id,
+                text,
+                deliver_as,
+            };
+
+            match actions.send_user_message(msg).await {
+                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Err(err) => HostcallOutcome::Error {
+                    code: "io".to_string(),
+                    message: err.to_string(),
+                },
+            }
+        }
         _ => HostcallOutcome::Success(Value::Null),
     }
 }
@@ -3722,19 +3841,46 @@ impl ExtensionManager {
         event: ExtensionEventName,
         data: Option<Value>,
     ) -> Result<()> {
+        let event_name = event.to_string();
         let Some(runtime) = self.js_runtime() else {
             return Ok(());
         };
 
-        let (has_ui, session) = {
+        let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
             let guard = self.inner.lock().unwrap();
-            (guard.ui_sender.is_some(), guard.session.clone())
+            let has_hook = guard
+                .extensions
+                .iter()
+                .any(|ext| ext.event_hooks.iter().any(|hook| hook == &event_name));
+            (
+                guard.ui_sender.is_some(),
+                guard.session.clone(),
+                guard.cwd.clone(),
+                guard.model_registry_values.clone(),
+                has_hook,
+            )
         };
+
+        if !has_hook {
+            return Ok(());
+        }
 
         let mut ctx = serde_json::Map::new();
         ctx.insert("hasUI".to_string(), Value::Bool(has_ui));
-        if let Ok(cwd) = std::env::current_dir() {
-            ctx.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+        if let Some(cwd) = cwd_override.or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        }) {
+            ctx.insert("cwd".to_string(), Value::String(cwd));
+        }
+
+        if !model_registry_values.is_empty() {
+            let mut map = serde_json::Map::new();
+            for (key, value) in model_registry_values {
+                map.insert(key, Value::String(value));
+            }
+            ctx.insert("modelRegistry".to_string(), Value::Object(map));
         }
 
         if let Some(session) = session {
@@ -3748,17 +3894,18 @@ impl ExtensionManager {
             ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
         }
 
-        let mut event_payload = data.unwrap_or(Value::Null);
-        if let Value::Object(map) = &mut event_payload {
-            map.entry("type".to_string())
-                .or_insert_with(|| Value::String(event.to_string()));
-        } else if event_payload.is_null() {
-            event_payload = json!({ "type": event.to_string() });
-        }
+        let event_payload = match data {
+            None => json!({ "type": event_name }),
+            Some(Value::Object(mut map)) => {
+                map.insert("type".to_string(), Value::String(event_name.clone()));
+                Value::Object(map)
+            }
+            Some(other) => json!({ "type": event_name, "data": other }),
+        };
 
         let _ = runtime
             .dispatch_event(
-                event.to_string(),
+                event_name,
                 event_payload,
                 Value::Object(ctx),
                 EXTENSION_EVENT_TIMEOUT_MS,
@@ -3775,19 +3922,46 @@ impl ExtensionManager {
         data: Option<Value>,
         timeout_ms: u64,
     ) -> Result<bool> {
+        let event_name = event.to_string();
         let Some(runtime) = self.js_runtime() else {
             return Ok(false);
         };
 
-        let (has_ui, session) = {
+        let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
             let guard = self.inner.lock().unwrap();
-            (guard.ui_sender.is_some(), guard.session.clone())
+            let has_hook = guard
+                .extensions
+                .iter()
+                .any(|ext| ext.event_hooks.iter().any(|hook| hook == &event_name));
+            (
+                guard.ui_sender.is_some(),
+                guard.session.clone(),
+                guard.cwd.clone(),
+                guard.model_registry_values.clone(),
+                has_hook,
+            )
         };
+
+        if !has_hook {
+            return Ok(false);
+        }
 
         let mut ctx = serde_json::Map::new();
         ctx.insert("hasUI".to_string(), Value::Bool(has_ui));
-        if let Ok(cwd) = std::env::current_dir() {
-            ctx.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+        if let Some(cwd) = cwd_override.or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        }) {
+            ctx.insert("cwd".to_string(), Value::String(cwd));
+        }
+
+        if !model_registry_values.is_empty() {
+            let mut map = serde_json::Map::new();
+            for (key, value) in model_registry_values {
+                map.insert(key, Value::String(value));
+            }
+            ctx.insert("modelRegistry".to_string(), Value::Object(map));
         }
 
         if let Some(session) = session {
@@ -3801,21 +3975,17 @@ impl ExtensionManager {
             ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
         }
 
-        let mut event_payload = data.unwrap_or(Value::Null);
-        if let Value::Object(map) = &mut event_payload {
-            map.entry("type".to_string())
-                .or_insert_with(|| Value::String(event.to_string()));
-        } else if event_payload.is_null() {
-            event_payload = json!({ "type": event.to_string() });
-        }
+        let event_payload = match data {
+            None => json!({ "type": event_name }),
+            Some(Value::Object(mut map)) => {
+                map.insert("type".to_string(), Value::String(event_name.clone()));
+                Value::Object(map)
+            }
+            Some(other) => json!({ "type": event_name, "data": other }),
+        };
 
         let response = runtime
-            .dispatch_event(
-                event.to_string(),
-                event_payload,
-                Value::Object(ctx),
-                timeout_ms,
-            )
+            .dispatch_event(event_name, event_payload, Value::Object(ctx), timeout_ms)
             .await?;
 
         Ok(response.as_bool() == Some(false)
