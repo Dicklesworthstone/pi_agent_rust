@@ -2545,6 +2545,10 @@ impl PiApp {
                         self.autocomplete.close();
                         return None;
                     }
+                    KeyType::Enter => {
+                        // Close autocomplete and allow Enter to submit.
+                        self.autocomplete.close();
+                    }
                     KeyType::Esc => {
                         self.autocomplete.close();
                         return None;
