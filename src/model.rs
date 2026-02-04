@@ -16,6 +16,7 @@ pub enum Message {
     User(UserMessage),
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
+    Custom(CustomMessage),
 }
 
 /// A user message.
@@ -59,6 +60,19 @@ pub struct ToolResultMessage {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
     pub is_error: bool,
+    pub timestamp: i64,
+}
+
+/// A custom message injected by the host or extensions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomMessage {
+    pub content: String,
+    pub custom_type: String,
+    #[serde(default)]
+    pub display: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
     pub timestamp: i64,
 }
 

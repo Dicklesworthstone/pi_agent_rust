@@ -1098,6 +1098,7 @@ fn model_message_text(message: &Message) -> String {
             })
             .collect::<Vec<_>>()
             .join("\n"),
+        Message::Custom(custom) => custom.content.clone(),
         Message::ToolResult(result) => result
             .content
             .iter()

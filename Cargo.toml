@@ -79,7 +79,14 @@ regex = "1"
 unicode-normalization = "0.1"
 similar = "2"
 sysinfo = "0.36"
-rquickjs = { version = "0.11", features = ["futures"] }
+rquickjs = { version = "0.11", features = ["futures", "loader"] }
+swc_common = "18.0.1"
+swc_ecma_codegen = "23.0.0"
+swc_ecma_ast = "20.0.1"
+swc_ecma_parser = "33.0.1"
+swc_ecma_transforms_base = "36.0.1"
+swc_ecma_transforms_typescript = "40.0.0"
+swc_ecma_visit = "20.0.0"
 
 # Image processing (optional)
 image = { version = "0.25", optional = true }

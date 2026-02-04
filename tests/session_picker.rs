@@ -2,12 +2,18 @@
 
 mod common;
 
+use asupersync::runtime::RuntimeBuilder;
 use bubbletea::{KeyMsg, KeyType, Message};
 use common::TestHarness;
-use pi::session::{SessionHeader, encode_cwd};
+use pi::config::Config;
+use pi::model::UserContent;
+use pi::session::{Session, SessionHeader, SessionMessage, encode_cwd};
 use pi::session_index::SessionMeta;
-use pi::session_picker::{SessionPicker, format_time, list_sessions_for_project};
-use std::path::Path;
+use pi::session_picker::{SessionPicker, format_time, list_sessions_for_project, pick_session};
+use std::env;
+use std::future::Future;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -37,6 +43,55 @@ fn write_session_file(base_dir: &Path, cwd: &Path, name: &str, id: &str) -> Stri
 
 fn selected_line(view: &str) -> Option<&str> {
     view.lines().find(|line| line.starts_with('>'))
+}
+
+fn run_async<T>(future: impl Future<Output = T>) -> T {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("runtime build");
+    runtime.block_on(future)
+}
+
+fn session_picker_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().expect("lock")
+}
+
+struct CurrentDirGuard {
+    previous: PathBuf,
+}
+
+impl CurrentDirGuard {
+    fn new(path: &Path) -> Self {
+        let previous = env::current_dir().expect("current dir");
+        env::set_current_dir(path).expect("set current dir");
+        Self { previous }
+    }
+}
+
+impl Drop for CurrentDirGuard {
+    fn drop(&mut self) {
+        let _ = env::set_current_dir(&self.previous);
+    }
+}
+
+fn create_session(harness: &TestHarness, base_dir: &Path, cwd: &Path, label: &str) -> PathBuf {
+    let mut session = Session::create_with_dir(Some(base_dir.to_path_buf()));
+    session.header.cwd = cwd.display().to_string();
+    session.append_message(SessionMessage::User {
+        content: UserContent::Text(format!("hello {label}")),
+        timestamp: Some(0),
+    });
+    run_async(async {
+        session.save().await.expect("save session");
+    });
+
+    let path = session.path.clone().expect("session path");
+    harness.log().info_ctx("setup", "Created session", |ctx| {
+        ctx.push(("label".to_string(), label.to_string()));
+        ctx.push(("path".to_string(), path.display().to_string()));
+    });
+    path
 }
 
 #[test]
@@ -240,4 +295,150 @@ fn session_picker_cancel_sets_flag() {
     picker.update(key_message(KeyType::Esc, Vec::new()));
     harness.log().info("cancel", "pressed Esc");
     assert!(picker.was_cancelled());
+}
+
+#[test]
+fn pick_session_returns_none_when_no_sessions() {
+    let _lock = session_picker_lock();
+    let harness = TestHarness::new("pick_session_returns_none_when_no_sessions");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_path("project");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let _guard = CurrentDirGuard::new(&cwd);
+
+    let result = run_async(pick_session(Some(&base_dir)));
+    harness
+        .log()
+        .info_ctx("result", "pick_session returned", |ctx| {
+            ctx.push(("is_some".to_string(), result.is_some().to_string()));
+        });
+    assert!(result.is_none());
+}
+
+#[test]
+fn pick_session_returns_session_when_single_entry() {
+    let _lock = session_picker_lock();
+    let harness = TestHarness::new("pick_session_returns_session_when_single_entry");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_path("project");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let _guard = CurrentDirGuard::new(&cwd);
+
+    let session_path = create_session(&harness, &base_dir, &cwd, "single");
+    let session = run_async(pick_session(Some(&base_dir))).expect("pick session");
+    harness
+        .log()
+        .info_ctx("verify", "picked session path", |ctx| {
+            ctx.push(("expected".to_string(), session_path.display().to_string()));
+            ctx.push((
+                "actual".to_string(),
+                session
+                    .path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default(),
+            ));
+        });
+    assert_eq!(session.path.as_ref(), Some(&session_path));
+    assert_eq!(session.session_dir.as_ref(), Some(&base_dir));
+}
+
+#[test]
+fn resume_with_picker_creates_new_session_when_project_dir_missing() {
+    let _lock = session_picker_lock();
+    let harness =
+        TestHarness::new("resume_with_picker_creates_new_session_when_project_dir_missing");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_path("project");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let _guard = CurrentDirGuard::new(&cwd);
+
+    let session = run_async(async {
+        Session::resume_with_picker(Some(&base_dir), &Config::default(), None)
+            .await
+            .expect("resume")
+    });
+    harness.log().info_ctx("verify", "resume result", |ctx| {
+        ctx.push((
+            "path".to_string(),
+            session
+                .path
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |p| p.display().to_string()),
+        ));
+    });
+    assert!(session.path.is_none());
+    assert_eq!(session.session_dir.as_ref(), Some(&base_dir));
+}
+
+#[test]
+fn resume_with_picker_creates_new_session_when_sessions_empty() {
+    let _lock = session_picker_lock();
+    let harness = TestHarness::new("resume_with_picker_creates_new_session_when_sessions_empty");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_path("project");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let _guard = CurrentDirGuard::new(&cwd);
+    let project_dir = base_dir.join(encode_cwd(&cwd));
+    std::fs::create_dir_all(&project_dir).expect("create project dir");
+
+    let session = run_async(async {
+        Session::resume_with_picker(Some(&base_dir), &Config::default(), None)
+            .await
+            .expect("resume")
+    });
+    harness.log().info_ctx("verify", "resume result", |ctx| {
+        ctx.push((
+            "path".to_string(),
+            session
+                .path
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |p| p.display().to_string()),
+        ));
+        ctx.push((
+            "session_dir".to_string(),
+            session
+                .session_dir
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+        ));
+    });
+    assert!(session.path.is_none());
+    assert_eq!(session.session_dir.as_ref(), Some(&base_dir));
+}
+
+#[test]
+fn resume_with_picker_selects_session_with_override_input() {
+    let _lock = session_picker_lock();
+    let harness = TestHarness::new("resume_with_picker_selects_session_with_override_input");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_path("project");
+    std::fs::create_dir_all(&cwd).expect("create cwd");
+    let _guard = CurrentDirGuard::new(&cwd);
+
+    let first_path = create_session(&harness, &base_dir, &cwd, "first");
+    sleep(Duration::from_millis(20));
+    let second_path = create_session(&harness, &base_dir, &cwd, "second");
+
+    let session = run_async(async {
+        Session::resume_with_picker(Some(&base_dir), &Config::default(), Some("2".to_string()))
+            .await
+            .expect("resume")
+    });
+
+    harness.log().info_ctx("verify", "selected session", |ctx| {
+        ctx.push(("expected".to_string(), first_path.display().to_string()));
+        ctx.push(("newest".to_string(), second_path.display().to_string()));
+        ctx.push((
+            "actual".to_string(),
+            session
+                .path
+                .as_ref()
+                .map_or_else(|| "<none>".to_string(), |p| p.display().to_string()),
+        ));
+    });
+
+    assert_eq!(session.path.as_ref(), Some(&first_path));
+    assert_eq!(session.session_dir.as_ref(), Some(&base_dir));
 }

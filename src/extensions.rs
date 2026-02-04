@@ -1766,6 +1766,8 @@ pub struct ExtensionUiResponse {
 pub trait ExtensionSession: Send + Sync {
     async fn get_state(&self) -> Value;
     async fn get_messages(&self) -> Vec<SessionMessage>;
+    async fn get_entries(&self) -> Vec<Value>;
+    async fn get_branch(&self) -> Vec<Value>;
     async fn set_name(&self, name: String) -> Result<()>;
 }
 

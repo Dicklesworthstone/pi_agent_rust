@@ -25,8 +25,15 @@
 
 use crate::error::{Error, Result};
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, Scheduler, WallClock};
-use rquickjs::function::Func;
-use rquickjs::{AsyncContext, AsyncRuntime, Ctx, Function, IntoJs, Object, Value};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use rquickjs::function::{Func, Opt};
+use rquickjs::loader::{Loader as JsModuleLoader, Resolver as JsModuleResolver};
+use rquickjs::module::Declared as JsModuleDeclared;
+use rquickjs::{
+    AsyncContext, AsyncRuntime, Coerced, Ctx, Exception, FromJs, Function, IntoJs, Module, Object,
+    Value,
+};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::cmp::Ordering;
@@ -35,6 +42,13 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, path::Path, path::PathBuf};
+use swc_common::{FileName, GLOBALS, Globals, Mark, SourceMap, sync::Lrc};
+use swc_ecma_ast::{Module as SwcModule, Pass, Program as SwcProgram};
+use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
+use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
+use swc_ecma_transforms_base::resolver;
+use swc_ecma_transforms_typescript::strip;
 use uuid::Uuid;
 
 pub struct QuickJsRuntime {
@@ -333,7 +347,10 @@ impl Default for PendingHostcalls<'_> {
 
 /// Convert a serde_json::Value to a rquickjs Value.
 #[allow(clippy::option_if_let_else)]
-fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Result<Value<'js>> {
+pub(crate) fn json_to_js<'js>(
+    ctx: &Ctx<'js>,
+    value: &serde_json::Value,
+) -> rquickjs::Result<Value<'js>> {
     match value {
         serde_json::Value::Null => Ok(Value::new_null(ctx.clone())),
         serde_json::Value::Bool(b) => Ok(Value::new_bool(ctx.clone(), *b)),
@@ -367,7 +384,7 @@ fn json_to_js<'js>(ctx: &Ctx<'js>, value: &serde_json::Value) -> rquickjs::Resul
 }
 
 /// Convert a rquickjs Value to a serde_json::Value.
-fn js_to_json(value: &Value<'_>) -> rquickjs::Result<serde_json::Value> {
+pub(crate) fn js_to_json(value: &Value<'_>) -> rquickjs::Result<serde_json::Value> {
     if value.is_null() || value.is_undefined() {
         return Ok(serde_json::Value::Null);
     }
@@ -686,7 +703,28 @@ fn throw_unimplemented(ctx: &Ctx<'_>, name: &str) -> rquickjs::Error {
 }
 
 fn map_js_error(err: &rquickjs::Error) -> Error {
-    Error::extension(format!("QuickJS: {err}"))
+    Error::extension(format!("QuickJS: {err:?}"))
+}
+
+fn format_quickjs_exception<'js>(ctx: &Ctx<'js>, caught: Value<'js>) -> String {
+    if let Ok(obj) = caught.clone().try_into_object() {
+        if let Some(exception) = Exception::from_object(obj) {
+            if let Some(message) = exception.message() {
+                if let Some(stack) = exception.stack() {
+                    return format!("{message}\n{stack}");
+                }
+                return message;
+            }
+            if let Some(stack) = exception.stack() {
+                return stack;
+            }
+        }
+    }
+
+    match Coerced::<String>::from_js(ctx, caught) {
+        Ok(value) => value.0,
+        Err(err) => format!("(failed to stringify QuickJS exception: {err})"),
+    }
 }
 
 // ============================================================================
@@ -841,6 +879,579 @@ impl HostcallTracker {
     }
 }
 
+// ============================================================================
+// PiJS Module Loader (TypeScript + virtual modules)
+// ============================================================================
+
+#[derive(Debug)]
+struct PiJsModuleState {
+    virtual_modules: HashMap<String, String>,
+    compiled_sources: HashMap<String, Vec<u8>>,
+}
+
+impl PiJsModuleState {
+    fn new() -> Self {
+        Self {
+            virtual_modules: default_virtual_modules(),
+            compiled_sources: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PiJsResolver {
+    state: Rc<RefCell<PiJsModuleState>>,
+}
+
+impl JsModuleResolver for PiJsResolver {
+    fn resolve(&mut self, _ctx: &Ctx<'_>, base: &str, name: &str) -> rquickjs::Result<String> {
+        let spec = name.trim();
+        if spec.is_empty() {
+            return Err(rquickjs::Error::new_resolving(base, name));
+        }
+
+        if self.state.borrow().virtual_modules.contains_key(spec) {
+            return Ok(spec.to_string());
+        }
+
+        if let Some(path) = resolve_module_path(base, spec) {
+            return Ok(path.to_string_lossy().to_string());
+        }
+
+        Err(rquickjs::Error::new_resolving_message(
+            base,
+            name,
+            format!("Unsupported module specifier: {spec}"),
+        ))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PiJsLoader {
+    state: Rc<RefCell<PiJsModuleState>>,
+}
+
+impl JsModuleLoader for PiJsLoader {
+    fn load<'js>(
+        &mut self,
+        ctx: &Ctx<'js>,
+        name: &str,
+    ) -> rquickjs::Result<Module<'js, JsModuleDeclared>> {
+        let source = {
+            let mut state = self.state.borrow_mut();
+            if let Some(cached) = state.compiled_sources.get(name) {
+                cached.clone()
+            } else {
+                let compiled = compile_module_source(&state.virtual_modules, name)?;
+                state
+                    .compiled_sources
+                    .insert(name.to_string(), compiled.clone());
+                compiled
+            }
+        };
+
+        Module::declare(ctx.clone(), name, source)
+    }
+}
+
+fn compile_module_source(
+    virtual_modules: &HashMap<String, String>,
+    name: &str,
+) -> rquickjs::Result<Vec<u8>> {
+    if let Some(source) = virtual_modules.get(name) {
+        return Ok(prefix_import_meta_url(name, source));
+    }
+
+    let path = Path::new(name);
+    if !path.is_file() {
+        return Err(rquickjs::Error::new_loading_message(
+            name,
+            "Module is not a file",
+        ));
+    }
+
+    let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+    let raw = fs::read_to_string(path)
+        .map_err(|err| rquickjs::Error::new_loading_message(name, format!("read: {err}")))?;
+
+    let compiled = match extension {
+        "ts" | "tsx" => transpile_typescript_module(&raw, name).map_err(|message| {
+            rquickjs::Error::new_loading_message(name, format!("transpile: {message}"))
+        })?,
+        "js" | "mjs" => raw,
+        "json" => json_module_to_esm(&raw, name).map_err(|message| {
+            rquickjs::Error::new_loading_message(name, format!("json: {message}"))
+        })?,
+        other => {
+            return Err(rquickjs::Error::new_loading_message(
+                name,
+                format!("Unsupported module extension: {other}"),
+            ));
+        }
+    };
+
+    Ok(prefix_import_meta_url(name, &compiled))
+}
+
+fn prefix_import_meta_url(module_name: &str, body: &str) -> Vec<u8> {
+    let url = if module_name.starts_with('/') {
+        format!("file://{module_name}")
+    } else if module_name.starts_with("file://") {
+        module_name.to_string()
+    } else {
+        format!("pi://{module_name}")
+    };
+    let url_literal = serde_json::to_string(&url).unwrap_or_else(|_| "\"\"".to_string());
+    format!("import.meta.url = {url_literal};\n{body}").into_bytes()
+}
+
+fn resolve_module_path(base: &str, specifier: &str) -> Option<PathBuf> {
+    let specifier = specifier.trim();
+    if specifier.is_empty() {
+        return None;
+    }
+
+    if let Some(path) = specifier.strip_prefix("file://") {
+        return resolve_existing_file(PathBuf::from(path));
+    }
+
+    let path = if specifier.starts_with('/') {
+        PathBuf::from(specifier)
+    } else if specifier.starts_with('.') {
+        let base_path = Path::new(base);
+        let base_dir = base_path.parent()?;
+        base_dir.join(specifier)
+    } else {
+        return None;
+    };
+
+    resolve_existing_module_candidate(path)
+}
+
+fn resolve_existing_file(path: PathBuf) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path);
+    }
+    None
+}
+
+fn resolve_existing_module_candidate(path: PathBuf) -> Option<PathBuf> {
+    if path.is_file() {
+        return Some(path);
+    }
+
+    if path.is_dir() {
+        for candidate in ["index.ts", "index.js"] {
+            let full = path.join(candidate);
+            if full.is_file() {
+                return Some(full);
+            }
+        }
+        return None;
+    }
+
+    let extension = path.extension().and_then(|ext| ext.to_str());
+    match extension {
+        Some("js" | "mjs") => {
+            let ts = path.with_extension("ts");
+            if ts.is_file() {
+                return Some(ts);
+            }
+        }
+        None => {
+            for ext in ["ts", "js"] {
+                let candidate = path.with_extension(ext);
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    None
+}
+
+fn json_module_to_esm(raw: &str, name: &str) -> std::result::Result<String, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|err| format!("parse {name}: {err}"))?;
+    let literal = serde_json::to_string(&value).map_err(|err| format!("encode {name}: {err}"))?;
+    Ok(format!("export default {literal};\n"))
+}
+
+fn transpile_typescript_module(source: &str, name: &str) -> std::result::Result<String, String> {
+    let globals = Globals::new();
+    GLOBALS.set(&globals, || {
+        let cm: Lrc<SourceMap> = Lrc::default();
+        let fm = cm.new_source_file(
+            FileName::Custom(name.to_string()).into(),
+            source.to_string(),
+        );
+
+        let syntax = Syntax::Typescript(TsSyntax {
+            tsx: Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("tsx")),
+            decorators: true,
+            ..Default::default()
+        });
+
+        let mut parser = SwcParser::new(syntax, StringInput::from(&*fm), None);
+        let module: SwcModule = parser
+            .parse_module()
+            .map_err(|err| format!("parse {name}: {err:?}"))?;
+
+        let unresolved_mark = Mark::new();
+        let top_level_mark = Mark::new();
+        let mut program = SwcProgram::Module(module);
+        {
+            let mut pass = resolver(unresolved_mark, top_level_mark, false);
+            pass.process(&mut program);
+        }
+        {
+            let mut pass = strip(unresolved_mark, top_level_mark);
+            pass.process(&mut program);
+        }
+        let SwcProgram::Module(module) = program else {
+            return Err(format!("transpile {name}: expected module"));
+        };
+
+        let mut buf = Vec::new();
+        {
+            let mut emitter = Emitter {
+                cfg: swc_ecma_codegen::Config::default(),
+                comments: None,
+                cm: cm.clone(),
+                wr: JsWriter::new(cm, "\n", &mut buf, None),
+            };
+            emitter
+                .emit_module(&module)
+                .map_err(|err| format!("emit {name}: {err}"))?;
+        }
+
+        String::from_utf8(buf).map_err(|err| format!("utf8 {name}: {err}"))
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn default_virtual_modules() -> HashMap<String, String> {
+    let mut modules = HashMap::new();
+
+    modules.insert(
+        "@sinclair/typebox".to_string(),
+        r#"
+export const Type = {
+  String: (opts = {}) => ({ type: "string", ...opts }),
+  Number: (opts = {}) => ({ type: "number", ...opts }),
+  Boolean: (opts = {}) => ({ type: "boolean", ...opts }),
+  Array: (items, opts = {}) => ({ type: "array", items, ...opts }),
+  Object: (props = {}, opts = {}) => {
+    const required = [];
+    const properties = {};
+    for (const [k, v] of Object.entries(props)) {
+      if (v && typeof v === "object" && v.__pi_optional) {
+        properties[k] = v.schema;
+      } else {
+        properties[k] = v;
+        required.push(k);
+      }
+    }
+    const out = { type: "object", properties, ...opts };
+    if (required.length) out.required = required;
+    return out;
+  },
+  Optional: (schema) => ({ __pi_optional: true, schema }),
+  Literal: (value, opts = {}) => ({ const: value, ...opts }),
+};
+export default { Type };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@mariozechner/pi-ai".to_string(),
+        r#"
+export function StringEnum(values, opts = {}) {
+  const list = Array.isArray(values) ? values.map((v) => String(v)) : [];
+  return { type: "string", enum: list, ...opts };
+}
+
+export function calculateCost() {}
+
+export function createAssistantMessageEventStream() {
+  return {
+    push: () => {},
+    end: () => {},
+  };
+}
+
+export default { StringEnum, calculateCost, createAssistantMessageEventStream };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@mariozechner/pi-tui".to_string(),
+        r#"
+export function matchesKey(_data, _key) {
+  return false;
+}
+
+export function truncateToWidth(text, width) {
+  const s = String(text ?? "");
+  const w = Number(width ?? 0);
+  if (!w || w <= 0) return "";
+  return s.length <= w ? s : s.slice(0, w);
+}
+
+export class Text {
+  constructor(text, x = 0, y = 0) {
+    this.text = String(text ?? "");
+    this.x = x;
+    this.y = y;
+  }
+}
+
+export class Container {
+  constructor(..._args) {}
+}
+
+export class Markdown {
+  constructor(..._args) {}
+}
+
+export class Spacer {
+  constructor(..._args) {}
+}
+
+export const Key = {
+  ctrlAlt: (key) => ({ kind: "ctrlAlt", key: String(key) }),
+};
+
+export default { matchesKey, truncateToWidth, Text, Container, Markdown, Spacer, Key };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@mariozechner/pi-coding-agent".to_string(),
+        r#"
+export function parseFrontmatter(text) {
+  const raw = String(text ?? "");
+  if (!raw.startsWith("---")) return { frontmatter: {}, body: raw };
+  const end = raw.indexOf("\n---", 3);
+  if (end === -1) return { frontmatter: {}, body: raw };
+
+  const header = raw.slice(3, end).trim();
+  const body = raw.slice(end + 4).replace(/^\n/, "");
+  const frontmatter = {};
+  for (const line of header.split(/\r?\n/)) {
+    const idx = line.indexOf(":");
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    const val = line.slice(idx + 1).trim();
+    if (!key) continue;
+    frontmatter[key] = val;
+  }
+  return { frontmatter, body };
+}
+
+export function getMarkdownTheme() {
+  return {};
+}
+
+export function createBashTool(_cwd, _opts = {}) {
+  return {
+    name: "bash",
+    label: "bash",
+    description: "Execute a shell command",
+    parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+    async execute(_id, params) {
+      return { content: [{ type: "text", text: String(params?.command ?? "") }], details: {} };
+    },
+  };
+}
+
+export default { parseFrontmatter, getMarkdownTheme, createBashTool };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@anthropic-ai/sdk".to_string(),
+        r"
+export default class Anthropic {
+  constructor(_opts = {}) {}
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@anthropic-ai/sandbox-runtime".to_string(),
+        r"
+export const SandboxManager = {
+  initialize: async (_config) => {},
+  reset: async () => {},
+};
+export default { SandboxManager };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "ms".to_string(),
+        r#"
+function parseMs(text) {
+  const s = String(text ?? "").trim();
+  if (!s) return undefined;
+
+  const match = s.match(/^(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w|y)?$/i);
+  if (!match) return undefined;
+  const value = Number(match[1]);
+  const unit = (match[2] || "ms").toLowerCase();
+  const mult = unit === "ms" ? 1 :
+               unit === "s"  ? 1000 :
+               unit === "m"  ? 60000 :
+               unit === "h"  ? 3600000 :
+               unit === "d"  ? 86400000 :
+               unit === "w"  ? 604800000 :
+               unit === "y"  ? 31536000000 : 1;
+  return Math.round(value * mult);
+}
+
+export default function ms(value) {
+  return parseMs(value);
+}
+
+export const parse = parseMs;
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:path".to_string(),
+        r#"
+export function join(...parts) {
+  const cleaned = parts.map((p) => String(p ?? "").replace(/\\/g, "/")).filter((p) => p.length > 0);
+  return cleaned.join("/").replace(/\/+/g, "/");
+}
+
+export function dirname(p) {
+  const s = String(p ?? "").replace(/\\/g, "/");
+  const idx = s.lastIndexOf("/");
+  if (idx <= 0) return "/";
+  return s.slice(0, idx);
+}
+
+export default { join, dirname };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:url".to_string(),
+        r#"
+export function fileURLToPath(url) {
+  const s = String(url ?? "");
+  if (s.startsWith("file://")) return s.slice("file://".length);
+  return s;
+}
+export default { fileURLToPath };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:os".to_string(),
+        r#"
+export function homedir() {
+  return "/home/unknown";
+}
+export default { homedir };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:child_process".to_string(),
+        r#"
+export function spawn() {
+  throw new Error("node:child_process.spawn is not available in PiJS");
+}
+export default { spawn };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:module".to_string(),
+        r#"
+export function createRequire(_path) {
+  return function require(_id) {
+    throw new Error("require() is not available in PiJS");
+  };
+}
+
+export default { createRequire };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:fs".to_string(),
+        r#"
+export function existsSync(_path) { return false; }
+export function readFileSync(_path, _encoding) { return ""; }
+export function writeFileSync(_path, _data, _opts) { return; }
+export function readdirSync(_path, _opts) { return []; }
+export function statSync(_path) { throw new Error("statSync unavailable"); }
+export default { existsSync, readFileSync, writeFileSync, readdirSync, statSync };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:fs/promises".to_string(),
+        r"
+export async function mkdir(_path, _opts) { return; }
+export async function writeFile(_path, _data, _opts) { return; }
+export default { mkdir, writeFile };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:crypto".to_string(),
+        r#"
+export function randomUUID() {
+  // Not cryptographically secure; sufficient for deterministic tests.
+  const r = Math.random().toString(16).slice(2);
+  return `00000000-0000-4000-8000-${r.padEnd(12, "0").slice(0, 12)}`;
+}
+export default { randomUUID };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules
+}
+
 /// Integrated PiJS runtime combining QuickJS, scheduler, and Promise bridge.
 ///
 /// This is the main entry point for running JavaScript extensions with
@@ -925,6 +1536,18 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 .await;
         }
 
+        let module_state = Rc::new(RefCell::new(PiJsModuleState::new()));
+        runtime
+            .set_loader(
+                PiJsResolver {
+                    state: Rc::clone(&module_state),
+                },
+                PiJsLoader {
+                    state: Rc::clone(&module_state),
+                },
+            )
+            .await;
+
         let context = AsyncContext::full(&runtime)
             .await
             .map_err(|err| map_js_error(&err))?;
@@ -994,12 +1617,38 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         Ok(())
     }
 
+    /// Run a closure inside the JS context and map QuickJS errors into `pi::Error`.
+    ///
+    /// This is intentionally `pub(crate)` so the extensions runtime can call JS helper
+    /// functions without exposing raw rquickjs types as part of the public API.
+    pub(crate) async fn with_ctx<F, R>(&self, f: F) -> Result<R>
+    where
+        F: for<'js> FnOnce(Ctx<'js>) -> rquickjs::Result<R> + rquickjs::markers::ParallelSend,
+        R: rquickjs::markers::ParallelSend,
+    {
+        self.interrupt_budget.reset();
+        match self.context.with(f).await {
+            Ok(value) => Ok(value),
+            Err(err) => Err(self.map_quickjs_error(&err)),
+        }
+    }
+
     /// Drain pending hostcall requests from the queue.
     ///
     /// Returns the requests that need to be processed by the host.
     /// After processing, call `complete_hostcall()` for each.
     pub fn drain_hostcall_requests(&self) -> VecDeque<HostcallRequest> {
         std::mem::take(&mut *self.hostcall_queue.borrow_mut())
+    }
+
+    /// Drain pending QuickJS jobs (Promise microtasks) until fixpoint.
+    pub async fn drain_microtasks(&self) -> Result<usize> {
+        self.drain_jobs().await
+    }
+
+    /// Return the next timer deadline (runtime clock), if any.
+    pub fn next_timer_deadline_ms(&self) -> Option<u64> {
+        self.scheduler.borrow().next_timer_deadline()
     }
 
     /// Peek at pending hostcall requests without draining.
@@ -1320,7 +1969,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
-                // __pi_exec_native(cmd, args) -> call_id
+                // __pi_exec_native(cmd, args, options) -> call_id
                 global.set(
                     "__pi_exec_native",
                     Func::from({
@@ -1331,9 +1980,18 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let trace_seq = Arc::clone(&trace_seq);
                         move |_ctx: Ctx<'_>,
                               cmd: String,
-                              args: Value<'_>|
+                              args: Value<'_>,
+                              options: Opt<Value<'_>>|
                               -> rquickjs::Result<String> {
-                            let payload = js_to_json(&args)?;
+                            let options_json = match options.0.as_ref() {
+                                None => serde_json::json!({}),
+                                Some(value) if value.is_null() => serde_json::json!({}),
+                                Some(value) => js_to_json(value)?,
+                            };
+                            let payload = serde_json::json!({
+                                "args": js_to_json(&args)?,
+                                "options": options_json,
+                            });
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
                             let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
@@ -1580,8 +2238,63 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     ),
                 )?;
 
+                // __pi_base64_encode_native(binary_string) -> base64 string
+                global.set(
+                    "__pi_base64_encode_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>, input: String| -> rquickjs::Result<String> {
+                            let mut bytes = Vec::with_capacity(input.len());
+                            for ch in input.chars() {
+                                let code = ch as u32;
+                                let byte = u8::try_from(code).map_err(|_| {
+                                    rquickjs::Error::new_into_js_message(
+                                        "base64",
+                                        "encode",
+                                        "Input contains non-latin1 characters",
+                                    )
+                                })?;
+                                bytes.push(byte);
+                            }
+                            Ok(BASE64_STANDARD.encode(bytes))
+                        },
+                    ),
+                )?;
+
+                // __pi_base64_decode_native(base64) -> binary string
+                global.set(
+                    "__pi_base64_decode_native",
+                    Func::from(
+                        move |_ctx: Ctx<'_>, input: String| -> rquickjs::Result<String> {
+                            let bytes = BASE64_STANDARD.decode(input).map_err(|err| {
+                                rquickjs::Error::new_into_js_message(
+                                    "base64",
+                                    "decode",
+                                    format!("Invalid base64: {err}"),
+                                )
+                            })?;
+
+                            let mut out = String::with_capacity(bytes.len());
+                            for byte in bytes {
+                                out.push(byte as char);
+                            }
+                            Ok(out)
+                        },
+                    ),
+                )?;
+
                 // Install the JS bridge that creates Promises and wraps the native functions
-                ctx.eval::<(), _>(PI_BRIDGE_JS)?;
+                match ctx.eval::<(), _>(PI_BRIDGE_JS) {
+                    Ok(()) => {}
+                    Err(rquickjs::Error::Exception) => {
+                        let detail = format_quickjs_exception(&ctx, ctx.catch());
+                        return Err(rquickjs::Error::new_into_js_message(
+                            "PI_BRIDGE_JS",
+                            "eval",
+                            detail,
+                        ));
+                    }
+                    Err(err) => return Err(err),
+                }
 
                 Ok(())
             })
@@ -1635,6 +2348,586 @@ const __pi_timer_callbacks = new Map();
 
 // Event listeners: event_id -> [callback, ...]
 const __pi_event_listeners = new Map();
+
+// ============================================================================
+// Extension Registry (registration + hooks)
+// ============================================================================
+
+let __pi_current_extension_id = null;
+
+// extension_id -> { id, name, version, apiVersion, tools: Map, commands: Map, hooks: Map }
+const __pi_extensions = new Map();
+
+// Fast indexes
+const __pi_tool_index = new Map();      // tool_name -> { extensionId, spec, execute }
+const __pi_command_index = new Map();   // command_name -> { extensionId, name, description, handler }
+const __pi_hook_index = new Map();      // event_name -> [{ extensionId, handler }, ...]
+const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
+
+// Async task tracking for Rust-driven calls (tool exec, command exec, event dispatch).
+// task_id -> { status: 'pending'|'resolved'|'rejected', value?, error? }
+const __pi_tasks = new Map();
+
+function __pi_serialize_error(err) {
+    if (!err) {
+        return { message: 'Unknown error' };
+    }
+    if (typeof err === 'string') {
+        return { message: err };
+    }
+    const out = { message: String(err.message || err) };
+    if (err.code) out.code = String(err.code);
+    if (err.stack) out.stack = String(err.stack);
+    return out;
+}
+
+function __pi_task_start(task_id, promise) {
+    const id = String(task_id || '').trim();
+    if (!id) {
+        throw new Error('task_id is required');
+    }
+    __pi_tasks.set(id, { status: 'pending' });
+    Promise.resolve(promise).then(
+        (value) => {
+            __pi_tasks.set(id, { status: 'resolved', value: value });
+        },
+        (err) => {
+            __pi_tasks.set(id, { status: 'rejected', error: __pi_serialize_error(err) });
+        }
+    );
+    return id;
+}
+
+function __pi_task_poll(task_id) {
+    const id = String(task_id || '').trim();
+    return __pi_tasks.get(id) || null;
+}
+
+function __pi_task_take(task_id) {
+    const id = String(task_id || '').trim();
+    const state = __pi_tasks.get(id) || null;
+    if (state && state.status !== 'pending') {
+        __pi_tasks.delete(id);
+    }
+    return state;
+}
+
+function __pi_get_or_create_extension(extension_id, meta) {
+    const id = String(extension_id || '').trim();
+    if (!id) {
+        throw new Error('extension_id is required');
+    }
+
+    if (!__pi_extensions.has(id)) {
+        __pi_extensions.set(id, {
+            id: id,
+            name: (meta && meta.name) ? String(meta.name) : id,
+            version: (meta && meta.version) ? String(meta.version) : '0.0.0',
+            apiVersion: (meta && meta.apiVersion) ? String(meta.apiVersion) : '1.0',
+            tools: new Map(),
+            commands: new Map(),
+            hooks: new Map(),
+            providers: new Map(),
+            shortcuts: new Map(),
+            flags: new Map(),
+            flagValues: new Map(),
+            activeTools: null,
+        });
+    }
+
+    return __pi_extensions.get(id);
+}
+
+function __pi_begin_extension(extension_id, meta) {
+    const ext = __pi_get_or_create_extension(extension_id, meta);
+    __pi_current_extension_id = ext.id;
+}
+
+function __pi_end_extension() {
+    __pi_current_extension_id = null;
+}
+
+function __pi_current_extension_or_throw() {
+    if (!__pi_current_extension_id) {
+        throw new Error('No active extension. Did you forget to call __pi_begin_extension?');
+    }
+    const ext = __pi_extensions.get(__pi_current_extension_id);
+    if (!ext) {
+        throw new Error('Internal error: active extension not found');
+    }
+    return ext;
+}
+
+async function __pi_with_extension_async(extension_id, fn) {
+    const prev = __pi_current_extension_id;
+    __pi_current_extension_id = String(extension_id || '').trim();
+    try {
+        return await fn();
+    } finally {
+        __pi_current_extension_id = prev;
+    }
+}
+
+function __pi_register_tool(spec) {
+    const ext = __pi_current_extension_or_throw();
+    if (!spec || typeof spec !== 'object') {
+        throw new Error('registerTool: spec must be an object');
+    }
+    const name = String(spec.name || '').trim();
+    if (!name) {
+        throw new Error('registerTool: spec.name is required');
+    }
+    if (typeof spec.execute !== 'function') {
+        throw new Error('registerTool: spec.execute must be a function');
+    }
+
+    const toolSpec = {
+        name: name,
+        label: spec.label ? String(spec.label) : name,
+        description: spec.description ? String(spec.description) : '',
+        parameters: spec.parameters || { type: 'object', properties: {} },
+    };
+
+    if (__pi_tool_index.has(name)) {
+        const existing = __pi_tool_index.get(name);
+        if (existing && existing.extensionId !== ext.id) {
+            throw new Error(`registerTool: tool name collision: ${name}`);
+        }
+    }
+
+    const record = { extensionId: ext.id, spec: toolSpec, execute: spec.execute };
+    ext.tools.set(name, record);
+    __pi_tool_index.set(name, record);
+}
+
+function __pi_register_command(name, spec) {
+    const ext = __pi_current_extension_or_throw();
+    const cmd = String(name || '').trim().replace(/^\//, '');
+    if (!cmd) {
+        throw new Error('registerCommand: name is required');
+    }
+    if (!spec || typeof spec !== 'object') {
+        throw new Error('registerCommand: spec must be an object');
+    }
+    if (typeof spec.handler !== 'function') {
+        throw new Error('registerCommand: spec.handler must be a function');
+    }
+
+    const cmdSpec = {
+        name: cmd,
+        description: spec.description ? String(spec.description) : '',
+    };
+
+    if (__pi_command_index.has(cmd)) {
+        const existing = __pi_command_index.get(cmd);
+        if (existing && existing.extensionId !== ext.id) {
+            throw new Error(`registerCommand: command name collision: ${cmd}`);
+        }
+    }
+
+    const record = {
+        extensionId: ext.id,
+        name: cmd,
+        description: cmdSpec.description,
+        handler: spec.handler,
+        spec: cmdSpec,
+    };
+    ext.commands.set(cmd, record);
+    __pi_command_index.set(cmd, record);
+}
+
+function __pi_register_provider(provider_id, spec) {
+    const ext = __pi_current_extension_or_throw();
+    const id = String(provider_id || '').trim();
+    if (!id) {
+        throw new Error('registerProvider: id is required');
+    }
+    if (!spec || typeof spec !== 'object') {
+        throw new Error('registerProvider: spec must be an object');
+    }
+
+    const models = Array.isArray(spec.models) ? spec.models.map((m) => {
+        const out = {
+            id: m && m.id ? String(m.id) : '',
+            name: m && m.name ? String(m.name) : '',
+        };
+        if (m && m.api) out.api = String(m.api);
+        if (m && m.reasoning !== undefined) out.reasoning = !!m.reasoning;
+        if (m && Array.isArray(m.input)) out.input = m.input.slice();
+        if (m && m.cost) out.cost = m.cost;
+        if (m && m.contextWindow !== undefined) out.contextWindow = m.contextWindow;
+        if (m && m.maxTokens !== undefined) out.maxTokens = m.maxTokens;
+        return out;
+    }) : [];
+
+    const providerSpec = {
+        id: id,
+        baseUrl: spec.baseUrl ? String(spec.baseUrl) : '',
+        apiKey: spec.apiKey ? String(spec.apiKey) : '',
+        api: spec.api ? String(spec.api) : '',
+        models: models,
+    };
+
+    if (__pi_provider_index.has(id)) {
+        const existing = __pi_provider_index.get(id);
+        if (existing && existing.extensionId !== ext.id) {
+            throw new Error(`registerProvider: provider id collision: ${id}`);
+        }
+    }
+
+    const record = { extensionId: ext.id, spec: providerSpec };
+    ext.providers.set(id, record);
+    __pi_provider_index.set(id, record);
+}
+
+function __pi_register_shortcut(key, spec) {
+    const ext = __pi_current_extension_or_throw();
+    if (!spec || typeof spec !== 'object') {
+        throw new Error('registerShortcut: spec must be an object');
+    }
+    if (typeof spec.handler !== 'function') {
+        throw new Error('registerShortcut: spec.handler must be a function');
+    }
+
+    // Keys can be strings or small objects. Keep it stable for snapshots.
+    const keyId = typeof key === 'string' ? key : JSON.stringify(key ?? null);
+    const entry = {
+        key: key,
+        description: spec.description ? String(spec.description) : '',
+    };
+    ext.shortcuts.set(keyId, entry);
+}
+
+function __pi_register_hook(event_name, handler) {
+    const ext = __pi_current_extension_or_throw();
+    const eventName = String(event_name || '').trim();
+    if (!eventName) {
+        throw new Error('on: event name is required');
+    }
+    if (typeof handler !== 'function') {
+        throw new Error('on: handler must be a function');
+    }
+
+    if (!ext.hooks.has(eventName)) {
+        ext.hooks.set(eventName, []);
+    }
+    ext.hooks.get(eventName).push(handler);
+
+    if (!__pi_hook_index.has(eventName)) {
+        __pi_hook_index.set(eventName, []);
+    }
+    __pi_hook_index.get(eventName).push({ extensionId: ext.id, handler: handler });
+}
+
+function __pi_register_flag(flag_name, spec) {
+    const ext = __pi_current_extension_or_throw();
+    const name = String(flag_name || '').trim().replace(/^\//, '');
+    if (!name) {
+        throw new Error('registerFlag: name is required');
+    }
+    if (!spec || typeof spec !== 'object') {
+        throw new Error('registerFlag: spec must be an object');
+    }
+    ext.flags.set(name, spec);
+}
+
+function __pi_set_flag_value(extension_id, flag_name, value) {
+    const extId = String(extension_id || '').trim();
+    const name = String(flag_name || '').trim().replace(/^\//, '');
+    if (!extId || !name) return false;
+    const ext = __pi_extensions.get(extId);
+    if (!ext) return false;
+    ext.flagValues.set(name, value);
+    return true;
+}
+
+function __pi_get_flag(flag_name) {
+    const ext = __pi_current_extension_or_throw();
+    const name = String(flag_name || '').trim().replace(/^\//, '');
+    if (!name) return undefined;
+    if (ext.flagValues.has(name)) {
+        return ext.flagValues.get(name);
+    }
+    const spec = ext.flags.get(name);
+    return spec ? spec.default : undefined;
+}
+
+function __pi_set_active_tools(tools) {
+    const ext = __pi_current_extension_or_throw();
+    if (!Array.isArray(tools)) {
+        throw new Error('setActiveTools: tools must be an array');
+    }
+    ext.activeTools = tools.map((t) => String(t));
+    // Best-effort notify host; ignore completion.
+    try {
+        pi.events('setActiveTools', { extensionId: ext.id, tools: ext.activeTools }).catch(() => {});
+    } catch (_) {}
+}
+
+function __pi_get_active_tools() {
+    const ext = __pi_current_extension_or_throw();
+    if (!Array.isArray(ext.activeTools)) return undefined;
+    return ext.activeTools.slice();
+}
+
+function __pi_append_entry(custom_type, data) {
+    const ext = __pi_current_extension_or_throw();
+    const customType = String(custom_type || '').trim();
+    if (!customType) {
+        throw new Error('appendEntry: customType is required');
+    }
+    try {
+        pi.events('appendEntry', {
+            extensionId: ext.id,
+            customType: customType,
+            data: data === undefined ? null : data,
+        }).catch(() => {});
+    } catch (_) {}
+}
+
+function __pi_send_message(message, options) {
+    const ext = __pi_current_extension_or_throw();
+    if (!message || typeof message !== 'object') {
+        throw new Error('sendMessage: message must be an object');
+    }
+    const opts = options && typeof options === 'object' ? options : {};
+    try {
+        pi.events('sendMessage', { extensionId: ext.id, message: message, options: opts }).catch(() => {});
+    } catch (_) {}
+}
+
+function __pi_send_user_message(text) {
+    const ext = __pi_current_extension_or_throw();
+    const msg = String(text === undefined || text === null ? '' : text).trim();
+    if (!msg) return;
+    try {
+        pi.events('sendUserMessage', { extensionId: ext.id, text: msg }).catch(() => {});
+    } catch (_) {}
+}
+
+function __pi_snapshot_extensions() {
+    const out = [];
+    for (const [id, ext] of __pi_extensions.entries()) {
+        const tools = [];
+        for (const tool of ext.tools.values()) {
+            tools.push(tool.spec);
+        }
+
+        const commands = [];
+        for (const cmd of ext.commands.values()) {
+            commands.push(cmd.spec);
+        }
+
+        const providers = [];
+        for (const provider of ext.providers.values()) {
+            providers.push(provider.spec);
+        }
+
+        const event_hooks = [];
+        for (const key of ext.hooks.keys()) {
+            event_hooks.push(String(key));
+        }
+
+        out.push({
+            id: id,
+            name: ext.name,
+            version: ext.version,
+            api_version: ext.apiVersion,
+            tools: tools,
+            slash_commands: commands,
+            providers: providers,
+            event_hooks: event_hooks,
+            active_tools: Array.isArray(ext.activeTools) ? ext.activeTools.slice() : null,
+        });
+    }
+    return out;
+}
+
+function __pi_make_extension_theme() {
+    // Minimal theme shim. Legacy emits ANSI; conformance harness should normalize ANSI away.
+    return {
+        fg: (_style, text) => String(text === undefined || text === null ? '' : text),
+        bold: (text) => String(text === undefined || text === null ? '' : text),
+        strikethrough: (text) => String(text === undefined || text === null ? '' : text),
+    };
+}
+
+function __pi_make_extension_ui(hasUI) {
+    const ui = {
+        theme: __pi_make_extension_theme(),
+        select: (title, options) => {
+            if (!hasUI) return Promise.resolve(undefined);
+            const list = Array.isArray(options) ? options : [];
+            const mapped = list.map((v) => String(v));
+            return pi.ui('select', { title: String(title === undefined || title === null ? '' : title), options: mapped });
+        },
+        confirm: (title, message) => {
+            if (!hasUI) return Promise.resolve(false);
+            return pi.ui('confirm', {
+                title: String(title === undefined || title === null ? '' : title),
+                message: String(message === undefined || message === null ? '' : message),
+            });
+        },
+        input: (title, placeholder, def) => {
+            if (!hasUI) return Promise.resolve(undefined);
+            // Legacy extensions typically call input(title, placeholder?, default?)
+            let payloadDefault = def;
+            let payloadPlaceholder = placeholder;
+            if (def === undefined && typeof placeholder === 'string') {
+                payloadDefault = placeholder;
+                payloadPlaceholder = undefined;
+            }
+            return pi.ui('input', {
+                title: String(title === undefined || title === null ? '' : title),
+                placeholder: payloadPlaceholder,
+                default: payloadDefault,
+            });
+        },
+        editor: (title, def, language) => {
+            if (!hasUI) return Promise.resolve(undefined);
+            // Legacy extensions typically call editor(title, defaultText)
+            return pi.ui('editor', {
+                title: String(title === undefined || title === null ? '' : title),
+                language: language,
+                default: def,
+            });
+        },
+        notify: (message, level) => {
+            const notifyType = level ? String(level) : undefined;
+            const payload = {
+                message: String(message === undefined || message === null ? '' : message),
+            };
+            if (notifyType) {
+                payload.level = notifyType;
+                payload.notifyType = notifyType; // legacy field
+            }
+            void pi.ui('notify', payload).catch(() => {});
+        },
+        setStatus: (statusKey, statusText) => {
+            void pi.ui('setStatus', {
+                statusKey: String(statusKey === undefined || statusKey === null ? '' : statusKey),
+                statusText: String(statusText === undefined || statusText === null ? '' : statusText),
+            }).catch(() => {});
+        },
+        setWidget: (widgetKey, lines) => {
+            if (!hasUI) return;
+            const payload = { widgetKey: String(widgetKey === undefined || widgetKey === null ? '' : widgetKey) };
+            if (Array.isArray(lines)) payload.lines = lines.map((v) => String(v));
+            void pi.ui('setWidget', payload).catch(() => {});
+        },
+        setTitle: (title) => {
+            void pi.ui('setTitle', {
+                title: String(title === undefined || title === null ? '' : title),
+            }).catch(() => {});
+        },
+        setEditorText: (text) => {
+            void pi.ui('set_editor_text', {
+                text: String(text === undefined || text === null ? '' : text),
+            }).catch(() => {});
+        },
+        custom: (_component, options) => {
+            if (!hasUI) return Promise.resolve(undefined);
+            const payload = options && typeof options === 'object' ? options : {};
+            return pi.ui('custom', payload);
+        },
+    };
+    return ui;
+}
+
+function __pi_make_extension_ctx(ctx_payload) {
+    const hasUI = !!(ctx_payload && (ctx_payload.hasUI || ctx_payload.has_ui));
+    const cwd = ctx_payload && (ctx_payload.cwd || ctx_payload.CWD) ? String(ctx_payload.cwd || ctx_payload.CWD) : '';
+
+    const entriesRaw =
+        (ctx_payload && (ctx_payload.sessionEntries || ctx_payload.session_entries || ctx_payload.entries)) || [];
+    const branchRaw =
+        (ctx_payload && (ctx_payload.sessionBranch || ctx_payload.session_branch || ctx_payload.branch)) || entriesRaw;
+
+    const entries = Array.isArray(entriesRaw) ? entriesRaw : [];
+    const branch = Array.isArray(branchRaw) ? branchRaw : entries;
+
+    const leafEntry =
+        (ctx_payload &&
+            (ctx_payload.sessionLeafEntry ||
+                ctx_payload.session_leaf_entry ||
+                ctx_payload.leafEntry ||
+                ctx_payload.leaf_entry)) ||
+        null;
+
+    const modelRegistryValues =
+        (ctx_payload && (ctx_payload.modelRegistry || ctx_payload.model_registry || ctx_payload.model_registry_values)) ||
+        {};
+
+    const sessionManager = {
+        getEntries: () => entries,
+        getBranch: () => branch,
+        getLeafEntry: () => leafEntry,
+    };
+
+    return {
+        hasUI: hasUI,
+        cwd: cwd,
+        ui: __pi_make_extension_ui(hasUI),
+        sessionManager: sessionManager,
+        modelRegistry: {
+            getApiKeyForProvider: async (provider) => {
+                const key = String(provider || '').trim();
+                if (!key) return undefined;
+                const value = modelRegistryValues[key];
+                if (value === undefined || value === null) return undefined;
+                return String(value);
+            },
+        },
+    };
+}
+
+async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payload) {
+    const eventName = String(event_name || '').trim();
+    if (!eventName) {
+        throw new Error('dispatch_event: event name is required');
+    }
+
+    const handlers = __pi_hook_index.get(eventName) || [];
+    if (handlers.length === 0) {
+        return undefined;
+    }
+
+    const ctx = __pi_make_extension_ctx(ctx_payload);
+    let first = undefined;
+    for (const entry of handlers) {
+        const handler = entry && entry.handler;
+        if (typeof handler !== 'function') continue;
+        const value = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
+        if (value !== undefined && first === undefined) {
+            first = value;
+        }
+    }
+    return first;
+}
+
+async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
+    const name = String(tool_name || '').trim();
+    const record = __pi_tool_index.get(name);
+    if (!record) {
+        throw new Error(`Unknown tool: ${name}`);
+    }
+
+    const ctx = __pi_make_extension_ctx(ctx_payload);
+    return await __pi_with_extension_async(record.extensionId, () =>
+        record.execute(tool_call_id, input, undefined, undefined, ctx)
+    );
+}
+
+async function __pi_execute_command(command_name, args, ctx_payload) {
+    const name = String(command_name || '').trim().replace(/^\//, '');
+    const record = __pi_command_index.get(name);
+    if (!record) {
+        throw new Error(`Unknown command: ${name}`);
+    }
+
+    const ctx = __pi_make_extension_ctx(ctx_payload);
+    return await __pi_with_extension_async(record.extensionId, () => record.handler(args, ctx));
+}
 
 // Complete a hostcall (called from Rust)
 function __pi_complete_hostcall(call_id, outcome) {
@@ -1785,12 +3078,13 @@ function __pi_sleep(ms) {
 }
 
 // Create the pi global object with Promise-returning methods
+const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
 const pi = {
     // pi.tool(name, input) - invoke a tool
     tool: __pi_make_hostcall(__pi_tool_native),
 
     // pi.exec(cmd, args) - execute a shell command
-    exec: __pi_make_hostcall(__pi_exec_native),
+    exec: (cmd, args, options = {}) => __pi_exec_hostcall(cmd, args, options),
 
     // pi.http(request) - make an HTTP request
     http: __pi_make_hostcall(__pi_http_native),
@@ -1803,6 +3097,18 @@ const pi = {
 
     // pi.events(op, args) - event operations
     events: __pi_make_hostcall(__pi_events_native),
+
+    // Extension API (legacy-compatible subset)
+    registerTool: __pi_register_tool,
+    registerCommand: __pi_register_command,
+    on: __pi_register_hook,
+    registerFlag: __pi_register_flag,
+    getFlag: __pi_get_flag,
+    setActiveTools: __pi_set_active_tools,
+    getActiveTools: __pi_get_active_tools,
+    appendEntry: __pi_append_entry,
+    sendMessage: __pi_send_message,
+    sendUserMessage: __pi_send_user_message,
 };
 
 pi.env = {
@@ -1832,6 +3138,443 @@ pi.time = {
 
 // Make pi available globally
 globalThis.pi = pi;
+
+// ============================================================================
+// Minimal Web/Node polyfills for legacy extensions (best-effort)
+// ============================================================================
+
+if (typeof globalThis.btoa !== 'function') {
+    globalThis.btoa = (s) => {
+        const bin = String(s === undefined || s === null ? '' : s);
+        return __pi_base64_encode_native(bin);
+    };
+}
+
+if (typeof globalThis.atob !== 'function') {
+    globalThis.atob = (s) => {
+        const b64 = String(s === undefined || s === null ? '' : s);
+        return __pi_base64_decode_native(b64);
+    };
+}
+
+if (typeof globalThis.TextEncoder === 'undefined') {
+    class TextEncoder {
+        encode(input) {
+            const s = String(input === undefined || input === null ? '' : input);
+            const bytes = [];
+            for (let i = 0; i < s.length; i++) {
+                let code = s.charCodeAt(i);
+                if (code < 0x80) {
+                    bytes.push(code);
+                    continue;
+                }
+                if (code < 0x800) {
+                    bytes.push(0xc0 | (code >> 6));
+                    bytes.push(0x80 | (code & 0x3f));
+                    continue;
+                }
+                if (code >= 0xd800 && code <= 0xdbff && i + 1 < s.length) {
+                    const next = s.charCodeAt(i + 1);
+                    if (next >= 0xdc00 && next <= 0xdfff) {
+                        const cp = ((code - 0xd800) << 10) + (next - 0xdc00) + 0x10000;
+                        bytes.push(0xf0 | (cp >> 18));
+                        bytes.push(0x80 | ((cp >> 12) & 0x3f));
+                        bytes.push(0x80 | ((cp >> 6) & 0x3f));
+                        bytes.push(0x80 | (cp & 0x3f));
+                        i++;
+                        continue;
+                    }
+                }
+                bytes.push(0xe0 | (code >> 12));
+                bytes.push(0x80 | ((code >> 6) & 0x3f));
+                bytes.push(0x80 | (code & 0x3f));
+            }
+            return new Uint8Array(bytes);
+        }
+    }
+    globalThis.TextEncoder = TextEncoder;
+}
+
+if (typeof globalThis.TextDecoder === 'undefined') {
+    class TextDecoder {
+        constructor(encoding = 'utf-8') {
+            this.encoding = encoding;
+        }
+
+        decode(input, _opts) {
+            if (input === undefined || input === null) return '';
+            if (typeof input === 'string') return input;
+
+            let bytes;
+            if (input instanceof ArrayBuffer) {
+                bytes = new Uint8Array(input);
+            } else if (ArrayBuffer.isView && ArrayBuffer.isView(input)) {
+                bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+            } else if (Array.isArray(input)) {
+                bytes = new Uint8Array(input);
+            } else if (typeof input.length === 'number') {
+                bytes = new Uint8Array(input);
+            } else {
+                return '';
+            }
+
+            let out = '';
+            for (let i = 0; i < bytes.length; ) {
+                const b0 = bytes[i++];
+                if (b0 < 0x80) {
+                    out += String.fromCharCode(b0);
+                    continue;
+                }
+                if ((b0 & 0xe0) === 0xc0) {
+                    const b1 = bytes[i++] & 0x3f;
+                    out += String.fromCharCode(((b0 & 0x1f) << 6) | b1);
+                    continue;
+                }
+                if ((b0 & 0xf0) === 0xe0) {
+                    const b1 = bytes[i++] & 0x3f;
+                    const b2 = bytes[i++] & 0x3f;
+                    out += String.fromCharCode(((b0 & 0x0f) << 12) | (b1 << 6) | b2);
+                    continue;
+                }
+                if ((b0 & 0xf8) === 0xf0) {
+                    const b1 = bytes[i++] & 0x3f;
+                    const b2 = bytes[i++] & 0x3f;
+                    const b3 = bytes[i++] & 0x3f;
+                    let cp = ((b0 & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3;
+                    cp -= 0x10000;
+                    out += String.fromCharCode(0xd800 + (cp >> 10), 0xdc00 + (cp & 0x3ff));
+                    continue;
+                }
+            }
+            return out;
+        }
+    }
+
+    globalThis.TextDecoder = TextDecoder;
+}
+
+if (typeof globalThis.URLSearchParams === 'undefined') {
+    class URLSearchParams {
+        constructor(init) {
+            this._pairs = [];
+            if (typeof init === 'string') {
+                const s = init.replace(/^\?/, '');
+                if (s.length > 0) {
+                    for (const part of s.split('&')) {
+                        const idx = part.indexOf('=');
+                        if (idx === -1) {
+                            this.append(decodeURIComponent(part), '');
+                        } else {
+                            const k = part.slice(0, idx);
+                            const v = part.slice(idx + 1);
+                            this.append(decodeURIComponent(k), decodeURIComponent(v));
+                        }
+                    }
+                }
+            } else if (Array.isArray(init)) {
+                for (const entry of init) {
+                    if (!entry) continue;
+                    this.append(entry[0], entry[1]);
+                }
+            } else if (init && typeof init === 'object') {
+                for (const k of Object.keys(init)) {
+                    this.append(k, init[k]);
+                }
+            }
+        }
+
+        append(key, value) {
+            this._pairs.push([String(key), String(value)]);
+        }
+
+        toString() {
+            const out = [];
+            for (const [k, v] of this._pairs) {
+                out.push(encodeURIComponent(k) + '=' + encodeURIComponent(v));
+            }
+            return out.join('&');
+        }
+    }
+
+    globalThis.URLSearchParams = URLSearchParams;
+}
+
+if (typeof globalThis.Buffer === 'undefined') {
+    class Buffer extends Uint8Array {
+        static from(input, encoding) {
+            if (typeof input === 'string') {
+                const enc = String(encoding || '').toLowerCase();
+                if (enc === 'base64') {
+                    const bin = __pi_base64_decode_native(input);
+                    const out = new Uint8Array(bin.length);
+                    for (let i = 0; i < bin.length; i++) {
+                        out[i] = bin.charCodeAt(i) & 0xff;
+                    }
+                    return out;
+                }
+                return new TextEncoder().encode(input);
+            }
+            if (input instanceof ArrayBuffer) {
+                return new Uint8Array(input);
+            }
+            if (ArrayBuffer.isView && ArrayBuffer.isView(input)) {
+                return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+            }
+            if (Array.isArray(input)) {
+                return new Uint8Array(input);
+            }
+            throw new Error('Buffer.from: unsupported input');
+        }
+    }
+    globalThis.Buffer = Buffer;
+}
+
+if (typeof globalThis.crypto === 'undefined') {
+    globalThis.crypto = {};
+}
+
+if (typeof globalThis.crypto.getRandomValues !== 'function') {
+    globalThis.crypto.getRandomValues = (arr) => {
+        const len = Number(arr && arr.length ? arr.length : 0);
+        const bytes = __pi_crypto_random_bytes_native(len);
+        for (let i = 0; i < len; i++) {
+            arr[i] = bytes[i] || 0;
+        }
+        return arr;
+    };
+}
+
+if (!globalThis.crypto.subtle) {
+    globalThis.crypto.subtle = {};
+}
+
+if (typeof globalThis.crypto.subtle.digest !== 'function') {
+    globalThis.crypto.subtle.digest = async (algorithm, data) => {
+        const name = typeof algorithm === 'string' ? algorithm : (algorithm && algorithm.name ? algorithm.name : '');
+        const upper = String(name).toUpperCase();
+        if (upper !== 'SHA-256') {
+            throw new Error('crypto.subtle.digest: only SHA-256 is supported');
+        }
+        const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        let text = '';
+        for (let i = 0; i < bytes.length; i++) {
+            text += String.fromCharCode(bytes[i]);
+        }
+        const hex = __pi_crypto_sha256_hex_native(text);
+        const out = new Uint8Array(hex.length / 2);
+        for (let i = 0; i < out.length; i++) {
+            out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+        }
+        return out.buffer;
+    };
+}
+
+if (typeof globalThis.crypto.randomUUID !== 'function') {
+    globalThis.crypto.randomUUID = () => {
+        const bytes = __pi_crypto_random_bytes_native(16);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = Array.from(bytes, (b) => (b & 0xff).toString(16).padStart(2, '0')).join('');
+        return (
+            hex.slice(0, 8) +
+            '-' +
+            hex.slice(8, 12) +
+            '-' +
+            hex.slice(12, 16) +
+            '-' +
+            hex.slice(16, 20) +
+            '-' +
+            hex.slice(20)
+        );
+    };
+}
+
+if (typeof globalThis.process === 'undefined') {
+    const platform =
+        __pi_env_get_native('PI_PLATFORM') ||
+        __pi_env_get_native('OSTYPE') ||
+        __pi_env_get_native('OS') ||
+        'linux';
+
+    const envProxy = new Proxy(
+        {},
+        {
+            get(_target, prop) {
+                if (typeof prop !== 'string') return undefined;
+                const value = __pi_env_get_native(prop);
+                return value === null || value === undefined ? undefined : value;
+            },
+            set(_target, prop, value) {
+                // Read-only in PiJS
+                return typeof prop === 'string';
+            },
+            has(_target, prop) {
+                if (typeof prop !== 'string') return false;
+                const value = __pi_env_get_native(prop);
+                return value !== null && value !== undefined;
+            },
+        },
+    );
+
+    globalThis.process = {
+        env: envProxy,
+        argv: __pi_process_args_native(),
+        cwd: () => __pi_process_cwd_native(),
+        platform: String(platform).split('-')[0],
+        kill: (_pid, _sig) => {
+            throw new Error('process.kill is not available in PiJS');
+        },
+        exit: (_code) => {
+            throw new Error('process.exit is not available in PiJS');
+        },
+    };
+}
+
+if (typeof globalThis.setTimeout !== 'function') {
+    globalThis.setTimeout = (callback, delay, ...args) => {
+        const ms = Number(delay || 0);
+        const timer_id = __pi_set_timeout_native(ms <= 0 ? 0 : Math.floor(ms));
+        __pi_register_timer(timer_id, () => {
+            try {
+                callback(...args);
+            } catch (e) {
+                console.error('setTimeout callback error:', e);
+            }
+        });
+        return timer_id;
+    };
+}
+
+if (typeof globalThis.clearTimeout !== 'function') {
+    globalThis.clearTimeout = (timer_id) => {
+        __pi_unregister_timer(timer_id);
+        try {
+            __pi_clear_timeout_native(timer_id);
+        } catch (_) {}
+    };
+}
+
+if (typeof globalThis.fetch !== 'function') {
+    class Headers {
+        constructor(init) {
+            this._map = {};
+            if (init && typeof init === 'object') {
+                if (Array.isArray(init)) {
+                    for (const pair of init) {
+                        if (pair && pair.length >= 2) this.set(pair[0], pair[1]);
+                    }
+                } else if (typeof init.forEach === 'function') {
+                    init.forEach((v, k) => this.set(k, v));
+                } else {
+                    for (const k of Object.keys(init)) {
+                        this.set(k, init[k]);
+                    }
+                }
+            }
+        }
+
+        get(name) {
+            const key = String(name || '').toLowerCase();
+            return this._map[key] === undefined ? null : this._map[key];
+        }
+
+        set(name, value) {
+            const key = String(name || '').toLowerCase();
+            this._map[key] = String(value === undefined || value === null ? '' : value);
+        }
+
+        entries() {
+            return Object.entries(this._map);
+        }
+    }
+
+    class Response {
+        constructor(bodyBytes, init) {
+            const options = init && typeof init === 'object' ? init : {};
+            this.status = Number(options.status || 0);
+            this.ok = this.status >= 200 && this.status < 300;
+            this.headers = new Headers(options.headers || {});
+            this._bytes = bodyBytes || new Uint8Array();
+            this.body = {
+                getReader: () => {
+                    let done = false;
+                    return {
+                        read: async () => {
+                            if (done) return { done: true, value: undefined };
+                            done = true;
+                            return { done: false, value: this._bytes };
+                        },
+                        cancel: async () => {
+                            done = true;
+                        },
+                        releaseLock: () => {},
+                    };
+                },
+            };
+        }
+
+        async text() {
+            return new TextDecoder().decode(this._bytes);
+        }
+
+        async json() {
+            return JSON.parse(await this.text());
+        }
+
+        async arrayBuffer() {
+            const copy = new Uint8Array(this._bytes.length);
+            copy.set(this._bytes);
+            return copy.buffer;
+        }
+    }
+
+    globalThis.Headers = Headers;
+    globalThis.Response = Response;
+
+    globalThis.fetch = async (input, init) => {
+        const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input);
+        const options = init && typeof init === 'object' ? init : {};
+        const method = options.method ? String(options.method) : 'GET';
+
+        const headers = {};
+        if (options.headers && typeof options.headers === 'object') {
+            if (options.headers instanceof Headers) {
+                for (const [k, v] of options.headers.entries()) headers[k] = v;
+            } else if (Array.isArray(options.headers)) {
+                for (const pair of options.headers) {
+                    if (pair && pair.length >= 2) headers[String(pair[0])] = String(pair[1]);
+                }
+            } else {
+                for (const k of Object.keys(options.headers)) {
+                    headers[k] = String(options.headers[k]);
+                }
+            }
+        }
+
+        let body = undefined;
+        if (options.body !== undefined && options.body !== null) {
+            body = typeof options.body === 'string' ? options.body : String(options.body);
+        }
+
+        const resp = await pi.http({ url, method, headers, body });
+        const status = resp && resp.status !== undefined ? Number(resp.status) : 0;
+        const respHeaders = resp && resp.headers && typeof resp.headers === 'object' ? resp.headers : {};
+
+        let bytes = new Uint8Array();
+        if (resp && resp.body_bytes) {
+            const bin = __pi_base64_decode_native(String(resp.body_bytes));
+            const out = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) {
+                out[i] = bin.charCodeAt(i) & 0xff;
+            }
+            bytes = out;
+        } else if (resp && resp.body !== undefined && resp.body !== null) {
+            bytes = new TextEncoder().encode(String(resp.body));
+        }
+
+        return new Response(bytes, { status, headers: respHeaders });
+    };
+}
 ";
 
 #[cfg(test)]
@@ -2017,7 +3760,11 @@ mod tests {
                 .expect("eval");
 
             let requests = runtime.drain_hostcall_requests();
-            assert_eq!(requests.len(), 3);
+            let kinds = requests
+                .iter()
+                .map(|req| format!("{:?}", req.kind))
+                .collect::<Vec<_>>();
+            assert_eq!(requests.len(), 3, "hostcalls: {kinds:?}");
 
             assert!(matches!(&requests[0].kind, HostcallKind::Tool { name } if name == "read"));
             assert!(matches!(&requests[1].kind, HostcallKind::Exec { cmd } if cmd == "ls"));

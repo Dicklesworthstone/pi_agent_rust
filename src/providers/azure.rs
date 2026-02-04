@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 // ============================================================================
@@ -204,6 +205,10 @@ impl Provider for AzureOpenAIProvider {
             StreamState::new(event_source, model, api, provider),
             |mut state| async move {
                 loop {
+                    if let Some(event) = state.pending_events.pop_front() {
+                        return Some((Ok(event), state));
+                    }
+
                     match state.event_source.next().await {
                         Some(Ok(msg)) => {
                             // Azure also sends "[DONE]" as final message
@@ -218,10 +223,8 @@ impl Provider for AzureOpenAIProvider {
                                 ));
                             }
 
-                            match state.process_event(&msg.data) {
-                                Ok(Some(event)) => return Some((Ok(event), state)),
-                                Ok(None) => {}
-                                Err(e) => return Some((Err(e), state)),
+                            if let Err(e) = state.process_event(&msg.data) {
+                                return Some((Err(e), state));
                             }
                         }
                         Some(Err(e)) => {
@@ -250,10 +253,12 @@ where
     partial: AssistantMessage,
     current_text: String,
     tool_calls: Vec<ToolCallState>,
+    pending_events: VecDeque<StreamEvent>,
     started: bool,
 }
 
 struct ToolCallState {
+    content_index: usize,
     id: String,
     name: String,
     arguments: String,
@@ -278,12 +283,64 @@ where
             },
             current_text: String::new(),
             tool_calls: Vec::new(),
+            pending_events: VecDeque::new(),
             started: false,
         }
     }
 
+    fn finalize_tool_call_arguments(&mut self) {
+        for tc in &self.tool_calls {
+            let arguments: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+                Ok(args) => args,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        raw = %tc.arguments,
+                        "Failed to parse tool arguments as JSON"
+                    );
+                    serde_json::Value::Null
+                }
+            };
+
+            if let Some(ContentBlock::ToolCall(block)) =
+                self.partial.content.get_mut(tc.content_index)
+            {
+                block.arguments = arguments;
+            }
+        }
+    }
+
+    fn push_text_delta(&mut self, text: String) -> StreamEvent {
+        let last_is_text = matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
+        if !last_is_text {
+            self.partial
+                .content
+                .push(ContentBlock::Text(crate::model::TextContent::new("")));
+        }
+        let content_index = self.partial.content.len() - 1;
+
+        if let Some(ContentBlock::Text(t)) = self.partial.content.get_mut(content_index) {
+            t.text.push_str(&text);
+        }
+
+        StreamEvent::TextDelta {
+            content_index,
+            delta: text,
+            partial: self.partial.clone(),
+        }
+    }
+
+    fn ensure_started(&mut self) {
+        if !self.started {
+            self.started = true;
+            self.pending_events.push_back(StreamEvent::Start {
+                partial: self.partial.clone(),
+            });
+        }
+    }
+
     #[allow(clippy::unnecessary_wraps)]
-    fn process_event(&mut self, data: &str) -> Result<Option<StreamEvent>> {
+    fn process_event(&mut self, data: &str) -> Result<()> {
         let chunk: AzureStreamChunk =
             serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
 
@@ -294,16 +351,22 @@ where
             self.partial.usage.total_tokens = usage.total_tokens;
         }
 
-        // Emit Start event on first chunk
+        let choices = chunk.choices;
         if !self.started {
-            self.started = true;
-            return Ok(Some(StreamEvent::Start {
-                partial: self.partial.clone(),
-            }));
+            let first = choices.first();
+            let delta_is_empty = first.is_some_and(|choice| {
+                choice.finish_reason.is_none()
+                    && choice.delta.content.is_none()
+                    && choice.delta.tool_calls.is_none()
+            });
+            if delta_is_empty {
+                self.ensure_started();
+                return Ok(());
+            }
         }
 
         // Process choices
-        for choice in chunk.choices {
+        for choice in choices {
             // Handle finish reason
             if let Some(reason) = choice.finish_reason {
                 self.partial.stop_reason = match reason.as_str() {
@@ -314,97 +377,89 @@ where
                     _ => StopReason::Stop,
                 };
 
-                // Finalize any pending text
-                if !self.current_text.is_empty() {
-                    self.partial
-                        .content
-                        .push(ContentBlock::Text(crate::model::TextContent::new(
-                            &self.current_text,
-                        )));
-                }
-
-                // Finalize any pending tool calls
-                for tc in &self.tool_calls {
-                    let arguments: serde_json::Value = match serde_json::from_str(&tc.arguments) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                raw = %tc.arguments,
-                                "Failed to parse tool arguments as JSON"
-                            );
-                            serde_json::Value::Null
-                        }
-                    };
-                    self.partial
-                        .content
-                        .push(ContentBlock::ToolCall(crate::model::ToolCall {
-                            id: tc.id.clone(),
-                            name: tc.name.clone(),
-                            arguments,
-                            thought_signature: None,
-                        }));
-                }
+                // Finalize tool call arguments
+                self.finalize_tool_call_arguments();
             }
 
             // Handle text content
             if let Some(text) = choice.delta.content {
-                // Always save text first (before started check) to avoid losing content
-                self.current_text.push_str(&text);
-
-                // Emit TextDelta for this content
-                return Ok(Some(StreamEvent::TextDelta {
-                    content_index: 0,
-                    delta: text,
-                    partial: self.partial.clone(),
-                }));
+                self.ensure_started();
+                let event = self.push_text_delta(text);
+                self.pending_events.push_back(event);
             }
 
             // Handle tool calls
             if let Some(tool_calls) = choice.delta.tool_calls {
+                self.ensure_started();
+
                 for tc in tool_calls {
                     let idx = tc.index as usize;
 
                     // Ensure we have a slot for this tool call
-                    while self.tool_calls.len() <= idx {
+                    if self.tool_calls.len() <= idx {
+                        let content_index = self.partial.content.len();
                         self.tool_calls.push(ToolCallState {
+                            content_index,
                             id: String::new(),
                             name: String::new(),
                             arguments: String::new(),
                         });
+
+                        // Initialize block in partial
+                        self.partial
+                            .content
+                            .push(ContentBlock::ToolCall(crate::model::ToolCall {
+                                id: String::new(),
+                                name: String::new(),
+                                arguments: serde_json::Value::Null,
+                                thought_signature: None,
+                            }));
+
+                        // Emit ToolCallStart
+                        self.pending_events.push_back(StreamEvent::ToolCallStart {
+                            content_index,
+                            partial: self.partial.clone(),
+                        });
                     }
+
+                    let tc_state = &mut self.tool_calls[idx];
+                    let content_index = tc_state.content_index;
 
                     // Update the tool call state
                     if let Some(id) = tc.id {
-                        self.tool_calls[idx].id = id;
+                        tc_state.id.clone_from(&id);
+                        if let Some(ContentBlock::ToolCall(block)) =
+                            self.partial.content.get_mut(content_index)
+                        {
+                            block.id = id;
+                        }
                     }
                     if let Some(func) = tc.function {
                         if let Some(name) = func.name {
-                            self.tool_calls[idx].name = name;
+                            tc_state.name.clone_from(&name);
+                            if let Some(ContentBlock::ToolCall(block)) =
+                                self.partial.content.get_mut(content_index)
+                            {
+                                block.name = name;
+                            }
                         }
                         if let Some(args) = func.arguments {
-                            self.tool_calls[idx].arguments.push_str(&args);
+                            tc_state.arguments.push_str(&args);
+                            // Note: we don't update partial arguments here as they need to be valid JSON.
+                            // We do that at the end.
 
-                            if !self.started {
-                                self.started = true;
-                                self.partial.stop_reason = StopReason::ToolUse;
-                                return Ok(Some(StreamEvent::Start {
-                                    partial: self.partial.clone(),
-                                }));
-                            }
-
-                            return Ok(Some(StreamEvent::ToolCallDelta {
-                                content_index: idx,
+                            self.pending_events.push_back(StreamEvent::ToolCallDelta {
+                                content_index,
                                 delta: args,
                                 partial: self.partial.clone(),
-                            }));
+                            });
                         }
                     }
                 }
             }
         }
 
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -552,6 +607,12 @@ fn convert_message_to_azure(message: &Message) -> Vec<AzureMessage> {
         Message::User(user) => vec![AzureMessage {
             role: "user".to_string(),
             content: Some(convert_user_content(&user.content)),
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        Message::Custom(custom) => vec![AzureMessage {
+            role: "user".to_string(),
+            content: Some(AzureContent::Text(custom.content.clone())),
             tool_calls: None,
             tool_call_id: None,
         }],
@@ -785,6 +846,7 @@ mod tests {
             while let Some(item) = state.event_source.next().await {
                 let msg = item.expect("SSE event");
                 if msg.data == "[DONE]" {
+                    out.extend(state.pending_events.drain(..));
                     let reason = state.partial.stop_reason;
                     out.push(StreamEvent::Done {
                         reason,
@@ -792,9 +854,8 @@ mod tests {
                     });
                     break;
                 }
-                if let Some(event) = state.process_event(&msg.data).expect("process_event") {
-                    out.push(event);
-                }
+                state.process_event(&msg.data).expect("process_event");
+                out.extend(state.pending_events.drain(..));
             }
 
             out

@@ -389,16 +389,16 @@ impl ResourceLoader {
 // Package resources
 // ============================================================================
 
-pub fn discover_package_resources(manager: &PackageManager) -> Result<PackageResources> {
-    let entries = manager.list_packages().unwrap_or_default();
+pub async fn discover_package_resources(manager: &PackageManager) -> Result<PackageResources> {
+    let entries = manager.list_packages().await.unwrap_or_default();
     let mut resources = PackageResources::default();
 
     for entry in entries {
-        let Some(root) = manager.installed_path(&entry.source, entry.scope)? else {
+        let Some(root) = manager.installed_path(&entry.source, entry.scope).await? else {
             continue;
         };
         if !root.exists() {
-            if let Err(err) = manager.install(&entry.source, entry.scope) {
+            if let Err(err) = manager.install(&entry.source, entry.scope).await {
                 eprintln!("Warning: Failed to install {}: {err}", entry.source);
                 continue;
             }
@@ -1311,7 +1311,10 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
         let maybe_len = caps.get(2).and_then(|m| m.as_str().parse::<usize>().ok());
         let slice = maybe_len.map_or_else(
             || args.get(start_idx..).unwrap_or(&[]).to_vec(),
-            |len| args.get(start_idx..start_idx + len).unwrap_or(&[]).to_vec(),
+            |len| {
+                let end = (start_idx + len).min(args.len());
+                args.get(start_idx..end).unwrap_or(&[]).to_vec()
+            },
         );
         slice.join(" ")
     });

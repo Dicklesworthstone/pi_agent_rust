@@ -1,25 +1,57 @@
 # Android (Termux) Notes
 
-Pi can run on Android via [Termux](https://termux.dev/).
+Pi can run on Android via [Termux](https://termux.dev/), but some features are limited by the
+mobile environment.
 
-## Clipboard
+## Prerequisites
 
-To use clipboard features (`/copy`, pasting images), you must install the Termux API package.
-
-1. Install the API app from the Play Store or F-Droid.
-2. Install the package in Termux:
+1. Install **Termux** from F-Droid or GitHub (the Play Store build is deprecated).
+2. Install **Termux:API** (required for clipboard integration).
+3. In Termux:
    ```bash
-   pkg install termux-api
+   pkg update && pkg upgrade
+   pkg install termux-api git
    ```
 
-Pi detects the `termux-clipboard-get` and `termux-clipboard-set` commands if standard clipboard access fails.
+Pi detects `termux-clipboard-get` and `termux-clipboard-set` when standard clipboard access fails.
 
-## Terminal
+> Note: `pi_agent_rust` requires **Rust nightly**. If Termux can’t provide nightly easily,
+> build the binary on a desktop and copy it over.
 
-- If arrow keys or shortcuts behave unexpectedly, check your Termux keyboard extra keys row configuration.
-- `Ctrl` key modifiers usually work as expected.
+## Clipboard Support
+
+- **Text clipboard**: Works via `termux-clipboard-get` / `termux-clipboard-set`.
+- **Image clipboard**: **Not supported** on Termux (the `Ctrl+V` image paste flow will no-op).
+
+## Terminal Quirks
+
+- If arrow keys or shortcuts misbehave, configure the **extra keys row** in Termux settings.
+- Some terminals send `Ctrl+Enter` instead of `Shift+Enter` for “insert newline” behavior.
 
 ## Storage
 
-- Pi stores sessions in `~/.pi/agent/sessions`.
-- Ensure you have granted storage permissions if you intend to access files outside the Termux private storage.
+- Sessions live in `~/.pi/agent/sessions`.
+- To access shared storage (Downloads/Documents), run once:
+  ```bash
+  termux-setup-storage
+  ```
+
+## Troubleshooting
+
+### Clipboard not working
+
+Ensure both apps are installed:
+1. Termux (from F-Droid/GitHub)
+2. Termux:API
+
+Then install the CLI tools:
+```bash
+pkg install termux-api
+```
+
+### Permission denied for shared storage
+
+Run once to grant storage permissions:
+```bash
+termux-setup-storage
+```

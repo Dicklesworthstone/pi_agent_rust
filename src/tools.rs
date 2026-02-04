@@ -980,7 +980,7 @@ impl Tool for ReadTool {
         let total_file_lines = all_lines.len();
 
         let start_line: usize = match input.offset {
-            Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or_default(),
+            Some(n) if n > 0 => n.saturating_sub(1).try_into().unwrap_or(usize::MAX),
             _ => 0,
         };
         let start_line_display = start_line.saturating_add(1);
@@ -1000,7 +1000,7 @@ impl Tool for ReadTool {
             || (all_lines.len(), None),
             |limit| {
                 let limit_usize = if limit > 0 {
-                    usize::try_from(limit).unwrap_or(0)
+                    usize::try_from(limit).unwrap_or(usize::MAX)
                 } else {
                     0
                 };
@@ -1157,7 +1157,10 @@ pub(crate) async fn run_bash_command(
         .take()
         .ok_or_else(|| Error::tool("bash", "Missing stderr".to_string()))?;
 
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    // Wrap in ProcessGuard for cleanup (including tree kill)
+    let mut guard = ProcessGuard::new(child, true);
+
+    let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(128);
     let tx_stdout = tx.clone();
     thread::spawn(move || pump_stream(stdout, &tx_stdout));
     thread::spawn(move || pump_stream(stderr, &tx));
@@ -1167,7 +1170,6 @@ pub(crate) async fn run_bash_command(
 
     let mut timed_out = false;
     let mut exit_code: Option<i32> = None;
-    let child_pid = Some(child.id());
     let start = Instant::now();
     let timeout = timeout_secs.map(Duration::from_secs);
 
@@ -1177,7 +1179,7 @@ pub(crate) async fn run_bash_command(
             process_bash_chunk(&chunk, &mut bash_output, on_update).await?;
         }
 
-        match child.try_wait() {
+        match guard.child.as_mut().unwrap().try_wait() {
             Ok(Some(status)) => {
                 exit_code = status.code();
                 break;
@@ -1189,10 +1191,7 @@ pub(crate) async fn run_bash_command(
         if let Some(timeout) = timeout {
             if start.elapsed() >= timeout {
                 timed_out = true;
-                kill_process_tree(child_pid);
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
+                break; // Guard drop will kill process tree
             }
         }
 
@@ -1985,7 +1984,8 @@ impl Tool for WriteTool {
                 .map_err(|e| Error::tool("write", format!("Failed to create directories: {e}")))?;
         }
 
-        let bytes_written = js_string_length(&input.content);
+        // Parity with legacy pi-mono: report JS string length (UTF-16 code units) as "bytes".
+        let bytes_written = input.content.encode_utf16().count();
 
         // Write atomically using tempfile
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
@@ -2184,64 +2184,101 @@ impl Tool for GrepTool {
             .take()
             .ok_or_else(|| Error::tool("grep", "Missing stderr".to_string()))?;
 
-        let stderr_task = thread::spawn(move || {
+        let mut guard = ProcessGuard::new(child, false);
+
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let reader = std::io::BufReader::new(stdout);
+            for line in reader.lines() {
+                if stdout_tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+
+        std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stderr);
             let mut buf = Vec::new();
-            let _ = reader.read_to_end(&mut buf);
-            buf
+            if reader.read_to_end(&mut buf).is_ok() {
+                let _ = stderr_tx.send(buf);
+            }
         });
 
         let mut matches: Vec<(PathBuf, usize)> = Vec::new();
         let mut match_count: usize = 0;
         let mut match_limit_reached = false;
+        let mut stderr_bytes = Vec::new();
 
-        let stdout_reader = std::io::BufReader::new(stdout);
-        for line in stdout_reader.lines() {
-            if match_count >= effective_limit {
+        let tick = Duration::from_millis(10);
+
+        loop {
+            while let Ok(line_res) = stdout_rx.try_recv() {
+                if match_limit_reached {
+                    continue;
+                }
+
+                let line = line_res.map_err(|e| Error::tool("grep", e.to_string()))?;
+                if line.trim().is_empty() {
+                    continue;
+                }
+
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+                    continue;
+                };
+
+                if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
+                    continue;
+                }
+
+                match_count += 1;
+
+                let file_path = event
+                    .pointer("/data/path/text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(PathBuf::from);
+                let line_number = event
+                    .pointer("/data/line_number")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|n| usize::try_from(n).ok());
+
+                if let (Some(fp), Some(ln)) = (file_path, line_number) {
+                    matches.push((fp, ln));
+                }
+
+                if match_count >= effective_limit {
+                    match_limit_reached = true;
+                    break; // Guard drop will kill the process
+                }
+            }
+
+            while let Ok(chunk) = stderr_rx.try_recv() {
+                stderr_bytes.extend_from_slice(&chunk);
+            }
+
+            if match_limit_reached {
                 break;
             }
 
-            let line = line.map_err(|e| Error::tool("grep", e.to_string()))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-
-            if event.get("type").and_then(serde_json::Value::as_str) != Some("match") {
-                continue;
-            }
-
-            match_count += 1;
-
-            let file_path = event
-                .pointer("/data/path/text")
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from);
-            let line_number = event
-                .pointer("/data/line_number")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|n| usize::try_from(n).ok());
-
-            if let (Some(fp), Some(ln)) = (file_path, line_number) {
-                matches.push((fp, ln));
-            }
-
-            if match_count >= effective_limit {
-                match_limit_reached = true;
-                let _ = child.kill();
-                break;
+            match guard.child.as_mut().unwrap().try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    sleep(wall_now(), tick).await;
+                }
+                Err(e) => return Err(Error::tool("grep", e.to_string())),
             }
         }
 
-        let status = child
+        // Drain any remaining stderr
+        while let Ok(chunk) = stderr_rx.try_recv() {
+            stderr_bytes.extend_from_slice(&chunk);
+        }
+
+        let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+        let status = guard
             .wait()
             .map_err(|e| Error::tool("grep", e.to_string()))?;
-
-        let stderr_bytes = stderr_task.join().unwrap_or_default();
-        let stderr_text = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
         let code = status.code().unwrap_or(0);
 
         if !match_limit_reached && code != 0 && code != 1 {
@@ -2476,18 +2513,67 @@ impl Tool for FindTool {
         args.push(input.pattern.clone());
         args.push(search_path.display().to_string());
 
-        let output = Command::new(fd_cmd)
+        let mut child = Command::new(fd_cmd)
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
+            .spawn()
             .map_err(|e| Error::tool("find", format!("Failed to run fd: {e}")))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::tool("find", "Missing stdout"))?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::tool("find", "Missing stderr"))?;
 
-        if !output.status.success() && stdout.is_empty() {
-            let code = output.status.code().unwrap_or(1);
+        let mut guard = ProcessGuard::new(child, false);
+
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if stdout_pipe.read_to_end(&mut buf).is_ok() {
+                let _ = stdout_tx.send(buf);
+            }
+        });
+
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if stderr_pipe.read_to_end(&mut buf).is_ok() {
+                let _ = stderr_tx.send(buf);
+            }
+        });
+
+        let tick = Duration::from_millis(10);
+
+        loop {
+            // Check if process is done
+            match guard.child.as_mut().unwrap().try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    sleep(wall_now(), tick).await;
+                }
+                Err(e) => return Err(Error::tool("find", e.to_string())),
+            }
+        }
+
+        let status = guard
+            .wait()
+            .map_err(|e| Error::tool("find", e.to_string()))?;
+
+        // Read results from channels (should be available since process exited)
+        let stdout_bytes = stdout_rx.recv().unwrap_or_default();
+        let stderr_bytes = stderr_rx.recv().unwrap_or_default();
+
+        let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_string();
+
+        if !status.success() && stdout.is_empty() {
+            let code = status.code().unwrap_or(1);
             let msg = if stderr.is_empty() {
                 format!("fd exited with code {code}")
             } else {
@@ -2760,7 +2846,7 @@ fn rg_available() -> bool {
         .is_ok()
 }
 
-fn pump_stream<R: Read + Send + 'static>(mut reader: R, tx: &mpsc::Sender<Vec<u8>>) {
+fn pump_stream<R: Read + Send + 'static>(mut reader: R, tx: &mpsc::SyncSender<Vec<u8>>) {
     let mut buf = vec![0u8; 8192];
     loop {
         match reader.read(&mut buf) {
@@ -2875,7 +2961,41 @@ async fn process_bash_chunk(
     Ok(())
 }
 
-fn kill_process_tree(pid: Option<u32>) {
+struct ProcessGuard {
+    child: Option<std::process::Child>,
+    kill_tree: bool,
+}
+
+impl ProcessGuard {
+    const fn new(child: std::process::Child, kill_tree: bool) -> Self {
+        Self {
+            child: Some(child),
+            kill_tree,
+        }
+    }
+
+    fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if let Some(mut child) = self.child.take() {
+            return child.wait();
+        }
+        Err(std::io::Error::other("Already waited"))
+    }
+}
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if self.kill_tree {
+                let pid = child.id();
+                kill_process_tree(Some(pid));
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+pub fn kill_process_tree(pid: Option<u32>) {
     let Some(pid) = pid else { return };
     let root = sysinfo::Pid::from_u32(pid);
 

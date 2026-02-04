@@ -65,6 +65,26 @@ impl AuthStorage {
         Ok(Self { path, entries })
     }
 
+    /// Load auth.json asynchronously (creates empty if missing).
+    pub async fn load_async(path: PathBuf) -> Result<Self> {
+        let entries = if path.exists() {
+            // Note: File::open is blocking, but typically fast.
+            // For rigorous async correctness we might offload this, but sticking to std::fs::File for fs4 compatibility.
+            let file = File::open(&path).map_err(|e| Error::auth(format!("auth.json: {e}")))?;
+            let mut locked = lock_file_async(file, Duration::from_secs(30)).await?;
+            // Read from the locked file handle
+            let mut content = String::new();
+            // read_to_string is blocking, but we hold the lock and it's local FS.
+            locked.as_file_mut().read_to_string(&mut content)?;
+            let parsed: AuthFile = serde_json::from_str(&content).unwrap_or_default();
+            parsed.entries
+        } else {
+            HashMap::new()
+        };
+
+        Ok(Self { path, entries })
+    }
+
     /// Persist auth.json (atomic write + permissions).
     pub fn save(&self) -> Result<()> {
         if let Some(parent) = self.path.parent() {
@@ -87,6 +107,41 @@ impl AuthStorage {
         let f = locked.as_file_mut();
         f.seek(SeekFrom::Start(0))?;
         f.set_len(0)?; // Truncate after seeking to avoid data loss
+        f.write_all(data.as_bytes())?;
+        f.flush()?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = fs::Permissions::from_mode(0o600);
+            fs::set_permissions(&self.path, perms)?;
+        }
+
+        Ok(())
+    }
+
+    /// Persist auth.json asynchronously.
+    pub async fn save_async(&self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&self.path)?;
+        let mut locked = lock_file_async(file, Duration::from_secs(30)).await?;
+
+        let data = serde_json::to_string_pretty(&AuthFile {
+            entries: self.entries.clone(),
+        })?;
+
+        // Write to the locked file handle
+        let f = locked.as_file_mut();
+        f.seek(SeekFrom::Start(0))?;
+        f.set_len(0)?;
         f.write_all(data.as_bytes())?;
         f.flush()?;
 
@@ -177,7 +232,7 @@ impl AuthStorage {
                 _ => continue,
             };
             self.entries.insert(provider, refreshed);
-            self.save()?;
+            self.save_async().await?;
         }
 
         Ok(())
@@ -458,6 +513,21 @@ fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
         }
 
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
+    let start = Instant::now();
+    loop {
+        if matches!(FileExt::try_lock_exclusive(&file), Ok(true)) {
+            return Ok(LockedFile { file });
+        }
+
+        if start.elapsed() >= timeout {
+            return Err(Error::auth("Timed out waiting for auth lock".to_string()));
+        }
+
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
     }
 }
 

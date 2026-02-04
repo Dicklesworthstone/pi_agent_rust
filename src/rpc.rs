@@ -32,7 +32,7 @@ use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
 use asupersync::time::{sleep, wall_now};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -1301,9 +1301,22 @@ async fn run_prompt_with_retry(
 
         let event_tx = out_tx.clone();
         let event_handler = move |event: AgentEvent| {
-            if let Ok(serialized) = serde_json::to_string(&event) {
-                let _ = event_tx.send(serialized);
-            }
+            let serialized = if let AgentEvent::AgentEnd { error, .. } = &event {
+                json!({
+                    "type": "agent_end",
+                    "error": error,
+                })
+                .to_string()
+            } else {
+                serde_json::to_string(&event).unwrap_or_else(|err| {
+                    json!({
+                        "type": "event_serialize_error",
+                        "error": err.to_string(),
+                    })
+                    .to_string()
+                })
+            };
+            let _ = event_tx.send(serialized);
         };
 
         let result = {
@@ -1930,7 +1943,7 @@ fn session_stats(session: &crate::session::Session) -> Value {
 
     for message in &messages {
         match message {
-            Message::User(_) => user_messages += 1,
+            Message::User(_) | Message::Custom(_) => user_messages += 1,
             Message::Assistant(message) => {
                 assistant_messages += 1;
                 tool_calls += message
@@ -2138,7 +2151,7 @@ async fn run_bash_rpc(
 
         if !cancelled && abort_rx.try_recv().is_ok() {
             cancelled = true;
-            kill_process_tree(child_pid);
+            crate::tools::kill_process_tree(child_pid);
             let _ = child.kill();
         }
 
@@ -2198,46 +2211,6 @@ async fn run_bash_rpc(
         truncated,
         full_output_path,
     })
-}
-
-fn kill_process_tree(pid: Option<u32>) {
-    let Some(pid) = pid else {
-        return;
-    };
-    let root = sysinfo::Pid::from_u32(pid);
-
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-
-    let mut children_map: HashMap<sysinfo::Pid, Vec<sysinfo::Pid>> = HashMap::new();
-    for (p, proc_) in sys.processes() {
-        if let Some(parent) = proc_.parent() {
-            children_map.entry(parent).or_default().push(*p);
-        }
-    }
-
-    let mut to_kill = Vec::new();
-    collect_process_tree(root, &children_map, &mut to_kill);
-
-    // Kill children first.
-    for pid in to_kill.into_iter().rev() {
-        if let Some(proc_) = sys.process(pid) {
-            let _ = proc_.kill();
-        }
-    }
-}
-
-fn collect_process_tree(
-    pid: sysinfo::Pid,
-    children_map: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>,
-    out: &mut Vec<sysinfo::Pid>,
-) {
-    out.push(pid);
-    if let Some(children) = children_map.get(&pid) {
-        for child in children {
-            collect_process_tree(*child, children_map, out);
-        }
-    }
 }
 
 fn parse_prompt_images(value: Option<&Value>) -> Result<Vec<ImageContent>> {

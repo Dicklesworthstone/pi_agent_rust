@@ -1,0 +1,25 @@
+{
+  "name": "dark",
+  "version": "1.0",
+  "colors": {
+    "foreground": "#d4d4d4",
+    "background": "#1e1e1e",
+    "accent": "#007acc",
+    "success": "#4ec9b0",
+    "warning": "#ce9178",
+    "error": "#f44747",
+    "muted": "#6a6a6a"
+  },
+  "syntax": {
+    "keyword": "#569cd6",
+    "string": "#ce9178",
+    "number": "#b5cea8",
+    "comment": "#6a9955",
+    "function": "#dcdcaa"
+  },
+  "ui": {
+    "border": "#3c3c3c",
+    "selection": "#264f78",
+    "cursor": "#aeafad"
+  }
+}

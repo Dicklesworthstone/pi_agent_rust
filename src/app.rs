@@ -13,8 +13,9 @@ use glob::Pattern;
 use crate::auth::AuthStorage;
 use crate::cli;
 use crate::config::Config;
-use crate::model::{self, ContentBlock, ImageContent, TextContent};
+use crate::model::{self, AssistantMessage, ContentBlock, ImageContent, TextContent};
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
+use crate::provider::{StreamOptions, ThinkingBudgets};
 use crate::session::Session;
 use crate::tools::process_file_arguments;
 
@@ -477,6 +478,35 @@ fn last_thinking_level(session: &Session) -> Option<model::ThinkingLevel> {
     None
 }
 
+pub fn update_session_for_selection(session: &mut Session, selection: &ModelSelection) {
+    session.set_model_header(
+        Some(selection.model_entry.model.provider.clone()),
+        Some(selection.model_entry.model.id.clone()),
+        Some(selection.thinking_level.to_string()),
+    );
+
+    let model_changed = match last_model_from_session(session) {
+        Some((provider, model_id)) => {
+            provider != selection.model_entry.model.provider
+                || model_id != selection.model_entry.model.id
+        }
+        None => true,
+    };
+
+    if model_changed {
+        session.append_model_change(
+            selection.model_entry.model.provider.clone(),
+            selection.model_entry.model.id.clone(),
+        );
+    }
+
+    let thinking_changed = last_thinking_level(session) != Some(selection.thinking_level);
+
+    if thinking_changed {
+        session.append_thinking_level_change(selection.thinking_level.to_string());
+    }
+}
+
 fn restore_model_from_session(
     saved_provider: &str,
     saved_model_id: &str,
@@ -555,6 +585,35 @@ pub fn resolve_api_key(auth: &AuthStorage, cli: &cli::Cli, entry: &ModelEntry) -
                 entry.model.provider
             )
         })
+}
+
+pub fn build_stream_options(
+    config: &Config,
+    api_key: String,
+    selection: &ModelSelection,
+    session: &Session,
+) -> StreamOptions {
+    let mut options = StreamOptions {
+        api_key: Some(api_key),
+        headers: selection.model_entry.headers.clone(),
+        session_id: Some(session.header.id.clone()),
+        ..Default::default()
+    };
+
+    options.thinking_level = Some(selection.thinking_level);
+
+    if let Some(budgets) = &config.thinking_budgets {
+        let defaults = ThinkingBudgets::default();
+        options.thinking_budgets = Some(ThinkingBudgets {
+            minimal: budgets.minimal.unwrap_or(defaults.minimal),
+            low: budgets.low.unwrap_or(defaults.low),
+            medium: budgets.medium.unwrap_or(defaults.medium),
+            high: budgets.high.unwrap_or(defaults.high),
+            xhigh: budgets.xhigh.unwrap_or(defaults.xhigh),
+        });
+    }
+
+    options
 }
 
 fn supports_xhigh(model_id: &str) -> bool {
@@ -779,6 +838,18 @@ fn is_alias(model_id: &str) -> bool {
 
 fn models_equal(left: &ModelEntry, right: &ModelEntry) -> bool {
     left.model.provider == right.model.provider && left.model.id == right.model.id
+}
+
+pub fn output_final_text(message: &AssistantMessage) {
+    for block in &message.content {
+        if let ContentBlock::Text(text) = block {
+            println!("{}", text.text);
+        }
+    }
+}
+
+pub fn render_session_html(session: &Session) -> String {
+    session.to_html()
 }
 
 #[cfg(test)]

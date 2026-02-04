@@ -398,10 +398,17 @@ fn find_cut_point(
         accumulated_tokens = accumulated_tokens.saturating_add(estimate_tokens(&msg_entry.message));
 
         if accumulated_tokens >= u64::from(keep_recent_tokens) {
+            let mut found = false;
             for &cut_point in &cut_points {
                 if cut_point >= i {
                     cut_index = cut_point;
+                    found = true;
                     break;
+                }
+            }
+            if !found {
+                if let Some(&last) = cut_points.last() {
+                    cut_index = last;
                 }
             }
             break;
@@ -464,6 +471,16 @@ fn serialize_conversation(messages: &[Message]) -> String {
                 };
                 if !content.is_empty() {
                     parts.push(format!("[User]: {content}"));
+                }
+            }
+            Message::Custom(custom) => {
+                let label = if custom.custom_type.trim().is_empty() {
+                    "Custom".to_string()
+                } else {
+                    format!("Custom:{}", custom.custom_type)
+                };
+                if !custom.content.trim().is_empty() {
+                    parts.push(format!("[{label}]: {}", custom.content));
                 }
             }
             Message::Assistant(assistant) => {

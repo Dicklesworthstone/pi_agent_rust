@@ -659,6 +659,12 @@ fn convert_message_to_anthropic(message: &Message) -> AnthropicMessage {
             role: "user".to_string(),
             content: convert_user_content(&user.content),
         },
+        Message::Custom(custom) => AnthropicMessage {
+            role: "user".to_string(),
+            content: vec![AnthropicContent::Text {
+                text: custom.content.clone(),
+            }],
+        },
         Message::Assistant(assistant) => AnthropicMessage {
             role: "assistant".to_string(),
             content: assistant

@@ -322,14 +322,36 @@ impl Clone for PiConsole {
 /// Strip rich markup tags from text.
 fn strip_markup(text: &str) -> String {
     let mut result = String::with_capacity(text.len());
-    let mut in_tag = false;
+    let mut chars = text.chars();
 
-    for c in text.chars() {
-        match c {
-            '[' => in_tag = true,
-            ']' if in_tag => in_tag = false,
-            _ if !in_tag => result.push(c),
-            _ => {}
+    while let Some(c) = chars.next() {
+        if c == '[' {
+            // Potential tag
+            let mut buffer = String::new();
+            let mut is_tag = true;
+
+            for next_c in chars.by_ref() {
+                if next_c == ']' {
+                    break;
+                }
+                buffer.push(next_c);
+                // Heuristic: rich_rust tags usually contain alpha, space, slash, comma.
+                // If we see digits or other symbols, assume it's not a tag (e.g. array[0]).
+                if !next_c.is_ascii_alphabetic() && !matches!(next_c, ' ' | '/' | ',') {
+                    is_tag = false;
+                }
+            }
+
+            if is_tag && !buffer.is_empty() {
+                // It was a tag, discard buffer (already consumed)
+            } else {
+                // Not a tag, append literal
+                result.push('[');
+                result.push_str(&buffer);
+                result.push(']');
+            }
+        } else {
+            result.push(c);
         }
     }
 
@@ -375,6 +397,7 @@ mod tests {
         assert_eq!(strip_markup("[red]A[/] [blue]B[/]"), "A B");
         assert_eq!(strip_markup("No markup"), "No markup");
         assert_eq!(strip_markup("[bold red on blue]Text[/]"), "Text");
+        assert_eq!(strip_markup("array[0]"), "array[0]");
     }
 
     #[test]

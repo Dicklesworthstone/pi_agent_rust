@@ -487,7 +487,14 @@ fn request_matches(recorded: &RecordedRequest, incoming: &RecordedRequest) -> bo
     if recorded.url != incoming.url {
         return false;
     }
-    if recorded.body != incoming.body {
+
+    // Redact incoming body to match recorded body state (which is always redacted)
+    let mut incoming_body = incoming.body.clone();
+    if let Some(body) = &mut incoming_body {
+        redact_json(body);
+    }
+
+    if recorded.body != incoming_body {
         return false;
     }
     if recorded.body_text != incoming.body_text {
@@ -566,7 +573,13 @@ fn is_sensitive_key(key: &str) -> bool {
     key.contains("api_key")
         || key.contains("apikey")
         || key.contains("authorization")
-        || key.contains("token")
+        // "token" is sensitive when it refers to auth tokens (access_token, id_token, etc),
+        // but many APIs also use fields like "max_tokens"/"prompt_tokens" which are just counts.
+        // Redacting those breaks matching with existing cassettes and is not necessary.
+        || ((key.contains("token") && !key.contains("tokens"))
+            || key.contains("access_tokens")
+            || key.contains("refresh_tokens")
+            || key.contains("id_tokens"))
         || key.contains("secret")
         || key.contains("password")
 }

@@ -80,6 +80,7 @@ A theme is a JSON file defining colors for UI elements and syntax highlighting. 
 
 ## Built-in Themes
 
-Pi includes two built-in themes:
+Pi includes built-in themes:
 - `dark` (default)
 - `light`
+- `solarized`

@@ -12,6 +12,8 @@ use crate::model::{
 };
 use crate::session_index::SessionIndex;
 use crate::tui::PiConsole;
+use asupersync::Cx;
+use asupersync::channel::oneshot;
 use rich_rust::Theme;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,6 +22,7 @@ use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Current session file format version.
@@ -52,7 +55,7 @@ pub fn get_share_viewer_url(gist_id: &str) -> String {
 // ============================================================================
 
 /// A session manages conversation state and persistence.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
     /// Session header
     pub header: SessionHeader,
@@ -96,7 +99,7 @@ impl Session {
         }
 
         if cli.resume {
-            return Self::resume_with_picker(session_dir.as_deref(), config).await;
+            return Self::resume_with_picker(session_dir.as_deref(), config, None).await;
         }
 
         if cli.r#continue {
@@ -108,7 +111,11 @@ impl Session {
     }
 
     /// Resume a session by prompting the user to select from recent sessions.
-    pub async fn resume_with_picker(override_dir: Option<&Path>, config: &Config) -> Result<Self> {
+    pub async fn resume_with_picker(
+        override_dir: Option<&Path>,
+        config: &Config,
+        picker_input_override: Option<String>,
+    ) -> Result<Self> {
         if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             if let Some(session) = crate::session_picker::pick_session(override_dir).await {
                 return Ok(session);
@@ -167,6 +174,7 @@ impl Session {
             .collect();
         console.render_table(&headers, &row_refs);
 
+        let mut picker_input_override = picker_input_override;
         let mut attempts = 0;
         loop {
             attempts += 1;
@@ -181,8 +189,13 @@ impl Session {
             );
             let _ = std::io::stdout().flush();
 
-            let mut input = String::new();
-            std::io::stdin().read_line(&mut input)?;
+            let input = if let Some(override_input) = picker_input_override.take() {
+                override_input
+            } else {
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                input
+            };
             let input = input.trim();
             if input.is_empty() {
                 console.render_info("Starting a new session.");
@@ -388,7 +401,7 @@ impl Session {
             self.path = Some(project_session_dir.join(filename));
         }
 
-        let path = self.path.as_ref().unwrap();
+        let path = self.path.clone().unwrap();
         let mut content = String::new();
 
         // Write header
@@ -401,23 +414,38 @@ impl Session {
             content.push('\n');
         }
 
-        // Atomic write using tempfile
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+        let session_clone = self.clone();
+        let path_clone = path.clone();
+        let content_clone = content.clone();
+        let session_dir_clone = self.session_dir.clone();
 
-        asupersync::fs::write(temp_file.path(), content).await?;
+        let (tx, rx) = oneshot::channel();
 
-        temp_file
-            .persist(path)
-            .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
+        thread::spawn(move || {
+            let res = || -> Result<()> {
+                let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
+                let temp_file = tempfile::NamedTempFile::new_in(parent)?;
+                std::fs::write(temp_file.path(), content_clone)?;
+                temp_file
+                    .persist(&path_clone)
+                    .map_err(|e| crate::Error::Io(Box::new(e.error)))?;
 
-        let sessions_root = self
-            .session_dir
-            .clone()
-            .unwrap_or_else(Config::sessions_dir);
-        if let Err(err) = SessionIndex::for_sessions_root(&sessions_root).index_session(self) {
-            tracing::warn!("Failed to update session index: {err}");
-        }
+                let sessions_root = session_dir_clone.unwrap_or_else(Config::sessions_dir);
+                if let Err(err) =
+                    SessionIndex::for_sessions_root(&sessions_root).index_session(&session_clone)
+                {
+                    tracing::warn!("Failed to update session index: {err}");
+                }
+                Ok(())
+            }();
+            let cx = Cx::for_request();
+            let _ = tx.send(&cx, res);
+        });
+
+        let cx = Cx::for_request();
+        rx.recv(&cx)
+            .await
+            .map_err(|_| crate::Error::session("Save task cancelled"))??;
         Ok(())
     }
 
@@ -1308,6 +1336,12 @@ impl From<Message> for SessionMessage {
                 is_error: result.is_error,
                 timestamp: Some(result.timestamp),
             },
+            Message::Custom(custom) => Self::Custom {
+                custom_type: custom.custom_type,
+                content: custom.content,
+                display: custom.display,
+                details: custom.details,
+            },
         }
     }
 }
@@ -1426,8 +1460,16 @@ pub(crate) fn session_message_to_model(message: &SessionMessage) -> Option<Messa
             is_error: *is_error,
             timestamp: timestamp.unwrap_or_else(|| chrono::Utc::now().timestamp_millis()),
         })),
-        SessionMessage::Custom { content, .. } => Some(Message::User(UserMessage {
-            content: UserContent::Blocks(vec![ContentBlock::Text(TextContent::new(content))]),
+        SessionMessage::Custom {
+            custom_type,
+            content,
+            display,
+            details,
+        } => Some(Message::Custom(crate::model::CustomMessage {
+            content: content.clone(),
+            custom_type: custom_type.clone(),
+            display: *display,
+            details: details.clone(),
             timestamp: chrono::Utc::now().timestamp_millis(),
         })),
         SessionMessage::BashExecution {

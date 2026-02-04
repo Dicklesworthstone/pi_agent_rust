@@ -20,94 +20,181 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use tempfile::NamedTempFile;
+use tracing::trace;
 
-const PLACEHOLDER_TS: &str = "<ts>";
-const PLACEHOLDER_HOST: &str = "<host>";
-const PLACEHOLDER_SESSION_ID: &str = "<session_id>";
-const PLACEHOLDER_RUN_ID: &str = "<run_id>";
-const PLACEHOLDER_ARTIFACT_ID: &str = "<artifact_id>";
-const PLACEHOLDER_TRACE_ID: &str = "<trace_id>";
-const PLACEHOLDER_SPAN_ID: &str = "<span_id>";
+const PLACEHOLDER_TIMESTAMP: &str = "<TIMESTAMP>";
+const PLACEHOLDER_HOST: &str = "<HOST>";
+const PLACEHOLDER_SESSION_ID: &str = "<SESSION_ID>";
+const PLACEHOLDER_RUN_ID: &str = "<RUN_ID>";
+const PLACEHOLDER_ARTIFACT_ID: &str = "<ARTIFACT_ID>";
+const PLACEHOLDER_TRACE_ID: &str = "<TRACE_ID>";
+const PLACEHOLDER_SPAN_ID: &str = "<SPAN_ID>";
+const PLACEHOLDER_UUID: &str = "<UUID>";
+const PLACEHOLDER_PI_MONO_ROOT: &str = "<PI_MONO_ROOT>";
+const PLACEHOLDER_PROJECT_ROOT: &str = "<PROJECT_ROOT>";
+const PLACEHOLDER_PORT: &str = "<PORT>";
 
 static ANSI_REGEX: OnceLock<Regex> = OnceLock::new();
+static RUN_ID_REGEX: OnceLock<Regex> = OnceLock::new();
+static UUID_REGEX: OnceLock<Regex> = OnceLock::new();
+static OPENAI_BASE_REGEX: OnceLock<Regex> = OnceLock::new();
 
 fn ansi_regex() -> &'static Regex {
     ANSI_REGEX.get_or_init(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("ansi regex"))
 }
 
-fn normalize_ext_log_line(mut value: Value, cwd: &Path) -> Value {
-    normalize_known_dynamic_fields(&mut value);
-    normalize_strings_in_value(&mut value, cwd);
+#[derive(Debug, Clone)]
+struct NormalizationContext {
+    project_root: String,
+    pi_mono_root: String,
+    cwd: String,
+}
+
+impl NormalizationContext {
+    fn from_cwd(cwd: &Path) -> Self {
+        let project_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+            .display()
+            .to_string();
+        let pi_mono_root = PathBuf::from(&project_root)
+            .join("legacy_pi_mono_code")
+            .join("pi-mono")
+            .canonicalize()
+            .unwrap_or_else(|_| {
+                PathBuf::from(&project_root)
+                    .join("legacy_pi_mono_code")
+                    .join("pi-mono")
+            })
+            .display()
+            .to_string();
+        let cwd = cwd
+            .canonicalize()
+            .unwrap_or_else(|_| cwd.to_path_buf())
+            .display()
+            .to_string();
+        Self {
+            project_root,
+            pi_mono_root,
+            cwd,
+        }
+    }
+}
+
+fn normalize_ext_log_line(mut value: Value, ctx: &NormalizationContext) -> Value {
+    normalize_value(&mut value, None, ctx);
     canonicalize_json_keys(&value)
 }
 
-fn normalize_known_dynamic_fields(value: &mut Value) {
-    // Top-level: ts
-    if let Some(ts) = value.get_mut("ts") {
-        if ts.is_string() {
-            *ts = Value::String(PLACEHOLDER_TS.to_string());
-        }
-    }
-
-    // correlation: replace known dynamic identifiers
-    if let Some(correlation) = value.get_mut("correlation").and_then(Value::as_object_mut) {
-        replace_string_field(correlation, "session_id", PLACEHOLDER_SESSION_ID);
-        replace_string_field(correlation, "run_id", PLACEHOLDER_RUN_ID);
-        replace_string_field(correlation, "artifact_id", PLACEHOLDER_ARTIFACT_ID);
-        replace_string_field(correlation, "trace_id", PLACEHOLDER_TRACE_ID);
-        replace_string_field(correlation, "span_id", PLACEHOLDER_SPAN_ID);
-    }
-
-    // source: host + pid
-    if let Some(source) = value.get_mut("source").and_then(Value::as_object_mut) {
-        replace_string_field(source, "host", PLACEHOLDER_HOST);
-        if let Some(pid) = source.get_mut("pid") {
-            if pid.is_number() {
-                *pid = Value::Number(0.into());
-            }
-        }
-    }
-}
-
-fn replace_string_field(object: &mut serde_json::Map<String, Value>, key: &str, replacement: &str) {
-    if let Some(value) = object.get_mut(key) {
-        if value.is_string() {
-            *value = Value::String(replacement.to_string());
-        }
-    }
-}
-
-fn normalize_strings_in_value(value: &mut Value, cwd: &Path) {
+fn normalize_value(value: &mut Value, key: Option<&str>, ctx: &NormalizationContext) {
     match value {
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::Null | Value::Bool(_) => {}
         Value::String(s) => {
-            *s = normalize_string(s, cwd);
+            if matches!(
+                key,
+                Some(
+                    "timestamp" | "started_at" | "finished_at" | "created_at" | "createdAt" | "ts"
+                )
+            ) {
+                *s = PLACEHOLDER_TIMESTAMP.to_string();
+                return;
+            }
+            if matches!(key, Some("cwd")) {
+                *s = PLACEHOLDER_PI_MONO_ROOT.to_string();
+                return;
+            }
+            if matches!(key, Some("host")) {
+                *s = PLACEHOLDER_HOST.to_string();
+                return;
+            }
+            if matches!(key, Some("session_id" | "sessionId")) {
+                *s = PLACEHOLDER_SESSION_ID.to_string();
+                return;
+            }
+            if matches!(key, Some("run_id" | "runId")) {
+                *s = PLACEHOLDER_RUN_ID.to_string();
+                return;
+            }
+            if matches!(key, Some("artifact_id" | "artifactId")) {
+                *s = PLACEHOLDER_ARTIFACT_ID.to_string();
+                return;
+            }
+            if matches!(key, Some("trace_id" | "traceId")) {
+                *s = PLACEHOLDER_TRACE_ID.to_string();
+                return;
+            }
+            if matches!(key, Some("span_id" | "spanId")) {
+                *s = PLACEHOLDER_SPAN_ID.to_string();
+                return;
+            }
+            *s = normalize_string(s, ctx);
         }
         Value::Array(items) => {
             for item in items {
-                normalize_strings_in_value(item, cwd);
+                normalize_value(item, None, ctx);
             }
         }
         Value::Object(map) => {
-            for (_key, item) in map.iter_mut() {
-                normalize_strings_in_value(item, cwd);
+            for (key, item) in map.iter_mut() {
+                normalize_value(item, Some(key.as_str()), ctx);
+            }
+        }
+        Value::Number(_) => {
+            if matches!(
+                key,
+                Some(
+                    "timestamp"
+                        | "started_at"
+                        | "finished_at"
+                        | "created_at"
+                        | "createdAt"
+                        | "ts"
+                        | "pid"
+                )
+            ) {
+                *value = Value::Number(0.into());
             }
         }
     }
 }
 
-fn normalize_string(input: &str, cwd: &Path) -> String {
+fn normalize_string(input: &str, ctx: &NormalizationContext) -> String {
+    let run_id_re =
+        RUN_ID_REGEX.get_or_init(|| Regex::new(r"\brun-[0-9a-fA-F-]{36}\b").expect("run id regex"));
+    let uuid_re = UUID_REGEX.get_or_init(|| {
+        Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .expect("uuid regex")
+    });
+    let openai_base_re = OPENAI_BASE_REGEX
+        .get_or_init(|| Regex::new(r"http://127\.0\.0\.1:\d+/v1").expect("openai base regex"));
+
     // 1) Strip ANSI escape sequences (keeps plain text).
     // Covers CSI sequences like: ESC[31m, ESC[0m, ESC[2K, etc.
     let without_ansi = ansi_regex().replace_all(input, "");
 
     // 2) Normalize absolute paths under cwd to "<cwd>/...".
-    let cwd = cwd.display().to_string();
-    let cwd_backslashes = cwd.replace('/', "\\");
     let mut out = without_ansi.to_string();
-    if !cwd.is_empty() {
-        out = out.replace(&cwd, "<cwd>");
-        out = out.replace(&cwd_backslashes, "<cwd>");
+    out = replace_path_variants(&out, &ctx.pi_mono_root, PLACEHOLDER_PI_MONO_ROOT);
+    out = replace_path_variants(&out, &ctx.cwd, PLACEHOLDER_PI_MONO_ROOT);
+    out = replace_path_variants(&out, &ctx.project_root, PLACEHOLDER_PROJECT_ROOT);
+    out = run_id_re.replace_all(&out, PLACEHOLDER_RUN_ID).into_owned();
+    out = openai_base_re
+        .replace_all(&out, format!("http://127.0.0.1:{PLACEHOLDER_PORT}/v1"))
+        .into_owned();
+    out = uuid_re.replace_all(&out, PLACEHOLDER_UUID).into_owned();
+    out
+}
+
+fn replace_path_variants(input: &str, path: &str, placeholder: &str) -> String {
+    if path.is_empty() {
+        return input.to_string();
+    }
+    let mut out = input.replace(path, placeholder);
+    let path_backslashes = path.replace('/', "\\");
+    if path_backslashes != path {
+        out = out.replace(&path_backslashes, placeholder);
     }
     out
 }
@@ -167,8 +254,9 @@ fn diff_normalized_jsonl(
     actual_jsonl: &str,
     cwd: &Path,
 ) -> Result<(), String> {
-    let expected = parse_and_normalize_jsonl(expected_jsonl, cwd)?;
-    let actual = parse_and_normalize_jsonl(actual_jsonl, cwd)?;
+    let ctx = NormalizationContext::from_cwd(cwd);
+    let expected = parse_and_normalize_jsonl(expected_jsonl, &ctx)?;
+    let actual = parse_and_normalize_jsonl(actual_jsonl, &ctx)?;
 
     let expected_groups = group_by_diff_key(&expected);
     let actual_groups = group_by_diff_key(&actual);
@@ -201,7 +289,10 @@ fn diff_normalized_jsonl(
     }
 }
 
-fn parse_and_normalize_jsonl(input: &str, cwd: &Path) -> Result<Vec<Value>, String> {
+fn parse_and_normalize_jsonl(
+    input: &str,
+    ctx: &NormalizationContext,
+) -> Result<Vec<Value>, String> {
     let mut out = Vec::new();
     for (idx, line) in input.lines().enumerate() {
         let line = line.trim();
@@ -210,7 +301,15 @@ fn parse_and_normalize_jsonl(input: &str, cwd: &Path) -> Result<Vec<Value>, Stri
         }
         let parsed: Value = serde_json::from_str(line)
             .map_err(|err| format!("line {idx}: JSON parse error: {err}"))?;
-        out.push(normalize_ext_log_line(parsed, cwd));
+        let normalized = normalize_ext_log_line(parsed, ctx);
+        if std::env::var_os("PI_TEST_MODE").is_some() {
+            trace!(
+                target: "ext_conformance.normalize",
+                line = idx + 1,
+                value = %serde_json::to_string(&normalized).unwrap_or_default()
+            );
+        }
+        out.push(normalized);
     }
     Ok(out)
 }
@@ -249,6 +348,7 @@ fn render_text_diff(expected: &str, actual: &str) -> String {
 #[test]
 fn normalizes_dynamic_fields_paths_and_ansi() {
     let cwd = Path::new("/tmp/pi_ext_conformance");
+    let ctx = NormalizationContext::from_cwd(cwd);
     let original = json!({
         "schema": "pi.ext.log.v1",
         "ts": "2026-02-03T03:01:02.123Z",
@@ -271,9 +371,9 @@ fn normalizes_dynamic_fields_paths_and_ansi() {
         }
     });
 
-    let normalized = normalize_ext_log_line(original, cwd);
+    let normalized = normalize_ext_log_line(original, &ctx);
 
-    assert_eq!(normalized["ts"], PLACEHOLDER_TS);
+    assert_eq!(normalized["ts"], PLACEHOLDER_TIMESTAMP);
     assert_eq!(
         normalized["correlation"]["session_id"],
         PLACEHOLDER_SESSION_ID
@@ -289,16 +389,30 @@ fn normalizes_dynamic_fields_paths_and_ansi() {
     assert_eq!(normalized["source"]["pid"], 0);
 
     let msg = normalized["message"].as_str().unwrap_or_default();
-    assert!(msg.contains("<cwd>/file.txt"));
+    assert!(msg.contains("<PI_MONO_ROOT>/file.txt"));
     assert!(!msg.contains(&cwd.display().to_string()));
     assert!(!msg.contains("\u{1b}["));
     assert!(msg.contains("ERR"));
 
     let path = normalized["data"]["path"].as_str().unwrap_or_default();
-    assert!(path.contains("<cwd>/dir/sub/file.rs"));
+    assert!(path.contains("<PI_MONO_ROOT>/dir/sub/file.rs"));
     assert!(!path.contains(&cwd.display().to_string()));
 
     assert_eq!(normalized["data"]["note"], "Bold");
+}
+
+#[test]
+fn normalize_string_rewrites_run_ids_ports_and_roots() {
+    let cwd = Path::new("/tmp/pi_ext_conformance");
+    let ctx = NormalizationContext::from_cwd(cwd);
+    let input = format!(
+        "run-123e4567-e89b-12d3-a456-426614174000 http://127.0.0.1:4887/v1 {}",
+        ctx.pi_mono_root
+    );
+    let out = normalize_string(&input, &ctx);
+    assert!(out.contains(PLACEHOLDER_RUN_ID), "{out}");
+    assert!(out.contains("http://127.0.0.1:<PORT>/v1"), "{out}");
+    assert!(out.contains(PLACEHOLDER_PI_MONO_ROOT), "{out}");
 }
 
 #[test]

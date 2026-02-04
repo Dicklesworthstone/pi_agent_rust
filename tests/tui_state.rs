@@ -28,6 +28,14 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
+fn make_executable(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms).expect("set permissions");
+}
+
 fn test_runtime_handle() -> asupersync::runtime::RuntimeHandle {
     static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
     RT.get_or_init(|| {
@@ -155,7 +163,21 @@ fn build_app_with_session_and_events(
     pending_inputs: Vec<PendingInput>,
     session: Session,
 ) -> (PiApp, mpsc::Receiver<PiMsg>) {
-    let config = Config::default();
+    build_app_with_session_and_events_and_config(
+        harness,
+        pending_inputs,
+        session,
+        Config::default(),
+    )
+}
+
+#[allow(dead_code)]
+fn build_app_with_session_and_events_and_config(
+    harness: &TestHarness,
+    pending_inputs: Vec<PendingInput>,
+    session: Session,
+    config: Config,
+) -> (PiApp, mpsc::Receiver<PiMsg>) {
     let cwd = harness.temp_dir().to_path_buf();
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
@@ -1332,15 +1354,30 @@ fn tui_state_slash_session_shows_basic_info() {
 }
 
 #[test]
-fn tui_state_slash_settings_shows_summary() {
-    let harness = TestHarness::new("tui_state_slash_settings_shows_summary");
+fn tui_state_slash_settings_opens_selector_and_restores_editor() {
+    let harness = TestHarness::new("tui_state_slash_settings_opens_selector_and_restores_editor");
     let mut app = build_app(&harness, Vec::new());
     log_initial_state(&harness, &app);
 
     type_text(&harness, &mut app, "/settings");
     let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "Settings:");
-    assert_after_contains(&harness, &step, "Resources:");
+    assert_after_contains(&harness, &step, "Settings");
+    assert_after_contains(&harness, &step, "Summary");
+    assert_after_not_contains(&harness, &step, "[single-line]");
+
+    // Navigate and confirm selection (scaffold: returns to editor, does not mutate settings).
+    press_down(&harness, &mut app);
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Selected setting: Theme");
+    assert_after_contains(&harness, &step, "[single-line]");
+
+    // Reopen and cancel to ensure editor is restored.
+    type_text(&harness, &mut app, "/settings");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "↑/↓/j/k: navigate");
+    let step = press_esc(&harness, &mut app);
+    assert_after_contains(&harness, &step, "[single-line]");
+    assert_after_not_contains(&harness, &step, "↑/↓/j/k: navigate");
 }
 
 #[test]
@@ -1355,14 +1392,164 @@ fn tui_state_slash_export_writes_html_and_reports_path() {
 }
 
 #[test]
-fn tui_state_slash_share_writes_temp_html_and_reports_path() {
-    let harness = TestHarness::new("tui_state_slash_share_writes_temp_html_and_reports_path");
-    let mut app = build_app(&harness, Vec::new());
+fn tui_state_slash_share_reports_error_when_gh_missing() {
+    let harness = TestHarness::new("tui_state_slash_share_reports_error_when_gh_missing");
+    let missing = harness.temp_path("missing-gh");
+    let config = Config {
+        gh_path: Some(missing.display().to_string()),
+        ..Default::default()
+    };
+    let (mut app, event_rx) = build_app_with_session_and_events_and_config(
+        &harness,
+        Vec::new(),
+        Session::in_memory(),
+        config,
+    );
     log_initial_state(&harness, &app);
 
     type_text(&harness, &mut app, "/share");
     let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "Shared HTML:");
+    assert_after_contains(&harness, &step, "Sharing session...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_millis(500), |msgs| {
+        msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
+    });
+    let error = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::AgentError(_)))
+        .expect("expected AgentError for missing gh");
+    let step = apply_pi(&harness, &mut app, "PiMsg::AgentError", error);
+    assert_after_contains(&harness, &step, "GitHub CLI `gh` not found");
+}
+
+#[test]
+#[cfg(unix)]
+fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
+    let harness = TestHarness::new(
+        "tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file",
+    );
+
+    let record_path = harness.temp_path("gh_record_path.txt");
+    let gh_path = harness.temp_path("gh");
+    let script = format!(
+        "#!/bin/sh\nset -e\n\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then\n  exit 0\nfi\n\nif [ \"$1\" = \"gist\" ] && [ \"$2\" = \"create\" ]; then\n  file=\"\"\n  for arg in \"$@\"; do\n    file=\"$arg\"\n  done\n  printf '%s' \"$file\" > \"{record_path}\"\n  echo \"https://gist.github.com/testuser/abcdef1234567890\"\n  exit 0\nfi\n\necho \"unexpected gh args: $@\" >&2\nexit 2\n",
+        record_path = record_path.display(),
+    );
+    fs::write(&gh_path, script).expect("write fake gh");
+    make_executable(&gh_path);
+
+    let config = Config {
+        gh_path: Some(gh_path.display().to_string()),
+        ..Default::default()
+    };
+    let (mut app, event_rx) = build_app_with_session_and_events_and_config(
+        &harness,
+        Vec::new(),
+        Session::in_memory(),
+        config,
+    );
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/share");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Sharing session...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter()
+            .any(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
+    });
+    let msg = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
+        .expect("expected share result");
+    let step = apply_pi(&harness, &mut app, "PiMsg share result", msg);
+    assert_after_contains(&harness, &step, "Share URL:");
+    assert_after_contains(
+        &harness,
+        &step,
+        "https://buildwithpi.ai/session/#abcdef1234567890",
+    );
+    assert_after_contains(&harness, &step, "Gist:");
+    assert_after_contains(
+        &harness,
+        &step,
+        "https://gist.github.com/testuser/abcdef1234567890",
+    );
+
+    let recorded = fs::read_to_string(&record_path).expect("read record path");
+    let shared_path = std::path::Path::new(recorded.trim());
+    let start = Instant::now();
+    while shared_path.exists() && start.elapsed() < Duration::from_millis(500) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !shared_path.exists(),
+        "expected temp HTML file to be cleaned up (still exists at {})",
+        shared_path.display()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn tui_state_slash_share_is_cancellable_and_cleans_temp_file() {
+    let harness = TestHarness::new("tui_state_slash_share_is_cancellable_and_cleans_temp_file");
+
+    let record_path = harness.temp_path("gh_record_path.txt");
+    let gh_path = harness.temp_path("gh");
+    let script = format!(
+        "#!/bin/sh\nset -e\n\nif [ \"$1\" = \"auth\" ] && [ \"$2\" = \"status\" ]; then\n  exit 0\nfi\n\nif [ \"$1\" = \"gist\" ] && [ \"$2\" = \"create\" ]; then\n  file=\"\"\n  for arg in \"$@\"; do\n    file=\"$arg\"\n  done\n  printf '%s' \"$file\" > \"{record_path}\"\n  sleep 1\n  echo \"https://gist.github.com/testuser/abcdef1234567890\"\n  exit 0\nfi\n\necho \"unexpected gh args: $@\" >&2\nexit 2\n",
+        record_path = record_path.display(),
+    );
+    fs::write(&gh_path, script).expect("write fake gh");
+    make_executable(&gh_path);
+
+    let config = Config {
+        gh_path: Some(gh_path.display().to_string()),
+        ..Default::default()
+    };
+    let (mut app, event_rx) = build_app_with_session_and_events_and_config(
+        &harness,
+        Vec::new(),
+        Session::in_memory(),
+        config,
+    );
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/share");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Sharing session...");
+
+    let start = Instant::now();
+    while !record_path.exists() && start.elapsed() < Duration::from_millis(500) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(record_path.exists(), "expected fake gh to record temp path");
+
+    let step = press_esc(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Aborting request...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter()
+            .any(|msg| matches!(msg, PiMsg::System(message) if message.contains("Share cancelled")))
+    });
+    let msg = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::System(message) if message.contains("Share cancelled")))
+        .expect("expected Share cancelled message");
+    let step = apply_pi(&harness, &mut app, "PiMsg::System", msg);
+    assert_after_contains(&harness, &step, "Share cancelled");
+
+    let recorded = fs::read_to_string(&record_path).expect("read record path");
+    let shared_path = std::path::Path::new(recorded.trim());
+    let start = Instant::now();
+    while shared_path.exists() && start.elapsed() < Duration::from_millis(500) {
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !shared_path.exists(),
+        "expected temp HTML file to be cleaned up (still exists at {})",
+        shared_path.display()
+    );
 }
 
 #[test]
@@ -1415,8 +1602,8 @@ fn tui_state_slash_resume_selects_latest_session_and_loads_messages() {
 }
 
 #[test]
-fn tui_state_session_picker_ctrl_d_reports_disabled() {
-    let harness = TestHarness::new("tui_state_session_picker_ctrl_d_reports_disabled");
+fn tui_state_session_picker_ctrl_d_prompts_for_delete() {
+    let harness = TestHarness::new("tui_state_session_picker_ctrl_d_prompts_for_delete");
     let base_dir = harness.temp_path("sessions");
     let cwd = harness.temp_dir().to_path_buf();
 
@@ -1431,11 +1618,10 @@ fn tui_state_session_picker_ctrl_d_reports_disabled() {
     assert_after_contains(&harness, &step, "Select a session to resume");
 
     let step = press_ctrld(&harness, &mut app);
-    assert_after_contains(
-        &harness,
-        &step,
-        "Session deletion is disabled (requires explicit permission).",
-    );
+    assert_after_contains(&harness, &step, "Delete session? Press y/n to confirm.");
+    assert_after_contains(&harness, &step, "Select a session to resume");
+
+    let step = apply_key(&harness, &mut app, "key:n", KeyMsg::from_runes(vec!['n']));
     assert_after_contains(&harness, &step, "Select a session to resume");
 }
 

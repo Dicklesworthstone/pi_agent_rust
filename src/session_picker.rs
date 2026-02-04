@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bubbletea::{Cmd, KeyMsg, KeyType, Message, Program, quit};
 
 use crate::config::Config;
+use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader, encode_cwd};
 use crate::session_index::{SessionIndex, SessionMeta};
 use crate::theme::{Theme, TuiStyles};
@@ -30,6 +31,9 @@ pub struct SessionPicker {
     selected: usize,
     chosen: Option<usize>,
     cancelled: bool,
+    confirm_delete: Option<usize>,
+    status_message: Option<String>,
+    sessions_root: Option<PathBuf>,
     styles: TuiStyles,
 }
 
@@ -45,6 +49,9 @@ impl SessionPicker {
             selected: 0,
             chosen: None,
             cancelled: false,
+            confirm_delete: None,
+            status_message: None,
+            sessions_root: None,
             styles,
         }
     }
@@ -57,6 +64,28 @@ impl SessionPicker {
             selected: 0,
             chosen: None,
             cancelled: false,
+            confirm_delete: None,
+            status_message: None,
+            sessions_root: None,
+            styles,
+        }
+    }
+
+    #[must_use]
+    pub fn with_theme_and_root(
+        sessions: Vec<SessionMeta>,
+        theme: &Theme,
+        sessions_root: PathBuf,
+    ) -> Self {
+        let styles = theme.tui_styles();
+        Self {
+            sessions,
+            selected: 0,
+            chosen: None,
+            cancelled: false,
+            confirm_delete: None,
+            status_message: None,
+            sessions_root: Some(sessions_root),
             styles,
         }
     }
@@ -81,6 +110,9 @@ impl SessionPicker {
     #[allow(clippy::needless_pass_by_value)] // Required by Model trait
     pub fn update(&mut self, msg: Message) -> Option<Cmd> {
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
+            if self.confirm_delete.is_some() {
+                return self.handle_delete_prompt(key);
+            }
             match key.key_type {
                 KeyType::Up => {
                     if self.selected > 0 {
@@ -116,10 +148,62 @@ impl SessionPicker {
                     self.cancelled = true;
                     return Some(quit());
                 }
+                KeyType::CtrlD => {
+                    if !self.sessions.is_empty() {
+                        self.confirm_delete = Some(self.selected);
+                        self.status_message =
+                            Some("Delete session? Press y/n to confirm.".to_string());
+                    }
+                }
                 _ => {}
             }
         }
         None
+    }
+
+    fn handle_delete_prompt(&mut self, key: &KeyMsg) -> Option<Cmd> {
+        match key.key_type {
+            KeyType::Runes if key.runes == ['y'] || key.runes == ['Y'] => {
+                if let Some(index) = self.confirm_delete.take() {
+                    if let Err(err) = self.delete_session_at(index) {
+                        self.status_message = Some(err.to_string());
+                    } else {
+                        self.status_message = Some("Session deleted.".to_string());
+                        if self.sessions.is_empty() {
+                            self.cancelled = true;
+                            return Some(quit());
+                        }
+                    }
+                }
+            }
+            KeyType::Runes if key.runes == ['n'] || key.runes == ['N'] => {
+                self.confirm_delete = None;
+                self.status_message = None;
+            }
+            KeyType::Esc | KeyType::CtrlC => {
+                self.confirm_delete = None;
+                self.status_message = None;
+            }
+            _ => {}
+        }
+        None
+    }
+
+    fn delete_session_at(&mut self, index: usize) -> Result<()> {
+        let Some(meta) = self.sessions.get(index) else {
+            return Ok(());
+        };
+        let path = PathBuf::from(&meta.path);
+        delete_session_file(&path)?;
+        if let Some(root) = self.sessions_root.as_ref() {
+            let index = SessionIndex::for_sessions_root(root);
+            let _ = index.delete_session_path(&path);
+        }
+        self.sessions.remove(index);
+        if self.selected >= self.sessions.len() {
+            self.selected = self.sessions.len().saturating_sub(1);
+        }
+        Ok(())
     }
 
     pub fn view(&self) -> String {
@@ -191,8 +275,11 @@ impl SessionPicker {
             "  {}",
             self.styles
                 .muted
-                .render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
+                .render("↑/↓/j/k: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel")
         );
+        if let Some(message) = &self.status_message {
+            let _ = writeln!(output, "  {}", self.styles.warning_bold.render(message));
+        }
 
         output
     }
@@ -225,7 +312,7 @@ pub async fn pick_session(override_dir: Option<&Path>) -> Option<Session> {
 
     let config = Config::load().unwrap_or_default();
     let theme = Theme::resolve(&config, &cwd);
-    let picker = SessionPicker::with_theme(sessions, &theme);
+    let picker = SessionPicker::with_theme_and_root(sessions, &theme, base_dir.clone());
 
     // Run the TUI
     let result = Program::new(picker).with_alt_screen().run();
@@ -336,9 +423,55 @@ fn build_meta_from_file(path: &Path) -> crate::error::Result<SessionMeta> {
     })
 }
 
+pub(crate) fn delete_session_file(path: &Path) -> Result<()> {
+    if try_trash(path)? {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(|err| {
+        Error::session(format!(
+            "Failed to delete session {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn try_trash(path: &Path) -> Result<bool> {
+    match std::process::Command::new("trash").arg(path).status() {
+        Ok(status) => {
+            if status.success() {
+                Ok(true)
+            } else {
+                Err(Error::session(format!(
+                    "trash failed for {} (exit={})",
+                    path.display(),
+                    status.code().unwrap_or(-1)
+                )))
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(Error::session(format!(
+            "trash invocation failed for {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_meta(path: &Path) -> SessionMeta {
+        SessionMeta {
+            path: path.display().to_string(),
+            id: "sess".to_string(),
+            cwd: "/tmp".to_string(),
+            timestamp: "2025-01-15T10:00:00.000Z".to_string(),
+            message_count: 1,
+            last_modified_ms: 1000,
+            size_bytes: 100,
+            name: None,
+        }
+    }
 
     #[test]
     fn test_format_time() {
@@ -444,5 +577,63 @@ mod tests {
         });
         picker.update(k_msg);
         assert_eq!(picker.selected, 0);
+    }
+
+    #[test]
+    fn session_picker_delete_prompt_and_cancel() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("sess.jsonl");
+        fs::write(&session_path, "test").expect("write session");
+
+        let sessions = vec![make_meta(&session_path)];
+        let mut picker = SessionPicker::new(sessions);
+
+        let ctrl_d_msg = Message::new(KeyMsg {
+            key_type: KeyType::CtrlD,
+            runes: vec![],
+            alt: false,
+            paste: false,
+        });
+        picker.update(ctrl_d_msg);
+        assert!(picker.confirm_delete.is_some());
+
+        let n_msg = Message::new(KeyMsg {
+            key_type: KeyType::Runes,
+            runes: vec!['n'],
+            alt: false,
+            paste: false,
+        });
+        picker.update(n_msg);
+        assert!(picker.confirm_delete.is_none());
+        assert!(session_path.exists());
+    }
+
+    #[test]
+    fn session_picker_delete_confirm_removes_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("sess.jsonl");
+        fs::write(&session_path, "test").expect("write session");
+
+        let sessions = vec![make_meta(&session_path)];
+        let mut picker = SessionPicker::new(sessions);
+
+        let ctrl_d_msg = Message::new(KeyMsg {
+            key_type: KeyType::CtrlD,
+            runes: vec![],
+            alt: false,
+            paste: false,
+        });
+        picker.update(ctrl_d_msg);
+
+        let y_msg = Message::new(KeyMsg {
+            key_type: KeyType::Runes,
+            runes: vec!['y'],
+            alt: false,
+            paste: false,
+        });
+        picker.update(y_msg);
+
+        assert!(!session_path.exists());
+        assert!(picker.sessions.is_empty());
     }
 }

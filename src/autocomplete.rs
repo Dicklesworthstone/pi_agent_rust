@@ -92,6 +92,7 @@ impl AutocompleteCatalog {
 #[derive(Debug)]
 pub struct AutocompleteProvider {
     cwd: PathBuf,
+    home_dir_override: Option<PathBuf>,
     catalog: AutocompleteCatalog,
     file_cache: FileCache,
     max_items: usize,
@@ -102,6 +103,7 @@ impl AutocompleteProvider {
     pub const fn new(cwd: PathBuf, catalog: AutocompleteCatalog) -> Self {
         Self {
             cwd,
+            home_dir_override: None,
             catalog,
             file_cache: FileCache::new(),
             max_items: 50,
@@ -314,7 +316,9 @@ impl AutocompleteProvider {
         let raw = token.text.trim();
         let (dir_part_raw, base_part) = split_path_prefix(raw);
 
-        let Some(dir_path) = resolve_dir_path(&self.cwd, &dir_part_raw) else {
+        let Some(dir_path) =
+            resolve_dir_path(&self.cwd, &dir_part_raw, self.home_dir_override.as_deref())
+        else {
             return AutocompleteResponse {
                 replace: token.range.clone(),
                 items: Vec::new(),
@@ -712,6 +716,9 @@ fn is_path_like(text: &str) -> bool {
     if text.is_empty() {
         return false;
     }
+    if text.starts_with('~') {
+        return true;
+    }
     text.starts_with("./")
         || text.starts_with("../")
         || text.starts_with("~/")
@@ -729,14 +736,15 @@ fn expand_tilde(text: &str) -> String {
     text.to_string()
 }
 
-fn resolve_dir_path(cwd: &Path, dir_part: &str) -> Option<PathBuf> {
+fn resolve_dir_path(cwd: &Path, dir_part: &str, home_override: Option<&Path>) -> Option<PathBuf> {
     let dir_part = dir_part.trim();
+    let home_dir = || home_override.map(Path::to_path_buf).or_else(dirs::home_dir);
 
     if dir_part == "~" {
-        return dirs::home_dir();
+        return home_dir();
     }
     if let Some(rest) = dir_part.strip_prefix("~/") {
-        return dirs::home_dir().map(|home| home.join(rest));
+        return home_dir().map(|home| home.join(rest));
     }
     if Path::new(dir_part).is_absolute() {
         return Some(PathBuf::from(dir_part));
@@ -747,6 +755,9 @@ fn resolve_dir_path(cwd: &Path, dir_part: &str) -> Option<PathBuf> {
 
 fn split_path_prefix(path: &str) -> (String, String) {
     let path = path.trim();
+    if path == "~" {
+        return ("~".to_string(), String::new());
+    }
     if path.ends_with('/') {
         return (path.to_string(), String::new());
     }
@@ -909,5 +920,20 @@ mod tests {
                 .any(|item| item.insert == "./tags/" && item.kind == AutocompleteItemKind::Path)
         );
         assert!(!resp.items.iter().any(|item| item.insert == "./target/"));
+    }
+
+    #[test]
+    fn path_like_accepts_tilde() {
+        assert!(is_path_like("~"));
+        assert!(is_path_like("~/"));
+    }
+
+    #[test]
+    fn split_path_prefix_handles_tilde() {
+        assert_eq!(split_path_prefix("~"), ("~".to_string(), String::new()));
+        assert_eq!(
+            split_path_prefix("~/notes.txt"),
+            ("~".to_string(), "notes.txt".to_string())
+        );
     }
 }

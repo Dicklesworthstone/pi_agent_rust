@@ -92,6 +92,7 @@ pub struct RequestBuilder<'a> {
     url: String,
     headers: Vec<(String, String)>,
     body: Vec<u8>,
+    timeout: Option<std::time::Duration>,
 }
 
 impl<'a> RequestBuilder<'a> {
@@ -102,12 +103,19 @@ impl<'a> RequestBuilder<'a> {
             url: url.to_string(),
             headers: Vec::new(),
             body: Vec::new(),
+            timeout: None,
         }
     }
 
     #[must_use]
     pub fn header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((key.into(), value.into()));
+        self
+    }
+
+    #[must_use]
+    pub const fn timeout(mut self, duration: std::time::Duration) -> Self {
+        self.timeout = Some(duration);
         self
     }
 
@@ -132,6 +140,7 @@ impl<'a> RequestBuilder<'a> {
             url,
             headers,
             body,
+            timeout,
         } = self;
 
         if let Some(recorder) = client.vcr() {
@@ -157,8 +166,23 @@ impl<'a> RequestBuilder<'a> {
             });
         }
 
-        let (status, response_headers, stream) =
-            send_parts(client, method, &url, &headers, &body).await?;
+        let send_fut = send_parts(client, method, &url, &headers, &body);
+
+        let (status, response_headers, stream) = if let Some(duration) = timeout {
+            use asupersync::time::{sleep, wall_now};
+            use futures::future::{Either, FutureExt, select};
+
+            let sleep_fut = sleep(wall_now(), duration).fuse();
+            let send_fut = send_fut.fuse();
+            futures::pin_mut!(sleep_fut, send_fut);
+
+            match select(send_fut, sleep_fut).await {
+                Either::Left((res, _)) => res?,
+                Either::Right(_) => return Err(Error::api("Request timed out")),
+            }
+        } else {
+            send_fut.await?
+        };
 
         Ok(Response {
             status,

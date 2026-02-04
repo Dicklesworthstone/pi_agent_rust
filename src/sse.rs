@@ -45,6 +45,43 @@ impl SseParser {
         Self::default()
     }
 
+    /// Process a single line of SSE data.
+    fn process_line(line: &str, current: &mut SseEvent, has_data: &mut bool) {
+        if let Some(rest) = line.strip_prefix(':') {
+            // Comment line - ignore (but could be used for keep-alive)
+            let _ = rest;
+        } else if let Some((field, value)) = line.split_once(':') {
+            // Field: value
+            let value = value.strip_prefix(' ').unwrap_or(value);
+            match field {
+                "event" => current.event = value.to_string(),
+                "data" => {
+                    if *has_data {
+                        current.data.push('\n');
+                    }
+                    current.data.push_str(value);
+                    *has_data = true;
+                }
+                "id" => current.id = Some(value.to_string()),
+                "retry" => current.retry = value.parse().ok(),
+                _ => {} // Unknown field - ignore
+            }
+        } else {
+            // Field with no value
+            match line {
+                "event" => current.event = String::new(),
+                "data" => {
+                    if *has_data {
+                        current.data.push('\n');
+                    }
+                    *has_data = true;
+                }
+                "id" => current.id = Some(String::new()),
+                _ => {}
+            }
+        }
+    }
+
     /// Feed data to the parser and extract any complete events.
     ///
     /// Returns a vector of parsed events. Events are delimited by blank lines.
@@ -52,10 +89,11 @@ impl SseParser {
         self.buffer.push_str(data);
         let mut events = Vec::new();
 
+        let mut buffer = std::mem::take(&mut self.buffer);
         let mut start = 0usize;
-        while let Some(rel_newline) = self.buffer[start..].find('\n') {
+        while let Some(rel_newline) = buffer[start..].find('\n') {
             let newline_pos = start + rel_newline;
-            let mut line = &self.buffer[start..newline_pos];
+            let mut line = &buffer[start..newline_pos];
             if let Some(stripped) = line.strip_suffix('\r') {
                 line = stripped;
             }
@@ -72,44 +110,15 @@ impl SseParser {
                     self.current = SseEvent::default();
                     self.has_data = false;
                 }
-            } else if let Some(rest) = line.strip_prefix(':') {
-                // Comment line - ignore (but could be used for keep-alive)
-                let _ = rest;
-            } else if let Some((field, value)) = line.split_once(':') {
-                // Field: value
-                let value = value.strip_prefix(' ').unwrap_or(value);
-                match field {
-                    "event" => self.current.event = value.to_string(),
-                    "data" => {
-                        if self.has_data {
-                            self.current.data.push('\n');
-                        }
-                        self.current.data.push_str(value);
-                        self.has_data = true;
-                    }
-                    "id" => self.current.id = Some(value.to_string()),
-                    "retry" => self.current.retry = value.parse().ok(),
-                    _ => {} // Unknown field - ignore
-                }
             } else {
-                // Field with no value
-                match line {
-                    "event" => self.current.event = String::new(),
-                    "data" => {
-                        if self.has_data {
-                            self.current.data.push('\n');
-                        }
-                        self.has_data = true;
-                    }
-                    "id" => self.current.id = Some(String::new()),
-                    _ => {}
-                }
+                Self::process_line(line, &mut self.current, &mut self.has_data);
             }
         }
 
         if start > 0 {
-            self.buffer.drain(..start);
+            buffer.drain(..start);
         }
+        self.buffer = buffer;
         events
     }
 
@@ -124,16 +133,7 @@ impl SseParser {
         if !self.buffer.is_empty() {
             let line = std::mem::take(&mut self.buffer);
             let line = line.trim_end_matches('\r');
-            if let Some((field, value)) = line.split_once(':') {
-                let value = value.strip_prefix(' ').unwrap_or(value);
-                if field == "data" {
-                    if self.has_data {
-                        self.current.data.push('\n');
-                    }
-                    self.current.data.push_str(value);
-                    self.has_data = true;
-                }
-            }
+            Self::process_line(line, &mut self.current, &mut self.has_data);
         }
 
         if self.has_data {

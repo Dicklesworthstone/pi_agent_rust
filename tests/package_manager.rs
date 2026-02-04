@@ -109,8 +109,7 @@ fn installed_path_resolves_project_and_user_scopes_without_external_commands() {
     let manager = PackageManager::new(cwd.clone());
 
     harness.section("npm project");
-    let npm_project = manager
-        .installed_path("npm:react@18.2.0", PackageScope::Project)
+    let npm_project = run_async(manager.installed_path("npm:react@18.2.0", PackageScope::Project))
         .expect("npm installed_path");
     let npm_project = npm_project.expect("npm returns Some(path)");
     harness
@@ -129,8 +128,7 @@ fn installed_path_resolves_project_and_user_scopes_without_external_commands() {
     harness.section("git project + user");
     let git_source = "git:https://github.com/example-org/example-repo@main";
 
-    let git_project = manager
-        .installed_path(git_source, PackageScope::Project)
+    let git_project = run_async(manager.installed_path(git_source, PackageScope::Project))
         .expect("git project installed_path")
         .expect("git project returns Some(path)");
     harness
@@ -147,8 +145,7 @@ fn installed_path_resolves_project_and_user_scopes_without_external_commands() {
             .join("example-repo")
     );
 
-    let git_user = manager
-        .installed_path(git_source, PackageScope::User)
+    let git_user = run_async(manager.installed_path(git_source, PackageScope::User))
         .expect("git user installed_path")
         .expect("git user returns Some(path)");
     harness.log().info_ctx("installed_path", "git user", |ctx| {
@@ -163,8 +160,7 @@ fn installed_path_resolves_project_and_user_scopes_without_external_commands() {
     assert!(git_user.ends_with(&expected_suffix));
 
     harness.section("local");
-    let local_path = manager
-        .installed_path("./x/../y/thing", PackageScope::Project)
+    let local_path = run_async(manager.installed_path("./x/../y/thing", PackageScope::Project))
         .expect("local installed_path")
         .expect("local returns Some(path)");
     harness.log().info_ctx("installed_path", "local", |ctx| {

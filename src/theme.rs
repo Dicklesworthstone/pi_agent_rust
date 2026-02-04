@@ -85,7 +85,7 @@ impl Theme {
     /// Resolve the active theme for the given config/cwd.
     ///
     /// - If `config.theme` is unset/empty, defaults to [`Theme::dark`].
-    /// - If set to `dark` or `light`, uses built-in defaults.
+    /// - If set to `dark`, `light`, or `solarized`, uses built-in defaults.
     /// - Otherwise, attempts to load a theme JSON by name, falling back to dark on error.
     #[must_use]
     pub fn resolve(config: &Config, cwd: &Path) -> Self {
@@ -101,6 +101,9 @@ impl Theme {
         }
         if name.eq_ignore_ascii_case("light") {
             return Self::light();
+        }
+        if name.eq_ignore_ascii_case("solarized") {
+            return Self::solarized();
         }
 
         match Self::load_by_name(name, cwd) {
@@ -285,6 +288,36 @@ impl Theme {
                 border: "#c8c8c8".to_string(),
                 selection: "#cce7ff".to_string(),
                 cursor: "#000000".to_string(),
+            },
+        }
+    }
+
+    /// Default solarized dark theme.
+    #[must_use]
+    pub fn solarized() -> Self {
+        Self {
+            name: "solarized".to_string(),
+            version: "1.0".to_string(),
+            colors: ThemeColors {
+                foreground: "#839496".to_string(),
+                background: "#002b36".to_string(),
+                accent: "#268bd2".to_string(),
+                success: "#859900".to_string(),
+                warning: "#b58900".to_string(),
+                error: "#dc322f".to_string(),
+                muted: "#586e75".to_string(),
+            },
+            syntax: SyntaxColors {
+                keyword: "#268bd2".to_string(),
+                string: "#2aa198".to_string(),
+                number: "#d33682".to_string(),
+                comment: "#586e75".to_string(),
+                function: "#b58900".to_string(),
+            },
+            ui: UiColors {
+                border: "#073642".to_string(),
+                selection: "#073642".to_string(),
+                cursor: "#93a1a1".to_string(),
             },
         }
     }
@@ -485,5 +518,8 @@ mod tests {
     fn default_themes_validate() {
         Theme::dark().validate().expect("dark theme valid");
         Theme::light().validate().expect("light theme valid");
+        Theme::solarized()
+            .validate()
+            .expect("solarized theme valid");
     }
 }

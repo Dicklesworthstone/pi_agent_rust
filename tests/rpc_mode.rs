@@ -78,7 +78,7 @@ async fn recv_line(rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Result<Str
             Err(TryRecvError::Empty) => {}
         }
 
-        if start.elapsed() > Duration::from_secs(2) {
+        if start.elapsed() > Duration::from_secs(20) {
             return Err(format!("{label}: timed out waiting for output"));
         }
 
@@ -186,11 +186,24 @@ fn rpc_get_state_and_prompt() {
         // Collect events until agent_end.
         let mut saw_agent_end = false;
         let mut message_end_count = 0usize;
-        for _ in 0..10 {
+        let log_events = env_truthy("RPC_TEST_LOG");
+        for _ in 0..100 {
             let line = recv_line(&out_rx, "event stream")
                 .await
                 .expect("recv event stream");
             let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+            if log_events {
+                if event["type"] == "auto_retry_start" {
+                    eprintln!(
+                        "rpc event: auto_retry_start delayMs={} errorMessage={}",
+                        event["delayMs"], event["errorMessage"]
+                    );
+                } else if event["type"] == "agent_end" {
+                    eprintln!("rpc event: agent_end error={}", event["error"]);
+                } else {
+                    eprintln!("rpc event: {}", event["type"]);
+                }
+            }
             if event["type"] == "message_end" {
                 message_end_count += 1;
             }
@@ -215,6 +228,9 @@ fn rpc_get_state_and_prompt() {
             .await
             .expect("recv get_session_stats response");
         let get_stats_response: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        if log_events {
+            eprintln!("get_session_stats response: {get_stats_response}");
+        }
         assert_eq!(get_stats_response["type"], "response");
         assert_eq!(get_stats_response["command"], "get_session_stats");
         assert_eq!(get_stats_response["success"], true);

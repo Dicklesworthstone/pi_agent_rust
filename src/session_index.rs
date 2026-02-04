@@ -114,6 +114,16 @@ impl SessionIndex {
         })
     }
 
+    pub fn delete_session_path(&self, path: &Path) -> Result<()> {
+        let path = path.to_string_lossy().to_string();
+        self.with_lock(|conn| {
+            init_schema(conn)?;
+            conn.execute_sync("DELETE FROM sessions WHERE path=?1", &[Value::Text(path)])
+                .map_err(|e| Error::session(format!("Delete failed: {e}")))?;
+            Ok(())
+        })
+    }
+
     pub fn reindex_all(&self) -> Result<()> {
         let sessions_root = self.sessions_root();
         if !sessions_root.exists() {

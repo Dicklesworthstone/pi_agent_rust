@@ -1,0 +1,25 @@
+{
+  "name": "light",
+  "version": "1.0",
+  "colors": {
+    "foreground": "#2d2d2d",
+    "background": "#ffffff",
+    "accent": "#0066bf",
+    "success": "#2e8b57",
+    "warning": "#b36200",
+    "error": "#c62828",
+    "muted": "#7a7a7a"
+  },
+  "syntax": {
+    "keyword": "#0000ff",
+    "string": "#a31515",
+    "number": "#098658",
+    "comment": "#008000",
+    "function": "#795e26"
+  },
+  "ui": {
+    "border": "#c8c8c8",
+    "selection": "#cce7ff",
+    "cursor": "#000000"
+  }
+}

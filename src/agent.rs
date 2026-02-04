@@ -762,7 +762,16 @@ impl Agent {
                     content_index,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::TextStart {
@@ -776,7 +785,16 @@ impl Agent {
                     delta,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::TextDelta {
@@ -791,7 +809,16 @@ impl Agent {
                     content,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::TextEnd {
@@ -805,7 +832,16 @@ impl Agent {
                     content_index,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::ThinkingStart {
@@ -819,7 +855,16 @@ impl Agent {
                     delta,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::ThinkingDelta {
@@ -834,7 +879,16 @@ impl Agent {
                     content,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::ThinkingEnd {
@@ -848,7 +902,16 @@ impl Agent {
                     content_index,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::ToolCallStart {
@@ -862,7 +925,16 @@ impl Agent {
                     delta,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::ToolCallDelta {
@@ -877,7 +949,16 @@ impl Agent {
                     tool_call,
                     partial,
                 } => {
-                    self.update_partial_message(&mut partial_message, &partial, added_partial);
+                    let started_now = self.update_partial_message(
+                        &mut partial_message,
+                        &partial,
+                        &mut added_partial,
+                    );
+                    if started_now {
+                        on_event(AgentEvent::MessageStart {
+                            message: Message::Assistant(partial.clone()),
+                        });
+                    }
                     on_event(AgentEvent::MessageUpdate {
                         message: Message::Assistant(partial.clone()),
                         assistant_message_event: Box::new(AssistantMessageEvent::ToolCallEnd {
@@ -887,24 +968,10 @@ impl Agent {
                         }),
                     });
                 }
-                StreamEvent::Done { reason, message } => {
-                    on_event(AgentEvent::MessageUpdate {
-                        message: Message::Assistant(message.clone()),
-                        assistant_message_event: Box::new(AssistantMessageEvent::Done {
-                            reason,
-                            message: message.clone(),
-                        }),
-                    });
+                StreamEvent::Done { message, .. } => {
                     return Ok(self.finalize_assistant_message(message, on_event, added_partial));
                 }
-                StreamEvent::Error { reason, error } => {
-                    on_event(AgentEvent::MessageUpdate {
-                        message: Message::Assistant(error.clone()),
-                        assistant_message_event: Box::new(AssistantMessageEvent::Error {
-                            reason,
-                            error: error.clone(),
-                        }),
-                    });
+                StreamEvent::Error { error, .. } => {
                     return Ok(self.finalize_assistant_message(error, on_event, added_partial));
                 }
             }
@@ -917,16 +984,19 @@ impl Agent {
         &mut self,
         partial_message: &mut Option<AssistantMessage>,
         partial: &AssistantMessage,
-        added_partial: bool,
-    ) {
+        added_partial: &mut bool,
+    ) -> bool {
         *partial_message = Some(partial.clone());
-        if added_partial {
+        if *added_partial {
             if let Some(last) = self.messages.last_mut() {
                 *last = Message::Assistant(partial.clone());
+                return false;
             }
-        } else {
-            self.messages.push(Message::Assistant(partial.clone()));
         }
+        self.messages.push(Message::Assistant(partial.clone()));
+        let was_added = !*added_partial;
+        *added_partial = true;
+        was_added
     }
 
     fn finalize_assistant_message(
@@ -973,7 +1043,31 @@ impl Agent {
                 args: tool_call.arguments.clone(),
             });
 
-            let (output, is_error) = self.execute_tool(tool_call, on_event).await;
+            let tool_execution = self.execute_tool(tool_call, on_event);
+
+            let (output, is_error) = if let Some(signal) = abort.as_ref() {
+                use futures::future::{Either, select};
+
+                let tool_fut = tool_execution.fuse();
+                let abort_fut = signal.wait().fuse();
+                futures::pin_mut!(tool_fut, abort_fut);
+
+                match select(tool_fut, abort_fut).await {
+                    Either::Left((result, _)) => result,
+                    Either::Right(_) => {
+                        // Aborted
+                        let output = ToolOutput {
+                            content: vec![ContentBlock::Text(TextContent::new(
+                                "Tool execution aborted",
+                            ))],
+                            details: None,
+                        };
+                        (output, true)
+                    }
+                }
+            } else {
+                tool_execution.await
+            };
 
             // Emit a final update so UIs can render tool output even if the tool
             // doesn't stream incremental updates.
@@ -1011,6 +1105,10 @@ impl Agent {
             });
 
             results.push(tool_result);
+
+            if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
+                break;
+            }
 
             // Delivery boundary: after tool completion (steering interrupts).
             let steering = self.drain_steering_messages().await;

@@ -1993,6 +1993,12 @@ mod tests {
     // ============================================================================
 
     #[test]
+    fn test_user_config_path_matches_global_dir() {
+        let expected = crate::config::Config::global_dir().join("keybindings.json");
+        assert_eq!(KeyBindings::user_config_path(), expected);
+    }
+
+    #[test]
     fn test_load_from_nonexistent_path_returns_defaults() {
         let path = std::path::Path::new("/nonexistent/keybindings.json");
         let result = KeyBindings::load_from_path_with_diagnostics(path);

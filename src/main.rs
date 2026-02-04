@@ -9,7 +9,6 @@
 // Allow dead code and unused async during scaffolding phase - remove once implementation is complete
 #![allow(dead_code, clippy::unused_async)]
 
-use std::collections::HashSet;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -17,18 +16,15 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
-use chrono::{Datelike, Local};
 use clap::Parser;
-use glob::Pattern;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::auth::AuthStorage;
 use pi::cli;
 use pi::config::Config;
-use pi::model;
-use pi::model::{AssistantMessage, ContentBlock, StopReason};
+use pi::model::{AssistantMessage, StopReason};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{PackageEntry, PackageManager, PackageScope};
-use pi::provider::{InputType, StreamOptions, ThinkingBudgets};
+use pi::provider::InputType;
 use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
@@ -95,9 +91,10 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
             ResourceLoader::empty(config.enable_skill_commands())
         }
     };
-    let mut auth = AuthStorage::load(Config::auth_path())?;
+    let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
     let global_dir = Config::global_dir();
+    let package_dir = Config::package_dir();
     let models_path = default_models_path(&global_dir);
     let model_registry = ModelRegistry::load(&auth, Some(models_path));
     if let Some(error) = model_registry.error() {
@@ -129,7 +126,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
 
     let mut messages: Vec<String> = cli.message_args().iter().map(ToString::to_string).collect();
     let file_args: Vec<String> = cli.file_args().iter().map(ToString::to_string).collect();
-    let initial = prepare_initial_message(
+    let initial = pi::app::prepare_initial_message(
         &cwd,
         &file_args,
         &mut messages,
@@ -145,7 +142,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     let enabled_tools = cli.enabled_tools();
 
     let scoped_patterns = if let Some(models_arg) = &cli.models {
-        parse_models_arg(models_arg)
+        pi::app::parse_models_arg(models_arg)
     } else {
         config.enabled_models.clone().unwrap_or_default()
     };
@@ -163,7 +160,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         bail!("--api-key requires a model to be specified via --provider/--model or --models");
     }
 
-    let mut session = Session::new(&cli, &config).await?;
+    let mut session = Box::pin(Session::new(&cli, &config)).await?;
 
     let selection = pi::app::select_model_and_thinking(
         &cli,
@@ -174,7 +171,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         &global_dir,
     )?;
 
-    update_session_for_selection(&mut session, &selection);
+    pi::app::update_session_for_selection(&mut session, &selection);
 
     if let Some(message) = &selection.fallback_message {
         eprintln!("Warning: {message}");
@@ -187,7 +184,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     } else {
         String::new()
     };
-    let system_prompt = build_system_prompt(
+    let system_prompt = pi::app::build_system_prompt(
         &cli,
         &cwd,
         &enabled_tools,
@@ -196,10 +193,12 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         } else {
             Some(skills_prompt.as_str())
         },
+        &global_dir,
+        &package_dir,
     );
     let provider =
         providers::create_provider(&selection.model_entry).map_err(anyhow::Error::new)?;
-    let stream_options = build_stream_options(&config, resolved_key, &selection, &session);
+    let stream_options = pi::app::build_stream_options(&config, resolved_key, &selection, &session);
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
         max_tool_iterations: 50,
@@ -272,16 +271,16 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
     let manager = PackageManager::new(cwd.to_path_buf());
     match command {
         cli::Commands::Install { source, local } => {
-            handle_package_install(&manager, &source, local)?;
+            handle_package_install(&manager, &source, local).await?;
         }
         cli::Commands::Remove { source, local } => {
-            handle_package_remove(&manager, &source, local)?;
+            handle_package_remove(&manager, &source, local).await?;
         }
         cli::Commands::Update { source } => {
-            handle_package_update(&manager, source)?;
+            handle_package_update(&manager, source).await?;
         }
         cli::Commands::List => {
-            handle_package_list(&manager)?;
+            handle_package_list(&manager).await?;
         }
         cli::Commands::Config => {
             handle_config(cwd)?;
@@ -312,24 +311,24 @@ const fn scope_from_flag(local: bool) -> PackageScope {
     }
 }
 
-fn handle_package_install(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
+async fn handle_package_install(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
     let scope = scope_from_flag(local);
-    manager.install(source, scope)?;
-    manager.add_package_source(source, scope)?;
+    manager.install(source, scope).await?;
+    manager.add_package_source(source, scope).await?;
     println!("Installed {source}");
     Ok(())
 }
 
-fn handle_package_remove(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
+async fn handle_package_remove(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
     let scope = scope_from_flag(local);
-    manager.remove(source, scope)?;
-    manager.remove_package_source(source, scope)?;
+    manager.remove(source, scope).await?;
+    manager.remove_package_source(source, scope).await?;
     println!("Removed {source}");
     Ok(())
 }
 
-fn handle_package_update(manager: &PackageManager, source: Option<String>) -> Result<()> {
-    let entries = manager.list_packages()?;
+async fn handle_package_update(manager: &PackageManager, source: Option<String>) -> Result<()> {
+    let entries = manager.list_packages().await?;
 
     if let Some(source) = source {
         let identity = manager.package_identity(&source);
@@ -337,21 +336,21 @@ fn handle_package_update(manager: &PackageManager, source: Option<String>) -> Re
             if manager.package_identity(&entry.source) != identity {
                 continue;
             }
-            manager.update_source(&entry.source, entry.scope)?;
+            manager.update_source(&entry.source, entry.scope).await?;
         }
         println!("Updated {source}");
         return Ok(());
     }
 
     for entry in entries {
-        manager.update_source(&entry.source, entry.scope)?;
+        manager.update_source(&entry.source, entry.scope).await?;
     }
     println!("Updated packages");
     Ok(())
 }
 
-fn handle_package_list(manager: &PackageManager) -> Result<()> {
-    let entries = manager.list_packages()?;
+async fn handle_package_list(manager: &PackageManager) -> Result<()> {
+    let entries = manager.list_packages().await?;
 
     let mut user = Vec::new();
     let mut project = Vec::new();
@@ -370,7 +369,7 @@ fn handle_package_list(manager: &PackageManager) -> Result<()> {
     if !user.is_empty() {
         println!("User packages:");
         for entry in &user {
-            print_package_entry(manager, entry)?;
+            print_package_entry(manager, entry).await?;
         }
     }
 
@@ -380,21 +379,21 @@ fn handle_package_list(manager: &PackageManager) -> Result<()> {
         }
         println!("Project packages:");
         for entry in &project {
-            print_package_entry(manager, entry)?;
+            print_package_entry(manager, entry).await?;
         }
     }
 
     Ok(())
 }
 
-fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
+async fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
     let display = if entry.filter.is_some() {
         format!("{} (filtered)", entry.source)
     } else {
         entry.source.clone()
     };
     println!("  {display}");
-    if let Some(path) = manager.installed_path(&entry.source, entry.scope)? {
+    if let Some(path) = manager.installed_path(&entry.source, entry.scope).await? {
         println!("    {}", path.display());
     }
     Ok(())
@@ -557,7 +556,7 @@ async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<P
     }
 
     let session = Session::open(input_path).await?;
-    let html = render_session_html(&session);
+    let html = pi::app::render_session_html(&session);
     let output_path = output_path.map_or_else(|| default_export_path(input), PathBuf::from);
 
     if let Some(parent) = output_path.parent() {
@@ -639,7 +638,7 @@ async fn run_print_mode(
         .collect::<Vec<_>>();
 
     if let Some(initial) = initial {
-        let content = build_initial_content(&initial);
+        let content = pi::app::build_initial_content(&initial);
         last_message = Some(
             session
                 .run_with_content_with_abort(content, Some(abort_signal.clone()), event_handler)
@@ -670,7 +669,7 @@ async fn run_print_mode(
     }
 
     if mode == "text" {
-        output_final_text(&last_message);
+        pi::app::output_final_text(&last_message);
     }
 
     io::stdout().flush()?;
@@ -695,7 +694,7 @@ async fn run_interactive_mode(
     let mut pending = Vec::new();
     if let Some(initial) = initial {
         pending.push(pi::interactive::PendingInput::Content(
-            build_initial_content(&initial),
+            pi::app::build_initial_content(&initial),
         ));
     }
     for message in messages {
@@ -722,27 +721,6 @@ async fn run_interactive_mode(
 }
 
 type InitialMessage = pi::app::InitialMessage;
-type ScopedModel = pi::app::ScopedModel;
-
-#[derive(Debug, Clone)]
-struct ParsedModelResult {
-    model: Option<ModelEntry>,
-    thinking_level: Option<model::ThinkingLevel>,
-    warning: Option<String>,
-}
-
-type ModelSelection = pi::app::ModelSelection;
-
-#[derive(Debug, Clone)]
-struct ContextFile {
-    path: String,
-    content: String,
-}
-
-struct RestoreResult {
-    model: Option<ModelEntry>,
-    fallback_message: Option<String>,
-}
 
 fn read_piped_stdin() -> Result<Option<String>> {
     if io::stdin().is_terminal() {
@@ -756,203 +734,6 @@ fn read_piped_stdin() -> Result<Option<String>> {
     } else {
         Ok(Some(data))
     }
-}
-
-fn prepare_initial_message(
-    cwd: &Path,
-    file_args: &[String],
-    messages: &mut Vec<String>,
-    auto_resize_images: bool,
-) -> Result<Option<InitialMessage>> {
-    pi::app::prepare_initial_message(cwd, file_args, messages, auto_resize_images)
-}
-
-fn build_initial_content(initial: &InitialMessage) -> Vec<ContentBlock> {
-    pi::app::build_initial_content(initial)
-}
-
-fn build_system_prompt(
-    cli: &cli::Cli,
-    cwd: &Path,
-    enabled_tools: &[&str],
-    skills_prompt: Option<&str>,
-) -> String {
-    let global_dir = Config::global_dir();
-    let package_dir = Config::package_dir();
-    pi::app::build_system_prompt(
-        cli,
-        cwd,
-        enabled_tools,
-        skills_prompt,
-        &global_dir,
-        &package_dir,
-    )
-}
-
-fn resolve_prompt_input(input: Option<&str>, description: &str) -> Option<String> {
-    let value = input?;
-
-    let path = Path::new(value);
-    if path.exists() {
-        match std::fs::read_to_string(path) {
-            Ok(content) => Some(content),
-            Err(err) => {
-                eprintln!("Warning: Could not read {description} file {value}: {err}");
-                Some(value.to_string())
-            }
-        }
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn default_system_prompt(enabled_tools: &[&str]) -> String {
-    let tool_descriptions = [
-        ("read", "Read file contents"),
-        ("bash", "Execute bash commands (ls, grep, find, etc.)"),
-        (
-            "edit",
-            "Make surgical edits to files (find exact text and replace)",
-        ),
-        ("write", "Create or overwrite files"),
-        (
-            "grep",
-            "Search file contents for patterns (respects .gitignore)",
-        ),
-        ("find", "Find files by glob pattern (respects .gitignore)"),
-        ("ls", "List directory contents"),
-    ];
-
-    let mut tools = Vec::new();
-    for tool in enabled_tools {
-        if let Some((_, description)) = tool_descriptions.iter().find(|(name, _)| name == tool) {
-            tools.push(format!("- {tool}: {description}"));
-        }
-    }
-
-    let tools_list = if tools.is_empty() {
-        "(none)".to_string()
-    } else {
-        tools.join("\n")
-    };
-
-    let has_tool = |name: &str| enabled_tools.contains(&name);
-    let has_bash = has_tool("bash");
-    let has_edit = has_tool("edit");
-    let has_write = has_tool("write");
-    let has_grep = has_tool("grep");
-    let has_find = has_tool("find");
-    let has_ls = has_tool("ls");
-    let has_read = has_tool("read");
-
-    let mut guidelines_list = Vec::new();
-    if has_bash && !has_grep && !has_find && !has_ls {
-        guidelines_list.push("Use bash for file operations like ls, rg, find");
-    } else if has_bash && (has_grep || has_find || has_ls) {
-        guidelines_list.push(
-            "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)",
-        );
-    }
-
-    if has_read && has_edit {
-        guidelines_list.push(
-            "Use read to examine files before editing. You must use this tool instead of cat or sed.",
-        );
-    }
-    if has_edit {
-        guidelines_list.push("Use edit for precise changes (old text must match exactly)");
-    }
-    if has_write {
-        guidelines_list.push("Use write only for new files or complete rewrites");
-    }
-    if has_edit || has_write {
-        guidelines_list.push(
-            "When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did",
-        );
-    }
-
-    guidelines_list.push("Be concise in your responses");
-    guidelines_list.push("Show file paths clearly when working with files");
-
-    let guidelines = guidelines_list
-        .iter()
-        .map(|g| format!("- {g}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let readme_path = Config::package_dir()
-        .join("README.md")
-        .display()
-        .to_string();
-    let docs_path = Config::package_dir().join("docs").display().to_string();
-    let examples_path = Config::package_dir().join("examples").display().to_string();
-
-    format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
-    )
-}
-
-fn load_project_context_files(cwd: &Path) -> Vec<ContextFile> {
-    let mut context_files = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Some(global) = load_context_file_from_dir(&Config::global_dir()) {
-        seen.insert(global.path.clone());
-        context_files.push(global);
-    }
-
-    let mut ancestor_files = Vec::new();
-    let mut current = cwd.to_path_buf();
-
-    loop {
-        if let Some(context) = load_context_file_from_dir(&current) {
-            if seen.insert(context.path.clone()) {
-                ancestor_files.push(context);
-            }
-        }
-
-        if !current.pop() {
-            break;
-        }
-    }
-
-    ancestor_files.reverse();
-    context_files.extend(ancestor_files);
-    context_files
-}
-
-fn load_context_file_from_dir(dir: &Path) -> Option<ContextFile> {
-    let candidates = ["AGENTS.md", "CLAUDE.md"];
-    for filename in candidates {
-        let path = dir.join(filename);
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(content) => {
-                    return Some(ContextFile {
-                        path: path.display().to_string(),
-                        content,
-                    });
-                }
-                Err(err) => {
-                    eprintln!("Warning: Could not read {}: {err}", path.display());
-                }
-            }
-        }
-    }
-    None
-}
-
-fn format_current_datetime() -> String {
-    let now = Local::now();
-    let date = format!(
-        "{}, {} {}, {}",
-        now.format("%A"),
-        now.format("%B"),
-        now.day(),
-        now.year()
-    );
-    let time = format!("{} {}", now.format("%I:%M:%S %p"), now.format("%Z"));
-    format!("{date}, {time}")
 }
 
 fn format_token_count(count: u32) -> String {
@@ -988,569 +769,10 @@ fn fuzzy_match(pattern: &str, value: &str) -> bool {
     true
 }
 
-fn parse_models_arg(models: &str) -> Vec<String> {
-    pi::app::parse_models_arg(models)
-}
-
-fn resolve_model_scope(
-    patterns: &[String],
-    registry: &ModelRegistry,
-    allow_missing_keys: bool,
-) -> Vec<ScopedModel> {
-    let available_models = if allow_missing_keys {
-        registry.models().to_vec()
-    } else {
-        registry.get_available()
-    };
-
-    let mut scoped_models: Vec<ScopedModel> = Vec::new();
-
-    for pattern in patterns {
-        if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
-            let mut glob_pattern = pattern.as_str();
-            let mut thinking_level = None;
-            if let Some((prefix, suffix)) = pattern.rsplit_once(':') {
-                if let Some(parsed) = parse_thinking_level_opt(suffix) {
-                    thinking_level = Some(parsed);
-                    glob_pattern = prefix;
-                }
-            }
-
-            let glob = match Pattern::new(&glob_pattern.to_lowercase()) {
-                Ok(glob) => glob,
-                Err(err) => {
-                    eprintln!("Warning: Invalid model pattern \"{pattern}\": {err}");
-                    continue;
-                }
-            };
-
-            let mut matched_any = false;
-            for model in &available_models {
-                let full_id = format!("{}/{}", model.model.provider, model.model.id);
-                let candidate_full = full_id.to_lowercase();
-                let candidate_id = model.model.id.to_lowercase();
-                if glob.matches(&candidate_full) || glob.matches(&candidate_id) {
-                    matched_any = true;
-                    if !scoped_models
-                        .iter()
-                        .any(|sm| models_equal(&sm.model, model))
-                    {
-                        scoped_models.push(ScopedModel {
-                            model: model.clone(),
-                            thinking_level,
-                        });
-                    }
-                }
-            }
-
-            if !matched_any {
-                eprintln!("Warning: No models match pattern \"{pattern}\"");
-            }
-            continue;
-        }
-
-        let parsed = parse_model_pattern(pattern, &available_models);
-        if let Some(warning) = parsed.warning {
-            eprintln!("Warning: {warning}");
-        }
-
-        if let Some(model) = parsed.model {
-            if !scoped_models
-                .iter()
-                .any(|sm| models_equal(&sm.model, &model))
-            {
-                scoped_models.push(ScopedModel {
-                    model,
-                    thinking_level: parsed.thinking_level,
-                });
-            }
-        } else {
-            eprintln!("Warning: No models match pattern \"{pattern}\"");
-        }
-    }
-
-    scoped_models
-}
-
-fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> ParsedModelResult {
-    if let Some(model) = try_match_model(pattern, available_models) {
-        return ParsedModelResult {
-            model: Some(model),
-            thinking_level: None,
-            warning: None,
-        };
-    }
-
-    let Some((prefix, suffix)) = pattern.rsplit_once(':') else {
-        return ParsedModelResult {
-            model: None,
-            thinking_level: None,
-            warning: None,
-        };
-    };
-
-    if let Some(thinking_level) = parse_thinking_level_opt(suffix) {
-        let result = parse_model_pattern(prefix, available_models);
-        if result.model.is_some() {
-            return ParsedModelResult {
-                model: result.model,
-                thinking_level: if result.warning.is_some() {
-                    None
-                } else {
-                    Some(thinking_level)
-                },
-                warning: result.warning,
-            };
-        }
-        return result;
-    }
-
-    let result = parse_model_pattern(prefix, available_models);
-    if result.model.is_some() {
-        return ParsedModelResult {
-            model: result.model,
-            thinking_level: None,
-            warning: Some(format!(
-                "Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead."
-            )),
-        };
-    }
-
-    result
-}
-
-fn try_match_model(pattern: &str, available_models: &[ModelEntry]) -> Option<ModelEntry> {
-    if let Some((provider, model_id)) = pattern.split_once('/') {
-        if let Some(found) = available_models.iter().find(|m| {
-            m.model.provider.eq_ignore_ascii_case(provider)
-                && m.model.id.eq_ignore_ascii_case(model_id)
-        }) {
-            return Some(found.clone());
-        }
-    }
-
-    if let Some(found) = available_models
-        .iter()
-        .find(|m| m.model.id.eq_ignore_ascii_case(pattern))
-    {
-        return Some(found.clone());
-    }
-
-    let pattern_lower = pattern.to_lowercase();
-    let matches: Vec<ModelEntry> = available_models
-        .iter()
-        .filter(|m| {
-            m.model.id.to_lowercase().contains(&pattern_lower)
-                || m.model.name.to_lowercase().contains(&pattern_lower)
-        })
-        .cloned()
-        .collect();
-
-    if matches.is_empty() {
-        return None;
-    }
-
-    let mut aliases: Vec<ModelEntry> = matches
-        .iter()
-        .filter(|m| is_alias(&m.model.id))
-        .cloned()
-        .collect();
-    let mut dated: Vec<ModelEntry> = matches
-        .iter()
-        .filter(|m| !is_alias(&m.model.id))
-        .cloned()
-        .collect();
-
-    if !aliases.is_empty() {
-        aliases.sort_by(|a, b| b.model.id.cmp(&a.model.id));
-        return aliases.first().cloned();
-    }
-
-    dated.sort_by(|a, b| b.model.id.cmp(&a.model.id));
-    dated.first().cloned()
-}
-
-fn is_alias(model_id: &str) -> bool {
-    if model_id.ends_with("-latest") {
-        return true;
-    }
-    if model_id.len() < 9 {
-        return true;
-    }
-    let suffix = &model_id[model_id.len() - 9..];
-    if !suffix.starts_with('-') {
-        return true;
-    }
-    !suffix[1..].chars().all(|c| c.is_ascii_digit())
-}
-
-fn parse_thinking_level(value: &str) -> Result<model::ThinkingLevel> {
-    value
-        .parse()
-        .map_err(|err| anyhow::anyhow!("Invalid thinking level \"{value}\": {err}"))
-}
-
-fn parse_thinking_level_opt(value: &str) -> Option<model::ThinkingLevel> {
-    value.parse().ok()
-}
-
-#[allow(clippy::too_many_lines)]
-fn select_model_and_thinking(
-    cli: &cli::Cli,
-    config: &Config,
-    session: &Session,
-    registry: &ModelRegistry,
-    scoped_models: &[ScopedModel],
-) -> Result<ModelSelection> {
-    let is_continuing = cli.r#continue || cli.resume || cli.session.is_some();
-    let mut selected_model: Option<ModelEntry> = None;
-    let mut scoped_thinking: Option<model::ThinkingLevel> = None;
-    let mut fallback_message = None;
-
-    if let (Some(provider), Some(model_id)) = (cli.provider.as_deref(), cli.model.as_deref()) {
-        let found = registry.find(provider, model_id);
-        if found.is_none() {
-            bail!("Model {provider}/{model_id} not found");
-        }
-        selected_model = found;
-    } else if let Some(provider) = cli.provider.as_deref() {
-        let mut candidates: Vec<ModelEntry> = registry
-            .models()
-            .iter()
-            .filter(|m| m.model.provider == provider)
-            .cloned()
-            .collect();
-        if candidates.is_empty() {
-            bail!("No models available for provider {provider}");
-        }
-        if let Some(found) = candidates.iter().find(|m| m.api_key.is_some()) {
-            selected_model = Some(found.clone());
-        } else {
-            selected_model = Some(candidates.remove(0));
-        }
-    } else if let Some(model_id) = cli.model.as_deref() {
-        let matches: Vec<ModelEntry> = registry
-            .models()
-            .iter()
-            .filter(|m| m.model.id == model_id)
-            .cloned()
-            .collect();
-        if matches.is_empty() {
-            bail!("Model {model_id} not found");
-        }
-        if let Some(default_provider) = config.default_provider.as_deref() {
-            if let Some(found) = matches
-                .iter()
-                .find(|m| m.model.provider == default_provider)
-            {
-                selected_model = Some(found.clone());
-            }
-        }
-        if selected_model.is_none() {
-            if let Some(found) = matches.iter().find(|m| m.api_key.is_some()) {
-                selected_model = Some(found.clone());
-            }
-        }
-        if selected_model.is_none() {
-            selected_model = Some(matches[0].clone());
-        }
-    } else if !scoped_models.is_empty() && !is_continuing {
-        if let (Some(default_provider), Some(default_model)) = (
-            config.default_provider.as_deref(),
-            config.default_model.as_deref(),
-        ) {
-            if let Some(found) = scoped_models.iter().find(|sm| {
-                sm.model.model.provider == default_provider && sm.model.model.id == default_model
-            }) {
-                selected_model = Some(found.model.clone());
-                if cli.thinking.is_none() {
-                    scoped_thinking = found.thinking_level;
-                }
-            }
-        }
-        if selected_model.is_none() {
-            let first = &scoped_models[0];
-            selected_model = Some(first.model.clone());
-            if cli.thinking.is_none() {
-                scoped_thinking = first.thinking_level;
-            }
-        }
-    }
-
-    if selected_model.is_none() {
-        if let Some((provider, model_id)) = last_model_from_session(session) {
-            let restore = restore_model_from_session(&provider, &model_id, None, registry);
-            selected_model = restore.model;
-            fallback_message = restore.fallback_message;
-        }
-    }
-
-    if selected_model.is_none() {
-        if let (Some(default_provider), Some(default_model)) = (
-            config.default_provider.as_deref(),
-            config.default_model.as_deref(),
-        ) {
-            if let Some(found) = registry.find(default_provider, default_model) {
-                selected_model = Some(found);
-            }
-        }
-    }
-
-    if selected_model.is_none() {
-        let available = registry.get_available();
-        if !available.is_empty() {
-            selected_model = Some(default_model_from_available(&available));
-        }
-    }
-
-    let Some(model_entry) = selected_model else {
-        let models_path = default_models_path(&Config::global_dir());
-        bail!(
-            "No models available. Set API keys in environment variables or create {}",
-            models_path.display()
-        );
-    };
-
-    let mut thinking_level: Option<model::ThinkingLevel> = None;
-
-    if let Some(cli_thinking) = cli.thinking.as_deref() {
-        thinking_level = Some(parse_thinking_level(cli_thinking)?);
-    } else if scoped_thinking.is_some() {
-        thinking_level = scoped_thinking;
-    } else if is_continuing {
-        if let Some(saved) = last_thinking_level(session) {
-            thinking_level = Some(saved);
-        }
-    }
-
-    if thinking_level.is_none() {
-        thinking_level = config
-            .default_thinking_level
-            .as_deref()
-            .and_then(parse_thinking_level_opt);
-    }
-
-    let thinking_level = clamp_thinking_level(
-        thinking_level.unwrap_or(model::ThinkingLevel::Medium),
-        &model_entry,
-    );
-
-    Ok(ModelSelection {
-        model_entry,
-        thinking_level,
-        scoped_models: scoped_models.to_vec(),
-        fallback_message,
-    })
-}
-
-fn last_model_from_session(session: &Session) -> Option<(String, String)> {
-    for entry in session.entries.iter().rev() {
-        if let pi::session::SessionEntry::ModelChange(change) = entry {
-            return Some((change.provider.clone(), change.model_id.clone()));
-        }
-    }
-    None
-}
-
-fn last_thinking_level(session: &Session) -> Option<model::ThinkingLevel> {
-    for entry in session.entries.iter().rev() {
-        if let pi::session::SessionEntry::ThinkingLevelChange(change) = entry {
-            if let Some(level) = parse_thinking_level_opt(&change.thinking_level) {
-                return Some(level);
-            }
-        }
-    }
-    None
-}
-
-fn restore_model_from_session(
-    saved_provider: &str,
-    saved_model_id: &str,
-    current_model: Option<ModelEntry>,
-    registry: &ModelRegistry,
-) -> RestoreResult {
-    let restored = registry.find(saved_provider, saved_model_id);
-    let has_key = restored.as_ref().and_then(|m| m.api_key.clone()).is_some();
-
-    if restored.is_some() && has_key {
-        return RestoreResult {
-            model: restored,
-            fallback_message: None,
-        };
-    }
-
-    let reason = if restored.is_none() {
-        "model no longer exists"
-    } else {
-        "no API key available"
-    };
-
-    if let Some(current) = current_model {
-        return RestoreResult {
-            model: Some(current.clone()),
-            fallback_message: Some(format!(
-                "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
-                current.model.provider, current.model.id
-            )),
-        };
-    }
-
-    let available = registry.get_available();
-    if !available.is_empty() {
-        let fallback = default_model_from_available(&available);
-        return RestoreResult {
-            model: Some(fallback.clone()),
-            fallback_message: Some(format!(
-                "Could not restore model {saved_provider}/{saved_model_id} ({reason}). Using {}/{}.",
-                fallback.model.provider, fallback.model.id
-            )),
-        };
-    }
-
-    RestoreResult {
-        model: None,
-        fallback_message: None,
-    }
-}
-
-fn default_model_from_available(available: &[ModelEntry]) -> ModelEntry {
-    let defaults = [
-        ("anthropic", "claude-opus-4-5"),
-        ("openai", "gpt-5.1-codex"),
-        ("google", "gemini-2.5-pro"),
-    ];
-
-    for (provider, model_id) in defaults {
-        if let Some(found) = available
-            .iter()
-            .find(|m| m.model.provider == provider && m.model.id == model_id)
-        {
-            return found.clone();
-        }
-    }
-
-    available[0].clone()
-}
-
-fn models_equal(a: &ModelEntry, b: &ModelEntry) -> bool {
-    a.model.provider == b.model.provider && a.model.id == b.model.id
-}
-
-fn update_session_for_selection(session: &mut Session, selection: &ModelSelection) {
-    session.set_model_header(
-        Some(selection.model_entry.model.provider.clone()),
-        Some(selection.model_entry.model.id.clone()),
-        Some(thinking_level_to_str(selection.thinking_level).to_string()),
-    );
-
-    let model_changed = match last_model_from_session(session) {
-        Some((provider, model_id)) => {
-            provider != selection.model_entry.model.provider
-                || model_id != selection.model_entry.model.id
-        }
-        None => true,
-    };
-
-    if model_changed {
-        session.append_model_change(
-            selection.model_entry.model.provider.clone(),
-            selection.model_entry.model.id.clone(),
-        );
-    }
-
-    let thinking = thinking_level_to_str(selection.thinking_level).to_string();
-    let thinking_changed = last_thinking_level(session)
-        .is_none_or(|level| thinking_level_to_str(level) != thinking.as_str());
-
-    if thinking_changed {
-        session.append_thinking_level_change(thinking);
-    }
-}
-
-fn resolve_api_key(auth: &AuthStorage, cli: &cli::Cli, entry: &ModelEntry) -> Result<String> {
-    auth.resolve_api_key(&entry.model.provider, cli.api_key.as_deref())
-        .or_else(|| entry.api_key.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "No API key found for provider {}. Set env var or use --api-key.",
-                entry.model.provider
-            )
-        })
-}
-
-fn build_stream_options(
-    config: &Config,
-    api_key: String,
-    selection: &ModelSelection,
-    session: &Session,
-) -> StreamOptions {
-    let mut options = StreamOptions {
-        api_key: Some(api_key),
-        headers: selection.model_entry.headers.clone(),
-        session_id: Some(session.header.id.clone()),
-        ..Default::default()
-    };
-
-    options.thinking_level = Some(selection.thinking_level);
-
-    if let Some(budgets) = &config.thinking_budgets {
-        let defaults = ThinkingBudgets::default();
-        options.thinking_budgets = Some(ThinkingBudgets {
-            minimal: budgets.minimal.unwrap_or(defaults.minimal),
-            low: budgets.low.unwrap_or(defaults.low),
-            medium: budgets.medium.unwrap_or(defaults.medium),
-            high: budgets.high.unwrap_or(defaults.high),
-            xhigh: budgets.xhigh.unwrap_or(defaults.xhigh),
-        });
-    }
-
-    options
-}
-
-fn supports_xhigh(model_id: &str) -> bool {
-    matches!(model_id, "gpt-5.1-codex-max" | "gpt-5.2" | "gpt-5.2-codex")
-}
-
-fn clamp_thinking_level(
-    thinking: model::ThinkingLevel,
-    model_entry: &ModelEntry,
-) -> model::ThinkingLevel {
-    if !model_entry.model.reasoning {
-        return model::ThinkingLevel::Off;
-    }
-    if thinking == model::ThinkingLevel::XHigh && !supports_xhigh(&model_entry.model.id) {
-        return model::ThinkingLevel::High;
-    }
-    thinking
-}
-
-const fn thinking_level_to_str(level: model::ThinkingLevel) -> &'static str {
-    match level {
-        model::ThinkingLevel::Off => "off",
-        model::ThinkingLevel::Minimal => "minimal",
-        model::ThinkingLevel::Low => "low",
-        model::ThinkingLevel::Medium => "medium",
-        model::ThinkingLevel::High => "high",
-        model::ThinkingLevel::XHigh => "xhigh",
-    }
-}
-
-fn output_final_text(message: &AssistantMessage) {
-    for block in &message.content {
-        if let ContentBlock::Text(text) = block {
-            println!("{}", text.text);
-        }
-    }
-}
-
 fn default_export_path(input: &Path) -> PathBuf {
     let basename = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("session");
     PathBuf::from(format!("pi-session-{basename}.html"))
-}
-
-fn render_session_html(session: &Session) -> String {
-    session.to_html()
 }

@@ -36,6 +36,9 @@ pub struct Config {
     pub double_escape_action: Option<String>,
     pub editor_padding_x: Option<u32>,
     pub autocomplete_max_visible: Option<u32>,
+    /// Non-interactive session picker selection (1-based index).
+    #[serde(alias = "sessionPickerInput")]
+    pub session_picker_input: Option<u32>,
 
     // Compaction
     pub compaction: Option<CompactionSettings>,
@@ -49,6 +52,9 @@ pub struct Config {
     // Shell
     pub shell_path: Option<String>,
     pub shell_command_prefix: Option<String>,
+    /// Override path to GitHub CLI (`gh`) for features like `/share`.
+    #[serde(alias = "ghPath")]
+    pub gh_path: Option<String>,
 
     // Images
     pub images: Option<ImageSettings>,
@@ -200,17 +206,26 @@ impl Config {
         }
 
         let content = std::fs::read_to_string(path)?;
-        let config: Self = serde_json::from_str(&content).unwrap_or_default();
+        let config: Self = serde_json::from_str(&content).map_err(|e| {
+            Error::config(format!(
+                "Failed to parse settings file {}: {e}",
+                path.display()
+            ))
+        })?;
         Ok(config)
     }
 
-    fn load_with_roots(
+    pub fn load_with_roots(
         config_path: Option<&std::path::Path>,
         global_dir: &std::path::Path,
         cwd: &std::path::Path,
     ) -> Result<Self> {
         if let Some(path) = config_path {
-            let config = Self::load_from_path(path)?;
+            let config = match Self::load_from_path(path) {
+                Ok(config) => config,
+                Err(Error::Config(_)) => Self::default(),
+                Err(err) => return Err(err),
+            };
             config.emit_queue_mode_diagnostics();
             return Ok(config);
         }
@@ -270,6 +285,7 @@ impl Config {
             autocomplete_max_visible: other
                 .autocomplete_max_visible
                 .or(base.autocomplete_max_visible),
+            session_picker_input: other.session_picker_input.or(base.session_picker_input),
 
             // Compaction
             compaction: merge_compaction(base.compaction, other.compaction),
@@ -283,6 +299,7 @@ impl Config {
             // Shell
             shell_path: other.shell_path.or(base.shell_path),
             shell_command_prefix: other.shell_command_prefix.or(base.shell_command_prefix),
+            gh_path: other.gh_path.or(base.gh_path),
 
             // Images
             images: merge_images(base.images, other.images),
@@ -747,6 +764,34 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn patch_settings_applies_theme_and_queue_modes() {
+        let temp = TempDir::new().expect("create tempdir");
+        let cwd = temp.path().join("cwd");
+        let global_dir = temp.path().join("global");
+
+        Config::patch_settings_with_roots(
+            SettingsScope::Project,
+            &global_dir,
+            &cwd,
+            json!({
+                "theme": "solarized",
+                "steeringMode": "all",
+                "followUpMode": "one-at-a-time",
+                "editor_padding_x": 4,
+                "show_hardware_cursor": true,
+            }),
+        )
+        .expect("patch settings");
+
+        let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load config");
+        assert_eq!(config.theme.as_deref(), Some("solarized"));
+        assert_eq!(config.steering_queue_mode(), QueueMode::All);
+        assert_eq!(config.follow_up_queue_mode(), QueueMode::OneAtATime);
+        assert_eq!(config.editor_padding_x, Some(4));
+        assert_eq!(config.show_hardware_cursor, Some(true));
     }
 
     #[test]

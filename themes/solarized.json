@@ -1,0 +1,25 @@
+{
+  "name": "solarized",
+  "version": "1.0",
+  "colors": {
+    "foreground": "#839496",
+    "background": "#002b36",
+    "accent": "#268bd2",
+    "success": "#859900",
+    "warning": "#b58900",
+    "error": "#dc322f",
+    "muted": "#586e75"
+  },
+  "syntax": {
+    "keyword": "#268bd2",
+    "string": "#2aa198",
+    "number": "#d33682",
+    "comment": "#586e75",
+    "function": "#b58900"
+  },
+  "ui": {
+    "border": "#073642",
+    "selection": "#073642",
+    "cursor": "#93a1a1"
+  }
+}

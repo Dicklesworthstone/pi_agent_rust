@@ -202,7 +202,6 @@ impl Provider for GeminiProvider {
                             // Stream ended naturally
                             if !state.finished {
                                 state.finished = true;
-                                state.finalize_content();
                                 return Some((
                                     Ok(StreamEvent::Done {
                                         reason: state.partial.stop_reason,
@@ -306,10 +305,6 @@ where
             for part in content.parts {
                 match part {
                     GeminiPart::Text { text } => {
-                        // Always save text first (before started check) to avoid losing content
-                        self.current_text.push_str(&text);
-
-                        // Emit start event on first content
                         if !self.started {
                             self.started = true;
                             return Ok(Some(StreamEvent::Start {
@@ -317,8 +312,24 @@ where
                             }));
                         }
 
+                        // Find the last text block to append to, or create new
+                        let last_is_text =
+                            matches!(self.partial.content.last(), Some(ContentBlock::Text(_)));
+                        if !last_is_text {
+                            self.partial
+                                .content
+                                .push(ContentBlock::Text(TextContent::new("")));
+                        }
+                        let content_index = self.partial.content.len() - 1;
+
+                        if let Some(ContentBlock::Text(t)) =
+                            self.partial.content.get_mut(content_index)
+                        {
+                            t.text.push_str(&text);
+                        }
+
                         return Ok(Some(StreamEvent::TextDelta {
-                            content_index: 0,
+                            content_index,
                             delta: text,
                             partial: self.partial.clone(),
                         }));
@@ -327,15 +338,20 @@ where
                         // Generate a unique ID for this tool call
                         let id = format!("call_{}", uuid::Uuid::new_v4().simple());
 
-                        // Serialize args before moving
+                        // Serialize args
                         let args_str = serde_json::to_string(&function_call.args)
                             .unwrap_or_else(|_| "{}".to_string());
+                        let GeminiFunctionCall { name, args } = function_call;
 
-                        self.tool_calls.push(ToolCallState {
+                        let tool_call = ToolCall {
                             id,
-                            name: function_call.name.clone(),
-                            arguments: function_call.args,
-                        });
+                            name,
+                            arguments: args,
+                            thought_signature: None,
+                        };
+
+                        self.partial.content.push(ContentBlock::ToolCall(tool_call));
+                        let content_index = self.partial.content.len() - 1;
 
                         // Update stop reason for tool use
                         self.partial.stop_reason = StopReason::ToolUse;
@@ -348,9 +364,9 @@ where
                             }));
                         }
 
-                        // Emit tool call delta
+                        // Emit tool call delta (Gemini sends full args, so delta is full args)
                         return Ok(Some(StreamEvent::ToolCallDelta {
-                            content_index: self.tool_calls.len() - 1,
+                            content_index,
                             delta: args_str,
                             partial: self.partial.clone(),
                         }));
@@ -363,25 +379,6 @@ where
         }
 
         Ok(None)
-    }
-
-    fn finalize_content(&mut self) {
-        // Add accumulated text
-        if !self.current_text.is_empty() {
-            self.partial
-                .content
-                .push(ContentBlock::Text(TextContent::new(&self.current_text)));
-        }
-
-        // Add tool calls
-        for tc in &self.tool_calls {
-            self.partial.content.push(ContentBlock::ToolCall(ToolCall {
-                id: tc.id.clone(),
-                name: tc.name.clone(),
-                arguments: tc.arguments.clone(),
-                thought_signature: None,
-            }));
-        }
     }
 }
 
@@ -527,6 +524,12 @@ fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent> {
         Message::User(user) => vec![GeminiContent {
             role: Some("user".to_string()),
             parts: convert_user_content_to_parts(&user.content),
+        }],
+        Message::Custom(custom) => vec![GeminiContent {
+            role: Some("user".to_string()),
+            parts: vec![GeminiPart::Text {
+                text: custom.content.clone(),
+            }],
         }],
         Message::Assistant(assistant) => {
             let mut parts = Vec::new();
@@ -753,7 +756,6 @@ mod tests {
                 let Some(item) = state.event_source.next().await else {
                     if !state.finished {
                         state.finished = true;
-                        state.finalize_content();
                         out.push(StreamEvent::Done {
                             reason: state.partial.stop_reason,
                             message: state.partial.clone(),

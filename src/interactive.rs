@@ -15,6 +15,7 @@ use asupersync::Cx;
 use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
+use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use bubbles::spinner::{SpinnerModel, spinners};
 use bubbles::textarea::TextArea;
@@ -25,8 +26,10 @@ use crossterm::{cursor, terminal};
 use futures::future::BoxFuture;
 use glamour::{Renderer as MarkdownRenderer, StyleConfig as GlamourStyleConfig};
 use serde_json::{Value, json};
+use url::Url;
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -53,7 +56,8 @@ use crate::package_manager::PackageManager;
 use crate::providers;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::session::{Session, SessionEntry, SessionMessage, bash_execution_to_text};
-use crate::session_index::SessionMeta;
+use crate::session_index::{SessionIndex, SessionMeta};
+use crate::session_picker::delete_session_file;
 use crate::theme::{Theme, TuiStyles};
 use crate::tools::{process_file_arguments, resolve_read_path};
 
@@ -348,7 +352,10 @@ impl PiApp {
     }
 
     fn maybe_trigger_autocomplete(&mut self) {
-        if self.agent_state != AgentState::Idle || self.session_picker.is_some() {
+        if self.agent_state != AgentState::Idle
+            || self.session_picker.is_some()
+            || self.settings_ui.is_some()
+        {
             self.autocomplete.close();
             return;
         }
@@ -837,9 +844,12 @@ impl PiApp {
             let _ = writeln!(
                 output,
                 "  {}",
-                self.styles
-                    .warning_bold
-                    .render("Session deletion is disabled (requires explicit permission).")
+                self.styles.warning_bold.render(
+                    picker
+                        .status_message
+                        .as_deref()
+                        .unwrap_or("Delete session? Press y/n to confirm."),
+                )
             );
         } else {
             let _ = writeln!(
@@ -847,11 +857,144 @@ impl PiApp {
                 "  {}",
                 self.styles
                     .muted_italic
-                    .render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
+                    .render("↑/↓/j/k: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel")
             );
+            if let Some(message) = &picker.status_message {
+                let _ = writeln!(output, "  {}", self.styles.warning_bold.render(message));
+            }
         }
 
         output
+    }
+
+    fn render_settings_ui(&self, settings_ui: &SettingsUiState) -> String {
+        let mut output = String::new();
+
+        let _ = writeln!(output, "\n  {}\n", self.styles.title.render("Settings"));
+
+        if settings_ui.entries.is_empty() {
+            let _ = writeln!(
+                output,
+                "  {}",
+                self.styles.muted.render("No settings available.")
+            );
+        } else {
+            let offset = settings_ui.scroll_offset();
+            let visible_count = settings_ui.max_visible.min(settings_ui.entries.len());
+            let end = (offset + visible_count).min(settings_ui.entries.len());
+
+            for (idx, entry) in settings_ui.entries[offset..end].iter().enumerate() {
+                let global_idx = offset + idx;
+                let is_selected = global_idx == settings_ui.selected;
+
+                let prefix = if is_selected { ">" } else { " " };
+                let row = format!(" {entry}");
+                let rendered = if is_selected {
+                    self.styles.selection.render(&row)
+                } else {
+                    row
+                };
+
+                let _ = writeln!(output, "{prefix} {rendered}");
+            }
+
+            if settings_ui.entries.len() > visible_count {
+                let _ = writeln!(
+                    output,
+                    "  {}",
+                    self.styles.muted.render(&format!(
+                        "({}-{} of {})",
+                        offset + 1,
+                        end,
+                        settings_ui.entries.len()
+                    ))
+                );
+            }
+        }
+
+        output.push('\n');
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted_italic
+                .render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
+        );
+
+        output
+    }
+}
+
+async fn run_command_output(
+    program: &str,
+    args: Vec<OsString>,
+    cwd: &Path,
+    abort_signal: &crate::agent::AbortSignal,
+) -> std::io::Result<std::process::Output> {
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc as std_mpsc;
+    use std::time::Duration;
+
+    let child = Command::new(program)
+        .args(&args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+
+    let (tx, rx) = std_mpsc::channel();
+    std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(result);
+    });
+
+    let tick = Duration::from_millis(10);
+    loop {
+        if abort_signal.is_aborted() {
+            crate::tools::kill_process_tree(Some(pid));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "command aborted",
+            ));
+        }
+
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(std_mpsc::TryRecvError::Empty) => sleep(wall_now(), tick).await,
+            Err(std_mpsc::TryRecvError::Disconnected) => {
+                return Err(std::io::Error::other("command output channel disconnected"));
+            }
+        }
+    }
+}
+
+fn parse_gist_url_and_id(output: &str) -> Option<(String, String)> {
+    for raw in output.split_whitespace() {
+        let token = raw.trim_matches(|c: char| matches!(c, '"' | '\'' | ',' | ';'));
+        let Ok(url) = Url::parse(token) else {
+            continue;
+        };
+        if url.host_str()? != "gist.github.com" {
+            continue;
+        }
+        let gist_id = url.path_segments()?.next_back()?.to_string();
+        if gist_id.is_empty() {
+            continue;
+        }
+        return Some((token.to_string(), gist_id));
+    }
+    None
+}
+
+fn format_command_output(output: &std::process::Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => "(no output)".to_string(),
+        (false, true) => format!("stdout:\n{stdout}"),
+        (true, false) => format!("stderr:\n{stderr}"),
+        (false, false) => format!("stdout:\n{stdout}\n\nstderr:\n{stderr}"),
     }
 }
 
@@ -1492,7 +1635,7 @@ impl SlashCommand {
   /history, /hist    - Show input history
   /export [path]     - Export conversation to HTML
   /session, /info    - Show session info (path, tokens, cost)
-  /settings          - Show current settings summary
+  /settings          - Open settings selector
   /theme [name]      - List or switch themes (dark/light/custom)
   /resume, /r        - Pick and resume a previous session
   /new               - Start a new session
@@ -1504,7 +1647,7 @@ impl SlashCommand {
   /fork [id|index]   - Fork from a user message (default: last on current path)
   /compact [notes]   - Compact older context with optional instructions
   /reload            - Reload skills/prompts from disk
-  /share             - Export to a temp HTML file and show path
+  /share             - Upload session HTML to a secret GitHub gist and show URL
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -2319,6 +2462,9 @@ pub struct PiApp {
     // Session picker overlay for /resume
     session_picker: Option<SessionPickerOverlay>,
 
+    // Settings UI overlay for /settings
+    settings_ui: Option<SettingsUiState>,
+
     // Tree navigation UI state (for /tree command)
     tree_ui: Option<TreeUiState>,
 }
@@ -2407,6 +2553,55 @@ struct SessionPickerOverlay {
     max_visible: usize,
     /// Whether we're in delete confirmation mode.
     confirm_delete: bool,
+    /// Status message to render in the picker overlay.
+    status_message: Option<String>,
+    /// Base directory for session storage (used for index cleanup).
+    sessions_root: Option<PathBuf>,
+}
+
+/// Settings selector overlay state for /settings command.
+#[derive(Debug)]
+struct SettingsUiState {
+    entries: Vec<&'static str>,
+    selected: usize,
+    max_visible: usize,
+}
+
+impl SettingsUiState {
+    fn new() -> Self {
+        Self {
+            entries: vec!["Summary", "Theme"],
+            selected: 0,
+            max_visible: 10,
+        }
+    }
+
+    fn select_next(&mut self) {
+        if !self.entries.is_empty() {
+            self.selected = (self.selected + 1) % self.entries.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.entries.is_empty() {
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(self.entries.len() - 1);
+        }
+    }
+
+    fn selected_entry(&self) -> Option<&'static str> {
+        self.entries.get(self.selected).copied()
+    }
+
+    const fn scroll_offset(&self) -> usize {
+        if self.selected < self.max_visible {
+            0
+        } else {
+            self.selected - self.max_visible + 1
+        }
+    }
 }
 
 impl SessionPickerOverlay {
@@ -2416,6 +2611,19 @@ impl SessionPickerOverlay {
             selected: 0,
             max_visible: 10,
             confirm_delete: false,
+            status_message: None,
+            sessions_root: None,
+        }
+    }
+
+    const fn new_with_root(sessions: Vec<SessionMeta>, sessions_root: Option<PathBuf>) -> Self {
+        Self {
+            sessions,
+            selected: 0,
+            max_visible: 10,
+            confirm_delete: false,
+            status_message: None,
+            sessions_root,
         }
     }
 
@@ -2459,6 +2667,20 @@ impl SessionPickerOverlay {
         }
         // Clear confirmation state
         self.confirm_delete = false;
+    }
+
+    fn delete_selected(&mut self) -> crate::error::Result<()> {
+        let Some(session_meta) = self.selected_session().cloned() else {
+            return Ok(());
+        };
+        let path = PathBuf::from(&session_meta.path);
+        delete_session_file(&path)?;
+        if let Some(root) = self.sessions_root.as_ref() {
+            let index = SessionIndex::for_sessions_root(root);
+            let _ = index.delete_session_path(&path);
+        }
+        self.remove_selected();
+        Ok(())
     }
 }
 
@@ -2546,6 +2768,23 @@ impl ExtensionSession for InteractiveExtensionSession {
                 _ => None,
             })
             .collect::<Vec<_>>()
+    }
+
+    async fn get_entries(&self) -> Vec<Value> {
+        let cx = Cx::for_request();
+        let Ok(guard) = self.session.lock(&cx).await else {
+            return Vec::new();
+        };
+        guard
+            .entries_for_current_path()
+            .iter()
+            .filter_map(|entry| serde_json::to_value(*entry).ok())
+            .collect()
+    }
+
+    async fn get_branch(&self) -> Vec<Value> {
+        // For now, treat the current path as the active branch (pi-mono semantics).
+        self.get_entries().await
     }
 
     async fn set_name(&self, name: String) -> crate::error::Result<()> {
@@ -2756,6 +2995,7 @@ impl PiApp {
             last_escape_time: None,
             autocomplete,
             session_picker: None,
+            settings_ui: None,
             tree_ui: None,
         };
 
@@ -2825,6 +3065,72 @@ impl PiApp {
                 return self.handle_tree_ui_key(key);
             }
 
+            // /settings modal captures all input while active.
+            if self.settings_ui.is_some() {
+                let mut settings_ui = self
+                    .settings_ui
+                    .take()
+                    .expect("checked settings_ui is_some");
+                match key.key_type {
+                    KeyType::Up => {
+                        settings_ui.select_prev();
+                        self.settings_ui = Some(settings_ui);
+                        return None;
+                    }
+                    KeyType::Down => {
+                        settings_ui.select_next();
+                        self.settings_ui = Some(settings_ui);
+                        return None;
+                    }
+                    KeyType::Runes if key.runes == ['k'] => {
+                        settings_ui.select_prev();
+                        self.settings_ui = Some(settings_ui);
+                        return None;
+                    }
+                    KeyType::Runes if key.runes == ['j'] => {
+                        settings_ui.select_next();
+                        self.settings_ui = Some(settings_ui);
+                        return None;
+                    }
+                    KeyType::Enter => {
+                        if let Some(selected) = settings_ui.selected_entry() {
+                            match selected {
+                                "Summary" => {
+                                    self.messages.push(ConversationMessage {
+                                        role: MessageRole::System,
+                                        content: self.format_settings_summary(),
+                                        thinking: None,
+                                    });
+                                    self.scroll_to_bottom();
+                                    self.status_message =
+                                        Some("Selected setting: Summary".to_string());
+                                }
+                                other => {
+                                    self.status_message =
+                                        Some(format!("Selected setting: {other}"));
+                                }
+                            }
+                        }
+                        self.settings_ui = None;
+                        return None;
+                    }
+                    KeyType::Esc => {
+                        self.settings_ui = None;
+                        self.status_message = Some("Settings cancelled".to_string());
+                        return None;
+                    }
+                    KeyType::Runes if key.runes == ['q'] => {
+                        self.settings_ui = None;
+                        self.status_message = Some("Settings cancelled".to_string());
+                        return None;
+                    }
+                    _ => {
+                        self.settings_ui = Some(settings_ui);
+                        return None;
+                    }
+                }
+            }
+
             // Handle session picker navigation when overlay is open
             if let Some(ref mut picker) = self.session_picker {
                 // If in delete confirmation mode, handle y/n/Esc/Enter
@@ -2832,20 +3138,33 @@ impl PiApp {
                     match key.key_type {
                         KeyType::Runes if key.runes == ['y'] || key.runes == ['Y'] => {
                             picker.confirm_delete = false;
-                            self.status_message = Some(
-                                "Session deletion is disabled (requires explicit permission)."
-                                    .to_string(),
-                            );
+                            match picker.delete_selected() {
+                                Ok(()) => {
+                                    if picker.sessions.is_empty() {
+                                        self.session_picker = None;
+                                        self.status_message =
+                                            Some("No sessions found for this project".to_string());
+                                    } else {
+                                        picker.status_message =
+                                            Some("Session deleted.".to_string());
+                                    }
+                                }
+                                Err(err) => {
+                                    picker.status_message = Some(err.to_string());
+                                }
+                            }
                             return None;
                         }
                         KeyType::Runes if key.runes == ['n'] || key.runes == ['N'] => {
                             // Cancel delete
                             picker.confirm_delete = false;
+                            picker.status_message = None;
                             return None;
                         }
                         KeyType::Esc => {
                             // Cancel delete
                             picker.confirm_delete = false;
+                            picker.status_message = None;
                             return None;
                         }
                         _ => {
@@ -2883,10 +3202,9 @@ impl PiApp {
                         return None;
                     }
                     KeyType::CtrlD => {
-                        self.status_message = Some(
-                            "Session deletion is disabled (requires explicit permission)."
-                                .to_string(),
-                        );
+                        picker.confirm_delete = true;
+                        picker.status_message =
+                            Some("Delete session? Press y/n to confirm.".to_string());
                         return None;
                     }
                     KeyType::Esc => {
@@ -3045,8 +3363,16 @@ impl PiApp {
             output.push_str(&self.render_session_picker(picker));
         }
 
-        // Input area (only when idle and no picker open)
-        if self.agent_state == AgentState::Idle && self.session_picker.is_none() {
+        // Settings overlay (if open)
+        if let Some(ref settings_ui) = self.settings_ui {
+            output.push_str(&self.render_settings_ui(settings_ui));
+        }
+
+        // Input area (only when idle and no overlay open)
+        if self.agent_state == AgentState::Idle
+            && self.session_picker.is_none()
+            && self.settings_ui.is_none()
+        {
             output.push_str(&self.render_input());
 
             // Autocomplete dropdown (if open)
@@ -4644,7 +4970,7 @@ impl PiApp {
         let runtime_handle = self.runtime_handle.clone();
         runtime_handle.spawn(async move {
             let auth_path = crate::config::Config::auth_path();
-            let mut auth = match crate::auth::AuthStorage::load(auth_path) {
+            let mut auth = match crate::auth::AuthStorage::load_async(auth_path).await {
                 Ok(a) => a,
                 Err(e) => {
                     let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
@@ -4674,7 +5000,7 @@ impl PiApp {
             };
 
             auth.set(provider.clone(), credential);
-            if let Err(e) = auth.save() {
+            if let Err(e) = auth.save_async().await {
                 let _ = event_tx.try_send(PiMsg::AgentError(e.to_string()));
                 return;
             }
@@ -5522,12 +5848,14 @@ impl PiApp {
                 None
             }
             SlashCommand::Settings => {
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: self.format_settings_summary(),
-                    thinking: None,
-                });
-                self.scroll_to_bottom();
+                if self.agent_state != AgentState::Idle {
+                    self.status_message = Some("Cannot open settings while processing".to_string());
+                    return None;
+                }
+
+                self.settings_ui = Some(SettingsUiState::new());
+                self.session_picker = None;
+                self.autocomplete.close();
                 None
             }
             SlashCommand::Theme => {
@@ -5582,6 +5910,7 @@ impl PiApp {
                     .try_lock()
                     .ok()
                     .and_then(|guard| guard.session_dir.clone());
+                let base_dir = override_dir.clone().unwrap_or_else(Config::sessions_dir);
                 let sessions = crate::session_picker::list_sessions_for_project(
                     &self.cwd,
                     override_dir.as_deref(),
@@ -5591,7 +5920,10 @@ impl PiApp {
                     return None;
                 }
 
-                self.session_picker = Some(SessionPickerOverlay::new(sessions));
+                self.session_picker = Some(SessionPickerOverlay::new_with_root(
+                    sessions,
+                    Some(base_dir),
+                ));
                 self.autocomplete.close();
                 None
             }
@@ -6222,45 +6554,146 @@ impl PiApp {
                     return None;
                 }
 
-                let html = {
-                    let Ok(session_guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
-                        return None;
+                self.agent_state = AgentState::Processing;
+                self.status_message = Some("Sharing session... (Esc to cancel)".to_string());
+
+                let (abort_handle, abort_signal) = AbortHandle::new();
+                self.abort_handle = Some(abort_handle);
+
+                let event_tx = self.event_tx.clone();
+                let runtime_handle = self.runtime_handle.clone();
+                let session = Arc::clone(&self.session);
+                let cwd = self.cwd.clone();
+                let gh_path_override = self.config.gh_path.clone();
+
+                runtime_handle.spawn(async move {
+                    let gh = gh_path_override
+                        .as_ref()
+                        .filter(|value| !value.trim().is_empty())
+                        .cloned()
+                        .unwrap_or_else(|| "gh".to_string());
+
+                    let auth_args = vec![OsString::from("auth"), OsString::from("status")];
+                    match run_command_output(&gh, auth_args, &cwd, &abort_signal).await {
+                        Ok(output) => {
+                            if !output.status.success() {
+                                let details = format_command_output(&output);
+                                let message = format!(
+                                    "`gh` is not authenticated.\nRun `gh auth login` and retry.\n\n{details}"
+                                );
+                                let _ = event_tx.try_send(PiMsg::AgentError(message));
+                                return;
+                            }
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                            let message = "GitHub CLI `gh` not found.\nInstall it and run `gh auth login`, then retry `/share`.".to_string();
+                            let _ = event_tx.try_send(PiMsg::AgentError(message));
+                            return;
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                            let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                            return;
+                        }
+                        Err(err) => {
+                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                "Failed to run `gh auth status`: {err}"
+                            )));
+                            return;
+                        }
+                    }
+
+                    if abort_signal.is_aborted() {
+                        let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                        return;
+                    }
+
+                    let cx = Cx::for_request();
+                    let html = match session.lock(&cx).await {
+                        Ok(guard) => guard.to_html(),
+                        Err(err) => {
+                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                "Failed to lock session: {err}"
+                            )));
+                            return;
+                        }
                     };
-                    session_guard.to_html()
-                };
 
-                let temp = tempfile::Builder::new()
-                    .prefix("pi-share-")
-                    .suffix(".html")
-                    .tempfile();
-                let mut temp = match temp {
-                    Ok(temp) => temp,
-                    Err(err) => {
-                        self.status_message = Some(format!("Failed to create temp file: {err}"));
-                        return None;
+                    if abort_signal.is_aborted() {
+                        let _ = event_tx.try_send(PiMsg::System("Share cancelled".to_string()));
+                        return;
                     }
-                };
-                if let Err(err) = std::io::Write::write_all(&mut temp, html.as_bytes()) {
-                    self.status_message = Some(format!("Failed to write temp file: {err}"));
-                    return None;
-                }
 
-                let (_file, path) = match temp.keep() {
-                    Ok(kept) => kept,
-                    Err(err) => {
-                        self.status_message = Some(format!("Failed to keep temp file: {err}"));
-                        return None;
+                    let temp_file = match tempfile::Builder::new()
+                        .prefix("pi-share-")
+                        .suffix(".html")
+                        .tempfile()
+                    {
+                        Ok(file) => file,
+                        Err(err) => {
+                            let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                "Failed to create temp file: {err}"
+                            )));
+                            return;
+                        }
+                    };
+                    let temp_path = temp_file.into_temp_path();
+                    if let Err(err) = std::fs::write(&temp_path, html.as_bytes()) {
+                        let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                            "Failed to write temp file: {err}"
+                        )));
+                        return;
                     }
-                };
 
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: format!("Shared HTML: {}", path.display()),
-                    thinking: None,
+                    let gist_args = vec![
+                        OsString::from("gist"),
+                        OsString::from("create"),
+                        OsString::from("--public=false"),
+                        temp_path.as_os_str().to_os_string(),
+                    ];
+                    let output =
+                        match run_command_output(&gh, gist_args, &cwd, &abort_signal).await {
+                            Ok(output) => output,
+                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                                let message = "GitHub CLI `gh` not found.\nInstall it and run `gh auth login`, then retry `/share`.".to_string();
+                                let _ = event_tx.try_send(PiMsg::AgentError(message));
+                                return;
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                                let _ = event_tx
+                                    .try_send(PiMsg::System("Share cancelled".to_string()));
+                                return;
+                            }
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to run `gh gist create`: {err}"
+                                )));
+                                return;
+                            }
+                        };
+
+                    if !output.status.success() {
+                        let details = format_command_output(&output);
+                        let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                            "`gh gist create` failed.\n\n{details}"
+                        )));
+                        return;
+                    }
+
+                    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                    let Some((gist_url, gist_id)) = parse_gist_url_and_id(&stdout) else {
+                        let details = format_command_output(&output);
+                        let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                            "Failed to parse gist URL from `gh gist create` output.\n\n{details}"
+                        )));
+                        return;
+                    };
+
+                    let share_url = crate::session::get_share_viewer_url(&gist_id);
+                    drop(temp_path);
+
+                    let message = format!("Share URL: {share_url}\nGist: {gist_url}");
+                    let _ = event_tx.try_send(PiMsg::System(message));
                 });
-                self.scroll_to_bottom();
-                self.status_message = Some(format!("Shared: {}", path.display()));
                 None
             }
         }
