@@ -3374,6 +3374,19 @@ impl ExtensionSession for InteractiveExtensionSession {
         Ok(())
     }
 
+    async fn append_message(&self, message: SessionMessage) -> crate::error::Result<()> {
+        let cx = Cx::for_request();
+        let mut guard =
+            self.session.lock(&cx).await.map_err(|err| {
+                crate::error::Error::session(format!("session lock failed: {err}"))
+            })?;
+        guard.append_message(message);
+        if self.save_enabled {
+            guard.save().await?;
+        }
+        Ok(())
+    }
+
     async fn append_custom_entry(
         &self,
         custom_type: String,

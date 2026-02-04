@@ -25,8 +25,9 @@ use serde_json::{Value, json};
 use sha2::Digest as _;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
@@ -1771,20 +1772,6 @@ pub struct ExtensionUiResponse {
     pub cancelled: bool,
 }
 
-/// Host-side event dispatched by extensions (via `pi.events(...)`).
-#[derive(Debug, Clone)]
-pub enum ExtensionHostEvent {
-    SendMessage {
-        extension_id: String,
-        message: SessionMessage,
-        trigger_turn: bool,
-    },
-    SendUserMessage {
-        extension_id: String,
-        text: String,
-    },
-}
-
 /// Minimal session access for extensions (hostcalls).
 #[async_trait]
 pub trait ExtensionSession: Send + Sync {
@@ -3149,7 +3136,7 @@ async fn dispatch_hostcall_tool(
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn dispatch_hostcall_exec(_call_id: &str, cmd: &str, payload: Value) -> HostcallOutcome {
     let args_value = payload.get("args").cloned().unwrap_or(Value::Null);
     let args_array = match args_value {
@@ -3165,11 +3152,17 @@ async fn dispatch_hostcall_exec(_call_id: &str, cmd: &str, payload: Value) -> Ho
 
     let args = args_array
         .iter()
-        .map(|v| v.as_str().map_or_else(|| v.to_string(), ToString::to_string))
+        .map(|v| {
+            v.as_str()
+                .map_or_else(|| v.to_string(), ToString::to_string)
+        })
         .collect::<Vec<_>>();
 
     let options = payload.get("options").cloned().unwrap_or_else(|| json!({}));
-    let cwd = options.get("cwd").and_then(Value::as_str).map(ToString::to_string);
+    let cwd = options
+        .get("cwd")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
     let timeout_ms = options
         .get("timeout")
         .and_then(Value::as_u64)
@@ -3393,7 +3386,7 @@ async fn dispatch_hostcall_ui(
     }
 }
 
-#[allow(clippy::future_not_send)]
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
 async fn dispatch_hostcall_events(
     _call_id: &str,
     manager: &ExtensionManager,

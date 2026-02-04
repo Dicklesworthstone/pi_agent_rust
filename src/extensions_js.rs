@@ -1987,11 +1987,32 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                               args: Value<'_>,
                               options: Opt<Value<'_>>|
                               -> rquickjs::Result<String> {
-                            let options_json = match options.0.as_ref() {
+                            let mut options_json = match options.0.as_ref() {
                                 None => serde_json::json!({}),
                                 Some(value) if value.is_null() => serde_json::json!({}),
                                 Some(value) => js_to_json(value)?,
                             };
+                            if let Some(default_timeout_ms) =
+                                default_hostcall_timeout_ms.filter(|ms| *ms > 0)
+                            {
+                                match &mut options_json {
+                                    serde_json::Value::Object(map) => {
+                                        let has_timeout = map.contains_key("timeout")
+                                            || map.contains_key("timeoutMs")
+                                            || map.contains_key("timeout_ms");
+                                        if !has_timeout {
+                                            map.insert(
+                                                "timeoutMs".to_string(),
+                                                serde_json::Value::from(default_timeout_ms),
+                                            );
+                                        }
+                                    }
+                                    _ => {
+                                        options_json =
+                                            serde_json::json!({ "timeoutMs": default_timeout_ms });
+                                    }
+                                }
+                            }
                             let payload = serde_json::json!({
                                 "args": js_to_json(&args)?,
                                 "options": options_json,
@@ -2737,12 +2758,13 @@ function __pi_send_message(message, options) {
     } catch (_) {}
 }
 
-function __pi_send_user_message(text) {
+function __pi_send_user_message(text, options) {
     const ext = __pi_current_extension_or_throw();
     const msg = String(text === undefined || text === null ? '' : text).trim();
     if (!msg) return;
+    const opts = options && typeof options === 'object' ? options : {};
     try {
-        pi.events('sendUserMessage', { extensionId: ext.id, text: msg }).catch(() => {});
+        pi.events('sendUserMessage', { extensionId: ext.id, text: msg, options: opts }).catch(() => {});
     } catch (_) {}
 }
 
@@ -2934,16 +2956,86 @@ async function __pi_dispatch_extension_event(event_name, event_payload, ctx_payl
     }
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
-    let first = undefined;
+    if (eventName === 'input') {
+        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+        const originalText = typeof base.text === 'string' ? base.text : String(base.text ?? '');
+        const originalImages = Array.isArray(base.images) ? base.images : undefined;
+        const source = base.source !== undefined ? base.source : 'extension';
+
+        let currentText = originalText;
+        let currentImages = originalImages;
+
+        for (const entry of handlers) {
+            const handler = entry && entry.handler;
+            if (typeof handler !== 'function') continue;
+            const event = { type: 'input', text: currentText, images: currentImages, source: source };
+            const result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+            if (result && typeof result === 'object') {
+                if (result.action === 'handled') return result;
+                if (result.action === 'transform' && typeof result.text === 'string') {
+                    currentText = result.text;
+                    if (result.images !== undefined) currentImages = result.images;
+                }
+            }
+        }
+
+        if (currentText !== originalText || currentImages !== originalImages) {
+            return { action: 'transform', text: currentText, images: currentImages };
+        }
+        return { action: 'continue' };
+    }
+
+    if (eventName === 'before_agent_start') {
+        const base = event_payload && typeof event_payload === 'object' ? event_payload : {};
+        const prompt = typeof base.prompt === 'string' ? base.prompt : '';
+        const images = Array.isArray(base.images) ? base.images : undefined;
+        let currentSystemPrompt = typeof base.systemPrompt === 'string' ? base.systemPrompt : '';
+        let modified = false;
+        const messages = [];
+
+        for (const entry of handlers) {
+            const handler = entry && entry.handler;
+            if (typeof handler !== 'function') continue;
+            const event = { type: 'before_agent_start', prompt, images, systemPrompt: currentSystemPrompt };
+            const result = await __pi_with_extension_async(entry.extensionId, () => handler(event, ctx));
+            if (result && typeof result === 'object') {
+                if (result.message !== undefined) messages.push(result.message);
+                if (result.systemPrompt !== undefined) {
+                    currentSystemPrompt = String(result.systemPrompt);
+                    modified = true;
+                }
+            }
+        }
+
+        if (messages.length > 0 || modified) {
+            return { messages: messages.length > 0 ? messages : undefined, systemPrompt: modified ? currentSystemPrompt : undefined };
+        }
+        return undefined;
+    }
+
+    let last = undefined;
     for (const entry of handlers) {
         const handler = entry && entry.handler;
         if (typeof handler !== 'function') continue;
         const value = await __pi_with_extension_async(entry.extensionId, () => handler(event_payload, ctx));
-        if (value !== undefined && first === undefined) {
-            first = value;
+        if (value === undefined) continue;
+
+        // First-result semantics (legacy parity)
+        if (eventName === 'user_bash') {
+            return value;
+        }
+
+        last = value;
+
+        // Early-stop semantics (legacy parity)
+        if (eventName === 'tool_call' && value && typeof value === 'object' && value.block) {
+            return value;
+        }
+        if (eventName.startsWith('session_before_') && value && typeof value === 'object' && value.cancel) {
+            return value;
         }
     }
-    return first;
+    return last;
 }
 
 async function __pi_execute_tool(tool_name, tool_call_id, input, ctx_payload) {
