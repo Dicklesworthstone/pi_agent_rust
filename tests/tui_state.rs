@@ -1592,7 +1592,7 @@ fn tui_state_slash_scoped_models_clear_persists_and_restores_all_models() {
         settings
             .get("enabled_models")
             .and_then(|value| value.as_array())
-            .map(|array| array.len()),
+            .map(std::vec::Vec::len),
         Some(0)
     );
 
@@ -2270,7 +2270,7 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
             PiMsg::ConversationReset { .. } => reset_msg = Some(msg),
             PiMsg::SetEditorText(_) => editor_msg = Some(msg),
             PiMsg::AgentError(err) => {
-                assert!(false, "Unexpected fork error: {err}");
+                panic!("Unexpected fork error: {err}");
             }
             _ => {}
         }

@@ -1952,6 +1952,7 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
         .hidden(true)
         .follow_links(true)
         .max_depth(Some(1))
+        .git_ignore(false)
         .git_global(false)
         .git_exclude(false)
         .add_custom_ignore_filename(".fdignore")
