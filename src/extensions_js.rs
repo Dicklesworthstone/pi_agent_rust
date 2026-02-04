@@ -201,6 +201,105 @@ pub struct HostcallRequest {
     pub extension_id: Option<String>,
 }
 
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                if let Some(value) = map.get(&key) {
+                    out.insert(key, canonicalize_json(value));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.iter().map(canonicalize_json).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+fn sha256_hex(input: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    hex_lower(digest.as_slice())
+}
+
+fn hostcall_params_hash(method: &str, params: &serde_json::Value) -> String {
+    let canonical = canonicalize_json(&serde_json::json!({ "method": method, "params": params }));
+    let json = serde_json::to_string(&canonical).expect("serialize canonical hostcall params");
+    sha256_hex(&json)
+}
+
+impl HostcallRequest {
+    #[must_use]
+    pub const fn method(&self) -> &'static str {
+        match self.kind {
+            HostcallKind::Tool { .. } => "tool",
+            HostcallKind::Exec { .. } => "exec",
+            HostcallKind::Http => "http",
+            HostcallKind::Session { .. } => "session",
+            HostcallKind::Ui { .. } => "ui",
+            HostcallKind::Events { .. } => "events",
+        }
+    }
+
+    #[must_use]
+    pub fn required_capability(&self) -> String {
+        match &self.kind {
+            HostcallKind::Tool { name } => match name.trim().to_ascii_lowercase().as_str() {
+                "read" | "grep" | "find" | "ls" => "read".to_string(),
+                "write" | "edit" => "write".to_string(),
+                "bash" => "exec".to_string(),
+                _ => "tool".to_string(),
+            },
+            HostcallKind::Exec { .. } => "exec".to_string(),
+            HostcallKind::Http => "http".to_string(),
+            HostcallKind::Session { .. } => "session".to_string(),
+            HostcallKind::Ui { .. } => "ui".to_string(),
+            HostcallKind::Events { .. } => "events".to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn params_for_hash(&self) -> serde_json::Value {
+        match &self.kind {
+            HostcallKind::Tool { name } => {
+                serde_json::json!({ "name": name, "input": self.payload.clone() })
+            }
+            HostcallKind::Exec { cmd } => {
+                let mut map = serde_json::Map::new();
+                map.insert("cmd".to_string(), serde_json::Value::String(cmd.clone()));
+                match &self.payload {
+                    serde_json::Value::Object(obj) => {
+                        for (key, value) in obj {
+                            map.insert(key.clone(), value.clone());
+                        }
+                    }
+                    other => {
+                        map.insert("payload".to_string(), other.clone());
+                    }
+                }
+                serde_json::Value::Object(map)
+            }
+            HostcallKind::Http => self.payload.clone(),
+            HostcallKind::Session { op }
+            | HostcallKind::Ui { op }
+            | HostcallKind::Events { op } => {
+                serde_json::json!({ "op": op, "args": self.payload.clone() })
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn params_hash(&self) -> String {
+        hostcall_params_hash(self.method(), &self.params_for_hash())
+    }
+}
+
 /// Stores pending Promise resolvers for hostcalls.
 ///
 /// This is the core bridge between JS Promises and Rust async completions.
@@ -1951,7 +2050,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let scheduler = Rc::clone(&scheduler);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
-                        move |_ctx: Ctx<'_>,
+                        move |ctx: Ctx<'_>,
                               name: String,
                               input: Value<'_>|
                               -> rquickjs::Result<String> {
@@ -1963,11 +2062,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker.borrow_mut().register(call_id.clone(), timer_id);
-                            let extension_id: Option<String> = _ctx
+                            let extension_id: Option<String> = ctx
                                 .globals()
-                                .get::<_, Opt<String>>("__pi_current_extension_id")
+                                .get::<_, Option<String>>("__pi_current_extension_id")
                                 .ok()
-                                .and_then(|value| value.0)
+                                .flatten()
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
                             let request = HostcallRequest {
@@ -1992,7 +2091,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let scheduler = Rc::clone(&scheduler);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
-                        move |_ctx: Ctx<'_>,
+                        move |ctx: Ctx<'_>,
                               cmd: String,
                               args: Value<'_>,
                               options: Opt<Value<'_>>|
@@ -2034,11 +2133,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker.borrow_mut().register(call_id.clone(), timer_id);
-                            let extension_id: Option<String> = _ctx
+                            let extension_id: Option<String> = ctx
                                 .globals()
-                                .get::<_, Opt<String>>("__pi_current_extension_id")
+                                .get::<_, Option<String>>("__pi_current_extension_id")
                                 .ok()
-                                .and_then(|value| value.0)
+                                .flatten()
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
                             let request = HostcallRequest {
@@ -2063,7 +2162,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let scheduler = Rc::clone(&scheduler);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
-                        move |_ctx: Ctx<'_>, req: Value<'_>| -> rquickjs::Result<String> {
+                        move |ctx: Ctx<'_>, req: Value<'_>| -> rquickjs::Result<String> {
                             let payload = js_to_json(&req)?;
                             let call_id = format!("call-{}", generate_call_id());
                             hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
@@ -2072,11 +2171,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker.borrow_mut().register(call_id.clone(), timer_id);
-                            let extension_id: Option<String> = _ctx
+                            let extension_id: Option<String> = ctx
                                 .globals()
-                                .get::<_, Opt<String>>("__pi_current_extension_id")
+                                .get::<_, Option<String>>("__pi_current_extension_id")
                                 .ok()
-                                .and_then(|value| value.0)
+                                .flatten()
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
                             let request = HostcallRequest {
@@ -2101,7 +2200,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let scheduler = Rc::clone(&scheduler);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
-                        move |_ctx: Ctx<'_>,
+                        move |ctx: Ctx<'_>,
                               op: String,
                               args: Value<'_>|
                               -> rquickjs::Result<String> {
@@ -2113,11 +2212,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker.borrow_mut().register(call_id.clone(), timer_id);
-                            let extension_id: Option<String> = _ctx
+                            let extension_id: Option<String> = ctx
                                 .globals()
-                                .get::<_, Opt<String>>("__pi_current_extension_id")
+                                .get::<_, Option<String>>("__pi_current_extension_id")
                                 .ok()
-                                .and_then(|value| value.0)
+                                .flatten()
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
                             let request = HostcallRequest {
@@ -2142,7 +2241,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let scheduler = Rc::clone(&scheduler);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
-                        move |_ctx: Ctx<'_>,
+                        move |ctx: Ctx<'_>,
                               op: String,
                               args: Value<'_>|
                               -> rquickjs::Result<String> {
@@ -2154,11 +2253,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker.borrow_mut().register(call_id.clone(), timer_id);
-                            let extension_id: Option<String> = _ctx
+                            let extension_id: Option<String> = ctx
                                 .globals()
-                                .get::<_, Opt<String>>("__pi_current_extension_id")
+                                .get::<_, Option<String>>("__pi_current_extension_id")
                                 .ok()
-                                .and_then(|value| value.0)
+                                .flatten()
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
                             let request = HostcallRequest {
@@ -2183,7 +2282,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         let scheduler = Rc::clone(&scheduler);
                         let hostcalls_total = Arc::clone(&hostcalls_total);
                         let trace_seq = Arc::clone(&trace_seq);
-                        move |_ctx: Ctx<'_>,
+                        move |ctx: Ctx<'_>,
                               op: String,
                               args: Value<'_>|
                               -> rquickjs::Result<String> {
@@ -2195,11 +2294,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let timer_id =
                                 timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
                             tracker.borrow_mut().register(call_id.clone(), timer_id);
-                            let extension_id: Option<String> = _ctx
+                            let extension_id: Option<String> = ctx
                                 .globals()
-                                .get::<_, Opt<String>>("__pi_current_extension_id")
+                                .get::<_, Option<String>>("__pi_current_extension_id")
                                 .ok()
-                                .and_then(|value| value.0)
+                                .flatten()
                                 .map(|value| value.trim().to_string())
                                 .filter(|value| !value.is_empty());
                             let request = HostcallRequest {
@@ -3930,7 +4029,47 @@ mod tests {
             let req = &requests[0];
             assert!(matches!(&req.kind, HostcallKind::Tool { name } if name == "read"));
             assert_eq!(req.payload["path"], "test.txt");
+            assert_eq!(req.extension_id.as_deref(), None);
         });
+    }
+
+    #[test]
+    fn pijs_runtime_hostcall_request_captures_extension_id() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                __pi_begin_extension("ext.test", { name: "Test" });
+                pi.tool("read", { path: "test.txt" });
+                __pi_end_extension();
+            "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].extension_id.as_deref(), Some("ext.test"));
+        });
+    }
+
+    #[test]
+    fn hostcall_params_hash_is_stable_for_key_ordering() {
+        let first = serde_json::json!({ "b": 2, "a": 1 });
+        let second = serde_json::json!({ "a": 1, "b": 2 });
+
+        assert_eq!(
+            hostcall_params_hash("http", &first),
+            hostcall_params_hash("http", &second)
+        );
+        assert_ne!(
+            hostcall_params_hash("http", &first),
+            hostcall_params_hash("tool", &first)
+        );
     }
 
     #[test]

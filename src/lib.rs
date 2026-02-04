@@ -40,6 +40,7 @@ pub mod config;
 pub mod connectors;
 pub mod error;
 pub mod error_hints;
+pub mod extension_dispatcher;
 pub mod extensions;
 pub mod extensions_js;
 pub mod http;
@@ -64,3 +65,4 @@ pub mod tui;
 pub mod vcr;
 
 pub use error::{Error, Result as PiResult};
+pub use extension_dispatcher::ExtensionDispatcher;

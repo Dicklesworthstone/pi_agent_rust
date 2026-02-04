@@ -2,7 +2,8 @@
 
 mod common;
 
-use common::TestHarness;
+use common::{TestHarness, run_async};
+use pi::package_manager::{PackageManager, ResolveRoots};
 use pi::resources::{
     DiagnosticKind, LoadPromptTemplatesOptions, LoadSkillsOptions, LoadThemesOptions,
     dedupe_prompts, dedupe_themes, load_prompt_templates, load_skills, load_themes,
@@ -390,5 +391,159 @@ fn themes_invalid_ini_emits_warning() {
             .iter()
             .any(|d| d.kind == DiagnosticKind::Warning),
         "expected warning diagnostic"
+    );
+}
+
+fn fixture_source_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("resource_loader")
+        .join(name)
+}
+
+fn copy_fixture_dir(src: &Path, dest: &Path) {
+    std::fs::create_dir_all(dest).expect("create fixture dest");
+    let entries = std::fs::read_dir(src).expect("read fixture dir");
+    for entry in entries {
+        let entry = entry.expect("fixture entry");
+        let src_path = entry.path();
+        let dest_path = dest.join(entry.file_name());
+        let meta = entry.metadata().expect("fixture metadata");
+        if meta.is_dir() {
+            copy_fixture_dir(&src_path, &dest_path);
+        } else if meta.is_file() {
+            std::fs::copy(&src_path, &dest_path).expect("copy fixture file");
+        }
+    }
+}
+
+#[test]
+fn resolved_paths_feed_skill_and_prompt_loaders_with_collision_diagnostics() {
+    let harness =
+        TestHarness::new("resolved_paths_feed_skill_and_prompt_loaders_with_collision_diagnostics");
+
+    let src_root = fixture_source_dir("resolve_basic");
+    let dest_root = harness.temp_path("fixture");
+    copy_fixture_dir(&src_root, &dest_root);
+
+    let cwd = dest_root.join("project");
+    let global_base_dir = dest_root.join("global");
+    let project_base_dir = cwd.join(".pi");
+
+    let manager = PackageManager::new(cwd.clone());
+    let roots = ResolveRoots {
+        global_settings_path: global_base_dir.join("settings.json"),
+        project_settings_path: project_base_dir.join("settings.json"),
+        global_base_dir: global_base_dir.clone(),
+        project_base_dir: project_base_dir.clone(),
+    };
+
+    let resolved = run_async(async move { manager.resolve_with_roots(&roots).await })
+        .expect("resolve_with_roots");
+
+    let skill_paths = resolved
+        .skills
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.path.clone())
+        .collect::<Vec<_>>();
+    let skills_result = load_skills(LoadSkillsOptions {
+        cwd: cwd.clone(),
+        agent_dir: global_base_dir.clone(),
+        skill_paths,
+        include_defaults: false,
+    });
+
+    harness.log().info_ctx("skills", "loaded skills", |ctx| {
+        ctx.push(("count".into(), skills_result.skills.len().to_string()));
+        for skill in &skills_result.skills {
+            ctx.push((skill.name.clone(), skill.file_path.display().to_string()));
+        }
+    });
+    harness
+        .log()
+        .info_ctx("skills", "load_skills diagnostics", |ctx| {
+            ctx.push(("count".into(), skills_result.diagnostics.len().to_string()));
+            for (idx, diag) in skills_result.diagnostics.iter().enumerate() {
+                ctx.push((format!("diag_{idx}"), diag.message.clone()));
+            }
+        });
+
+    let alpha = skills_result
+        .skills
+        .iter()
+        .find(|s| s.name == "alpha")
+        .expect("alpha skill present");
+    assert!(
+        alpha
+            .file_path
+            .ends_with(Path::new("global/skills/alpha/SKILL.md")),
+        "expected global alpha skill to win collision"
+    );
+    assert!(
+        skills_result
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == DiagnosticKind::Collision && d.message.contains("alpha")),
+        "expected alpha collision diagnostic"
+    );
+
+    let prompt_paths = resolved
+        .prompts
+        .iter()
+        .filter(|r| r.enabled)
+        .map(|r| r.path.clone())
+        .collect::<Vec<_>>();
+    let templates = load_prompt_templates(LoadPromptTemplatesOptions {
+        cwd,
+        agent_dir: global_base_dir,
+        prompt_paths,
+        include_defaults: false,
+    });
+    let (prompts, diagnostics) = dedupe_prompts(templates);
+
+    harness.log().info_ctx("prompts", "deduped prompts", |ctx| {
+        ctx.push(("count".into(), prompts.len().to_string()));
+        for prompt in &prompts {
+            ctx.push((prompt.name.clone(), prompt.file_path.display().to_string()));
+        }
+    });
+    harness
+        .log()
+        .info_ctx("prompts", "dedupe_prompts diagnostics", |ctx| {
+            ctx.push(("count".into(), diagnostics.len().to_string()));
+            for (idx, diag) in diagnostics.iter().enumerate() {
+                ctx.push((format!("diag_{idx}"), diag.message.clone()));
+            }
+        });
+
+    let collision = prompts
+        .iter()
+        .find(|p| p.name == "collision")
+        .expect("collision prompt present");
+    assert!(
+        collision
+            .file_path
+            .ends_with(Path::new("global/prompts/collision.md")),
+        "expected global collision prompt to win"
+    );
+
+    let collision_diag = diagnostics
+        .iter()
+        .find(|d| d.kind == DiagnosticKind::Collision)
+        .expect("collision diagnostic present");
+    let info = collision_diag.collision.as_ref().expect("collision info");
+    assert_eq!(info.resource_type, "prompt");
+    assert_eq!(info.name, "collision");
+    assert!(
+        info.winner_path
+            .ends_with(Path::new("global/prompts/collision.md")),
+        "expected winner path to be global collision prompt"
+    );
+    assert!(
+        info.loser_path
+            .ends_with(Path::new("project/.pi/prompts/collision.md")),
+        "expected loser path to be project collision prompt"
     );
 }

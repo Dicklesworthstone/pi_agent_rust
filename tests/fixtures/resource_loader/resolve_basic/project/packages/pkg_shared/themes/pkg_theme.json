@@ -1,0 +1,25 @@
+{
+  "name": "pkg-theme",
+  "version": "1.0",
+  "colors": {
+    "foreground": "#ffffff",
+    "background": "#000000",
+    "accent": "#38bdf8",
+    "success": "#22c55e",
+    "warning": "#f59e0b",
+    "error": "#ef4444",
+    "muted": "#94a3b8"
+  },
+  "syntax": {
+    "keyword": "#38bdf8",
+    "string": "#22c55e",
+    "number": "#a78bfa",
+    "comment": "#94a3b8",
+    "function": "#f59e0b"
+  },
+  "ui": {
+    "border": "#1f2937",
+    "selection": "#111827",
+    "cursor": "#e6e6e6"
+  }
+}

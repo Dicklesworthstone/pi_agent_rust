@@ -820,4 +820,45 @@ mod tests {
 
         let _ = join.join();
     }
+
+    #[test]
+    fn test_dispatch_uses_call_timeout_ms_when_request_timeout_absent() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
+        let addr = listener.local_addr().expect("listener addr");
+
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = ready_tx.send(());
+            let (_stream, _peer) = listener.accept().expect("accept");
+            thread::sleep(std::time::Duration::from_millis(150));
+        });
+        let _ = ready_rx.recv();
+
+        // Default timeout is large; call.timeout_ms should take precedence when params omit it.
+        let connector = HttpConnector::new(HttpConnectorConfig {
+            require_tls: false,
+            default_timeout_ms: 5000,
+            ..Default::default()
+        });
+
+        let call = HostCallPayload {
+            call_id: "call-1".to_string(),
+            capability: "http".to_string(),
+            method: "http".to_string(),
+            params: json!({
+                "url": format!("http://{addr}/"),
+                "method": "GET",
+            }),
+            timeout_ms: Some(50),
+            cancel_token: None,
+            context: None,
+        };
+
+        let result = run_async(async move { connector.dispatch(&call).await.unwrap() });
+        assert!(result.is_error);
+        let error = result.error.expect("error payload");
+        assert_eq!(error.code, HostCallErrorCode::Timeout);
+
+        let _ = join.join();
+    }
 }

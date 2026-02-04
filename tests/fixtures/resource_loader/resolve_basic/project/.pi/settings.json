@@ -1,0 +1,11 @@
+{
+  "packages": [
+    {
+      "source": "./packages/pkg_shared",
+      "extensions": ["pkg_ext.js"],
+      "skills": ["pkg-skill"],
+      "prompts": ["pkg_prompt.md"],
+      "themes": ["pkg_theme.json"]
+    }
+  ]
+}

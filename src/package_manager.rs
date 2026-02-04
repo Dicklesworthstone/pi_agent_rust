@@ -939,7 +939,16 @@ impl ResourceAccumulator {
         }
     }
 
-    fn into_resolved_paths(self) -> ResolvedPaths {
+    fn into_resolved_paths(mut self) -> ResolvedPaths {
+        for items in [
+            &mut self.extensions.items,
+            &mut self.skills.items,
+            &mut self.prompts.items,
+            &mut self.themes.items,
+        ] {
+            items.sort_by(|a, b| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()));
+        }
+
         ResolvedPaths {
             extensions: self.extensions.items,
             skills: self.skills.items,
@@ -1889,6 +1898,7 @@ fn collect_auto_prompt_entries(dir: &Path) -> Vec<PathBuf> {
             out.push(path);
         }
     }
+    out.sort();
     out
 }
 
@@ -1914,6 +1924,7 @@ fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
             out.push(path);
         }
     }
+    out.sort();
     out
 }
 
@@ -2157,20 +2168,43 @@ fn resolve_local_path(input: &str, cwd: &Path) -> PathBuf {
 }
 
 fn normalize_dot_segments(path: &Path) -> PathBuf {
+    use std::ffi::{OsStr, OsString};
     use std::path::Component;
 
     let mut out = PathBuf::new();
+    let mut normals: Vec<OsString> = Vec::new();
+    let mut has_prefix = false;
+    let mut has_root = false;
+
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = out.pop();
+            Component::Prefix(prefix) => {
+                out.push(prefix.as_os_str());
+                has_prefix = true;
             }
-            Component::Normal(part) => out.push(part),
+            Component::RootDir => {
+                out.push(component.as_os_str());
+                has_root = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => match normals.last() {
+                Some(last) if last.as_os_str() != OsStr::new("..") => {
+                    normals.pop();
+                }
+                _ => {
+                    if !has_root && !has_prefix {
+                        normals.push(OsString::from(".."));
+                    }
+                }
+            },
+            Component::Normal(part) => normals.push(part.to_os_string()),
         }
     }
+
+    for part in normals {
+        out.push(part);
+    }
+
     out
 }
 

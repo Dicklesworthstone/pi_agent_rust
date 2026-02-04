@@ -2029,7 +2029,6 @@ pub struct WasmExtension {
 mod wasm_host {
     use super::*;
 
-    use crate::connectors::Connector as _;
     use crate::connectors::http::{HttpConnector, HttpConnectorConfig};
     use std::collections::BTreeSet;
     use wasmtime::component::{Component, Linker};
@@ -2337,24 +2336,24 @@ mod wasm_host {
             // Minimal: map exec -> bash tool (same sandbox semantics).
             let mut params = call.params.clone();
             if params.get("command").is_none() {
-                if let (Some(cmd), Some(args)) = (
-                    params.get("cmd").and_then(Value::as_str),
-                    params.get("args").and_then(Value::as_array),
-                ) {
-                    let args_str = args
-                        .iter()
+                let cmd = params
+                    .get("cmd")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let args_str = params.get("args").and_then(Value::as_array).map(|args| {
+                    args.iter()
                         .filter_map(Value::as_str)
                         .collect::<Vec<_>>()
-                        .join(" ");
+                        .join(" ")
+                });
+                if let (Some(cmd), Some(args_str)) = (cmd, args_str) {
+                    let command = format!("{cmd} {args_str}");
                     if let Some(obj) = params.as_object_mut() {
-                        obj.insert(
-                            "command".to_string(),
-                            Value::String(format!("{cmd} {args_str}")),
-                        );
+                        obj.insert("command".to_string(), Value::String(command));
                         obj.remove("cmd");
                         obj.remove("args");
                     } else {
-                        params = json!({ "command": format!("{cmd} {args_str}") });
+                        params = json!({ "command": command });
                     }
                 }
             }
@@ -2815,6 +2814,169 @@ mod wasm_host {
                 .await
                 .map_err(|err| Error::extension(format!("WASM shutdown failed: {err}")))?;
             Ok(())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use asupersync::runtime::RuntimeBuilder;
+        use serde_json::json;
+        use std::future::Future;
+        use tempfile::tempdir;
+
+        fn run_async<T, Fut>(future: Fut) -> T
+        where
+            Fut: Future<Output = T>,
+        {
+            let runtime = RuntimeBuilder::current_thread()
+                .build()
+                .expect("build asupersync runtime");
+            runtime.block_on(future)
+        }
+
+        fn permissive_policy() -> ExtensionPolicy {
+            ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+            }
+        }
+
+        fn registration_payload() -> RegisterPayload {
+            RegisterPayload {
+                name: "ext.test".to_string(),
+                version: "0.1.0".to_string(),
+                api_version: PROTOCOL_VERSION.to_string(),
+                capabilities: Vec::new(),
+                capability_manifest: Some(CapabilityManifest {
+                    schema: "pi.ext.cap.v1".to_string(),
+                    capabilities: vec![
+                        CapabilityRequirement {
+                            capability: "env".to_string(),
+                            methods: vec!["env".to_string()],
+                            scope: Some(CapabilityScope {
+                                env: Some(vec!["PI_TEST_ENV".to_string()]),
+                                paths: None,
+                                hosts: None,
+                            }),
+                        },
+                        CapabilityRequirement {
+                            capability: "read".to_string(),
+                            methods: vec!["fs".to_string()],
+                            scope: Some(CapabilityScope {
+                                paths: Some(vec![".".to_string()]),
+                                hosts: None,
+                                env: None,
+                            }),
+                        },
+                    ],
+                }),
+                tools: Vec::new(),
+                slash_commands: Vec::new(),
+                event_hooks: Vec::new(),
+            }
+        }
+
+        #[test]
+        fn wasm_host_env_requires_allowlist() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let allowed_call = HostCallPayload {
+                call_id: "call-env-1".to_string(),
+                capability: "env".to_string(),
+                method: "env".to_string(),
+                params: json!({ "name": "PI_TEST_ENV" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let allowed_json = serde_json::to_string(&allowed_call).expect("serialize hostcall");
+            let allowed_out = run_async(async {
+                host::Host::call(&mut state, "env".to_string(), allowed_json).await
+            })
+            .expect("env hostcall ok");
+
+            let out: Value = serde_json::from_str(&allowed_out).expect("parse env output");
+            let values = out
+                .get("values")
+                .and_then(Value::as_object)
+                .expect("values object");
+            assert!(values.get("PI_TEST_ENV").is_some());
+
+            let denied_call = HostCallPayload {
+                call_id: "call-env-2".to_string(),
+                capability: "env".to_string(),
+                method: "env".to_string(),
+                params: json!({ "name": "NOT_ALLOWED_ENV" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let denied_json = serde_json::to_string(&denied_call).expect("serialize hostcall");
+            let err_json = run_async(async {
+                host::Host::call(&mut state, "env".to_string(), denied_json).await
+            })
+            .expect_err("env hostcall denied");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+        }
+
+        #[test]
+        fn wasm_host_fs_respects_manifest_scopes() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+            std::fs::write(dir.path().join("file.txt"), "hello").expect("write file");
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let read_call = HostCallPayload {
+                call_id: "call-fs-read".to_string(),
+                capability: "read".to_string(),
+                method: "fs".to_string(),
+                params: json!({ "op": "read", "path": "file.txt" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let read_json = serde_json::to_string(&read_call).expect("serialize hostcall");
+            let read_out = run_async(async {
+                host::Host::call(&mut state, "fs".to_string(), read_json).await
+            })
+            .expect("fs read ok");
+            let out: Value = serde_json::from_str(&read_out).expect("parse fs output");
+            assert_eq!(out.get("text").and_then(Value::as_str), Some("hello"));
+
+            let write_call = HostCallPayload {
+                call_id: "call-fs-write".to_string(),
+                capability: "write".to_string(),
+                method: "fs".to_string(),
+                params: json!({ "op": "write", "path": "out.txt", "encoding": "utf8", "data": "hi" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let write_json = serde_json::to_string(&write_call).expect("serialize hostcall");
+            let err_json = run_async(async {
+                host::Host::call(&mut state, "fs".to_string(), write_json).await
+            })
+            .expect_err("fs write denied");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
         }
     }
 }
@@ -4986,6 +5148,20 @@ mod tests {
         assert_eq!(
             required_capability_for_host_call(&fs_delete).as_deref(),
             Some("write")
+        );
+
+        let env_get = HostCallPayload {
+            call_id: "call-env-get".to_string(),
+            capability: "env".to_string(),
+            method: "env".to_string(),
+            params: json!({ "name": "HOME" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        assert_eq!(
+            required_capability_for_host_call(&env_get).as_deref(),
+            Some("env")
         );
 
         let unknown = HostCallPayload {

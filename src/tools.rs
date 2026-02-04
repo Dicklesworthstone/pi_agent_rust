@@ -100,6 +100,11 @@ pub const DEFAULT_FIND_LIMIT: usize = 1000;
 /// Default ls result limit.
 pub const DEFAULT_LS_LIMIT: usize = 500;
 
+/// Default timeout (in seconds) for bash tool execution.
+pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 120;
+
+const BASH_TERMINATE_GRACE_SECS: u64 = 5;
+
 /// Result of truncation operation.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -451,20 +456,43 @@ pub struct ProcessedFiles {
 }
 
 fn normalize_dot_segments(path: &Path) -> PathBuf {
+    use std::ffi::{OsStr, OsString};
     use std::path::Component;
 
     let mut out = PathBuf::new();
+    let mut normals: Vec<OsString> = Vec::new();
+    let mut has_prefix = false;
+    let mut has_root = false;
+
     for component in path.components() {
         match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                let _ = out.pop();
+            Component::Prefix(prefix) => {
+                out.push(prefix.as_os_str());
+                has_prefix = true;
             }
-            Component::Normal(part) => out.push(part),
+            Component::RootDir => {
+                out.push(component.as_os_str());
+                has_root = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir => match normals.last() {
+                Some(last) if last.as_os_str() != OsStr::new("..") => {
+                    normals.pop();
+                }
+                _ => {
+                    if !has_root && !has_prefix {
+                        normals.push(OsString::from(".."));
+                    }
+                }
+            },
+            Component::Normal(part) => normals.push(part.to_os_string()),
         }
     }
+
+    for part in normals {
+        out.push(part);
+    }
+
     out
 }
 
@@ -1166,11 +1194,16 @@ pub(crate) async fn run_bash_command(
     timeout_secs: Option<u64>,
     on_update: Option<&(dyn Fn(ToolUpdate) + Send + Sync)>,
 ) -> Result<BashRunResult> {
-    let timeout_secs = timeout_secs.filter(|t| *t > 0);
+    let timeout_secs = match timeout_secs {
+        None => Some(DEFAULT_BASH_TIMEOUT_SECS),
+        Some(0) => None,
+        Some(value) => Some(value),
+    };
     let command = command_prefix.filter(|p| !p.trim().is_empty()).map_or_else(
         || command.to_string(),
         |prefix| format!("{prefix}\n{command}"),
     );
+    let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
 
     if !cwd.exists() {
         return Err(Error::tool(
@@ -1195,6 +1228,7 @@ pub(crate) async fn run_bash_command(
         .arg("-c")
         .arg(&command)
         .current_dir(cwd)
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1224,6 +1258,7 @@ pub(crate) async fn run_bash_command(
     let mut exit_code: Option<i32> = None;
     let start = Instant::now();
     let timeout = timeout_secs.map(Duration::from_secs);
+    let mut terminate_deadline: Option<Instant> = None;
 
     let tick = Duration::from_millis(10);
     loop {
@@ -1240,9 +1275,8 @@ pub(crate) async fn run_bash_command(
             Err(err) => return Err(Error::tool("bash", err.to_string())),
         }
 
-        if let Some(timeout) = timeout {
-            if start.elapsed() >= timeout {
-                timed_out = true;
+        if let Some(deadline) = terminate_deadline {
+            if Instant::now() >= deadline {
                 if let Some(status) = guard
                     .kill()
                     .map_err(|err| Error::tool("bash", format!("Failed to kill process: {err}")))?
@@ -1251,15 +1285,27 @@ pub(crate) async fn run_bash_command(
                 }
                 break; // Guard now owns no child after kill()
             }
+        } else if let Some(timeout) = timeout {
+            if start.elapsed() >= timeout {
+                timed_out = true;
+                let pid = guard.child.as_ref().map(std::process::Child::id);
+                terminate_process_tree(pid);
+                terminate_deadline =
+                    Some(Instant::now() + Duration::from_secs(BASH_TERMINATE_GRACE_SECS));
+            }
         }
 
         sleep(wall_now(), tick).await;
     }
 
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match rx.try_recv() {
             Ok(chunk) => process_bash_chunk(&chunk, &mut bash_output, None).await?,
             Err(mpsc::TryRecvError::Empty) => {
+                if Instant::now() >= drain_deadline {
+                    break;
+                }
                 sleep(wall_now(), tick).await;
             }
             Err(mpsc::TryRecvError::Disconnected) => break,
@@ -1385,7 +1431,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds."
+        "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. `timeout` defaults to 120 seconds; set `timeout: 0` to disable."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -1398,7 +1444,7 @@ impl Tool for BashTool {
                 },
                 "timeout": {
                     "type": "number",
-                    "description": "Timeout in seconds (optional, no default timeout)"
+                    "description": "Timeout in seconds (default 120; set 0 to disable)"
                 }
             },
             "required": ["command"]
@@ -3072,6 +3118,10 @@ impl ProcessGuard {
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) | Err(_) => return,
+            }
             if self.kill_tree {
                 let pid = child.id();
                 kill_process_tree(Some(pid));
@@ -3082,8 +3132,18 @@ impl Drop for ProcessGuard {
     }
 }
 
+fn terminate_process_tree(pid: Option<u32>) {
+    kill_process_tree_with(pid, sysinfo::Signal::Term);
+}
+
 pub fn kill_process_tree(pid: Option<u32>) {
-    let Some(pid) = pid else { return };
+    kill_process_tree_with(pid, sysinfo::Signal::Kill);
+}
+
+fn kill_process_tree_with(pid: Option<u32>, signal: sysinfo::Signal) {
+    let Some(pid) = pid else {
+        return;
+    };
     let root = sysinfo::Pid::from_u32(pid);
 
     let mut sys = sysinfo::System::new();
@@ -3102,7 +3162,12 @@ pub fn kill_process_tree(pid: Option<u32>) {
     // Kill children first.
     for pid in to_kill.into_iter().rev() {
         if let Some(proc_) = sys.process(pid) {
-            let _ = proc_.kill();
+            match proc_.kill_with(signal) {
+                Some(true) => {}
+                Some(false) | None => {
+                    let _ = proc_.kill();
+                }
+            }
         }
     }
 }
@@ -3227,6 +3292,18 @@ mod tests {
         let cwd = PathBuf::from("/home/user/project");
         let result = resolve_path("src/main.rs", &cwd);
         assert_eq!(result, PathBuf::from("/home/user/project/src/main.rs"));
+    }
+
+    #[test]
+    fn test_normalize_dot_segments_preserves_root() {
+        let result = normalize_dot_segments(std::path::Path::new("/../etc/passwd"));
+        assert_eq!(result, PathBuf::from("/etc/passwd"));
+    }
+
+    #[test]
+    fn test_normalize_dot_segments_preserves_leading_parent_for_relative() {
+        let result = normalize_dot_segments(std::path::Path::new("../a/../b"));
+        assert_eq!(result, PathBuf::from("../b"));
     }
 
     #[test]

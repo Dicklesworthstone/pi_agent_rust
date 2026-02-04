@@ -455,6 +455,8 @@ fn kill_process_tree(root_pid: Pid) {
 4. Process tree walked and all descendants killed
 5. Exit code set to indicate timeout vs. normal termination
 
+To avoid orphaned background jobs (e.g. `cmd &`), the bash script installs an `EXIT` trap that waits for any remaining child processes and then exits with the original command's status.
+
 This prevents the common failure mode where killing a shell leaves its children running.
 
 ### Session Tree Structure
@@ -565,6 +567,7 @@ Input: { "command": "cargo test", "timeout": 120 }
 ```
 
 - Default 120s timeout, configurable per-call
+- Set `timeout: 0` to disable the default timeout
 - Process tree cleanup on timeout (kills children)
 - Rolling buffer for real-time output
 - Full output saved to temp file if truncated

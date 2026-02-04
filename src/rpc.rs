@@ -2185,10 +2185,13 @@ async fn run_bash_rpc(
         "sh"
     };
 
+    let command = format!("trap 'code=$?; wait; exit $code' EXIT\n{command}");
+
     let mut child = std::process::Command::new(shell)
         .arg("-c")
-        .arg(command)
+        .arg(&command)
         .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -2204,8 +2207,9 @@ async fn run_bash_rpc(
 
     let (tx, rx) = std::sync::mpsc::channel::<StreamChunk>();
     let tx_stdout = tx.clone();
-    std::thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));
-    std::thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
+    let stdout_handle =
+        std::thread::spawn(move || pump_stream(stdout, tx_stdout, StreamKind::Stdout));
+    let stderr_handle = std::thread::spawn(move || pump_stream(stderr, tx, StreamKind::Stderr));
 
     let tick = Duration::from_millis(10);
     let mut stdout_bytes = Vec::new();
@@ -2253,6 +2257,8 @@ async fn run_bash_rpc(
             Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
         }
     }
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
 
     let mut combined = stdout_bytes;
     combined.extend_from_slice(&stderr_bytes);
