@@ -2324,7 +2324,12 @@ fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
                 let _ = writeln!(&mut out, "{message}");
             }
             for (idx, opt) in options.iter().enumerate() {
-                let label = opt.get("label").and_then(Value::as_str).unwrap_or("");
+                let label = opt
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .or_else(|| opt.get("value").and_then(Value::as_str))
+                    .or_else(|| opt.as_str())
+                    .unwrap_or("");
                 let _ = writeln!(&mut out, "  {}) {label}", idx + 1);
             }
             out.push_str("\nEnter a number, label, or 'cancel'.");
@@ -2377,12 +2382,15 @@ fn parse_extension_ui_response(
             if let Ok(index) = trimmed.parse::<usize>() {
                 if index > 0 && index <= options.len() {
                     let chosen = &options[index - 1];
-                    let value = chosen.get("value").cloned().or_else(|| {
-                        chosen
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .map(|s| Value::String(s.to_string()))
-                    });
+                    let value = chosen
+                        .get("value")
+                        .cloned()
+                        .or_else(|| chosen.get("label").cloned())
+                        .or_else(|| {
+                            chosen
+                                .as_str()
+                                .map(|s| Value::String(s.to_string()))
+                        });
                     return Ok(ExtensionUiResponse {
                         id: request.id.clone(),
                         value,
@@ -2393,6 +2401,16 @@ fn parse_extension_ui_response(
 
             let lowered = trimmed.to_lowercase();
             for option in options {
+                if let Some(value_str) = option.as_str() {
+                    if value_str.to_lowercase() == lowered {
+                        return Ok(ExtensionUiResponse {
+                            id: request.id.clone(),
+                            value: Some(Value::String(value_str.to_string())),
+                            cancelled: false,
+                        });
+                    }
+                }
+
                 let label = option.get("label").and_then(Value::as_str).unwrap_or("");
                 if !label.is_empty() && label.to_lowercase() == lowered {
                     let value = option.get("value").cloned().or_else(|| {
@@ -5262,6 +5280,8 @@ impl PiApp {
                     .payload
                     .get("level")
                     .and_then(Value::as_str)
+                    .or_else(|| request.payload.get("notifyType").and_then(Value::as_str))
+                    .or_else(|| request.payload.get("notify_type").and_then(Value::as_str))
                     .unwrap_or("info");
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
@@ -5271,15 +5291,61 @@ impl PiApp {
                 self.scroll_to_bottom();
             }
             "setStatus" | "set_status" => {
-                if let Some(text) = request.payload.get("text").and_then(Value::as_str) {
-                    self.status_message = Some(text.to_string());
+                let status_text = request
+                    .payload
+                    .get("statusText")
+                    .and_then(Value::as_str)
+                    .or_else(|| request.payload.get("status_text").and_then(Value::as_str))
+                    .or_else(|| request.payload.get("text").and_then(Value::as_str))
+                    .unwrap_or("");
+                if !status_text.is_empty() {
+                    let status_key = request
+                        .payload
+                        .get("statusKey")
+                        .and_then(Value::as_str)
+                        .or_else(|| request.payload.get("status_key").and_then(Value::as_str))
+                        .unwrap_or("");
+
+                    self.status_message = Some(if status_key.is_empty() {
+                        status_text.to_string()
+                    } else {
+                        format!("{status_key}: {status_text}")
+                    });
                 }
             }
             "setWidget" | "set_widget" => {
-                if let Some(content) = request.payload.get("content").and_then(Value::as_str) {
+                let widget_key = request
+                    .payload
+                    .get("widgetKey")
+                    .and_then(Value::as_str)
+                    .or_else(|| request.payload.get("widget_key").and_then(Value::as_str))
+                    .unwrap_or("widget");
+
+                let content = request
+                    .payload
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        request
+                            .payload
+                            .get("widgetLines")
+                            .or_else(|| request.payload.get("widget_lines"))
+                            .or_else(|| request.payload.get("lines"))
+                            .and_then(Value::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(Value::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                    });
+
+                if let Some(content) = content {
                     self.messages.push(ConversationMessage {
                         role: MessageRole::System,
-                        content: format!("Extension widget:\n{content}"),
+                        content: format!("Extension widget ({widget_key}):\n{content}"),
                         thinking: None,
                     });
                     self.scroll_to_bottom();
@@ -7986,6 +8052,7 @@ fn normalize_raw_terminal_newlines(input: String) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn normalize_raw_terminal_newlines_inserts_crlf() {
@@ -8014,6 +8081,50 @@ mod tests {
         let (command, exclude) = parse_bash_command("!! ls -la").expect("double bang command");
         assert_eq!(command, "ls -la");
         assert!(exclude);
+    }
+
+    #[test]
+    fn extension_ui_select_accepts_string_options() {
+        let request = ExtensionUiRequest::new(
+            "req-1",
+            "select",
+            json!({
+                "title": "Pick a color",
+                "options": ["red", "green", "blue"],
+            }),
+        );
+
+        let prompt = format_extension_ui_prompt(&request);
+        assert!(prompt.contains("1) red"));
+        assert!(prompt.contains("2) green"));
+        assert!(prompt.contains("3) blue"));
+
+        let response = parse_extension_ui_response(&request, "2").expect("parse selection");
+        assert_eq!(response.value, Some(json!("green")));
+
+        let response = parse_extension_ui_response(&request, "red").expect("parse selection");
+        assert_eq!(response.value, Some(json!("red")));
+    }
+
+    #[test]
+    fn extension_ui_select_accepts_object_options() {
+        let request = ExtensionUiRequest::new(
+            "req-1",
+            "select",
+            json!({
+                "title": "Pick",
+                "options": [
+                    { "label": "A", "value": "alpha" },
+                    { "label": "B" },
+                ],
+            }),
+        );
+
+        let response = parse_extension_ui_response(&request, "1").expect("parse selection");
+        assert_eq!(response.value, Some(json!("alpha")));
+
+        let response = parse_extension_ui_response(&request, "B").expect("parse selection");
+        assert_eq!(response.value, Some(json!("B")));
     }
 
     #[cfg(all(feature = "clipboard", feature = "image-resize"))]
