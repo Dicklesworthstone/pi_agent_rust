@@ -200,23 +200,134 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn event_name_matches_expected_strings() {
-        let event = ExtensionEvent::ToolCall {
-            tool_name: "read".to_string(),
-            tool_call_id: "call-1".to_string(),
-            input: Value::Null,
-        };
-        assert_eq!(event.event_name(), "tool_call");
-    }
+        fn sample_message() -> Message {
+            Message::Custom(crate::model::CustomMessage {
+                content: "hi".to_string(),
+                custom_type: "test".to_string(),
+                display: true,
+                details: None,
+                timestamp: 0,
+            })
+        }
 
-    #[test]
-    fn event_serializes_with_type_tag() {
-        let event = ExtensionEvent::Startup {
-            version: "0.1.0".to_string(),
-            session_file: None,
-        };
-        let value = serde_json::to_value(event).expect("serialize");
-        assert_eq!(value.get("type").and_then(Value::as_str), Some("startup"));
+        fn sample_assistant_message() -> AssistantMessage {
+            AssistantMessage {
+                content: vec![ContentBlock::Text(crate::model::TextContent::new("ok"))],
+                api: "test".to_string(),
+                provider: "test".to_string(),
+                model: "test".to_string(),
+                usage: crate::model::Usage::default(),
+                stop_reason: crate::model::StopReason::Stop,
+                error_message: None,
+                timestamp: 0,
+            }
+        }
+
+        fn sample_tool_result() -> ToolResultMessage {
+            ToolResultMessage {
+                tool_call_id: "call-1".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ContentBlock::Text(crate::model::TextContent::new("ok"))],
+                details: None,
+                is_error: false,
+                timestamp: 0,
+            }
+        }
+
+        fn sample_image() -> ImageContent {
+            ImageContent {
+                data: "BASE64".to_string(),
+                mime_type: "image/png".to_string(),
+            }
+        }
+
+        let cases: Vec<(ExtensionEvent, &str)> = vec![
+            (
+                ExtensionEvent::Startup {
+                    version: "0.1.0".to_string(),
+                    session_file: None,
+                },
+                "startup",
+            ),
+            (
+                ExtensionEvent::AgentStart {
+                    session_id: "s".to_string(),
+                },
+                "agent_start",
+            ),
+            (
+                ExtensionEvent::AgentEnd {
+                    session_id: "s".to_string(),
+                    messages: vec![sample_message()],
+                    error: None,
+                },
+                "agent_end",
+            ),
+            (
+                ExtensionEvent::TurnStart {
+                    session_id: "s".to_string(),
+                    turn_index: 0,
+                },
+                "turn_start",
+            ),
+            (
+                ExtensionEvent::TurnEnd {
+                    session_id: "s".to_string(),
+                    turn_index: 0,
+                    message: sample_assistant_message(),
+                    tool_results: vec![sample_tool_result()],
+                },
+                "turn_end",
+            ),
+            (
+                ExtensionEvent::ToolCall {
+                    tool_name: "read".to_string(),
+                    tool_call_id: "call-1".to_string(),
+                    input: json!({ "path": "a.txt" }),
+                },
+                "tool_call",
+            ),
+            (
+                ExtensionEvent::ToolResult {
+                    tool_name: "read".to_string(),
+                    tool_call_id: "call-1".to_string(),
+                    input: json!({ "path": "a.txt" }),
+                    content: vec![ContentBlock::Text(crate::model::TextContent::new("ok"))],
+                    details: Some(json!({ "k": "v" })),
+                    is_error: false,
+                },
+                "tool_result",
+            ),
+            (
+                ExtensionEvent::SessionBeforeSwitch {
+                    current_session: None,
+                    target_session: "next".to_string(),
+                },
+                "session_before_switch",
+            ),
+            (
+                ExtensionEvent::SessionBeforeFork {
+                    current_session: Some("cur".to_string()),
+                    fork_entry_id: "entry-1".to_string(),
+                },
+                "session_before_fork",
+            ),
+            (
+                ExtensionEvent::Input {
+                    content: "hello".to_string(),
+                    attachments: vec![sample_image()],
+                },
+                "input",
+            ),
+        ];
+
+        for (event, expected) in cases {
+            assert_eq!(event.event_name(), expected);
+            let value = serde_json::to_value(&event).expect("serialize");
+            assert_eq!(value.get("type").and_then(Value::as_str), Some(expected));
+        }
     }
 
     #[test]
@@ -230,5 +341,27 @@ mod tests {
                 reason: Some("nope".to_string())
             }
         );
+    }
+
+    #[test]
+    fn result_types_deserialize_all() {
+        let tool_call: ToolCallEventResult =
+            serde_json::from_value(json!({ "block": true })).expect("deserialize tool_call");
+        assert!(tool_call.block);
+        assert_eq!(tool_call.reason, None);
+
+        let tool_result: ToolResultEventResult = serde_json::from_value(json!({
+            "content": [{ "type": "text", "text": "hello" }],
+            "details": { "k": "v" }
+        }))
+        .expect("deserialize tool_result");
+        assert!(tool_result.content.is_some());
+        assert_eq!(tool_result.details, Some(json!({ "k": "v" })));
+
+        let input: InputEventResult =
+            serde_json::from_value(json!({ "content": "hi" })).expect("deserialize input");
+        assert_eq!(input.content.as_deref(), Some("hi"));
+        assert!(!input.block);
+        assert_eq!(input.reason, None);
     }
 }

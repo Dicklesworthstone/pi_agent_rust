@@ -201,6 +201,16 @@ pub struct HostcallRequest {
     pub extension_id: Option<String>,
 }
 
+/// Tool definition registered by a JS extension.
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Debug, Clone, serde::Deserialize, PartialEq)]
+pub struct ExtensionToolDef {
+    pub name: String,
+    pub label: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+}
+
 fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
@@ -1761,6 +1771,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         self.hostcall_tracker.borrow().pending_count()
     }
 
+    /// Get all tools registered by loaded JS extensions.
+    pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
+        self.interrupt_budget.reset();
+        let value = match self
+            .context
+            .with(|ctx| {
+                let global = ctx.globals();
+                let getter: Function<'_> = global.get("__pi_get_registered_tools")?;
+                let tools: Value<'_> = getter.call(())?;
+                js_to_json(&tools)
+            })
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => return Err(self.map_quickjs_error(&err)),
+        };
+
+        serde_json::from_value(value).map_err(|err| Error::Json(Box::new(err)))
+    }
+
     /// Enqueue a hostcall completion to be delivered on next tick.
     pub fn complete_hostcall(&self, call_id: impl Into<String>, outcome: HostcallOutcome) {
         self.scheduler
@@ -2709,6 +2739,18 @@ function __pi_register_tool(spec) {
     const record = { extensionId: ext.id, spec: toolSpec, execute: spec.execute };
     ext.tools.set(name, record);
     __pi_tool_index.set(name, record);
+}
+
+function __pi_get_registered_tools() {
+    const names = Array.from(__pi_tool_index.keys()).map((v) => String(v));
+    names.sort();
+    const out = [];
+    for (const name of names) {
+        const record = __pi_tool_index.get(name);
+        if (!record || !record.spec) continue;
+        out.push(record.spec);
+    }
+    return out;
 }
 
 function __pi_register_command(name, spec) {
@@ -4082,6 +4124,91 @@ mod tests {
             let requests = runtime.drain_hostcall_requests();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].extension_id.as_deref(), Some("ext.test"));
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_get_registered_tools_empty() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            let tools = runtime.get_registered_tools().await.expect("get tools");
+            assert!(tools.is_empty());
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_get_registered_tools_single_tool() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                __pi_begin_extension('ext.test', { name: 'Test' });
+                pi.registerTool({
+                    name: 'my_tool',
+                    label: 'My Tool',
+                    description: 'Does stuff',
+                    parameters: { type: 'object', properties: { path: { type: 'string' } } },
+                    execute: async (_callId, _input) => { return { ok: true }; },
+                });
+                __pi_end_extension();
+            ",
+                )
+                .await
+                .expect("eval");
+
+            let tools = runtime.get_registered_tools().await.expect("get tools");
+            assert_eq!(tools.len(), 1);
+            assert_eq!(
+                tools[0],
+                ExtensionToolDef {
+                    name: "my_tool".to_string(),
+                    label: "My Tool".to_string(),
+                    description: "Does stuff".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        }
+                    }),
+                }
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_runtime_get_registered_tools_sorts_by_name() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                __pi_begin_extension('ext.test', { name: 'Test' });
+                pi.registerTool({ name: 'b', execute: async (_callId, _input) => { return {}; } });
+                pi.registerTool({ name: 'a', execute: async (_callId, _input) => { return {}; } });
+                __pi_end_extension();
+            ",
+                )
+                .await
+                .expect("eval");
+
+            let tools = runtime.get_registered_tools().await.expect("get tools");
+            assert_eq!(
+                tools
+                    .iter()
+                    .map(|tool| tool.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["a", "b"]
+            );
         });
     }
 

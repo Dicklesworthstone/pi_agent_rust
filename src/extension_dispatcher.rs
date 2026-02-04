@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use crate::connectors::http::HttpConnector;
 use crate::error::Result;
 use crate::extensions::{ExtensionSession, ExtensionUiRequest, ExtensionUiResponse};
-use crate::extensions_js::{HostcallRequest, PiJsRuntime};
+use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime};
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
 use crate::tools::ToolRegistry;
 
@@ -58,6 +58,56 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[must_use]
     pub fn drain_hostcall_requests(&self) -> VecDeque<HostcallRequest> {
         self.runtime.drain_hostcall_requests()
+    }
+
+    /// Dispatch a hostcall and enqueue its completion into the JS scheduler.
+    #[allow(clippy::future_not_send)]
+    pub async fn dispatch_and_complete(&self, request: HostcallRequest) {
+        let HostcallRequest {
+            call_id,
+            kind,
+            payload,
+            ..
+        } = request;
+
+        let outcome = match kind {
+            HostcallKind::Tool { name } => self.dispatch_tool(&call_id, &name, payload).await,
+            other => HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: format!("Unsupported hostcall kind: {other:?}"),
+            },
+        };
+
+        self.runtime.complete_hostcall(call_id, outcome);
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_tool(
+        &self,
+        call_id: &str,
+        name: &str,
+        payload: serde_json::Value,
+    ) -> HostcallOutcome {
+        let Some(tool) = self.tool_registry.get(name) else {
+            return HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: format!("Unknown tool: {name}"),
+            };
+        };
+
+        match tool.execute(call_id, payload, None).await {
+            Ok(output) => match serde_json::to_value(output) {
+                Ok(value) => HostcallOutcome::Success(value),
+                Err(err) => HostcallOutcome::Error {
+                    code: "internal".to_string(),
+                    message: format!("Serialize tool output: {err}"),
+                },
+            },
+            Err(err) => HostcallOutcome::Error {
+                code: "tool_error".to_string(),
+                message: err.to_string(),
+            },
+        }
     }
 }
 
@@ -193,6 +243,102 @@ mod tests {
             let dispatcher = build_dispatcher(Rc::clone(&runtime));
             let drained = dispatcher.drain_hostcall_requests();
             assert_eq!(drained.len(), 1);
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_hostcall_executes_and_resolves_promise() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp_dir.path().join("test.txt"), "hello world").expect("write file");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.tool("read", { path: "test.txt" }).then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["read"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            let stats = runtime.tick().await.expect("tick");
+            assert!(stats.ran_macrotask);
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("Promise not resolved");
+                    if (!JSON.stringify(globalThis.result).includes("hello world")) {
+                        throw new Error("Wrong result: " + JSON.stringify(globalThis.result));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify result");
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_hostcall_unknown_tool_rejects_promise() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.tool("nope", {}).catch((e) => { globalThis.err = e.code; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err !== "invalid_request") {
+                        throw new Error("Wrong error code: " + globalThis.err);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify error");
         });
     }
 }
