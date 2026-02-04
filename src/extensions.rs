@@ -6216,15 +6216,16 @@ mod tests {
             "hello"
         );
 
-        match read_outcome {
-            HostcallOutcome::Success(value) => {
-                let encoded = serde_json::to_string(&value).expect("serialize read output");
-                assert!(encoded.contains("hello"));
+        let value = match read_outcome {
+            HostcallOutcome::Success(value) => value,
+            HostcallOutcome::Error { code, message } => {
+                assert!(false, "expected read success, got error {code}: {message}");
+                return;
             }
-            other @ HostcallOutcome::Error { .. } => {
-                panic!("expected read success, got {other:?}")
-            }
-        }
+        };
+
+        let encoded = serde_json::to_string(&value).expect("serialize read output");
+        assert!(encoded.contains("hello"));
 
         let decisions = events
             .iter()
