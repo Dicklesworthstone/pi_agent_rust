@@ -2760,6 +2760,92 @@ impl JsExtensionRuntimeHandle {
             .await
             .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
     }
+
+    pub async fn dispatch_event(
+        &self,
+        event_name: String,
+        event_payload: Value,
+        ctx_payload: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::DispatchEvent {
+                    event_name,
+                    event_payload,
+                    ctx_payload,
+                    timeout_ms,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn execute_tool(
+        &self,
+        tool_name: String,
+        tool_call_id: String,
+        input: Value,
+        ctx_payload: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ExecuteTool {
+                    tool_name,
+                    tool_call_id,
+                    input,
+                    ctx_payload,
+                    timeout_ms,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn execute_command(
+        &self,
+        command_name: String,
+        args: String,
+        ctx_payload: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ExecuteCommand {
+                    command_name,
+                    args,
+                    ctx_payload,
+                    timeout_ms,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -3538,7 +3624,49 @@ impl ExtensionManager {
         event: ExtensionEventName,
         data: Option<Value>,
     ) -> Result<()> {
-        let _ = (event, data); // Stub - extension runtime not yet implemented
+        let Some(runtime) = self.js_runtime() else {
+            return Ok(());
+        };
+
+        let (has_ui, session) = {
+            let guard = self.inner.lock().unwrap();
+            (guard.ui_sender.is_some(), guard.session.clone())
+        };
+
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("hasUI".to_string(), Value::Bool(has_ui));
+        if let Ok(cwd) = std::env::current_dir() {
+            ctx.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+        }
+
+        if let Some(session) = session {
+            let state = session.get_state().await;
+            let entries = session.get_entries().await;
+            let branch = session.get_branch().await;
+            let leaf_entry = entries.last().cloned().unwrap_or(Value::Null);
+            ctx.insert("sessionState".to_string(), state);
+            ctx.insert("sessionEntries".to_string(), Value::Array(entries));
+            ctx.insert("sessionBranch".to_string(), Value::Array(branch));
+            ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
+        }
+
+        let mut event_payload = data.unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut event_payload {
+            map.entry("type".to_string())
+                .or_insert_with(|| Value::String(event.to_string()));
+        } else if event_payload.is_null() {
+            event_payload = json!({ "type": event.to_string() });
+        }
+
+        let _ = runtime
+            .dispatch_event(
+                event.to_string(),
+                event_payload,
+                Value::Object(ctx),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await?;
+
         Ok(())
     }
 
@@ -3547,10 +3675,60 @@ impl ExtensionManager {
         &self,
         event: ExtensionEventName,
         data: Option<Value>,
-        _timeout_ms: u64,
+        timeout_ms: u64,
     ) -> Result<bool> {
-        let _ = (event, data); // Stub - extension runtime not yet implemented
-        Ok(false) // Not cancelled
+        let Some(runtime) = self.js_runtime() else {
+            return Ok(false);
+        };
+
+        let (has_ui, session) = {
+            let guard = self.inner.lock().unwrap();
+            (guard.ui_sender.is_some(), guard.session.clone())
+        };
+
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("hasUI".to_string(), Value::Bool(has_ui));
+        if let Ok(cwd) = std::env::current_dir() {
+            ctx.insert("cwd".to_string(), Value::String(cwd.display().to_string()));
+        }
+
+        if let Some(session) = session {
+            let state = session.get_state().await;
+            let entries = session.get_entries().await;
+            let branch = session.get_branch().await;
+            let leaf_entry = entries.last().cloned().unwrap_or(Value::Null);
+            ctx.insert("sessionState".to_string(), state);
+            ctx.insert("sessionEntries".to_string(), Value::Array(entries));
+            ctx.insert("sessionBranch".to_string(), Value::Array(branch));
+            ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
+        }
+
+        let mut event_payload = data.unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut event_payload {
+            map.entry("type".to_string())
+                .or_insert_with(|| Value::String(event.to_string()));
+        } else if event_payload.is_null() {
+            event_payload = json!({ "type": event.to_string() });
+        }
+
+        let response = runtime
+            .dispatch_event(
+                event.to_string(),
+                event_payload,
+                Value::Object(ctx),
+                timeout_ms,
+            )
+            .await?;
+
+        Ok(response.as_bool() == Some(false)
+            || response
+                .get("cancelled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            || response
+                .get("cancel")
+                .and_then(Value::as_bool)
+                .unwrap_or(false))
     }
 }
 
