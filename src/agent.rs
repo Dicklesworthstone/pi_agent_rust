@@ -1580,15 +1580,15 @@ mod turn_event_tests {
 
             assert!(assistant_message_end < turn_end_indices[0]);
 
-            if let AgentEvent::TurnEnd {
-                message,
-                tool_results,
-            } = &events[turn_end_indices[0]]
-            {
-                assert!(matches!(message, Message::Assistant(_)));
-                assert!(tool_results.is_empty());
-            } else {
-                panic!("Expected TurnEnd event");
+            match &events[turn_end_indices[0]] {
+                AgentEvent::TurnEnd {
+                    message,
+                    tool_results,
+                } => {
+                    assert!(matches!(message, Message::Assistant(_)));
+                    assert!(tool_results.is_empty());
+                }
+                other => assert!(false, "Expected TurnEnd event, got {other:?}"),
             }
         });
     }
@@ -1721,7 +1721,7 @@ mod tests {
                 content: UserContent::Text(text),
                 ..
             }) => assert_eq!(text, expected),
-            other => panic!("expected user text message, got {other:?}"),
+            other => assert!(false, "expected user text message, got {other:?}"),
         }
     }
 

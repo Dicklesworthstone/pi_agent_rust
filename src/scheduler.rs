@@ -540,7 +540,7 @@ mod tests {
         assert!(task.is_some());
         match task.unwrap().kind {
             MacrotaskKind::TimerFired { timer_id: id } => assert_eq!(id, timer_id),
-            _ => panic!("Expected TimerFired"),
+            other => assert!(false, "Expected TimerFired, got {other:?}"),
         }
     }
 
@@ -564,15 +564,15 @@ mod tests {
 
         match task1.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t1),
-            _ => panic!("Expected t1"),
+            other => assert!(false, "Expected t1, got {other:?}"),
         }
         match task2.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t2),
-            _ => panic!("Expected t2"),
+            other => assert!(false, "Expected t2, got {other:?}"),
         }
         match task3.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t3),
-            _ => panic!("Expected t3"),
+            other => assert!(false, "Expected t3, got {other:?}"),
         }
     }
 
@@ -595,15 +595,15 @@ mod tests {
         // Must fire in order they were created (by seq)
         match task1.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t1),
-            _ => panic!("Expected t1"),
+            other => assert!(false, "Expected t1, got {other:?}"),
         }
         match task2.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t2),
-            _ => panic!("Expected t2"),
+            other => assert!(false, "Expected t2, got {other:?}"),
         }
         match task3.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t3),
-            _ => panic!("Expected t3"),
+            other => assert!(false, "Expected t3, got {other:?}"),
         }
     }
 
@@ -625,7 +625,7 @@ mod tests {
         let task = sched.tick().unwrap();
         match task.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t2),
-            _ => panic!("Expected t2"),
+            other => assert!(false, "Expected t2, got {other:?}"),
         }
 
         // No more tasks
@@ -648,10 +648,10 @@ mod tests {
                 assert_eq!(call_id, "call-1");
                 match outcome {
                     HostcallOutcome::Success(v) => assert_eq!(v["result"], 42),
-                    HostcallOutcome::Error { .. } => panic!("Expected success"),
+                    HostcallOutcome::Error { .. } => assert!(false, "Expected success"),
                 }
             }
-            _ => panic!("Expected HostcallComplete"),
+            other => assert!(false, "Expected HostcallComplete, got {other:?}"),
         }
     }
 
@@ -670,11 +670,11 @@ mod tests {
 
         match task1.kind {
             MacrotaskKind::InboundEvent { event_id, .. } => assert_eq!(event_id, "evt-1"),
-            _ => panic!("Expected evt-1"),
+            other => assert!(false, "Expected evt-1, got {other:?}"),
         }
         match task2.kind {
             MacrotaskKind::InboundEvent { event_id, .. } => assert_eq!(event_id, "evt-2"),
-            _ => panic!("Expected evt-2"),
+            other => assert!(false, "Expected evt-2, got {other:?}"),
         }
     }
 
@@ -696,14 +696,14 @@ mod tests {
         let task1 = sched.tick().unwrap();
         match task1.kind {
             MacrotaskKind::InboundEvent { event_id, .. } => assert_eq!(event_id, "evt-1"),
-            _ => panic!("Expected event first"),
+            other => assert!(false, "Expected event first, got {other:?}"),
         }
 
         // Then timer
         let task2 = sched.tick().unwrap();
         match task2.kind {
             MacrotaskKind::TimerFired { .. } => {}
-            _ => panic!("Expected timer second"),
+            other => assert!(false, "Expected timer second, got {other:?}"),
         }
     }
 
