@@ -2158,6 +2158,81 @@ mod tests {
     }
 
     #[test]
+    fn pijs_hostcall_timeout_rejects_promise() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let mut config = PiJsRuntimeConfig::default();
+            config.limits.hostcall_timeout_ms = Some(50);
+
+            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.done = false;
+                    globalThis.code = null;
+                    pi.tool("read", { path: "test.txt" })
+                        .then(() => { globalThis.done = true; })
+                        .catch((e) => { globalThis.code = e.code; globalThis.done = true; });
+                    "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            clock.set(50);
+            let stats = runtime.tick().await.expect("tick");
+            assert!(stats.ran_macrotask);
+            assert_eq!(stats.hostcalls_timed_out, 1);
+            assert_eq!(
+                get_global_json(&runtime, "done").await,
+                serde_json::json!(true)
+            );
+            assert_eq!(
+                get_global_json(&runtime, "code").await,
+                serde_json::json!("timeout")
+            );
+
+            // Late completions should be ignored.
+            runtime.complete_hostcall(
+                requests[0].call_id.clone(),
+                HostcallOutcome::Success(serde_json::json!({ "ok": true })),
+            );
+            let stats = runtime.tick().await.expect("tick late completion");
+            assert!(stats.ran_macrotask);
+            assert_eq!(stats.hostcalls_timed_out, 1);
+        });
+    }
+
+    #[test]
+    fn pijs_interrupt_budget_aborts_eval() {
+        futures::executor::block_on(async {
+            let mut config = PiJsRuntimeConfig::default();
+            config.limits.interrupt_budget = Some(0);
+
+            let runtime = PiJsRuntime::with_clock_and_config(DeterministicClock::new(0), config)
+                .await
+                .expect("create runtime");
+
+            let err = runtime
+                .eval(
+                    r#"
+                    let sum = 0;
+                    for (let i = 0; i < 1000000; i++) { sum += i; }
+                    "#,
+                )
+                .await
+                .expect_err("expected budget exceed");
+
+            assert!(err.to_string().contains("PiJS execution budget exceeded"));
+        });
+    }
+
+    #[test]
     fn pijs_microtasks_drain_before_next_macrotask() {
         futures::executor::block_on(async {
             let clock = Arc::new(DeterministicClock::new(0));
