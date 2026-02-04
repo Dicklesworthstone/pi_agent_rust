@@ -26,7 +26,7 @@ use sha2::Digest as _;
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
