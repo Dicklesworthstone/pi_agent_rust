@@ -964,11 +964,11 @@ impl Tool for ReadTool {
                     "description": "Path to the file to read (relative or absolute)"
                 },
                 "offset": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Line number to start reading from (1-indexed)"
                 },
                 "limit": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Maximum number of lines to read"
                 }
             },
@@ -1443,7 +1443,7 @@ impl Tool for BashTool {
                     "description": "Bash command to execute"
                 },
                 "timeout": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Timeout in seconds (default 120; set 0 to disable)"
                 }
             },
@@ -2260,11 +2260,11 @@ impl Tool for GrepTool {
                     "description": "Treat pattern as literal string instead of regex (default: false)"
                 },
                 "context": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Number of lines to show before and after each match (default: 0)"
                 },
                 "limit": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Maximum number of matches to return (default: 100)"
                 }
             },
@@ -2616,7 +2616,7 @@ impl Tool for FindTool {
                     "description": "Directory to search in (default: current directory)"
                 },
                 "limit": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Maximum number of results (default: 1000)"
                 }
             },
@@ -2898,7 +2898,7 @@ impl Tool for LsTool {
                     "description": "Directory to list (default: current directory)"
                 },
                 "limit": {
-                    "type": "number",
+                    "type": "integer",
                     "description": "Maximum number of entries to return (default: 500)"
                 }
             }
