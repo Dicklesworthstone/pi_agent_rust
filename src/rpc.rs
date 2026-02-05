@@ -560,8 +560,13 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
+                    let inner_session = guard
+                        .session
+                        .lock(&cx)
+                        .await
+                        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
                     session_state(
-                        &guard,
+                        &inner_session,
                         &options,
                         &snapshot,
                         is_streaming.load(Ordering::SeqCst),
@@ -934,7 +939,11 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    guard.session.append_session_info(Some(name.to_string()));
+                    {
+                        let mut inner_session = guard.session.lock(&cx).await
+                            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                        inner_session.append_session_info(Some(name.to_string()));
+                    }
                     guard.persist_session().await?;
                 }
                 let _ = out_tx.send(response_ok(id, "set_session_name", None));
@@ -946,7 +955,9 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    last_assistant_text(&guard.session)
+                    let inner_session = guard.session.lock(&cx).await
+                        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                    last_assistant_text(&inner_session)
                 };
                 let _ = out_tx.send(response_ok(
                     id,
@@ -965,7 +976,9 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    export_html(&guard.session, output_path.as_deref()).await?
+                    let inner_session = guard.session.lock(&cx).await
+                        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
+                    export_html(&inner_session, output_path.as_deref()).await?
                 };
                 let _ = out_tx.send(response_ok(
                     id,
@@ -1953,18 +1966,17 @@ fn rpc_model_from_entry(entry: &ModelEntry) -> Value {
 }
 
 fn session_state(
-    session: &AgentSession,
+    session: &crate::session::Session,
     options: &RpcOptions,
     snapshot: &RpcStateSnapshot,
     is_streaming: bool,
     is_compacting: bool,
 ) -> Value {
     let model = session
-        .session
         .header
         .provider
         .as_deref()
-        .zip(session.session.header.model_id.as_deref())
+        .zip(session.header.model_id.as_deref())
         .and_then(|(provider, model_id)| {
             options
                 .available_models
@@ -1974,14 +1986,12 @@ fn session_state(
         .map(rpc_model_from_entry);
 
     let message_count = session
-        .session
         .entries_for_current_path()
         .iter()
         .filter(|entry| matches!(entry, crate::session::SessionEntry::Message(_)))
         .count();
 
     let session_name = session
-        .session
         .entries_for_current_path()
         .iter()
         .rev()
@@ -1998,7 +2008,6 @@ fn session_state(
         "thinkingLevel".to_string(),
         Value::String(
             session
-                .session
                 .header
                 .thinking_level
                 .clone()
@@ -2018,14 +2027,13 @@ fn session_state(
     state.insert(
         "sessionFile".to_string(),
         session
-            .session
             .path
             .as_ref()
             .map_or(Value::Null, |p| Value::String(p.display().to_string())),
     );
     state.insert(
         "sessionId".to_string(),
-        Value::String(session.session.header.id.clone()),
+        Value::String(session.header.id.clone()),
     );
     state.insert(
         "sessionName".to_string(),

@@ -3956,6 +3956,8 @@ impl PiApp {
         save_enabled: bool,
         extensions: Option<ExtensionManager>,
         keybindings_override: Option<KeyBindings>,
+        messages: Vec<ConversationMessage>,
+        total_usage: Usage,
     ) -> Self {
         // Get terminal size
         let (term_width, term_height) =
@@ -3988,6 +3990,11 @@ impl PiApp {
             Viewport::new(term_width.saturating_sub(2), viewport_height);
         conversation_viewport.mouse_wheel_enabled = true;
         conversation_viewport.mouse_wheel_delta = 3;
+
+        let (messages, total_usage) = {
+            let guard = session.try_lock().expect("session lock unavailable during PiApp init");
+            load_conversation_from_session(&guard)
+        };
 
         let model = format!(
             "{}/{}",

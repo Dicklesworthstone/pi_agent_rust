@@ -7,6 +7,7 @@ use crate::agent::AgentEvent;
 use crate::connectors::Connector;
 use crate::connectors::http::HttpConnector;
 use crate::error::{Error, Result};
+use crate::extension_dispatcher::{ExtensionDispatcher, ExtensionUiHandler};
 use crate::extension_events::{ToolCallEventResult, ToolResultEventResult};
 use crate::extensions_js::{
     ExtensionToolDef, HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig, js_to_json,
