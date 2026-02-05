@@ -2200,17 +2200,18 @@ pub async fn run_interactive(
 
     let extensions = extensions;
 
-    let (extension_ui_tx, extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
     if let Some(manager) = &extensions {
+        let (extension_ui_tx, extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
         manager.set_ui_sender(extension_ui_tx);
+
+        let extension_event_tx = event_tx.clone();
+        runtime_handle.spawn(async move {
+            let cx = Cx::for_request();
+            while let Ok(request) = extension_ui_rx.recv(&cx).await {
+                let _ = extension_event_tx.try_send(PiMsg::ExtensionUiRequest(request));
+            }
+        });
     }
-    let extension_event_tx = event_tx.clone();
-    runtime_handle.spawn(async move {
-        let cx = Cx::for_request();
-        while let Ok(request) = extension_ui_rx.recv(&cx).await {
-            let _ = extension_event_tx.try_send(PiMsg::ExtensionUiRequest(request));
-        }
-    });
 
     let app = PiApp::new(
         agent,
@@ -6643,6 +6644,14 @@ impl PiApp {
             self.model_entry.model.provider, self.model_entry.model.id
         );
         self.status_message = Some(format!("Switched model: {}", self.model));
+    }
+
+    fn quit_cmd(&mut self) -> Cmd {
+        // Drop the async → bubbletea bridge sender so bubbletea can shut down cleanly.
+        // Without this, bubbletea's external forwarder thread can block on `recv()` during quit.
+        let (tx, _rx) = mpsc::channel::<PiMsg>(1);
+        drop(std::mem::replace(&mut self.event_tx, tx));
+        quit()
     }
 
     /// Handle an action dispatched from the keybindings layer.
