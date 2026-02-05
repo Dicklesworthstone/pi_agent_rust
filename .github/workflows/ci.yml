@@ -150,8 +150,8 @@ jobs:
         run: |
           set -euxo pipefail
           start=$(date +%s)
-          # Baseline (2026-02-03): 31.07% line coverage (cargo llvm-cov --summary-only)
-          cargo llvm-cov --all-targets --workspace --lcov --output-path lcov.info --fail-under-lines 30
+          # Coverage gate: 50% (actual: ~66% as of 2026-02-05)
+          cargo llvm-cov --all-targets --workspace --lcov --output-path lcov.info --fail-under-lines 50
           ls -lah lcov.info
           end=$(date +%s)
           echo "coverage_lcov_duration_s=$((end-start))"
