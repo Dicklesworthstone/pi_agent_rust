@@ -1188,9 +1188,13 @@ impl Session {
     pub fn get_path_to_entry(&self, entry_id: &str) -> Vec<String> {
         let parent_map = self.build_parent_map();
         let mut path = Vec::new();
+        let mut visited = std::collections::HashSet::new();
         let mut current = Some(entry_id.to_string());
 
         while let Some(id) = current {
+            if !visited.insert(id.clone()) {
+                break; // cycle detected
+            }
             path.push(id.clone());
             current = parent_map.get(&id).and_then(Clone::clone);
         }
