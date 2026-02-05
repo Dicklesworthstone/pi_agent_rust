@@ -974,10 +974,13 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                        Error::session(format!("inner session lock failed: {err}"))
-                    })?;
-                    export_html(&inner_session, output_path.as_deref()).await?
+                    let session_snapshot = {
+                        let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                            Error::session(format!("inner session lock failed: {err}"))
+                        })?;
+                        inner_session.clone()
+                    };
+                    export_html(&session_snapshot, output_path.as_deref()).await?
                 };
                 let _ = out_tx.send(response_ok(
                     id,
@@ -1176,14 +1179,8 @@ pub async fn run(
                     };
                     new_session.header.parent_session = parent;
                     // Keep model fields in header for clients.
-                    new_session
-                        .header
-                        .provider
-                        .clone_from(&provider);
-                    new_session
-                        .header
-                        .model_id
-                        .clone_from(&model_id);
+                    new_session.header.provider.clone_from(&provider);
+                    new_session.header.model_id.clone_from(&model_id);
                     new_session
                         .header
                         .thinking_level
@@ -1197,8 +1194,7 @@ pub async fn run(
                         *inner_session = new_session;
                     }
                     guard.agent.clear_messages();
-                    guard.agent.stream_options_mut().session_id =
-                        Some(session_id);
+                    guard.agent.stream_options_mut().session_id = Some(session_id);
                 }
                 {
                     let mut state = shared_state
@@ -1235,14 +1231,14 @@ pub async fn run(
                             .await
                             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
                         {
-                            let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-                                Error::session(format!("inner session lock failed: {err}"))
-                            })?;
+                            let mut inner_session =
+                                guard.session.lock(&cx).await.map_err(|err| {
+                                    Error::session(format!("inner session lock failed: {err}"))
+                                })?;
                             *inner_session = new_session;
                         }
                         guard.agent.replace_messages(messages);
-                        guard.agent.stream_options_mut().session_id =
-                            Some(session_id);
+                        guard.agent.stream_options_mut().session_id = Some(session_id);
                         let _ = out_tx.send(response_ok(
                             id,
                             "switch_session",
@@ -1754,8 +1750,8 @@ mod retry_tests {
             let provider = Arc::new(FlakyProvider::new());
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
-            let agent_session = AgentSession::new(agent, session, false);
+            let inner_session = Arc::new(Mutex::new(Session::in_memory()));
+            let agent_session = AgentSession::new(agent, inner_session, false);
 
             let session = Arc::new(Mutex::new(agent_session));
 
@@ -1854,7 +1850,7 @@ async fn maybe_auto_compact(
 ) {
     let cx = Cx::for_request();
     let (path_entries, context_window, reserve_tokens, settings) = {
-        let Ok(mut guard) = session.lock(&cx).await else {
+        let Ok(guard) = session.lock(&cx).await else {
             return;
         };
         let (path_entries, context_window) = {
@@ -1880,12 +1876,7 @@ async fn maybe_auto_compact(
             keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
         };
 
-        (
-            path_entries,
-            context_window,
-            reserve_tokens,
-            settings,
-        )
+        (path_entries, context_window, reserve_tokens, settings)
     };
 
     let Some(prep) = prepare_compaction(&path_entries, settings) else {
@@ -2482,9 +2473,11 @@ async fn apply_thinking_level(
 ) -> Result<()> {
     let cx = Cx::for_request();
     {
-        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-            Error::session(format!("inner session lock failed: {err}"))
-        })?;
+        let mut inner_session = guard
+            .session
+            .lock(&cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         inner_session.header.thinking_level = Some(level.to_string());
         inner_session.append_thinking_level_change(level.to_string());
     }
@@ -2495,9 +2488,11 @@ async fn apply_thinking_level(
 async fn apply_model_change(guard: &mut AgentSession, entry: &ModelEntry) -> Result<()> {
     let cx = Cx::for_request();
     {
-        let mut inner_session = guard.session.lock(&cx).await.map_err(|err| {
-            Error::session(format!("inner session lock failed: {err}"))
-        })?;
+        let mut inner_session = guard
+            .session
+            .lock(&cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         inner_session.header.provider = Some(entry.model.provider.clone());
         inner_session.header.model_id = Some(entry.model.id.clone());
         inner_session.append_model_change(entry.model.provider.clone(), entry.model.id.clone());
@@ -2510,9 +2505,11 @@ async fn fork_session(
     entry_id: &str,
     cx: &Cx,
 ) -> Result<(Option<String>, bool)> {
-    let mut inner_session = guard.session.lock(cx).await.map_err(|err| {
-        Error::session(format!("inner session lock failed: {err}"))
-    })?;
+    let mut inner_session = guard
+        .session
+        .lock(cx)
+        .await
+        .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
 
     let entry = inner_session
         .get_entry(entry_id)
@@ -2535,10 +2532,8 @@ async fn fork_session(
     } else {
         crate::session::Session::in_memory()
     };
-    new_session.header.parent_session = inner_session
-        .path
-        .as_ref()
-        .map(|p| p.display().to_string());
+    new_session.header.parent_session =
+        inner_session.path.as_ref().map(|p| p.display().to_string());
     new_session
         .header
         .provider
@@ -2660,9 +2655,11 @@ async fn cycle_model_for_rpc(
 
     let cx = Cx::for_request();
     let (current_provider, current_model_id) = {
-        let inner_session = guard.session.lock(&cx).await.map_err(|err| {
-            Error::session(format!("inner session lock failed: {err}"))
-        })?;
+        let inner_session = guard
+            .session
+            .lock(&cx)
+            .await
+            .map_err(|err| Error::session(format!("inner session lock failed: {err}")))?;
         (
             inner_session.header.provider.clone(),
             inner_session.header.model_id.clone(),
