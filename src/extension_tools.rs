@@ -145,6 +145,7 @@ mod tests {
     use crate::session::Session;
     use crate::tools::ToolRegistry;
     use asupersync::runtime::RuntimeBuilder;
+    use asupersync::sync::Mutex;
     use async_trait::async_trait;
     use futures::Stream;
     use serde_json::json;
@@ -399,7 +400,7 @@ mod tests {
             let mut agent = Agent::new(provider, tools, AgentConfig::default());
             agent.extend_tools(wrappers);
 
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
             let message = agent_session
                 .run_text("hi".to_string(), |_event: AgentEvent| {})

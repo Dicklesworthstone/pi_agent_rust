@@ -114,7 +114,9 @@ fn agent_loop_openai_vcr_basic() {
         };
         let agent = Agent::new(Arc::new(provider), tools, agent_config);
 
-        let session = Session::create_with_dir(Some(harness.temp_dir().to_path_buf()));
+        let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
+            Some(harness.temp_dir().to_path_buf()),
+        )));
         let mut agent_session = AgentSession::new(agent, session, true);
 
         let timeline: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
@@ -148,7 +150,12 @@ fn agent_loop_openai_vcr_basic() {
             .await
             .expect("persist session");
 
-        if let Some(path) = agent_session.session.path.clone() {
+        let session_path = {
+            let cx = asupersync::Cx::for_testing();
+            let guard = agent_session.session.lock(&cx).await.expect("lock session");
+            guard.path.clone()
+        };
+        if let Some(path) = session_path {
             harness.record_artifact("session.jsonl", &path);
         }
 

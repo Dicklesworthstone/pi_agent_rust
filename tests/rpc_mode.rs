@@ -169,6 +169,7 @@ fn rpc_get_state_and_prompt() {
         session.header.provider = Some("openai".to_string());
         session.header.model_id = Some(model);
         session.header.thinking_level = Some("off".to_string());
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
 
         let agent_session = AgentSession::new(agent, session, false);
 
@@ -466,6 +467,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
             timestamp: Some(now),
         });
 
+        let session = Arc::new(asupersync::sync::Mutex::new(session));
         let agent_session = AgentSession::new(agent, session, false);
 
         let auth_dir = tempfile::tempdir().unwrap();

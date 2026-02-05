@@ -40,6 +40,7 @@ fn build_agent_session(session: Session, cassette_dir: &Path) -> AgentSession {
     let tools = ToolRegistry::new(&[], &std::env::current_dir().unwrap(), None);
     let config = AgentConfig::default();
     let agent = Agent::new(provider, tools, config);
+    let session = Arc::new(asupersync::sync::Mutex::new(session));
     AgentSession::new(agent, session, false)
 }
 

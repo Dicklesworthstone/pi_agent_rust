@@ -1658,7 +1658,7 @@ mod extensions_integration_tests {
             let provider = Arc::new(NoopProvider);
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -1726,7 +1726,7 @@ mod extensions_integration_tests {
                 calls: Arc::clone(&calls),
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -1790,7 +1790,7 @@ mod extensions_integration_tests {
                 calls: Arc::clone(&calls),
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -1840,7 +1840,7 @@ mod extensions_integration_tests {
                 calls: Arc::clone(&calls),
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -1892,7 +1892,7 @@ mod extensions_integration_tests {
                 calls: Arc::clone(&calls),
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -1945,7 +1945,7 @@ mod extensions_integration_tests {
             let provider = Arc::new(NoopProvider);
             let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -2017,7 +2017,7 @@ mod extensions_integration_tests {
                 calls: Arc::clone(&calls),
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -2084,7 +2084,7 @@ mod extensions_integration_tests {
             let provider = Arc::new(NoopProvider);
             let tools = ToolRegistry::from_tools(Vec::new());
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -2147,7 +2147,7 @@ mod extensions_integration_tests {
                 calls: Arc::clone(&calls),
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -2221,7 +2221,7 @@ mod extensions_integration_tests {
                 calls: Arc::clone(&calls),
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
-            let session = Session::in_memory();
+            let session = Arc::new(Mutex::new(Session::in_memory()));
             let mut agent_session = AgentSession::new(agent, session, false);
 
             agent_session
@@ -2345,7 +2345,7 @@ mod abort_tests {
         let provider = Arc::new(HangingProvider);
         let tools = ToolRegistry::new(&[], Path::new("."), None);
         let agent = Agent::new(provider, tools, AgentConfig::default());
-        let session = Session::in_memory();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
         let mut agent_session = AgentSession::new(agent, session, false);
 
         let started_tx = Arc::clone(&started);
@@ -2385,7 +2385,8 @@ mod turn_event_tests {
     use futures::Stream;
     use std::path::Path;
     use std::pin::Pin;
-    use std::sync::Mutex;
+    // Note: Mutex from super::* is asupersync::sync::Mutex (for Session)
+    // Use std::sync::Mutex directly for synchronous event capture
 
     fn assistant_message(text: &str) -> AssistantMessage {
         AssistantMessage {
@@ -2447,10 +2448,11 @@ mod turn_event_tests {
         let provider = Arc::new(SingleShotProvider);
         let tools = ToolRegistry::new(&[], Path::new("."), None);
         let agent = Agent::new(provider, tools, AgentConfig::default());
-        let session = Session::in_memory();
+        let session = Arc::new(Mutex::new(Session::in_memory()));
         let mut agent_session = AgentSession::new(agent, session, false);
 
-        let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
         let events_capture = Arc::clone(&events);
 
         let join = handle.spawn(async move {
@@ -2799,7 +2801,7 @@ impl AgentSession {
         Ok(result)
     }
 
-    async fn persist_new_messages(&mut self, start_len: usize) -> Result<()> {
+    async fn persist_new_messages(&self, start_len: usize) -> Result<()> {
         let new_messages = self.agent.messages()[start_len..].to_vec();
         {
             let cx = crate::agent_cx::AgentCx::for_request();
