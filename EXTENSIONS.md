@@ -439,11 +439,53 @@ used by CI/harnesses:
   conformance (all tiers, minimal fields + checksums).
 - `docs/extension-catalog.json` — enriched metadata for the **official upstream**
   corpus (capabilities, IO patterns, complexity buckets, checksums).
+- `docs/extension-catalog.schema.json` — JSON Schema for `docs/extension-catalog.json`
+  (`pi.ext.catalog.v1`).
 - `docs/extension-priority.json` — ranking/order plan for the official corpus
   (testability-first execution strategy).
 
 Downstream beads should treat these as inputs and avoid re-scraping/re-scanning
 unless they are explicitly rebuilding the pipeline.
+
+#### Catalog Schema: `pi.ext.catalog.v1`
+
+`docs/extension-catalog.json` is the enriched metadata layer for the **official**
+extension corpus. It is defined by:
+- Version tag: `schema: "pi.ext.catalog.v1"` (embedded in the JSON)
+- Validation: `docs/extension-catalog.schema.json`
+
+**Top-level fields**
+- `schema` *(string, const)*: schema identifier (`pi.ext.catalog.v1`)
+- `generated_at` *(RFC3339 string)*: artifact generation timestamp
+- `total_extensions` *(int)*: number of catalog entries
+- `items` *(array)*: catalog entries (see below)
+- `tier_summary` / `runtime_summary` *(object)*: aggregate counts
+
+**Catalog entry fields (required in v1)**
+- `id` *(string)*: stable extension identifier
+- `name` *(string)*: entrypoint filename (informational)
+- `source_tier` *(enum)*: provenance tier (official/community/npm/etc)
+- `source` *(union)*: pinned source reference (`git`/`npm`/`url`)
+- `runtime_tier` *(enum)*: packaging shape bucket (`legacy-js`/`multi-file`/`pkg-with-deps`)
+- `interaction_tags` *(enum[])*: tool/command/event/UI/provider surface tags
+- `capabilities` *(enum[])*: required capability set (read/write/http/exec/session/ui/etc)
+- `io_pattern` *(enum[])*: coarse IO behavior buckets
+- `complexity` *(enum)*: `small|medium|large`
+- `file_count` / `total_bytes` *(int)*: size metadata for the artifact
+- `checksum.sha256` *(hex string)*: stable content checksum
+
+**Reserved fields (optional; populated by downstream beads)**
+- `version`: extension version (when applicable; e.g. npm)
+- `license`: license identifier (`docs/extension-artifact-provenance.json`)
+- `category_tags`: workflow tags (git/tests/devops/etc)
+- `compatibility_notes`: known constraints / warning reasons (see `docs/ext-compat.md`)
+- `perf_budgets`: perf expectations + observed baselines (bench artifacts)
+
+**Mapping / source-of-truth inputs**
+- Checksums + file metadata: `docs/extension-master-catalog.json`
+- License + pinned provenance: `docs/extension-artifact-provenance.json`
+- Node API + hostcall usage: `docs/extension-api-matrix.json`
+- Testability notes + execution order: `docs/extension-priority.json`
 
 ### 1C.5 Coverage Targets (v1)
 

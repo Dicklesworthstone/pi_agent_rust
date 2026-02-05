@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "pi.ext.catalog.v1",
+  "title": "Pi Extension Catalog (Official Upstream)",
+  "description": "Schema for docs/extension-catalog.json (enriched metadata for the official upstream corpus).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "generated_at", "total_extensions", "items"],
+  "properties": {
+    "schema": { "const": "pi.ext.catalog.v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "total_extensions": { "type": "integer", "minimum": 0 },
+    "tier_summary": { "type": "object" },
+    "runtime_summary": { "type": "object" },
+    "items": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/ExtensionCatalogItem" }
+    }
+  },
+  "$defs": {
+    "Sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "Checksum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sha256"],
+      "properties": {
+        "sha256": { "$ref": "#/$defs/Sha256" }
+      }
+    },
+    "SourceRef": {
+      "oneOf": [
+        { "$ref": "#/$defs/GitSource" },
+        { "$ref": "#/$defs/NpmSource" },
+        { "$ref": "#/$defs/UrlSource" }
+      ]
+    },
+    "GitSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "repo", "path"],
+      "properties": {
+        "type": { "const": "git" },
+        "repo": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "NpmSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "package", "version"],
+      "properties": {
+        "type": { "const": "npm" },
+        "package": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 },
+        "url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "UrlSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "url"],
+      "properties": {
+        "type": { "const": "url" },
+        "url": { "type": "string", "minLength": 1 }
+      }
+    },
+    "ExtensionCatalogItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "source_tier",
+        "source",
+        "runtime_tier",
+        "interaction_tags",
+        "capabilities",
+        "io_pattern",
+        "complexity",
+        "file_count",
+        "total_bytes",
+        "checksum"
+      ],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "source_tier": {
+          "type": "string",
+          "enum": [
+            "official_examples",
+            "official-pi-mono",
+            "npm-registry",
+            "community",
+            "third-party-github",
+            "agents-mikeastock"
+          ]
+        },
+        "source": { "$ref": "#/$defs/SourceRef" },
+        "runtime_tier": {
+          "type": "string",
+          "enum": ["legacy-js", "multi-file", "pkg-with-deps"]
+        },
+        "interaction_tags": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "tool_only",
+              "event_hook",
+              "flag",
+              "provider",
+              "shortcut",
+              "ui_integration"
+            ]
+          }
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "env",
+              "event_hook",
+              "exec",
+              "flag",
+              "http",
+              "provider",
+              "read",
+              "session",
+              "shortcut",
+              "tool",
+              "ui",
+              "write"
+            ]
+          }
+        },
+        "io_pattern": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["fs-heavy", "network-heavy", "os-heavy", "ui-centric"]
+          }
+        },
+        "complexity": {
+          "type": "string",
+          "enum": ["small", "medium", "large"]
+        },
+        "file_count": { "type": "integer", "minimum": 1 },
+        "total_bytes": { "type": "integer", "minimum": 0 },
+        "checksum": { "$ref": "#/$defs/Checksum" },
+
+        "version": { "type": "string", "minLength": 1 },
+        "license": { "type": "string", "minLength": 1 },
+        "category_tags": { "type": "array", "items": { "type": "string" } },
+        "compatibility_notes": { "type": "object" },
+        "perf_budgets": { "type": "object" }
+      }
+    }
+  }
+}
