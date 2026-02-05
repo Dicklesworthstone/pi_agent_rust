@@ -1302,3 +1302,99 @@ fn e2e_interactive_smoke_tmux() {
         .harness
         .record_artifact("interactive-smoke-artifacts.jsonl", &artifact_index);
 }
+
+#[test]
+fn e2e_cli_theme_flag_valid_builtin() {
+    let harness = CliTestHarness::new("e2e_cli_theme_flag_valid_builtin");
+    // Use --version as a quick command that initializes the app (and thus checks args)
+    let result = harness.run(&["--theme", "light", "--version"]);
+    assert_exit_code(&harness.harness, &result, 0);
+}
+
+#[test]
+fn e2e_cli_theme_flag_invalid_path() {
+    let harness = CliTestHarness::new("e2e_cli_theme_flag_invalid_path");
+    let result = harness.run(&["--theme", "nonexistent.json", "--version"]);
+    assert_ne!(result.exit_code, 0);
+    let combined = format!("{}\n{}", result.stdout, result.stderr);
+    assert_contains_case_insensitive(&harness.harness, &combined, "theme file not found");
+}
+
+#[test]
+fn e2e_cli_theme_flag_valid_file() {
+    let harness = CliTestHarness::new("e2e_cli_theme_flag_valid_file");
+    let theme_path = harness.harness.temp_path("custom.json");
+    let theme_json = json!({
+        "name": "custom",
+        "version": "1.0",
+        "colors": {
+            "foreground": "#ffffff",
+            "background": "#000000",
+            "accent": "#123456",
+            "success": "#00ff00",
+            "warning": "#ffcc00",
+            "error": "#ff0000",
+            "muted": "#888888"
+        },
+        "syntax": {
+            "keyword": "#111111",
+            "string": "#222222",
+            "number": "#333333",
+            "comment": "#444444",
+            "function": "#555555"
+        },
+        "ui": {
+            "border": "#666666",
+            "selection": "#777777",
+            "cursor": "#888888"
+        }
+    });
+    fs::write(&theme_path, serde_json::to_string(&theme_json).unwrap()).expect("write theme");
+
+    let result = harness.run(&["--theme", theme_path.to_str().unwrap(), "--version"]);
+    assert_exit_code(&harness.harness, &result, 0);
+}
+
+#[test]
+fn e2e_cli_theme_path_discovery() {
+    let mut harness = CliTestHarness::new("e2e_cli_theme_path_discovery");
+    let themes_dir = harness.harness.temp_path("my-themes");
+    fs::create_dir_all(&themes_dir).expect("create themes dir");
+
+    let theme_path = themes_dir.join("custom-path.json");
+    let theme_json = json!({
+        "name": "custom-path",
+        "version": "1.0",
+        "colors": {
+            "foreground": "#ffffff",
+            "background": "#000000",
+            "accent": "#123456",
+            "success": "#00ff00",
+            "warning": "#ffcc00",
+            "error": "#ff0000",
+            "muted": "#888888"
+        },
+        "syntax": {
+            "keyword": "#111111",
+            "string": "#222222",
+            "number": "#333333",
+            "comment": "#444444",
+            "function": "#555555"
+        },
+        "ui": {
+            "border": "#666666",
+            "selection": "#777777",
+            "cursor": "#888888"
+        }
+    });
+    fs::write(&theme_path, serde_json::to_string(&theme_json).unwrap()).expect("write theme");
+
+    let result = harness.run(&[
+        "--theme-path",
+        themes_dir.to_str().unwrap(),
+        "--theme",
+        "custom-path",
+        "--version",
+    ]);
+    assert_exit_code(&harness.harness, &result, 0);
+}
