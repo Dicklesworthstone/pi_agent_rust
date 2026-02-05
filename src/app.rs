@@ -158,9 +158,19 @@ pub fn build_system_prompt(
         prompt.push_str(skills_prompt);
     }
 
-    let date_time = format_current_datetime();
+    let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
+    let date_time = if test_mode {
+        "<TIMESTAMP>".to_string()
+    } else {
+        format_current_datetime()
+    };
     let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    let _ = write!(prompt, "\nCurrent working directory: {}", cwd.display());
+    let cwd_display = if test_mode {
+        "<CWD>".to_string()
+    } else {
+        cwd.display().to_string()
+    };
+    let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
 
     prompt
 }
