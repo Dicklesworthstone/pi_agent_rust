@@ -321,7 +321,7 @@ fn all_anthropic_scenarios() -> Vec<E2eScenario> {
         E2eScenario {
             cassette_name: "anthropic_auth_failure_401",
             description: "Auth failure (HTTP 401)",
-            messages: vec![user_text("Trigger auth failure.")],
+            messages: vec![user_text("Trigger an auth failure.")],
             tools: Vec::new(),
             max_tokens: 256,
             thinking_level: None,
@@ -334,7 +334,7 @@ fn all_anthropic_scenarios() -> Vec<E2eScenario> {
         E2eScenario {
             cassette_name: "anthropic_forbidden_403",
             description: "Forbidden (HTTP 403)",
-            messages: vec![user_text("Trigger forbidden.")],
+            messages: vec![user_text("Trigger a forbidden error.")],
             tools: Vec::new(),
             max_tokens: 256,
             thinking_level: None,
@@ -347,7 +347,7 @@ fn all_anthropic_scenarios() -> Vec<E2eScenario> {
         E2eScenario {
             cassette_name: "anthropic_bad_request_400",
             description: "Bad request (HTTP 400)",
-            messages: vec![user_text("Trigger bad request.")],
+            messages: vec![user_text("Trigger a bad request error.")],
             tools: Vec::new(),
             max_tokens: 256,
             thinking_level: None,
@@ -360,7 +360,7 @@ fn all_anthropic_scenarios() -> Vec<E2eScenario> {
         E2eScenario {
             cassette_name: "anthropic_server_error_500",
             description: "Server error (HTTP 500)",
-            messages: vec![user_text("Trigger server error.")],
+            messages: vec![user_text("Trigger a server error.")],
             tools: Vec::new(),
             max_tokens: 256,
             thinking_level: None,
@@ -373,7 +373,7 @@ fn all_anthropic_scenarios() -> Vec<E2eScenario> {
         E2eScenario {
             cassette_name: "anthropic_rate_limit_429",
             description: "Rate limit (HTTP 429)",
-            messages: vec![user_text("Trigger rate limit.")],
+            messages: vec![user_text("Trigger a rate limit error.")],
             tools: Vec::new(),
             max_tokens: 256,
             thinking_level: None,
@@ -386,7 +386,7 @@ fn all_anthropic_scenarios() -> Vec<E2eScenario> {
         E2eScenario {
             cassette_name: "anthropic_overloaded_529",
             description: "Overloaded (HTTP 529)",
-            messages: vec![user_text("Trigger overloaded.")],
+            messages: vec![user_text("Trigger an overloaded error.")],
             tools: Vec::new(),
             max_tokens: 256,
             thinking_level: None,
@@ -488,17 +488,19 @@ async fn run_e2e_scenario(
         high: 1024,
         xhigh: 1024,
     });
-    let max_tokens = thinking_budgets.as_ref().map_or(scenario.max_tokens, |budgets| {
-        let budget = match scenario.thinking_level.unwrap_or(ThinkingLevel::Off) {
-            ThinkingLevel::Off => 0,
-            ThinkingLevel::Minimal => budgets.minimal,
-            ThinkingLevel::Low => budgets.low,
-            ThinkingLevel::Medium => budgets.medium,
-            ThinkingLevel::High => budgets.high,
-            ThinkingLevel::XHigh => budgets.xhigh,
-        };
-        scenario.max_tokens.max(budget.saturating_add(256))
-    });
+    let max_tokens = thinking_budgets
+        .as_ref()
+        .map_or(scenario.max_tokens, |budgets| {
+            let budget = match scenario.thinking_level.unwrap_or(ThinkingLevel::Off) {
+                ThinkingLevel::Off => 0,
+                ThinkingLevel::Minimal => budgets.minimal,
+                ThinkingLevel::Low => budgets.low,
+                ThinkingLevel::Medium => budgets.medium,
+                ThinkingLevel::High => budgets.high,
+                ThinkingLevel::XHigh => budgets.xhigh,
+            };
+            scenario.max_tokens.max(budget.saturating_add(256))
+        });
 
     let options = StreamOptions {
         api_key: Some("vcr-playback".to_string()),
@@ -531,7 +533,7 @@ async fn run_e2e_scenario(
 
         harness.log().info_ctx(
             "e2e",
-            &format!("{}: error scenario validated", scenario.cassette_name),
+            format!("{}: error scenario validated", scenario.cassette_name),
             |ctx| {
                 ctx.push(("status".into(), expected_status.to_string()));
                 ctx.push(("error".into(), message.clone()));
@@ -556,7 +558,6 @@ async fn run_e2e_scenario(
         .await
         .unwrap_or_else(|e| panic!("{}: stream failed: {e}", scenario.cassette_name));
 
-    use futures::StreamExt;
     let mut events = Vec::new();
     let mut stream_error = None;
     let mut pinned = std::pin::pin!(stream);
@@ -664,7 +665,7 @@ async fn run_e2e_scenario(
 
     harness.log().info_ctx(
         "e2e",
-        &format!("{}: scenario validated", scenario.cassette_name),
+        format!("{}: scenario validated", scenario.cassette_name),
         |ctx| {
             ctx.push(("events".into(), events.len().to_string()));
             ctx.push(("text_deltas".into(), text_deltas.to_string()));

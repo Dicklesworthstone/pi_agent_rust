@@ -1835,6 +1835,10 @@ pub trait ExtensionSession: Send + Sync {
     async fn set_name(&self, name: String) -> Result<()>;
     async fn append_message(&self, message: SessionMessage) -> Result<()>;
     async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()>;
+    async fn set_model(&self, provider: String, model_id: String) -> Result<()>;
+    async fn get_model(&self) -> (Option<String>, Option<String>);
+    async fn set_thinking_level(&self, level: String) -> Result<()>;
+    async fn get_thinking_level(&self) -> Option<String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2843,6 +2847,7 @@ mod wasm_host {
                                     dispatch_hostcall_events(
                                         &payload.call_id,
                                         &manager,
+                                        self.tools.as_ref(),
                                         &op,
                                         payload.params.clone(),
                                     )
@@ -5700,6 +5705,40 @@ async fn dispatch_hostcall_events(
             manager.register_command(&name, description.as_deref());
             HostcallOutcome::Success(Value::Null)
         }
+        "getmodel" | "get_model" => {
+            let (provider, model_id) = manager.current_model();
+            HostcallOutcome::Success(json!({
+                "provider": provider,
+                "modelId": model_id,
+            }))
+        }
+        "setmodel" | "set_model" => {
+            let provider = payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let model_id = payload
+                .get("modelId")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("model_id").and_then(Value::as_str))
+                .map(ToString::to_string);
+            manager.set_current_model(provider, model_id);
+            HostcallOutcome::Success(Value::Null)
+        }
+        "getthinkinglevel" | "get_thinking_level" => {
+            let level = manager.current_thinking_level();
+            HostcallOutcome::Success(json!({ "thinkingLevel": level }))
+        }
+        "setthinkinglevel" | "set_thinking_level" => {
+            let level = payload
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            manager.set_current_thinking_level(level);
+            HostcallOutcome::Success(Value::Null)
+        }
         _ => HostcallOutcome::Success(Value::Null),
     }
 }
@@ -5813,6 +5852,9 @@ struct ExtensionManagerInner {
     providers: Vec<Value>,
     cwd: Option<String>,
     model_registry_values: HashMap<String, String>,
+    current_provider: Option<String>,
+    current_model_id: Option<String>,
+    current_thinking_level: Option<String>,
     host_actions: Option<Arc<dyn ExtensionHostActions>>,
     policy_prompt_cache: HashMap<String, HashMap<String, bool>>,
 }
@@ -6015,6 +6057,30 @@ impl ExtensionManager {
     pub fn set_active_tools(&self, tools: Vec<String>) {
         let mut guard = self.inner.lock().unwrap();
         guard.active_tools = Some(tools);
+    }
+
+    pub fn current_model(&self) -> (Option<String>, Option<String>) {
+        let guard = self.inner.lock().unwrap();
+        (
+            guard.current_provider.clone(),
+            guard.current_model_id.clone(),
+        )
+    }
+
+    pub fn set_current_model(&self, provider: Option<String>, model_id: Option<String>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.current_provider = provider;
+        guard.current_model_id = model_id;
+    }
+
+    pub fn current_thinking_level(&self) -> Option<String> {
+        let guard = self.inner.lock().unwrap();
+        guard.current_thinking_level.clone()
+    }
+
+    pub fn set_current_thinking_level(&self, level: Option<String>) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.current_thinking_level = level;
     }
 
     /// Collect tool definitions from all registered extensions.

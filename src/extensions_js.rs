@@ -2926,6 +2926,25 @@ function __pi_get_active_tools() {
     return ext.activeTools.slice();
 }
 
+function __pi_get_model() {
+    return pi.events('getModel', {});
+}
+
+function __pi_set_model(provider, modelId) {
+    const p = provider != null ? String(provider) : null;
+    const m = modelId != null ? String(modelId) : null;
+    return pi.events('setModel', { provider: p, modelId: m });
+}
+
+function __pi_get_thinking_level() {
+    return pi.events('getThinkingLevel', {});
+}
+
+function __pi_set_thinking_level(level) {
+    const l = level != null ? String(level).trim() : null;
+    return pi.events('setThinkingLevel', { thinkingLevel: l });
+}
+
 function __pi_append_entry(custom_type, data) {
     const ext = __pi_current_extension_or_throw();
     const customType = String(custom_type || '').trim();
@@ -3442,6 +3461,10 @@ const pi = {
     getFlag: __pi_get_flag,
     setActiveTools: __pi_set_active_tools,
     getActiveTools: __pi_get_active_tools,
+    getModel: __pi_get_model,
+    setModel: __pi_set_model,
+    getThinkingLevel: __pi_get_thinking_level,
+    setThinkingLevel: __pi_set_thinking_level,
     appendEntry: __pi_append_entry,
     sendMessage: __pi_send_message,
     sendUserMessage: __pi_send_user_message,
