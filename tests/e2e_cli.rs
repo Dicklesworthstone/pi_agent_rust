@@ -616,7 +616,12 @@ impl TmuxInstance {
     }
 
     fn kill_server(&self) {
-        let _ = self.tmux_base().args(["kill-server"]).status();
+        let _ = self
+            .tmux_base()
+            .args(["kill-server"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
     }
 }
 
@@ -1270,16 +1275,23 @@ fn e2e_interactive_smoke_tmux() {
         }
     }
 
-    let pane = tmux.capture_pane();
-    let pane_exit_path = harness.harness.temp_path("tmux-pane.exit.txt");
-    fs::write(&pane_exit_path, &pane).expect("write pane exit");
-    harness
-        .harness
-        .record_artifact("tmux-pane.exit.txt", &pane_exit_path);
+    let pane = if tmux.session_exists() {
+        let pane = tmux.capture_pane();
+        let pane_exit_path = harness.harness.temp_path("tmux-pane.exit.txt");
+        fs::write(&pane_exit_path, &pane).expect("write pane exit");
+        harness
+            .harness
+            .record_artifact("tmux-pane.exit.txt", &pane_exit_path);
+        Some(pane)
+    } else {
+        None
+    };
 
     assert!(
         !tmux.session_exists(),
-        "tmux session did not exit cleanly within timeout; final pane:\n{pane}"
+        "tmux session did not exit cleanly within timeout; final pane:\n{}",
+        pane.as_deref()
+            .unwrap_or("<tmux session ended before capture>")
     );
 
     let log_path = harness.harness.temp_path("interactive-smoke-log.jsonl");
@@ -1357,7 +1369,7 @@ fn e2e_cli_theme_flag_valid_file() {
 
 #[test]
 fn e2e_cli_theme_path_discovery() {
-    let mut harness = CliTestHarness::new("e2e_cli_theme_path_discovery");
+    let harness = CliTestHarness::new("e2e_cli_theme_path_discovery");
     let themes_dir = harness.harness.temp_path("my-themes");
     fs::create_dir_all(&themes_dir).expect("create themes dir");
 
