@@ -547,7 +547,7 @@ fn hints_config_serde_keyword() {
 
 #[test]
 fn hints_config_missing_file() {
-    let err = Error::config("config file not found at /home/user/.pi/settings.json");
+    let err = Error::config("config file not found at /home/user/.pi/settings");
     let h = err.hints();
     assert_summary_contains(&h, "missing");
     assert_any_hint_contains(&h, "PI_CONFIG_PATH");
@@ -555,7 +555,7 @@ fn hints_config_missing_file() {
 
 #[test]
 fn hints_config_no_such_file() {
-    let err = Error::config("no such file: settings.json");
+    let err = Error::config("no such file or directory");
     let h = err.hints();
     assert_summary_contains(&h, "missing");
 }
