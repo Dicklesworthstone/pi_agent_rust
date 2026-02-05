@@ -45,6 +45,7 @@ These are the target performance metrics. Regressions beyond these thresholds sh
 | ext_protocol/parse | <100μs | ~5μs | ✅ |
 | ext_js_runtime/cold_start | <200ms | ~315μs | ✅ |
 | ext_js_runtime/warm_eval_noop | <25ms | ~3.48μs | ✅ |
+| ext_js_runtime/tool_call_roundtrip | <500μs | TBD | ⬜ |
 
 ### Extension Runtime (Planned)
 
@@ -248,6 +249,12 @@ This workstream uses a strict **baseline → profile → prove → implement →
 
 ```bash
 hyperfine --warmup 3 --runs 10 'target/release/pi --version'
+```
+
+- Use the PiJS workload harness for deterministic extension roundtrips:
+
+```bash
+scripts/bench_extension_workloads.sh
 ```
 
 #### 2) Profile

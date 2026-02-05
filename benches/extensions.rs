@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::executor::block_on;
+use pi::extensions_js::PiJsRuntime;
+use pi::scheduler::HostcallOutcome;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sysinfo::System;
@@ -18,6 +20,30 @@ fn sha256_hex(input: &str) -> String {
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
 }
+
+const BENCH_TOOL_SETUP: &str = r#"
+__pi_begin_extension("ext.bench", { name: "Bench" });
+pi.registerTool({
+  name: "bench_tool",
+  description: "Benchmark tool",
+  parameters: { type: "object", properties: { value: { type: "number" } } },
+  execute: async (_callId, input) => {
+    return { ok: true, value: input.value };
+  },
+});
+__pi_end_extension();
+"#;
+
+const BENCH_TOOL_CALL: &str = r#"
+globalThis.__bench_done = false;
+pi.tool("bench_tool", { value: 1 }).then(() => { globalThis.__bench_done = true; });
+"#;
+
+const BENCH_TOOL_ASSERT: &str = r#"
+if (!globalThis.__bench_done) {
+  throw new Error("bench tool call did not resolve");
+}
+"#;
 
 fn print_bench_banner_once() {
     static ONCE: OnceLock<()> = OnceLock::new();
@@ -288,6 +314,36 @@ fn bench_js_runtime(c: &mut Criterion) {
         b.iter(|| {
             block_on(async {
                 rt.run_pending_jobs().await.unwrap();
+            });
+        });
+    });
+
+    let tool_runtime = block_on(PiJsRuntime::new()).unwrap();
+    block_on(async {
+        tool_runtime
+            .eval(BENCH_TOOL_SETUP)
+            .await
+            .expect("register bench tool");
+    });
+    group.bench_function("tool_call_roundtrip", |b| {
+        b.iter(|| {
+            block_on(async {
+                tool_runtime
+                    .eval(BENCH_TOOL_CALL)
+                    .await
+                    .expect("eval tool call");
+                let mut requests = tool_runtime.drain_hostcall_requests();
+                assert_eq!(requests.len(), 1, "expected one hostcall request");
+                let request = requests.pop_front().expect("hostcall request");
+                tool_runtime.complete_hostcall(
+                    request.call_id,
+                    HostcallOutcome::Success(json!({"ok": true})),
+                );
+                tool_runtime.tick().await.expect("tick");
+                tool_runtime
+                    .eval(BENCH_TOOL_ASSERT)
+                    .await
+                    .expect("assert bench tool call");
             });
         });
     });

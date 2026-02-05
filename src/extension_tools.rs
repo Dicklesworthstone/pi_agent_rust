@@ -65,7 +65,7 @@ pub struct WasmExtensionToolWrapper {
 #[cfg(feature = "wasm-host")]
 impl WasmExtensionToolWrapper {
     #[must_use]
-    pub fn new(def: ExtensionToolDef, handle: WasmExtensionHandle) -> Self {
+    pub const fn new(def: ExtensionToolDef, handle: WasmExtensionHandle) -> Self {
         Self {
             def,
             handle,

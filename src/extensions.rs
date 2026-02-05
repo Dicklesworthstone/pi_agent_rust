@@ -2047,19 +2047,19 @@ mod wasm_host {
 
     use self::pi::extension::host;
 
-    pub struct HostState {
-        pub policy: ExtensionPolicy,
-        pub cwd: PathBuf,
-        pub tools: Arc<crate::tools::ToolRegistry>,
-        pub manager: Option<ExtensionManagerHandle>,
-        pub http: HttpConnector,
-        pub fs: FsConnector,
-        pub env_allowlist: BTreeSet<String>,
-        pub extension_id: Option<String>,
+    pub(super) struct HostState {
+        policy: ExtensionPolicy,
+        cwd: PathBuf,
+        tools: Arc<crate::tools::ToolRegistry>,
+        manager: Option<ExtensionManagerHandle>,
+        http: HttpConnector,
+        fs: FsConnector,
+        env_allowlist: BTreeSet<String>,
+        extension_id: Option<String>,
     }
 
     impl HostState {
-        pub fn new(policy: ExtensionPolicy, cwd: PathBuf) -> Result<Self> {
+        pub(super) fn new(policy: ExtensionPolicy, cwd: PathBuf) -> Result<Self> {
             let tools = Arc::new(crate::tools::ToolRegistry::new(
                 &["read", "bash", "edit", "write", "grep", "find", "ls"],
                 &cwd,
@@ -2068,7 +2068,7 @@ mod wasm_host {
             Self::new_with_tools(policy, cwd, tools, None)
         }
 
-        pub fn new_with_tools(
+        pub(super) fn new_with_tools(
             policy: ExtensionPolicy,
             cwd: PathBuf,
             tools: Arc<crate::tools::ToolRegistry>,
@@ -2203,7 +2203,6 @@ mod wasm_host {
                 "denied" => HostCallErrorCode::Denied,
                 "io" => HostCallErrorCode::Io,
                 "invalid_request" => HostCallErrorCode::InvalidRequest,
-                "internal" => HostCallErrorCode::Internal,
                 _ => HostCallErrorCode::Internal,
             }
         }
@@ -2808,7 +2807,7 @@ mod wasm_host {
                                     message: format!("Unsupported host_call method: {method}"),
                                 },
                             };
-                            return Self::hostcall_outcome_to_result(outcome);
+                            Self::hostcall_outcome_to_result(outcome)
                         }
                         _ => Err(Self::host_error_json(
                             HostCallErrorCode::InvalidRequest,
@@ -2897,7 +2896,7 @@ mod wasm_host {
     }
 
     impl Instance {
-        pub async fn instantiate(
+        pub(super) async fn instantiate(
             engine: &wasmtime::Engine,
             path: &Path,
             state: HostState,
@@ -3647,7 +3646,7 @@ impl WasmExtensionHost {
         .await
     }
 
-    pub async fn instantiate_with(
+    async fn instantiate_with(
         &self,
         extension: &WasmExtension,
         tools: Arc<ToolRegistry>,

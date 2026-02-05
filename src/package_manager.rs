@@ -9,7 +9,7 @@
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::extensions::CompatibilityScanner;
+use crate::extensions::{CompatibilityScanner, load_extension_manifest};
 use asupersync::Cx;
 use asupersync::channel::oneshot;
 use serde_json::Value;
@@ -1929,6 +1929,16 @@ fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
 }
 
 fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
+    match load_extension_manifest(dir) {
+        Ok(Some(_)) => {
+            return Some(vec![dir.to_path_buf()]);
+        }
+        Ok(None) => {}
+        Err(err) => {
+            warn!(path = %dir.display(), "Invalid extension manifest: {err}");
+        }
+    }
+
     let package_json_path = dir.join("package.json");
     if package_json_path.exists() {
         let manifest = read_pi_manifest(dir);
@@ -1964,6 +1974,11 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     }
 
+    let mut out = Vec::new();
+    if let Some(entries) = resolve_extension_entries(dir) {
+        out.extend(entries);
+    }
+
     let mut builder = ignore::WalkBuilder::new(dir);
     builder
         .hidden(true)
@@ -1975,7 +1990,6 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
         .add_custom_ignore_filename(".fdignore")
         .filter_entry(|e| e.file_name() != std::ffi::OsStr::new("node_modules"));
 
-    let mut out = Vec::new();
     for entry in builder.build().skip(1).filter_map(std::result::Result::ok) {
         let path = entry.path().to_path_buf();
         let Ok(stats) = fs::metadata(&path) else {
