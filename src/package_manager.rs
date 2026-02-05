@@ -339,14 +339,12 @@ impl PackageManager {
     }
 
     pub async fn resolve_with_roots(&self, roots: &ResolveRoots) -> Result<ResolvedPaths> {
-        eprintln!("[dbg] resolve_with_roots: starting setup phase");
         let this_for_setup = self.clone();
         let roots_for_setup = roots.clone();
         let (tx, rx) = oneshot::channel();
 
         // Offload the heavy lifting (sync I/O) to a thread
         thread::spawn(move || {
-            eprintln!("[dbg] resolve_with_roots: setup thread started");
             let res: Result<(SettingsSnapshot, SettingsSnapshot, Vec<ScopedPackage>)> = (|| {
                 let global = read_settings_snapshot(&roots_for_setup.global_settings_path)?;
                 let project = read_settings_snapshot(&roots_for_setup.project_settings_path)?;
@@ -365,27 +363,20 @@ impl PackageManager {
                 Ok((global, project, package_sources))
             })(
             );
-
-            eprintln!("[dbg] resolve_with_roots: setup thread sending result (ok={})", res.is_ok());
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
-            eprintln!("[dbg] resolve_with_roots: setup thread done");
         });
 
         let cx = AgentCx::for_request();
-        eprintln!("[dbg] resolve_with_roots: awaiting setup rx...");
         let (global, project, package_sources) = rx
             .recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Resolve setup task cancelled"))??;
-        eprintln!("[dbg] resolve_with_roots: setup received, {} packages", package_sources.len());
 
         let mut accumulator = ResourceAccumulator::new();
 
         // This part is async (network calls for NPM)
-        eprintln!("[dbg] resolve_with_roots: resolving package sources...");
         Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
-        eprintln!("[dbg] resolve_with_roots: package sources resolved");
 
         // Offload the rest of sync resolution
         let this = self.clone();
@@ -393,9 +384,7 @@ impl PackageManager {
         let (tx, rx) = oneshot::channel();
         let accumulator = std::sync::Mutex::new(accumulator);
 
-        eprintln!("[dbg] resolve_with_roots: spawning finalize thread");
         thread::spawn(move || {
-            eprintln!("[dbg] resolve_with_roots: finalize thread started");
             let mut accumulator = accumulator.lock().unwrap();
 
             // 2) Local entries from settings (global and project)
@@ -442,16 +431,12 @@ impl PackageManager {
             maybe_emit_compat_ledgers(&resolved.extensions);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(resolved));
-            eprintln!("[dbg] resolve_with_roots: finalize thread done");
         });
 
-        eprintln!("[dbg] resolve_with_roots: awaiting finalize rx...");
         let cx = AgentCx::for_request();
-        let result = rx.recv(cx.cx())
+        rx.recv(cx.cx())
             .await
-            .map_err(|_| Error::tool("package_manager", "Resolve processing task cancelled"))?;
-        eprintln!("[dbg] resolve_with_roots: finalize received");
-        result
+            .map_err(|_| Error::tool("package_manager", "Resolve processing task cancelled"))?
     }
 
     /// Resolve resources for extension sources specified via CLI `-e/--extension`.

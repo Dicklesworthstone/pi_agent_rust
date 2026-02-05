@@ -68,20 +68,15 @@ impl AuthStorage {
     /// Load auth.json asynchronously (creates empty if missing).
     pub async fn load_async(path: PathBuf) -> Result<Self> {
         let entries = if path.exists() {
-            // Note: File::open is blocking, but typically fast.
-            // For rigorous async correctness we might offload this, but sticking to std::fs::File for fs4 compatibility.
             let file = File::open(&path).map_err(|e| Error::auth(format!("auth.json: {e}")))?;
             let mut locked = lock_file_async(file, Duration::from_secs(30)).await?;
-            // Read from the locked file handle
             let mut content = String::new();
-            // read_to_string is blocking, but we hold the lock and it's local FS.
             locked.as_file_mut().read_to_string(&mut content)?;
             let parsed: AuthFile = serde_json::from_str(&content).unwrap_or_default();
             parsed.entries
         } else {
             HashMap::new()
         };
-
         Ok(Self { path, entries })
     }
 
@@ -536,9 +531,7 @@ async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
     let start = Instant::now();
     loop {
         let lock_result = FileExt::try_lock_exclusive(&file);
-        eprintln!("[dbg] lock_file_async: try_lock_exclusive result = {:?}", lock_result);
         if matches!(lock_result, Ok(true)) {
-            eprintln!("[dbg] lock_file_async: lock acquired!");
             return Ok(LockedFile { file });
         }
 
@@ -546,9 +539,7 @@ async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
             return Err(Error::auth("Timed out waiting for auth lock".to_string()));
         }
 
-        eprintln!("[dbg] lock_file_async: sleeping 50ms before retry...");
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
-        eprintln!("[dbg] lock_file_async: sleep done");
     }
 }
 

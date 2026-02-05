@@ -101,13 +101,11 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("[dbg] loading config...");
     let mut config = Config::load()?;
     if let Some(theme_spec) = cli.theme.as_deref() {
         // Theme already validated above
         config.theme = Some(theme_spec.to_string());
     }
-    eprintln!("[dbg] config loaded, spawning session index maintenance...");
     spawn_session_index_maintenance();
     let package_manager = PackageManager::new(cwd.clone());
     let resource_cli = ResourceCliOptions {
@@ -120,19 +118,14 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         extension_paths: cli.extension.clone(),
         theme_paths: cli.theme_path.clone(),
     };
-    eprintln!("[dbg] calling ResourceLoader::load...");
     let resources = match ResourceLoader::load(&package_manager, &cwd, &config, &resource_cli).await
     {
-        Ok(resources) => {
-            eprintln!("[dbg] resources loaded OK");
-            resources
-        }
+        Ok(resources) => resources,
         Err(err) => {
             eprintln!("Warning: Failed to load skills/prompts: {err}");
             ResourceLoader::empty(config.enable_skill_commands())
         }
     };
-    eprintln!("[dbg] calling AuthStorage::load_async...");
     let mut auth = AuthStorage::load_async(Config::auth_path()).await?;
     auth.refresh_expired_oauth_tokens().await?;
     let global_dir = Config::global_dir();
@@ -142,7 +135,6 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     if let Some(error) = model_registry.error() {
         eprintln!("Warning: models.json error: {error}");
     }
-
     if let Some(pattern) = &cli.list_models {
         list_models(&model_registry, pattern.as_deref());
         return Ok(());
@@ -234,7 +226,9 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         };
 
         match pi::app::resolve_api_key(&auth, &cli, &selection.model_entry) {
-            Ok(key) => break (selection, key),
+            Ok(key) => {
+                break (selection, key);
+            }
             Err(err) => {
                 if let Some(startup) = err.downcast_ref::<StartupError>() {
                     if is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal() {
@@ -278,7 +272,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         &package_dir,
     );
     let provider =
-        providers::create_provider(&selection.model_entry).map_err(anyhow::Error::new)?;
+        providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
     let stream_options = pi::app::build_stream_options(&config, resolved_key, &selection, &session);
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
