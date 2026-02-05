@@ -56,8 +56,8 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const VCR_TEST_NAME: &str = "e2e_tui_tool_read";
 const VCR_BASIC_CHAT_TEST_NAME: &str = "e2e_tui_basic_chat";
 const VCR_MODEL: &str = "claude-sonnet-4-20250514";
-const VCR_PROMPT: &str = "Readsample.txt";
-const VCR_BASIC_CHAT_PROMPT: &str = "Sayhello";
+const VCR_PROMPT: &str = "Read sample.txt";
+const VCR_BASIC_CHAT_PROMPT: &str = "Say hello";
 const VCR_BASIC_CHAT_RESPONSE: &str = "Hello! How can I help you today?";
 const SAMPLE_FILE_NAME: &str = "sample.txt";
 const SAMPLE_FILE_CONTENT: &str = "Hello\nWorld\n";
@@ -190,6 +190,7 @@ fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
             ),
             sse_chunk("message_stop", json!({ "type": "message_stop" })),
         ],
+        body_chunks_base64: None,
     };
 
     let cassette = Cassette {
@@ -335,6 +336,7 @@ fn write_vcr_cassette(dir: &Path, tool_output: &str, system_prompt: &str) -> Pat
             ),
             sse_chunk("message_stop", json!({ "type": "message_stop" })),
         ],
+        body_chunks_base64: None,
     };
 
     let response_two = RecordedResponse {
@@ -375,6 +377,7 @@ fn write_vcr_cassette(dir: &Path, tool_output: &str, system_prompt: &str) -> Pat
             ),
             sse_chunk("message_stop", json!({ "type": "message_stop" })),
         ],
+        body_chunks_base64: None,
     };
 
     let cassette = Cassette {

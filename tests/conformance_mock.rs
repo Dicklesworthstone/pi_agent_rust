@@ -976,16 +976,13 @@ fn event_dispatch_through_manager() {
         load_with_mock(&harness, EVENT_HOOK_TS, "event_dispatch.ts", spec);
 
     // Dispatch a turn_start event through the manager
-    let result = common::run_async({
-        let manager = manager.clone();
-        async move {
-            manager
-                .dispatch_event(
-                    ExtensionEventName::TurnStart,
-                    Some(serde_json::json!({ "turn": 1 })),
-                )
-                .await
-        }
+    let result = common::run_async(async move {
+        manager
+            .dispatch_event(
+                ExtensionEventName::TurnStart,
+                Some(serde_json::json!({ "turn": 1 })),
+            )
+            .await
     });
 
     // Event dispatch should succeed (handler registered for turn_start)
@@ -1062,10 +1059,10 @@ fn session_mutation_scenario() {
 
     common::run_async({
         let manager = manager.clone();
-        let spec = load_spec.clone();
+        let load_spec = load_spec.clone();
         async move {
             manager
-                .load_js_extensions(vec![spec])
+                .load_js_extensions(vec![load_spec])
                 .await
                 .expect("load extension");
         }
@@ -1087,12 +1084,24 @@ fn session_mutation_scenario() {
     // Verify hostcall log captured the sequence
     let log = capture.snapshot();
     let ops: Vec<&str> = log.iter().map(|c| c.op.as_str()).collect();
-    assert!(ops.contains(&"get_state"), "get_state should be in hostcall log: {ops:?}");
-    assert!(ops.contains(&"set_name"), "set_name should be in hostcall log: {ops:?}");
-    assert!(ops.contains(&"set_label"), "set_label should be in hostcall log: {ops:?}");
+    assert!(
+        ops.contains(&"get_state"),
+        "get_state should be in hostcall log: {ops:?}"
+    );
+    assert!(
+        ops.contains(&"set_name"),
+        "set_name should be in hostcall log: {ops:?}"
+    );
+    assert!(
+        ops.contains(&"set_label"),
+        "set_label should be in hostcall log: {ops:?}"
+    );
 
     // Verify the command was registered
-    assert!(manager.has_command("mutator"), "mutator command should be registered");
+    assert!(
+        manager.has_command("mutator"),
+        "mutator command should be registered"
+    );
 
     let output = build_conformance_output(&load_spec, &manager, &capture);
     let json_str = serde_json::to_string_pretty(&output).expect("serialize");
@@ -1129,8 +1138,7 @@ fn custom_entry_scenario() {
     let session = Arc::new(ConformanceMockSession::new(spec, capture.clone()));
 
     let cwd = harness.temp_dir().to_path_buf();
-    let ext_path =
-        harness.create_file("extensions/custom_entry.ts", CUSTOM_ENTRY_TS.as_bytes());
+    let ext_path = harness.create_file("extensions/custom_entry.ts", CUSTOM_ENTRY_TS.as_bytes());
 
     let load_spec = JsExtensionLoadSpec::from_entry_path(&ext_path).expect("load spec");
 
@@ -1154,9 +1162,9 @@ fn custom_entry_scenario() {
     });
     manager.set_js_runtime(runtime);
 
+    let spec = load_spec;
     common::run_async({
         let manager = manager.clone();
-        let spec = load_spec.clone();
         async move {
             manager
                 .load_js_extensions(vec![spec])
@@ -1215,8 +1223,7 @@ fn model_control_scenario() {
     let session = Arc::new(ConformanceMockSession::new(spec, capture.clone()));
 
     let cwd = harness.temp_dir().to_path_buf();
-    let ext_path =
-        harness.create_file("extensions/model_control.ts", MODEL_CONTROL_TS.as_bytes());
+    let ext_path = harness.create_file("extensions/model_control.ts", MODEL_CONTROL_TS.as_bytes());
 
     let load_spec = JsExtensionLoadSpec::from_entry_path(&ext_path).expect("load spec");
 
@@ -1257,8 +1264,14 @@ fn model_control_scenario() {
 
     assert!(ops.contains(&"get_model"), "get_model in log: {ops:?}");
     assert!(ops.contains(&"set_model"), "set_model in log: {ops:?}");
-    assert!(ops.contains(&"get_thinking_level"), "get_thinking_level in log: {ops:?}");
-    assert!(ops.contains(&"set_thinking_level"), "set_thinking_level in log: {ops:?}");
+    assert!(
+        ops.contains(&"get_thinking_level"),
+        "get_thinking_level in log: {ops:?}"
+    );
+    assert!(
+        ops.contains(&"set_thinking_level"),
+        "set_thinking_level in log: {ops:?}"
+    );
 
     // Verify model was changed
     let model = common::run_async({

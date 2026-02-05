@@ -30,9 +30,18 @@ async function main() {
 
 	const extensionPath = path.resolve(args[0]);
 	const cwd = args[1] ? path.resolve(args[1]) : process.cwd();
+	const timeoutMs = Number(process.env.PI_TS_ORACLE_TIMEOUT_MS ?? "20000");
 
 	try {
-		const result = await loadExtensions([extensionPath], cwd);
+		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timeoutHandle = setTimeout(() => {
+				reject(new Error(`loadExtensions timeout after ${timeoutMs}ms`));
+			}, timeoutMs);
+		});
+
+		const result = await Promise.race([loadExtensions([extensionPath], cwd), timeout]);
+		if (timeoutHandle) clearTimeout(timeoutHandle);
 
 		if (result.errors.length > 0) {
 			const output = {
@@ -145,6 +154,10 @@ async function main() {
 		};
 
 		console.log(JSON.stringify(output, null, 2));
+		// Extensions may install timers/handles (e.g. spinners) that keep the event
+		// loop alive. The oracle is a one-shot snapshotter, so force exit after
+		// printing to avoid hung differential tests.
+		process.exit(0);
 	} catch (err) {
 		const output = {
 			success: false,
@@ -152,6 +165,7 @@ async function main() {
 			extension: null,
 		};
 		console.log(JSON.stringify(output, null, 2));
+		process.exit(0);
 	}
 }
 

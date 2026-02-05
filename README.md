@@ -325,6 +325,17 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
 | `OPENAI_API_KEY` | OpenAI API key |
 | `GOOGLE_API_KEY` | Google Gemini API key |
 | `AZURE_OPENAI_API_KEY` | Azure OpenAI API key |
+| `GROQ_API_KEY` | Groq API key (OpenAI-compatible) |
+| `CEREBRAS_API_KEY` | Cerebras API key (OpenAI-compatible) |
+| `OPENROUTER_API_KEY` | OpenRouter API key (OpenAI-compatible) |
+| `MISTRAL_API_KEY` | Mistral API key (OpenAI-compatible) |
+| `MOONSHOT_API_KEY` | Moonshot/Kimi API key (OpenAI-compatible) |
+| `DASHSCOPE_API_KEY` | DashScope/Qwen API key (OpenAI-compatible) |
+| `DEEPSEEK_API_KEY` | DeepSeek API key (OpenAI-compatible) |
+| `FIREWORKS_API_KEY` | Fireworks API key (OpenAI-compatible) |
+| `TOGETHER_API_KEY` | Together API key (OpenAI-compatible) |
+| `PERPLEXITY_API_KEY` | Perplexity API key (OpenAI-compatible) |
+| `XAI_API_KEY` | xAI API key (OpenAI-compatible) |
 | `PI_CONFIG_PATH` | Custom config file path |
 | `PI_CODING_AGENT_DIR` | Override the global config directory |
 | `PI_PACKAGE_DIR` | Override the packages directory |

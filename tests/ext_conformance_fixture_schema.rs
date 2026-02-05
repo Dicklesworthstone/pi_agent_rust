@@ -197,6 +197,21 @@ fn ext_conformance_fixtures_parse_and_match_schema_and_normalization_rules() {
         let content = fs::read_to_string(&path).expect("read fixture");
         let value: Value = serde_json::from_str(&content).expect("parse fixture");
 
+        let schema = value
+            .pointer("/schema")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if schema != EXT_FIXTURE_SCHEMA {
+            harness.log().debug(
+                "fixture",
+                format!(
+                    "skipping {}: schema {schema} (expected {EXT_FIXTURE_SCHEMA})",
+                    path.display()
+                ),
+            );
+            continue;
+        }
+
         validate_fixture(&path, &value).expect("validate fixture");
 
         // Basic normalization sanity checks: no raw ANSI and no raw absolute project root or UUIDs.

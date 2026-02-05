@@ -1,0 +1,526 @@
+{
+  "schema": "pi.ext.event-payloads.v1",
+  "description": "Standard event payloads for extension conformance testing. Each event type has 2-3 payloads covering normal, edge, and error/blocking cases.",
+  "context": {
+    "description": "Context object passed to all event handlers alongside the event payload.",
+    "template": {
+      "hasUI": false,
+      "cwd": "/tmp/test-workspace",
+      "modelRegistry": {
+        "claude-sonnet-4-5": {
+          "id": "claude-sonnet-4-5",
+          "name": "Claude Sonnet 4.5",
+          "provider": "anthropic"
+        }
+      },
+      "sessionState": {},
+      "sessionEntries": [],
+      "sessionBranch": [],
+      "sessionLeafEntry": null
+    }
+  },
+  "event_payloads": {
+    "startup": [
+      {
+        "name": "normal_startup",
+        "description": "Standard agent startup with session file",
+        "payload": {
+          "type": "startup",
+          "version": "1.0.0-test",
+          "sessionFile": "/tmp/test-workspace/.pi/sessions/test-session.jsonl"
+        },
+        "default_response": null
+      },
+      {
+        "name": "startup_no_session",
+        "description": "Startup without existing session (fresh start)",
+        "payload": {
+          "type": "startup",
+          "version": "1.0.0-test",
+          "sessionFile": null
+        },
+        "default_response": null
+      }
+    ],
+    "agent_start": [
+      {
+        "name": "normal_agent_start",
+        "description": "Agent loop begins processing user input",
+        "payload": {
+          "type": "agent_start",
+          "sessionId": "sess-001"
+        },
+        "default_response": null
+      },
+      {
+        "name": "agent_start_empty_session",
+        "description": "Agent starts with minimal session ID",
+        "payload": {
+          "type": "agent_start",
+          "sessionId": ""
+        },
+        "default_response": null
+      }
+    ],
+    "agent_end": [
+      {
+        "name": "normal_agent_end",
+        "description": "Agent loop completes successfully",
+        "payload": {
+          "type": "agent_end",
+          "sessionId": "sess-001",
+          "messages": [
+            {
+              "role": "assistant",
+              "content": [{"type": "text", "text": "Hello!"}]
+            }
+          ],
+          "error": null
+        },
+        "default_response": null
+      },
+      {
+        "name": "agent_end_with_error",
+        "description": "Agent loop terminates with error",
+        "payload": {
+          "type": "agent_end",
+          "sessionId": "sess-001",
+          "messages": [],
+          "error": "rate_limit_exceeded"
+        },
+        "default_response": null
+      },
+      {
+        "name": "agent_end_empty_messages",
+        "description": "Agent ends with no messages produced",
+        "payload": {
+          "type": "agent_end",
+          "sessionId": "sess-001",
+          "messages": [],
+          "error": null
+        },
+        "default_response": null
+      }
+    ],
+    "turn_start": [
+      {
+        "name": "first_turn",
+        "description": "First turn of a conversation",
+        "payload": {
+          "type": "turn_start",
+          "sessionId": "sess-001",
+          "turnIndex": 0
+        },
+        "default_response": null
+      },
+      {
+        "name": "later_turn",
+        "description": "Multi-turn conversation, turn index > 0",
+        "payload": {
+          "type": "turn_start",
+          "sessionId": "sess-001",
+          "turnIndex": 5
+        },
+        "default_response": null
+      }
+    ],
+    "turn_end": [
+      {
+        "name": "normal_turn_end",
+        "description": "Turn completes with assistant message and tool results",
+        "payload": {
+          "type": "turn_end",
+          "sessionId": "sess-001",
+          "turnIndex": 0,
+          "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "I'll help you with that."}],
+            "stop_reason": "end_turn"
+          },
+          "toolResults": [
+            {
+              "type": "tool_result",
+              "tool_use_id": "tool-001",
+              "content": [{"type": "text", "text": "file.txt contents"}]
+            }
+          ]
+        },
+        "default_response": null
+      },
+      {
+        "name": "turn_end_no_tools",
+        "description": "Turn ends without any tool usage",
+        "payload": {
+          "type": "turn_end",
+          "sessionId": "sess-001",
+          "turnIndex": 0,
+          "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Sure, here's the answer."}],
+            "stop_reason": "end_turn"
+          },
+          "toolResults": []
+        },
+        "default_response": null
+      }
+    ],
+    "tool_call": [
+      {
+        "name": "basic_tool_call",
+        "description": "Normal tool call that should be allowed",
+        "payload": {
+          "type": "tool_call",
+          "toolName": "bash",
+          "toolCallId": "tc-001",
+          "input": {"command": "echo hello"}
+        },
+        "default_response": {"block": false}
+      },
+      {
+        "name": "blocked_tool_call",
+        "description": "Dangerous tool call that should be blocked by security extensions",
+        "payload": {
+          "type": "tool_call",
+          "toolName": "bash",
+          "toolCallId": "tc-002",
+          "input": {"command": "rm -rf /"}
+        },
+        "default_response": {"block": true, "reason": "Destructive command blocked"}
+      },
+      {
+        "name": "tool_call_with_complex_input",
+        "description": "Tool call with nested JSON input and unicode",
+        "payload": {
+          "type": "tool_call",
+          "toolName": "write",
+          "toolCallId": "tc-003",
+          "input": {
+            "file_path": "/tmp/test-\u00e9l\u00e8ve.txt",
+            "content": "line 1\nline 2\n\u2603 snowman"
+          }
+        },
+        "default_response": {"block": false}
+      }
+    ],
+    "tool_result": [
+      {
+        "name": "normal_tool_result",
+        "description": "Successful tool execution result",
+        "payload": {
+          "type": "tool_result",
+          "toolName": "bash",
+          "toolCallId": "tc-001",
+          "input": {"command": "echo hello"},
+          "content": [{"type": "text", "text": "hello\n"}],
+          "details": {"exitCode": 0, "duration_ms": 42},
+          "isError": false
+        },
+        "default_response": {}
+      },
+      {
+        "name": "error_tool_result",
+        "description": "Tool execution that resulted in error",
+        "payload": {
+          "type": "tool_result",
+          "toolName": "bash",
+          "toolCallId": "tc-004",
+          "input": {"command": "false"},
+          "content": [{"type": "text", "text": ""}],
+          "details": {"exitCode": 1},
+          "isError": true
+        },
+        "default_response": {}
+      },
+      {
+        "name": "modified_tool_result",
+        "description": "Extension modifies the tool result content",
+        "payload": {
+          "type": "tool_result",
+          "toolName": "read",
+          "toolCallId": "tc-005",
+          "input": {"file_path": "/tmp/secret.env"},
+          "content": [{"type": "text", "text": "API_KEY=sk-secret123"}],
+          "details": null,
+          "isError": false
+        },
+        "default_response": {
+          "content": [{"type": "text", "text": "API_KEY=***REDACTED***"}]
+        }
+      }
+    ],
+    "input": [
+      {
+        "name": "normal_text_input",
+        "description": "Standard user text input, passed through",
+        "payload": {
+          "type": "input",
+          "content": "Please explain this code",
+          "attachments": []
+        },
+        "default_response": {"action": "continue"}
+      },
+      {
+        "name": "transformed_input",
+        "description": "Extension transforms the user input",
+        "payload": {
+          "type": "input",
+          "content": "/translate hello world",
+          "attachments": []
+        },
+        "default_response": {
+          "action": "transform",
+          "text": "Translate the following to all languages: hello world"
+        }
+      },
+      {
+        "name": "blocked_input",
+        "description": "Extension handles the input entirely (no LLM call)",
+        "payload": {
+          "type": "input",
+          "content": "/quit",
+          "attachments": []
+        },
+        "default_response": {"action": "handled"}
+      },
+      {
+        "name": "input_with_unicode",
+        "description": "Input containing unicode, emoji, and CJK characters",
+        "payload": {
+          "type": "input",
+          "content": "\u4f60\u597d\u4e16\u754c \ud83d\ude80 caf\u00e9",
+          "attachments": []
+        },
+        "default_response": {"action": "continue"}
+      }
+    ],
+    "before_agent_start": [
+      {
+        "name": "normal_before_start",
+        "description": "Extension can inject custom system prompt",
+        "payload": {
+          "type": "before_agent_start",
+          "prompt": "Help me debug this function",
+          "images": [],
+          "systemPrompt": "You are a helpful assistant."
+        },
+        "default_response": {}
+      },
+      {
+        "name": "system_prompt_override",
+        "description": "Extension appends to system prompt",
+        "payload": {
+          "type": "before_agent_start",
+          "prompt": "Write a haiku",
+          "images": [],
+          "systemPrompt": "You are a helpful assistant."
+        },
+        "default_response": {
+          "systemPrompt": "You are a helpful assistant.\nAlways respond in haiku format."
+        }
+      }
+    ],
+    "context": [
+      {
+        "name": "normal_context",
+        "description": "Extension receives message history before LLM call",
+        "payload": {
+          "type": "context",
+          "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Hello"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": "Hi!"}]}
+          ]
+        },
+        "default_response": {}
+      },
+      {
+        "name": "context_with_modification",
+        "description": "Extension modifies messages before LLM sees them",
+        "payload": {
+          "type": "context",
+          "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Secret: password123"}]}
+          ]
+        },
+        "default_response": {
+          "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Secret: ***REDACTED***"}]}
+          ]
+        }
+      },
+      {
+        "name": "context_empty_messages",
+        "description": "Edge case: context with no messages",
+        "payload": {
+          "type": "context",
+          "messages": []
+        },
+        "default_response": {}
+      }
+    ],
+    "resources_discover": [
+      {
+        "name": "startup_discovery",
+        "description": "Resource discovery on startup",
+        "payload": {
+          "type": "resources_discover",
+          "cwd": "/tmp/test-workspace",
+          "reason": "startup"
+        },
+        "default_response": {}
+      },
+      {
+        "name": "reload_discovery",
+        "description": "Resource discovery on reload",
+        "payload": {
+          "type": "resources_discover",
+          "cwd": "/tmp/test-workspace",
+          "reason": "reload"
+        },
+        "default_response": {
+          "skillPaths": ["/tmp/test-workspace/.pi/skills"],
+          "promptPaths": ["/tmp/test-workspace/.pi/prompts"]
+        }
+      }
+    ],
+    "user_bash": [
+      {
+        "name": "normal_user_bash",
+        "description": "User runs a bash command via terminal",
+        "payload": {
+          "type": "user_bash",
+          "command": "ls -la",
+          "excludeFromContext": false,
+          "cwd": "/tmp/test-workspace"
+        },
+        "default_response": {}
+      },
+      {
+        "name": "excluded_bash_command",
+        "description": "Bash command excluded from context window",
+        "payload": {
+          "type": "user_bash",
+          "command": "clear",
+          "excludeFromContext": true,
+          "cwd": "/tmp/test-workspace"
+        },
+        "default_response": {}
+      }
+    ],
+    "session_before_compact": [
+      {
+        "name": "allow_compaction",
+        "description": "Extension allows normal compaction",
+        "payload": {
+          "type": "session_before_compact",
+          "preparation": {
+            "messageCount": 50,
+            "tokenEstimate": 45000,
+            "threshold": 100000
+          },
+          "branchEntries": [],
+          "customInstructions": null
+        },
+        "default_response": {}
+      },
+      {
+        "name": "cancel_compaction",
+        "description": "Extension cancels compaction",
+        "payload": {
+          "type": "session_before_compact",
+          "preparation": {
+            "messageCount": 10,
+            "tokenEstimate": 5000,
+            "threshold": 100000
+          },
+          "branchEntries": [],
+          "customInstructions": null
+        },
+        "default_response": {"cancel": true}
+      }
+    ],
+    "session_before_tree": [
+      {
+        "name": "allow_tree",
+        "description": "Extension allows session tree rendering",
+        "payload": {
+          "type": "session_before_tree",
+          "preparation": {
+            "branchCount": 3,
+            "entryCount": 15
+          }
+        },
+        "default_response": {}
+      },
+      {
+        "name": "custom_label_tree",
+        "description": "Extension provides custom tree label",
+        "payload": {
+          "type": "session_before_tree",
+          "preparation": {
+            "branchCount": 1,
+            "entryCount": 5
+          }
+        },
+        "default_response": {
+          "label": "Debug Session #42"
+        }
+      }
+    ],
+    "session_before_switch": [
+      {
+        "name": "allow_switch",
+        "description": "Extension allows session switch",
+        "payload": {
+          "type": "session_before_switch",
+          "currentSession": "sess-001",
+          "targetSession": "sess-002",
+          "reason": "resume"
+        },
+        "default_response": {}
+      },
+      {
+        "name": "cancel_switch",
+        "description": "Extension cancels session switch",
+        "payload": {
+          "type": "session_before_switch",
+          "currentSession": "sess-001",
+          "targetSession": "sess-002",
+          "reason": "new"
+        },
+        "default_response": {"cancel": true}
+      }
+    ],
+    "session_before_fork": [
+      {
+        "name": "allow_fork",
+        "description": "Extension allows session fork",
+        "payload": {
+          "type": "session_before_fork",
+          "currentSession": "sess-001",
+          "forkEntryId": "entry-007"
+        },
+        "default_response": {}
+      },
+      {
+        "name": "cancel_fork",
+        "description": "Extension cancels session fork",
+        "payload": {
+          "type": "session_before_fork",
+          "currentSession": "sess-001",
+          "forkEntryId": "entry-003"
+        },
+        "default_response": {"cancel": true}
+      }
+    ],
+    "session_shutdown": [
+      {
+        "name": "normal_shutdown",
+        "description": "Clean session shutdown",
+        "payload": {
+          "type": "session_shutdown"
+        },
+        "default_response": null
+      }
+    ]
+  }
+}

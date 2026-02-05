@@ -6060,6 +6060,7 @@ const fn hostcall_code_to_str(code: crate::connectors::HostCallErrorCode) -> &'s
 }
 
 #[allow(clippy::future_not_send)]
+#[allow(clippy::too_many_lines)]
 async fn dispatch_hostcall_session(
     _call_id: &str,
     manager: &ExtensionManager,
@@ -6107,6 +6108,59 @@ async fn dispatch_hostcall_session(
                 .unwrap_or_default()
                 .to_string();
             session.set_name(name).await.map(|()| Value::Null)
+        }
+        "set_model" | "setmodel" => {
+            let provider = payload
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let model_id = payload
+                .get("modelId")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("model_id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if provider.is_empty() || model_id.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setModel: provider and modelId are required".to_string(),
+                };
+            }
+            session
+                .set_model(provider, model_id)
+                .await
+                .map(|()| Value::Bool(true))
+        }
+        "get_model" | "getmodel" => {
+            let (provider, model_id) = session.get_model().await;
+            Ok(serde_json::json!({
+                "provider": provider,
+                "modelId": model_id,
+            }))
+        }
+        "set_thinking_level" | "setthinkinglevel" => {
+            let level = payload
+                .get("level")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("thinkingLevel").and_then(Value::as_str))
+                .or_else(|| payload.get("thinking_level").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if level.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setThinkingLevel: level is required".to_string(),
+                };
+            }
+            session
+                .set_thinking_level(level)
+                .await
+                .map(|()| Value::Null)
+        }
+        "get_thinking_level" | "getthinkinglevel" => {
+            let level = session.get_thinking_level().await;
+            Ok(level.map_or(Value::Null, Value::String))
         }
         "append_message" | "appendmessage" => {
             let message_value = payload.get("message").cloned().unwrap_or(payload);

@@ -1,0 +1,98 @@
+{
+  "schema": "pi.ext.mock_spec.v1",
+  "extension_id": "_default",
+  "description": "Default mock spec for simple extensions. Provides minimal session state, no HTTP/exec mocks, and auto-accept UI dialogs. Suitable for Tier 1-2 extensions that only register tools/commands and subscribe to events.",
+  "session": {
+    "name": "test-session",
+    "file": "/tmp/pi-test/sessions/test-session.jsonl",
+    "state": {
+      "sessionName": "test-session",
+      "sessionFile": "/tmp/pi-test/sessions/test-session.jsonl"
+    },
+    "messages": [
+      {
+        "id": "msg-001",
+        "role": "user",
+        "content": [{ "type": "text", "text": "Hello" }]
+      },
+      {
+        "id": "msg-002",
+        "role": "assistant",
+        "content": [{ "type": "text", "text": "Hi! How can I help you?" }]
+      }
+    ],
+    "entries": [],
+    "branch": [],
+    "accept_mutations": true
+  },
+  "http": {
+    "rules": [],
+    "default_response": {
+      "status": 404,
+      "headers": { "content-type": "text/plain" },
+      "body": "mock: no HTTP rule matched"
+    }
+  },
+  "exec": {
+    "rules": [],
+    "default_result": {
+      "stdout": "",
+      "stderr": "mock: command not found",
+      "code": 127,
+      "killed": false
+    }
+  },
+  "tools": {
+    "active_tools": ["read", "write", "edit", "bash", "grep", "find", "ls"],
+    "all_tools": [
+      { "name": "read", "description": "Read file contents" },
+      { "name": "write", "description": "Write file contents" },
+      { "name": "edit", "description": "Edit file contents" },
+      { "name": "bash", "description": "Execute shell commands" },
+      { "name": "grep", "description": "Search file contents" },
+      { "name": "find", "description": "Discover files by pattern" },
+      { "name": "ls", "description": "List directory contents" }
+    ],
+    "invocations": []
+  },
+  "ui": {
+    "capture": true,
+    "responses": {},
+    "confirm_default": true,
+    "dialog_default": ""
+  },
+  "events": {
+    "fire_sequence": []
+  },
+  "model": {
+    "current": {
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-4-5",
+      "name": "Claude Sonnet 4.5"
+    },
+    "thinking_level": "off",
+    "available_models": [
+      {
+        "provider": "anthropic",
+        "id": "claude-sonnet-4-5",
+        "name": "Claude Sonnet 4.5",
+        "reasoning": true,
+        "input": ["text", "image"],
+        "context_window": 200000,
+        "max_tokens": 8192,
+        "cost": { "input": 3.0, "output": 15.0 }
+      },
+      {
+        "provider": "openai",
+        "id": "gpt-4o",
+        "name": "GPT-4o",
+        "reasoning": false,
+        "input": ["text", "image"],
+        "context_window": 128000,
+        "max_tokens": 4096,
+        "cost": { "input": 5.0, "output": 15.0 }
+      }
+    ],
+    "accept_mutations": true
+  }
+}

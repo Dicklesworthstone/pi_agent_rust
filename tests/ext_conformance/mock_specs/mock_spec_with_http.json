@@ -1,0 +1,135 @@
+{
+  "schema": "pi.ext.mock_spec.v1",
+  "extension_id": "git-checkpoint",
+  "description": "Example mock spec with HTTP and exec rules for git-checkpoint extension. Demonstrates deterministic HTTP + git command mocking and a simple event fire sequence.",
+  "session": {
+    "name": "git-checkpoint-test",
+    "file": "/tmp/pi-test/sessions/git-checkpoint.jsonl",
+    "state": {
+      "sessionName": "git-checkpoint-test",
+      "sessionFile": "/tmp/pi-test/sessions/git-checkpoint.jsonl"
+    },
+    "messages": [],
+    "entries": [],
+    "branch": [],
+    "accept_mutations": true
+  },
+  "http": {
+    "rules": [
+      {
+        "match": {
+          "method": "GET",
+          "url_prefix": "https://api.github.com/repos/"
+        },
+        "response": {
+          "status": 200,
+          "headers": { "content-type": "application/json" },
+          "body_json": {
+            "full_name": "test/repo",
+            "default_branch": "main",
+            "private": false
+          }
+        },
+        "times": 0
+      }
+    ],
+    "default_response": {
+      "status": 404,
+      "headers": { "content-type": "text/plain" },
+      "body": "mock: no HTTP rule matched"
+    }
+  },
+  "exec": {
+    "rules": [
+      {
+        "match": { "cmd_exact": "git", "args_contain": ["status", "--porcelain"] },
+        "result": {
+          "stdout": "M  src/main.rs\n?? new-file.txt\n",
+          "stderr": "",
+          "code": 0,
+          "killed": false
+        },
+        "times": 0
+      },
+      {
+        "match": { "cmd_exact": "git", "args_contain": ["rev-parse", "HEAD"] },
+        "result": {
+          "stdout": "abc123def456789012345678901234567890abcd\n",
+          "stderr": "",
+          "code": 0,
+          "killed": false
+        },
+        "times": 0
+      },
+      {
+        "match": { "cmd_exact": "git", "args_contain": ["diff", "--stat"] },
+        "result": {
+          "stdout": " src/main.rs | 5 +++--\n 1 file changed, 3 insertions(+), 2 deletions(-)\n",
+          "stderr": "",
+          "code": 0,
+          "killed": false
+        },
+        "times": 0
+      },
+      {
+        "match": { "cmd_exact": "git", "args_contain": ["stash"] },
+        "result": {
+          "stdout": "Saved working directory and index state WIP on main: abc123d Test commit\n",
+          "stderr": "",
+          "code": 0,
+          "killed": false
+        },
+        "times": 1
+      },
+      {
+        "match": { "cmd_exact": "git", "args_contain": ["log", "--oneline"] },
+        "result": {
+          "stdout": "abc123d Initial commit\n",
+          "stderr": "",
+          "code": 0,
+          "killed": false
+        },
+        "times": 0
+      }
+    ],
+    "default_result": {
+      "stdout": "",
+      "stderr": "mock: unmatched git command",
+      "code": 1,
+      "killed": false
+    }
+  },
+  "tools": {
+    "active_tools": ["read", "write", "bash"],
+    "all_tools": [
+      { "name": "read", "description": "Read file contents" },
+      { "name": "write", "description": "Write file contents" },
+      { "name": "bash", "description": "Execute shell commands" }
+    ],
+    "invocations": []
+  },
+  "ui": {
+    "capture": true,
+    "responses": {},
+    "confirm_default": true,
+    "dialog_default": ""
+  },
+  "events": {
+    "fire_sequence": [
+      {
+        "event": "turn_end",
+        "payload": {}
+      }
+    ]
+  },
+  "model": {
+    "current": {
+      "provider": "anthropic",
+      "model_id": "claude-sonnet-4-5",
+      "name": "Claude Sonnet 4.5"
+    },
+    "thinking_level": "off",
+    "available_models": [],
+    "accept_mutations": true
+  }
+}

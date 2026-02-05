@@ -56,10 +56,8 @@ impl SseParser {
             match field {
                 "event" => current.event = value.to_string(),
                 "data" => {
-                    if *has_data {
-                        current.data.push('\n');
-                    }
                     current.data.push_str(value);
+                    current.data.push('\n');
                     *has_data = true;
                 }
                 "id" => current.id = Some(value.to_string()),
@@ -71,9 +69,7 @@ impl SseParser {
             match line {
                 "event" => current.event = String::new(),
                 "data" => {
-                    if *has_data {
-                        current.data.push('\n');
-                    }
+                    current.data.push('\n');
                     *has_data = true;
                 }
                 "id" => current.id = Some(String::new()),

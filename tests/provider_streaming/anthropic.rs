@@ -228,6 +228,7 @@ fn generate_error_fixture(
                 status: expectation.status,
                 headers: response_headers,
                 body_chunks: vec![serde_json::to_string(&error_body).unwrap_or_default()],
+                body_chunks_base64: None,
             },
         }],
     };

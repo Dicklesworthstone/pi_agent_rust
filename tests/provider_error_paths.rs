@@ -3,13 +3,13 @@
 //! These tests use VCR cassette playback for HTTP error handling and malformed SSE validation
 //! without requiring API keys or real provider endpoints.
 //!
-//! The `openai_invalid_utf8_in_sse_is_reported` test is the sole exception: it requires raw
-//! byte injection (invalid UTF-8) which VCR cassettes cannot represent, so it uses
-//! `MockHttpServer`.
+//! The `openai_invalid_utf8_in_sse_is_reported` test uses base64-encoded VCR body chunks to
+//! preserve raw bytes (including invalid UTF-8) without requiring a mock HTTP server.
 
 mod common;
 
-use common::TestHarness;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use futures::StreamExt;
 use pi::http::client::Client;
 use pi::model::{Message, UserContent, UserMessage};
@@ -66,6 +66,48 @@ fn vcr_client(
                 status,
                 headers: response_headers,
                 body_chunks: response_chunks,
+                body_chunks_base64: None,
+            },
+        }],
+    };
+    let serialized = serde_json::to_string_pretty(&cassette).expect("serialize cassette");
+    std::fs::write(temp.path().join(format!("{test_name}.json")), serialized)
+        .expect("write cassette");
+    let recorder = VcrRecorder::new_with(test_name, VcrMode::Playback, temp.path());
+    let client = Client::new().with_vcr(recorder);
+    (client, temp)
+}
+
+fn vcr_client_bytes(
+    test_name: &str,
+    url: &str,
+    request_body: serde_json::Value,
+    status: u16,
+    response_headers: Vec<(String, String)>,
+    response_chunks: Vec<Vec<u8>>,
+) -> (Client, tempfile::TempDir) {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let encoded_chunks = response_chunks
+        .into_iter()
+        .map(|chunk| STANDARD.encode(chunk))
+        .collect::<Vec<_>>();
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: test_name.to_string(),
+        recorded_at: "2026-02-05T00:00:00.000Z".to_string(),
+        interactions: vec![Interaction {
+            request: RecordedRequest {
+                method: "POST".to_string(),
+                url: url.to_string(),
+                headers: Vec::new(),
+                body: Some(request_body),
+                body_text: None,
+            },
+            response: RecordedResponse {
+                status,
+                headers: response_headers,
+                body_chunks: Vec::new(),
+                body_chunks_base64: Some(encoded_chunks),
             },
         }],
     };
@@ -185,9 +227,9 @@ fn anthropic_http_500_is_reported() {
 #[test]
 fn gemini_http_500_is_reported() {
     let model = "gemini-test";
-    let api_key = "test-key";
+    let credential = "test-key";
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={credential}"
     );
     let (client, _dir) = vcr_client(
         "gemini_http_500_is_reported",
@@ -202,7 +244,7 @@ fn gemini_http_500_is_reported() {
         let err = provider
             .stream(
                 &context_for("Trigger server error."),
-                &options_with_key(api_key),
+                &options_with_key(credential),
             )
             .await
             .err()
@@ -356,9 +398,9 @@ fn anthropic_invalid_json_event_fails_stream() {
 #[test]
 fn gemini_invalid_json_event_fails_stream() {
     let model = "gemini-test";
-    let api_key = "test-key";
+    let credential = "test-key";
     let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={credential}"
     );
     let (client, _dir) = vcr_client(
         "gemini_invalid_json_event_fails_stream",
@@ -373,7 +415,7 @@ fn gemini_invalid_json_event_fails_stream() {
         let mut stream = provider
             .stream(
                 &context_for("Trigger invalid json."),
-                &options_with_key(api_key),
+                &options_with_key(credential),
             )
             .await
             .expect("stream");
@@ -394,30 +436,22 @@ fn gemini_invalid_json_event_fails_stream() {
 }
 
 // ---------------------------------------------------------------------------
-// Invalid UTF-8 Test (MockHttpServer — allowlisted)
-//
-// VCR cassettes store body_chunks as UTF-8 strings and cannot represent raw
-// invalid byte sequences. This is the only test that genuinely requires byte-
-// level control, so MockHttpServer is retained.
+// Invalid UTF-8 Test (base64 VCR body chunks)
 // ---------------------------------------------------------------------------
 
 #[test]
 fn openai_invalid_utf8_in_sse_is_reported() {
-    let harness = TestHarness::new("openai_invalid_utf8_in_sse_is_reported");
-    let server = harness.start_mock_http_server();
-    server.add_route(
-        "POST",
-        "/v1/chat/completions",
-        common::harness::MockHttpResponse {
-            status: 200,
-            headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
-            body: b"data: \xFF\xFF\n\n".to_vec(),
-        },
+    let (client, _dir) = vcr_client_bytes(
+        "openai_invalid_utf8_in_sse_is_reported",
+        "https://api.openai.com/v1/chat/completions",
+        openai_body("gpt-test", "Trigger invalid utf8."),
+        200,
+        sse_headers(),
+        vec![b"data: \xFF\xFF\n\n".to_vec()],
     );
 
     common::run_async(async move {
-        let provider = pi::providers::openai::OpenAIProvider::new("gpt-test")
-            .with_base_url(format!("{}/v1/chat/completions", server.base_url()));
+        let provider = pi::providers::openai::OpenAIProvider::new("gpt-test").with_client(client);
         let context = context_for("Trigger invalid utf8.");
         let options = options_with_key("test-key");
 

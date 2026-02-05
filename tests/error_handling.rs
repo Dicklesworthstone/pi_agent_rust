@@ -79,6 +79,7 @@ fn vcr_client(
                 status,
                 headers: response_headers,
                 body_chunks: response_chunks,
+                body_chunks_base64: None,
             },
         }],
     };

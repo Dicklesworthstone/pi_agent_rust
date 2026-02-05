@@ -1032,6 +1032,9 @@ impl JsModuleResolver for PiJsResolver {
             "os" => "node:os",
             "child_process" => "node:child_process",
             "crypto" => "node:crypto",
+            "http" => "node:http",
+            "https" => "node:https",
+            "util" => "node:util",
             other => other,
         };
 
@@ -1311,7 +1314,11 @@ export function createAssistantMessageEventStream() {
   };
 }
 
-export default { StringEnum, calculateCost, createAssistantMessageEventStream };
+export function streamSimpleAnthropic() {
+  throw new Error("@mariozechner/pi-ai.streamSimpleAnthropic is not available in PiJS");
+}
+
+export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic };
 "#
         .trim()
         .to_string(),
@@ -1365,11 +1372,53 @@ export class Editor {
   }
 }
 
+export const CURSOR_MARKER = "▌";
+
+export function isKeyRelease(_data) {
+  return false;
+}
+
+export function parseKey(key) {
+  return { key: String(key ?? "") };
+}
+
+export class Box {
+  constructor(_padX = 0, _padY = 0, _styleFn = null) {
+    this.children = [];
+  }
+
+  addChild(child) {
+    this.children.push(child);
+  }
+}
+
+export class SelectList {
+  constructor(items = [], _opts = {}) {
+    this.items = Array.isArray(items) ? items : [];
+    this.selected = 0;
+  }
+
+  setItems(items) {
+    this.items = Array.isArray(items) ? items : [];
+  }
+
+  select(index) {
+    const i = Number(index ?? 0);
+    this.selected = Number.isFinite(i) ? i : 0;
+  }
+}
+
+export class Input {
+  constructor(_opts = {}) {
+    this.value = "";
+  }
+}
+
 export const Key = {
   ctrlAlt: (key) => ({ kind: "ctrlAlt", key: String(key) }),
 };
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Key };
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key };
 "#
         .trim()
         .to_string(),
@@ -1378,6 +1427,141 @@ export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Te
     modules.insert(
         "@mariozechner/pi-coding-agent".to_string(),
         r#"
+export const VERSION = "0.0.0";
+
+export const DEFAULT_MAX_LINES = 2000;
+export const DEFAULT_MAX_BYTES = 50 * 1024;
+
+export function formatSize(bytes) {
+  const b = Number(bytes ?? 0);
+  const KB = 1024;
+  const MB = 1024 * 1024;
+  if (b >= MB) return `${(b / MB).toFixed(1)}MB`;
+  if (b >= KB) return `${(b / KB).toFixed(1)}KB`;
+  return `${Math.trunc(b)}B`;
+}
+
+function jsBytes(value) {
+  return String(value ?? "").length;
+}
+
+export function truncateHead(text, opts = {}) {
+  const raw = String(text ?? "");
+  const maxLines = Number(opts.maxLines ?? DEFAULT_MAX_LINES);
+  const maxBytes = Number(opts.maxBytes ?? DEFAULT_MAX_BYTES);
+
+  const lines = raw.split("\n");
+  const totalLines = lines.length;
+  const totalBytes = jsBytes(raw);
+
+  const out = [];
+  let outBytes = 0;
+  let truncatedBy = null;
+
+  for (const line of lines) {
+    if (out.length >= maxLines) {
+      truncatedBy = "lines";
+      break;
+    }
+
+    const candidate = out.length ? `\n${line}` : line;
+    const candidateBytes = jsBytes(candidate);
+    if (outBytes + candidateBytes > maxBytes) {
+      truncatedBy = "bytes";
+      break;
+    }
+    out.push(line);
+    outBytes += candidateBytes;
+  }
+
+  const content = out.join("\n");
+  return {
+    content,
+    truncated: truncatedBy != null,
+    truncatedBy,
+    totalLines,
+    totalBytes,
+    outputLines: out.length,
+    outputBytes: jsBytes(content),
+    lastLinePartial: false,
+    firstLineExceedsLimit: false,
+    maxLines,
+    maxBytes,
+  };
+}
+
+export function truncateTail(text, opts = {}) {
+  const raw = String(text ?? "");
+  const maxLines = Number(opts.maxLines ?? DEFAULT_MAX_LINES);
+  const maxBytes = Number(opts.maxBytes ?? DEFAULT_MAX_BYTES);
+
+  const lines = raw.split("\n");
+  const totalLines = lines.length;
+  const totalBytes = jsBytes(raw);
+
+  const out = [];
+  let outBytes = 0;
+  let truncatedBy = null;
+
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (out.length >= maxLines) {
+      truncatedBy = "lines";
+      break;
+    }
+    const line = lines[i];
+    const candidate = out.length ? `${line}\n` : line;
+    const candidateBytes = jsBytes(candidate);
+    if (outBytes + candidateBytes > maxBytes) {
+      truncatedBy = "bytes";
+      break;
+    }
+    out.unshift(line);
+    outBytes += candidateBytes;
+  }
+
+  const content = out.join("\n");
+  return {
+    content,
+    truncated: truncatedBy != null,
+    truncatedBy,
+    totalLines,
+    totalBytes,
+    outputLines: out.length,
+    outputBytes: jsBytes(content),
+    lastLinePartial: false,
+    firstLineExceedsLimit: false,
+    maxLines,
+    maxBytes,
+  };
+}
+
+export function parseSessionEntries(text) {
+  const raw = String(text ?? "");
+  const out = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      out.push(JSON.parse(trimmed));
+    } catch {
+      // ignore malformed lines
+    }
+  }
+  return out;
+}
+
+export function convertToLlm(entries) {
+  return entries;
+}
+
+export function serializeConversation(entries) {
+  try {
+    return JSON.stringify(entries ?? []);
+  } catch {
+    return String(entries ?? "");
+  }
+}
+
 export function parseFrontmatter(text) {
   const raw = String(text ?? "");
   if (!raw.startsWith("---")) return { frontmatter: {}, body: raw };
@@ -1402,6 +1586,30 @@ export function getMarkdownTheme() {
   return {};
 }
 
+export function getSettingsListTheme() {
+  return {};
+}
+
+export class DynamicBorder {
+  constructor(..._args) {}
+}
+
+export class BorderedLoader {
+  constructor(..._args) {}
+}
+
+export class CustomEditor {
+  constructor(_opts = {}) {
+    this.value = "";
+  }
+
+  handleInput(_data) {}
+
+  render(_width) {
+    return [];
+  }
+}
+
 export function createBashTool(_cwd, _opts = {}) {
   return {
     name: "bash",
@@ -1414,7 +1622,65 @@ export function createBashTool(_cwd, _opts = {}) {
   };
 }
 
-export default { parseFrontmatter, getMarkdownTheme, createBashTool };
+function toolStub(name, description) {
+  return {
+    name,
+    label: name,
+    description,
+    parameters: { type: "object", properties: {}, required: [] },
+    async execute() {
+      return { content: [{ type: "text", text: "" }], details: {} };
+    },
+  };
+}
+
+export function createReadTool(_cwd, _ops = {}) {
+  return toolStub("read", "Read the contents of a file");
+}
+
+export function createWriteTool(_cwd, _ops = {}) {
+  return toolStub("write", "Write a file to disk");
+}
+
+export function createEditTool(_cwd, _ops = {}) {
+  return toolStub("edit", "Edit a file by replacing exact text");
+}
+
+export function copyToClipboard(_text) {
+  return;
+}
+
+export function getAgentDir() {
+  const home =
+    globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
+      ? globalThis.pi.env.get("HOME")
+      : undefined;
+  return home ? `${home}/.pi/agent` : "/home/unknown/.pi/agent";
+}
+
+export default {
+  VERSION,
+  DEFAULT_MAX_LINES,
+  DEFAULT_MAX_BYTES,
+  formatSize,
+  truncateHead,
+  truncateTail,
+  parseSessionEntries,
+  convertToLlm,
+  serializeConversation,
+  parseFrontmatter,
+  getMarkdownTheme,
+  getSettingsListTheme,
+  DynamicBorder,
+  BorderedLoader,
+  CustomEditor,
+  createBashTool,
+  createReadTool,
+  createWriteTool,
+  createEditTool,
+  copyToClipboard,
+  getAgentDir,
+};
 "#
         .trim()
         .to_string(),
@@ -1476,6 +1742,27 @@ export const parse = parseMs;
     );
 
     modules.insert(
+        "jsonwebtoken".to_string(),
+        r#"
+export function sign() {
+  throw new Error("jsonwebtoken.sign is not available in PiJS");
+}
+
+export function verify() {
+  throw new Error("jsonwebtoken.verify is not available in PiJS");
+}
+
+export function decode() {
+  return null;
+}
+
+export default { sign, verify, decode };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
         "node:path".to_string(),
         r#"
 export function join(...parts) {
@@ -1490,7 +1777,30 @@ export function dirname(p) {
   return s.slice(0, idx);
 }
 
-export default { join, dirname };
+export function resolve(...parts) {
+  const base =
+    globalThis.pi && globalThis.pi.process && typeof globalThis.pi.process.cwd === "string"
+      ? globalThis.pi.process.cwd
+      : "/";
+  const cleaned = parts
+    .map((p) => String(p ?? "").replace(/\\/g, "/"))
+    .filter((p) => p.length > 0);
+
+  let out = "";
+  for (const part of cleaned) {
+    if (part.startsWith("/")) {
+      out = part;
+      continue;
+    }
+    out = out === "" || out.endsWith("/") ? out + part : out + "/" + part;
+  }
+  if (!out.startsWith("/")) {
+    out = base.endsWith("/") ? base + out : base + "/" + out;
+  }
+  return out.replace(/\/+/g, "/");
+}
+
+export default { join, dirname, resolve };
 "#
         .trim()
         .to_string(),
@@ -1532,7 +1842,16 @@ export default { homedir };
 export function spawn() {
   throw new Error("node:child_process.spawn is not available in PiJS");
 }
-export default { spawn };
+
+export function spawnSync() {
+  throw new Error("node:child_process.spawnSync is not available in PiJS");
+}
+
+export function execSync() {
+  throw new Error("node:child_process.execSync is not available in PiJS");
+}
+
+export default { spawn, spawnSync, execSync };
 "#
         .trim()
         .to_string(),
@@ -1556,12 +1875,14 @@ export default { createRequire };
     modules.insert(
         "node:fs".to_string(),
         r#"
+export const constants = { R_OK: 4, W_OK: 2, X_OK: 1, F_OK: 0 };
 export function existsSync(_path) { return false; }
 export function readFileSync(_path, _encoding) { return ""; }
+export function appendFileSync(_path, _data, _opts) { return; }
 export function writeFileSync(_path, _data, _opts) { return; }
 export function readdirSync(_path, _opts) { return []; }
 export function statSync(_path) { throw new Error("statSync unavailable"); }
-export default { existsSync, readFileSync, writeFileSync, readdirSync, statSync };
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync };
 "#
         .trim()
         .to_string(),
@@ -1570,10 +1891,72 @@ export default { existsSync, readFileSync, writeFileSync, readdirSync, statSync 
     modules.insert(
         "node:fs/promises".to_string(),
         r"
+export async function access(_path, _mode) { return; }
 export async function mkdir(_path, _opts) { return; }
+export async function readFile(_path, _opts) { return ''; }
 export async function writeFile(_path, _data, _opts) { return; }
-export default { mkdir, writeFile };
+export default { access, mkdir, readFile, writeFile };
 "
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:http".to_string(),
+        r#"
+export function createServer() {
+  throw new Error("node:http.createServer is not available in PiJS");
+}
+
+export function request() {
+  throw new Error("node:http.request is not available in PiJS");
+}
+
+export default { createServer, request };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:https".to_string(),
+        r#"
+export function request() {
+  throw new Error("node:https.request is not available in PiJS");
+}
+
+export default { request };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:util".to_string(),
+        r#"
+export function inspect(value) {
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value ?? "");
+  }
+}
+
+export function promisify(fn) {
+  return (...args) => new Promise((resolve, reject) => {
+    try {
+      fn(...args, (err, result) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+export default { inspect, promisify };
+"#
         .trim()
         .to_string(),
     );
@@ -2606,6 +2989,7 @@ const __pi_extensions = new Map();
 const __pi_tool_index = new Map();      // tool_name -> { extensionId, spec, execute }
 const __pi_command_index = new Map();   // command_name -> { extensionId, name, description, handler }
 const __pi_hook_index = new Map();      // event_name -> [{ extensionId, handler }, ...]
+const __pi_event_bus_index = new Map(); // event_name -> [{ extensionId, handler }, ...] (pi.events.on)
 const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
 const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, description, handler }
 
@@ -2672,6 +3056,7 @@ function __pi_get_or_create_extension(extension_id, meta) {
             tools: new Map(),
             commands: new Map(),
             hooks: new Map(),
+            eventBusHooks: new Map(),
             providers: new Map(),
             shortcuts: new Map(),
             flags: new Map(),
@@ -3044,6 +3429,48 @@ function __pi_register_shortcut(key, spec) {
 	    };
 	}
 
+	function __pi_register_event_bus_hook(event_name, handler) {
+	    const ext = __pi_current_extension_or_throw();
+	    const eventName = String(event_name || '').trim();
+	    if (!eventName) {
+	        throw new Error('events.on: event name is required');
+	    }
+	    if (typeof handler !== 'function') {
+	        throw new Error('events.on: handler must be a function');
+	    }
+
+	    if (!ext.eventBusHooks.has(eventName)) {
+	        ext.eventBusHooks.set(eventName, []);
+	    }
+	    ext.eventBusHooks.get(eventName).push(handler);
+
+	    if (!__pi_event_bus_index.has(eventName)) {
+	        __pi_event_bus_index.set(eventName, []);
+	    }
+	    const indexed = { extensionId: ext.id, handler: handler };
+	    __pi_event_bus_index.get(eventName).push(indexed);
+
+	    let removed = false;
+	    return function unsubscribe() {
+	        if (removed) return;
+	        removed = true;
+
+	        const local = ext.eventBusHooks.get(eventName);
+	        if (Array.isArray(local)) {
+	            const idx = local.indexOf(handler);
+	            if (idx !== -1) local.splice(idx, 1);
+	            if (local.length === 0) ext.eventBusHooks.delete(eventName);
+	        }
+
+	        const global = __pi_event_bus_index.get(eventName);
+	        if (Array.isArray(global)) {
+	            const idx = global.indexOf(indexed);
+	            if (idx !== -1) global.splice(idx, 1);
+	            if (global.length === 0) __pi_event_bus_index.delete(eventName);
+	        }
+	    };
+	}
+
 function __pi_register_flag(flag_name, spec) {
     const ext = __pi_current_extension_or_throw();
     const name = String(flag_name || '').trim().replace(/^\//, '');
@@ -3374,7 +3801,10 @@ function __pi_make_extension_ctx(ctx_payload) {
 	        throw new Error('dispatch_event: event name is required');
 	    }
 
-    const handlers = __pi_hook_index.get(eventName) || [];
+    const handlers = [
+        ...(__pi_hook_index.get(eventName) || []),
+        ...(__pi_event_bus_index.get(eventName) || []),
+    ];
     if (handlers.length === 0) {
         return undefined;
     }
@@ -3722,7 +4152,7 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
 	    }
 	    return pi.events('emit', payload);
 	};
-	pi.events.on = (event, handler) => __pi_register_hook(event, handler);
+	pi.events.on = (event, handler) => __pi_register_event_bus_hook(event, handler);
 
 	pi.env = {
 	    get: __pi_env_get,

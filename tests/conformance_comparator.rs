@@ -51,7 +51,7 @@ pub struct CompareResult {
 }
 
 impl CompareResult {
-    fn pass() -> Self {
+    const fn pass() -> Self {
         Self {
             status: CompareStatus::Pass,
             registration_match: true,
@@ -63,13 +63,10 @@ impl CompareResult {
 
 // ─── Numeric Tolerance ───────────────────────────────────────────────────────
 
-const FLOAT_TOLERANCE: f64 = 1e-9;
+const FLOAT_TOLERANCE: f64 = 1e-10;
 
 fn numbers_equal(a: f64, b: f64) -> bool {
-    if a == b {
-        return true;
-    }
-    (a - b).abs() <= FLOAT_TOLERANCE
+    (a - b).abs() <= FLOAT_TOLERANCE + f64::EPSILON
 }
 
 // ─── Canonicalization ────────────────────────────────────────────────────────
@@ -79,7 +76,7 @@ fn canonicalize(value: &Value) -> Value {
     match value {
         Value::Object(map) => {
             let mut entries: Vec<_> = map.iter().collect();
-            entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+            entries.sort_by_key(|(key, _)| *key);
             let mut out = serde_json::Map::with_capacity(entries.len());
             for (key, val) in entries {
                 let canonical = canonicalize(val);
@@ -98,6 +95,7 @@ fn canonicalize(value: &Value) -> Value {
 // ─── Deep Comparison ─────────────────────────────────────────────────────────
 
 /// Compare two JSON values deeply with path tracking.
+#[allow(clippy::too_many_lines)]
 fn deep_compare(expected: &Value, actual: &Value, path: &str, diffs: &mut Vec<DiffEntry>) {
     match (expected, actual) {
         (Value::Null, Value::Null) => {}
@@ -315,6 +313,7 @@ fn compare_arrays_by_key(
 // ─── Registration Comparison ─────────────────────────────────────────────────
 
 /// Compare registration structures semantically.
+#[allow(clippy::too_many_lines)]
 fn compare_registrations(expected: &Value, actual: &Value, diffs: &mut Vec<DiffEntry>) {
     let path = "registrations";
 
@@ -471,10 +470,7 @@ fn compare_registrations(expected: &Value, actual: &Value, diffs: &mut Vec<DiffE
             diffs.push(DiffEntry {
                 path: format!("{path}.event_hooks"),
                 category: "set_mismatch".to_string(),
-                message: format!(
-                    "event hooks differ: expected {:?}, actual {:?}",
-                    exp_set, act_set
-                ),
+                message: format!("event hooks differ: expected {exp_set:?}, actual {act_set:?}"),
                 expected: Some(serde_json::to_value(&exp_set).unwrap()),
                 actual: Some(serde_json::to_value(&act_set).unwrap()),
             });
@@ -527,6 +523,7 @@ fn compare_hostcalls(expected: &Value, actual: &Value, diffs: &mut Vec<DiffEntry
 ///
 /// Uses set-based comparison for registrations and ordered comparison
 /// for hostcall sequences. Returns a structured `CompareResult`.
+#[must_use]
 pub fn compare_conformance_outputs(expected: &Value, actual: &Value) -> CompareResult {
     let mut diffs = Vec::new();
 
@@ -567,10 +564,14 @@ pub fn compare_conformance_outputs(expected: &Value, actual: &Value) -> CompareR
 }
 
 /// Format a `CompareResult` as a human-readable report.
+#[must_use]
 pub fn format_compare_report(result: &CompareResult) -> String {
+    use std::fmt::Write as _;
+
     let mut report = String::new();
-    report.push_str(&format!(
-        "Status: {:?} | Registrations: {} | Hostcalls: {}\n",
+    let _ = writeln!(
+        report,
+        "Status: {:?} | Registrations: {} | Hostcalls: {}",
         result.status,
         if result.registration_match {
             "MATCH"
@@ -582,20 +583,21 @@ pub fn format_compare_report(result: &CompareResult) -> String {
         } else {
             "DIFFER"
         },
-    ));
+    );
 
     if result.diffs.is_empty() {
         report.push_str("No differences found.\n");
     } else {
-        report.push_str(&format!("{} difference(s):\n", result.diffs.len()));
+        let _ = writeln!(report, "{} difference(s):", result.diffs.len());
         for (i, diff) in result.diffs.iter().enumerate() {
-            report.push_str(&format!(
-                "  {}. [{}] {} — {}\n",
+            let _ = writeln!(
+                report,
+                "  {}. [{}] {} — {}",
                 i + 1,
                 diff.category,
                 diff.path,
                 diff.message
-            ));
+            );
         }
     }
 
@@ -702,7 +704,7 @@ fn numeric_precision_tolerance() {
     let expected = serde_json::json!({
         "extension_id": "hello",
         "registrations": {
-            "commands": [{"name": "t", "value": 1.0000000001}],
+            "commands": [{"name": "t", "value": 1.000_000_000_1}],
             "shortcuts": [], "flags": [], "providers": [],
             "tool_defs": [], "models": [], "event_hooks": []
         },

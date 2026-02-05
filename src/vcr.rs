@@ -4,6 +4,8 @@
 //! responses (e.g., SSE) for deterministic provider tests.
 
 use crate::error::{Error, Result};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use chrono::{SecondsFormat, Utc};
 use futures::StreamExt;
 use futures::stream::{self, BoxStream};
@@ -137,18 +139,29 @@ pub struct RecordedResponse {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body_chunks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body_chunks_base64: Option<Vec<String>>,
 }
 
 impl RecordedResponse {
     pub fn into_byte_stream(
         self,
     ) -> BoxStream<'static, std::result::Result<Vec<u8>, std::io::Error>> {
-        stream::iter(
-            self.body_chunks
-                .into_iter()
-                .map(|chunk| Ok(chunk.into_bytes())),
-        )
-        .boxed()
+        if let Some(chunks) = self.body_chunks_base64 {
+            stream::iter(chunks.into_iter().map(|chunk| {
+                STANDARD
+                    .decode(chunk)
+                    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+            }))
+            .boxed()
+        } else {
+            stream::iter(
+                self.body_chunks
+                    .into_iter()
+                    .map(|chunk| Ok(chunk.into_bytes())),
+            )
+            .boxed()
+        }
     }
 }
 
@@ -268,6 +281,7 @@ impl VcrRecorder {
         let (status, headers, mut stream) = send().await?;
 
         let mut body_chunks = Vec::new();
+        let mut body_chunks_base64: Option<Vec<String>> = None;
         let mut body_bytes = 0usize;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| Error::api(format!("HTTP stream read failed: {e}")))?;
@@ -275,20 +289,37 @@ impl VcrRecorder {
                 continue;
             }
             body_bytes = body_bytes.saturating_add(chunk.len());
-            body_chunks.push(String::from_utf8_lossy(&chunk).to_string());
+            if let Some(encoded) = body_chunks_base64.as_mut() {
+                encoded.push(STANDARD.encode(&chunk));
+            } else if let Ok(text) = std::str::from_utf8(&chunk) {
+                body_chunks.push(text.to_string());
+            } else {
+                let mut encoded = Vec::with_capacity(body_chunks.len() + 1);
+                for existing in &body_chunks {
+                    encoded.push(STANDARD.encode(existing.as_bytes()));
+                }
+                encoded.push(STANDARD.encode(&chunk));
+                body_chunks.clear();
+                body_chunks_base64 = Some(encoded);
+            }
         }
 
         let recorded = RecordedResponse {
             status,
             headers,
             body_chunks,
+            body_chunks_base64,
         };
+        let chunk_count = recorded
+            .body_chunks_base64
+            .as_ref()
+            .map_or(recorded.body_chunks.len(), Vec::len);
 
         info!(
             cassette_path = %self.cassette_path.display(),
             status = recorded.status,
             header_count = recorded.headers.len(),
-            chunk_count = recorded.body_chunks.len(),
+            chunk_count,
             body_bytes,
             "VCR record: captured streaming response"
         );
@@ -559,13 +590,70 @@ fn request_matches(recorded: &RecordedRequest, incoming: &RecordedRequest) -> bo
         redact_json(body);
     }
 
-    if recorded.body != incoming_body {
+    if !match_optional_json(recorded.body.as_ref(), incoming_body.as_ref()) {
         return false;
     }
-    if recorded.body_text != incoming.body_text {
-        return false;
+
+    // Treat a missing recorded `body_text` as a wildcard. This is useful for
+    // tests where the JSON body is dynamic (paths, timestamps, etc.) and the
+    // cassette only wants to constrain method+URL (and optionally structured JSON).
+    if let Some(recorded_text) = recorded.body_text.as_ref() {
+        if incoming.body_text.as_deref() != Some(recorded_text) {
+            return false;
+        }
     }
+
     true
+}
+
+fn match_optional_json(recorded: Option<&Value>, incoming: Option<&Value>) -> bool {
+    let Some(recorded) = recorded else {
+        // Cassette does not constrain JSON body.
+        return true;
+    };
+    let Some(incoming) = incoming else {
+        return false;
+    };
+    match_json_template(recorded, incoming)
+}
+
+/// Match a recorded JSON "template" against an incoming JSON value.
+///
+/// Semantics:
+/// - Objects: recorded keys must match; incoming may have extra keys.
+///   - A recorded key with `null` matches both missing and `null` incoming keys.
+/// - Arrays: strict length + element matching (order-sensitive).
+/// - Scalars: strict equality.
+fn match_json_template(recorded: &Value, incoming: &Value) -> bool {
+    match (recorded, incoming) {
+        (Value::Object(recorded_obj), Value::Object(incoming_obj)) => {
+            for (key, recorded_value) in recorded_obj {
+                match incoming_obj.get(key) {
+                    Some(incoming_value) => {
+                        if !match_json_template(recorded_value, incoming_value) {
+                            return false;
+                        }
+                    }
+                    None => {
+                        if !recorded_value.is_null() {
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        (Value::Array(recorded_items), Value::Array(incoming_items)) => {
+            if recorded_items.len() != incoming_items.len() {
+                return false;
+            }
+            recorded_items
+                .iter()
+                .zip(incoming_items)
+                .all(|(left, right)| match_json_template(left, right))
+        }
+        _ => recorded == incoming,
+    }
 }
 
 pub fn redact_cassette(cassette: &mut Cassette) -> RedactionSummary {
@@ -674,6 +762,7 @@ mod tests {
                     status: 200,
                     headers: vec![("x-api-key".to_string(), "secret".to_string())],
                     body_chunks: vec!["event: message\n\n".to_string()],
+                    body_chunks_base64: None,
                 },
             }],
         };
@@ -749,6 +838,7 @@ mod tests {
                     status: 200,
                     headers: vec![("x-api-key".to_string(), "secret".to_string())],
                     body_chunks: vec![],
+                    body_chunks_base64: None,
                 },
             }],
         };
@@ -792,6 +882,7 @@ mod tests {
                                 "text/event-stream".to_string(),
                             )],
                             body_chunks: vec!["event: message\ndata: ok\n\n".to_string()],
+                            body_chunks_base64: None,
                         };
                         Ok((
                             recorded.status,

@@ -295,6 +295,61 @@ Then:
 
 ---
 
+## 1B. Extension Taxonomy + Compatibility Matrix (Normative)
+
+This section defines the **canonical extension shapes** we support and maps
+each shape to its **entrypoint/config** and **required host capabilities**.
+It is the reference for selection, conformance, and documentation work.
+
+### 1B.1 Extension Shapes (Canonical)
+
+**Runtime extensions (executable):**
+- **PiJS (JS/TS)** — legacy extensions compiled to JS (Tier B).
+- **WASM component** — WIT-based components (Tier A).
+
+**External servers (out-of-process):**
+- **MCP server** — stdio/http/sse tool server (Tier C).
+
+**Resource packs (non-executable):**
+- **Skill pack** — `SKILL.md` bundles for agent behavior.
+- **Prompt template** — `.md` prompt files.
+- **Theme** — `.json` theme definitions for UI.
+
+**Bundles/packages (distribution):**
+- **Package source** — a bundle that may include any of the above (extensions,
+  skills, prompts, themes). Resolved by `src/package_manager.rs`.
+
+### 1B.2 Shape Matrix (entrypoint/config → runtime → I/O)
+
+| Shape | Entrypoint / Config | Runtime | Primary I/O Surface | Notes |
+|---|---|---|---|---|
+| **PiJS extension** | `extension.json` (`pi.ext.manifest.v1`) or package manifest listing `extensions`; entry `.ts`/`.js` | QuickJS + Pi event loop | `register` + `host_call`/`host_result` | Legacy TS/JS compiled and shimmed; no Node/Bun. |
+| **WASM component** | `extension.json` with `runtime="wasm"`; entry `.wasm` component | Wasmtime (component model) | WIT hostcalls → `host_call`/`host_result` | Typed hostcalls via WIT. |
+| **MCP server** | MCP config (`*.json`) or CLI args | External process / remote server | MCP protocol (stdio/http/sse) | Not the extension protocol; policy-gated by connector. |
+| **Skill pack** | `SKILL.md` + optional assets | None (resource) | File load only | Injected into prompt context; no hostcalls. |
+| **Prompt template** | `.md` prompt files | None (resource) | File load only | Used by `/template` invocation. |
+| **Theme** | `.json` theme file | None (resource) | File load only | Used by TUI renderer. |
+| **Package source** | `package.json` / package manifest with resources | Mixed | Depends on contained resources | May include extensions + skills + prompts + themes. |
+
+### 1B.3 Capability Matrix (registration type → required capabilities)
+
+**Capabilities are always derived from hostcalls** (never trusted from the
+extension), but registration types imply typical capability usage:
+
+| Registration type | Protocol surface | Typical hostcalls | Derived capabilities | Notes |
+|---|---|---|---|---|
+| **Tool** (`registerTool`) | `register` → `tool_call`/`tool_result` | `pi.tool(...)` / `pi.exec(...)` | `read` / `write` / `exec` / `tool` | `read/write/exec` derived by tool name; unknown tools map to `tool`. |
+| **Slash command** (`registerCommand`) | `register` → `slash_command`/`slash_result` | `pi.ui.*`, `pi.session.*`, optional `pi.exec` | `ui` / `session` / `exec` | Commands are UI-driven; exec is optional. |
+| **Event hook** (`event_hook`) | `register` → `event_hook` | `pi.session.*`, `pi.ui.*`, `pi.exec`, `pi.http` | `session` / `ui` / `exec` / `http` | Capabilities depend on event handler behavior. |
+| **Provider** (`registerProvider`) | `register` + streaming hooks | `pi.http(...)` | `http` (+ `read` if local files) | Providers require network; record API key access as `env` if used. |
+| **Flag** (`registerFlag`) | `register` only | none until used | none (at register) | Flags are config; capabilities are driven by later behavior. |
+| **Shortcut** (`registerShortcut`) | `register` only | `pi.ui.*` on activation | `ui` | Shortcuts are UI-level triggers. |
+
+**Non-executable resource packs (skills/prompts/themes)** do not invoke hostcalls
+and therefore have **no runtime capability requirements** beyond file loading.
+
+---
+
 ## 2. Artifact Pipeline (Legacy → Optimized)
 
 **Inputs**

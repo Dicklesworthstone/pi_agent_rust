@@ -658,7 +658,7 @@ checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
 
 [[package]]
 name = "charmed-bubbles"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "charmed-bubbletea",
  "charmed-harmonica",
@@ -670,7 +670,7 @@ dependencies = [
 
 [[package]]
 name = "charmed-bubbletea"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "charmed-bubbletea-macros",
  "crossterm",
@@ -681,7 +681,7 @@ dependencies = [
 
 [[package]]
 name = "charmed-bubbletea-macros"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "darling",
  "proc-macro-error2",
@@ -692,7 +692,7 @@ dependencies = [
 
 [[package]]
 name = "charmed-glamour"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "charmed-lipgloss",
  "lru 0.12.5",
@@ -703,11 +703,11 @@ dependencies = [
 
 [[package]]
 name = "charmed-harmonica"
-version = "0.1.0"
+version = "0.1.2"
 
 [[package]]
 name = "charmed-lipgloss"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "bitflags 2.10.0",
  "colored",

@@ -7,6 +7,8 @@
 mod common;
 
 use common::TestHarness;
+use pi::config::Config;
+use pi::tools::ToolRegistry;
 use serde::Deserialize;
 use serde_json::json;
 use std::cell::Cell;
@@ -1588,6 +1590,24 @@ fn expected_system_prompt(custom: &str) -> String {
     format!("{custom}\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>")
 }
 
+fn expected_anthropic_tools(enabled: &[&str]) -> Vec<serde_json::Value> {
+    let cwd = Path::new(".");
+    let config = Config::default();
+    let tools = ToolRegistry::new(enabled, cwd, Some(&config));
+
+    tools
+        .tools()
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name(),
+                "description": tool.description(),
+                "input_schema": tool.parameters(),
+            })
+        })
+        .collect()
+}
+
 #[test]
 fn e2e_cli_print_mode_vcr_roundtrip() {
     let mut harness = CliTestHarness::new("e2e_cli_print_mode_vcr_roundtrip");
@@ -1849,6 +1869,7 @@ fn e2e_cli_specific_tools_enables_subset() {
             {"role": "user", "content": [{"type": "text", "text": "Say tools."}]}
         ],
         "system": expected_system_prompt("Test tools subset."),
+        "tools": expected_anthropic_tools(&["read", "grep"]),
         "max_tokens": 8192,
         "stream": true
     });
@@ -1904,6 +1925,7 @@ fn e2e_cli_default_tools_when_no_flag() {
             {"role": "user", "content": [{"type": "text", "text": "Say default."}]}
         ],
         "system": expected_system_prompt("Test default tools."),
+        "tools": expected_anthropic_tools(&["read", "bash", "edit", "write"]),
         "max_tokens": 8192,
         "stream": true
     });
@@ -2148,122 +2170,29 @@ fn e2e_cli_auth_failure_error() {
     );
 }
 
-/// `--no-tools` with VCR playback that returns a tool_use response:
+/// `--no-tools` with VCR playback that returns a `tool_use` response:
 /// Verify the agent gracefully handles the situation (no crash, clear behavior).
 #[test]
+#[allow(clippy::too_many_lines)]
 fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
     let mut harness = CliTestHarness::new("e2e_cli_no_tools_handles_tool_use_response_gracefully");
 
-    // Build a VCR cassette that returns a tool_use response even though
-    // no tools were sent. The binary should handle this gracefully.
-    let cassette_dir = harness.harness.temp_path("vcr-cassettes");
-    fs::create_dir_all(&cassette_dir).expect("create cassette dir");
-
-    let message_start = json!({
-        "type": "message_start",
-        "message": {
-            "model": "claude-sonnet-4-5",
-            "id": "msg_mock_no_tools_001",
-            "type": "message",
-            "role": "assistant",
-            "content": [],
-            "stop_reason": null,
-            "stop_sequence": null,
-            "usage": {
-                "input_tokens": 10,
-                "cache_creation_input_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "output_tokens": 1,
-                "service_tier": "standard"
-            }
-        }
-    });
-    let text_start = json!({
-        "type": "content_block_start",
-        "index": 0,
-        "content_block": {"type": "text", "text": ""}
-    });
-    let text_delta = json!({
-        "type": "content_block_delta",
-        "index": 0,
-        "delta": {"type": "text_delta", "text": "I wanted to use a tool but none are available."}
-    });
-    let text_stop = json!({
-        "type": "content_block_stop",
-        "index": 0
-    });
-    let message_delta = json!({
-        "type": "message_delta",
-        "delta": {"stop_reason": "end_turn", "stop_sequence": null},
-        "usage": {
-            "input_tokens": 10,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "output_tokens": 15
-        }
+    let request_body = json!({
+        "model": "claude-sonnet-4-5",
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "Read a file for me."}]}
+        ],
+        "system": expected_system_prompt("Test no-tools graceful."),
+        "max_tokens": 8192,
+        "stream": true
     });
 
-    let chunks = vec![
-        format!("event: message_start\ndata: {message_start}\n\n"),
-        format!("event: content_block_start\ndata: {text_start}\n\n"),
-        "event: ping\ndata: {\"type\": \"ping\"}\n\n".to_string(),
-        format!("event: content_block_delta\ndata: {text_delta}\n\n"),
-        format!("event: content_block_stop\ndata: {text_stop}\n\n"),
-        format!("event: message_delta\ndata: {message_delta}\n\n"),
-        "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
-    ];
-
-    let cassette = json!({
-        "version": "1.0",
-        "test_name": "e2e_no_tools_graceful",
-        "recorded_at": "2026-02-05T00:00:00.000Z",
-        "interactions": [{
-            "request": {
-                "method": "POST",
-                "url": "https://api.anthropic.com/v1/messages",
-                "headers": [
-                    ["Content-Type", "application/json"],
-                    ["Accept", "text/event-stream"]
-                ],
-                "body": null
-            },
-            "response": {
-                "status": 200,
-                "headers": [
-                    ["Content-Type", "text/event-stream; charset=utf-8"]
-                ],
-                "body_chunks": chunks
-            }
-        }]
-    });
-
-    let cassette_path = cassette_dir.join("e2e_no_tools_graceful.json");
-    fs::write(
-        &cassette_path,
-        serde_json::to_string_pretty(&cassette).expect("serialize cassette"),
-    )
-    .expect("write cassette");
-
-    harness
-        .env
-        .insert("VCR_MODE".to_string(), "playback".to_string());
-    harness.env.insert(
-        "VCR_CASSETTE_DIR".to_string(),
-        cassette_dir.display().to_string(),
+    setup_vcr_anthropic(
+        &mut harness,
+        "e2e_no_tools_graceful",
+        &request_body,
+        "I wanted to use a tool but none are available.",
     );
-    harness.env.insert(
-        "PI_VCR_TEST_NAME".to_string(),
-        "e2e_no_tools_graceful".to_string(),
-    );
-    harness
-        .env
-        .insert("ANTHROPIC_API_KEY".to_string(), "test-vcr-key".to_string());
-    harness
-        .env
-        .insert("PI_TEST_MODE".to_string(), "1".to_string());
-    harness
-        .env
-        .insert("VCR_DEBUG_BODY".to_string(), "1".to_string());
 
     let result = harness.run(&[
         "-p",
@@ -2278,6 +2207,8 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
         "--no-themes",
         "--thinking",
         "off",
+        "--system-prompt",
+        "Test no-tools graceful.",
         "Read a file for me.",
     ]);
 
@@ -2307,7 +2238,7 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
 // ============================================================================
 
 /// Create a rich, multi-entry session JSONL (header + user msg + assistant msg +
-/// model_change + thinking_level_change).  Returns the session ID.
+/// `model_change` + `thinking_level_change`).  Returns the session ID.
 fn write_rich_session(path: &Path, cwd: &Path) -> String {
     let session_id = "rich-session-e2e-42";
     let header = json!({
@@ -2345,8 +2276,8 @@ fn write_rich_session(path: &Path, cwd: &Path) -> String {
                 "totalTokens": 18,
                 "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
             },
-            "stopReason": "endTurn",
-            "timestamp": 1738663202000_i64
+            "stopReason": "stop",
+            "timestamp": 1_738_663_202_000_i64
         }
     });
     let model_change = json!({
@@ -2365,9 +2296,8 @@ fn write_rich_session(path: &Path, cwd: &Path) -> String {
         "thinkingLevel": "high"
     });
 
-    let content = format!(
-        "{header}\n{user_msg}\n{assistant_msg}\n{model_change}\n{thinking_change}\n"
-    );
+    let content =
+        format!("{header}\n{user_msg}\n{assistant_msg}\n{model_change}\n{thinking_change}\n");
     fs::write(path, content).expect("write rich session jsonl");
     session_id.to_string()
 }
@@ -2421,7 +2351,7 @@ fn e2e_cli_export_multi_entry_session_integrity() {
     assert_contains(&harness.harness, &html, "high");
 }
 
-/// Test 2: PI_SESSIONS_DIR env override appears in `config` output.
+/// Test 2: `PI_SESSIONS_DIR` env override appears in `config` output.
 #[test]
 fn e2e_cli_session_dir_override_via_env() {
     let mut harness = CliTestHarness::new("e2e_cli_session_dir_override_via_env");
@@ -2460,7 +2390,10 @@ fn e2e_cli_export_session_from_nonstandard_path() {
     let result = harness.run(&["--export", &session_arg, &export_arg]);
 
     assert_exit_code(&harness.harness, &result, 0);
-    assert!(export_path.exists(), "expected export file at non-standard path");
+    assert!(
+        export_path.exists(),
+        "expected export file at non-standard path"
+    );
     let html = fs::read_to_string(&export_path).expect("read export html");
     harness
         .harness
@@ -2660,8 +2593,7 @@ fn e2e_interactive_session_creates_valid_jsonl_tmux() {
     );
 
     // Find the created session file and validate header.
-    let session_file = find_first_jsonl(&sessions_dir)
-        .expect("should find a session jsonl file");
+    let session_file = find_first_jsonl(&sessions_dir).expect("should find a session jsonl file");
 
     harness
         .harness
@@ -2704,7 +2636,10 @@ fn e2e_interactive_session_creates_valid_jsonl_tmux() {
         v["type"] == "message" && v["message"]["role"] == "assistant"
     });
     assert!(has_user, "session should contain a user message entry");
-    assert!(has_assistant, "session should contain an assistant message entry");
+    assert!(
+        has_assistant,
+        "session should contain an assistant message entry"
+    );
 }
 
 /// Test 6: `-c` (continue) loads the most recent session from the project session directory.
@@ -2712,8 +2647,7 @@ fn e2e_interactive_session_creates_valid_jsonl_tmux() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_interactive_session_continue_loads_previous_tmux() {
-    let mut harness =
-        CliTestHarness::new("e2e_interactive_session_continue_loads_previous_tmux");
+    let mut harness = CliTestHarness::new("e2e_interactive_session_continue_loads_previous_tmux");
     let logger = harness.harness.log();
 
     if !TmuxInstance::tmux_available() {
@@ -2759,11 +2693,8 @@ fn e2e_interactive_session_continue_loads_previous_tmux() {
             "content": "Previous session user message."
         }
     });
-    fs::write(
-        &session_file,
-        format!("{header}\n{user_entry}\n"),
-    )
-    .expect("write pre-existing session");
+    fs::write(&session_file, format!("{header}\n{user_entry}\n"))
+        .expect("write pre-existing session");
     let original_size = fs::metadata(&session_file)
         .expect("stat session file")
         .len();
@@ -2879,7 +2810,8 @@ fn e2e_interactive_session_continue_loads_previous_tmux() {
         Duration::from_secs(20),
     );
     assert!(
-        pane.contains("Welcome to Pi!") || pane.contains("Continuing session")
+        pane.contains("Welcome to Pi!")
+            || pane.contains("Continuing session")
             || pane.contains("session"),
         "Expected pi to start; got:\n{pane}"
     );
@@ -2959,11 +2891,7 @@ fn e2e_cli_session_explicit_path_loads_session() {
             "content": "Alpha session content unique."
         }
     });
-    fs::write(
-        &session_a_path,
-        format!("{header_a}\n{entry_a}\n"),
-    )
-    .expect("write session a");
+    fs::write(&session_a_path, format!("{header_a}\n{entry_a}\n")).expect("write session a");
 
     let header_b = json!({
         "type": "session",
@@ -2982,11 +2910,7 @@ fn e2e_cli_session_explicit_path_loads_session() {
             "content": "Beta session content unique."
         }
     });
-    fs::write(
-        &session_b_path,
-        format!("{header_b}\n{entry_b}\n"),
-    )
-    .expect("write session b");
+    fs::write(&session_b_path, format!("{header_b}\n{entry_b}\n")).expect("write session b");
 
     // Export session A.
     let export_a = harness.harness.temp_path("export-a.html");

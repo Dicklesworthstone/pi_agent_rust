@@ -2831,7 +2831,7 @@ mod abort_tests {
                             message: Message::Assistant(_)
                         }
                     ) {
-                        started_tx.notify_waiters();
+                        started_tx.notify_one();
                     }
                 })
                 .await

@@ -152,13 +152,9 @@ impl<'a> RequestBuilder<'a> {
                     Ok((status, response_headers, stream))
                 })
                 .await?;
-            let crate::vcr::RecordedResponse {
-                status,
-                headers: response_headers,
-                body_chunks,
-            } = recorded;
-            let stream =
-                stream::iter(body_chunks.into_iter().map(|chunk| Ok(chunk.into_bytes()))).boxed();
+            let status = recorded.status;
+            let response_headers = recorded.headers.clone();
+            let stream = recorded.into_byte_stream();
             return Ok(Response {
                 status,
                 headers: response_headers,

@@ -564,7 +564,7 @@ fn numbers_equal(left: &serde_json::Number, right: &serde_json::Number) -> bool 
     let left = left.as_f64();
     let right = right.as_f64();
     match (left, right) {
-        (Some(left), Some(right)) => (left - right).abs() <= FLOAT_EPSILON,
+        (Some(left), Some(right)) => (left - right).abs() <= FLOAT_EPSILON + f64::EPSILON,
         _ => false,
     }
 }

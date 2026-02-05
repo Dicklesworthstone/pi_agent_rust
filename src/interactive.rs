@@ -4882,6 +4882,17 @@ impl PiApp {
 
         // Forward to appropriate component based on state
         if self.agent_state == AgentState::Idle {
+            if let Some(key) = msg.downcast_ref::<KeyMsg>() {
+                if key.key_type == KeyType::Space {
+                    let mut key = key.clone();
+                    key.key_type = KeyType::Runes;
+                    key.runes = vec![' '];
+
+                    let result = BubbleteaModel::update(&mut self.input, Message::new(key));
+                    self.maybe_trigger_autocomplete();
+                    return result;
+                }
+            }
             let result = BubbleteaModel::update(&mut self.input, msg);
 
             // After text area update, check if we should trigger autocomplete
@@ -7845,14 +7856,9 @@ impl PiApp {
                         let provider = provider.trim().to_ascii_lowercase();
                         let model_id = model_id.trim();
                         if !provider.is_empty() && !model_id.is_empty() {
-                            if let Some(mut entry) =
+                            if let Some(entry) =
                                 crate::models::ad_hoc_model_entry(&provider, model_id)
                             {
-                                let auth_path = crate::config::Config::auth_path();
-                                let resolved_key = crate::auth::AuthStorage::load(auth_path)
-                                    .ok()
-                                    .and_then(|auth| auth.resolve_api_key(&provider, None));
-                                entry.api_key = resolved_key;
                                 matches.push(entry);
                             }
                         }
@@ -7883,7 +7889,7 @@ impl PiApp {
 
                 let next = matches.into_iter().next().expect("matches is non-empty");
 
-                let resolved_api_key = if next.api_key.is_some() {
+                let resolved_key_opt = if next.api_key.is_some() {
                     next.api_key.clone()
                 } else {
                     let auth_path = crate::config::Config::auth_path();
@@ -7891,7 +7897,7 @@ impl PiApp {
                         .ok()
                         .and_then(|auth| auth.resolve_api_key(&next.model.provider, None))
                 };
-                if resolved_api_key.is_none() {
+                if resolved_key_opt.is_none() {
                     self.status_message = Some(format!(
                         "Missing API key for provider {}",
                         next.model.provider
@@ -7920,7 +7926,10 @@ impl PiApp {
                     return None;
                 };
                 agent_guard.set_provider(provider_impl);
-                agent_guard.stream_options_mut().api_key = resolved_api_key;
+                agent_guard
+                    .stream_options_mut()
+                    .api_key
+                    .clone_from(&resolved_key_opt);
                 agent_guard
                     .stream_options_mut()
                     .headers
