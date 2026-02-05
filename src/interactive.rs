@@ -1554,7 +1554,7 @@ fn run_command_output(
 
         match rx.recv_timeout(tick) {
             Ok(result) => return result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {}
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(std::io::Error::other("command output channel disconnected"));
             }
