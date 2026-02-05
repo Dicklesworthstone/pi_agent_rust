@@ -2022,6 +2022,158 @@ export default { sign, verify, decode };
         .to_string(),
     );
 
+    // ── shell-quote ──────────────────────────────────────────────────
+    modules.insert(
+        "shell-quote".to_string(),
+        r#"
+export function parse(cmd) {
+  if (typeof cmd !== 'string') return [];
+  const args = [];
+  let current = '';
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  for (let i = 0; i < cmd.length; i++) {
+    const ch = cmd[i];
+    if (escaped) { current += ch; escaped = false; continue; }
+    if (ch === '\\' && !inSingle) { escaped = true; continue; }
+    if (ch === "'" && !inDouble) { inSingle = !inSingle; continue; }
+    if (ch === '"' && !inSingle) { inDouble = !inDouble; continue; }
+    if ((ch === ' ' || ch === '\t') && !inSingle && !inDouble) {
+      if (current) { args.push(current); current = ''; }
+      continue;
+    }
+    current += ch;
+  }
+  if (current) args.push(current);
+  return args;
+}
+export function quote(args) {
+  if (!Array.isArray(args)) return '';
+  return args.map(a => {
+    if (/[^a-zA-Z0-9_\-=:./]/.test(a)) return "'" + a.replace(/'/g, "'\\''") + "'";
+    return a;
+  }).join(' ');
+}
+export default { parse, quote };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // ── vscode-languageserver-protocol ──────────────────────────────
+    {
+        let vls = r"
+export const DiagnosticSeverity = { Error: 1, Warning: 2, Information: 3, Hint: 4 };
+export const CodeActionKind = { QuickFix: 'quickfix', Refactor: 'refactor', RefactorExtract: 'refactor.extract', RefactorInline: 'refactor.inline', RefactorRewrite: 'refactor.rewrite', Source: 'source', SourceOrganizeImports: 'source.organizeImports', SourceFixAll: 'source.fixAll' };
+export const DocumentDiagnosticReportKind = { Full: 'full', Unchanged: 'unchanged' };
+export const SymbolKind = { File: 1, Module: 2, Namespace: 3, Package: 4, Class: 5, Method: 6, Property: 7, Field: 8, Constructor: 9, Enum: 10, Interface: 11, Function: 12, Variable: 13, Constant: 14 };
+function makeReqType(m) { return { type: { get method() { return m; } }, method: m }; }
+function makeNotifType(m) { return { type: { get method() { return m; } }, method: m }; }
+export const InitializeRequest = makeReqType('initialize');
+export const DefinitionRequest = makeReqType('textDocument/definition');
+export const ReferencesRequest = makeReqType('textDocument/references');
+export const HoverRequest = makeReqType('textDocument/hover');
+export const SignatureHelpRequest = makeReqType('textDocument/signatureHelp');
+export const DocumentSymbolRequest = makeReqType('textDocument/documentSymbol');
+export const RenameRequest = makeReqType('textDocument/rename');
+export const CodeActionRequest = makeReqType('textDocument/codeAction');
+export const DocumentDiagnosticRequest = makeReqType('textDocument/diagnostic');
+export const WorkspaceDiagnosticRequest = makeReqType('workspace/diagnostic');
+export const InitializedNotification = makeNotifType('initialized');
+export const DidOpenTextDocumentNotification = makeNotifType('textDocument/didOpen');
+export const DidChangeTextDocumentNotification = makeNotifType('textDocument/didChange');
+export const DidCloseTextDocumentNotification = makeNotifType('textDocument/didClose');
+export const DidSaveTextDocumentNotification = makeNotifType('textDocument/didSave');
+export const PublishDiagnosticsNotification = makeNotifType('textDocument/publishDiagnostics');
+export function createMessageConnection(_reader, _writer) {
+  return {
+    listen() {},
+    sendRequest() { return Promise.resolve(null); },
+    sendNotification() {},
+    onNotification() {},
+    onRequest() {},
+    onClose() {},
+    dispose() {},
+  };
+}
+export class StreamMessageReader { constructor(_s) {} }
+export class StreamMessageWriter { constructor(_s) {} }
+"
+        .trim()
+        .to_string();
+
+        modules.insert("vscode-languageserver-protocol".to_string(), vls.clone());
+        modules.insert(
+            "vscode-languageserver-protocol/node.js".to_string(),
+            vls.clone(),
+        );
+        modules.insert("vscode-languageserver-protocol/node".to_string(), vls);
+    }
+
+    // ── @modelcontextprotocol/sdk ──────────────────────────────────
+    {
+        let mcp_client = r"
+export class Client {
+  constructor(_opts = {}) {}
+  async connect(_transport) {}
+  async listTools() { return { tools: [] }; }
+  async listResources() { return { resources: [] }; }
+  async callTool(_name, _args) { return { content: [] }; }
+  async close() {}
+}
+"
+        .trim()
+        .to_string();
+
+        let mcp_transport = r"
+export class StdioClientTransport {
+  constructor(_opts = {}) {}
+  async start() {}
+  async close() {}
+}
+"
+        .trim()
+        .to_string();
+
+        modules.insert(
+            "@modelcontextprotocol/sdk/client/index.js".to_string(),
+            mcp_client.clone(),
+        );
+        modules.insert(
+            "@modelcontextprotocol/sdk/client/index".to_string(),
+            mcp_client,
+        );
+        modules.insert(
+            "@modelcontextprotocol/sdk/client/stdio.js".to_string(),
+            mcp_transport,
+        );
+        modules.insert(
+            "@modelcontextprotocol/sdk/client/streamableHttp.js".to_string(),
+            r"
+export class StreamableHTTPClientTransport {
+  constructor(_opts = {}) {}
+  async start() {}
+  async close() {}
+}
+"
+            .trim()
+            .to_string(),
+        );
+        modules.insert(
+            "@modelcontextprotocol/sdk/client/sse.js".to_string(),
+            r"
+export class SSEClientTransport {
+  constructor(_opts = {}) {}
+  async start() {}
+  async close() {}
+}
+"
+            .trim()
+            .to_string(),
+        );
+    }
+
     modules.insert(
         "node:path".to_string(),
         r#"
@@ -2228,23 +2380,57 @@ export function readFileSync(_path, _encoding) { return ""; }
 export function appendFileSync(_path, _data, _opts) { return; }
 export function writeFileSync(_path, _data, _opts) { return; }
 export function readdirSync(_path, _opts) { return []; }
-export function statSync(_path) { throw new Error("statSync unavailable"); }
+const __fakeStat = {
+  isFile() { return false; },
+  isDirectory() { return false; },
+  isSymbolicLink() { return false; },
+  isBlockDevice() { return false; },
+  isCharacterDevice() { return false; },
+  isFIFO() { return false; },
+  isSocket() { return false; },
+  size: 0, mode: 0o644, uid: 0, gid: 0,
+  atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0,
+  atime: new Date(0), mtime: new Date(0), ctime: new Date(0), birthtime: new Date(0),
+  dev: 0, ino: 0, nlink: 1, rdev: 0, blksize: 4096, blocks: 0,
+};
+export function statSync(_path) { return __fakeStat; }
+export function lstatSync(_path) { return __fakeStat; }
 export function mkdtempSync(prefix, _opts) {
-  // Return a fake temp directory path based on prefix
   const p = String(prefix ?? "/tmp/tmp-");
   return `${p}${Date.now().toString(36)}`;
 }
 export function realpathSync(path, _opts) {
-  // Return the path as-is (no symlink resolution in stub)
   return String(path ?? '');
 }
 export function unlinkSync(_path) { return; }
 export function rmdirSync(_path, _opts) { return; }
+export function rmSync(_path, _opts) { return; }
 export function copyFileSync(_src, _dest, _mode) { return; }
 export function renameSync(_oldPath, _newPath) { return; }
 export function mkdirSync(_path, _opts) { return; }
 export function accessSync(_path, _mode) { throw new Error("ENOENT: no such file or directory"); }
-export function lstatSync(_path) { throw new Error("lstatSync unavailable"); }
+export function chmodSync(_path, _mode) { return; }
+export function chownSync(_path, _uid, _gid) { return; }
+export function openSync(_path, _flags, _mode) { return 99; }
+export function closeSync(_fd) { return; }
+export function readSync(_fd, _buf, _off, _len, _pos) { return 0; }
+export function writeSync(_fd, _buf, _off, _len, _pos) { return typeof _buf === 'string' ? _buf.length : (_len || 0); }
+export function fstatSync(_fd) { return __fakeStat; }
+export function ftruncateSync(_fd, _len) { return; }
+export function futimesSync(_fd, _atime, _mtime) { return; }
+function __fakeWatcher() {
+  const w = { close() {}, unref() { return w; }, ref() { return w; }, on() { return w; }, once() { return w; }, removeListener() { return w; }, removeAllListeners() { return w; } };
+  return w;
+}
+export function watch(_path, _optsOrListener, _listener) { return __fakeWatcher(); }
+export function watchFile(_path, _optsOrListener, _listener) { return __fakeWatcher(); }
+export function unwatchFile(_path, _listener) { return; }
+export function createReadStream(_path, _opts) {
+  return { on() { return this; }, pipe() { return this; }, destroy() {}, read() { return null; }, resume() { return this; }, pause() { return this; } };
+}
+export function createWriteStream(_path, _opts) {
+  return { on() { return this; }, write() { return true; }, end() {}, destroy() {}, cork() {}, uncork() {} };
+}
 export function readFile(_path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
   if (typeof callback === 'function') callback(null, '');
@@ -2268,12 +2454,16 @@ export const promises = {
   writeFile: async (_path, _data, _opts) => {},
   unlink: async (_path) => {},
   rmdir: async (_path, _opts) => {},
-  stat: async (_path) => { throw new Error('stat unavailable'); },
+  stat: async (_path) => __fakeStat,
+  lstat: async (_path) => __fakeStat,
   realpath: async (path, _opts) => String(path ?? ''),
   readdir: async (_path, _opts) => [],
   rm: async (_path, _opts) => {},
+  rename: async (_oldPath, _newPath) => {},
+  copyFile: async (_src, _dest, _mode) => {},
+  chmod: async (_path, _mode) => {},
 };
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, copyFileSync, renameSync, mkdirSync, accessSync, lstatSync, readFile, writeFile, access, promises };
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, access, promises };
 "#
         .trim()
         .to_string(),
@@ -5437,6 +5627,22 @@ if (typeof globalThis.TextDecoder === 'undefined') {
     globalThis.TextDecoder = TextDecoder;
 }
 
+// structuredClone — deep clone using JSON round-trip
+if (typeof globalThis.structuredClone === 'undefined') {
+    globalThis.structuredClone = (value) => JSON.parse(JSON.stringify(value));
+}
+
+// queueMicrotask — schedule a microtask
+if (typeof globalThis.queueMicrotask === 'undefined') {
+    globalThis.queueMicrotask = (fn) => Promise.resolve().then(fn);
+}
+
+// performance.now() — high-resolution timer
+if (typeof globalThis.performance === 'undefined') {
+    const start = Date.now();
+    globalThis.performance = { now: () => Date.now() - start, timeOrigin: start };
+}
+
 if (typeof globalThis.URLSearchParams === 'undefined') {
     class URLSearchParams {
         constructor(init) {
@@ -5827,6 +6033,25 @@ if (typeof globalThis.fetch !== 'function') {
 
     globalThis.Headers = Headers;
     globalThis.Response = Response;
+
+    // AbortController / AbortSignal polyfill — many npm packages check for these
+    if (typeof globalThis.AbortController === 'undefined') {
+        class AbortSignal {
+            constructor() { this.aborted = false; this._listeners = []; }
+            get reason() { return this.aborted ? new Error('This operation was aborted') : undefined; }
+            addEventListener(type, fn) { if (type === 'abort') this._listeners.push(fn); }
+            removeEventListener(type, fn) { if (type === 'abort') this._listeners = this._listeners.filter(f => f !== fn); }
+            throwIfAborted() { if (this.aborted) throw this.reason; }
+            static abort(reason) { const s = new AbortSignal(); s.aborted = true; s._reason = reason; return s; }
+            static timeout(ms) { const s = new AbortSignal(); setTimeout(() => { s.aborted = true; s._listeners.forEach(fn => fn()); }, ms); return s; }
+        }
+        class AbortController {
+            constructor() { this.signal = new AbortSignal(); }
+            abort(reason) { this.signal.aborted = true; this.signal._reason = reason; this.signal._listeners.forEach(fn => fn()); }
+        }
+        globalThis.AbortController = AbortController;
+        globalThis.AbortSignal = AbortSignal;
+    }
 
     globalThis.fetch = async (input, init) => {
         const url = typeof input === 'string' ? input : String(input && input.url ? input.url : input);

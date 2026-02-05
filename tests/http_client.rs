@@ -334,7 +334,6 @@ fn vcr_round_trip_playback_reuses_recorded_stream() {
     assert_eq!(recorded_body, "hello from vcr");
 
     let playback_body = common::run_async({
-        let url = url.clone();
         let cassette_dir = cassette_dir.clone();
         async move {
             let recorder = VcrRecorder::new_with(
