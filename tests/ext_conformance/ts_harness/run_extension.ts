@@ -119,6 +119,76 @@ const originalConsole = {
 	error: console.error.bind(console),
 };
 
+function applyDeterministicGlobals() {
+	const timeRaw = process.env.PI_DETERMINISTIC_TIME_MS;
+	const stepRaw = process.env.PI_DETERMINISTIC_TIME_STEP_MS;
+	if (timeRaw && timeRaw.trim().length > 0) {
+		const base = Number(timeRaw);
+		if (Number.isFinite(base)) {
+			const stepValue = stepRaw ? Number(stepRaw) : 1;
+			const step = Number.isFinite(stepValue) ? stepValue : 1;
+			let tick = 0;
+			const nextNow = () => {
+				const value = base + step * tick;
+				tick += 1;
+				return value;
+			};
+			const OriginalDate = Date;
+			class DeterministicDate extends OriginalDate {
+				constructor(...args: any[]) {
+					if (args.length === 0) {
+						super(nextNow());
+					} else {
+						super(...args);
+					}
+				}
+				static now() {
+					return nextNow();
+				}
+			}
+			DeterministicDate.UTC = OriginalDate.UTC;
+			DeterministicDate.parse = OriginalDate.parse;
+			(globalThis as any).Date = DeterministicDate;
+		}
+	}
+
+	const randRaw = process.env.PI_DETERMINISTIC_RANDOM;
+	const randSeedRaw = process.env.PI_DETERMINISTIC_RANDOM_SEED;
+	if (randRaw && randRaw.trim().length > 0) {
+		const value = Number(randRaw);
+		if (Number.isFinite(value)) {
+			Math.random = () => value;
+		}
+	} else if (randSeedRaw && randSeedRaw.trim().length > 0) {
+		let state = Number(randSeedRaw);
+		if (Number.isFinite(state)) {
+			state = state >>> 0;
+			Math.random = () => {
+				state = (state * 1664525 + 1013904223) >>> 0;
+				return state / 4294967296;
+			};
+		}
+	}
+
+	const detCwd = process.env.PI_DETERMINISTIC_CWD;
+	if (detCwd && detCwd.trim().length > 0) {
+		try {
+			Object.defineProperty(process, "cwd", {
+				value: () => detCwd,
+				configurable: true,
+			});
+		} catch {}
+	}
+
+	const detHome = process.env.PI_DETERMINISTIC_HOME;
+	if (detHome && detHome.trim().length > 0) {
+		try {
+			process.env.HOME = detHome;
+			process.env.USERPROFILE = detHome;
+		} catch {}
+	}
+}
+
 function serializeArgs(args: unknown[]): string {
 	return args
 		.map((arg) => {
@@ -188,6 +258,7 @@ function installFetchMock(spec: MockSpec, capture: CaptureLog): () => void {
 }
 
 async function main() {
+	applyDeterministicGlobals();
 	const args = process.argv.slice(2);
 	if (args.length < 2) {
 		console.error("Usage: bun run tests/ext_conformance/ts_harness/run_extension.ts <extension-path> <mock-spec-path> [cwd]");
@@ -196,7 +267,8 @@ async function main() {
 
 	const extensionPath = path.resolve(args[0]);
 	const mockSpecPath = path.resolve(args[1]);
-	const cwd = args[2] ? path.resolve(args[2]) : process.cwd();
+	const envCwd = process.env.PI_DETERMINISTIC_CWD;
+	const cwd = args[2] ? path.resolve(args[2]) : envCwd ? path.resolve(envCwd) : process.cwd();
 
 	const spec = normalizeMockSpec(readJson(mockSpecPath));
 	const capture: CaptureLog = {

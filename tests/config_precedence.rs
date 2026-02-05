@@ -186,10 +186,9 @@ fn patch_settings_is_deep_merge_and_writes_restrictive_permissions() {
 }
 
 #[test]
-fn config_load_pi_config_path_invalid_json_falls_back_to_defaults() {
+fn config_load_pi_config_path_invalid_json_returns_error() {
     let _lock = config_lock();
-    let harness =
-        TestHarness::new("config_load_pi_config_path_invalid_json_falls_back_to_defaults");
+    let harness = TestHarness::new("config_load_pi_config_path_invalid_json_returns_error");
 
     let cwd = harness.create_dir("cwd");
     let global_dir = harness.create_dir("global");
@@ -205,17 +204,11 @@ fn config_load_pi_config_path_invalid_json_falls_back_to_defaults() {
     );
 
     let _cwd_guard = CurrentDirGuard::new(&cwd);
-    let config =
-        Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
-    harness.log().info_ctx("config", "Loaded config", |ctx| {
-        ctx.push((
-            "theme".to_string(),
-            config.theme.as_deref().unwrap_or("<none>").to_string(),
-        ));
-    });
-
-    assert!(config.theme.is_none());
-    assert!(config.default_provider.is_none());
+    let result = Config::load_with_roots(Some(&override_path), &global_dir, &cwd);
+    harness
+        .log()
+        .info("config", format!("Loaded config result: {result:?}"));
+    assert!(result.is_err());
 }
 
 #[test]

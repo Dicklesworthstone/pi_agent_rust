@@ -16,3 +16,8 @@ rustc-ice-*.txt
 # generated test artifacts
 tests/ext_conformance/artifacts/entry-point-scan.json
 tests/ext_conformance/reports/
+
+# sqlite WAL/SHM artifacts
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal

@@ -233,11 +233,7 @@ impl Config {
         cwd: &std::path::Path,
     ) -> Result<Self> {
         if let Some(path) = config_path {
-            let config = match Self::load_from_path(path) {
-                Ok(config) => config,
-                Err(Error::Config(_)) => Self::default(),
-                Err(err) => return Err(err),
-            };
+            let config = Self::load_from_path(path)?;
             config.emit_queue_mode_diagnostics();
             return Ok(config);
         }
@@ -823,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn load_with_invalid_pi_config_path_json_falls_back_to_defaults() {
+    fn load_with_invalid_pi_config_path_json_returns_error() {
         let temp = TempDir::new().expect("create tempdir");
         let cwd = temp.path().join("cwd");
         let global_dir = temp.path().join("global");
@@ -831,11 +827,8 @@ mod tests {
         let override_path = temp.path().join("override.json");
         write_file(&override_path, "not json");
 
-        let config =
-            Config::load_with_roots(Some(&override_path), &global_dir, &cwd).expect("load config");
-        assert!(config.theme.is_none());
-        assert!(config.default_provider.is_none());
-        assert!(config.default_model.is_none());
+        let result = Config::load_with_roots(Some(&override_path), &global_dir, &cwd);
+        assert!(result.is_err());
     }
 
     #[test]

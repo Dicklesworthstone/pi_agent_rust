@@ -1035,6 +1035,7 @@ impl JsModuleResolver for PiJsResolver {
             "http" => "node:http",
             "https" => "node:https",
             "util" => "node:util",
+            "readline" => "node:readline",
             other => other,
         };
 
@@ -1327,12 +1328,18 @@ export async function complete(_model, _messages, _opts = {}) {
   return { content: "", model: _model ?? "unknown", usage: { input_tokens: 0, output_tokens: 0 } };
 }
 
+// Stub: completeSimple returns a simple text completion without streaming
+export async function completeSimple(_model, _prompt, _opts = {}) {
+  // Return an empty string completion
+  return "";
+}
+
 export function getModel() {
   // Return a default model identifier
   return "claude-sonnet-4-5";
 }
 
-export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, complete, getModel };
+export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, complete, completeSimple, getModel };
 "#
         .trim()
         .to_string(),
@@ -1475,7 +1482,28 @@ export class SettingsList {
   }
 }
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList };
+// Fuzzy string matching for filtering lists
+export function fuzzyMatch(query, text, _opts = {}) {
+  const q = String(query ?? '').toLowerCase();
+  const t = String(text ?? '').toLowerCase();
+  if (!q) return { match: true, score: 0, positions: [] };
+  if (!t) return { match: false, score: 0, positions: [] };
+
+  const positions = [];
+  let qi = 0;
+  for (let ti = 0; ti < t.length && qi < q.length; ti++) {
+    if (t[ti] === q[qi]) {
+      positions.push(ti);
+      qi++;
+    }
+  }
+
+  const match = qi === q.length;
+  const score = match ? (q.length / t.length) * 100 : 0;
+  return { match, score, positions };
+}
+
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch };
 "#
         .trim()
         .to_string(),
@@ -1757,6 +1785,31 @@ export function getAgentDir() {
   return home ? `${home}/.pi/agent` : "/home/unknown/.pi/agent";
 }
 
+// Stub: keyHint returns a keyboard shortcut hint string for UI display
+export function keyHint(action, fallback = "") {
+  // Map action names to default key bindings
+  const keyMap = {
+    expandTools: "Ctrl+E",
+    copy: "Ctrl+C",
+    paste: "Ctrl+V",
+    save: "Ctrl+S",
+    quit: "Ctrl+Q",
+    help: "?",
+  };
+  return keyMap[action] || fallback || action;
+}
+
+// Stub: compact performs conversation compaction via LLM
+export async function compact(_preparation, _model, _apiKey, _customInstructions, _signal) {
+  // Return a minimal compaction result
+  return {
+    summary: "Conversation summary placeholder",
+    firstKeptEntryId: null,
+    tokensBefore: 0,
+    tokensAfter: 0,
+  };
+}
+
 export default {
   VERSION,
   DEFAULT_MAX_LINES,
@@ -1779,6 +1832,8 @@ export default {
   createEditTool,
   copyToClipboard,
   getAgentDir,
+  keyHint,
+  compact,
 };
 "#
         .trim()
@@ -2087,6 +2142,36 @@ export function randomUUID() {
 }
 export default { randomUUID };
 "#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "node:readline".to_string(),
+        r"
+// Stub readline module - interactive prompts are not available in PiJS
+
+export function createInterface(_opts) {
+  return {
+    question: (_query, callback) => {
+      if (typeof callback === 'function') callback('');
+    },
+    close: () => {},
+    on: () => {},
+    once: () => {},
+  };
+}
+
+export const promises = {
+  createInterface: (_opts) => ({
+    question: async (_query) => '',
+    close: () => {},
+    [Symbol.asyncIterator]: async function* () {},
+  }),
+};
+
+export default { createInterface, promises };
+"
         .trim()
         .to_string(),
     );
@@ -4338,6 +4423,11 @@ pi.process = {
     args: __pi_process_args_native(),
 };
 
+const __pi_det_cwd = __pi_env_get('PI_DETERMINISTIC_CWD');
+if (__pi_det_cwd) {
+    try { pi.process.cwd = __pi_det_cwd; } catch (_) {}
+}
+
 try { Object.freeze(pi.process.args); } catch (_) {}
 try { Object.freeze(pi.process); } catch (_) {}
 
@@ -4359,6 +4449,65 @@ pi.time = {
 
 // Make pi available globally
 globalThis.pi = pi;
+
+const __pi_det_time_raw = __pi_env_get('PI_DETERMINISTIC_TIME_MS');
+const __pi_det_time_step_raw = __pi_env_get('PI_DETERMINISTIC_TIME_STEP_MS');
+const __pi_det_random_raw = __pi_env_get('PI_DETERMINISTIC_RANDOM');
+const __pi_det_random_seed_raw = __pi_env_get('PI_DETERMINISTIC_RANDOM_SEED');
+
+if (__pi_det_time_raw !== undefined) {
+    const __pi_det_base = Number(__pi_det_time_raw);
+    if (Number.isFinite(__pi_det_base)) {
+        const __pi_det_step = (() => {
+            if (__pi_det_time_step_raw === undefined) return 1;
+            const value = Number(__pi_det_time_step_raw);
+            return Number.isFinite(value) ? value : 1;
+        })();
+        let __pi_det_tick = 0;
+        const __pi_det_now = () => {
+            const value = __pi_det_base + (__pi_det_step * __pi_det_tick);
+            __pi_det_tick += 1;
+            return value;
+        };
+
+        if (pi && pi.time) {
+            pi.time.nowMs = () => __pi_det_now();
+        }
+
+        const __pi_OriginalDate = Date;
+        class PiDeterministicDate extends __pi_OriginalDate {
+            constructor(...args) {
+                if (args.length === 0) {
+                    super(__pi_det_now());
+                } else {
+                    super(...args);
+                }
+            }
+            static now() {
+                return __pi_det_now();
+            }
+        }
+        PiDeterministicDate.UTC = __pi_OriginalDate.UTC;
+        PiDeterministicDate.parse = __pi_OriginalDate.parse;
+        globalThis.Date = PiDeterministicDate;
+    }
+}
+
+if (__pi_det_random_raw !== undefined) {
+    const __pi_det_random_val = Number(__pi_det_random_raw);
+    if (Number.isFinite(__pi_det_random_val)) {
+        Math.random = () => __pi_det_random_val;
+    }
+} else if (__pi_det_random_seed_raw !== undefined) {
+    let __pi_det_state = Number(__pi_det_random_seed_raw);
+    if (Number.isFinite(__pi_det_state)) {
+        __pi_det_state = __pi_det_state >>> 0;
+        Math.random = () => {
+            __pi_det_state = (__pi_det_state * 1664525 + 1013904223) >>> 0;
+            return __pi_det_state / 4294967296;
+        };
+    }
+}
 
 // ============================================================================
 // Minimal Web/Node polyfills for legacy extensions (best-effort)
@@ -4616,12 +4765,15 @@ if (typeof globalThis.process === 'undefined') {
         __pi_env_get_native('OSTYPE') ||
         __pi_env_get_native('OS') ||
         'linux';
+    const detHome = __pi_env_get_native('PI_DETERMINISTIC_HOME');
+    const detCwd = __pi_env_get_native('PI_DETERMINISTIC_CWD');
 
     const envProxy = new Proxy(
         {},
         {
             get(_target, prop) {
                 if (typeof prop !== 'string') return undefined;
+                if (prop === 'HOME' && detHome) return detHome;
                 const value = __pi_env_get_native(prop);
                 return value === null || value === undefined ? undefined : value;
             },
@@ -4631,6 +4783,7 @@ if (typeof globalThis.process === 'undefined') {
             },
             has(_target, prop) {
                 if (typeof prop !== 'string') return false;
+                if (prop === 'HOME' && detHome) return true;
                 const value = __pi_env_get_native(prop);
                 return value !== null && value !== undefined;
             },
@@ -4640,7 +4793,7 @@ if (typeof globalThis.process === 'undefined') {
     globalThis.process = {
         env: envProxy,
         argv: __pi_process_args_native(),
-        cwd: () => __pi_process_cwd_native(),
+        cwd: () => detCwd || __pi_process_cwd_native(),
         platform: String(platform).split('-')[0],
         kill: (_pid, _sig) => {
             throw new Error('process.kill is not available in PiJS');

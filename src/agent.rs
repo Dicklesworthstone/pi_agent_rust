@@ -602,6 +602,15 @@ impl Agent {
                 self.dispatch_extension_lifecycle_event(&turn_start_event)
                     .await;
 
+                for message in std::mem::take(&mut pending_messages) {
+                    self.messages.push(message.clone());
+                    new_messages.push(message.clone());
+                    on_event(AgentEvent::MessageStart {
+                        message: message.clone(),
+                    });
+                    on_event(AgentEvent::MessageEnd { message });
+                }
+
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
                     let abort_message = self.build_abort_message(last_assistant.clone());
                     let message = Message::Assistant(abort_message.clone());
@@ -638,15 +647,6 @@ impl Agent {
                     self.dispatch_extension_lifecycle_event(&agent_end_event)
                         .await;
                     return Ok(abort_message);
-                }
-
-                for message in std::mem::take(&mut pending_messages) {
-                    self.messages.push(message.clone());
-                    new_messages.push(message.clone());
-                    on_event(AgentEvent::MessageStart {
-                        message: message.clone(),
-                    });
-                    on_event(AgentEvent::MessageEnd { message });
                 }
 
                 let assistant_message = self

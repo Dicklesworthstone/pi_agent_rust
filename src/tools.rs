@@ -2343,8 +2343,8 @@ impl Tool for GrepTool {
 
         let mut guard = ProcessGuard::new(child, false);
 
-        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
-        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::sync_channel(1024);
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::sync_channel(1024);
 
         let stdout_thread = std::thread::spawn(move || {
             let reader = std::io::BufReader::new(stdout);

@@ -4,7 +4,8 @@ This document defines what **“popular”** means for Pi extensions and how we 
 extension belongs in the **expanded compatibility corpus** (see `bd-po15` / `bd-d7gn`).
 
 Goal: make selection **mechanical and reproducible** so two people applying the rubric to the same
-inputs would converge on the same tiering.
+inputs would converge on the same tiering, while explicitly accounting for **compatibility** and
+**reliability risk**.
 
 Non-goals:
 - This is **not** the stratified conformance sample (that’s the pinned 16 in `docs/extension-sample.json`).
@@ -74,16 +75,20 @@ Tier-1/Tier-2 candidates must have at least one scenario that can run determinis
 
 ---
 
-## 2) Scoring Rubric (0–100)
+## 2) Scoring Rubric (Base 0–100 + Risk Penalty)
 
-Total score is the weighted sum of 4 sub-scores:
+We compute a **base score (0–100)** and then subtract a **reliability‑risk penalty (0–15)**.
+
+**Base score = Popularity + Adoption + Coverage + Activity + Compatibility.**  
+**Final score = Base score – Risk penalty (floor at 0).**
 
 | Sub-score | Weight | What it measures |
 |---|---:|---|
-| Popularity | 40 | “How broadly visible is it?” |
-| Adoption | 20 | “Do real users install/use it?” |
-| Coverage | 25 | “How much new surface does it cover for our proof?” |
-| Recency | 15 | “Is it maintained enough to matter today?” |
+| Popularity | 30 | “How broadly visible is it?” |
+| Adoption | 15 | “Do real users install/use it?” |
+| Coverage | 20 | “How much new surface does it cover for our proof?” |
+| Activity | 15 | “Is it maintained enough to matter today?” |
+| Compatibility | 20 | “How close is it to unmodified compatibility?” |
 
 The inventory should store **all inputs** used to compute the score and a short rationale.
 
@@ -158,7 +163,7 @@ Coverage is about maximizing proof value, not “popularity”. Score by tags:
 - uses `ui`: +1
 - uses session mutation APIs: +1
 
-### 2.4 Recency (0–15)
+### 2.4 Activity / Recency (0–15)
 
 Use the most relevant date for the source type (repo last commit, npm publish, gist update).
 
@@ -169,6 +174,31 @@ Use the most relevant date for the source type (repo last commit, npm publish, g
 - ≤ 730 days: +3
 - otherwise: +0
 
+### 2.5 Compatibility (0–20)
+
+Compatibility is a **positive score** (not just a gate) so selection can favor
+extensions that are already close to unmodified parity.
+
+Suggested scoring (pick best matching level, then adjust ±2 for nuance):
+
+- **20** — Unmodified, passes static scan, no forbidden APIs, no extension‑specific shims.
+- **15** — Unmodified, but requires **generic** shims/rewrites (Node core, `pi:*` shims).
+- **10** — Unmodified but depends on **incomplete generic runtime features** (e.g. provider hooks
+  not fully wired yet); still plausible to land via runtime work.
+- **0** — Requires per‑extension edits or fails compatibility gates (blocked).
+
+### 2.6 Reliability Risk Penalty (0–15)
+
+Risk is a **penalty** (subtracted from base score). It captures “how likely this
+extension will be flaky, non‑deterministic, or expensive to support in CI.”
+
+Suggested penalty bands:
+
+- **0** — Deterministic, minimal deps, no network or fully VCR‑able.
+- **5** — Moderate deps or network use, but reproducible with mocks/VCR.
+- **10** — High risk: OAuth flows, heavy UI timing sensitivity, large dep trees.
+- **15** — Critical risk: native binaries, non‑deterministic side effects, unclear license.
+
 ---
 
 ## 3) Tiering Rules
@@ -177,9 +207,9 @@ Tiering uses both gates and score thresholds:
 
 | Tier | Requirements |
 |---|---|
-| Tier-1 | Pass all gates + total score ≥ 70 |
-| Tier-2 | Pass all gates + total score ≥ 50 |
-| Excluded | Fails a gate OR total score < 50 |
+| Tier-1 | Pass all gates + **final score** ≥ 70 |
+| Tier-2 | Pass all gates + **final score** ≥ 50 |
+| Excluded | Fails a gate OR final score < 50 |
 
 Tie-breakers (when selecting a fixed-size set):
 1) prefer higher **Coverage** score (proof value)
@@ -226,10 +256,14 @@ The candidate inventory should be representable as JSON objects with these field
     "popularity": 0,
     "adoption": 0,
     "coverage": 0,
-    "recency": 0,
-    "total": 0,
+    "activity": 0,
+    "compatibility": 0,
+    "risk_penalty": 0,
+    "base_total": 0,
+    "final_total": 0,
     "tier": "tier-1|tier-2|excluded",
-    "rationale": "1-3 sentences explaining the score."
+    "rationale": "1-3 sentences explaining the score.",
+    "risk_notes": "Optional: why the risk penalty was applied."
   }
 }
 ```
@@ -237,4 +271,3 @@ The candidate inventory should be representable as JSON objects with these field
 Notes:
 - `required_shims` is descriptive (what the extension appears to need), not a per-extension hack list.
 - `blocked_reasons` must be objective and actionable (e.g. “license unknown”, “requires Node C++ addon”).
-

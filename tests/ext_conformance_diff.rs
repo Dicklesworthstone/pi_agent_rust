@@ -1036,3 +1036,161 @@ fn diff_community_manifest() {
         failures.join("\n")
     );
 }
+
+/// Run differential conformance tests on npm registry extensions (63 packages).
+/// Use PI_NPM_FILTER env var to filter by name substring.
+/// Use PI_NPM_MAX env var to limit the number of extensions to test.
+#[test]
+#[ignore = "bd-3dd7: npm registry extensions not yet expected to pass; run manually with --ignored"]
+fn diff_npm_manifest() {
+    let filter = std::env::var("PI_NPM_FILTER").ok();
+    let max = std::env::var("PI_NPM_MAX")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok());
+
+    let selected: Vec<(String, String)> = npm_extensions()
+        .iter()
+        .filter(|(dir, entry)| {
+            let name = format!("{dir}/{entry}");
+            filter.as_ref().is_none_or(|needle| name.contains(needle))
+        })
+        .take(max.unwrap_or(usize::MAX))
+        .cloned()
+        .collect();
+
+    eprintln!(
+        "[diff_npm_manifest] Starting (selected={} filter={:?} max={:?})",
+        selected.len(),
+        filter,
+        max
+    );
+
+    let mut failures = Vec::new();
+    let mut passes: u32 = 0;
+    for (idx, (extension_dir, entry_file)) in selected.iter().enumerate() {
+        let name = format!("{extension_dir}/{entry_file}");
+        eprintln!("[diff_npm_manifest] {}/{}: {name}", idx + 1, selected.len());
+        let start = std::time::Instant::now();
+        match run_differential_test_strict(extension_dir, entry_file) {
+            Ok(()) => passes += 1,
+            Err(err) => failures.push(format!("{name}: {err}")),
+        }
+        eprintln!(
+            "[diff_npm_manifest] {}/{}: done in {:?}",
+            idx + 1,
+            selected.len(),
+            start.elapsed()
+        );
+    }
+
+    let total: u32 = selected.len().try_into().unwrap_or(0);
+    eprintln!(
+        "[diff_npm_manifest] Results: {} passed, {} failed out of {} total",
+        passes,
+        failures.len(),
+        total
+    );
+
+    if !failures.is_empty() {
+        eprintln!(
+            "npm conformance failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    let pass_rate = if total == 0 {
+        0.0
+    } else {
+        f64::from(passes) / f64::from(total) * 100.0
+    };
+    eprintln!("[diff_npm_manifest] Pass rate: {pass_rate:.1}%");
+
+    assert!(
+        failures.is_empty(),
+        "npm conformance failures ({}):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Run differential conformance tests on third-party GitHub extensions (23 extensions).
+/// Use PI_THIRDPARTY_FILTER env var to filter by name substring.
+/// Use PI_THIRDPARTY_MAX env var to limit the number of extensions to test.
+#[test]
+#[ignore = "bd-22r2: third-party extensions not yet expected to pass; run manually with --ignored"]
+fn diff_thirdparty_manifest() {
+    let filter = std::env::var("PI_THIRDPARTY_FILTER").ok();
+    let max = std::env::var("PI_THIRDPARTY_MAX")
+        .ok()
+        .and_then(|val| val.parse::<usize>().ok());
+
+    let selected: Vec<(String, String)> = thirdparty_extensions()
+        .iter()
+        .filter(|(dir, entry)| {
+            let name = format!("{dir}/{entry}");
+            filter.as_ref().is_none_or(|needle| name.contains(needle))
+        })
+        .take(max.unwrap_or(usize::MAX))
+        .cloned()
+        .collect();
+
+    eprintln!(
+        "[diff_thirdparty_manifest] Starting (selected={} filter={:?} max={:?})",
+        selected.len(),
+        filter,
+        max
+    );
+
+    let mut failures = Vec::new();
+    let mut passes: u32 = 0;
+    for (idx, (extension_dir, entry_file)) in selected.iter().enumerate() {
+        let name = format!("{extension_dir}/{entry_file}");
+        eprintln!(
+            "[diff_thirdparty_manifest] {}/{}: {name}",
+            idx + 1,
+            selected.len()
+        );
+        let start = std::time::Instant::now();
+        match run_differential_test_strict(extension_dir, entry_file) {
+            Ok(()) => passes += 1,
+            Err(err) => failures.push(format!("{name}: {err}")),
+        }
+        eprintln!(
+            "[diff_thirdparty_manifest] {}/{}: done in {:?}",
+            idx + 1,
+            selected.len(),
+            start.elapsed()
+        );
+    }
+
+    let total: u32 = selected.len().try_into().unwrap_or(0);
+    eprintln!(
+        "[diff_thirdparty_manifest] Results: {} passed, {} failed out of {} total",
+        passes,
+        failures.len(),
+        total
+    );
+
+    if !failures.is_empty() {
+        eprintln!(
+            "Third-party conformance failures ({}):\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    let pass_rate = if total == 0 {
+        0.0
+    } else {
+        f64::from(passes) / f64::from(total) * 100.0
+    };
+    eprintln!("[diff_thirdparty_manifest] Pass rate: {pass_rate:.1}%");
+
+    assert!(
+        failures.is_empty(),
+        "Third-party conformance failures ({}):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

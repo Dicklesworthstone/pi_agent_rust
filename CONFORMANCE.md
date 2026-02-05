@@ -172,6 +172,11 @@ All extension-related logs must conform to the **ext.log.v1** schema
   `trace_id`, `span_id` with placeholders.
 - Normalize absolute paths to `<cwd>/...`.
 
+**Deterministic runtime controls (TS oracle + Rust PiJS):**
+- Patched globals: `Date`/`Date.now`, `Math.random`, `process.cwd`, `process.env.HOME`, `pi.time.nowMs`.
+- Env vars: `PI_DETERMINISTIC_TIME_MS`, `PI_DETERMINISTIC_TIME_STEP_MS`, `PI_DETERMINISTIC_RANDOM`,
+  `PI_DETERMINISTIC_RANDOM_SEED`, `PI_DETERMINISTIC_CWD`, `PI_DETERMINISTIC_HOME`.
+
 **CI consumption:**
 - Archive `target/ext_conformance/logs/**` as CI artifacts.
 - Diffs should be grouped by `event` and `correlation` IDs to speed triage.

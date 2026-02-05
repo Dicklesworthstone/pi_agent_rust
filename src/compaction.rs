@@ -169,7 +169,7 @@ const fn calculate_context_tokens(usage: &Usage) -> u64 {
     if usage.total_tokens > 0 {
         usage.total_tokens
     } else {
-        usage.input + usage.output + usage.cache_read + usage.cache_write
+        usage.input + usage.output
     }
 }
 

@@ -735,6 +735,37 @@ pub mod report {
         pub extensions: Vec<ExtensionConformanceResult>,
     }
 
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ExtensionRegression {
+        pub id: String,
+        pub previous: ConformanceStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub current: Option<ConformanceStatus>,
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ConformanceRegression {
+        /// Number of extensions compared for pass-rate deltas.
+        pub compared_total: u64,
+        pub previous_passed: u64,
+        pub current_passed: u64,
+        pub previous_pass_rate: f64,
+        pub current_pass_rate: f64,
+        pub pass_rate_delta: f64,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub regressed_extensions: Vec<ExtensionRegression>,
+    }
+
+    impl ConformanceRegression {
+        #[must_use]
+        pub fn has_regression(&self) -> bool {
+            const EPS: f64 = 1e-12;
+            self.pass_rate_delta < -EPS || !self.regressed_extensions.is_empty()
+        }
+    }
+
     fn tier_key(tier: Option<u32>) -> String {
         tier.map_or_else(|| "tier_unknown".to_string(), |tier| format!("tier{tier}"))
     }
@@ -805,6 +836,65 @@ pub mod report {
                 by_tier,
             },
             extensions: results,
+        }
+    }
+
+    /// Compute regression signals between a previous and current report.
+    ///
+    /// Semantics:
+    /// - Pass-rate deltas are computed over the *previous* extension set only, so that
+    ///   newly-added extensions do not count as regressions.
+    /// - An extension regresses if it was `PASS` previously and is now non-`PASS` (or
+    ///   missing).
+    #[must_use]
+    pub fn compute_regression(
+        previous: &ConformanceReport,
+        current: &ConformanceReport,
+    ) -> ConformanceRegression {
+        let compared_total = previous.extensions.len() as u64;
+        let previous_passed = previous
+            .extensions
+            .iter()
+            .filter(|r| r.status == ConformanceStatus::Pass)
+            .count() as u64;
+
+        let current_by_id = current
+            .extensions
+            .iter()
+            .map(|r| (r.id.as_str(), r.status))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut current_passed = 0u64;
+        let mut regressed_extensions = Vec::new();
+        for result in &previous.extensions {
+            let current_status = current_by_id.get(result.id.as_str()).copied();
+            if matches!(current_status, Some(ConformanceStatus::Pass)) {
+                current_passed = current_passed.saturating_add(1);
+            }
+
+            if result.status == ConformanceStatus::Pass
+                && !matches!(current_status, Some(ConformanceStatus::Pass))
+            {
+                regressed_extensions.push(ExtensionRegression {
+                    id: result.id.clone(),
+                    previous: result.status,
+                    current: current_status,
+                });
+            }
+        }
+
+        let previous_pass_rate = ratio(previous_passed, compared_total);
+        let current_pass_rate = ratio(current_passed, compared_total);
+        let pass_rate_delta = current_pass_rate - previous_pass_rate;
+
+        ConformanceRegression {
+            compared_total,
+            previous_passed,
+            current_passed,
+            previous_pass_rate,
+            current_pass_rate,
+            pass_rate_delta,
+            regressed_extensions,
         }
     }
 
@@ -909,6 +999,7 @@ pub mod report {
 #[cfg(test)]
 mod tests {
     use super::compare_conformance_output;
+    use super::report::compute_regression;
     use super::report::generate_report;
     use super::report::{ConformanceDiffEntry, ConformanceStatus, ExtensionConformanceResult};
     use serde_json::json;
@@ -1187,5 +1278,118 @@ mod tests {
         assert!(md.contains("| hello | PASS | 42ms | 38ms |"));
         assert!(md.contains("## Failures"));
         assert!(md.contains("### event-bus (Tier 2)"));
+    }
+
+    #[test]
+    fn conformance_regression_ignores_new_extensions_for_pass_rate() {
+        let previous = generate_report(
+            "run-prev",
+            Some("2026-02-05T00:00:00Z".to_string()),
+            vec![
+                ExtensionConformanceResult {
+                    id: "a".to_string(),
+                    tier: Some(1),
+                    status: ConformanceStatus::Pass,
+                    ts_time_ms: None,
+                    rust_time_ms: None,
+                    diffs: Vec::new(),
+                    notes: None,
+                },
+                ExtensionConformanceResult {
+                    id: "b".to_string(),
+                    tier: Some(1),
+                    status: ConformanceStatus::Fail,
+                    ts_time_ms: None,
+                    rust_time_ms: None,
+                    diffs: Vec::new(),
+                    notes: None,
+                },
+            ],
+        );
+
+        let current = generate_report(
+            "run-cur",
+            Some("2026-02-06T00:00:00Z".to_string()),
+            vec![
+                ExtensionConformanceResult {
+                    id: "a".to_string(),
+                    tier: Some(1),
+                    status: ConformanceStatus::Pass,
+                    ts_time_ms: None,
+                    rust_time_ms: None,
+                    diffs: Vec::new(),
+                    notes: None,
+                },
+                ExtensionConformanceResult {
+                    id: "b".to_string(),
+                    tier: Some(1),
+                    status: ConformanceStatus::Fail,
+                    ts_time_ms: None,
+                    rust_time_ms: None,
+                    diffs: Vec::new(),
+                    notes: None,
+                },
+                // New failing extension: should not count as regression.
+                ExtensionConformanceResult {
+                    id: "c".to_string(),
+                    tier: Some(1),
+                    status: ConformanceStatus::Fail,
+                    ts_time_ms: None,
+                    rust_time_ms: None,
+                    diffs: Vec::new(),
+                    notes: None,
+                },
+            ],
+        );
+
+        let regression = compute_regression(&previous, &current);
+        assert!(!regression.has_regression());
+        assert_eq!(regression.compared_total, 2);
+        assert_eq!(regression.previous_passed, 1);
+        assert_eq!(regression.current_passed, 1);
+    }
+
+    #[test]
+    fn conformance_regression_flags_pass_to_fail() {
+        let previous = generate_report(
+            "run-prev",
+            Some("2026-02-05T00:00:00Z".to_string()),
+            vec![ExtensionConformanceResult {
+                id: "a".to_string(),
+                tier: Some(1),
+                status: ConformanceStatus::Pass,
+                ts_time_ms: None,
+                rust_time_ms: None,
+                diffs: Vec::new(),
+                notes: None,
+            }],
+        );
+
+        let current = generate_report(
+            "run-cur",
+            Some("2026-02-06T00:00:00Z".to_string()),
+            vec![ExtensionConformanceResult {
+                id: "a".to_string(),
+                tier: Some(1),
+                status: ConformanceStatus::Fail,
+                ts_time_ms: None,
+                rust_time_ms: None,
+                diffs: vec![ConformanceDiffEntry {
+                    category: "root".to_string(),
+                    path: "x".to_string(),
+                    message: "changed".to_string(),
+                }],
+                notes: None,
+            }],
+        );
+
+        let regression = compute_regression(&previous, &current);
+        assert!(regression.has_regression());
+        assert_eq!(regression.regressed_extensions.len(), 1);
+        assert_eq!(regression.regressed_extensions[0].id, "a");
+        assert_eq!(
+            regression.regressed_extensions[0].current,
+            Some(ConformanceStatus::Fail)
+        );
     }
 }

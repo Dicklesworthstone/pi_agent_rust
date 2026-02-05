@@ -79,7 +79,13 @@ const BUN = process.env.BUN ?? "/home/ubuntu/.bun/bin/bun";
 const TIMEOUT_MS = Number(process.env.PI_TS_VALIDATE_TIMEOUT_MS ?? "15000");
 const LIMIT = Number(process.env.PI_TS_VALIDATE_LIMIT ?? "0");
 const FILTER_TIER = process.env.PI_TS_VALIDATE_TIER;
-const CWD = process.env.PI_TS_VALIDATE_CWD ?? REPO_ROOT;
+const DET_TIME_MS = process.env.PI_DETERMINISTIC_TIME_MS ?? "1700000000000";
+const DET_TIME_STEP_MS = process.env.PI_DETERMINISTIC_TIME_STEP_MS ?? "1";
+const DET_RANDOM_SEED = process.env.PI_DETERMINISTIC_RANDOM_SEED ?? "1337";
+const DET_RANDOM = process.env.PI_DETERMINISTIC_RANDOM ?? "0.5";
+const DET_CWD = process.env.PI_DETERMINISTIC_CWD ?? "/tmp/ext-conformance-test";
+const DET_HOME = process.env.PI_DETERMINISTIC_HOME ?? "/tmp/ext-conformance-home";
+const CWD = process.env.PI_TS_VALIDATE_CWD ?? DET_CWD;
 
 function readManifest(filePath: string): ManifestFile {
 	const raw = fs.readFileSync(filePath, "utf-8");
@@ -123,6 +129,12 @@ async function runHarness(entryAbs: string): Promise<{
 			...process.env,
 			NODE_PATH: path.join(PI_MONO_ROOT, "node_modules"),
 			PI_TS_CAPTURE_LOGS: "1",
+			PI_DETERMINISTIC_TIME_MS: DET_TIME_MS,
+			PI_DETERMINISTIC_TIME_STEP_MS: DET_TIME_STEP_MS,
+			PI_DETERMINISTIC_RANDOM_SEED: DET_RANDOM_SEED,
+			PI_DETERMINISTIC_CWD: DET_CWD,
+			PI_DETERMINISTIC_HOME: DET_HOME,
+			...(DET_RANDOM ? { PI_DETERMINISTIC_RANDOM: DET_RANDOM } : {}),
 		},
 	});
 

@@ -1,5 +1,5 @@
 use pi::extensions::CompatibilityScanner;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -53,6 +53,35 @@ fn digest_artifact_dir(dir: &Path) -> io::Result<String> {
     }
 
     Ok(hex_lower(&hasher.finalize()))
+}
+
+#[derive(Debug, Deserialize)]
+struct MasterCatalog {
+    extensions: Vec<MasterCatalogExtension>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MasterCatalogExtension {
+    id: String,
+    directory: String,
+    checksum: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactProvenanceManifest {
+    items: Vec<ArtifactProvenanceItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactProvenanceItem {
+    id: String,
+    directory: String,
+    checksum: ArtifactChecksum,
+}
+
+#[derive(Debug, Deserialize)]
+struct ArtifactChecksum {
+    sha256: String,
 }
 
 #[test]
@@ -119,6 +148,69 @@ fn test_ext_conformance_artifacts_match_manifest_checksums() {
         let actual =
             digest_artifact_dir(&artifact_dir).unwrap_or_else(|err| panic!("digest {id}: {err}"));
         assert_eq!(actual, expected, "artifact checksum mismatch for {id}");
+    }
+}
+
+#[test]
+fn test_ext_conformance_artifact_provenance_matches_master_catalog_checksums() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let artifacts_root = repo_root.join("tests/ext_conformance/artifacts");
+
+    let master_path = repo_root.join("docs/extension-master-catalog.json");
+    let master_bytes = fs::read(&master_path).expect("read docs/extension-master-catalog.json");
+    let master: MasterCatalog =
+        serde_json::from_slice(&master_bytes).expect("parse docs/extension-master-catalog.json");
+
+    let provenance_path = repo_root.join("docs/extension-artifact-provenance.json");
+    let provenance_bytes =
+        fs::read(&provenance_path).expect("read docs/extension-artifact-provenance.json");
+    let provenance: ArtifactProvenanceManifest = serde_json::from_slice(&provenance_bytes)
+        .expect("parse docs/extension-artifact-provenance.json");
+
+    let master_map = master
+        .extensions
+        .into_iter()
+        .map(|ext| (ext.id.clone(), ext))
+        .collect::<BTreeMap<_, _>>();
+    let provenance_map = provenance
+        .items
+        .into_iter()
+        .map(|item| (item.id.clone(), item))
+        .collect::<BTreeMap<_, _>>();
+
+    assert_eq!(
+        master_map.len(),
+        provenance_map.len(),
+        "master/provenance extension counts differ"
+    );
+
+    for (id, master_ext) in master_map {
+        let Some(provenance_item) = provenance_map.get(&id) else {
+            panic!("Missing provenance entry for {id}");
+        };
+
+        assert_eq!(
+            provenance_item.directory, master_ext.directory,
+            "directory mismatch for {id}"
+        );
+        assert_eq!(
+            provenance_item.checksum.sha256, master_ext.checksum,
+            "checksum mismatch between provenance and master catalog for {id}"
+        );
+
+        let artifact_dir = artifacts_root.join(&master_ext.directory);
+        assert!(
+            artifact_dir.is_dir(),
+            "missing artifact directory for {id}: {}",
+            artifact_dir.display()
+        );
+
+        let actual = digest_artifact_dir(&artifact_dir)
+            .unwrap_or_else(|err| panic!("digest {id} ({}): {err}", artifact_dir.display()));
+        assert_eq!(
+            actual, master_ext.checksum,
+            "artifact checksum mismatch for {id}"
+        );
     }
 }
 
