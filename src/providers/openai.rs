@@ -173,6 +173,30 @@ impl Provider for OpenAIProvider {
             )));
         }
 
+        let content_type = response
+            .headers()
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.to_ascii_lowercase());
+        if !content_type
+            .as_deref()
+            .is_some_and(|value| value.contains("text/event-stream"))
+        {
+            let message = content_type.map_or_else(
+                || {
+                    format!(
+                        "OpenAI API protocol error (HTTP {status}): missing Content-Type (expected text/event-stream)"
+                    )
+                },
+                |value| {
+                    format!(
+                        "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {value} (expected text/event-stream)"
+                    )
+                },
+            );
+            return Err(Error::api(message));
+        }
+
         // Create SSE stream for streaming responses.
         let event_source = SseStream::new(response.bytes_stream());
 
