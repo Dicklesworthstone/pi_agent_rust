@@ -1700,20 +1700,26 @@ mod turn_event_tests {
 
             assert!(assistant_message_end < turn_end_indices[0]);
 
-            let turn_end_event = &events[turn_end_indices[0]];
-            assert!(
-                matches!(turn_end_event, AgentEvent::TurnEnd { .. }),
-                "Expected TurnEnd event, got {turn_end_event:?}"
-            );
-            let AgentEvent::TurnEnd {
-                message,
-                tool_results,
-            } = turn_end_event
-            else {
-                return;
+            let (message_is_assistant, tool_results_empty) = {
+                let turn_end_event = &events[turn_end_indices[0]];
+                assert!(
+                    matches!(turn_end_event, AgentEvent::TurnEnd { .. }),
+                    "Expected TurnEnd event, got {turn_end_event:?}"
+                );
+                match turn_end_event {
+                    AgentEvent::TurnEnd {
+                        message,
+                        tool_results,
+                    } => (
+                        matches!(message, Message::Assistant(_)),
+                        tool_results.is_empty(),
+                    ),
+                    _ => (false, false),
+                }
             };
-            assert!(matches!(message, Message::Assistant(_)));
-            assert!(tool_results.is_empty());
+            drop(events);
+            assert!(message_is_assistant);
+            assert!(tool_results_empty);
         });
     }
 }
