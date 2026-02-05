@@ -1,9 +1,10 @@
 //! Unit tests: JS runtime + shims + event loop ordering (bd-39u).
 //!
-//! These tests exercise the PiJsRuntime through its public API only,
+//! These tests exercise the `PiJsRuntime` through its public API only,
 //! verifying promise bridge behavior, hostcall completion ordering,
 //! timer scheduling, and event loop semantics.
 #![forbid(unsafe_code)]
+#![allow(clippy::future_not_send)] // PiJsRuntime is single-threaded (QuickJS) and not Send/Sync.
 
 mod common;
 
@@ -16,7 +17,7 @@ use std::sync::Arc;
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Create a PiJsRuntime with a deterministic clock starting at 0.
+/// Create a `PiJsRuntime` with a deterministic clock starting at 0.
 async fn make_runtime() -> (
     PiJsRuntime<Arc<DeterministicClock>>,
     Arc<DeterministicClock>,
@@ -28,7 +29,7 @@ async fn make_runtime() -> (
     (runtime, clock)
 }
 
-/// Create a PiJsRuntime with custom limits and a deterministic clock.
+/// Create a `PiJsRuntime` with custom limits and a deterministic clock.
 async fn make_runtime_with_limits(
     limits: PiJsRuntimeLimits,
 ) -> (
@@ -80,7 +81,7 @@ async fn get_global_json(
     let req = requests
         .iter()
         .find(|r| r.payload.get("name").and_then(|v| v.as_str()) == Some(name))
-        .unwrap_or_else(|| panic!("no __test_read_global request for {name}"));
+        .unwrap_or_else(|| unreachable!("no __test_read_global request for {name}"));
     req.payload
         .get("value")
         .cloned()
@@ -532,7 +533,7 @@ fn clear_timeout_prevents_callback() {
         let timer_id = runtime.set_timeout(10);
         runtime
             .eval(&format!(
-                r#"__pi_register_timer({timer_id}, () => {{ globalThis.fired = true; }});"#
+                r"__pi_register_timer({timer_id}, () => {{ globalThis.fired = true; }});"
             ))
             .await
             .expect("register timer");
@@ -610,7 +611,7 @@ fn has_pending_reflects_timer_state() {
 
         let timer_id = runtime.set_timeout(10);
         runtime
-            .eval(&format!(r#"__pi_register_timer({timer_id}, () => {{}});"#))
+            .eval(&format!(r"__pi_register_timer({timer_id}, () => {{}});"))
             .await
             .expect("register timer");
 
@@ -837,6 +838,8 @@ fn now_ms_tracks_clock() {
 fn hostcall_kinds_are_correctly_classified() {
     let _harness = TestHarness::new("hostcall_kinds_classified");
     futures::executor::block_on(async {
+        use pi::extensions_js::HostcallKind;
+
         let (runtime, _clock) = make_runtime().await;
 
         runtime
@@ -854,8 +857,6 @@ fn hostcall_kinds_are_correctly_classified() {
 
         let requests = runtime.drain_hostcall_requests();
         assert_eq!(requests.len(), 5);
-
-        use pi::extensions_js::HostcallKind;
         assert!(matches!(&requests[0].kind, HostcallKind::Tool { name } if name == "read"));
         assert!(matches!(&requests[1].kind, HostcallKind::Exec { cmd } if cmd == "ls"));
         assert!(matches!(&requests[2].kind, HostcallKind::Http));

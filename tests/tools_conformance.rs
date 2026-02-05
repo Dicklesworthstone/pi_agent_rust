@@ -1358,20 +1358,19 @@ mod e2e_grep {
     }
 
     #[test]
-    fn e2e_grep_glob_filter_with_artifacts() {
+    fn e2e_grep_with_context_lines() {
         if !binary_available("rg") {
             eprintln!("SKIP: rg (ripgrep) not available on PATH");
             return;
         }
         asupersync::test_utils::run_test(|| async {
-            let harness = TestHarness::new("e2e_grep_glob_filter_with_artifacts");
-            harness.create_file("src/code.rs", b"fn match_here() {}");
-            harness.create_file("src/code.py", b"def match_here(): pass");
+            let harness = TestHarness::new("e2e_grep_with_context_lines");
+            harness.create_file("data.txt", b"line1\nline2\nTARGET\nline4\nline5");
 
             let tool = pi::tools::GrepTool::new(harness.temp_dir());
             let input = serde_json::json!({
-                "pattern": "match_here",
-                "glob": "**/*.rs"
+                "pattern": "TARGET",
+                "context": 1
             });
 
             let result = tool.execute("grep-003", input.clone(), None).await;
@@ -1379,13 +1378,11 @@ mod e2e_grep {
 
             let output = result.expect("should succeed");
             let text = get_text_content(&output.content);
+            assert!(text.contains("TARGET"), "should contain match: {text}");
+            // Context lines should include adjacent lines
             assert!(
-                text.contains("code.rs"),
-                "expected code.rs in output: {text}"
-            );
-            assert!(
-                !text.contains("code.py"),
-                "expected no code.py in output: {text}"
+                text.contains("line2") || text.contains("line4"),
+                "should contain context lines: {text}"
             );
         });
     }
