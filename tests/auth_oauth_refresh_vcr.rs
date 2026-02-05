@@ -54,7 +54,7 @@ fn write_redacted_snapshot(harness: &TestHarness, src: &Path, name: &str) -> (Pa
     (path, redacted)
 }
 
-fn oauth_entry(value: &Value, provider: &str) -> &serde_json::Map<String, Value> {
+fn oauth_entry<'a>(value: &'a Value, provider: &str) -> &'a serde_json::Map<String, Value> {
     let Some(map) = value.as_object() else {
         panic!("expected auth.json root object");
     };
