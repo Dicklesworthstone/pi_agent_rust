@@ -14,24 +14,56 @@ pub mod gemini;
 pub mod openai;
 
 pub fn create_provider(entry: &ModelEntry) -> Result<Arc<dyn Provider>> {
+    // Try matching on known provider name first.
     match entry.model.provider.as_str() {
-        "anthropic" => Ok(Arc::new(
+        "anthropic" => {
+            return Ok(Arc::new(
+                anthropic::AnthropicProvider::new(entry.model.id.clone())
+                    .with_base_url(entry.model.base_url.clone()),
+            ));
+        }
+        "openai" => {
+            return Ok(Arc::new(
+                openai::OpenAIProvider::new(entry.model.id.clone())
+                    .with_base_url(normalize_openai_base(&entry.model.base_url)),
+            ));
+        }
+        "google" => {
+            return Ok(Arc::new(
+                gemini::GeminiProvider::new(entry.model.id.clone())
+                    .with_base_url(entry.model.base_url.clone()),
+            ));
+        }
+        "azure-openai" => {
+            return Err(Error::provider(
+                "azure-openai",
+                "Azure OpenAI provider requires resource+deployment; configure via models.json",
+            ));
+        }
+        _ => {}
+    }
+
+    // Fall back to API type for extension-registered providers.
+    match entry.model.api.as_str() {
+        "anthropic-messages" => Ok(Arc::new(
             anthropic::AnthropicProvider::new(entry.model.id.clone())
                 .with_base_url(entry.model.base_url.clone()),
         )),
-        "openai" => Ok(Arc::new(
+        "openai-completions" | "openai-responses" => Ok(Arc::new(
             openai::OpenAIProvider::new(entry.model.id.clone())
                 .with_base_url(normalize_openai_base(&entry.model.base_url)),
         )),
-        "google" => Ok(Arc::new(
+        "google-generative-ai" => Ok(Arc::new(
             gemini::GeminiProvider::new(entry.model.id.clone())
                 .with_base_url(entry.model.base_url.clone()),
         )),
-        "azure-openai" => Err(Error::provider(
-            "azure-openai",
-            "Azure OpenAI provider requires resource+deployment; configure via models.json",
+        _ => Err(Error::provider(
+            &entry.model.provider,
+            &format!(
+                "Provider not implemented (api: {})",
+                entry.model.api
+            ),
         )),
-        other => Err(Error::provider(other, "Provider not implemented")),
     }
 }
 

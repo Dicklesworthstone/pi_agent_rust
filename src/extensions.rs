@@ -6323,12 +6323,6 @@ impl ExtensionManager {
             .await
     }
 
-    /// Dynamically register a provider at runtime (from a hostcall).
-    pub fn register_provider(&self, spec: Value) {
-        let mut guard = self.inner.lock().unwrap();
-        guard.providers.push(spec);
-    }
-
     /// Return extension-registered providers as raw JSON specs.
     pub fn extension_providers(&self) -> Vec<Value> {
         let guard = self.inner.lock().unwrap();

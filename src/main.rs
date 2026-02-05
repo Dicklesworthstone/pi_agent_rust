@@ -305,6 +305,14 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
             .enable_extensions(&enabled_tools, &cwd, Some(&config), resources.extensions())
             .await
             .map_err(anyhow::Error::new)?;
+
+        // Merge extension-registered providers into the model registry.
+        if let Some(manager) = &agent_session.extensions {
+            let ext_entries = manager.extension_model_entries();
+            if !ext_entries.is_empty() {
+                model_registry.merge_entries(ext_entries);
+            }
+        }
     }
 
     if mode == "rpc" {
