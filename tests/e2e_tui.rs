@@ -15,7 +15,6 @@
 mod common;
 
 use clap::Parser as _;
-use common::harness::{MockHttpResponse, MockHttpServer};
 use common::run_async;
 use common::tmux::TuiSession;
 use pi::app::build_system_prompt;
@@ -55,8 +54,11 @@ fn base_interactive_args() -> Vec<&'static str> {
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const VCR_TEST_NAME: &str = "e2e_tui_tool_read";
+const VCR_BASIC_CHAT_TEST_NAME: &str = "e2e_tui_basic_chat";
 const VCR_MODEL: &str = "claude-sonnet-4-20250514";
 const VCR_PROMPT: &str = "Readsample.txt";
+const VCR_BASIC_CHAT_PROMPT: &str = "Say hello";
+const VCR_BASIC_CHAT_RESPONSE: &str = "Hello! How can I help you today?";
 const SAMPLE_FILE_NAME: &str = "sample.txt";
 const SAMPLE_FILE_CONTENT: &str = "Hello\nWorld\n";
 const TOOL_CALL_ID: &str = "toolu_e2e_read_1";
@@ -82,9 +84,33 @@ fn vcr_interactive_args() -> Vec<&'static str> {
     ]
 }
 
-fn build_vcr_system_prompt(workdir: &Path, env_root: &Path) -> String {
+fn vcr_interactive_args_no_tools() -> Vec<&'static str> {
+    vec![
+        "--provider",
+        "anthropic",
+        "--model",
+        VCR_MODEL,
+        "--api-key",
+        "test-key-e2e",
+        "--no-tools",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--thinking",
+        "off",
+        "--system-prompt",
+        "pi e2e vcr harness",
+    ]
+}
+
+fn build_vcr_system_prompt_for_args(
+    args_fn: fn() -> Vec<&'static str>,
+    workdir: &Path,
+    env_root: &Path,
+) -> String {
     let mut args: Vec<&str> = vec!["pi"];
-    args.extend(vcr_interactive_args());
+    args.extend(args_fn());
     let cli = cli::Cli::try_parse_from(args).expect("parse vcr cli args");
     let enabled_tools = cli.enabled_tools();
     let global_dir = env_root.join("agent");
@@ -98,6 +124,97 @@ fn build_vcr_system_prompt(workdir: &Path, env_root: &Path) -> String {
         &package_dir,
         true,
     )
+}
+
+fn build_vcr_system_prompt(workdir: &Path, env_root: &Path) -> String {
+    build_vcr_system_prompt_for_args(vcr_interactive_args, workdir, env_root)
+}
+
+/// Write a VCR cassette for a basic chat interaction (no tools, simple text response).
+fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
+    let cassette_path = dir.join(format!("{VCR_BASIC_CHAT_TEST_NAME}.json"));
+
+    let request = json!({
+        "model": VCR_MODEL,
+        "messages": [
+            { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
+        ],
+        "system": system_prompt,
+        "max_tokens": 8192,
+        "stream": true,
+    });
+
+    let sse_chunk = |event: &str, data: serde_json::Value| -> String {
+        let payload = serde_json::to_string(&data).expect("serialize sse payload");
+        format!("event: {event}\ndata: {payload}\n\n")
+    };
+
+    let response = RecordedResponse {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
+        body_chunks: vec![
+            sse_chunk(
+                "message_start",
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 10 } }
+                }),
+            ),
+            sse_chunk(
+                "content_block_start",
+                json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": { "type": "text" }
+                }),
+            ),
+            sse_chunk(
+                "content_block_delta",
+                json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": VCR_BASIC_CHAT_RESPONSE }
+                }),
+            ),
+            sse_chunk(
+                "content_block_stop",
+                json!({ "type": "content_block_stop", "index": 0 }),
+            ),
+            sse_chunk(
+                "message_delta",
+                json!({
+                    "type": "message_delta",
+                    "delta": { "stop_reason": "end_turn" },
+                    "usage": { "output_tokens": 8 }
+                }),
+            ),
+            sse_chunk("message_stop", json!({ "type": "message_stop" })),
+        ],
+    };
+
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: VCR_BASIC_CHAT_TEST_NAME.to_string(),
+        recorded_at: "1970-01-01T00:00:00Z".to_string(),
+        interactions: vec![Interaction {
+            request: RecordedRequest {
+                method: "POST".to_string(),
+                url: "https://api.anthropic.com/v1/messages".to_string(),
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("Accept".to_string(), "text/event-stream".to_string()),
+                ],
+                body: Some(request),
+                body_text: None,
+            },
+            response,
+        }],
+    };
+
+    std::fs::create_dir_all(dir).expect("create cassette dir");
+    let json = serde_json::to_string_pretty(&cassette).expect("serialize cassette");
+    std::fs::write(&cassette_path, json).expect("write cassette");
+    cassette_path
 }
 
 fn read_output_for_sample(cwd: &Path, path: &str) -> String {
@@ -645,236 +762,50 @@ fn e2e_tui_artifact_format() {
         });
 }
 
-// ─── Mock HTTP Helpers ────────────────────────────────────────────────────────
+// ─── VCR Chat Tests ──────────────────────────────────────────────────────────
 
-/// Build SSE body for a simple Anthropic text response.
-fn build_mock_anthropic_text_sse(text: &str) -> String {
-    let sse_chunk = |event: &str, data: serde_json::Value| -> String {
-        let payload = serde_json::to_string(&data).expect("serialize sse payload");
-        format!("event: {event}\ndata: {payload}\n\n")
-    };
-    let mut sse = String::new();
-    sse.push_str(&sse_chunk(
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": "msg_mock_001",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-sonnet-4-5-20250514",
-                "content": [],
-                "stop_reason": null,
-                "usage": { "input_tokens": 10 }
-            }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": { "type": "text", "text": "" }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "text_delta", "text": text }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "content_block_stop",
-        json!({ "type": "content_block_stop", "index": 0 }),
-    ));
-    sse.push_str(&sse_chunk(
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": { "stop_reason": "end_turn" },
-            "usage": { "output_tokens": 5 }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "message_stop",
-        json!({ "type": "message_stop" }),
-    ));
-    sse
-}
-
-/// Build SSE body for a `tool_use` response.
-fn build_mock_anthropic_tool_call_sse(tool_name: &str, tool_id: &str, args_json: &str) -> String {
-    let sse_chunk = |event: &str, data: serde_json::Value| -> String {
-        let payload = serde_json::to_string(&data).expect("serialize sse payload");
-        format!("event: {event}\ndata: {payload}\n\n")
-    };
-    let mut sse = String::new();
-    sse.push_str(&sse_chunk(
-        "message_start",
-        json!({
-            "type": "message_start",
-            "message": {
-                "id": "msg_mock_tool_001",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-sonnet-4-5-20250514",
-                "content": [],
-                "stop_reason": null,
-                "usage": { "input_tokens": 20 }
-            }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "content_block_start",
-        json!({
-            "type": "content_block_start",
-            "index": 0,
-            "content_block": { "type": "tool_use", "id": tool_id, "name": tool_name }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "content_block_delta",
-        json!({
-            "type": "content_block_delta",
-            "index": 0,
-            "delta": { "type": "input_json_delta", "partial_json": args_json }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "content_block_stop",
-        json!({ "type": "content_block_stop", "index": 0 }),
-    ));
-    sse.push_str(&sse_chunk(
-        "message_delta",
-        json!({
-            "type": "message_delta",
-            "delta": { "stop_reason": "tool_use" },
-            "usage": { "output_tokens": 10 }
-        }),
-    ));
-    sse.push_str(&sse_chunk(
-        "message_stop",
-        json!({ "type": "message_stop" }),
-    ));
-    sse
-}
-
-/// Build a `MockHttpResponse` for an SSE body.
-fn mock_sse_response(sse_body: &str) -> MockHttpResponse {
-    MockHttpResponse {
-        status: 200,
-        headers: vec![("Content-Type".to_string(), "text/event-stream".to_string())],
-        body: sse_body.as_bytes().to_vec(),
-    }
-}
-
-/// Set up a mock Anthropic server for TUI tests.
-///
-/// Writes a `models.json` to the session's `PI_CODING_AGENT_DIR` with `baseUrl`
-/// pointing to the mock server, and sets `ANTHROPIC_API_KEY`.
-///
-/// Returns the `MockHttpServer` (must be kept alive for the duration of the test).
-fn setup_mock_anthropic_for_tui(session: &mut TuiSession) -> MockHttpServer {
-    let server = session.harness.start_mock_http_server();
-    let base_url = format!("{}/v1/messages", server.base_url());
-
-    // Write models.json into the agent dir so the binary picks it up.
-    let agent_dir = session.harness.temp_dir().join("env").join("agent");
-    std::fs::create_dir_all(&agent_dir).expect("create agent dir");
-    let models_json = json!({
-        "providers": {
-            "anthropic": {
-                "baseUrl": base_url
-            }
-        }
-    });
-    let models_path = agent_dir.join("models.json");
-    std::fs::write(
-        &models_path,
-        serde_json::to_string_pretty(&models_json).unwrap(),
-    )
-    .expect("write models.json");
-    session.harness.record_artifact("models.json", &models_path);
-
-    session.set_env("ANTHROPIC_API_KEY", "test-mock-key");
-
-    session
-        .harness
-        .log()
-        .info_ctx("mock", "Anthropic mock server configured", |ctx| {
-            ctx.push(("base_url".into(), base_url));
-            ctx.push(("addr".into(), server.addr().to_string()));
-        });
-
-    server
-}
-
-const MOCK_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
-const MOCK_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
-const MOCK_TOOL_FLOW_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Standard CLI args for interactive mode with Anthropic mock provider.
-fn mock_anthropic_interactive_args_no_tools() -> Vec<&'static str> {
-    vec![
-        "--provider",
-        "anthropic",
-        "--model",
-        "claude-sonnet-4-5",
-        "--no-tools",
-        "--no-skills",
-        "--no-prompt-templates",
-        "--no-extensions",
-        "--no-themes",
-        "--thinking",
-        "off",
-        "--system-prompt",
-        "pi e2e mock test harness",
-    ]
-}
-
-fn mock_anthropic_interactive_args_with_read() -> Vec<&'static str> {
-    vec![
-        "--provider",
-        "anthropic",
-        "--model",
-        "claude-sonnet-4-5",
-        "--tools",
-        "read",
-        "--no-skills",
-        "--no-prompt-templates",
-        "--no-extensions",
-        "--no-themes",
-        "--thinking",
-        "off",
-        "--system-prompt",
-        "pi e2e mock test harness",
-    ]
-}
-
-// ─── Mock HTTP Tests ─────────────────────────────────────────────────────────
-
-/// E2E interactive: basic chat via mock HTTP server.
+/// E2E interactive: basic chat via VCR playback (no tools).
 #[test]
-fn e2e_tui_basic_chat_mock() {
-    let Some(mut session) = TuiSession::new("e2e_tui_basic_chat_mock") else {
+fn e2e_tui_basic_chat_vcr() {
+    let Some(mut session) = TuiSession::new("e2e_tui_basic_chat_vcr") else {
         eprintln!("Skipping: tmux not available");
         return;
     };
 
-    session.harness.section("setup mock");
-    let server = setup_mock_anthropic_for_tui(&mut session);
+    session.harness.section("setup vcr");
+    let cassette_dir = session.harness.temp_path("vcr");
+    let env_root = session.harness.temp_dir().join("env");
+    let system_prompt = build_vcr_system_prompt_for_args(
+        vcr_interactive_args_no_tools,
+        session.harness.temp_dir(),
+        &env_root,
+    );
+    let cassette_path = write_vcr_basic_chat_cassette(&cassette_dir, &system_prompt);
+    let cassette_name = cassette_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vcr-cassette.json");
+    session
+        .harness
+        .record_artifact(cassette_name, &cassette_path);
 
-    // Configure mock to return a simple text response
-    let sse_body = build_mock_anthropic_text_sse("Hello from mock!");
-    server.add_route("POST", "/v1/messages", mock_sse_response(&sse_body));
+    session
+        .harness
+        .log()
+        .info_ctx("vcr", "Prepared basic chat playback cassette", |ctx| {
+            ctx.push(("cassette_path".into(), cassette_path.display().to_string()));
+            ctx.push(("system_prompt_sha256".into(), sha256_hex(&system_prompt)));
+        });
+
+    let cassette_dir_str = cassette_dir.display().to_string();
+    session.set_env(VCR_ENV_MODE, "playback");
+    session.set_env(VCR_ENV_DIR, &cassette_dir_str);
+    session.set_env("PI_VCR_TEST_NAME", VCR_BASIC_CHAT_TEST_NAME);
 
     session.harness.section("launch");
-    session.launch(&mock_anthropic_interactive_args_no_tools());
+    session.launch(&vcr_interactive_args_no_tools());
 
-    // Wait for welcome
-    let pane = session.wait_and_capture("startup", "Welcome to Pi!", MOCK_STARTUP_TIMEOUT);
+    let pane = session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
     assert!(
         pane.contains("Welcome to Pi!"),
         "Expected welcome message; got:\n{pane}"
@@ -883,130 +814,13 @@ fn e2e_tui_basic_chat_mock() {
     session.harness.section("send prompt");
     let pane = session.send_text_and_wait(
         "prompt",
-        "Say hello",
-        "Hello from mock!",
-        MOCK_COMMAND_TIMEOUT,
+        VCR_BASIC_CHAT_PROMPT,
+        VCR_BASIC_CHAT_RESPONSE,
+        COMMAND_TIMEOUT,
     );
     assert!(
-        pane.contains("Hello from mock!"),
-        "Expected mock response in pane; got:\n{pane}"
-    );
-
-    session.harness.section("verify requests");
-    let requests = server.requests();
-    session
-        .harness
-        .log()
-        .info_ctx("verify", "Mock server requests", |ctx| {
-            ctx.push(("count".into(), requests.len().to_string()));
-        });
-    assert!(
-        !requests.is_empty(),
-        "Expected at least one request to mock server"
-    );
-
-    session.harness.section("exit");
-    session.exit_gracefully();
-    assert!(
-        !session.tmux.session_exists(),
-        "Session did not exit cleanly"
-    );
-
-    session.write_artifacts();
-
-    assert!(
-        session.steps().len() >= 2,
-        "Expected >= 2 steps (startup + prompt), got {}",
-        session.steps().len()
-    );
-}
-
-/// E2E interactive: tool call (read) via mock HTTP with response queue.
-#[test]
-#[allow(clippy::too_many_lines)]
-fn e2e_tui_tool_call_read() {
-    let Some(mut session) = TuiSession::new("e2e_tui_tool_call_read") else {
-        eprintln!("Skipping: tmux not available");
-        return;
-    };
-
-    session.harness.section("setup files");
-    // Create sample.txt in the workdir
-    let sample_content = "Hello World from sample file";
-    let sample_path = session.harness.temp_path("sample.txt");
-    std::fs::write(&sample_path, sample_content).expect("write sample.txt");
-    session.harness.record_artifact("sample.txt", &sample_path);
-
-    session.harness.section("setup mock");
-    let server = setup_mock_anthropic_for_tui(&mut session);
-
-    // Response 1: tool call to read sample.txt
-    let tool_call_sse = build_mock_anthropic_tool_call_sse(
-        "read",
-        "toolu_mock_read_001",
-        &serde_json::to_string(&json!({ "path": "sample.txt" })).unwrap(),
-    );
-
-    // Response 2: text response after receiving tool result
-    let text_sse = build_mock_anthropic_text_sse("The file says Hello World from sample file");
-
-    // Queue both responses: first request → tool call, second → text
-    server.add_route_queue(
-        "POST",
-        "/v1/messages",
-        vec![
-            mock_sse_response(&tool_call_sse),
-            mock_sse_response(&text_sse),
-        ],
-    );
-
-    session.harness.section("launch");
-    session.launch(&mock_anthropic_interactive_args_with_read());
-
-    // Wait for welcome
-    let pane = session.wait_and_capture("startup", "Welcome to Pi!", MOCK_STARTUP_TIMEOUT);
-    assert!(
-        pane.contains("Welcome to Pi!"),
-        "Expected welcome message; got:\n{pane}"
-    );
-
-    session
-        .harness
-        .section("send prompt and wait for tool flow");
-    // Send the prompt
-    session.tmux.send_literal("Read sample.txt");
-    session.tmux.send_key("Enter");
-
-    // Wait for the final text response (which comes after the tool call completes)
-    let pane = session
-        .tmux
-        .wait_for_pane_contains("The file says Hello World", MOCK_TOOL_FLOW_TIMEOUT);
-
-    // Record the step manually since we used low-level tmux ops
-    let artifact_name = format!("pane-{}.txt", session.steps().len());
-    let artifact_path = session.harness.temp_path(&artifact_name);
-    std::fs::write(&artifact_path, &pane).expect("write pane snapshot");
-    session
-        .harness
-        .record_artifact(&artifact_name, &artifact_path);
-
-    assert!(
-        pane.contains("The file says Hello World"),
-        "Expected final response in pane; got:\n{pane}"
-    );
-
-    session.harness.section("verify requests");
-    let requests = server.requests();
-    session
-        .harness
-        .log()
-        .info_ctx("verify", "Mock server requests", |ctx| {
-            ctx.push(("count".into(), requests.len().to_string()));
-        });
-    assert!(
-        requests.len() >= 2,
-        "Expected >= 2 requests (initial + after tool result), got {}",
-        requests.len()
+        pane.contains(VCR_BASIC_CHAT_RESPONSE),
+        "Expected VCR response in pane; got:\n{pane}"
     );
 
     session.harness.section("exit");
@@ -1025,36 +839,41 @@ fn e2e_tui_tool_call_read() {
             .harness
             .record_artifact("session.jsonl", &session_file);
         let content = std::fs::read_to_string(&session_file).expect("read session jsonl");
-        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        let mut lines = content.lines().filter(|line| !line.trim().is_empty());
+        let header_line = lines.next().expect("session header line");
+        let header: Value = serde_json::from_str(header_line).expect("parse session header");
+        assert_eq!(header.get("type").and_then(Value::as_str), Some("session"));
+        assert_eq!(
+            header.get("version").and_then(Value::as_u64),
+            Some(u64::from(SESSION_VERSION))
+        );
 
-        session
-            .harness
-            .log()
-            .info_ctx("verify", "Session JSONL analysis", |ctx| {
-                ctx.push(("lines".into(), lines.len().to_string()));
-            });
-
-        // Check for toolCall and toolResult in the session JSONL.
-        // ContentBlock uses serde rename_all = "camelCase" (ToolCall → "toolCall").
-        // SessionMessage uses serde tag = "role" rename_all = "camelCase" (ToolResult → "toolResult").
-        let has_tool_call = content.contains("toolCall");
-        let has_tool_result = content.contains("toolResult");
-        session
-            .harness
-            .log()
-            .info_ctx("verify", "Session content check", |ctx| {
-                ctx.push(("has_tool_call".into(), has_tool_call.to_string()));
-                ctx.push(("has_tool_result".into(), has_tool_result.to_string()));
-            });
-
-        assert!(has_tool_call, "Expected toolCall in session JSONL");
-        assert!(has_tool_result, "Expected toolResult in session JSONL");
+        let has_message = lines.any(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|v| {
+                    v.get("type")
+                        .and_then(Value::as_str)
+                        .map(|t| t == "message")
+                })
+                .unwrap_or(false)
+        });
+        assert!(
+            has_message,
+            "Expected at least one message entry in session"
+        );
     } else {
         session
             .harness
             .log()
             .warn("verify", "No session JSONL file found (non-fatal)");
     }
+
+    assert!(
+        session.steps().len() >= 2,
+        "Expected >= 2 steps (startup + prompt), got {}",
+        session.steps().len()
+    );
 }
 
 /// E2E interactive: VCR playback tool call with deterministic artifacts.

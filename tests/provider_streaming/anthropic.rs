@@ -4,13 +4,12 @@ use super::{
     tool_result_message, user_text, vcr_mode, vcr_strict,
 };
 use crate::common::TestHarness;
-use crate::common::harness::MockHttpResponse;
 use chrono::{SecondsFormat, Utc};
 use pi::http::client::Client;
-use pi::model::{Message, StopReason, ThinkingLevel};
+use pi::model::{Message, StopReason, ThinkingLevel, UserContent};
 use pi::provider::{CacheRetention, Context, Provider, StreamOptions, ThinkingBudgets, ToolDef};
 use pi::providers::anthropic::AnthropicProvider;
-use pi::vcr::{Cassette, RecordedRequest, VcrMode, VcrRecorder};
+use pi::vcr::{Cassette, Interaction, RecordedRequest, RecordedResponse, VcrMode, VcrRecorder};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::env;
@@ -142,51 +141,116 @@ fn build_options(scenario: &Scenario, api_key: String) -> StreamOptions {
     }
 }
 
-fn normalize_mock_error_cassette(cassette_path: &Path, harness: &TestHarness) {
-    let raw = match std::fs::read_to_string(cassette_path) {
-        Ok(raw) => raw,
-        Err(err) => {
-            harness.log().warn(
-                "vcr",
-                format!("Failed to read cassette for normalization: {err}"),
-            );
-            return;
-        }
-    };
-    let mut cassette: Cassette = match serde_json::from_str(&raw) {
-        Ok(cassette) => cassette,
-        Err(err) => {
-            harness.log().warn(
-                "vcr",
-                format!("Failed to parse cassette for normalization: {err}"),
-            );
-            return;
-        }
-    };
-    let Some(mut interaction) = cassette.interactions.pop() else {
-        harness
-            .log()
-            .warn("vcr", "Cassette had no interactions to normalize");
-        return;
-    };
-    interaction.request.url = ANTHROPIC_MESSAGES_URL.to_string();
-    cassette.interactions = vec![interaction];
+/// Generate a VCR error fixture cassette for scenarios where errors cannot be recorded from
+/// real API endpoints on demand. These are deterministic fixtures that match the request format
+/// the provider sends and return an appropriate error response.
+fn generate_error_fixture(
+    cassette_path: &Path,
+    scenario: &Scenario,
+    expectation: &super::ErrorExpectation,
+    harness: &TestHarness,
+) {
+    let options = build_options(scenario, "vcr-playback".to_string());
 
-    let serialized = match serde_json::to_string_pretty(&cassette) {
-        Ok(serialized) => serialized,
-        Err(err) => {
-            harness.log().warn(
-                "vcr",
-                format!("Failed to serialize normalized cassette: {err}"),
-            );
-            return;
-        }
-    };
-    if let Err(err) = std::fs::write(cassette_path, serialized) {
-        harness
-            .log()
-            .warn("vcr", format!("Failed to write normalized cassette: {err}"));
+    // Build the request body matching AnthropicProvider's serialization.
+    // Error scenarios use simple user text messages only.
+    let messages: Vec<serde_json::Value> = scenario
+        .messages
+        .iter()
+        .map(|msg| match msg {
+            Message::User(u) => {
+                let text = match &u.content {
+                    UserContent::Text(t) => t.clone(),
+                    _ => String::new(),
+                };
+                json!({"role": "user", "content": [{"type": "text", "text": text}]})
+            }
+            _ => json!({}),
+        })
+        .collect();
+
+    let mut body = json!({
+        "max_tokens": options.max_tokens.unwrap_or(8192),
+        "messages": messages,
+        "model": scenario.model,
+        "stream": true,
+    });
+    let context = build_context(scenario);
+    if let Some(system) = &context.system_prompt {
+        body["system"] = json!(system);
     }
+    if let Some(temp) = options.temperature {
+        body["temperature"] = json!(temp);
+    }
+
+    let (error_type, error_message) = match expectation.status {
+        400 => ("invalid_request_error", "Bad request."),
+        401 => ("authentication_error", "Invalid API key provided."),
+        403 => ("permission_error", "Forbidden."),
+        429 => (
+            "rate_limit_error",
+            "Rate limit exceeded. Please retry after 30 seconds.",
+        ),
+        500 => ("api_error", "Internal server error."),
+        529 => ("overloaded_error", "API is temporarily overloaded."),
+        _ => ("api_error", "Unknown error."),
+    };
+
+    let mut response_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+    if expectation.status == 429 {
+        response_headers.push(("retry-after".to_string(), "30".to_string()));
+    }
+
+    let error_body = json!({
+        "type": "error",
+        "error": {"type": error_type, "message": error_message},
+    });
+
+    let cassette = Cassette {
+        version: "1.0".to_string(),
+        test_name: scenario.name.to_string(),
+        recorded_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        interactions: vec![Interaction {
+            request: RecordedRequest {
+                method: "POST".to_string(),
+                url: ANTHROPIC_MESSAGES_URL.to_string(),
+                headers: vec![
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                    ("Accept".to_string(), "text/event-stream".to_string()),
+                    ("X-API-Key".to_string(), "[REDACTED]".to_string()),
+                    ("anthropic-version".to_string(), "2023-06-01".to_string()),
+                    ("Content-Type".to_string(), "application/json".to_string()),
+                ],
+                body: Some(body),
+                body_text: None,
+            },
+            response: RecordedResponse {
+                status: expectation.status,
+                headers: response_headers,
+                body_chunks: vec![serde_json::to_string(&error_body).unwrap_or_default()],
+            },
+        }],
+    };
+
+    let serialized = serde_json::to_string_pretty(&cassette)
+        .unwrap_or_else(|err| panic!("Failed to serialize error fixture: {err}"));
+    if let Some(parent) = cassette_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(cassette_path, &serialized).unwrap_or_else(|err| {
+        panic!(
+            "Failed to write error fixture {}: {err}",
+            cassette_path.display()
+        )
+    });
+    harness.log().info(
+        "fixture",
+        format!(
+            "Generated error fixture {} (HTTP {})",
+            cassette_path.display(),
+            expectation.status
+        ),
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -197,8 +261,25 @@ async fn run_scenario(scenario: Scenario) {
     let cassette_path = cassette_dir.join(format!("{}.json", scenario.name));
     harness.record_artifact(format!("{}.json", scenario.name), &cassette_path);
 
+    let error_expectation = match &scenario.expectation {
+        ScenarioExpectation::Error(expectation) => Some(expectation.clone()),
+        ScenarioExpectation::Stream(_) => None,
+    };
+
+    // Error scenarios use pre-built fixture cassettes rather than mock HTTP servers.
+    // Errors (4xx, 5xx, 529) cannot be triggered on demand from real API endpoints, so we
+    // generate deterministic fixture cassettes that the VCR replays in playback mode.
+    let effective_mode = if let Some(expectation) = error_expectation.as_ref() {
+        if !cassette_path.exists() {
+            generate_error_fixture(&cassette_path, &scenario, expectation, &harness);
+        }
+        VcrMode::Playback
+    } else {
+        mode
+    };
+
     let cassette_exists = cassette_path.exists();
-    if mode == VcrMode::Playback && !cassette_exists {
+    if effective_mode == VcrMode::Playback && !cassette_exists {
         let message = format!("Missing cassette {}", cassette_path.display());
         if vcr_strict() {
             assert!(cassette_exists, "{}", message);
@@ -208,53 +289,18 @@ async fn run_scenario(scenario: Scenario) {
         }
     }
 
-    let is_recording =
-        mode == VcrMode::Record || (mode == VcrMode::Auto && !cassette_path.exists());
-    let error_expectation = match &scenario.expectation {
-        ScenarioExpectation::Error(expectation) => Some(expectation.clone()),
-        ScenarioExpectation::Stream(_) => None,
-    };
-
-    let recorder = VcrRecorder::new_with(scenario.name, mode, &cassette_dir);
+    let recorder = VcrRecorder::new_with(scenario.name, effective_mode, &cassette_dir);
     let client = Client::new().with_vcr(recorder);
-    let mut provider = AnthropicProvider::new(scenario.model.clone()).with_client(client);
-    let _mock_server = if let (true, Some(expectation)) = (is_recording, error_expectation.as_ref())
-    {
-        let server = harness.start_mock_http_server();
-        let body = json!({
-            "type": "error",
-            "error": {
-                "type": "test_error",
-                "message": format!("Synthetic HTTP {} for VCR recording.", expectation.status),
-            }
-        });
-        let response = if expectation.status == 429 {
-            MockHttpResponse {
-                status: expectation.status,
-                headers: vec![
-                    ("Content-Type".to_string(), "application/json".to_string()),
-                    ("retry-after".to_string(), "1".to_string()),
-                ],
-                body: serde_json::to_vec(&body).unwrap_or_default(),
-            }
-        } else {
-            MockHttpResponse::json(expectation.status, &body)
-        };
-        server.add_route("POST", "/v1/messages", response);
-        provider = provider.with_base_url(format!("{}/v1/messages", server.base_url()));
-        Some(server)
-    } else {
-        None
-    };
+    let provider = AnthropicProvider::new(scenario.model.clone()).with_client(client);
     let context = build_context(&scenario);
-    let options = build_options(&scenario, anthropic_api_key(mode));
+    let options = build_options(&scenario, anthropic_api_key(effective_mode));
 
     harness
         .log()
         .info_ctx("scenario", "Anthropic scenario", |ctx| {
             ctx.push(("name".into(), scenario.name.to_string()));
             ctx.push(("description".into(), scenario.description.to_string()));
-            ctx.push(("mode".into(), format!("{mode:?}")));
+            ctx.push(("mode".into(), format!("{effective_mode:?}")));
             ctx.push(("model".into(), scenario.model.clone()));
             ctx.push(("max_tokens".into(), scenario.options.max_tokens.to_string()));
             if let Some(level) = scenario.options.thinking_level {
@@ -293,11 +339,7 @@ async fn run_scenario(scenario: Scenario) {
         }
     }
 
-    if is_recording && error_expectation.is_some() {
-        normalize_mock_error_cassette(&cassette_path, &harness);
-    }
-
-    if mode == VcrMode::Record {
+    if effective_mode == VcrMode::Record {
         update_manifest(&cassette_path, &scenario, &harness);
     }
 }
