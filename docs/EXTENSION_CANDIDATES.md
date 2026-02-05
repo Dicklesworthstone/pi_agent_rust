@@ -312,11 +312,110 @@ from repo names/descriptions and should be validated in follow‑up.
 }
 ```
 
+```json
+{
+  "executed_at": "2026-02-05T19:31:10Z",
+  "queries": [
+    {
+      "query": "\"pi extension\" in:name,description language:TypeScript",
+      "executed_at": "2026-02-05T19:31:10Z",
+      "limit": 50,
+      "result_count": 50,
+      "top_results": [
+        {"repo": "microsoft/azure-pipelines-extensions", "stars": 299, "forks": 426, "updated_at": "2026-01-27T14:30:57Z", "license": "mit", "url": "https://github.com/microsoft/azure-pipelines-extensions"},
+        {"repo": "tony2001/pinba_extension", "stars": 86, "forks": 24, "updated_at": "2025-08-29T13:25:10Z", "license": "lgpl-2.1", "url": "https://github.com/tony2001/pinba_extension"},
+        {"repo": "hackup/Pi1541io", "stars": 96, "forks": 20, "updated_at": "2025-12-26T05:49:21Z", "license": "cc-by-sa-4.0", "url": "https://github.com/hackup/Pi1541io"},
+        {"repo": "hashicorp/azure-pipelines-extension-terraform", "stars": 63, "forks": 23, "updated_at": "2025-01-13T21:32:26Z", "license": "mpl-2.0", "url": "https://github.com/hashicorp/azure-pipelines-extension-terraform"},
+        {"repo": "chrdavis/PIFShellExtensions", "stars": 35, "forks": 8, "updated_at": "2026-02-04T23:14:11Z", "license": "mit", "url": "https://github.com/chrdavis/PIFShellExtensions"},
+        {"repo": "microsoft/powerbi-azure-pipelines-extensions", "stars": 41, "forks": 13, "updated_at": "2025-10-30T23:48:32Z", "license": "mit", "url": "https://github.com/microsoft/powerbi-azure-pipelines-extensions"},
+        {"repo": "leognon/ClonePilotExtension", "stars": 98, "forks": 7, "updated_at": "2025-10-27T12:52:50Z", "license": "", "url": "https://github.com/leognon/ClonePilotExtension"},
+        {"repo": "winstonpuckett/WinstonPuckett.PipeExtensions", "stars": 40, "forks": 4, "updated_at": "2025-09-05T03:51:55Z", "license": "mit", "url": "https://github.com/winstonpuckett/WinstonPuckett.PipeExtensions"},
+        {"repo": "code-philia/CoEdPilot-extension", "stars": 21, "forks": 9, "updated_at": "2025-07-01T04:28:58Z", "license": "", "url": "https://github.com/code-philia/CoEdPilot-extension"},
+        {"repo": "mnholtz/pixiebrix-extension", "stars": 0, "forks": 24, "updated_at": "2021-06-24T00:54:10Z", "license": "gpl-3.0", "url": "https://github.com/mnholtz/pixiebrix-extension"}
+      ]
+    },
+    {
+      "query": "\"pi extension\" in:readme language:TypeScript",
+      "executed_at": "2026-02-05T19:31:10Z",
+      "limit": 50,
+      "result_count": 50,
+      "top_results": [
+        {"repo": "tmustier/pi-extensions", "stars": 36, "forks": 4, "updated_at": "2026-02-05T18:22:58Z", "license": "mit", "url": "https://github.com/tmustier/pi-extensions"},
+        {"repo": "mitsuhiko/agent-stuff", "stars": 911, "forks": 50, "updated_at": "2026-02-05T19:04:23Z", "license": "apache-2.0", "url": "https://github.com/mitsuhiko/agent-stuff"},
+        {"repo": "mactkg/vscode-sonic-pi", "stars": 26, "forks": 10, "updated_at": "2023-03-10T09:00:13Z", "license": "mit", "url": "https://github.com/mactkg/vscode-sonic-pi"},
+        {"repo": "qualisero/awesome-pi-agent", "stars": 49, "forks": 5, "updated_at": "2026-02-05T10:28:25Z", "license": "mit", "url": "https://github.com/qualisero/awesome-pi-agent"},
+        {"repo": "voocel/openclaw-mini", "stars": 280, "forks": 16, "updated_at": "2026-02-05T13:06:43Z", "license": "mit", "url": "https://github.com/voocel/openclaw-mini"},
+        {"repo": "aliou/pi-extensions", "stars": 21, "forks": 2, "updated_at": "2026-02-05T19:02:58Z", "license": "", "url": "https://github.com/aliou/pi-extensions"},
+        {"repo": "meesokim/spc1000", "stars": 8, "forks": 6, "updated_at": "2026-01-18T12:18:39Z", "license": "", "url": "https://github.com/meesokim/spc1000"},
+        {"repo": "nicobailon/pi-annotate", "stars": 35, "forks": 2, "updated_at": "2026-02-02T20:51:21Z", "license": "mit", "url": "https://github.com/nicobailon/pi-annotate"},
+        {"repo": "yongsukki/clickpirc", "stars": 2, "forks": 9, "updated_at": "2025-04-02T12:45:37Z", "license": "mit", "url": "https://github.com/yongsukki/clickpirc"},
+        {"repo": "nat-n/socket_control", "stars": 15, "forks": 5, "updated_at": "2024-10-20T11:59:19Z", "license": "", "url": "https://github.com/nat-n/socket_control"}
+      ]
+    },
+    {
+      "query": "\"pi agent\" \"extension\" in:readme language:TypeScript",
+      "executed_at": "2026-02-05T19:31:10Z",
+      "limit": 50,
+      "result_count": 50,
+      "top_results": [
+        {"repo": "openclaw/openclaw", "stars": 167158, "forks": 26567, "updated_at": "2026-02-05T19:30:43Z", "license": "mit", "url": "https://github.com/openclaw/openclaw"},
+        {"repo": "qualisero/awesome-pi-agent", "stars": 49, "forks": 5, "updated_at": "2026-02-05T10:28:25Z", "license": "mit", "url": "https://github.com/qualisero/awesome-pi-agent"},
+        {"repo": "nicobailon/pi-rewind-hook", "stars": 36, "forks": 3, "updated_at": "2026-02-04T15:10:39Z", "license": "", "url": "https://github.com/nicobailon/pi-rewind-hook"},
+        {"repo": "tmustier/pi-extensions", "stars": 36, "forks": 4, "updated_at": "2026-02-05T18:22:58Z", "license": "mit", "url": "https://github.com/tmustier/pi-extensions"},
+        {"repo": "Piebald-AI/splitrail", "stars": 100, "forks": 10, "updated_at": "2026-02-05T19:04:58Z", "license": "mit", "url": "https://github.com/Piebald-AI/splitrail"},
+        {"repo": "nicobailon/pi-interview-tool", "stars": 73, "forks": 7, "updated_at": "2026-02-05T17:36:33Z", "license": "", "url": "https://github.com/nicobailon/pi-interview-tool"},
+        {"repo": "dannote/dot-pi", "stars": 10, "forks": 3, "updated_at": "2026-02-04T19:37:14Z", "license": "mit", "url": "https://github.com/dannote/dot-pi"},
+        {"repo": "melihmucuk/leash", "stars": 37, "forks": 6, "updated_at": "2026-01-28T08:37:17Z", "license": "mit", "url": "https://github.com/melihmucuk/leash"},
+        {"repo": "Dicklesworthstone/pi_agent_rust", "stars": 15, "forks": 4, "updated_at": "2026-02-05T19:28:47Z", "license": "mit", "url": "https://github.com/Dicklesworthstone/pi_agent_rust"},
+        {"repo": "nicobailon/mcp-to-pi-tools", "stars": 13, "forks": 2, "updated_at": "2026-02-02T18:56:42Z", "license": "", "url": "https://github.com/nicobailon/mcp-to-pi-tools"}
+      ]
+    },
+    {
+      "query": "\"pi coding agent\" in:name,description language:TypeScript",
+      "executed_at": "2026-02-05T19:31:10Z",
+      "limit": 50,
+      "result_count": 50,
+      "top_results": [
+        {"repo": "badlogic/pi-skills", "stars": 338, "forks": 35, "updated_at": "2026-02-05T18:25:26Z", "license": "mit", "url": "https://github.com/badlogic/pi-skills"},
+        {"repo": "hjanuschka/shitty-extensions", "stars": 41, "forks": 5, "updated_at": "2026-02-05T03:14:02Z", "license": "", "url": "https://github.com/hjanuschka/shitty-extensions"},
+        {"repo": "dnouri/pi-coding-agent", "stars": 31, "forks": 6, "updated_at": "2026-02-04T21:54:26Z", "license": "gpl-3.0", "url": "https://github.com/dnouri/pi-coding-agent"},
+        {"repo": "nicobailon/pi-mcp-adapter", "stars": 45, "forks": 2, "updated_at": "2026-02-05T12:19:28Z", "license": "mit", "url": "https://github.com/nicobailon/pi-mcp-adapter"},
+        {"repo": "nicobailon/pi-review-loop", "stars": 20, "forks": 3, "updated_at": "2026-02-02T19:01:21Z", "license": "mit", "url": "https://github.com/nicobailon/pi-review-loop"},
+        {"repo": "qualisero/awesome-pi-agent", "stars": 49, "forks": 5, "updated_at": "2026-02-05T10:28:25Z", "license": "mit", "url": "https://github.com/qualisero/awesome-pi-agent"},
+        {"repo": "nicobailon/pi-powerline-footer", "stars": 14, "forks": 2, "updated_at": "2026-02-02T21:01:50Z", "license": "", "url": "https://github.com/nicobailon/pi-powerline-footer"},
+        {"repo": "dannote/dot-pi", "stars": 10, "forks": 3, "updated_at": "2026-02-04T19:37:14Z", "license": "mit", "url": "https://github.com/dannote/dot-pi"},
+        {"repo": "nicobailon/pi-interactive-shell", "stars": 109, "forks": 5, "updated_at": "2026-02-04T21:56:07Z", "license": "", "url": "https://github.com/nicobailon/pi-interactive-shell"},
+        {"repo": "nicobailon/pi-web-access", "stars": 34, "forks": 1, "updated_at": "2026-02-05T16:46:52Z", "license": "mit", "url": "https://github.com/nicobailon/pi-web-access"}
+      ]
+    },
+    {
+      "query": "\"pi-extensions\" in:name,description",
+      "executed_at": "2026-02-05T19:31:10Z",
+      "limit": 50,
+      "result_count": 50,
+      "top_results": [
+        {"repo": "microsoft/azure-pipelines-extensions", "stars": 299, "forks": 426, "updated_at": "2026-01-27T14:30:57Z", "license": "mit", "url": "https://github.com/microsoft/azure-pipelines-extensions"},
+        {"repo": "hackup/Pi1541io", "stars": 96, "forks": 20, "updated_at": "2025-12-26T05:49:21Z", "license": "cc-by-sa-4.0", "url": "https://github.com/hackup/Pi1541io"},
+        {"repo": "tmustier/pi-extensions", "stars": 36, "forks": 4, "updated_at": "2026-02-05T18:22:58Z", "license": "mit", "url": "https://github.com/tmustier/pi-extensions"},
+        {"repo": "aliou/pi-extensions", "stars": 21, "forks": 2, "updated_at": "2026-02-05T19:02:58Z", "license": "", "url": "https://github.com/aliou/pi-extensions"},
+        {"repo": "chrdavis/PIFShellExtensions", "stars": 35, "forks": 8, "updated_at": "2026-02-04T23:14:11Z", "license": "mit", "url": "https://github.com/chrdavis/PIFShellExtensions"},
+        {"repo": "nicobailon/pi-subagents", "stars": 87, "forks": 5, "updated_at": "2026-02-05T17:13:03Z", "license": "", "url": "https://github.com/nicobailon/pi-subagents"},
+        {"repo": "microsoft/powerbi-azure-pipelines-extensions", "stars": 41, "forks": 13, "updated_at": "2025-10-30T23:48:32Z", "license": "mit", "url": "https://github.com/microsoft/powerbi-azure-pipelines-extensions"},
+        {"repo": "meesokim/spc1000", "stars": 8, "forks": 6, "updated_at": "2026-01-18T12:18:39Z", "license": "", "url": "https://github.com/meesokim/spc1000"},
+        {"repo": "winstonpuckett/WinstonPuckett.PipeExtensions", "stars": 40, "forks": 4, "updated_at": "2025-09-05T03:51:55Z", "license": "mit", "url": "https://github.com/winstonpuckett/WinstonPuckett.PipeExtensions"},
+        {"repo": "asottile-archive/tox-pip-extensions", "stars": 36, "forks": 5, "updated_at": "2025-11-17T18:36:36Z", "license": "mit", "url": "https://github.com/asottile-archive/tox-pip-extensions"}
+      ]
+    }
+  ]
+}
+```
+
 Follow‑ups:
 - Resolve `NOASSERTION`/`NONE` license entries via LICENSE files or SPDX metadata.
 - Expand coverage to other high‑signal topic pages (e.g., `claude-code-mcp`, `claude-code-hooks`).
 - Several broad‑net queries returned zero results; plan to expand with code search + curated lists to reach target coverage.
 - `topic:claude-code*` queries are noisy (many non‑Pi repos); requires code‑signature validation (bd‑3l39) before acceptance.
+- Keyword-based `pi extension` / `pi-extensions` queries are **very** noisy (Azure Pipelines, Raspberry Pi, etc.); use as breadth-only and require signature validation before accepting candidates.
 
 ---
 
@@ -392,38 +491,76 @@ Executed via `gh search code` (limit=100 unless noted). Result counts:
 | `registerCommand(` | 100 |
 | `registerProvider(` | 100 |
 | `ExtensionAPI` | 100 |
+| `registerFlag(` | 100 |
+| `registerShortcut(` | 100 |
+| `registerMessageRenderer(` | 100 |
 | `.pi/agent/extensions` | 9 |
 | `"pi-extensions" "ExtensionAPI"` | 0 |
+| `pi.registerTool(` | rate-limited (403) |
+| `pi.registerCommand(` | rate-limited (403) |
+| `ExtensionAPI registerTool(` | rate-limited (403) |
 
-Validation pass (21 unique entrypoints; export‑default + registration/event hook observed):
+Validation pass (51 unique entrypoints; export‑default + registration/event hook observed):
 
 | Repo | Entrypoint | Evidence |
 |---|---|---|
-| `openclaw/openclaw` | `.pi/extensions/redraws.ts` | `export default` + `registerCommand("tui")` |
-| `mitsuhiko/agent-stuff` | `pi-extensions/loop.ts` | `export default` + `registerTool(` |
-| `joelazar/dotfiles` | `dot_pi/agent/extensions/qna.ts` | `export default` + `registerCommand("qna")` |
-| `w-winter/dot314` | `extensions/mac-system-theme.ts` | `export default` + `pi.on("session_start")` |
-| `davidgasquez/dotfiles` | `agents/pi/extensions/branch-term.ts` | `export default` + `registerFlag(` |
-| `pasky/pi-amplike` | `extensions/handoff.ts` | `export default` + `registerCommand("handoff")` |
-| `mikeyobrien/rho` | `extensions/vault.ts` | `export default` + `pi.on("session_start")` |
-| `mikeyobrien/rho` | `extensions/brain.ts` | `export default` + `pi.on("session_start")` |
-| `hjanuschka/shitty-extensions` | `extensions/flicker-corp.ts` | `export default` + `registerCommand("flicker-corp")` |
-| `hjanuschka/shitty-extensions` | `extensions/status-widget.ts` | `export default` + `pi.on("session_start")` |
-| `hjanuschka/shitty-extensions` | `extensions/memory-mode.ts` | `export default` + `registerCommand("mem")` |
-| `hjanuschka/shitty-extensions` | `extensions/plan-mode.ts` | `export default` + `registerFlag("plan")` |
-| `hjanuschka/shitty-extensions` | `extensions/speedreading.ts` | `export default` + `registerCommand("speedread")` |
-| `Mic92/dotfiles` | `home/.pi/agent/extensions/direnv.ts` | `export default` + `pi.on("session_start")` |
-| `Mic92/dotfiles` | `home/.pi/agent/extensions/custom-footer.ts` | `export default` + `pi.on("session_start")` |
-| `leiserfg/nix-config` | `home/leiserfg/pi-extensions/fzf.ts` | `export default` + `registerShortcut("ctrl+f")` |
-| `leiserfg/nix-config` | `home/leiserfg/pi-extensions/notify.ts` | `export default` + `pi.on("agent_end")` |
-| `zenobi-us/dotfiles` | `devtools/files/pi/agent/extensions/lsp/lsp.ts` | `export default` + `pi.on("session_start")` |
-| `nexxeln/dots` | `config/pi/agent/extensions/review.ts` | `export default` + `registerCommand("review")` |
-| `richardgill/nix` | `out-of-store-config/ai-agents/pi/extensions/process-info.ts` | `export default` + `pi.on("session_start")` |
-| `default-anton/dotfiles` | `pi/agent/extensions/inject-context.impl.mjs` | `export default` + `pi.on("before_agent_start")` |
+| `openclaw/openclaw` | `.pi/extensions/redraws.ts` | `export default` + `registerCommand(...)` |
+| `mitsuhiko/agent-stuff` | `pi-extensions/loop.ts` | `export default` + `registerTool(...)` |
+| `joelazar/dotfiles` | `dot_pi/agent/extensions/qna.ts` | `export default` + `registerCommand(...)` |
+| `w-winter/dot314` | `extensions/mac-system-theme.ts` | `export default` + `pi.on(...)` |
+| `davidgasquez/dotfiles` | `agents/pi/extensions/branch-term.ts` | `export default` + `registerFlag(...)` |
+| `pasky/pi-amplike` | `extensions/handoff.ts` | `export default` + `registerCommand(...)` |
+| `mikeyobrien/rho` | `extensions/vault.ts` | `export default` + `pi.on(...)` |
+| `mikeyobrien/rho` | `extensions/brain.ts` | `export default` + `pi.on(...)` |
+| `hjanuschka/shitty-extensions` | `extensions/flicker-corp.ts` | `export default` + `registerCommand(...)` |
+| `hjanuschka/shitty-extensions` | `extensions/status-widget.ts` | `export default` + `pi.on(...)` |
+| `hjanuschka/shitty-extensions` | `extensions/memory-mode.ts` | `export default` + `registerCommand(...)` |
+| `hjanuschka/shitty-extensions` | `extensions/plan-mode.ts` | `export default` + `registerFlag(...)` |
+| `hjanuschka/shitty-extensions` | `extensions/speedreading.ts` | `export default` + `registerCommand(...)` |
+| `Mic92/dotfiles` | `home/.pi/agent/extensions/direnv.ts` | `export default` + `pi.on(...)` |
+| `Mic92/dotfiles` | `home/.pi/agent/extensions/custom-footer.ts` | `export default` + `pi.on(...)` |
+| `leiserfg/nix-config` | `home/leiserfg/pi-extensions/fzf.ts` | `export default` + `registerShortcut(...)` |
+| `leiserfg/nix-config` | `home/leiserfg/pi-extensions/notify.ts` | `export default` + `pi.on(...)` |
+| `zenobi-us/dotfiles` | `devtools/files/pi/agent/extensions/lsp/lsp.ts` | `export default` + `pi.on(...)` |
+| `nexxeln/dots` | `config/pi/agent/extensions/review.ts` | `export default` + `registerCommand(...)` |
+| `richardgill/nix` | `out-of-store-config/ai-agents/pi/extensions/process-info.ts` | `export default` + `pi.on(...)` |
+| `default-anton/dotfiles` | `pi/agent/extensions/inject-context.impl.mjs` | `export default` + `pi.on(...)` |
+| `Dicklesworthstone/pi_agent_rust` | `tests/ext_conformance/artifacts/community/prateekmedia-lsp/lsp.ts` | `export default` + `registerMessageRenderer(...)` |
+| `Dicklesworthstone/pi_agent_rust` | `tests/ext_conformance/artifacts/npm/lsp-pi/lsp.ts` | `export default` + `registerMessageRenderer(...)` |
+| `Dicklesworthstone/pi_agent_rust` | `tests/ext_conformance/artifacts/npm/pi-mermaid/index.ts` | `export default` + `registerMessageRenderer(...)` |
+| `Dwsy/agent` | `extensions/ralph/index.ts` | `export default` + `registerFlag(...)` |
+| `Graffioh/dotfiles` | `pi/agent/extensions/pi-web-search/index.ts` | `export default` + `pi.on(...)` |
+| `badlogic/pi-mono` | `packages/coding-agent/examples/extensions/message-renderer.ts` | `export default` + `registerMessageRenderer(...)` |
+| `hjanuschka/pi-qmd` | `extensions/qmd.ts` | `export default` + `registerTool(...)` |
+| `hjanuschka/shitty-extensions` | `extensions/oracle.ts` | `export default` + `registerCommand(...)` |
+| `kcosr/pi-extensions` | `skill-picker/index.ts` | `export default` + `registerMessageRenderer(...)` |
+| `mitsuhiko/agent-stuff` | `pi-extensions/control.ts` | `export default` + `registerFlag(...)` |
+| `mrndstvndv/nixdots` | `modules/pi/package/extensions/lsp/lsp.ts` | `export default` + `registerMessageRenderer(...)` |
+| `nicobailon/pi-skill-palette` | `index.ts` | `export default` + `registerMessageRenderer(...)` |
+| `prateekmedia/pi-hooks` | `lsp/lsp.ts` | `export default` + `registerMessageRenderer(...)` |
+| `w-winter/dot314` | `extensions/oracle.ts` | `export default` + `registerCommand(...)` |
+| `w-winter/dot314` | `extensions/skill-palette/index.ts` | `export default` + `registerMessageRenderer(...)` |
+| `deybhayden/dotfiles` | `.pi/agent/extensions/answer.ts` | `export default` + `registerCommand(...)` |
+| `deybhayden/dotfiles` | `.pi/agent/extensions/github.ts` | `export default` + `registerTool(...)` |
+| `deybhayden/dotfiles` | `.pi/agent/extensions/uv.ts` | `export default` + `pi.on(...)` |
+| `joshuadavidthomas/agentkit` | `runtimes/pi/extensions/notify.ts` | `export default` + `pi.on(...)` |
+| `l-lin/dotfiles` | `home-manager/modules/share/ai/pi/.pi/agent/extensions/handoff.ts` | `export default` + `registerCommand(...)` |
+| `leiserfg/nix-config` | `home/leiserfg/pi-extensions/loop.ts` | `export default` + `registerTool(...)` |
+| `mikeyobrien/rho` | `extensions/rho.ts` | `export default` + `pi.on(...)` |
+| `nicobailon/pi-coordination` | `scout.ts` | `export default` + `registerTool(...)` |
+| `pasky/pi-amplike` | `extensions/session-query.ts` | `export default` + `registerTool(...)` |
+| `tmustier/pi-extensions` | `arcade/tetris.ts` | `export default` + `registerCommand(...)` |
+| `tmustier/pi-extensions` | `tab-status/tab-status.ts` | `export default` + `pi.on(...)` |
+| `vrslev/dotfiles` | `home/.pi/agent/extensions/todo.ts` | `export default` + `pi.on(...)` |
+| `zanieb/pi-plugins` | `extensions/rename.ts` | `export default` + `registerCommand(...)` |
+| `tmustier/pi-extensions` | `arcade/mario-not/mario-not.ts` | `export default` + `registerCommand(...)` |
+| `tmustier/pi-extensions` | `arcade/picman.ts` | `export default` + `registerCommand(...)` |
 
 Notes / next pass:
-- 6 queries hit the 100‑result cap; additional candidates remain unreviewed.
-- Current validated count: **21 / 50** target. Next pass should validate remaining candidates from the queued list and add code‑search queries for `registerFlag(`, `registerShortcut(`, `registerMessageRenderer(`, plus `pi.registerTool(` with TS/JS language filters.
+- 9 queries hit the 100‑result cap; additional candidates remain unreviewed.
+- 3 queries were rate‑limited by GitHub Search API (see table); rerun after limit reset.
+- 4 entries are already vendored artifacts or official examples (pi_agent_rust artifacts x3 + pi‑mono message‑renderer) and were included for completeness.
+- Current validated count: **51 / 50** target. Next pass should validate remaining candidates from the queued list and add code‑search queries for `registerFlag(`, `registerShortcut(`, `registerMessageRenderer(`, plus `pi.registerTool(` with TS/JS language filters.
 
 ### D) npm discovery (distribution layer)
 
