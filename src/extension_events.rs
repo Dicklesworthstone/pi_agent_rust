@@ -141,6 +141,120 @@ pub struct InputEventResult {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub enum InputEventOutcome {
+    Continue {
+        text: String,
+        images: Vec<ImageContent>,
+    },
+    Block {
+        reason: Option<String>,
+    },
+}
+
+#[must_use]
+pub fn apply_input_event_response(
+    response: Option<Value>,
+    original_text: String,
+    original_images: Vec<ImageContent>,
+) -> InputEventOutcome {
+    let Some(response) = response else {
+        return InputEventOutcome::Continue {
+            text: original_text,
+            images: original_images,
+        };
+    };
+
+    if response.is_null() {
+        return InputEventOutcome::Continue {
+            text: original_text,
+            images: original_images,
+        };
+    }
+
+    if let Some(obj) = response.as_object() {
+        let reason = obj
+            .get("reason")
+            .or_else(|| obj.get("message"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        if let Some(action) = obj
+            .get("action")
+            .and_then(Value::as_str)
+            .map(str::to_ascii_lowercase)
+        {
+            match action.as_str() {
+                "handled" | "block" | "blocked" => {
+                    return InputEventOutcome::Block { reason };
+                }
+                "transform" => {
+                    let text = obj
+                        .get("text")
+                        .or_else(|| obj.get("content"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .unwrap_or(original_text);
+                    let images = parse_input_event_images(obj, original_images);
+                    return InputEventOutcome::Continue { text, images };
+                }
+                "continue" => {
+                    return InputEventOutcome::Continue {
+                        text: original_text,
+                        images: original_images,
+                    };
+                }
+                _ => {}
+            }
+        }
+
+        if obj.get("block").and_then(Value::as_bool) == Some(true) {
+            return InputEventOutcome::Block { reason };
+        }
+
+        let text_override = obj
+            .get("text")
+            .or_else(|| obj.get("content"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let images_override = parse_input_event_images_opt(obj);
+
+        if text_override.is_some() || images_override.is_some() {
+            return InputEventOutcome::Continue {
+                text: text_override.unwrap_or(original_text),
+                images: images_override.unwrap_or(original_images),
+            };
+        }
+    }
+
+    if let Some(text) = response.as_str() {
+        return InputEventOutcome::Continue {
+            text: text.to_string(),
+            images: original_images,
+        };
+    }
+
+    InputEventOutcome::Continue {
+        text: original_text,
+        images: original_images,
+    }
+}
+
+fn parse_input_event_images_opt(obj: &serde_json::Map<String, Value>) -> Option<Vec<ImageContent>> {
+    let value = obj.get("images").or_else(|| obj.get("attachments"))?;
+    if value.is_null() {
+        return Some(Vec::new());
+    }
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn parse_input_event_images(
+    obj: &serde_json::Map<String, Value>,
+    fallback: Vec<ImageContent>,
+) -> Vec<ImageContent> {
+    parse_input_event_images_opt(obj).unwrap_or(fallback)
+}
+
 fn json_to_value<T: Serialize>(value: &T) -> Result<Value> {
     serde_json::to_value(value).map_err(|err| Error::Json(Box::new(err)))
 }
