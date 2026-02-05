@@ -640,6 +640,33 @@ mod tests {
     }
 
     #[test]
+    fn oauth_refresh_invalid_matches_after_redaction() {
+        let cassette_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/vcr/oauth_refresh_invalid.json");
+        let cassette = load_cassette(&cassette_path).expect("load cassette");
+        let recorded = &cassette.interactions.first().expect("interaction").request;
+        let recorded_body = recorded.body.as_ref().expect("recorded body");
+        let client_id = recorded_body
+            .get("client_id")
+            .and_then(serde_json::Value::as_str)
+            .expect("client_id string");
+
+        let incoming = RecordedRequest {
+            method: "POST".to_string(),
+            url: recorded.url.clone(),
+            headers: Vec::new(),
+            body: Some(serde_json::json!({
+                "grant_type": "refresh_token",
+                "client_id": client_id,
+                "refresh_token": "refresh-invalid",
+            })),
+            body_text: None,
+        };
+
+        assert!(request_matches(recorded, &incoming));
+    }
+
+    #[test]
     fn redacts_sensitive_headers_and_body_fields() {
         let mut cassette = Cassette {
             version: CASSETTE_VERSION.to_string(),
