@@ -854,12 +854,28 @@ fn e2e_anthropic_error_scenarios_comprehensive() {
         .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
 
     let error_scenarios: Vec<(&str, u16, &str)> = vec![
-        ("anthropic_auth_failure_401", 401, "Trigger an auth failure."),
+        (
+            "anthropic_auth_failure_401",
+            401,
+            "Trigger an auth failure.",
+        ),
         ("anthropic_forbidden_403", 403, "Trigger a forbidden error."),
-        ("anthropic_bad_request_400", 400, "Trigger a bad request error."),
+        (
+            "anthropic_bad_request_400",
+            400,
+            "Trigger a bad request error.",
+        ),
         ("anthropic_server_error_500", 500, "Trigger a server error."),
-        ("anthropic_rate_limit_429", 429, "Trigger a rate limit error."),
-        ("anthropic_overloaded_529", 529, "Trigger an overloaded error."),
+        (
+            "anthropic_rate_limit_429",
+            429,
+            "Trigger a rate limit error.",
+        ),
+        (
+            "anthropic_overloaded_529",
+            529,
+            "Trigger an overloaded error.",
+        ),
     ];
 
     for (cassette, expected_status, msg) in &error_scenarios {

@@ -5021,7 +5021,10 @@ mod tests {
                 .await
                 .expect("eval");
 
-            assert_eq!(get_global_json(&runtime, "done").await, serde_json::Value::Bool(true));
+            assert_eq!(
+                get_global_json(&runtime, "done").await,
+                serde_json::Value::Bool(true)
+            );
             assert_eq!(
                 get_global_json(&runtime, "seen").await,
                 serde_json::json!([{ "n": 1 }])
@@ -5059,7 +5062,10 @@ mod tests {
                 .await
                 .expect("eval");
 
-            assert_eq!(get_global_json(&runtime, "done").await, serde_json::Value::Bool(true));
+            assert_eq!(
+                get_global_json(&runtime, "done").await,
+                serde_json::Value::Bool(true)
+            );
             assert_eq!(
                 get_global_json(&runtime, "seen").await,
                 serde_json::json!([{ "hello": "world" }])

@@ -3976,10 +3976,7 @@ impl ExtensionSession for InteractiveExtensionSession {
         let Ok(guard) = self.session.lock(&cx).await else {
             return (None, None);
         };
-        (
-            guard.header.provider.clone(),
-            guard.header.model_id.clone(),
-        )
+        (guard.header.provider.clone(), guard.header.model_id.clone())
     }
 
     async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {

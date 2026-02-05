@@ -944,8 +944,14 @@ mod tests {
 
         async fn get_model(&self) -> (Option<String>, Option<String>) {
             let state = self.state.lock().unwrap();
-            let provider = state.get("provider").and_then(Value::as_str).map(String::from);
-            let model_id = state.get("modelId").and_then(Value::as_str).map(String::from);
+            let provider = state
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let model_id = state
+                .get("modelId")
+                .and_then(Value::as_str)
+                .map(String::from);
             drop(state);
             (provider, model_id)
         }
@@ -961,7 +967,10 @@ mod tests {
 
         async fn get_thinking_level(&self) -> Option<String> {
             let state = self.state.lock().unwrap();
-            let level = state.get("thinkingLevel").and_then(Value::as_str).map(String::from);
+            let level = state
+                .get("thinkingLevel")
+                .and_then(Value::as_str)
+                .map(String::from);
             drop(state);
             level
         }

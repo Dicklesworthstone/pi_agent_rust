@@ -1618,12 +1618,7 @@ fn e2e_cli_print_mode_mock_sse_roundtrip() {
     );
 
     // Verify no session files created in print mode (even on success).
-    let sessions_dir = PathBuf::from(
-        harness
-            .env
-            .get("PI_SESSIONS_DIR")
-            .expect("PI_SESSIONS_DIR"),
-    );
+    let sessions_dir = PathBuf::from(harness.env.get("PI_SESSIONS_DIR").expect("PI_SESSIONS_DIR"));
     let jsonl_count = count_jsonl_files(&sessions_dir);
     harness
         .harness
@@ -1676,17 +1671,15 @@ fn e2e_cli_print_mode_stdin_sends_to_provider() {
     );
 
     // Verify no session files created.
-    let sessions_dir = PathBuf::from(
-        harness
-            .env
-            .get("PI_SESSIONS_DIR")
-            .expect("PI_SESSIONS_DIR"),
-    );
+    let sessions_dir = PathBuf::from(harness.env.get("PI_SESSIONS_DIR").expect("PI_SESSIONS_DIR"));
     let jsonl_count = count_jsonl_files(&sessions_dir);
     harness
         .harness
         .assert_log("assert no session files from stdin pipe");
-    assert_eq!(jsonl_count, 0, "stdin pipe print mode should not create session files");
+    assert_eq!(
+        jsonl_count, 0,
+        "stdin pipe print mode should not create session files"
+    );
 }
 
 #[test]

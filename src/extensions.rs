@@ -1553,6 +1553,8 @@ pub struct RegisterPayload {
     #[serde(default)]
     pub slash_commands: Vec<Value>,
     #[serde(default)]
+    pub shortcuts: Vec<Value>,
+    #[serde(default)]
     pub event_hooks: Vec<String>,
 }
 
@@ -4452,6 +4454,12 @@ enum JsRuntimeCommand {
         timeout_ms: u64,
         reply: oneshot::Sender<Result<Value>>,
     },
+    ExecuteShortcut {
+        key_id: String,
+        ctx_payload: Value,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<Value>>,
+    },
 }
 
 #[derive(Clone)]
@@ -4558,6 +4566,22 @@ impl JsExtensionRuntimeHandle {
                                 &host,
                                 &command_name,
                                 &args,
+                                ctx_payload,
+                                timeout_ms,
+                            )
+                            .await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::ExecuteShortcut {
+                            key_id,
+                            ctx_payload,
+                            timeout_ms,
+                            reply,
+                        } => {
+                            let result = execute_extension_shortcut(
+                                &js_runtime,
+                                &host,
+                                &key_id,
                                 ctx_payload,
                                 timeout_ms,
                             )
@@ -4702,6 +4726,32 @@ impl JsExtensionRuntimeHandle {
                 JsRuntimeCommand::ExecuteCommand {
                     command_name,
                     args,
+                    ctx_payload,
+                    timeout_ms,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn execute_shortcut(
+        &self,
+        key_id: String,
+        ctx_payload: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ExecuteShortcut {
+                    key_id,
                     ctx_payload,
                     timeout_ms,
                     reply: reply_tx,
@@ -5772,9 +5822,7 @@ async fn dispatch_hostcall_events(
                     if let Err(err) = session.set_thinking_level(lvl.clone()).await {
                         return HostcallOutcome::Error {
                             code: "io".to_string(),
-                            message: format!(
-                                "setThinkingLevel: session update failed: {err}"
-                            ),
+                            message: format!("setThinkingLevel: session update failed: {err}"),
                         };
                     }
                 }
