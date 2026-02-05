@@ -2165,7 +2165,7 @@ fn queued_message_preview(text: &str, max_len: usize) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
     agent: Agent,
-    session: Session,
+    session: Arc<Mutex<Session>>,
     config: Config,
     model_entry: ModelEntry,
     model_scope: Vec<ModelEntry>,
@@ -3942,7 +3942,7 @@ impl PiApp {
     #[allow(clippy::too_many_lines)]
     pub fn new(
         agent: Agent,
-        session: Session,
+        session: Arc<Mutex<Session>>,
         config: Config,
         resources: ResourceLoader,
         resource_cli: ResourceCliOptions,
@@ -3989,7 +3989,10 @@ impl PiApp {
         conversation_viewport.mouse_wheel_enabled = true;
         conversation_viewport.mouse_wheel_delta = 3;
 
-        let (messages, total_usage) = load_conversation_from_session(&session);
+        let (messages, total_usage) = {
+            let guard = session.try_lock().expect("session lock unavailable during PiApp init");
+            load_conversation_from_session(&guard)
+        };
 
         let model = format!(
             "{}/{}",
