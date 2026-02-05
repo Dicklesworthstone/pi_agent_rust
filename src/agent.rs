@@ -1726,6 +1726,102 @@ mod extensions_integration_tests {
         }
     }
 
+    #[derive(Debug)]
+    struct ToolUseProvider {
+        stream_calls: AtomicUsize,
+    }
+
+    impl ToolUseProvider {
+        const fn new() -> Self {
+            Self {
+                stream_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn assistant_message(&self, stop_reason: StopReason, content: Vec<ContentBlock>) -> AssistantMessage {
+            AssistantMessage {
+                content,
+                api: self.api().to_string(),
+                provider: self.name().to_string(),
+                model: self.model_id().to_string(),
+                usage: Usage::default(),
+                stop_reason,
+                error_message: None,
+                timestamp: 0,
+            }
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for ToolUseProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call_index = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+
+            let partial = self.assistant_message(StopReason::Stop, Vec::new());
+
+            let (reason, message) = if call_index == 0 {
+                let tool_calls = vec![
+                    ToolCall {
+                        id: "call-1".to_string(),
+                        name: "count_tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                    ToolCall {
+                        id: "call-2".to_string(),
+                        name: "count_tool".to_string(),
+                        arguments: json!({}),
+                        thought_signature: None,
+                    },
+                ];
+
+                (
+                    StopReason::ToolUse,
+                    self.assistant_message(
+                        StopReason::ToolUse,
+                        tool_calls
+                            .into_iter()
+                            .map(ContentBlock::ToolCall)
+                            .collect::<Vec<_>>(),
+                    ),
+                )
+            } else {
+                (
+                    StopReason::Stop,
+                    self.assistant_message(
+                        StopReason::Stop,
+                        vec![ContentBlock::Text(TextContent::new("done"))],
+                    ),
+                )
+            };
+
+            let events = vec![
+                Ok(StreamEvent::Start { partial }),
+                Ok(StreamEvent::Done { reason, message }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
     #[test]
     fn agent_session_enable_extensions_registers_extension_tools() {
         let runtime = RuntimeBuilder::current_thread()
@@ -1797,6 +1893,190 @@ mod extensions_integration_tests {
                 details.get("from").and_then(serde_json::Value::as_str),
                 Some("extension")
             );
+        });
+    }
+
+    #[test]
+    fn extension_send_message_persists_custom_message_entry_when_idle() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "emit_message",
+                    label: "emit_message",
+                    description: "emit a custom message",
+                    parameters: { type: "object" },
+                    execute: async () => {
+                      pi.sendMessage({
+                        customType: "note",
+                        content: "hello",
+                        display: true,
+                        details: { from: "test" }
+                      }, {});
+                      return { content: [{ type: "text", text: "ok" }], isError: false };
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(agent, Arc::clone(&session), false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool = agent_session
+                .agent
+                .tools
+                .get("emit_message")
+                .expect("emit_message registered");
+
+            let _ = tool
+                .execute("call-1", json!({}), None)
+                .await
+                .expect("execute tool");
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session_guard = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session");
+            let messages = session_guard.to_messages_for_current_path();
+
+            assert!(
+                messages.iter().any(|msg| {
+                    matches!(
+                        msg,
+                        Message::Custom(CustomMessage { custom_type, content, display, details, .. })
+                            if custom_type == "note"
+                                && content == "hello"
+                                && *display
+                                && details.as_ref().and_then(|v| v.get("from").and_then(Value::as_str)) == Some("test")
+                    )
+                }),
+                "expected custom message to be persisted, got {messages:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn send_user_message_steer_skips_remaining_tools() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  let sent = false;
+                  pi.on("tool_call", async (event) => {
+                    if (sent) return {};
+                    if (event && event.toolName === "count_tool") {
+                      sent = true;
+                      await pi.events("sendUserMessage", {
+                        text: "steer-now",
+                        options: { deliverAs: "steer" }
+                      });
+                    }
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(ToolUseProvider::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let _ = agent_session
+                .run_text("go".to_string(), |_| {})
+                .await
+                .expect("run_text");
+
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn send_user_message_follow_up_does_not_skip_tools() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  let sent = false;
+                  pi.on("tool_call", async (event) => {
+                    if (sent) return {};
+                    if (event && event.toolName === "count_tool") {
+                      sent = true;
+                      await pi.events("sendUserMessage", {
+                        text: "follow-up",
+                        options: { deliverAs: "followUp" }
+                      });
+                    }
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(ToolUseProvider::new());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let _ = agent_session
+                .run_text("go".to_string(), |_| {})
+                .await
+                .expect("run_text");
+
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
         });
     }
 

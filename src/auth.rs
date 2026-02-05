@@ -535,7 +535,10 @@ fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
 async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
     let start = Instant::now();
     loop {
-        if matches!(FileExt::try_lock_exclusive(&file), Ok(true)) {
+        let lock_result = FileExt::try_lock_exclusive(&file);
+        eprintln!("[dbg] lock_file_async: try_lock_exclusive result = {:?}", lock_result);
+        if matches!(lock_result, Ok(true)) {
+            eprintln!("[dbg] lock_file_async: lock acquired!");
             return Ok(LockedFile { file });
         }
 
@@ -543,7 +546,9 @@ async fn lock_file_async(file: File, timeout: Duration) -> Result<LockedFile> {
             return Err(Error::auth("Timed out waiting for auth lock".to_string()));
         }
 
+        eprintln!("[dbg] lock_file_async: sleeping 50ms before retry...");
         asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50)).await;
+        eprintln!("[dbg] lock_file_async: sleep done");
     }
 }
 

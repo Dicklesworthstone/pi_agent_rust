@@ -3459,6 +3459,7 @@ struct InteractiveExtensionHostActions {
 }
 
 impl InteractiveExtensionHostActions {
+    #[allow(clippy::unnecessary_wraps)]
     fn queue_custom_message(
         &self,
         deliver_as: Option<ExtensionDeliverAs>,
