@@ -1429,7 +1429,34 @@ export class Input {
 }
 
 export const Key = {
-  ctrlAlt: (key) => ({ kind: "ctrlAlt", key: String(key) }),
+  // Special keys
+  escape: "escape",
+  esc: "esc",
+  enter: "enter",
+  tab: "tab",
+  space: "space",
+  backspace: "backspace",
+  delete: "delete",
+  home: "home",
+  end: "end",
+  pageUp: "pageUp",
+  pageDown: "pageDown",
+  up: "up",
+  down: "down",
+  left: "left",
+  right: "right",
+  // Single modifiers
+  ctrl: (key) => `ctrl+${key}`,
+  shift: (key) => `shift+${key}`,
+  alt: (key) => `alt+${key}`,
+  // Combined modifiers
+  ctrlShift: (key) => `ctrl+shift+${key}`,
+  shiftCtrl: (key) => `shift+ctrl+${key}`,
+  ctrlAlt: (key) => `ctrl+alt+${key}`,
+  altCtrl: (key) => `alt+ctrl+${key}`,
+  shiftAlt: (key) => `shift+alt+${key}`,
+  altShift: (key) => `alt+shift+${key}`,
+  ctrlAltShift: (key) => `ctrl+alt+shift+${key}`,
 };
 
 export class DynamicBorder {
@@ -3452,6 +3479,37 @@ async function __pi_provider_stream_simple_cancel(stream_id) {
 
 const __pi_reserved_keys = new Set(['ctrl+c', 'ctrl+d', 'ctrl+l', 'ctrl+z']);
 
+function __pi_key_to_string(key) {
+    // Convert Key object from @mariozechner/pi-tui to string format
+    if (typeof key === 'string') {
+        return key.toLowerCase();
+    }
+    if (key && typeof key === 'object') {
+        const kind = key.kind;
+        const k = key.key || '';
+        if (kind === 'ctrlAlt') {
+            return 'ctrl+alt+' + k.toLowerCase();
+        }
+        if (kind === 'ctrlShift') {
+            return 'ctrl+shift+' + k.toLowerCase();
+        }
+        if (kind === 'ctrl') {
+            return 'ctrl+' + k.toLowerCase();
+        }
+        if (kind === 'alt') {
+            return 'alt+' + k.toLowerCase();
+        }
+        if (kind === 'shift') {
+            return 'shift+' + k.toLowerCase();
+        }
+        // Fallback for unknown object format
+        if (k) {
+            return k.toLowerCase();
+        }
+    }
+    return '<unknown>';
+}
+
 function __pi_register_shortcut(key, spec) {
     const ext = __pi_current_extension_or_throw();
     if (!spec || typeof spec !== 'object') {
@@ -3461,7 +3519,7 @@ function __pi_register_shortcut(key, spec) {
         throw new Error('registerShortcut: spec.handler must be a function');
     }
 
-    const keyId = typeof key === 'string' ? key.toLowerCase() : JSON.stringify(key ?? null);
+    const keyId = __pi_key_to_string(key);
     if (__pi_reserved_keys.has(keyId)) {
         throw new Error('registerShortcut: key ' + keyId + ' is reserved and cannot be overridden');
     }
@@ -3472,7 +3530,7 @@ function __pi_register_shortcut(key, spec) {
         description: spec.description ? String(spec.description) : '',
         handler: spec.handler,
         extensionId: ext.id,
-        spec: { key: key, key_id: keyId, description: spec.description ? String(spec.description) : '' },
+        spec: { shortcut: keyId, key: key, key_id: keyId, description: spec.description ? String(spec.description) : '' },
     };
     ext.shortcuts.set(keyId, record);
     __pi_shortcut_index.set(keyId, record);
