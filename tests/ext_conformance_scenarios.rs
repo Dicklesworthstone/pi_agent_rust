@@ -15,11 +15,13 @@ use pi::extensions_js::PiJsRuntimeConfig;
 use pi::tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -1502,6 +1504,557 @@ fn smoke_runtime_suite() {
                 r.scenario_id,
                 r.extension_id,
                 r.runtime_tier,
+                r.diffs.join("; ")
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+// ─── Parity Runner: TS vs Rust (bd-vmm) ────────────────────────────────────
+
+fn ts_scenario_script() -> PathBuf {
+    project_root().join("tests/ext_conformance/ts_harness/run_scenario.ts")
+}
+
+fn ts_default_mock_spec() -> PathBuf {
+    project_root().join("tests/ext_conformance/mock_specs/mock_spec_default.json")
+}
+
+fn pi_mono_root() -> PathBuf {
+    project_root().join("legacy_pi_mono_code/pi-mono")
+}
+
+fn pi_mono_node_modules() -> PathBuf {
+    pi_mono_root().join("node_modules")
+}
+
+fn pi_mono_packages() -> PathBuf {
+    pi_mono_root().join("packages")
+}
+
+const fn bun_path() -> &'static str {
+    "/home/ubuntu/.bun/bin/bun"
+}
+
+fn ts_oracle_timeout() -> Duration {
+    std::env::var("PI_TS_ORACLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(Duration::from_secs(30), Duration::from_secs)
+}
+
+fn ts_oracle_node_path() -> PathBuf {
+    let base = PathBuf::from(format!(
+        "/tmp/pi_agent_rust_ts_parity_node_path-{}",
+        std::process::id()
+    ));
+    let scope_dir = base.join("@mariozechner");
+    let _ = fs::create_dir_all(&scope_dir);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let packages_dir = pi_mono_packages();
+        let pairs = [
+            ("pi-coding-agent", "coding-agent"),
+            ("pi-tui", "tui"),
+            ("pi-ai", "ai"),
+        ];
+        for (link_name, pkg_name) in &pairs {
+            let link = scope_dir.join(link_name);
+            if !link.exists() {
+                let _ = symlink(packages_dir.join(pkg_name), &link);
+            }
+        }
+    }
+
+    base
+}
+
+/// Run the TS scenario oracle on an extension with a given scenario.
+#[allow(clippy::too_many_lines)]
+fn run_ts_scenario(extension_path: &Path, scenario: &Scenario) -> Result<Value, String> {
+    let settings = deterministic_settings_for(extension_path);
+    ensure_deterministic_dirs(&settings);
+
+    let node_path_base = ts_oracle_node_path();
+    let node_path: Cow<'_, str> = match std::env::var("NODE_PATH") {
+        Ok(existing) if !existing.trim().is_empty() => Cow::Owned(format!(
+            "{}:{}:{}",
+            node_path_base.display(),
+            pi_mono_node_modules().display(),
+            existing
+        )),
+        _ => Cow::Owned(format!(
+            "{}:{}",
+            node_path_base.display(),
+            pi_mono_node_modules().display()
+        )),
+    };
+
+    // Build scenario JSON for stdin
+    let scenario_input = serde_json::json!({
+        "kind": scenario.kind,
+        "tool_name": scenario.tool_name,
+        "command_name": scenario.command_name,
+        "event_name": scenario.event_name,
+        "input": scenario.input,
+    });
+    let stdin_data =
+        serde_json::to_string(&scenario_input).map_err(|e| format!("serialize scenario: {e}"))?;
+
+    let mut cmd = Command::new(bun_path());
+    cmd.arg("run")
+        .arg(ts_scenario_script())
+        .arg(extension_path)
+        .arg(ts_default_mock_spec())
+        .current_dir(pi_mono_root())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("NODE_PATH", node_path.as_ref())
+        .env("PI_DETERMINISTIC_TIME_MS", &settings.time_ms)
+        .env("PI_DETERMINISTIC_TIME_STEP_MS", &settings.time_step_ms)
+        .env("PI_DETERMINISTIC_CWD", &settings.cwd)
+        .env("PI_DETERMINISTIC_HOME", &settings.home);
+    if let Some(random_value) = settings.random_value.as_deref() {
+        cmd.env("PI_DETERMINISTIC_RANDOM", random_value);
+    } else {
+        cmd.env("PI_DETERMINISTIC_RANDOM_SEED", &settings.random_seed);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to spawn TS scenario runner: {err}"))?;
+
+    // Write scenario JSON to stdin
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        let _ = stdin.write_all(stdin_data.as_bytes());
+    }
+
+    let timeout = ts_oracle_timeout();
+    let start = Instant::now();
+    loop {
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            return Err(format!("TS scenario timeout after {}s", timeout.as_secs()));
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                return Err(format!("TS scenario wait error: {err}"));
+            }
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("failed to capture TS scenario output: {err}"))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() && stdout.trim().is_empty() {
+        return Err(format!("TS scenario runner crashed:\nstderr: {stderr}"));
+    }
+
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "TS scenario returned empty stdout:\nstderr: {stderr}"
+        ));
+    }
+
+    serde_json::from_str(trimmed)
+        .or_else(|_| {
+            trimmed
+                .find('{')
+                .map(|idx| &trimmed[idx..])
+                .ok_or_else(|| "no JSON object found".to_string())
+                .and_then(|json_str| serde_json::from_str(json_str).map_err(|e| e.to_string()))
+        })
+        .map_err(|e| format!("TS scenario returned invalid JSON:\n  error: {e}\n  stdout: {stdout}\n  stderr: {stderr}"))
+}
+
+/// Normalize a result value for comparison by removing timing-dependent fields.
+fn normalize_result(val: &Value) -> Value {
+    match val {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                // Skip timing fields
+                if k == "load_time_ms" || k == "exec_time_ms" || k == "duration_ms" {
+                    continue;
+                }
+                out.insert(k.clone(), normalize_result(v));
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(normalize_result).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Compare Rust and TS scenario results, returning a list of diff descriptions.
+fn diff_scenario_results(rust_result: &Result<Value, String>, ts_output: &Value) -> Vec<String> {
+    let mut diffs = Vec::new();
+
+    let ts_success = ts_output
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ts_error = ts_output.get("error").and_then(Value::as_str);
+    let ts_result = ts_output.get("result");
+
+    match (rust_result, ts_success) {
+        (Ok(rust_val), true) => {
+            // Both succeeded - compare results
+            if let Some(ts_res) = ts_result {
+                let ts_norm = normalize_result(ts_res);
+                let rust_norm = normalize_result(rust_val);
+                if ts_norm != rust_norm {
+                    diffs.push(format!(
+                        "result mismatch:\n  TS:   {}\n  Rust: {}",
+                        serde_json::to_string(&ts_norm).unwrap_or_default(),
+                        serde_json::to_string(&rust_norm).unwrap_or_default(),
+                    ));
+                }
+            }
+        }
+        (Err(_), false) => {
+            // Both failed - acceptable
+        }
+        (Ok(_), false) => {
+            diffs.push(format!(
+                "TS failed but Rust succeeded:\n  TS error: {}",
+                ts_error.unwrap_or("unknown")
+            ));
+        }
+        (Err(rust_err), true) => {
+            diffs.push(format!(
+                "Rust failed but TS succeeded:\n  Rust error: {rust_err}"
+            ));
+        }
+    }
+
+    diffs
+}
+
+/// Result of a parity comparison for one scenario.
+#[derive(Debug, Clone, Serialize)]
+struct ParityResult {
+    scenario_id: String,
+    extension_id: String,
+    kind: String,
+    summary: String,
+    status: String, // "match", "mismatch", "skip", "ts_error", "rust_error"
+    source_tier: String,
+    runtime_tier: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    diffs: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ts_result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rust_result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    skip_reason: Option<String>,
+    ts_ms: u64,
+    rust_ms: u64,
+}
+
+/// Legacy vs Rust parity runner: runs each executable scenario in both the
+/// TS oracle (Bun + jiti) and Rust (`QuickJS`), normalizes outputs, and diffs.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn parity_runner() {
+    let sample = load_sample_json();
+    let run_id = format!(
+        "parity-{}",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    let parity_dir = reports_dir().join("parity");
+    let _ = fs::create_dir_all(&parity_dir);
+
+    eprintln!("[parity] run_id={run_id}");
+
+    let mut results: Vec<ParityResult> = Vec::new();
+    let mut events: Vec<Value> = Vec::new();
+
+    for ext in &sample.scenario_suite.items {
+        let item = sample.items.iter().find(|i| i.id == ext.extension_id);
+        let source_tier = item.map_or("unknown", |i| &i.source_tier);
+        let runtime_tier = item.map_or("unknown", |i| &i.runtime_tier);
+
+        for scenario in &ext.scenarios {
+            let base = ParityResult {
+                scenario_id: scenario.id.clone(),
+                extension_id: ext.extension_id.clone(),
+                kind: scenario.kind.clone(),
+                summary: scenario.summary.clone(),
+                status: String::new(),
+                source_tier: source_tier.to_string(),
+                runtime_tier: runtime_tier.to_string(),
+                diffs: Vec::new(),
+                ts_result: None,
+                rust_result: None,
+                error: None,
+                skip_reason: None,
+                ts_ms: 0,
+                rust_ms: 0,
+            };
+
+            // Skip unsupported scenarios
+            if let Some(reason) = needs_unsupported_setup(scenario) {
+                eprintln!(
+                    "  [SKIP] {} ({}) - {}: {reason}",
+                    scenario.id, ext.extension_id, scenario.summary
+                );
+                results.push(ParityResult {
+                    status: "skip".to_string(),
+                    skip_reason: Some(reason),
+                    ..base
+                });
+                continue;
+            }
+
+            // Resolve extension path
+            let Some(ext_path) = resolve_extension_path(&ext.extension_id, &sample.items) else {
+                results.push(ParityResult {
+                    status: "skip".to_string(),
+                    skip_reason: Some(format!(
+                        "cannot resolve artifact path for '{}'",
+                        ext.extension_id
+                    )),
+                    ..base
+                });
+                continue;
+            };
+
+            // Run Rust
+            let rust_start = Instant::now();
+            let rust_result = match scenario.kind.as_str() {
+                "tool" if scenario.tool_name.is_some() => {
+                    let loaded = match load_extension(&ext_path) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            results.push(ParityResult {
+                                status: "rust_error".to_string(),
+                                error: Some(format!("load: {e}")),
+                                ..base
+                            });
+                            continue;
+                        }
+                    };
+                    execute_tool_scenario(&loaded, scenario, &ext_path)
+                }
+                "command" => {
+                    let loaded = match load_extension(&ext_path) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            results.push(ParityResult {
+                                status: "rust_error".to_string(),
+                                error: Some(format!("load: {e}")),
+                                ..base
+                            });
+                            continue;
+                        }
+                    };
+                    execute_command_scenario(&loaded, scenario, &ext_path)
+                }
+                "event" => {
+                    let loaded = match load_extension(&ext_path) {
+                        Ok(l) => l,
+                        Err(e) => {
+                            results.push(ParityResult {
+                                status: "rust_error".to_string(),
+                                error: Some(format!("load: {e}")),
+                                ..base
+                            });
+                            continue;
+                        }
+                    };
+                    execute_event_scenario(&loaded, scenario, &ext_path)
+                }
+                "provider" | "tool" => {
+                    // Registration-only: skip parity
+                    results.push(ParityResult {
+                        status: "skip".to_string(),
+                        skip_reason: Some("registration-only scenario".to_string()),
+                        ..base
+                    });
+                    continue;
+                }
+                other => {
+                    results.push(ParityResult {
+                        status: "skip".to_string(),
+                        skip_reason: Some(format!("unsupported kind: {other}")),
+                        ..base
+                    });
+                    continue;
+                }
+            };
+            let rust_ms = u64::try_from(rust_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            // Run TS oracle
+            let ts_start = Instant::now();
+            let ts_output = run_ts_scenario(&ext_path, scenario);
+            let ts_ms = u64::try_from(ts_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+            // Handle TS error
+            let ts_output = match ts_output {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!(
+                        "  [TS_ERR] {} ({}) - TS error: {e}",
+                        scenario.id, ext.extension_id
+                    );
+                    results.push(ParityResult {
+                        status: "ts_error".to_string(),
+                        error: Some(e),
+                        rust_result: rust_result.as_ref().ok().cloned(),
+                        ts_ms,
+                        rust_ms,
+                        ..base
+                    });
+                    continue;
+                }
+            };
+
+            // Diff results
+            let diffs = diff_scenario_results(&rust_result, &ts_output);
+            let status = if diffs.is_empty() {
+                "match"
+            } else {
+                "mismatch"
+            };
+
+            let tag = if status == "match" { "MATCH" } else { "DIFF " };
+            eprintln!(
+                "  [{tag}] {} ({}) - {} [rust={}ms ts={}ms]",
+                scenario.id, ext.extension_id, scenario.summary, rust_ms, ts_ms
+            );
+            for diff in &diffs {
+                eprintln!("         {diff}");
+            }
+
+            // Build per-event log
+            events.push(serde_json::json!({
+                "schema": "pi.ext.parity.v1",
+                "run_id": run_id,
+                "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                "extension_id": ext.extension_id,
+                "scenario_id": scenario.id,
+                "kind": scenario.kind,
+                "source_tier": source_tier,
+                "runtime_tier": runtime_tier,
+                "status": status,
+                "ts_ms": ts_ms,
+                "rust_ms": rust_ms,
+                "diffs": diffs,
+            }));
+
+            results.push(ParityResult {
+                status: status.to_string(),
+                diffs: diffs.clone(),
+                ts_result: Some(ts_output),
+                rust_result: rust_result.as_ref().ok().cloned(),
+                ts_ms,
+                rust_ms,
+                ..base.clone()
+            });
+        }
+    }
+
+    // Write parity JSONL
+    let parity_jsonl = parity_dir.join("parity_events.jsonl");
+    let lines: Vec<String> = events
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .collect();
+    let _ = fs::write(&parity_jsonl, lines.join("\n") + "\n");
+
+    // Write per-extension parity diffs
+    let ext_dir = parity_dir.join("extensions");
+    let _ = fs::create_dir_all(&ext_dir);
+    let mut by_ext: HashMap<String, Vec<&ParityResult>> = HashMap::new();
+    for r in &results {
+        by_ext.entry(r.extension_id.clone()).or_default().push(r);
+    }
+    for (ext_id, ext_results) in &by_ext {
+        let path = ext_dir.join(format!("{ext_id}.jsonl"));
+        let ext_lines: Vec<String> = ext_results
+            .iter()
+            .filter_map(|r| serde_json::to_string(r).ok())
+            .collect();
+        let _ = fs::write(&path, ext_lines.join("\n") + "\n");
+    }
+
+    // Write triage summary
+    let matched = results.iter().filter(|r| r.status == "match").count();
+    let mismatched = results.iter().filter(|r| r.status == "mismatch").count();
+    let skipped = results.iter().filter(|r| r.status == "skip").count();
+    let ts_errors = results.iter().filter(|r| r.status == "ts_error").count();
+    let rust_errors = results.iter().filter(|r| r.status == "rust_error").count();
+
+    let triage = serde_json::json!({
+        "schema": "pi.ext.parity_triage.v1",
+        "run_id": run_id,
+        "generated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "counts": {
+            "total": results.len(),
+            "match": matched,
+            "mismatch": mismatched,
+            "skip": skipped,
+            "ts_error": ts_errors,
+            "rust_error": rust_errors,
+        },
+        "match_rate_pct": if matched + mismatched == 0 {
+            100.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            { (matched as f64) / ((matched + mismatched) as f64) * 100.0 }
+        },
+    });
+    let triage_path = parity_dir.join("triage.json");
+    let _ = fs::write(
+        &triage_path,
+        serde_json::to_string_pretty(&triage).unwrap_or_default(),
+    );
+
+    eprintln!(
+        "[parity] Results: {matched} match, {mismatched} mismatch, {skipped} skip, {ts_errors} ts_error, {rust_errors} rust_error"
+    );
+    eprintln!("[parity] Events: {}", parity_jsonl.display());
+    eprintln!("[parity] Triage: {}", triage_path.display());
+
+    // Known environment-dependent scenarios where TS and Rust legitimately differ
+    // due to different working directories / filesystem content
+    let known_env_diffs: &[&str] = &[
+        "scn-subagent-001", // TS finds project agents in pi-mono dir; Rust uses empty test dir
+    ];
+
+    // Assert no unexpected mismatches
+    let parity_failures: Vec<&ParityResult> = results
+        .iter()
+        .filter(|r| r.status == "mismatch" && !known_env_diffs.contains(&r.scenario_id.as_str()))
+        .collect();
+    assert!(
+        parity_failures.is_empty(),
+        "Parity mismatches ({}):\n{}",
+        parity_failures.len(),
+        parity_failures
+            .iter()
+            .map(|r| format!(
+                "  {} ({}): {}",
+                r.scenario_id,
+                r.extension_id,
                 r.diffs.join("; ")
             ))
             .collect::<Vec<_>>()
