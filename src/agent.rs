@@ -13,14 +13,16 @@
 //! 5. If done: return final message
 
 use crate::error::{Error, Result};
+use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, JsExtensionLoadSpec,
+    JsExtensionRuntimeHandle,
 };
 use crate::extensions_js::PiJsRuntimeConfig;
 use crate::model::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, Message, StopReason, StreamEvent,
-    TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, ImageContent, Message, StopReason,
+    StreamEvent, TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::Session;
@@ -31,6 +33,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures::future::BoxFuture;
 use serde::Serialize;
+use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,17 +182,32 @@ impl MessageQueue {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentEvent {
     /// Agent lifecycle start.
-    AgentStart,
+    AgentStart {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+    },
     /// Agent lifecycle end with all new messages.
     AgentEnd {
+        #[serde(rename = "sessionId")]
+        session_id: String,
         messages: Vec<Message>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
     /// Turn lifecycle start (assistant response + tool calls).
-    TurnStart,
+    TurnStart {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "turnIndex")]
+        turn_index: usize,
+        timestamp: i64,
+    },
     /// Turn lifecycle end with tool results.
     TurnEnd {
+        #[serde(rename = "sessionId")]
+        session_id: String,
+        #[serde(rename = "turnIndex")]
+        turn_index: usize,
         message: Message,
         #[serde(rename = "toolResults")]
         tool_results: Vec<Message>,
@@ -533,12 +551,23 @@ impl Agent {
         on_event: Arc<dyn Fn(AgentEvent) + Send + Sync>,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
+        let session_id = self
+            .config
+            .stream_options
+            .session_id
+            .clone()
+            .unwrap_or_default();
         let mut iterations = 0usize;
+        let mut turn_index: usize = 0;
         let mut new_messages: Vec<Message> = Vec::new();
         let mut last_assistant: Option<AssistantMessage> = None;
 
-        on_event(AgentEvent::AgentStart);
-        on_event(AgentEvent::TurnStart);
+        let agent_start_event = AgentEvent::AgentStart {
+            session_id: session_id.clone(),
+        };
+        on_event(agent_start_event.clone());
+        self.dispatch_extension_lifecycle_event(&agent_start_event)
+            .await;
 
         for prompt in prompts {
             self.messages.push(prompt.clone());
@@ -551,18 +580,21 @@ impl Agent {
 
         // Delivery boundary: start of turn (steering messages queued while idle).
         let mut pending_messages = self.drain_steering_messages().await;
-        let mut turn_started = true; // already emitted turn_start
 
         loop {
             let mut has_more_tool_calls = true;
             let mut steering_after_tools: Option<Vec<Message>> = None;
 
             while has_more_tool_calls || !pending_messages.is_empty() {
-                if turn_started {
-                    turn_started = false;
-                } else {
-                    on_event(AgentEvent::TurnStart);
-                }
+                let current_turn_index = turn_index;
+                let turn_start_event = AgentEvent::TurnStart {
+                    session_id: session_id.clone(),
+                    turn_index: current_turn_index,
+                    timestamp: Utc::now().timestamp_millis(),
+                };
+                on_event(turn_start_event.clone());
+                self.dispatch_extension_lifecycle_event(&turn_start_event)
+                    .await;
 
                 if abort.as_ref().is_some_and(AbortSignal::is_aborted) {
                     let abort_message = self.build_abort_message(last_assistant.clone());
@@ -577,11 +609,17 @@ impl Agent {
                     on_event(AgentEvent::MessageEnd {
                         message: message.clone(),
                     });
-                    on_event(AgentEvent::TurnEnd {
+                    let turn_end_event = AgentEvent::TurnEnd {
+                        session_id: session_id.clone(),
+                        turn_index: current_turn_index,
                         message,
                         tool_results: Vec::new(),
-                    });
-                    on_event(AgentEvent::AgentEnd {
+                    };
+                    on_event(turn_end_event.clone());
+                    self.dispatch_extension_lifecycle_event(&turn_end_event)
+                        .await;
+                    let agent_end_event = AgentEvent::AgentEnd {
+                        session_id: session_id.clone(),
                         messages: new_messages.clone(),
                         error: Some(
                             abort_message
@@ -589,7 +627,10 @@ impl Agent {
                                 .clone()
                                 .unwrap_or_else(|| "Aborted".to_string()),
                         ),
-                    });
+                    };
+                    on_event(agent_end_event.clone());
+                    self.dispatch_extension_lifecycle_event(&agent_end_event)
+                        .await;
                     return Ok(abort_message);
                 }
 
@@ -614,14 +655,23 @@ impl Agent {
                     assistant_message.stop_reason,
                     StopReason::Error | StopReason::Aborted
                 ) {
-                    on_event(AgentEvent::TurnEnd {
+                    let turn_end_event = AgentEvent::TurnEnd {
+                        session_id: session_id.clone(),
+                        turn_index: current_turn_index,
                         message: assistant_event_message.clone(),
                         tool_results: Vec::new(),
-                    });
-                    on_event(AgentEvent::AgentEnd {
+                    };
+                    on_event(turn_end_event.clone());
+                    self.dispatch_extension_lifecycle_event(&turn_end_event)
+                        .await;
+                    let agent_end_event = AgentEvent::AgentEnd {
+                        session_id: session_id.clone(),
                         messages: new_messages.clone(),
                         error: assistant_message.error_message.clone(),
-                    });
+                    };
+                    on_event(agent_end_event.clone());
+                    self.dispatch_extension_lifecycle_event(&agent_end_event)
+                        .await;
                     return Ok(assistant_message);
                 }
 
@@ -656,10 +706,17 @@ impl Agent {
                     .map(Message::ToolResult)
                     .collect::<Vec<_>>();
 
-                on_event(AgentEvent::TurnEnd {
+                let turn_end_event = AgentEvent::TurnEnd {
+                    session_id: session_id.clone(),
+                    turn_index: current_turn_index,
                     message: assistant_event_message.clone(),
                     tool_results: tool_messages,
-                });
+                };
+                on_event(turn_end_event.clone());
+                self.dispatch_extension_lifecycle_event(&turn_end_event)
+                    .await;
+
+                turn_index = turn_index.saturating_add(1);
 
                 if let Some(steering) = steering_after_tools.take() {
                     pending_messages = steering;
@@ -681,10 +738,14 @@ impl Agent {
             return Err(Error::api("Agent completed without assistant message"));
         };
 
-        on_event(AgentEvent::AgentEnd {
+        let agent_end_event = AgentEvent::AgentEnd {
+            session_id: session_id.clone(),
             messages: new_messages.clone(),
             error: None,
-        });
+        };
+        on_event(agent_end_event.clone());
+        self.dispatch_extension_lifecycle_event(&agent_end_event)
+            .await;
         Ok(final_message)
     }
 
@@ -693,6 +754,32 @@ impl Agent {
             (fetcher)().await
         } else {
             Vec::new()
+        }
+    }
+
+    async fn dispatch_extension_lifecycle_event(&self, event: &AgentEvent) {
+        let Some(extensions) = &self.extensions else {
+            return;
+        };
+
+        let name = match event {
+            AgentEvent::AgentStart { .. } => ExtensionEventName::AgentStart,
+            AgentEvent::AgentEnd { .. } => ExtensionEventName::AgentEnd,
+            AgentEvent::TurnStart { .. } => ExtensionEventName::TurnStart,
+            AgentEvent::TurnEnd { .. } => ExtensionEventName::TurnEnd,
+            _ => return,
+        };
+
+        let payload = match serde_json::to_value(event) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!("failed to serialize agent lifecycle event (fail-open): {err}");
+                return;
+            }
+        };
+
+        if let Err(err) = extensions.dispatch_event(name, Some(payload)).await {
+            tracing::warn!("agent lifecycle extension hook failed (fail-open): {err}");
         }
     }
 
@@ -2359,7 +2446,9 @@ mod turn_event_tests {
             let turn_start_indices = events
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, event)| matches!(event, AgentEvent::TurnStart).then_some(idx))
+                .filter_map(|(idx, event)| {
+                    matches!(event, AgentEvent::TurnStart { .. }).then_some(idx)
+                })
                 .collect::<Vec<_>>();
             let turn_end_indices = events
                 .iter()
@@ -2396,6 +2485,7 @@ mod turn_event_tests {
                     AgentEvent::TurnEnd {
                         message,
                         tool_results,
+                        ..
                     } => (
                         matches!(message, Message::Assistant(_)),
                         tool_results.is_empty(),
@@ -2445,7 +2535,7 @@ impl AgentSession {
             manager.clone(),
         )
         .await?;
-        manager.set_js_runtime(js_runtime);
+        manager.set_js_runtime(js_runtime.clone());
 
         let mut specs = Vec::new();
         for entry in extension_entries {
@@ -2453,6 +2543,24 @@ impl AgentSession {
         }
         if !specs.is_empty() {
             manager.load_js_extensions(specs).await?;
+        }
+
+        // Fire the `startup` lifecycle hook once extensions are loaded.
+        // Fail-open: extension errors must not prevent the agent from running.
+        if let Err(err) = js_runtime
+            .dispatch_event(
+                "startup".to_string(),
+                serde_json::json!({
+                    "type": "startup",
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "sessionFile": self.session.path.as_ref().map(|p| p.display().to_string()),
+                }),
+                serde_json::json!({ "cwd": cwd.display().to_string() }),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await
+        {
+            tracing::warn!("startup extension hook failed (fail-open): {err}");
         }
 
         let ctx_payload = serde_json::json!({ "cwd": cwd.display().to_string() });
@@ -2492,12 +2600,21 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.agent
-            .replace_messages(self.session.to_messages_for_current_path());
-        let start_len = self.agent.messages().len();
-        let result = self.agent.run_with_abort(input, abort, on_event).await?;
-        self.persist_new_messages(start_len).await?;
-        Ok(result)
+        let outcome = self.dispatch_input_event(input, Vec::new()).await?;
+        let (text, images) = match outcome {
+            InputEventOutcome::Continue { text, images } => (text, images),
+            InputEventOutcome::Block { reason } => {
+                let message = reason.unwrap_or_else(|| "Input blocked".to_string());
+                return Err(Error::extension(message));
+            }
+        };
+
+        if images.is_empty() {
+            self.run_agent_with_text(text, abort, on_event).await
+        } else {
+            let content = Self::build_content_blocks_for_input(&text, &images);
+            self.run_agent_with_content(content, abort, on_event).await
+        }
     }
 
     pub async fn run_with_content(
@@ -2510,6 +2627,99 @@ impl AgentSession {
     }
 
     pub async fn run_with_content_with_abort(
+        &mut self,
+        content: Vec<ContentBlock>,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        let (text, images) = Self::split_content_blocks_for_input(&content);
+        let outcome = self.dispatch_input_event(text, images).await?;
+        let (text, images) = match outcome {
+            InputEventOutcome::Continue { text, images } => (text, images),
+            InputEventOutcome::Block { reason } => {
+                let message = reason.unwrap_or_else(|| "Input blocked".to_string());
+                return Err(Error::extension(message));
+            }
+        };
+
+        let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
+        self.run_agent_with_content(content_for_agent, abort, on_event)
+            .await
+    }
+
+    async fn dispatch_input_event(
+        &self,
+        text: String,
+        images: Vec<ImageContent>,
+    ) -> Result<InputEventOutcome> {
+        let Some(extensions) = &self.extensions else {
+            return Ok(InputEventOutcome::Continue { text, images });
+        };
+
+        let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
+        let payload = json!({
+            "text": text,
+            "images": images_value,
+            "source": "user",
+        });
+
+        let response = extensions
+            .dispatch_event_with_response(
+                ExtensionEventName::Input,
+                Some(payload),
+                EXTENSION_EVENT_TIMEOUT_MS,
+            )
+            .await?;
+
+        Ok(apply_input_event_response(response, text, images))
+    }
+
+    fn split_content_blocks_for_input(blocks: &[ContentBlock]) -> (String, Vec<ImageContent>) {
+        let mut text = String::new();
+        let mut images = Vec::new();
+        for block in blocks {
+            match block {
+                ContentBlock::Text(text_block) => {
+                    if !text_block.text.trim().is_empty() {
+                        if !text.is_empty() {
+                            text.push('\n');
+                        }
+                        text.push_str(&text_block.text);
+                    }
+                }
+                ContentBlock::Image(image) => images.push(image.clone()),
+                _ => {}
+            }
+        }
+        (text, images)
+    }
+
+    fn build_content_blocks_for_input(text: &str, images: &[ImageContent]) -> Vec<ContentBlock> {
+        let mut content = Vec::new();
+        if !text.trim().is_empty() {
+            content.push(ContentBlock::Text(TextContent::new(text.to_string())));
+        }
+        for image in images {
+            content.push(ContentBlock::Image(image.clone()));
+        }
+        content
+    }
+
+    pub(crate) async fn run_agent_with_text(
+        &mut self,
+        input: String,
+        abort: Option<AbortSignal>,
+        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
+    ) -> Result<AssistantMessage> {
+        self.agent
+            .replace_messages(self.session.to_messages_for_current_path());
+        let start_len = self.agent.messages().len();
+        let result = self.agent.run_with_abort(input, abort, on_event).await?;
+        self.persist_new_messages(start_len).await?;
+        Ok(result)
+    }
+
+    pub(crate) async fn run_agent_with_content(
         &mut self,
         content: Vec<ContentBlock>,
         abort: Option<AbortSignal>,
