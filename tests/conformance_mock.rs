@@ -922,3 +922,366 @@ fn conformance_output_json_round_trips() {
 
     write_jsonl_artifacts(&harness);
 }
+
+// ─── Scenario Execution: Event Dispatch ──────────────────────────────────────
+
+/// Extension that registers event hooks.
+const EVENT_HOOK_TS: &str = r#"
+export default function init(pi: any): void {
+  pi.events.on("tool_call", (payload: any, _ctx: any) => {
+    return { block: false };
+  });
+
+  pi.events.on("turn_start", (payload: any, _ctx: any) => {
+    // Track turn start events
+  });
+}
+"#;
+
+#[test]
+fn event_hook_extension_registers_hooks() {
+    let harness = common::TestHarness::new("event_hook_extension_registers_hooks");
+    let spec = ConformanceMockSpec::default();
+
+    let (manager, load_spec, capture) =
+        load_with_mock(&harness, EVENT_HOOK_TS, "event_hooks.ts", spec);
+
+    let output = build_conformance_output(&load_spec, &manager, &capture);
+
+    // Verify the extension loaded
+    assert_eq!(output.extension_id, "event_hooks");
+
+    // Serialize for artifact logging
+    let json_str = serde_json::to_string_pretty(&output).expect("serialize");
+    let output_path = harness.temp_path("event_hook_output.json");
+    std::fs::write(&output_path, format!("{json_str}\n")).expect("write");
+    harness.record_artifact("event_hook_output.json", &output_path);
+
+    write_jsonl_artifacts(&harness);
+}
+
+#[test]
+fn event_dispatch_through_manager() {
+    use pi::extensions::ExtensionEventName;
+
+    let harness = common::TestHarness::new("event_dispatch_through_manager");
+    let spec = ConformanceMockSpec {
+        session_state: serde_json::json!({
+            "sessionName": "event-test",
+        }),
+        ..Default::default()
+    };
+
+    let (manager, _load_spec, capture) =
+        load_with_mock(&harness, EVENT_HOOK_TS, "event_dispatch.ts", spec);
+
+    // Dispatch a turn_start event through the manager
+    let result = common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .dispatch_event(
+                    ExtensionEventName::TurnStart,
+                    Some(serde_json::json!({ "turn": 1 })),
+                )
+                .await
+        }
+    });
+
+    // Event dispatch should succeed (handler registered for turn_start)
+    assert!(result.is_ok(), "dispatch_event should succeed: {result:?}");
+
+    // Capture log records hostcalls made during event dispatch
+    let log = capture.snapshot();
+    harness
+        .log()
+        .info_ctx("event", "Event dispatch completed", |ctx| {
+            ctx.push(("hostcalls".into(), log.len().to_string()));
+        });
+
+    write_jsonl_artifacts(&harness);
+}
+
+// ─── Scenario Execution: Session Mutations ───────────────────────────────────
+
+/// Extension that mutates session state during init.
+const SESSION_MUTATING_TS: &str = r#"
+export default async function init(pi: any): Promise<void> {
+  const state = await pi.session("get_state", {});
+  await pi.session("set_name", { name: "mutated-by-extension" });
+  await pi.session("set_label", { targetId: "init-label", label: "loaded" });
+
+  pi.registerCommand("mutator", {
+    description: "Extension that mutates session",
+    handler: async () => ({ display: "mutated" })
+  });
+}
+"#;
+
+#[test]
+fn session_mutation_scenario() {
+    let harness = common::TestHarness::new("session_mutation_scenario");
+    let spec = ConformanceMockSpec {
+        session_state: serde_json::json!({
+            "sessionName": "original",
+            "cwd": "/test",
+        }),
+        ..Default::default()
+    };
+
+    let capture = HostcallCaptureLog::new();
+    let session = Arc::new(ConformanceMockSession::new(spec, capture.clone()));
+
+    let cwd = harness.temp_dir().to_path_buf();
+    let ext_path = harness.create_file(
+        "extensions/session_mutating.ts",
+        SESSION_MUTATING_TS.as_bytes(),
+    );
+
+    let load_spec = JsExtensionLoadSpec::from_entry_path(&ext_path).expect("load spec");
+
+    let manager = ExtensionManager::new();
+    manager.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+
+    common::run_async({
+        let manager = manager.clone();
+        let spec = load_spec.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+        }
+    });
+
+    // Verify session mutations happened
+    let name_history = session.name_history();
+    assert!(
+        name_history.contains(&"mutated-by-extension".to_string()),
+        "set_name should have been called: {name_history:?}"
+    );
+
+    let label_history = session.label_history();
+    assert!(
+        label_history.iter().any(|(id, _)| id == "init-label"),
+        "set_label should have been called: {label_history:?}"
+    );
+
+    // Verify hostcall log captured the sequence
+    let log = capture.snapshot();
+    let ops: Vec<&str> = log.iter().map(|c| c.op.as_str()).collect();
+    assert!(ops.contains(&"get_state"), "get_state should be in hostcall log: {ops:?}");
+    assert!(ops.contains(&"set_name"), "set_name should be in hostcall log: {ops:?}");
+    assert!(ops.contains(&"set_label"), "set_label should be in hostcall log: {ops:?}");
+
+    // Verify the command was registered
+    assert!(manager.has_command("mutator"), "mutator command should be registered");
+
+    let output = build_conformance_output(&load_spec, &manager, &capture);
+    let json_str = serde_json::to_string_pretty(&output).expect("serialize");
+    let output_path = harness.temp_path("session_mutation_output.json");
+    std::fs::write(&output_path, format!("{json_str}\n")).expect("write");
+    harness.record_artifact("session_mutation_output.json", &output_path);
+
+    write_jsonl_artifacts(&harness);
+}
+
+// ─── Scenario Execution: Custom Entry ────────────────────────────────────────
+
+/// Extension that exercises custom entry append during init.
+const CUSTOM_ENTRY_TS: &str = r#"
+export default async function init(pi: any): Promise<void> {
+  await pi.session("append_entry", {
+    customType: "audit_log",
+    data: { action: "extension_loaded", extension: "custom_entry" }
+  });
+
+  pi.registerCommand("audit", {
+    description: "Extension with custom entries",
+    handler: async () => ({ display: "audited" })
+  });
+}
+"#;
+
+#[test]
+fn custom_entry_scenario() {
+    let harness = common::TestHarness::new("custom_entry_scenario");
+    let spec = ConformanceMockSpec::default();
+
+    let capture = HostcallCaptureLog::new();
+    let session = Arc::new(ConformanceMockSession::new(spec, capture.clone()));
+
+    let cwd = harness.temp_dir().to_path_buf();
+    let ext_path =
+        harness.create_file("extensions/custom_entry.ts", CUSTOM_ENTRY_TS.as_bytes());
+
+    let load_spec = JsExtensionLoadSpec::from_entry_path(&ext_path).expect("load spec");
+
+    let manager = ExtensionManager::new();
+    manager.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+
+    common::run_async({
+        let manager = manager.clone();
+        let spec = load_spec.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+        }
+    });
+
+    // Verify custom entry was appended
+    let entries = session.custom_entries();
+    assert_eq!(entries.len(), 1, "expected 1 custom entry: {entries:?}");
+    assert_eq!(entries[0].0, "audit_log");
+    let data = entries[0].1.as_ref().expect("entry should have data");
+    assert_eq!(data["action"], "extension_loaded");
+
+    // Verify hostcall log
+    let log = capture.snapshot();
+    let ops: Vec<&str> = log.iter().map(|c| c.op.as_str()).collect();
+    assert!(
+        ops.contains(&"append_custom_entry"),
+        "append_custom_entry should be in log: {ops:?}"
+    );
+
+    assert!(manager.has_command("audit"));
+
+    write_jsonl_artifacts(&harness);
+}
+
+// ─── Scenario Execution: Model Control ──────────────────────────────────────
+
+/// Extension that reads and modifies model settings during init.
+const MODEL_CONTROL_TS: &str = r#"
+export default async function init(pi: any): Promise<void> {
+  const model = await pi.session("get_model", {});
+  await pi.session("set_model", { provider: "openai", modelId: "gpt-4o" });
+  const level = await pi.session("get_thinking_level", {});
+  await pi.session("set_thinking_level", { level: "high" });
+
+  pi.registerCommand("model-control", {
+    description: "Extension that controls model settings",
+    handler: async () => ({ display: "controlled" })
+  });
+}
+"#;
+
+#[test]
+fn model_control_scenario() {
+    let harness = common::TestHarness::new("model_control_scenario");
+    let spec = ConformanceMockSpec {
+        model: Some(("anthropic".to_string(), "claude-sonnet-4-5".to_string())),
+        thinking_level: Some("medium".to_string()),
+        ..Default::default()
+    };
+
+    let capture = HostcallCaptureLog::new();
+    let session = Arc::new(ConformanceMockSession::new(spec, capture.clone()));
+
+    let cwd = harness.temp_dir().to_path_buf();
+    let ext_path =
+        harness.create_file("extensions/model_control.ts", MODEL_CONTROL_TS.as_bytes());
+
+    let load_spec = JsExtensionLoadSpec::from_entry_path(&ext_path).expect("load spec");
+
+    let manager = ExtensionManager::new();
+    manager.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+
+    common::run_async({
+        let manager = manager.clone();
+        let spec = load_spec.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+        }
+    });
+
+    // Verify hostcall sequence
+    let log = capture.snapshot();
+    let ops: Vec<&str> = log.iter().map(|c| c.op.as_str()).collect();
+
+    assert!(ops.contains(&"get_model"), "get_model in log: {ops:?}");
+    assert!(ops.contains(&"set_model"), "set_model in log: {ops:?}");
+    assert!(ops.contains(&"get_thinking_level"), "get_thinking_level in log: {ops:?}");
+    assert!(ops.contains(&"set_thinking_level"), "set_thinking_level in log: {ops:?}");
+
+    // Verify model was changed
+    let model = common::run_async({
+        let s = Arc::clone(&session);
+        async move { s.get_model().await }
+    });
+    assert_eq!(model.0.as_deref(), Some("openai"));
+    assert_eq!(model.1.as_deref(), Some("gpt-4o"));
+
+    // Verify thinking level was changed
+    let level = common::run_async({
+        let s = Arc::clone(&session);
+        async move { s.get_thinking_level().await }
+    });
+    assert_eq!(level.as_deref(), Some("high"));
+
+    assert!(manager.has_command("model-control"));
+
+    let output = build_conformance_output(&load_spec, &manager, &capture);
+    let json_str = serde_json::to_string_pretty(&output).expect("serialize");
+    let output_path = harness.temp_path("model_control_output.json");
+    std::fs::write(&output_path, format!("{json_str}\n")).expect("write");
+    harness.record_artifact("model_control_output.json", &output_path);
+
+    write_jsonl_artifacts(&harness);
+}
