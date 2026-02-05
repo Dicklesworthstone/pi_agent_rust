@@ -381,10 +381,9 @@ mod malformed_responses {
 
             let mut found_error = false;
             while let Some(item) = stream.next().await {
-                if item.is_err() {
+                if let Err(err) = item {
                     found_error = true;
-                    let msg = item.unwrap_err().to_string();
-                    harness.log().info("verify", &msg);
+                    harness.log().info("verify", err.to_string());
                     break;
                 }
             }
@@ -466,10 +465,9 @@ mod malformed_responses {
 
             let mut found_error = false;
             while let Some(item) = stream.next().await {
-                if item.is_err() {
+                if let Err(err) = item {
                     found_error = true;
-                    let msg = item.unwrap_err().to_string();
-                    harness.log().info("verify", &msg);
+                    harness.log().info("verify", err.to_string());
                     break;
                 }
             }
