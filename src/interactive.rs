@@ -46,14 +46,15 @@ use crate::autocomplete::{
     AutocompleteResponse,
 };
 use crate::config::{Config, SettingsScope};
+use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionSession,
     ExtensionUiRequest, ExtensionUiResponse, extension_event_from_agent,
 };
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
-    AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, TextContent,
-    ThinkingLevel, Usage, UserContent, UserMessage,
+    AssistantMessageEvent, ContentBlock, ImageContent, Message as ModelMessage, StopReason,
+    TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::package_manager::PackageManager;
@@ -1055,19 +1056,28 @@ impl PiApp {
             ),
         };
 
-        let thinking_badge = thinking_style.render(&format!("[thinking: {thinking_label}]"));
+        let thinking_plain = format!("[thinking: {thinking_label}]");
+        let thinking_badge = thinking_style.render(&thinking_plain);
         let bash_badge = is_bash_mode.then(|| self.styles.warning_bold.render("[bash]"));
 
-        let mode_text = match self.input_mode {
-            InputMode::SingleLine => {
-                "[single-line] Enter to send (Shift+Enter: newline, Alt+Enter: multi-line)"
-            }
-            InputMode::MultiLine => {
-                "[multi-line] Alt+Enter to send (Enter: newline, Esc: single-line)"
-            }
-        };
+        let max_width = self.term_width.saturating_sub(2);
+        let reserved = 2 + thinking_plain.chars().count()
+            + if is_bash_mode {
+                2 + "[bash]".chars().count()
+            } else {
+                0
+            };
+        let available_for_mode = max_width.saturating_sub(reserved);
+        let mut mode_text = match self.input_mode {
+            InputMode::SingleLine => "Enter: send  Shift+Enter: newline  Alt+Enter: multi-line",
+            InputMode::MultiLine => "Alt+Enter: send  Enter: newline  Esc: single-line",
+        }
+        .to_string();
+        if mode_text.chars().count() > available_for_mode {
+            mode_text = truncate(&mode_text, available_for_mode);
+        }
         let mut header_line = String::new();
-        header_line.push_str(&self.styles.muted.render(mode_text));
+        header_line.push_str(&self.styles.muted.render(&mode_text));
         header_line.push_str("  ");
         header_line.push_str(&thinking_badge);
         if let Some(bash_badge) = bash_badge {
@@ -1109,9 +1119,20 @@ impl PiApp {
             InputMode::SingleLine => "Shift+Enter: newline  |  Alt+Enter: multi-line",
             InputMode::MultiLine => "Enter: newline  |  Alt+Enter: send  |  Esc: single-line",
         };
-        let footer = format!(
+        let footer_long = format!(
             "Tokens: {input} in / {output_tokens} out{cost_str}  |  {mode_hint}  |  /help  |  Ctrl+C: quit"
         );
+        let footer_short =
+            format!("Tokens: {input} in / {output_tokens} out{cost_str}  |  /help  |  Ctrl+C: quit");
+        let max_width = self.term_width.saturating_sub(2);
+        let mut footer = if footer_long.chars().count() <= max_width {
+            footer_long
+        } else {
+            footer_short
+        };
+        if footer.chars().count() > max_width {
+            footer = truncate(&footer, max_width);
+        }
         format!("\n  {}\n", self.styles.muted.render(&footer))
     }
 
@@ -1672,6 +1693,51 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
         }
     }
     output
+}
+
+fn split_content_blocks_for_input(blocks: &[ContentBlock]) -> (String, Vec<ImageContent>) {
+    let mut text = String::new();
+    let mut images = Vec::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text(text_block) => push_line(&mut text, &text_block.text),
+            ContentBlock::Image(image) => images.push(image.clone()),
+            _ => {}
+        }
+    }
+    (text, images)
+}
+
+fn build_content_blocks_for_input(text: &str, images: &[ImageContent]) -> Vec<ContentBlock> {
+    let mut content = Vec::new();
+    if !text.trim().is_empty() {
+        content.push(ContentBlock::Text(TextContent::new(text.to_string())));
+    }
+    for image in images {
+        content.push(ContentBlock::Image(image.clone()));
+    }
+    content
+}
+
+async fn dispatch_input_event(
+    manager: &ExtensionManager,
+    text: String,
+    images: Vec<ImageContent>,
+) -> crate::error::Result<InputEventOutcome> {
+    let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
+    let payload = json!({
+        "text": text,
+        "images": images_value,
+        "source": "user",
+    });
+    let response = manager
+        .dispatch_event_with_response(
+            ExtensionEventName::Input,
+            Some(payload),
+            EXTENSION_EVENT_TIMEOUT_MS,
+        )
+        .await?;
+    Ok(apply_input_event_response(response, text, images))
 }
 
 fn next_non_whitespace_token(text: &str, start: usize) -> (&str, usize) {
@@ -2596,6 +2662,8 @@ pub enum PiMsg {
     AgentError(String),
     /// Non-error system message.
     System(String),
+    /// Update last user message content (input transform/redaction).
+    UpdateLastUserMessage(String),
     /// Bash command result (non-agent).
     BashResult {
         display: String,
@@ -3900,9 +3968,7 @@ impl PiApp {
 
         // Configure text area for input
         let mut input = TextArea::new();
-        input.placeholder =
-            "Type your message... (Enter to send, Shift+Enter for newline, Ctrl+C twice to quit)"
-                .to_string();
+        input.placeholder = "Type a message... (/help, /exit)".to_string();
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
         input.set_height(3); // Start with 3 lines
@@ -5194,6 +5260,17 @@ impl PiApp {
                     return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
                 }
             }
+            PiMsg::UpdateLastUserMessage(content) => {
+                if let Some(message) = self
+                    .messages
+                    .iter_mut()
+                    .rev()
+                    .find(|message| message.role == MessageRole::User)
+                {
+                    message.content = content;
+                }
+                self.scroll_to_bottom();
+            }
             PiMsg::System(message) => {
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
@@ -5541,7 +5618,7 @@ impl PiApp {
     #[allow(clippy::too_many_lines)]
     fn submit_content(&mut self, content: Vec<ContentBlock>) -> Option<Cmd> {
         let display = content_blocks_to_text(&content);
-        self.submit_content_with_display(content, &display, None)
+        self.submit_content_with_display(content, &display)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -5549,7 +5626,6 @@ impl PiApp {
         &mut self,
         content: Vec<ContentBlock>,
         display: &str,
-        input_text_override: Option<String>,
     ) -> Option<Cmd> {
         if content.is_empty() {
             return None;
@@ -5575,7 +5651,6 @@ impl PiApp {
         // Auto-scroll to bottom when new message is added
         self.scroll_to_bottom();
 
-        let input_text = input_text_override.unwrap_or_else(|| display_owned.clone());
         let content_for_agent = content;
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
@@ -5586,20 +5661,36 @@ impl PiApp {
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
-        if let Some(manager) = extensions.clone() {
-            let message = input_text;
-            runtime_handle.spawn(async move {
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::Input, Some(json!({ "text": message })))
-                    .await;
+        let runtime_handle_for_task = runtime_handle.clone();
+        runtime_handle.spawn(async move {
+            let mut content_for_agent = content_for_agent;
+            if let Some(manager) = extensions.clone() {
+                let (text, images) = split_content_blocks_for_input(&content_for_agent);
+                match dispatch_input_event(&manager, text, images).await {
+                    Ok(InputEventOutcome::Continue { text, images }) => {
+                        content_for_agent = build_content_blocks_for_input(&text, &images);
+                        let updated = content_blocks_to_text(&content_for_agent);
+                        if updated != display_owned {
+                            let _ = event_tx.try_send(PiMsg::UpdateLastUserMessage(updated));
+                        }
+                    }
+                    Ok(InputEventOutcome::Block { reason }) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::UpdateLastUserMessage("[input blocked]".to_string()));
+                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
+                        let _ = event_tx.try_send(PiMsg::AgentError(message));
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = event_tx.try_send(PiMsg::AgentError(err.to_string()));
+                        return;
+                    }
+                }
                 let _ = manager
                     .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
                     .await;
-            });
-        }
+            }
 
-        let runtime_handle_for_task = runtime_handle.clone();
-        runtime_handle.spawn(async move {
             let cx = Cx::for_request();
             let mut agent_guard = match agent.lock(&cx).await {
                 Ok(guard) => guard,
@@ -5618,7 +5709,7 @@ impl PiApp {
                 .run_with_content_with_abort(content_for_agent, Some(abort_signal), move |event| {
                     let extension_event = extension_event_from_agent(&event);
                     let mapped = match &event {
-                        AgentEvent::AgentStart => Some(PiMsg::AgentStart),
+                        AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
                         AgentEvent::MessageUpdate {
                             assistant_message_event,
                             ..
@@ -5687,11 +5778,19 @@ impl PiApp {
 
                     if let Some(manager) = &extensions {
                         if let Some((event_name, data)) = extension_event {
-                            let manager = manager.clone();
-                            let runtime_handle = runtime_handle.clone();
-                            runtime_handle.spawn(async move {
-                                let _ = manager.dispatch_event(event_name, data).await;
-                            });
+                            if !matches!(
+                                event_name,
+                                ExtensionEventName::AgentStart
+                                    | ExtensionEventName::AgentEnd
+                                    | ExtensionEventName::TurnStart
+                                    | ExtensionEventName::TurnEnd
+                            ) {
+                                let manager = manager.clone();
+                                let runtime_handle = runtime_handle.clone();
+                                runtime_handle.spawn(async move {
+                                    let _ = manager.dispatch_event(event_name, data).await;
+                                });
+                            }
                         }
                     }
                 })
@@ -5913,7 +6012,7 @@ impl PiApp {
             self.history.push(message_owned.clone());
 
             let display = content_blocks_to_text(&content);
-            return self.submit_content_with_display(content, &display, Some(message_owned));
+            return self.submit_content_with_display(content, &display);
         }
         let event_tx = self.event_tx.clone();
         let agent = Arc::clone(&self.agent);
@@ -5932,6 +6031,7 @@ impl PiApp {
             content: message_for_agent.clone(),
             thinking: None,
         });
+        let displayed_message = message_for_agent.clone();
 
         // Clear input and reset to single-line mode
         self.input.reset();
@@ -5946,21 +6046,38 @@ impl PiApp {
 
         let runtime_handle = self.runtime_handle.clone();
 
-        if let Some(manager) = extensions.clone() {
-            let message = message_owned;
-            runtime_handle.spawn(async move {
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::Input, Some(json!({ "text": message })))
-                    .await;
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
-            });
-        }
-
         // Spawn async task to run the agent
         let runtime_handle_for_agent = runtime_handle.clone();
         runtime_handle.spawn(async move {
+            let mut message_for_agent = message_for_agent;
+            let mut input_images = Vec::new();
+            if let Some(manager) = extensions.clone() {
+                match dispatch_input_event(&manager, message_for_agent.clone(), Vec::new()).await {
+                    Ok(InputEventOutcome::Continue { text, images }) => {
+                        message_for_agent = text;
+                        input_images = images;
+                        if message_for_agent != displayed_message {
+                            let _ = event_tx
+                                .try_send(PiMsg::UpdateLastUserMessage(message_for_agent.clone()));
+                        }
+                    }
+                    Ok(InputEventOutcome::Block { reason }) => {
+                        let _ = event_tx
+                            .try_send(PiMsg::UpdateLastUserMessage("[input blocked]".to_string()));
+                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
+                        let _ = event_tx.try_send(PiMsg::AgentError(message));
+                        return;
+                    }
+                    Err(err) => {
+                        let _ = event_tx.try_send(PiMsg::AgentError(err.to_string()));
+                        return;
+                    }
+                }
+                let _ = manager
+                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
+                    .await;
+            }
+
             let cx = Cx::for_request();
             let mut agent_guard = match agent.lock(&cx).await {
                 Ok(guard) => guard,
@@ -5974,87 +6091,193 @@ impl PiApp {
 
             let event_sender = event_tx.clone();
             let extensions = extensions.clone();
-            let result = agent_guard
-                .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
-                    let extension_event = extension_event_from_agent(&event);
-                    let mapped = match &event {
-                        AgentEvent::AgentStart => Some(PiMsg::AgentStart),
-                        AgentEvent::MessageUpdate {
-                            assistant_message_event,
-                            ..
-                        } => match assistant_message_event.as_ref() {
-                            AssistantMessageEvent::TextDelta { delta, .. } => {
-                                Some(PiMsg::TextDelta(delta.clone()))
-                            }
-                            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                                Some(PiMsg::ThinkingDelta(delta.clone()))
+            let result = if input_images.is_empty() {
+                agent_guard
+                    .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
+                        let extension_event = extension_event_from_agent(&event);
+                        let mapped = match &event {
+                            AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
+                            AgentEvent::MessageUpdate {
+                                assistant_message_event,
+                                ..
+                            } => match assistant_message_event.as_ref() {
+                                AssistantMessageEvent::TextDelta { delta, .. } => {
+                                    Some(PiMsg::TextDelta(delta.clone()))
+                                }
+                                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                                    Some(PiMsg::ThinkingDelta(delta.clone()))
+                                }
+                                _ => None,
+                            },
+                            AgentEvent::ToolExecutionStart {
+                                tool_name,
+                                tool_call_id,
+                                ..
+                            } => Some(PiMsg::ToolStart {
+                                name: tool_name.clone(),
+                                tool_id: tool_call_id.clone(),
+                            }),
+                            AgentEvent::ToolExecutionUpdate {
+                                tool_name,
+                                tool_call_id,
+                                partial_result,
+                                ..
+                            } => Some(PiMsg::ToolUpdate {
+                                name: tool_name.clone(),
+                                tool_id: tool_call_id.clone(),
+                                content: partial_result.content.clone(),
+                                details: partial_result.details.clone(),
+                            }),
+                            AgentEvent::ToolExecutionEnd {
+                                tool_name,
+                                tool_call_id,
+                                is_error,
+                                ..
+                            } => Some(PiMsg::ToolEnd {
+                                name: tool_name.clone(),
+                                tool_id: tool_call_id.clone(),
+                                is_error: *is_error,
+                            }),
+                            AgentEvent::AgentEnd { messages, .. } => {
+                                let last = last_assistant_message(messages);
+                                let mut usage = Usage::default();
+                                for message in messages {
+                                    if let ModelMessage::Assistant(assistant) = message {
+                                        add_usage(&mut usage, &assistant.usage);
+                                    }
+                                }
+                                Some(PiMsg::AgentDone {
+                                    usage: Some(usage),
+                                    stop_reason: last
+                                        .as_ref()
+                                        .map_or(StopReason::Stop, |msg| msg.stop_reason),
+                                    error_message: last
+                                        .as_ref()
+                                        .and_then(|msg| msg.error_message.clone()),
+                                })
                             }
                             _ => None,
-                        },
-                        AgentEvent::ToolExecutionStart {
-                            tool_name,
-                            tool_call_id,
-                            ..
-                        } => Some(PiMsg::ToolStart {
-                            name: tool_name.clone(),
-                            tool_id: tool_call_id.clone(),
-                        }),
-                        AgentEvent::ToolExecutionUpdate {
-                            tool_name,
-                            tool_call_id,
-                            partial_result,
-                            ..
-                        } => Some(PiMsg::ToolUpdate {
-                            name: tool_name.clone(),
-                            tool_id: tool_call_id.clone(),
-                            content: partial_result.content.clone(),
-                            details: partial_result.details.clone(),
-                        }),
-                        AgentEvent::ToolExecutionEnd {
-                            tool_name,
-                            tool_call_id,
-                            is_error,
-                            ..
-                        } => Some(PiMsg::ToolEnd {
-                            name: tool_name.clone(),
-                            tool_id: tool_call_id.clone(),
-                            is_error: *is_error,
-                        }),
-                        AgentEvent::AgentEnd { messages, .. } => {
-                            let last = last_assistant_message(messages);
-                            let mut usage = Usage::default();
-                            for message in messages {
-                                if let ModelMessage::Assistant(assistant) = message {
-                                    add_usage(&mut usage, &assistant.usage);
+                        };
+
+                        if let Some(msg) = mapped {
+                            let _ = event_sender.try_send(msg);
+                        }
+
+                        if let Some(manager) = &extensions {
+                            if let Some((event_name, data)) = extension_event {
+                                if !matches!(
+                                    event_name,
+                                    ExtensionEventName::AgentStart
+                                        | ExtensionEventName::AgentEnd
+                                        | ExtensionEventName::TurnStart
+                                        | ExtensionEventName::TurnEnd
+                                ) {
+                                    let manager = manager.clone();
+                                    runtime_handle_for_agent.spawn(async move {
+                                        let _ = manager.dispatch_event(event_name, data).await;
+                                    });
                                 }
                             }
-                            Some(PiMsg::AgentDone {
-                                usage: Some(usage),
-                                stop_reason: last
-                                    .as_ref()
-                                    .map_or(StopReason::Stop, |msg| msg.stop_reason),
-                                error_message: last
-                                    .as_ref()
-                                    .and_then(|msg| msg.error_message.clone()),
-                            })
                         }
-                        _ => None,
-                    };
+                    })
+                    .await
+            } else {
+                let content_for_agent =
+                    build_content_blocks_for_input(&message_for_agent, &input_images);
+                agent_guard
+                    .run_with_content_with_abort(
+                        content_for_agent,
+                        Some(abort_signal),
+                        move |event| {
+                            let extension_event = extension_event_from_agent(&event);
+                            let mapped = match &event {
+                                AgentEvent::AgentStart { .. } => Some(PiMsg::AgentStart),
+                                AgentEvent::MessageUpdate {
+                                    assistant_message_event,
+                                    ..
+                                } => match assistant_message_event.as_ref() {
+                                    AssistantMessageEvent::TextDelta { delta, .. } => {
+                                        Some(PiMsg::TextDelta(delta.clone()))
+                                    }
+                                    AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                                        Some(PiMsg::ThinkingDelta(delta.clone()))
+                                    }
+                                    _ => None,
+                                },
+                                AgentEvent::ToolExecutionStart {
+                                    tool_name,
+                                    tool_call_id,
+                                    ..
+                                } => Some(PiMsg::ToolStart {
+                                    name: tool_name.clone(),
+                                    tool_id: tool_call_id.clone(),
+                                }),
+                                AgentEvent::ToolExecutionUpdate {
+                                    tool_name,
+                                    tool_call_id,
+                                    partial_result,
+                                    ..
+                                } => Some(PiMsg::ToolUpdate {
+                                    name: tool_name.clone(),
+                                    tool_id: tool_call_id.clone(),
+                                    content: partial_result.content.clone(),
+                                    details: partial_result.details.clone(),
+                                }),
+                                AgentEvent::ToolExecutionEnd {
+                                    tool_name,
+                                    tool_call_id,
+                                    is_error,
+                                    ..
+                                } => Some(PiMsg::ToolEnd {
+                                    name: tool_name.clone(),
+                                    tool_id: tool_call_id.clone(),
+                                    is_error: *is_error,
+                                }),
+                                AgentEvent::AgentEnd { messages, .. } => {
+                                    let last = last_assistant_message(messages);
+                                    let mut usage = Usage::default();
+                                    for message in messages {
+                                        if let ModelMessage::Assistant(assistant) = message {
+                                            add_usage(&mut usage, &assistant.usage);
+                                        }
+                                    }
+                                    Some(PiMsg::AgentDone {
+                                        usage: Some(usage),
+                                        stop_reason: last
+                                            .as_ref()
+                                            .map_or(StopReason::Stop, |msg| msg.stop_reason),
+                                        error_message: last
+                                            .as_ref()
+                                            .and_then(|msg| msg.error_message.clone()),
+                                    })
+                                }
+                                _ => None,
+                            };
 
-                    if let Some(msg) = mapped {
-                        let _ = event_sender.try_send(msg);
-                    }
+                            if let Some(msg) = mapped {
+                                let _ = event_sender.try_send(msg);
+                            }
 
-                    if let Some(manager) = &extensions {
-                        if let Some((event_name, data)) = extension_event {
-                            let manager = manager.clone();
-                            runtime_handle_for_agent.spawn(async move {
-                                let _ = manager.dispatch_event(event_name, data).await;
-                            });
-                        }
-                    }
-                })
-                .await;
+                            if let Some(manager) = &extensions {
+                                if let Some((event_name, data)) = extension_event {
+                                    if !matches!(
+                                        event_name,
+                                        ExtensionEventName::AgentStart
+                                            | ExtensionEventName::AgentEnd
+                                            | ExtensionEventName::TurnStart
+                                            | ExtensionEventName::TurnEnd
+                                    ) {
+                                        let manager = manager.clone();
+                                        runtime_handle_for_agent.spawn(async move {
+                                            let _ = manager.dispatch_event(event_name, data).await;
+                                        });
+                                    }
+                                }
+                            }
+                        },
+                    )
+                    .await
+            };
 
             let new_messages: Vec<crate::model::Message> =
                 agent_guard.messages()[previous_len..].to_vec();
