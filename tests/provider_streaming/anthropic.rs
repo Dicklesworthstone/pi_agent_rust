@@ -218,6 +218,7 @@ async fn run_scenario(scenario: Scenario) {
     let recorder = VcrRecorder::new_with(scenario.name, mode, &cassette_dir);
     let client = Client::new().with_vcr(recorder);
     let mut provider = AnthropicProvider::new(scenario.model.clone()).with_client(client);
+    #[allow(clippy::option_if_let_else)] // closure would capture `provider` by move
     let _mock_server = if is_recording {
         if let Some(expectation) = error_expectation.as_ref() {
             let server = harness.start_mock_http_server();
