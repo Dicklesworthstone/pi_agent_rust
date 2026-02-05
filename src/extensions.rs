@@ -1254,7 +1254,44 @@ fn canonicalize_for_create(path: &Path) -> std::result::Result<PathBuf, HostCall
         retryable: None,
     })?;
 
-    Ok(canonical_ancestor.join(suffix))
+    let mut normalized_parts: Vec<std::ffi::OsString> = Vec::new();
+    for component in suffix.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(part) => normalized_parts.push(part.to_os_string()),
+            std::path::Component::ParentDir => {
+                if normalized_parts.pop().is_none() {
+                    return Err(HostCallError {
+                        code: HostCallErrorCode::InvalidRequest,
+                        message: "Path escapes existing ancestor".to_string(),
+                        details: Some(json!({
+                            "path": path.display().to_string(),
+                            "ancestor": ancestor.display().to_string(),
+                        })),
+                        retryable: None,
+                    });
+                }
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(HostCallError {
+                    code: HostCallErrorCode::InvalidRequest,
+                    message: "Invalid path suffix".to_string(),
+                    details: Some(json!({
+                        "path": path.display().to_string(),
+                        "ancestor": ancestor.display().to_string(),
+                    })),
+                    retryable: None,
+                });
+            }
+        }
+    }
+
+    let mut normalized_suffix = PathBuf::new();
+    for part in normalized_parts {
+        normalized_suffix.push(part);
+    }
+
+    Ok(canonical_ancestor.join(normalized_suffix))
 }
 
 fn hash_path(path: &Path) -> String {
@@ -7226,6 +7263,37 @@ mod tests {
             capability: "read".to_string(),
             method: "fs".to_string(),
             params: json!({ "op": "read", "path": "../outside.txt" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+        let denied = connector.handle_host_call(&denied_call);
+        assert!(denied.is_error);
+        assert_eq!(
+            denied.error.as_ref().expect("error").code,
+            HostCallErrorCode::Denied
+        );
+    }
+
+    #[test]
+    fn fs_connector_denies_write_escape_via_dotdot_segments() {
+        let dir = tempdir().expect("tempdir");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).expect("create project dir");
+
+        let policy = ExtensionPolicy::default();
+        let scopes = FsScopes::for_cwd(&project).expect("scopes");
+        let connector = FsConnector::new(&project, policy, scopes).expect("connector");
+
+        let denied_call = HostCallPayload {
+            call_id: "call-write-deny".to_string(),
+            capability: "write".to_string(),
+            method: "fs".to_string(),
+            params: json!({
+                "op": "write",
+                "path": "subdir/../../outside.txt",
+                "data": "secret",
+            }),
             timeout_ms: None,
             cancel_token: None,
             context: None,

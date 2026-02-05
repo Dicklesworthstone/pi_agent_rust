@@ -905,6 +905,15 @@ cargo test sse::tests
 cargo test conformance
 ```
 
+### Release & Publishing
+
+Releases are tag-driven and must align with `Cargo.toml` versions.
+
+- Tag format: `vX.Y.Z` (pre-releases like `vX.Y.Z-rc.N` are allowed but skip crates.io publish).
+- The tag version **must** match `package.version` in `Cargo.toml`.
+- Publish order for dependencies: `asupersync` → `rich_rust` → `charmed-*` (lipgloss, bubbletea, bubbles, glamour) → `pi_agent_rust`.
+- `.github/workflows/publish.yml` handles crates.io publish when `CARGO_REGISTRY_TOKEN` is set.
+
 ### Coverage
 
 Coverage uses `cargo-llvm-cov`:
