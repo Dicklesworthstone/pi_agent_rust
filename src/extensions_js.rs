@@ -2837,6 +2837,8 @@ function __pi_register_provider(provider_id, spec) {
     __pi_provider_index.set(id, record);
 }
 
+const __pi_reserved_keys = new Set(['ctrl+c', 'ctrl+d', 'ctrl+l', 'ctrl+z']);
+
 function __pi_register_shortcut(key, spec) {
     const ext = __pi_current_extension_or_throw();
     if (!spec || typeof spec !== 'object') {
@@ -2846,13 +2848,21 @@ function __pi_register_shortcut(key, spec) {
         throw new Error('registerShortcut: spec.handler must be a function');
     }
 
-    // Keys can be strings or small objects. Keep it stable for snapshots.
-    const keyId = typeof key === 'string' ? key : JSON.stringify(key ?? null);
-    const entry = {
+    const keyId = typeof key === 'string' ? key.toLowerCase() : JSON.stringify(key ?? null);
+    if (__pi_reserved_keys.has(keyId)) {
+        throw new Error('registerShortcut: key ' + keyId + ' is reserved and cannot be overridden');
+    }
+
+    const record = {
         key: key,
+        keyId: keyId,
         description: spec.description ? String(spec.description) : '',
+        handler: spec.handler,
+        extensionId: ext.id,
+        spec: { key: key, key_id: keyId, description: spec.description ? String(spec.description) : '' },
     };
-    ext.shortcuts.set(keyId, entry);
+    ext.shortcuts.set(keyId, record);
+    __pi_shortcut_index.set(keyId, record);
 }
 
 	function __pi_register_hook(event_name, handler) {
@@ -3026,6 +3036,11 @@ function __pi_snapshot_extensions() {
             event_hooks.push(String(key));
         }
 
+        const shortcuts = [];
+        for (const shortcut of ext.shortcuts.values()) {
+            shortcuts.push(shortcut.spec);
+        }
+
         out.push({
             id: id,
             name: ext.name,
@@ -3034,6 +3049,7 @@ function __pi_snapshot_extensions() {
             tools: tools,
             slash_commands: commands,
             providers: providers,
+            shortcuts: shortcuts,
             event_hooks: event_hooks,
             active_tools: Array.isArray(ext.activeTools) ? ext.activeTools.slice() : null,
         });
@@ -3320,6 +3336,17 @@ async function __pi_execute_command(command_name, args, ctx_payload) {
 
     const ctx = __pi_make_extension_ctx(ctx_payload);
     return await __pi_with_extension_async(record.extensionId, () => record.handler(args, ctx));
+}
+
+async function __pi_execute_shortcut(key_id, ctx_payload) {
+    const id = String(key_id || '').trim().toLowerCase();
+    const record = __pi_shortcut_index.get(id);
+    if (!record) {
+        throw new Error('Unknown shortcut: ' + id);
+    }
+
+    const ctx = __pi_make_extension_ctx(ctx_payload);
+    return await __pi_with_extension_async(record.extensionId, () => record.handler(ctx));
 }
 
 // Complete a hostcall (called from Rust)

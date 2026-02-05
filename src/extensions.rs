@@ -6297,6 +6297,12 @@ impl ExtensionManager {
         }
     }
 
+    /// Dynamically register a provider at runtime (from a hostcall).
+    pub fn register_provider(&self, payload: Value) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.providers.push(payload);
+    }
+
     /// Execute an extension slash command via the JS runtime.
     pub async fn execute_command(
         &self,
@@ -6315,6 +6321,147 @@ impl ExtensionManager {
                 timeout_ms,
             )
             .await
+    }
+
+    /// Dynamically register a provider at runtime (from a hostcall).
+    pub fn register_provider(&self, spec: Value) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.providers.push(spec);
+    }
+
+    /// Return extension-registered providers as raw JSON specs.
+    pub fn extension_providers(&self) -> Vec<Value> {
+        let guard = self.inner.lock().unwrap();
+        guard.providers.clone()
+    }
+
+    /// Convert extension-registered providers into model entries suitable for
+    /// merging into the [`ModelRegistry`].
+    pub fn extension_model_entries(&self) -> Vec<crate::models::ModelEntry> {
+        use crate::provider::{InputType, Model, ModelCost};
+        use std::collections::HashMap;
+
+        let guard = self.inner.lock().unwrap();
+        let mut entries = Vec::new();
+
+        for provider_spec in &guard.providers {
+            let provider_id = provider_spec
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if provider_id.is_empty() {
+                continue;
+            }
+            let base_url = provider_spec
+                .get("baseUrl")
+                .or_else(|| provider_spec.get("base_url"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let api_key_ref = provider_spec
+                .get("apiKey")
+                .or_else(|| provider_spec.get("api_key"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let api = provider_spec
+                .get("api")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+
+            // Resolve API key (supports env var names).
+            let resolved_key = if api_key_ref.is_empty() {
+                None
+            } else {
+                std::env::var(api_key_ref)
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .or_else(|| Some(api_key_ref.to_string()))
+            };
+
+            let models = provider_spec
+                .get("models")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+
+            for model_spec in &models {
+                let model_id = model_spec
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if model_id.is_empty() {
+                    continue;
+                }
+                let model_name = model_spec
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| model_id.clone());
+                let model_api = model_spec
+                    .get("api")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| api.clone());
+                let reasoning = model_spec
+                    .get("reasoning")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let context_window = model_spec
+                    .get("contextWindow")
+                    .or_else(|| model_spec.get("context_window"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(128_000) as u32;
+                let max_tokens = model_spec
+                    .get("maxTokens")
+                    .or_else(|| model_spec.get("max_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(16_384) as u32;
+
+                let input = model_spec
+                    .get("input")
+                    .and_then(Value::as_array)
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(Value::as_str)
+                            .filter_map(|s| match s {
+                                "text" => Some(InputType::Text),
+                                "image" => Some(InputType::Image),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_else(|| vec![InputType::Text]);
+
+                entries.push(crate::models::ModelEntry {
+                    model: Model {
+                        id: model_id,
+                        name: model_name,
+                        api: model_api,
+                        provider: provider_id.clone(),
+                        base_url: base_url.clone(),
+                        reasoning,
+                        input,
+                        cost: ModelCost {
+                            input: 0.0,
+                            output: 0.0,
+                            cache_read: 0.0,
+                            cache_write: 0.0,
+                        },
+                        context_window,
+                        max_tokens,
+                        headers: HashMap::new(),
+                    },
+                    api_key: resolved_key.clone(),
+                    headers: HashMap::new(),
+                    auth_header: true,
+                    compat: None,
+                });
+            }
+        }
+        entries
     }
 
     pub fn list_commands(&self) -> Vec<Value> {

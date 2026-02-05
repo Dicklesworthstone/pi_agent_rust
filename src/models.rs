@@ -113,6 +113,29 @@ impl ModelRegistry {
             .find(|m| m.model.provider == provider && m.model.id == id)
             .cloned()
     }
+
+    /// Find a model by ID alone (ignoring provider), useful for extension models
+    /// where the provider name may be custom.
+    pub fn find_by_id(&self, id: &str) -> Option<ModelEntry> {
+        self.models
+            .iter()
+            .find(|m| m.model.id == id)
+            .cloned()
+    }
+
+    /// Merge extension-provided model entries into the registry.
+    pub fn merge_entries(&mut self, entries: Vec<ModelEntry>) {
+        for entry in entries {
+            // Skip duplicates (same provider + id).
+            let exists = self
+                .models
+                .iter()
+                .any(|m| m.model.provider == entry.model.provider && m.model.id == entry.model.id);
+            if !exists {
+                self.models.push(entry);
+            }
+        }
+    }
 }
 
 fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
