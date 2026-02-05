@@ -37,6 +37,7 @@ pub mod autocomplete;
 pub mod cli;
 pub mod compaction;
 pub mod config;
+pub mod conformance;
 pub mod connectors;
 pub mod error;
 pub mod error_hints;
