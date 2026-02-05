@@ -2727,10 +2727,12 @@ impl Tool for FindTool {
                 continue;
             }
 
-            let mut rel = if Path::new(line).is_absolute() && line.starts_with(&search_path_str) {
-                line[search_path_str.len()..]
-                    .trim_start_matches(['/', '\\'])
-                    .to_string()
+            let mut rel = if Path::new(line).is_absolute() {
+                if let Ok(stripped) = Path::new(line).strip_prefix(&search_path) {
+                    stripped.to_string_lossy().to_string()
+                } else {
+                    line.to_string()
+                }
             } else {
                 line.to_string()
             };
