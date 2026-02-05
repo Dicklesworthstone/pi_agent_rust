@@ -14,12 +14,12 @@ mod common;
 
 use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
-    RegisterPayload, PROTOCOL_VERSION,
+    PROTOCOL_VERSION, RegisterPayload,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::model::ToolCall;
 use pi::tools::{ToolOutput, ToolRegistry};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
@@ -213,8 +213,7 @@ fn dispatch_event_invokes_matching_hook() {
                 .expect("get events")
         }
     });
-    let events: Vec<String> =
-        serde_json::from_str(result.as_str().unwrap()).expect("parse events");
+    let events: Vec<String> = serde_json::from_str(result.as_str().unwrap()).expect("parse events");
     assert!(
         events.contains(&"startup".to_string()),
         "Expected startup event, got: {events:?}"
@@ -310,7 +309,10 @@ fn dispatch_cancellable_event_detects_false() {
         }
     });
 
-    assert!(cancelled, "Expected cancellation when handler returns false");
+    assert!(
+        cancelled,
+        "Expected cancellation when handler returns false"
+    );
 }
 
 #[test]
@@ -482,8 +484,7 @@ fn dispatch_tool_result_with_hook_invoked() {
                 .expect("get events")
         }
     });
-    let events: Vec<String> =
-        serde_json::from_str(result.as_str().unwrap()).expect("parse events");
+    let events: Vec<String> = serde_json::from_str(result.as_str().unwrap()).expect("parse events");
     assert!(
         events.contains(&"tool_result:write".to_string()),
         "Expected tool_result:write in events, got: {events:?}"
@@ -504,7 +505,10 @@ fn event_hooks_only_matching_hooks_invoked() {
         let manager = manager.clone();
         async move {
             manager
-                .dispatch_event(ExtensionEventName::AgentStart, Some(json!({"session_id": "s1"})))
+                .dispatch_event(
+                    ExtensionEventName::AgentStart,
+                    Some(json!({"session_id": "s1"})),
+                )
                 .await
                 .expect("dispatch agent_start");
 
@@ -528,8 +532,7 @@ fn event_hooks_only_matching_hooks_invoked() {
                 .expect("get events")
         }
     });
-    let events: Vec<String> =
-        serde_json::from_str(result.as_str().unwrap()).expect("parse events");
+    let events: Vec<String> = serde_json::from_str(result.as_str().unwrap()).expect("parse events");
 
     assert!(
         events.contains(&"agent_start".to_string()),
@@ -547,8 +550,7 @@ fn event_hooks_only_matching_hooks_invoked() {
 
 #[test]
 fn event_ordering_startup_then_tool_call_then_agent_end() {
-    let harness =
-        common::TestHarness::new("event_ordering_startup_then_tool_call_then_agent_end");
+    let harness = common::TestHarness::new("event_ordering_startup_then_tool_call_then_agent_end");
     let manager = load_js_extension(&harness, EVENT_TRACKING_EXT);
 
     // Simulate lifecycle sequence: startup → agent_start → tool_call → tool_result → agent_end
@@ -561,7 +563,10 @@ fn event_ordering_startup_then_tool_call_then_agent_end() {
                 .expect("dispatch startup");
 
             manager
-                .dispatch_event(ExtensionEventName::AgentStart, Some(json!({"session_id": "s1"})))
+                .dispatch_event(
+                    ExtensionEventName::AgentStart,
+                    Some(json!({"session_id": "s1"})),
+                )
                 .await
                 .expect("dispatch agent_start");
 
@@ -591,7 +596,10 @@ fn event_ordering_startup_then_tool_call_then_agent_end() {
                 .expect("dispatch tool_result");
 
             manager
-                .dispatch_event(ExtensionEventName::AgentEnd, Some(json!({"session_id": "s1"})))
+                .dispatch_event(
+                    ExtensionEventName::AgentEnd,
+                    Some(json!({"session_id": "s1"})),
+                )
                 .await
                 .expect("dispatch agent_end");
         }
@@ -607,10 +615,13 @@ fn event_ordering_startup_then_tool_call_then_agent_end() {
                 .expect("get events")
         }
     });
-    let events: Vec<String> =
-        serde_json::from_str(result.as_str().unwrap()).expect("parse events");
+    let events: Vec<String> = serde_json::from_str(result.as_str().unwrap()).expect("parse events");
 
-    assert_eq!(events.len(), 5, "Expected 5 lifecycle events, got: {events:?}");
+    assert_eq!(
+        events.len(),
+        5,
+        "Expected 5 lifecycle events, got: {events:?}"
+    );
     assert_eq!(events[0], "startup");
     assert_eq!(events[1], "agent_start");
     assert_eq!(events[2], "tool_call:read");
