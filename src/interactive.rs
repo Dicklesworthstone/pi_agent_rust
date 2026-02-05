@@ -874,23 +874,48 @@ impl PiApp {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn load_session_from_path(&mut self, path: &str) -> Option<Cmd> {
         let path = path.to_string();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
+        let extensions = self.extensions.clone();
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
 
-        let session_dir = {
+        let (session_dir, previous_session_file) = {
             let Ok(guard) = self.session.try_lock() else {
                 self.status_message = Some("Session busy; try again".to_string());
                 return None;
             };
-            guard.session_dir.clone()
+            (
+                guard.session_dir.clone(),
+                guard.path.as_ref().map(|p| p.display().to_string()),
+            )
         };
 
         runtime_handle.spawn(async move {
             let cx = Cx::for_request();
+
+            if let Some(manager) = extensions.clone() {
+                let cancelled = manager
+                    .dispatch_cancellable_event(
+                        ExtensionEventName::SessionBeforeSwitch,
+                        Some(json!({
+                            "reason": "resume",
+                            "targetSessionFile": path.clone(),
+                        })),
+                        EXTENSION_EVENT_TIMEOUT_MS,
+                    )
+                    .await
+                    .unwrap_or(false);
+                if cancelled {
+                    let _ = event_tx.try_send(PiMsg::System(
+                        "Session switch cancelled by extension".to_string(),
+                    ));
+                    return;
+                }
+            }
 
             let mut loaded_session = match Session::open(&path).await {
                 Ok(session) => session,
@@ -900,6 +925,7 @@ impl PiApp {
                     return;
                 }
             };
+            let new_session_id = loaded_session.header.id.clone();
             loaded_session.session_dir = session_dir;
 
             let messages_for_agent = loaded_session.to_messages_for_current_path();
@@ -947,6 +973,20 @@ impl PiApp {
                 usage,
                 status: Some("Session resumed".to_string()),
             });
+
+            if let Some(manager) = extensions {
+                let _ = manager
+                    .dispatch_event(
+                        ExtensionEventName::SessionSwitch,
+                        Some(json!({
+                            "reason": "resume",
+                            "previousSessionFile": previous_session_file,
+                            "targetSessionFile": path,
+                            "sessionId": new_session_id,
+                        })),
+                    )
+                    .await;
+            }
         });
 
         self.status_message = Some("Loading session...".to_string());
@@ -2066,6 +2106,7 @@ pub async fn run_interactive(
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
+    extensions: Option<ExtensionManager>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
@@ -2091,11 +2132,7 @@ pub async fn run_interactive(
         }
     });
 
-    let extensions = if resource_cli.no_extensions {
-        None
-    } else {
-        Some(ExtensionManager::new())
-    };
+    let extensions = extensions;
 
     let (extension_ui_tx, extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
     if let Some(manager) = &extensions {
@@ -7233,40 +7270,133 @@ impl PiApp {
                     return None;
                 }
 
-                let Ok(mut session_guard) = self.session.try_lock() else {
-                    self.status_message = Some("Session busy; try again".to_string());
+                let Some(extensions) = self.extensions.clone() else {
+                    let Ok(mut session_guard) = self.session.try_lock() else {
+                        self.status_message = Some("Session busy; try again".to_string());
+                        return None;
+                    };
+                    let session_dir = session_guard.session_dir.clone();
+                    *session_guard = Session::create_with_dir(session_dir);
+                    session_guard.header.provider = Some(self.model_entry.model.provider.clone());
+                    session_guard.header.model_id = Some(self.model_entry.model.id.clone());
+                    session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                    drop(session_guard);
+
+                    if let Ok(mut agent_guard) = self.agent.try_lock() {
+                        agent_guard.replace_messages(Vec::new());
+                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                    }
+
+                    self.messages.clear();
+                    self.total_usage = Usage::default();
+                    self.current_response.clear();
+                    self.current_thinking.clear();
+                    self.current_tool = None;
+                    self.pending_tool_output = None;
+                    self.abort_handle = None;
+                    self.pending_oauth = None;
+                    self.session_picker = None;
+                    self.tree_ui = None;
+                    self.autocomplete.close();
+
+                    self.status_message = Some(format!(
+                        "Started new session\nModel set to {}\nThinking level: off",
+                        self.model
+                    ));
+                    self.scroll_to_bottom();
+                    self.input.focus();
                     return None;
                 };
-                let session_dir = session_guard.session_dir.clone();
-                *session_guard = Session::create_with_dir(session_dir);
-                session_guard.header.provider = Some(self.model_entry.model.provider.clone());
-                session_guard.header.model_id = Some(self.model_entry.model.id.clone());
-                session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
-                drop(session_guard);
 
-                if let Ok(mut agent_guard) = self.agent.try_lock() {
-                    agent_guard.replace_messages(Vec::new());
-                    agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
-                }
+                let model_provider = self.model_entry.model.provider.clone();
+                let model_id = self.model_entry.model.id.clone();
+                let model_label = self.model.clone();
+                let event_tx = self.event_tx.clone();
+                let session = Arc::clone(&self.session);
+                let agent = Arc::clone(&self.agent);
+                let runtime_handle = self.runtime_handle.clone();
 
-                self.messages.clear();
-                self.total_usage = Usage::default();
-                self.current_response.clear();
-                self.current_thinking.clear();
-                self.current_tool = None;
-                self.pending_tool_output = None;
-                self.abort_handle = None;
-                self.pending_oauth = None;
-                self.session_picker = None;
-                self.tree_ui = None;
-                self.autocomplete.close();
+                let previous_session_file = self
+                    .session
+                    .try_lock()
+                    .ok()
+                    .and_then(|guard| guard.path.as_ref().map(|p| p.display().to_string()));
 
-                self.status_message = Some(format!(
-                    "Started new session\nModel set to {}\nThinking level: off",
-                    self.model
-                ));
-                self.scroll_to_bottom();
-                self.input.focus();
+                self.agent_state = AgentState::Processing;
+                self.status_message = Some("Starting new session...".to_string());
+
+                runtime_handle.spawn(async move {
+                    let cx = Cx::for_request();
+
+                    let cancelled = extensions
+                        .dispatch_cancellable_event(
+                            ExtensionEventName::SessionBeforeSwitch,
+                            Some(json!({ "reason": "new" })),
+                            EXTENSION_EVENT_TIMEOUT_MS,
+                        )
+                        .await
+                        .unwrap_or(false);
+                    if cancelled {
+                        let _ = event_tx.try_send(PiMsg::System(
+                            "Session switch cancelled by extension".to_string(),
+                        ));
+                        return;
+                    }
+
+                    let new_session_id = {
+                        let mut guard = match session.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock session: {err}"
+                                )));
+                                return;
+                            }
+                        };
+                        let session_dir = guard.session_dir.clone();
+                        let mut new_session = Session::create_with_dir(session_dir);
+                        new_session.header.provider = Some(model_provider);
+                        new_session.header.model_id = Some(model_id);
+                        new_session.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                        let new_id = new_session.header.id.clone();
+                        *guard = new_session;
+                        new_id
+                    };
+
+                    {
+                        let mut agent_guard = match agent.lock(&cx).await {
+                            Ok(guard) => guard,
+                            Err(err) => {
+                                let _ = event_tx.try_send(PiMsg::AgentError(format!(
+                                    "Failed to lock agent: {err}"
+                                )));
+                                return;
+                            }
+                        };
+                        agent_guard.replace_messages(Vec::new());
+                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                    }
+
+                    let _ = event_tx.try_send(PiMsg::ConversationReset {
+                        messages: Vec::new(),
+                        usage: Usage::default(),
+                        status: Some(format!(
+                            "Started new session\nModel set to {model_label}\nThinking level: off"
+                        )),
+                    });
+
+                    let _ = extensions
+                        .dispatch_event(
+                            ExtensionEventName::SessionSwitch,
+                            Some(json!({
+                                "reason": "new",
+                                "previousSessionFile": previous_session_file,
+                                "sessionId": new_session_id,
+                            })),
+                        )
+                        .await;
+                });
+
                 None
             }
             SlashCommand::Copy => {

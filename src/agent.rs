@@ -13,6 +13,9 @@
 //! 5. If done: return final message
 
 use crate::error::{Error, Result};
+use crate::extension_tools::collect_extension_tool_wrappers;
+use crate::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+use crate::extensions_js::PiJsRuntimeConfig;
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Message, StopReason, StreamEvent,
     TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
@@ -1268,6 +1271,7 @@ pub struct AgentSession {
     pub agent: Agent,
     pub session: Session,
     save_enabled: bool,
+    pub extensions: Option<ExtensionManager>,
 }
 
 #[cfg(test)]
@@ -1338,6 +1342,117 @@ mod message_queue_tests {
         let first = queue.push_steering(user_message("a"));
         let second = queue.push_follow_up(user_message("b"));
         assert!(second > first);
+    }
+}
+
+#[cfg(test)]
+mod extensions_integration_tests {
+    use super::*;
+
+    use crate::session::Session;
+    use asupersync::runtime::RuntimeBuilder;
+    use async_trait::async_trait;
+    use futures::Stream;
+    use serde_json::json;
+    use std::path::Path;
+    use std::pin::Pin;
+
+    #[derive(Debug)]
+    struct NoopProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for NoopProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[test]
+    fn agent_session_enable_extensions_registers_extension_tools() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "hello_tool",
+                    label: "hello_tool",
+                    description: "test tool",
+                    parameters: { type: "object", properties: { name: { type: "string" } } },
+                    execute: async (_callId, input, _onUpdate, _abort, ctx) => {
+                      const who = input && input.name ? String(input.name) : "world";
+                      const cwd = ctx && ctx.cwd ? String(ctx.cwd) : "";
+                      return {
+                        content: [{ type: "text", text: `hello ${who}` }],
+                        details: { from: "extension", cwd: cwd },
+                        isError: false
+                      };
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Session::in_memory();
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool = agent_session
+                .agent
+                .tools
+                .get("hello_tool")
+                .expect("hello_tool registered");
+
+            let output = tool
+                .execute("call-1", json!({ "name": "pi" }), None)
+                .await
+                .expect("execute tool");
+
+            assert!(!output.is_error);
+            match output.content.as_slice() {
+                [ContentBlock::Text(text)] => assert_eq!(text.text, "hello pi"),
+                other => panic!("Expected single text content block, got {other:?}"),
+            }
+
+            let details = output.details.expect("details present");
+            assert_eq!(
+                details.get("from").and_then(serde_json::Value::as_str),
+                Some("extension")
+            );
+        });
     }
 }
 
@@ -1600,11 +1715,50 @@ impl AgentSession {
             agent,
             session,
             save_enabled,
+            extensions: None,
         }
     }
 
     pub const fn save_enabled(&self) -> bool {
         self.save_enabled
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enable_extensions(
+        &mut self,
+        enabled_tools: &[&str],
+        cwd: &std::path::Path,
+        config: Option<&crate::config::Config>,
+        extension_entries: &[std::path::PathBuf],
+    ) -> Result<()> {
+        let manager = ExtensionManager::new();
+        manager.set_cwd(cwd.display().to_string());
+
+        let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config));
+        let js_runtime = JsExtensionRuntimeHandle::start(
+            PiJsRuntimeConfig {
+                cwd: cwd.display().to_string(),
+                ..Default::default()
+            },
+            Arc::clone(&tools),
+            manager.clone(),
+        )
+        .await?;
+        manager.set_js_runtime(js_runtime);
+
+        let mut specs = Vec::new();
+        for entry in extension_entries {
+            specs.push(JsExtensionLoadSpec::from_entry_path(entry)?);
+        }
+        if !specs.is_empty() {
+            manager.load_js_extensions(specs).await?;
+        }
+
+        let ctx_payload = serde_json::json!({ "cwd": cwd.display().to_string() });
+        let wrappers = collect_extension_tool_wrappers(&manager, ctx_payload).await?;
+        self.agent.extend_tools(wrappers);
+        self.extensions = Some(manager);
+        Ok(())
     }
 
     pub async fn save_and_index(&mut self) -> Result<()> {

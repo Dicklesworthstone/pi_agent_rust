@@ -8,7 +8,10 @@ use common::TestHarness;
 use futures::stream;
 use pi::agent::{Agent, AgentConfig};
 use pi::config::{Config, TerminalSettings};
-use pi::extensions::ExtensionUiRequest;
+use pi::extensions::{
+    ExtensionManager, ExtensionUiRequest, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+};
+use pi::extensions_js::PiJsRuntimeConfig;
 use pi::interactive::{ConversationMessage, MessageRole, PendingInput, PiApp, PiMsg};
 use pi::keybindings::KeyBindings;
 use pi::model::{
@@ -165,6 +168,83 @@ fn build_app_with_session_and_config(
     );
     app.set_terminal_size(80, 24);
     app
+}
+
+fn build_app_with_session_and_events_and_extension(
+    harness: &TestHarness,
+    pending_inputs: Vec<PendingInput>,
+    session: Session,
+    config: Config,
+    extension_source: &str,
+) -> (PiApp, mpsc::Receiver<PiMsg>) {
+    let cwd = harness.temp_dir().to_path_buf();
+    let tools = ToolRegistry::new(&[], &cwd, Some(&config));
+    let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
+    let agent = Agent::new(provider, tools, AgentConfig::default());
+    let resources = ResourceLoader::empty(config.enable_skill_commands());
+    let resource_cli = ResourceCliOptions {
+        no_skills: false,
+        no_prompt_templates: false,
+        no_extensions: false,
+        no_themes: false,
+        skill_paths: Vec::new(),
+        prompt_paths: Vec::new(),
+        extension_paths: Vec::new(),
+        theme_paths: Vec::new(),
+    };
+    let model_entry = dummy_model_entry();
+    let model_scope = vec![model_entry.clone()];
+    let available_models = vec![model_entry.clone()];
+    let (event_tx, event_rx) = mpsc::channel(1024);
+
+    let manager = ExtensionManager::new();
+    let ext_entry_path = harness.create_file("extensions/ext.mjs", extension_source.as_bytes());
+
+    let tools_for_ext = Arc::new(ToolRegistry::new(&[], &cwd, Some(&config)));
+    let js_config = PiJsRuntimeConfig {
+        cwd: cwd.display().to_string(),
+        ..Default::default()
+    };
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools_for_ext);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+    let spec = JsExtensionLoadSpec::from_entry_path(&ext_entry_path).expect("load spec");
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+        }
+    });
+
+    let mut app = PiApp::new(
+        agent,
+        session,
+        config,
+        resources,
+        resource_cli,
+        cwd,
+        model_entry,
+        model_scope,
+        available_models,
+        pending_inputs,
+        event_tx,
+        test_runtime_handle(),
+        false,
+        Some(manager),
+        Some(KeyBindings::new()),
+    );
+    app.set_terminal_size(80, 24);
+    (app, event_rx)
 }
 
 fn build_app_with_models(
@@ -2203,6 +2283,97 @@ fn tui_state_slash_resume_selects_latest_session_and_loads_messages() {
 }
 
 #[test]
+fn tui_state_slash_resume_can_be_cancelled_by_extension() {
+    let harness = TestHarness::new("tui_state_slash_resume_can_be_cancelled_by_extension");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_dir().to_path_buf();
+
+    create_session_on_disk(&base_dir, &cwd, "older", "Older session message");
+    thread::sleep(Duration::from_millis(10));
+    create_session_on_disk(&base_dir, &cwd, "newer", "Newer session message");
+
+    let mut session = Session::create_with_dir(Some(base_dir));
+    session.header.cwd = cwd.display().to_string();
+
+    let extension_source = r#"
+export default function init(pi) {
+  pi.on("session_before_switch", async () => false);
+}
+"#;
+    let (mut app, event_rx) = build_app_with_session_and_events_and_extension(
+        &harness,
+        Vec::new(),
+        session,
+        Config::default(),
+        extension_source,
+    );
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/resume");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Select a session to resume");
+
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Loading session...");
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter().any(|msg| matches!(msg, PiMsg::System(_)))
+    });
+    let system = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::System(_)))
+        .expect("expected System message after cancelled resume");
+    let step = apply_pi(&harness, &mut app, "PiMsg::System", system);
+    assert_after_contains(&harness, &step, "Session switch cancelled by extension");
+    assert_after_not_contains(&harness, &step, "Session resumed");
+    assert_after_not_contains(&harness, &step, "Newer session message");
+}
+
+#[test]
+fn tui_state_slash_resume_fail_open_when_extension_errors() {
+    let harness = TestHarness::new("tui_state_slash_resume_fail_open_when_extension_errors");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_dir().to_path_buf();
+
+    create_session_on_disk(&base_dir, &cwd, "older", "Older session message");
+    thread::sleep(Duration::from_millis(10));
+    create_session_on_disk(&base_dir, &cwd, "newer", "Newer session message");
+
+    let mut session = Session::create_with_dir(Some(base_dir));
+    session.header.cwd = cwd.display().to_string();
+
+    let extension_source = r#"
+export default function init(pi) {
+  pi.on("session_before_switch", async () => { throw new Error("boom"); });
+}
+"#;
+    let (mut app, event_rx) = build_app_with_session_and_events_and_extension(
+        &harness,
+        Vec::new(),
+        session,
+        Config::default(),
+        extension_source,
+    );
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/resume");
+    press_enter(&harness, &mut app);
+    press_enter(&harness, &mut app);
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter()
+            .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
+    });
+    let reset = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
+        .expect("expected ConversationReset after resume");
+    let step = apply_pi(&harness, &mut app, "PiMsg::ConversationReset", reset);
+    assert_after_contains(&harness, &step, "Session resumed");
+    assert_after_contains(&harness, &step, "Newer session message");
+}
+
+#[test]
 fn tui_state_session_picker_ctrl_d_prompts_for_delete() {
     let harness = TestHarness::new("tui_state_session_picker_ctrl_d_prompts_for_delete");
     let base_dir = harness.temp_path("sessions");
@@ -2329,6 +2500,100 @@ fn tui_state_slash_new_resets_conversation_and_sets_status() {
     assert_after_not_contains(&harness, &step, "world");
     assert_after_contains(&harness, &step, "Model set to dummy/dummy-model");
     assert_after_contains(&harness, &step, "Thinking level: off");
+}
+
+#[test]
+fn tui_state_slash_new_can_be_cancelled_by_extension() {
+    let harness = TestHarness::new("tui_state_slash_new_can_be_cancelled_by_extension");
+    let session = Session::in_memory();
+
+    let extension_source = r#"
+export default function init(pi) {
+  pi.on("session_before_switch", async () => false);
+}
+"#;
+    let (mut app, event_rx) = build_app_with_session_and_events_and_extension(
+        &harness,
+        Vec::new(),
+        session,
+        Config::default(),
+        extension_source,
+    );
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ConversationReset",
+        PiMsg::ConversationReset {
+            messages: vec![user_msg("hello"), assistant_msg("world")],
+            usage: sample_usage(12, 34),
+            status: None,
+        },
+    );
+
+    type_text(&harness, &mut app, "/new");
+    press_enter(&harness, &mut app);
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter().any(|msg| matches!(msg, PiMsg::System(_)))
+    });
+    let system = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::System(_)))
+        .expect("expected System message after cancelled new");
+    let step = apply_pi(&harness, &mut app, "PiMsg::System", system);
+    assert_after_contains(&harness, &step, "Session switch cancelled by extension");
+    assert_after_contains(&harness, &step, "You: hello");
+    assert_after_contains(&harness, &step, "world");
+    assert_after_not_contains(&harness, &step, "Started new session");
+}
+
+#[test]
+fn tui_state_slash_new_fail_open_when_extension_errors() {
+    let harness = TestHarness::new("tui_state_slash_new_fail_open_when_extension_errors");
+    let session = Session::in_memory();
+
+    let extension_source = r#"
+export default function init(pi) {
+  pi.on("session_before_switch", async () => { throw new Error("boom"); });
+}
+"#;
+    let (mut app, event_rx) = build_app_with_session_and_events_and_extension(
+        &harness,
+        Vec::new(),
+        session,
+        Config::default(),
+        extension_source,
+    );
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ConversationReset",
+        PiMsg::ConversationReset {
+            messages: vec![user_msg("hello"), assistant_msg("world")],
+            usage: sample_usage(12, 34),
+            status: None,
+        },
+    );
+
+    type_text(&harness, &mut app, "/new");
+    press_enter(&harness, &mut app);
+
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+        msgs.iter()
+            .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
+    });
+    let reset = events
+        .into_iter()
+        .find(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
+        .expect("expected ConversationReset after new session");
+    let step = apply_pi(&harness, &mut app, "PiMsg::ConversationReset", reset);
+    assert_after_contains(&harness, &step, "Started new session");
+    assert_after_not_contains(&harness, &step, "You: hello");
+    assert_after_not_contains(&harness, &step, "world");
 }
 
 #[test]

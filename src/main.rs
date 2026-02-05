@@ -281,6 +281,13 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         agent_session.agent.replace_messages(history);
     }
 
+    if !resources.extensions().is_empty() {
+        agent_session
+            .enable_extensions(&enabled_tools, &cwd, Some(&config), resources.extensions())
+            .await
+            .map_err(anyhow::Error::new)?;
+    }
+
     if mode == "rpc" {
         let available_models = model_registry.get_available();
         let rpc_scoped_models = selection
@@ -931,7 +938,12 @@ async fn run_interactive_mode(
         pending.push(pi::interactive::PendingInput::Text(message));
     }
 
-    let AgentSession { agent, session, .. } = session;
+    let AgentSession {
+        agent,
+        session,
+        extensions,
+        ..
+    } = session;
     pi::interactive::run_interactive(
         agent,
         session,
@@ -943,6 +955,7 @@ async fn run_interactive_mode(
         save_enabled,
         resources,
         resource_cli,
+        extensions,
         cwd,
         runtime_handle,
     )

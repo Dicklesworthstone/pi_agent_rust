@@ -3676,6 +3676,9 @@ enum JsRuntimeCommand {
     GetRegisteredTools {
         reply: oneshot::Sender<Result<Vec<ExtensionToolDef>>>,
     },
+    PumpOnce {
+        reply: oneshot::Sender<Result<bool>>,
+    },
     DispatchEvent {
         event_name: String,
         event_payload: Value,
@@ -3748,6 +3751,10 @@ impl JsExtensionRuntimeHandle {
                         }
                         JsRuntimeCommand::GetRegisteredTools { reply } => {
                             let result = js_runtime.get_registered_tools().await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::PumpOnce { reply } => {
+                            let result = pump_js_runtime_once(&js_runtime, &host).await;
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::DispatchEvent {
@@ -3850,6 +3857,19 @@ impl JsExtensionRuntimeHandle {
                 &cx,
                 JsRuntimeCommand::GetRegisteredTools { reply: reply_tx },
             )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn pump_once(&self) -> Result<bool> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(&cx, JsRuntimeCommand::PumpOnce { reply: reply_tx })
             .await
             .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
         reply_rx
@@ -4088,6 +4108,21 @@ async fn execute_extension_command(
         .await?;
 
     await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
+}
+
+#[allow(clippy::future_not_send)]
+async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Result<bool> {
+    let mut pending = runtime.drain_hostcall_requests();
+    while let Some(req) = pending.pop_front() {
+        let call_id = req.call_id.clone();
+        let outcome = dispatch_hostcall(host, req).await;
+        runtime.complete_hostcall(call_id, outcome);
+    }
+
+    let _ = runtime.tick().await?;
+    let _ = runtime.drain_microtasks().await?;
+
+    Ok(runtime.has_pending())
 }
 
 #[derive(Debug, Deserialize)]
@@ -4889,15 +4924,7 @@ async fn await_js_task(
             )));
         }
 
-        let mut pending = runtime.drain_hostcall_requests();
-        while let Some(req) = pending.pop_front() {
-            let call_id = req.call_id.clone();
-            let outcome = dispatch_hostcall(host, req).await;
-            runtime.complete_hostcall(call_id, outcome);
-        }
-
-        let _ = runtime.tick().await?;
-        let _ = runtime.drain_microtasks().await?;
+        let _has_pending = pump_js_runtime_once(runtime, host).await?;
 
         let state_json = runtime
             .with_ctx(|ctx| {
@@ -5863,6 +5890,71 @@ mod tests {
             let _ = dispatch_hostcall(&host, request).await;
 
             assert_eq!(prompt_count.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn js_runtime_pump_once_advances_timers_and_hostcalls() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let entry_path = dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("agent_start", () => {
+                    setTimeout(() => {
+                      pi.tool("write", { path: "out.txt", content: "hi" });
+                    }, 0);
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let tools = Arc::new(ToolRegistry::new(&["write"], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+
+            manager
+                .dispatch_event(ExtensionEventName::AgentStart, None)
+                .await
+                .expect("dispatch agent_start");
+
+            let out_path = dir.path().join("out.txt");
+            let mut wrote = false;
+            for _ in 0..20 {
+                let _ = js_runtime.pump_once().await.expect("pump_once");
+                if out_path.exists() {
+                    wrote = true;
+                    break;
+                }
+                sleep(wall_now(), Duration::from_millis(1)).await;
+            }
+
+            assert!(wrote, "expected out.txt to be created after pumping");
+            let contents = std::fs::read_to_string(&out_path).expect("read out.txt");
+            assert_eq!(contents, "hi");
         });
     }
 
