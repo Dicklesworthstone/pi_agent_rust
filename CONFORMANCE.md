@@ -109,6 +109,56 @@ Current building blocks:
 - Normalization + diff triage utilities for extension logs (`tests/ext_conformance.rs`)
 - Deterministic PiJS scheduler conformance fixtures (`tests/event_loop_conformance.rs`)
 
+### 4A. Extension Conformance Matrix + Test Plan (bd-2kyq)
+
+This section turns the **extension taxonomy** (see `EXTENSIONS.md` §1B) into a
+concrete conformance matrix and a test plan. The goal is to ensure **every
+extension shape** has **explicit, testable pass/fail criteria** and **fixture
+coverage**.
+
+#### Conformance Matrix (shape × capability × expected behaviors)
+
+| Extension Shape | Entrypoint / Config | Required Capabilities / I/O | Expected Behaviors (Pass/Fail) | Coverage (Current / Planned) |
+|---|---|---|---|---|
+| **PiJS (JS/TS)** | `extension.json` (`pi.ext.manifest.v1`) or package manifest; entry `.ts/.js` | `tool` (→ `read/write/exec`), `http`, `session`, `ui`, `log` | **PASS** if: registrations match (tools/commands/flags/shortcuts/providers); derived capability matches hostcall method (see `EXTENSIONS.md` §3.2A); deterministic event ordering per scheduler contract; mock outputs deterministic under fixed spec; errors map to taxonomy (`timeout/denied/io/invalid_request/internal`). | **Current:** `tests/e2e_extension_registration.rs`, `tests/extensions_registration.rs`, `tests/ext_conformance.rs`, `tests/event_loop_conformance.rs`, `tests/ext_conformance/event_payloads/event_payloads.json`, `tests/ext_conformance/mock_specs/*`, `tests/ext_conformance_fixture_schema.rs`. **Planned:** differential TS↔Rust runner (`bd-21dv`). |
+| **WASM Component** | `extension.json` with `runtime="wasm"`; entry `.wasm` component | WIT hostcalls → same capability set as PiJS | **PASS** if: registration + hostcall behavior matches PiJS contract; capability derivation identical to JS; deterministic logs; error taxonomy identical. | **Planned:** WASM host conformance + parity suite (`bd-nom`, `bd-320`). |
+| **MCP Server** | MCP config or CLI args (stdio/http/sse) | MCP protocol (tools list + tool call/response); policy-gated connectors | **PASS** if: tool schemas discoverable; tool calls execute with deterministic mocks; policy denials surfaced as MCP errors; timeouts handled. | **Planned:** MCP conformance harness + fixtures (TBD). |
+| **Skill Pack** | `SKILL.md` + assets | File load only (no hostcalls) | **PASS** if: frontmatter valid; name/description parsed; injected into system prompt; skill resolution precedence correct. | **Current:** `tests/resource_loader.rs`, `tests/e2e_cli.rs` (skill discovery paths). |
+| **Prompt Template** | `.md` prompt file (optional frontmatter) | File load only | **PASS** if: template parse succeeds; parameters substitute deterministically; `/template` invocation expands correctly. | **Current:** `tests/resource_loader.rs`, `tests/e2e_cli.rs` (template paths). |
+| **Theme** | `.json` theme file | File load only | **PASS** if: JSON schema valid; theme resolves/loads; TUI applies without panics. | **Current:** `tests/tui_snapshot.rs` + theme loader coverage. |
+| **Package Source** | Package manifest listing resources | Depends on contained resources | **PASS** if: resource discovery resolves correctly; collisions resolved deterministically; package precedence honored. | **Current:** `tests/package_manager.rs`, `tests/resource_loader.rs`, `tests/e2e_cli.rs` (package flows). |
+
+#### Test Plan (fixtures → harness → assertions)
+
+1. **Fixture schemas**  
+   - Validate event payload fixtures: `tests/ext_conformance/event_payloads/event_payloads.json`  
+   - Validate mock specs: `tests/mock_spec_schema.rs` + `tests/mock_spec_validation.rs`
+
+2. **Registration parity**  
+   - Rust runtime: `tests/extensions_registration.rs` + `tests/e2e_extension_registration.rs`  
+   - Output: tools/commands/flags/shortcuts/providers must match expected snapshots
+
+3. **Event conformance**  
+   - Use `tests/ext_conformance/event_payloads/event_payloads.json` to drive event hooks  
+   - Validate scheduling/determinism: `tests/event_loop_conformance.rs`
+
+4. **Hostcall + capability mapping**  
+   - Exercise `tool_call` / `tool_result` / `pi.http` / `pi.exec` with mock specs  
+   - Assert derived capabilities match taxonomy (see `EXTENSIONS.md` §3.2A)
+
+5. **Differential TS ↔ Rust (oracle mode)**  
+   - TS harness: `tests/ext_conformance/ts_harness/run_extension.ts`  
+   - Rust harness: `tests/ext_conformance.rs` + conformance comparators  
+   - Planned runner: `bd-21dv` (per-extension comparisons + report)
+
+6. **Resource packs**  
+   - Skills/prompts/themes/packages: `tests/resource_loader.rs` + `tests/e2e_cli.rs`
+
+7. **Pass/Fail Criteria Summary**  
+   - **PASS** = registration parity + deterministic outputs + error taxonomy compliance  
+   - **FAIL** = any mismatch in registration, capability derivation, or normalized output diff  
+   - **SKIP** = unsupported capability/shape (must include rationale + tracking bead)
+
 ### Extension Logs (JSONL)
 
 All extension-related logs must conform to the **ext.log.v1** schema

@@ -164,6 +164,57 @@
         "default_response": null
       }
     ],
+    "model_select": [
+      {
+        "name": "model_select_cycle",
+        "description": "User cycles to a new model",
+        "payload": {
+          "type": "model_select",
+          "model": {
+            "id": "claude-sonnet-4-5",
+            "name": "Claude Sonnet 4.5",
+            "provider": "anthropic",
+            "api": "anthropic",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "contextWindow": 200000,
+            "maxTokens": 4096,
+            "input": ["text"]
+          },
+          "previousModel": {
+            "id": "claude-haiku-3-5",
+            "name": "Claude Haiku 3.5",
+            "provider": "anthropic",
+            "api": "anthropic",
+            "baseUrl": "https://api.anthropic.com/v1",
+            "contextWindow": 200000,
+            "maxTokens": 2048,
+            "input": ["text"]
+          },
+          "source": "cycle"
+        },
+        "default_response": null
+      },
+      {
+        "name": "model_select_restore",
+        "description": "Model restored from session metadata",
+        "payload": {
+          "type": "model_select",
+          "model": {
+            "id": "gpt-4o-mini",
+            "name": "GPT-4o Mini",
+            "provider": "openai",
+            "api": "openai",
+            "baseUrl": "https://api.openai.com/v1",
+            "contextWindow": 128000,
+            "maxTokens": 4096,
+            "input": ["text"]
+          },
+          "previousModel": null,
+          "source": "restore"
+        },
+        "default_response": null
+      }
+    ],
     "tool_call": [
       {
         "name": "basic_tool_call",
@@ -406,6 +457,24 @@
         "default_response": {}
       }
     ],
+    "session_start": [
+      {
+        "name": "session_start_fresh",
+        "description": "Initial session load (fresh start)",
+        "payload": {
+          "type": "session_start"
+        },
+        "default_response": null
+      },
+      {
+        "name": "session_start_resume",
+        "description": "Session load after resume",
+        "payload": {
+          "type": "session_start"
+        },
+        "default_response": null
+      }
+    ],
     "session_before_compact": [
       {
         "name": "allow_compaction",
@@ -438,6 +507,41 @@
         "default_response": {"cancel": true}
       }
     ],
+    "session_compact": [
+      {
+        "name": "compaction_from_pi",
+        "description": "Compaction entry created by Pi",
+        "payload": {
+          "type": "session_compact",
+          "compactionEntry": {
+            "type": "compaction",
+            "summary": "Summarized earlier messages",
+            "firstKeptEntryId": "entry-010",
+            "tokensBefore": 120000,
+            "fromHook": false
+          },
+          "fromExtension": false
+        },
+        "default_response": null
+      },
+      {
+        "name": "compaction_from_extension",
+        "description": "Compaction entry created by extension hook",
+        "payload": {
+          "type": "session_compact",
+          "compactionEntry": {
+            "type": "compaction",
+            "summary": "Extension compacted branch",
+            "firstKeptEntryId": "entry-002",
+            "tokensBefore": 45000,
+            "details": {"note": "extension-compaction"},
+            "fromHook": true
+          },
+          "fromExtension": true
+        },
+        "default_response": null
+      }
+    ],
     "session_before_tree": [
       {
         "name": "allow_tree",
@@ -466,6 +570,36 @@
         }
       }
     ],
+    "session_tree": [
+      {
+        "name": "tree_navigation_basic",
+        "description": "Tree navigation with summary entry",
+        "payload": {
+          "type": "session_tree",
+          "newLeafId": "entry-100",
+          "oldLeafId": "entry-042",
+          "summaryEntry": {
+            "type": "branch_summary",
+            "fromId": "entry-010",
+            "summary": "Branch summary for alternate approach",
+            "details": {"reason": "auto"},
+            "fromHook": true
+          },
+          "fromExtension": true
+        },
+        "default_response": null
+      },
+      {
+        "name": "tree_navigation_no_summary",
+        "description": "Tree navigation without summary entry",
+        "payload": {
+          "type": "session_tree",
+          "newLeafId": null,
+          "oldLeafId": "entry-042"
+        },
+        "default_response": null
+      }
+    ],
     "session_before_switch": [
       {
         "name": "allow_switch",
@@ -490,6 +624,28 @@
         "default_response": {"cancel": true}
       }
     ],
+    "session_switch": [
+      {
+        "name": "switch_resume",
+        "description": "Session switched via resume flow",
+        "payload": {
+          "type": "session_switch",
+          "reason": "resume",
+          "previousSessionFile": "/tmp/test-workspace/.pi/sessions/prev-session.jsonl"
+        },
+        "default_response": null
+      },
+      {
+        "name": "switch_new",
+        "description": "Session switched via new-session flow",
+        "payload": {
+          "type": "session_switch",
+          "reason": "new",
+          "previousSessionFile": null
+        },
+        "default_response": null
+      }
+    ],
     "session_before_fork": [
       {
         "name": "allow_fork",
@@ -512,10 +668,38 @@
         "default_response": {"cancel": true}
       }
     ],
+    "session_fork": [
+      {
+        "name": "fork_with_previous",
+        "description": "Session fork with a previous session file",
+        "payload": {
+          "type": "session_fork",
+          "previousSessionFile": "/tmp/test-workspace/.pi/sessions/prev-session.jsonl"
+        },
+        "default_response": null
+      },
+      {
+        "name": "fork_without_previous",
+        "description": "Session fork without a previous session file",
+        "payload": {
+          "type": "session_fork",
+          "previousSessionFile": null
+        },
+        "default_response": null
+      }
+    ],
     "session_shutdown": [
       {
         "name": "normal_shutdown",
         "description": "Clean session shutdown",
+        "payload": {
+          "type": "session_shutdown"
+        },
+        "default_response": null
+      },
+      {
+        "name": "shutdown_after_error",
+        "description": "Shutdown emitted after error/abort path (same payload shape)",
         "payload": {
           "type": "session_shutdown"
         },

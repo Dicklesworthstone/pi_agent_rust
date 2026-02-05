@@ -11,14 +11,14 @@
 
 mod common;
 
-	use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
-	use pi::extensions_js::PiJsRuntimeConfig;
-	use pi::tools::ToolRegistry;
-	use serde_json::Value;
-	use std::borrow::Cow;
-	use std::path::{Path, PathBuf};
-	use std::process::Command;
-	use std::sync::{Arc, OnceLock};
+use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+use pi::extensions_js::PiJsRuntimeConfig;
+use pi::tools::ToolRegistry;
+use serde_json::Value;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, OnceLock};
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -30,68 +30,72 @@ fn artifacts_dir() -> PathBuf {
     project_root().join("tests/ext_conformance/artifacts")
 }
 
-	fn ts_oracle_script() -> PathBuf {
-	    project_root().join("tests/ext_conformance/ts_oracle/load_extension.ts")
-	}
+fn ts_oracle_script() -> PathBuf {
+    project_root().join("tests/ext_conformance/ts_oracle/load_extension.ts")
+}
 
-	fn pi_mono_root() -> PathBuf {
-	    project_root().join("legacy_pi_mono_code/pi-mono")
-	}
+fn pi_mono_root() -> PathBuf {
+    project_root().join("legacy_pi_mono_code/pi-mono")
+}
 
-	fn pi_mono_packages() -> PathBuf {
-	    pi_mono_root().join("packages")
-	}
+fn pi_mono_packages() -> PathBuf {
+    pi_mono_root().join("packages")
+}
 
-	fn pi_mono_node_modules() -> PathBuf {
-	    pi_mono_root().join("node_modules")
-	}
+fn pi_mono_node_modules() -> PathBuf {
+    pi_mono_root().join("node_modules")
+}
 
 fn manifest_path() -> PathBuf {
     project_root().join("tests/ext_conformance/VALIDATED_MANIFEST.json")
 }
 
-	const fn bun_path() -> &'static str {
-	    "/home/ubuntu/.bun/bin/bun"
-	}
+const fn bun_path() -> &'static str {
+    "/home/ubuntu/.bun/bin/bun"
+}
 
-	fn ts_oracle_node_path() -> &'static Path {
-	    static NODE_PATH: OnceLock<PathBuf> = OnceLock::new();
-	    NODE_PATH.get_or_init(|| {
-	        let base = PathBuf::from(format!(
-	            "/tmp/pi_agent_rust_ts_oracle_node_path-{}",
-	            std::process::id()
-	        ));
+fn ts_oracle_node_path() -> &'static Path {
+    static NODE_PATH: OnceLock<PathBuf> = OnceLock::new();
+    NODE_PATH.get_or_init(|| {
+        #[cfg(unix)]
+        fn symlink_pkg(scope_dir: &Path, name: &str, target: &Path) {
+            use std::os::unix::fs::symlink;
 
-	        let scope_dir = base.join("@mariozechner");
-	        std::fs::create_dir_all(&scope_dir).expect("create ts oracle node_path scope dir");
+            let link = scope_dir.join(name);
+            if link.exists() {
+                return;
+            }
+            symlink(target, &link).expect("create ts oracle package symlink");
+        }
 
-	        #[cfg(unix)]
-	        fn symlink_pkg(scope_dir: &Path, name: &str, target: &Path) {
-	            use std::os::unix::fs::symlink;
+        #[cfg(not(unix))]
+        fn symlink_pkg(_scope_dir: &Path, _name: &str, _target: &Path) {}
 
-	            let link = scope_dir.join(name);
-	            if link.exists() {
-	                return;
-	            }
-	            symlink(target, &link).expect("create ts oracle package symlink");
-	        }
+        let base = PathBuf::from(format!(
+            "/tmp/pi_agent_rust_ts_oracle_node_path-{}",
+            std::process::id()
+        ));
 
-	        #[cfg(not(unix))]
-	        fn symlink_pkg(_scope_dir: &Path, _name: &str, _target: &Path) {}
+        let scope_dir = base.join("@mariozechner");
+        std::fs::create_dir_all(&scope_dir).expect("create ts oracle node_path scope dir");
 
-	        let packages_dir = pi_mono_packages();
-	        symlink_pkg(&scope_dir, "pi-coding-agent", &packages_dir.join("coding-agent"));
-	        symlink_pkg(&scope_dir, "pi-ai", &packages_dir.join("ai"));
-	        symlink_pkg(&scope_dir, "pi-tui", &packages_dir.join("tui"));
-	        symlink_pkg(&scope_dir, "pi-agent-core", &packages_dir.join("agent"));
+        let packages_dir = pi_mono_packages();
+        symlink_pkg(
+            &scope_dir,
+            "pi-coding-agent",
+            &packages_dir.join("coding-agent"),
+        );
+        symlink_pkg(&scope_dir, "pi-ai", &packages_dir.join("ai"));
+        symlink_pkg(&scope_dir, "pi-tui", &packages_dir.join("tui"));
+        symlink_pkg(&scope_dir, "pi-agent-core", &packages_dir.join("agent"));
 
-	        base
-	    })
-	}
+        base
+    })
+}
 
-	fn official_extensions() -> &'static Vec<(String, String)> {
-	    static OFFICIAL: OnceLock<Vec<(String, String)>> = OnceLock::new();
-	    OFFICIAL.get_or_init(|| {
+fn official_extensions() -> &'static Vec<(String, String)> {
+    static OFFICIAL: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    OFFICIAL.get_or_init(|| {
         let data = std::fs::read_to_string(manifest_path())
             .expect("Failed to read VALIDATED_MANIFEST.json");
         let json: Value =
@@ -131,31 +135,31 @@ fn manifest_path() -> PathBuf {
 
 // ─── TS oracle runner ────────────────────────────────────────────────────────
 
-	/// Run the TS oracle harness on an extension and parse the JSON output.
-	fn run_ts_oracle(extension_path: &Path) -> Value {
-	    let node_path: Cow<'_, str> = match std::env::var("NODE_PATH") {
-	        Ok(existing) if !existing.trim().is_empty() => Cow::Owned(format!(
-	            "{}:{}:{}",
-	            ts_oracle_node_path().display(),
-	            pi_mono_node_modules().display(),
-	            existing
-	        )),
-	        _ => Cow::Owned(format!(
-	            "{}:{}",
-	            ts_oracle_node_path().display(),
-	            pi_mono_node_modules().display()
-	        )),
-	    };
+/// Run the TS oracle harness on an extension and parse the JSON output.
+fn run_ts_oracle(extension_path: &Path) -> Value {
+    let node_path: Cow<'_, str> = match std::env::var("NODE_PATH") {
+        Ok(existing) if !existing.trim().is_empty() => Cow::Owned(format!(
+            "{}:{}:{}",
+            ts_oracle_node_path().display(),
+            pi_mono_node_modules().display(),
+            existing
+        )),
+        _ => Cow::Owned(format!(
+            "{}:{}",
+            ts_oracle_node_path().display(),
+            pi_mono_node_modules().display()
+        )),
+    };
 
-	    let output = Command::new(bun_path())
-	        .arg("run")
-	        .arg(ts_oracle_script())
-	        .arg(extension_path)
-	        .arg("/tmp")
-	        .current_dir(pi_mono_root())
-	        .env("NODE_PATH", node_path.as_ref())
-	        .output()
-	        .expect("failed to execute TS oracle harness");
+    let output = Command::new(bun_path())
+        .arg("run")
+        .arg(ts_oracle_script())
+        .arg(extension_path)
+        .arg("/tmp")
+        .current_dir(pi_mono_root())
+        .env("NODE_PATH", node_path.as_ref())
+        .output()
+        .expect("failed to execute TS oracle harness");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);

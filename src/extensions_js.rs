@@ -1318,7 +1318,21 @@ export function streamSimpleAnthropic() {
   throw new Error("@mariozechner/pi-ai.streamSimpleAnthropic is not available in PiJS");
 }
 
-export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic };
+export function streamSimpleOpenAIResponses() {
+  throw new Error("@mariozechner/pi-ai.streamSimpleOpenAIResponses is not available in PiJS");
+}
+
+export async function complete(_model, _messages, _opts = {}) {
+  // Return a minimal completion response stub
+  return { content: "", model: _model ?? "unknown", usage: { input_tokens: 0, output_tokens: 0 } };
+}
+
+export function getModel() {
+  // Return a default model identifier
+  return "claude-sonnet-4-5";
+}
+
+export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, complete, getModel };
 "#
         .trim()
         .to_string(),
@@ -1418,7 +1432,23 @@ export const Key = {
   ctrlAlt: (key) => ({ kind: "ctrlAlt", key: String(key) }),
 };
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key };
+export class DynamicBorder {
+  constructor(_styleFn = null) {
+    this.styleFn = _styleFn;
+  }
+}
+
+export class SettingsList {
+  constructor(_opts = {}) {
+    this.items = [];
+  }
+
+  setItems(items) {
+    this.items = Array.isArray(items) ? items : [];
+  }
+}
+
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList };
 "#
         .trim()
         .to_string(),
@@ -1614,36 +1644,78 @@ export function createBashTool(_cwd, _opts = {}) {
   return {
     name: "bash",
     label: "bash",
-    description: "Execute a shell command",
-    parameters: { type: "object", properties: { command: { type: "string" } }, required: ["command"] },
+    description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.",
+    parameters: {
+      type: "object",
+      properties: {
+        command: { type: "string", description: "The bash command to execute" },
+        timeout: { type: "number", description: "Optional timeout in seconds" },
+      },
+      required: ["command"],
+    },
     async execute(_id, params) {
       return { content: [{ type: "text", text: String(params?.command ?? "") }], details: {} };
     },
   };
 }
 
-function toolStub(name, description) {
+export function createReadTool(_cwd, _opts = {}) {
   return {
-    name,
-    label: name,
-    description,
-    parameters: { type: "object", properties: {}, required: [] },
-    async execute() {
+    name: "read",
+    label: "read",
+    description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "The path to the file to read" },
+        offset: { type: "number", description: "Line offset to start reading from (0-indexed)" },
+        limit: { type: "number", description: "Maximum number of lines to read" },
+      },
+      required: ["path"],
+    },
+    async execute(_id, _params) {
       return { content: [{ type: "text", text: "" }], details: {} };
     },
   };
 }
 
-export function createReadTool(_cwd, _ops = {}) {
-  return toolStub("read", "Read the contents of a file");
+export function createWriteTool(_cwd, _opts = {}) {
+  return {
+    name: "write",
+    label: "write",
+    description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "The path to the file to write" },
+        content: { type: "string", description: "The content to write to the file" },
+      },
+      required: ["path", "content"],
+    },
+    async execute(_id, _params) {
+      return { content: [{ type: "text", text: "" }], details: {} };
+    },
+  };
 }
 
-export function createWriteTool(_cwd, _ops = {}) {
-  return toolStub("write", "Write a file to disk");
-}
-
-export function createEditTool(_cwd, _ops = {}) {
-  return toolStub("edit", "Edit a file by replacing exact text");
+export function createEditTool(_cwd, _opts = {}) {
+  return {
+    name: "edit",
+    label: "edit",
+    description: "Edit a file by replacing exact text. The oldText must match exactly (including whitespace). Use this for precise, surgical edits.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "The path to the file to edit" },
+        oldText: { type: "string", description: "The exact text to find and replace" },
+        newText: { type: "string", description: "The text to replace oldText with" },
+      },
+      required: ["path", "oldText", "newText"],
+    },
+    async execute(_id, _params) {
+      return { content: [{ type: "text", text: "" }], details: {} };
+    },
+  };
 }
 
 export function copyToClipboard(_text) {
@@ -1830,7 +1902,10 @@ export function homedir() {
       : undefined;
   return home || "/home/unknown";
 }
-export default { homedir };
+export function tmpdir() {
+  return "/tmp";
+}
+export default { homedir, tmpdir };
 "#
         .trim()
         .to_string(),
@@ -1851,7 +1926,16 @@ export function execSync() {
   throw new Error("node:child_process.execSync is not available in PiJS");
 }
 
-export default { spawn, spawnSync, execSync };
+export function exec(_cmd, _opts, callback) {
+  // exec is async with callback - invoke callback with error to indicate unavailability
+  if (typeof callback === "function") {
+    setTimeout(() => callback(new Error("node:child_process.exec is not available in PiJS"), "", ""), 0);
+  } else if (typeof _opts === "function") {
+    setTimeout(() => _opts(new Error("node:child_process.exec is not available in PiJS"), "", ""), 0);
+  }
+}
+
+export default { spawn, spawnSync, execSync, exec };
 "#
         .trim()
         .to_string(),
@@ -1882,7 +1966,12 @@ export function appendFileSync(_path, _data, _opts) { return; }
 export function writeFileSync(_path, _data, _opts) { return; }
 export function readdirSync(_path, _opts) { return []; }
 export function statSync(_path) { throw new Error("statSync unavailable"); }
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync };
+export function mkdtempSync(prefix, _opts) {
+  // Return a fake temp directory path based on prefix
+  const p = String(prefix ?? "/tmp/tmp-");
+  return `${p}${Date.now().toString(36)}`;
+}
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync };
 "#
         .trim()
         .to_string(),
@@ -2992,6 +3081,7 @@ const __pi_hook_index = new Map();      // event_name -> [{ extensionId, handler
 const __pi_event_bus_index = new Map(); // event_name -> [{ extensionId, handler }, ...] (pi.events.on)
 const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
 const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, description, handler }
+const __pi_message_renderer_index = new Map(); // customType -> { extensionId, customType, renderer }
 
 // Async task tracking for Rust-driven calls (tool exec, command exec, event dispatch).
 // task_id -> { status: 'pending'|'resolved'|'rejected', value?, error? }
@@ -3061,6 +3151,7 @@ function __pi_get_or_create_extension(extension_id, meta) {
             shortcuts: new Map(),
             flags: new Map(),
             flagValues: new Map(),
+            messageRenderers: new Map(),
             activeTools: null,
         });
     }
@@ -3387,6 +3478,25 @@ function __pi_register_shortcut(key, spec) {
     __pi_shortcut_index.set(keyId, record);
 }
 
+function __pi_register_message_renderer(customType, renderer) {
+    const ext = __pi_current_extension_or_throw();
+    const typeId = String(customType || '').trim();
+    if (!typeId) {
+        throw new Error('registerMessageRenderer: customType is required');
+    }
+    if (typeof renderer !== 'function') {
+        throw new Error('registerMessageRenderer: renderer must be a function');
+    }
+
+    const record = {
+        customType: typeId,
+        renderer: renderer,
+        extensionId: ext.id,
+    };
+    ext.messageRenderers.set(typeId, record);
+    __pi_message_renderer_index.set(typeId, record);
+}
+
 	function __pi_register_hook(event_name, handler) {
 	    const ext = __pi_current_extension_or_throw();
 	    const eventName = String(event_name || '').trim();
@@ -3623,6 +3733,11 @@ function __pi_snapshot_extensions() {
             shortcuts.push(shortcut.spec);
         }
 
+        const message_renderers = [];
+        for (const renderer of ext.messageRenderers.values()) {
+            message_renderers.push(renderer.customType);
+        }
+
         const flags = [];
         for (const [flagName, flagSpec] of ext.flags.entries()) {
             flags.push({
@@ -3642,6 +3757,7 @@ function __pi_snapshot_extensions() {
             slash_commands: commands,
             providers: providers,
             shortcuts: shortcuts,
+            message_renderers: message_renderers,
             flags: flags,
             event_hooks: event_hooks,
             active_tools: Array.isArray(ext.activeTools) ? ext.activeTools.slice() : null,
@@ -4119,6 +4235,7 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     registerCommand: __pi_register_command,
     registerProvider: __pi_register_provider,
     registerShortcut: __pi_register_shortcut,
+    registerMessageRenderer: __pi_register_message_renderer,
     on: __pi_register_hook,
     registerFlag: __pi_register_flag,
     getFlag: __pi_get_flag,

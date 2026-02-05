@@ -5,6 +5,9 @@
  * Usage (from repo root):
  *   bun run tests/ext_conformance/ts_harness/run_extension.ts <extension-path> <mock-spec-path> [cwd]
  *
+ * Optional env:
+ * - PI_TS_CAPTURE_LOGS=1  Capture console output from extensions into JSON output (suppresses stdout noise).
+ *
  * Notes:
  * - This harness uses pi-mono's loader from the compiled dist/ output.
  * - It injects runtime action mocks (sendMessage, setModel, etc).
@@ -107,6 +110,40 @@ const PI_MONO_ROOT = path.resolve(__dirname, "../../../legacy_pi_mono_code/pi-mo
 const loaderPath = path.join(PI_MONO_ROOT, "packages/coding-agent/dist/core/extensions/loader.js");
 const { loadExtensions } = await import(loaderPath);
 
+const CAPTURE_LOGS = process.env.PI_TS_CAPTURE_LOGS === "1";
+const FORCE_EXIT = process.env.PI_TS_FORCE_EXIT !== "0";
+const capturedLogs: Array<{ level: "log" | "warn" | "error"; message: string }> = [];
+const originalConsole = {
+	log: console.log.bind(console),
+	warn: console.warn.bind(console),
+	error: console.error.bind(console),
+};
+
+function serializeArgs(args: unknown[]): string {
+	return args
+		.map((arg) => {
+			if (typeof arg === "string") return arg;
+			try {
+				return JSON.stringify(arg);
+			} catch {
+				return String(arg);
+			}
+		})
+		.join(" ");
+}
+
+if (CAPTURE_LOGS) {
+	console.log = (...args: unknown[]) => {
+		capturedLogs.push({ level: "log", message: serializeArgs(args) });
+	};
+	console.warn = (...args: unknown[]) => {
+		capturedLogs.push({ level: "warn", message: serializeArgs(args) });
+	};
+	console.error = (...args: unknown[]) => {
+		capturedLogs.push({ level: "error", message: serializeArgs(args) });
+	};
+}
+
 function readJson(filePath: string): JsonValue {
 	const raw = fs.readFileSync(filePath, "utf-8");
 	return JSON.parse(raw) as JsonValue;
@@ -179,16 +216,21 @@ async function main() {
 
 	const restoreFetch = installFetchMock(spec, capture);
 
+	let exitCode = 0;
 	try {
+		const loadStart = Date.now();
 		const result = await loadExtensions([extensionPath], cwd);
+		const loadTimeMs = Date.now() - loadStart;
 
 		if (result.errors.length > 0) {
-			console.log(
+			originalConsole.log(
 				JSON.stringify(
 					{
 						success: false,
 						error: result.errors.map((e: { path: string; error: string }) => `${e.path}: ${e.error}`).join("; "),
 						extension: null,
+						load_time_ms: loadTimeMs,
+						logs: CAPTURE_LOGS ? capturedLogs : undefined,
 					},
 					null,
 					2,
@@ -198,9 +240,15 @@ async function main() {
 		}
 
 		if (result.extensions.length === 0) {
-			console.log(
+			originalConsole.log(
 				JSON.stringify(
-					{ success: false, error: "No extension loaded (empty result)", extension: null },
+					{
+						success: false,
+						error: "No extension loaded (empty result)",
+						extension: null,
+						load_time_ms: loadTimeMs,
+						logs: CAPTURE_LOGS ? capturedLogs : undefined,
+					},
 					null,
 					2,
 				),
@@ -367,6 +415,7 @@ async function main() {
 		const output = {
 			success: true,
 			error: null,
+			load_time_ms: loadTimeMs,
 			spec: {
 				path: mockSpecPath,
 				schema: spec.schema ?? null,
@@ -392,18 +441,24 @@ async function main() {
 				thinkingLevel: spec.model?.thinking_level ?? "off",
 			},
 			capture,
+			logs: CAPTURE_LOGS ? capturedLogs : undefined,
 		};
 
-		console.log(JSON.stringify(output, null, 2));
+		originalConsole.log(JSON.stringify(output, null, 2));
 	} catch (err) {
 		const output = {
 			success: false,
 			error: err instanceof Error ? `${err.message}\n${err.stack}` : String(err),
 			extension: null,
+			load_time_ms: null,
+			logs: CAPTURE_LOGS ? capturedLogs : undefined,
 		};
-		console.log(JSON.stringify(output, null, 2));
+		originalConsole.log(JSON.stringify(output, null, 2));
 	} finally {
 		restoreFetch();
+		if (FORCE_EXIT) {
+			process.exit(exitCode);
+		}
 	}
 }
 

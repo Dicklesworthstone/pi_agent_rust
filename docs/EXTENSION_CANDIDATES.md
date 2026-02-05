@@ -34,6 +34,34 @@ This is a **source-first, unfiltered** candidate inventory for extension samplin
 
 ---
 
+## GitHub / Community Sweep (bd‑3jxt) — Initial Pass (2026‑02‑05)
+
+This is a **high‑signal, non‑exhaustive** snapshot of extension ecosystems discovered via
+GitHub topic pages (`claude-code-plugin`, `claude-code-plugins`) plus official Pi sources and
+curated community lists. "Updated" reflects GitHub topic page timestamps when available (proxy
+for last activity). Release tag notes are captured where visible; otherwise marked **unknown**.
+**Categories/notes are inferred** from repo names/descriptions and should be validated in follow‑up.
+
+| Repo | Category | Stars / Forks | Updated | License | Releases / Tags | Notes |
+|---|---|---:|---|---|---|---|
+| `badlogic/pi-mono` | Official repo | 6.9k / 713 | unknown | MIT | tags present (not enumerated) | — |
+| `wshobson/agents` | Community repo | 27.8k / 3.1k | Feb 2, 2026 | MIT | no releases listed | — |
+| `timescale/pg-aiguide` | Community repo | 1.5k / 77 | Feb 3, 2026 | Apache‑2.0 | `v0.3.0` (2026‑01‑28) | — |
+| `jeremylongshore/claude-code-plugins-plus-skills` | Community repo | 1.3k / 155 | Feb 1, 2026 | *View license* (type not visible) | unknown | — |
+| `kenryu42/claude-code-safety-net` | Community repo | 971 / 42 | Feb 2, 2026 | MIT | unknown | — |
+| `gmickel/gmickel-claude-marketplace` | Community repo | 500 / 33 | Feb 4, 2026 | MIT | unknown | — |
+| `ccplugins/awesome-claude-code-plugins` | Curated list | 440 / 65 | Oct 14, 2025 | Apache‑2.0 | unknown | — |
+| `fcakyon/claude-codex-settings` | Community repo | 401 / 39 | Feb 4, 2026 | Apache‑2.0 | unknown | — |
+| `quemsah/awesome-claude-plugins` | Curated list | 89 / 4 | unknown | unknown | unknown | — |
+| `vincenthopf/My-Claude-Code` | Curated list | 127 / 3 | unknown | CC BY‑NC 4.0 | unknown | — |
+
+Follow‑ups:
+- Confirm license type for `jeremylongshore/claude-code-plugins-plus-skills`.
+- Collect explicit release/tag info for repositories marked **unknown**.
+- Expand coverage to other high‑signal topic pages (e.g., `claude-code-mcp`, `claude-code-hooks`).
+
+---
+
 ## Discovery Playbook (Repeatable Queries) (bd‑19rf)
 
 Goal: provide a deterministic checklist of **discovery channels + copy/paste queries** so future agents can repeat online research and converge on the same candidate set.

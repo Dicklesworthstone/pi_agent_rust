@@ -350,6 +350,162 @@ and therefore have **no runtime capability requirements** beyond file loading.
 
 ---
 
+## 1C. Ecosystem Research & Candidate Pool (Informational)
+
+This section is the **research foundation** for extension compatibility work.
+It documents **where we discover candidates**, **how we validate them**, and the
+**canonical metadata** we track so downstream beads can rank/select without
+re‑doing discovery.
+
+### 1C.1 Source Tiers (where candidates come from)
+
+We classify candidates by **source tier** (not by runtime tier):
+
+- `official-pi-mono` — the canonical upstream corpus (the “official 60” plus any
+  additional pinned upstream examples).
+- `community` — small community repos/gists; often single‑file extensions.
+- `third-party-github` — larger third‑party repos (may be multi‑file).
+- `npm-registry` — published packages that contain Pi extensions.
+- `agents-mikeastock` — special-case curated corpus (kept as its own tier so we
+  can reason about provenance).
+- `non-conformance` — interesting but explicitly out-of-scope for parity (kept
+  for research/triage only).
+
+The tier labels above match the static-scan and master-catalog artifacts in
+`docs/` (see §1C.4).
+
+### 1C.2 Discovery Workflow (repeatable + evidence-based)
+
+**Authoritative discovery sources (v1, ordered):**
+
+1. **Upstream pi-mono** (`badlogic/pi-mono`) extension examples corpus (canonical
+   “official” reference set).
+2. **Curated corpora snapshots** checked into this repo (e.g. under
+   `legacy_pi_mono_code/`), used for deterministic scanning and reproducible
+   conformance runs.
+3. **GitHub discovery sweep** (keyword + topic search) → candidate repos and
+   raw files (tracked by research beads).
+4. **npm registry sweep** (keyword search + reverse-dep trails) → candidate
+   packages and tarballs (tracked by research beads).
+5. **Marketplaces/registries** (when applicable) such as OpenClaw/ClawHub
+   inventories (tracked by research beads).
+
+We treat discovery as a **pipeline**, not a one-off search:
+
+1. **Enumerate corpus roots** per tier (local repo snapshots, git checkouts,
+   npm package tarballs).
+2. **Static scan**:
+   - Find candidate entrypoints (default export / `register(...)` patterns).
+   - Record “capability signals” (imports/calls that imply hostcalls).
+   - Emit a machine-readable inventory for dedup + triage.
+3. **Dynamic validation** (ground truth):
+   - Load each candidate in the **pi-mono TS runtime** (Bun-based harness).
+   - Record load success/failure, error class, and registration output.
+   - Note: action methods may intentionally throw during load; we only require
+     *registration* to succeed.
+4. **Consolidate + deduplicate** into a master candidate pool.
+5. **Enrich + rank** (only after the pool is stable):
+   - Size, file-count, dependency shape, IO patterns, popularity signals.
+   - Produce tiered execution plans (conformance ordering, complexity buckets).
+
+### 1C.3 Candidate Identity & Dedup Strategy (deterministic)
+
+The same logical extension can show up via multiple paths (forks, mirrors,
+vendored copies, npm repacks). We deduplicate using **canonical source keys**
+and content checksums:
+
+- **Canonical source key** (stable identity):
+  - Git: `git:<repo_url>#<path>`
+  - npm: `npm:<package_name>@<version>#<path>` (or omit `@<version>` if unknown)
+  - local snapshot: `local:<absolute_path>`
+- **Content checksum** (stable content): `sha256(file_bytes)` (single-file) or
+  `sha256(concat(sorted(file_checksums)))` (multi-file directory).
+
+Rules:
+- Prefer upstream canonical URLs when known (avoid per-fork “new identities”).
+- When two candidates share a checksum, treat them as duplicates unless the
+  runtime behavior differs under dynamic validation.
+- Human-readable `id` should be stable when possible (manifest id or filename),
+  but the source key + checksum are the real identity.
+
+### 1C.4 Canonical Artifacts (source of truth)
+
+We keep the research outputs in `docs/` so they can be reviewed, diffed, and
+used by CI/harnesses:
+
+- `docs/extension-entry-scan.json` — static scan inventory (entrypoints +
+  submodules + confidence + per-tier stats).
+- `docs/extension-master-catalog.json` — **deduplicated master pool** for
+  conformance (all tiers, minimal fields + checksums).
+- `docs/extension-catalog.json` — enriched metadata for the **official upstream**
+  corpus (capabilities, IO patterns, complexity buckets, checksums).
+- `docs/extension-priority.json` — ranking/order plan for the official corpus
+  (testability-first execution strategy).
+
+Downstream beads should treat these as inputs and avoid re-scraping/re-scanning
+unless they are explicitly rebuilding the pipeline.
+
+### 1C.5 Coverage Targets (v1)
+
+The purpose of coverage targets is to prevent a “high-score shortlist” from
+missing whole classes of real-world behavior. Targets are used by selection
+beads to produce a Tier-1 “must-pass” corpus that is large, stratified, and
+defensible.
+
+**Tier size targets (selection constraint):**
+
+- **Tier-0 baseline:** the upstream official example set (must-pass baseline).
+- **Tier-1 MUST PASS:** **≥ 200** unmodified extensions, stratified across
+  source tiers and behavior buckets.
+- **Tier-2 stretch:** additional long-tail extensions chosen primarily for
+  unique API surface / coverage (not popularity).
+
+**Tier-1 per-source-tier minimums (initial framing):**
+
+| Source tier | Minimum | Rationale |
+|---|---:|---|
+| `official-pi-mono` | 60 | Baseline corpus; defines expected semantics. |
+| `npm-registry` | 50 | Real-world packaging/deps patterns. |
+| `community` | 50 | Diverse small extensions; fast surface coverage. |
+| `third-party-github` | 20 | Multi-file patterns and higher complexity. |
+| `agents-mikeastock` | all | Curated corpus; include all available. |
+
+**Tier-1 behavior / capability quotas (minimum coverage buckets):**
+
+Registration / surface:
+- **Tools:** include all extensions that register tools (or meet a minimum of
+  60, whichever is larger as the corpus grows).
+- **Event hooks:** include all event-hook extensions (or ≥ 80).
+- **Slash commands:** include ≥ 25 command extensions.
+- **Provider registration / streaming:** include **all** provider-registered
+  extensions (rare/high-risk surface).
+- **UI surfaces:** include ≥ 15 overlay-heavy and ≥ 40 UI-integrated (header/
+  footer/status/message-renderer) extensions.
+
+Hostcall / capability risk:
+- **Exec-heavy (`exec_api`)**: include all (capability is high risk).
+- **Network-heavy (`http`)**: include ≥ 25.
+- **FS-heavy (`read/write/edit`)**: include ≥ 50.
+- **Session/UI heavy (`session_api` / `ui_*`)**: include ≥ 50 combined.
+
+**Category coverage (user workflow buckets):**
+
+Maintain at least a small quorum in each high-value workflow category:
+- `git` / repo hygiene / checkpoints
+- `tests` / lint / format / CI
+- `devops` / infra / cloud tooling
+- `research` / search / summarization
+- `codegen` / refactor / scaffolding
+- `ui` / interaction / TUI enhancements
+- `security` / policy / guardrails
+
+Notes:
+- These targets intentionally mix **hard minima** and “include-all-rare” rules.
+  For rare-but-critical surfaces (provider registration, exec-heavy), selection
+  should bias toward full coverage rather than sampling.
+- The `docs/extension-*.json` artifacts are the measurement source for counts
+  and bucket classification.
+
 ## 2. Artifact Pipeline (Legacy → Optimized)
 
 **Inputs**
