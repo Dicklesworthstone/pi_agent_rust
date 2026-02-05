@@ -378,7 +378,7 @@ impl VcrRecorder {
                 for (idx, interaction) in cassette.interactions.iter().enumerate() {
                     if let Some(body) = &interaction.request.body {
                         if let Ok(pretty) = serde_json::to_string_pretty(body) {
-                            let _ = write!(debug, "=== RECORDED [{idx}] ===\n");
+                            let _ = writeln!(debug, "=== RECORDED [{idx}] ===");
                             debug.push_str(&pretty);
                             debug.push('\n');
                         }
