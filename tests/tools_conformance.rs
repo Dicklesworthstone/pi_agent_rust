@@ -665,7 +665,10 @@ mod grep_tool {
                 .expect("should succeed");
 
             let text = get_text_content(&result.content);
-            assert!(text.contains("matches limit reached"));
+            assert!(
+                text.contains("matches limit reached"),
+                "expected grep output to include match-limit notice; got: {text:?}"
+            );
             let details = result.details.expect("expected details");
             assert_eq!(
                 details.get("matchLimitReached"),
@@ -691,7 +694,10 @@ mod grep_tool {
                 .expect("should succeed");
 
             let text = get_text_content(&result.content);
-            assert!(text.contains("... [truncated]"));
+            assert!(
+                text.contains("... [truncated]"),
+                "expected grep output to include per-line truncation marker; got: {text:?}"
+            );
             let details = result.details.expect("expected details");
             assert_eq!(
                 details.get("linesTruncated"),
