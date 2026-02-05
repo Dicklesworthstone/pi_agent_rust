@@ -1,0 +1,1649 @@
+{
+  "schema": "pi.ext.catalog.v1",
+  "generated_at": "2026-02-05T06:30:00Z",
+  "total_extensions": 60,
+  "tier_summary": {
+    "small": 23,
+    "medium": 25,
+    "large": 12
+  },
+  "runtime_summary": {
+    "legacy-js": 51,
+    "multi-file": 4,
+    "pkg-with-deps": 5
+  },
+  "items": [
+    {
+      "id": "antigravity-image-gen",
+      "name": "antigravity-image-gen.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/antigravity-image-gen.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "tool_only"
+      ],
+      "capabilities": [
+        "env",
+        "http",
+        "read",
+        "tool",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "network-heavy"
+      ],
+      "complexity": "large",
+      "file_count": 1,
+      "total_bytes": 12549,
+      "checksum": {
+        "sha256": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924"
+      }
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "name": "auto-commit-on-exit.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/auto-commit-on-exit.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1569,
+      "checksum": {
+        "sha256": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c"
+      }
+    },
+    {
+      "id": "bash-spawn-hook",
+      "name": "bash-spawn-hook.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/bash-spawn-hook.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "tool_only"
+      ],
+      "capabilities": [
+        "exec",
+        "tool"
+      ],
+      "io_pattern": [
+        "os-heavy"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 692,
+      "checksum": {
+        "sha256": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3"
+      }
+    },
+    {
+      "id": "bookmark",
+      "name": "bookmark.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/bookmark.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1553,
+      "checksum": {
+        "sha256": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952"
+      }
+    },
+    {
+      "id": "claude-rules",
+      "name": "claude-rules.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/claude-rules.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2486,
+      "checksum": {
+        "sha256": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97"
+      }
+    },
+    {
+      "id": "confirm-destructive",
+      "name": "confirm-destructive.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/confirm-destructive.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1678,
+      "checksum": {
+        "sha256": "1ea07be2d3287b2ca19faa21bef82e578c7872255838d4257d1b86d4876135d2"
+      }
+    },
+    {
+      "id": "custom-compaction",
+      "name": "custom-compaction.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-compaction.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 4069,
+      "checksum": {
+        "sha256": "f530739cb3e6e36ea2df1e93e1da1fdaad71acc41acf042ac0877dcbfab5ded5"
+      }
+    },
+    {
+      "id": "custom-footer",
+      "name": "custom-footer.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-footer.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2143,
+      "checksum": {
+        "sha256": "3ea51342bd093054762695a878e5c309e1491309e25f1290c09c19231c161965"
+      }
+    },
+    {
+      "id": "custom-header",
+      "name": "custom-header.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-header.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2395,
+      "checksum": {
+        "sha256": "996f53a6a6dd531c9e3ca2585f5f57fd559ec8b0b6a8c802702205bd26fe2472"
+      }
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "name": "custom-provider-anthropic/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-provider-anthropic"
+      },
+      "runtime_tier": "pkg-with-deps",
+      "interaction_tags": [
+        "provider"
+      ],
+      "capabilities": [
+        "http",
+        "provider"
+      ],
+      "io_pattern": [
+        "network-heavy"
+      ],
+      "complexity": "large",
+      "file_count": 4,
+      "total_bytes": 20192,
+      "checksum": {
+        "sha256": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68"
+      }
+    },
+    {
+      "id": "custom-provider-gitlab-duo",
+      "name": "custom-provider-gitlab-duo/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-provider-gitlab-duo"
+      },
+      "runtime_tier": "pkg-with-deps",
+      "interaction_tags": [
+        "provider"
+      ],
+      "capabilities": [
+        "http",
+        "provider"
+      ],
+      "io_pattern": [
+        "network-heavy"
+      ],
+      "complexity": "large",
+      "file_count": 4,
+      "total_bytes": 13722,
+      "checksum": {
+        "sha256": "f4b4c1f5063b56a24ffb9f3746fc2107769ba3b4a0b1a65f7ee3e18e15684d77"
+      }
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "name": "custom-provider-qwen-cli/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-provider-qwen-cli"
+      },
+      "runtime_tier": "pkg-with-deps",
+      "interaction_tags": [
+        "event_hook",
+        "provider"
+      ],
+      "capabilities": [
+        "event_hook",
+        "http",
+        "provider"
+      ],
+      "io_pattern": [
+        "network-heavy"
+      ],
+      "complexity": "large",
+      "file_count": 3,
+      "total_bytes": 10442,
+      "checksum": {
+        "sha256": "29278eca3a44361d59e04256e57db294a0cd2fe6c612307b7b5c3139e1dc7286"
+      }
+    },
+    {
+      "id": "dirty-repo-guard",
+      "name": "dirty-repo-guard.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/dirty-repo-guard.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1477,
+      "checksum": {
+        "sha256": "86b312a1ccde2a74973e340b5fa8377a7926c0232afe4ea0eb239ce93b8b6cfd"
+      }
+    },
+    {
+      "id": "doom-overlay",
+      "name": "doom-overlay/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/doom-overlay"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "large",
+      "file_count": 11,
+      "total_bytes": 466917,
+      "checksum": {
+        "sha256": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10"
+      }
+    },
+    {
+      "id": "dynamic-resources",
+      "name": "dynamic-resources/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/dynamic-resources"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": [],
+      "capabilities": [],
+      "io_pattern": [],
+      "complexity": "medium",
+      "file_count": 4,
+      "total_bytes": 2826,
+      "checksum": {
+        "sha256": "7d9bc974bd48ecf0cd39e326b0d53815d1c17228ec14e14da63710ba79540788"
+      }
+    },
+    {
+      "id": "event-bus",
+      "name": "event-bus.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/event-bus.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration",
+        "event_hook"
+      ],
+      "capabilities": [
+        "event_hook",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1346,
+      "checksum": {
+        "sha256": "869e3d574d574e68d713f9eb947b26643e800981919f1cf1f1e8097eeafa255a"
+      }
+    },
+    {
+      "id": "file-trigger",
+      "name": "file-trigger.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/file-trigger.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "read",
+        "ui",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1031,
+      "checksum": {
+        "sha256": "d9623f289add349102a78ebf6a04df61a1b19cdcca9e6a8f4728138cc32a34fe"
+      }
+    },
+    {
+      "id": "git-checkpoint",
+      "name": "git-checkpoint.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/git-checkpoint.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1466,
+      "checksum": {
+        "sha256": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6"
+      }
+    },
+    {
+      "id": "handoff",
+      "name": "handoff.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/handoff.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "session",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 4628,
+      "checksum": {
+        "sha256": "c84672af255b3889d99c99fb76382520bc686a18fb26c1c04d341de0865e7fe9"
+      }
+    },
+    {
+      "id": "hello",
+      "name": "hello.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/hello.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "tool_only"
+      ],
+      "capabilities": [
+        "tool"
+      ],
+      "io_pattern": [],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 627,
+      "checksum": {
+        "sha256": "6d4d5a97ada168817b9cb3808e51013969c2ce7c2c4d1536b4d630ad3f8b78f1"
+      }
+    },
+    {
+      "id": "inline-bash",
+      "name": "inline-bash.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/inline-bash.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2956,
+      "checksum": {
+        "sha256": "41caf5a75b33eface492ba382a98db3745768563da10e35c55d4ef733e5a9287"
+      }
+    },
+    {
+      "id": "input-transform",
+      "name": "input-transform.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/input-transform.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1442,
+      "checksum": {
+        "sha256": "21c653ea09ff9467de4095770ba27709f41fd3540cc8087bfd7af618ce2b8050"
+      }
+    },
+    {
+      "id": "interactive-shell",
+      "name": "interactive-shell.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/interactive-shell.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "env",
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 4778,
+      "checksum": {
+        "sha256": "bb511be03dc47da3e31ae2011d3a932d3d0cdc74f8b7c535657d5cd7f699cd33"
+      }
+    },
+    {
+      "id": "mac-system-theme",
+      "name": "mac-system-theme.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/mac-system-theme.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1195,
+      "checksum": {
+        "sha256": "a9ac7ae1d161963f4c21cf8116a6ffd561f76aa7c858d9a73288745f2db99eb7"
+      }
+    },
+    {
+      "id": "message-renderer",
+      "name": "message-renderer.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/message-renderer.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [],
+      "capabilities": [],
+      "io_pattern": [],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1906,
+      "checksum": {
+        "sha256": "6eda7eaade9a07ff140bbdc88e5c8b8ad414fbbb738fea13dac620c194c4ba50"
+      }
+    },
+    {
+      "id": "modal-editor",
+      "name": "modal-editor.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/modal-editor.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2413,
+      "checksum": {
+        "sha256": "f875e8d3af9eb78ea88a2e274f798e7c8eae10b543e2728dde8e8fd2c7912da9"
+      }
+    },
+    {
+      "id": "model-status",
+      "name": "model-status.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/model-status.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 955,
+      "checksum": {
+        "sha256": "b43a7e8bc67c988f230fc730e12f92401870b04ebb1dba7a26667baa63daec0b"
+      }
+    },
+    {
+      "id": "notify",
+      "name": "notify.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/notify.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [],
+      "capabilities": [],
+      "io_pattern": [],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 776,
+      "checksum": {
+        "sha256": "8979cdf28c59201375cdec7c7c704bad425918fda771ec46736e1b627f586960"
+      }
+    },
+    {
+      "id": "overlay-qa-tests",
+      "name": "overlay-qa-tests.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/overlay-qa-tests.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "large",
+      "file_count": 1,
+      "total_bytes": 28484,
+      "checksum": {
+        "sha256": "bf9f1a3be8ce1d0d8d4d96d9ef411defab10d06756e7a12ce58febddc9ba3c4b"
+      }
+    },
+    {
+      "id": "overlay-test",
+      "name": "overlay-test.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/overlay-test.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 5367,
+      "checksum": {
+        "sha256": "a7ccdad170e3f68673e415144b2b995f63d116a3b966d351508c8b6e7cedbbc0"
+      }
+    },
+    {
+      "id": "permission-gate",
+      "name": "permission-gate.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/permission-gate.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1017,
+      "checksum": {
+        "sha256": "d3d73f1d4b2dcea877564979ab797e46a79192e1613121f647da839afbe0bea1"
+      }
+    },
+    {
+      "id": "pirate",
+      "name": "pirate.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/pirate.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1459,
+      "checksum": {
+        "sha256": "60b73aa9150a1e1e441310691ceeb1fc02c08e119975a9a151fcaa7e334de055"
+      }
+    },
+    {
+      "id": "plan-mode",
+      "name": "plan-mode/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/plan-mode"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": [
+        "ui_integration",
+        "flag",
+        "shortcut"
+      ],
+      "capabilities": [
+        "flag",
+        "shortcut",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "large",
+      "file_count": 3,
+      "total_bytes": 16764,
+      "checksum": {
+        "sha256": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9"
+      }
+    },
+    {
+      "id": "preset",
+      "name": "preset.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/preset.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration",
+        "flag",
+        "shortcut"
+      ],
+      "capabilities": [
+        "flag",
+        "read",
+        "shortcut",
+        "ui",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "ui-centric"
+      ],
+      "complexity": "large",
+      "file_count": 1,
+      "total_bytes": 13339,
+      "checksum": {
+        "sha256": "5b6675a52c54e0567ad4fb203f7b70adad4994e2e4e2d436b44f3f0f483d7c30"
+      }
+    },
+    {
+      "id": "protected-paths",
+      "name": "protected-paths.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/protected-paths.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 806,
+      "checksum": {
+        "sha256": "4a1d3f6628da9b93f28124085d58a864ceb57852d2df016603b897c3df7ba92b"
+      }
+    },
+    {
+      "id": "qna",
+      "name": "qna.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/qna.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 3554,
+      "checksum": {
+        "sha256": "ae359438f308bc86ecc4dbab766a9665853ccf78824c4b1c2192933e27843d66"
+      }
+    },
+    {
+      "id": "question",
+      "name": "question.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/question.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration",
+        "tool_only"
+      ],
+      "capabilities": [
+        "tool",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 7764,
+      "checksum": {
+        "sha256": "bc55457385e5c4d4ccc6a1583a69e68cf2ba196b8052ab0abdc1848cd1d65bec"
+      }
+    },
+    {
+      "id": "questionnaire",
+      "name": "questionnaire.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/questionnaire.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration",
+        "tool_only"
+      ],
+      "capabilities": [
+        "tool",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "large",
+      "file_count": 1,
+      "total_bytes": 12807,
+      "checksum": {
+        "sha256": "99cbd301a86000e8a50e861396f7523b2a3c6a4dd10463b2c9e5c8e773f6f1ed"
+      }
+    },
+    {
+      "id": "rainbow-editor",
+      "name": "rainbow-editor.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/rainbow-editor.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2384,
+      "checksum": {
+        "sha256": "db6b53ced476a4746c77c38c8ae1cf9a74f835899b0a0dcd8795e02fdbac4e15"
+      }
+    },
+    {
+      "id": "rpc-demo",
+      "name": "rpc-demo.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/rpc-demo.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 3771,
+      "checksum": {
+        "sha256": "ce2c285f6b4900da766fa143dab7ad58d3779cd39b537437807e7458d21a6f83"
+      }
+    },
+    {
+      "id": "sandbox",
+      "name": "sandbox/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/sandbox"
+      },
+      "runtime_tier": "pkg-with-deps",
+      "interaction_tags": [
+        "ui_integration",
+        "event_hook",
+        "tool_only",
+        "flag"
+      ],
+      "capabilities": [
+        "event_hook",
+        "exec",
+        "flag",
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "large",
+      "file_count": 4,
+      "total_bytes": 12213,
+      "checksum": {
+        "sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf"
+      }
+    },
+    {
+      "id": "send-user-message",
+      "name": "send-user-message.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/send-user-message.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2830,
+      "checksum": {
+        "sha256": "82fa2ff47441f8c1d21118ffd3c31c5fd6be4a70959c8c8bae5af2d378907f95"
+      }
+    },
+    {
+      "id": "session-name",
+      "name": "session-name.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/session-name.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "session",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 783,
+      "checksum": {
+        "sha256": "5df0ce9bc28cabed038684803f48d77f786849aa03720f25ef1ca73d77a754ef"
+      }
+    },
+    {
+      "id": "shutdown-command",
+      "name": "shutdown-command.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/shutdown-command.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "tool_only"
+      ],
+      "capabilities": [
+        "exec",
+        "tool"
+      ],
+      "io_pattern": [
+        "os-heavy"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2053,
+      "checksum": {
+        "sha256": "cc0e2521d0649a1f452daea39bdfdf01335fdefcf35d6fc33556b1a3c30a3a78"
+      }
+    },
+    {
+      "id": "snake",
+      "name": "snake.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/snake.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 9409,
+      "checksum": {
+        "sha256": "bbc517362fc270018de83528867dcba5657f2abf246994e5ce3798457ef08f97"
+      }
+    },
+    {
+      "id": "space-invaders",
+      "name": "space-invaders.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/space-invaders.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "large",
+      "file_count": 1,
+      "total_bytes": 15162,
+      "checksum": {
+        "sha256": "4503a565b6a6e76e0641322dc81e4ec28c974ca79d1b35a6cbad6a3fd317d7e5"
+      }
+    },
+    {
+      "id": "ssh",
+      "name": "ssh.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/ssh.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration",
+        "event_hook",
+        "tool_only",
+        "flag"
+      ],
+      "capabilities": [
+        "event_hook",
+        "exec",
+        "flag",
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 7289,
+      "checksum": {
+        "sha256": "215182f7f2cbec3253676800a1634087dec1893938f50e304f859736ef06bc77"
+      }
+    },
+    {
+      "id": "status-line",
+      "name": "status-line.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/status-line.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1137,
+      "checksum": {
+        "sha256": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428"
+      }
+    },
+    {
+      "id": "subagent",
+      "name": "subagent/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/subagent"
+      },
+      "runtime_tier": "multi-file",
+      "interaction_tags": [
+        "ui_integration",
+        "event_hook",
+        "tool_only"
+      ],
+      "capabilities": [
+        "event_hook",
+        "exec",
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "ui-centric",
+        "os-heavy"
+      ],
+      "complexity": "large",
+      "file_count": 10,
+      "total_bytes": 47908,
+      "checksum": {
+        "sha256": "f96041857c53f67acb940c4838fe9a48e032e03b147b3313850f23d4e77185fe"
+      }
+    },
+    {
+      "id": "summarize",
+      "name": "summarize.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/summarize.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 5006,
+      "checksum": {
+        "sha256": "00c714ef20680fa7561a2bf9fbb6ef38984b8806a9e35ca31bea0d15bd2a4c31"
+      }
+    },
+    {
+      "id": "system-prompt-header",
+      "name": "system-prompt-header.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/system-prompt-header.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 526,
+      "checksum": {
+        "sha256": "ad1a4f20208d1909359fc3e7a9973511984be6c17c8834131001f603f78744c9"
+      }
+    },
+    {
+      "id": "timed-confirm",
+      "name": "timed-confirm.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/timed-confirm.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 2236,
+      "checksum": {
+        "sha256": "1a263aeed2429cd08647d48432bf4aca42806bf801aca1dae7dc5cb40ed17b50"
+      }
+    },
+    {
+      "id": "titlebar-spinner",
+      "name": "titlebar-spinner.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/titlebar-spinner.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "session",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1617,
+      "checksum": {
+        "sha256": "80c0590aab9851dea93d5ece66c5c0f1a1192abdbd41225216375467350ffb47"
+      }
+    },
+    {
+      "id": "todo",
+      "name": "todo.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/todo.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration",
+        "tool_only"
+      ],
+      "capabilities": [
+        "tool",
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 8966,
+      "checksum": {
+        "sha256": "31a2be2d4f47ea22b054f6bb8732c491e9ee08f9b3decf6307495534c4df6dec"
+      }
+    },
+    {
+      "id": "tool-override",
+      "name": "tool-override.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/tool-override.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration",
+        "tool_only"
+      ],
+      "capabilities": [
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 4756,
+      "checksum": {
+        "sha256": "b4d1e4d1aab08c2410958fa690f5dfab120667d0e04f53b8bc9248fbdb3f1fbb"
+      }
+    },
+    {
+      "id": "tools",
+      "name": "tools.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/tools.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 3872,
+      "checksum": {
+        "sha256": "a2d13c338790648a1fea4ce01642765725708d7e88d51e3adef1517153c7b046"
+      }
+    },
+    {
+      "id": "trigger-compact",
+      "name": "trigger-compact.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/trigger-compact.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 1025,
+      "checksum": {
+        "sha256": "95c4b7b4a624b0998746a53c79a9de84ee56a8a8c015b2af04fb8890b2b8de8d"
+      }
+    },
+    {
+      "id": "truncated-tool",
+      "name": "truncated-tool.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/truncated-tool.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "tool_only"
+      ],
+      "capabilities": [
+        "exec",
+        "read",
+        "tool",
+        "write"
+      ],
+      "io_pattern": [
+        "fs-heavy",
+        "os-heavy"
+      ],
+      "complexity": "medium",
+      "file_count": 1,
+      "total_bytes": 6367,
+      "checksum": {
+        "sha256": "3751f5db4845438111c8346f4d0c975de07c65d2ee2445b1a6cca3b570a0f077"
+      }
+    },
+    {
+      "id": "widget-placement",
+      "name": "widget-placement.ts",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/widget-placement.ts"
+      },
+      "runtime_tier": "legacy-js",
+      "interaction_tags": [
+        "ui_integration"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "io_pattern": [
+        "ui-centric"
+      ],
+      "complexity": "small",
+      "file_count": 1,
+      "total_bytes": 526,
+      "checksum": {
+        "sha256": "9dc59e893eebd95e7a30aaeae140b9dad721ecbe388ac24afb0f034a13be507f"
+      }
+    },
+    {
+      "id": "with-deps",
+      "name": "with-deps/",
+      "source_tier": "official_examples",
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/with-deps"
+      },
+      "runtime_tier": "pkg-with-deps",
+      "interaction_tags": [
+        "tool_only"
+      ],
+      "capabilities": [
+        "tool"
+      ],
+      "io_pattern": [],
+      "complexity": "medium",
+      "file_count": 4,
+      "total_bytes": 2403,
+      "checksum": {
+        "sha256": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293"
+      }
+    }
+  ]
+}

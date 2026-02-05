@@ -1,0 +1,867 @@
+{
+  "schema": "pi.ext.api-matrix.v1",
+  "generated_at": "2026-02-05T06:35:00Z",
+  "extensions": {
+    "antigravity-image-gen": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "capabilities_required": [
+        "env",
+        "http",
+        "read",
+        "write"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "crypto",
+        "fs",
+        "os",
+        "path",
+        "process"
+      ],
+      "third_party_deps": []
+    },
+    "auto-commit-on-exit": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "bash-spawn-hook": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "process"
+      ],
+      "third_party_deps": []
+    },
+    "bookmark": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "claude-rules": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "read"
+      ],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [
+        "fs",
+        "path"
+      ],
+      "third_party_deps": []
+    },
+    "confirm-destructive": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_before_fork"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "custom-compaction": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "custom-footer": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "custom-header": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "custom-provider-anthropic": {
+      "registration_types": [
+        "provider"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "capabilities_required": [
+        "http"
+      ],
+      "events_listened": [
+        "stop",
+        "tool_result"
+      ],
+      "node_apis": [],
+      "third_party_deps": [
+        "@anthropic-ai/sdk"
+      ]
+    },
+    "custom-provider-gitlab-duo": {
+      "registration_types": [
+        "provider"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "capabilities_required": [
+        "http",
+        "read"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "fs",
+        "os",
+        "path",
+        "process"
+      ],
+      "third_party_deps": []
+    },
+    "custom-provider-qwen-cli": {
+      "registration_types": [
+        "event_hook",
+        "provider"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "capabilities_required": [
+        "http"
+      ],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "dirty-repo-guard": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [
+        "session_before_fork"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "doom-overlay": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.http()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "env",
+        "http",
+        "read",
+        "write"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "fs",
+        "path",
+        "process",
+        "url"
+      ],
+      "third_party_deps": []
+    },
+    "dynamic-resources": {
+      "registration_types": [],
+      "hostcalls": [],
+      "capabilities_required": [],
+      "events_listened": [
+        "resources_discover"
+      ],
+      "node_apis": [
+        "path",
+        "url"
+      ],
+      "third_party_deps": []
+    },
+    "event-bus": {
+      "registration_types": [
+        "event_hook"
+      ],
+      "hostcalls": [
+        "pi.events()"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "file-trigger": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "read",
+        "write"
+      ],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [
+        "fs"
+      ],
+      "third_party_deps": []
+    },
+    "git-checkpoint": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [
+        "session_before_fork",
+        "tool_result",
+        "turn_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "handoff": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "hello": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "inline-bash": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [
+        "input"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "input-transform": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "input"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "interactive-shell": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "env",
+        "exec"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "child_process",
+        "process"
+      ],
+      "third_party_deps": []
+    },
+    "mac-system-theme": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [
+        "child_process"
+      ],
+      "third_party_deps": []
+    },
+    "message-renderer": {
+      "registration_types": [],
+      "hostcalls": [],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "modal-editor": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "model-status": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "notify": {
+      "registration_types": [],
+      "hostcalls": [],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "overlay-qa-tests": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "child_process"
+      ],
+      "third_party_deps": []
+    },
+    "overlay-test": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "permission-gate": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "tool_call"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "pirate": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "plan-mode": {
+      "registration_types": [
+        "flag",
+        "shortcut"
+      ],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "write"
+      ],
+      "events_listened": [
+        "session_start",
+        "tool_call",
+        "turn_end"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "preset": {
+      "registration_types": [
+        "flag",
+        "shortcut"
+      ],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "read"
+      ],
+      "events_listened": [
+        "session_start",
+        "turn_start"
+      ],
+      "node_apis": [
+        "fs",
+        "os",
+        "path"
+      ],
+      "third_party_deps": []
+    },
+    "protected-paths": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "tool_call"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "qna": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "stop"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "question": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "questionnaire": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "rainbow-editor": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "rpc-demo": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start",
+        "tool_call",
+        "turn_end",
+        "turn_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "sandbox": {
+      "registration_types": [
+        "event_hook",
+        "flag",
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec",
+        "read"
+      ],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [
+        "child_process",
+        "fs",
+        "os",
+        "path",
+        "process"
+      ],
+      "third_party_deps": [
+        "@anthropic-ai/sandbox-runtime"
+      ]
+    },
+    "send-user-message": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "session-name": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "shutdown-command": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "snake": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec"
+      ],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "space-invaders": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "ssh": {
+      "registration_types": [
+        "event_hook",
+        "flag",
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec",
+        "read",
+        "write"
+      ],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [
+        "child_process",
+        "process"
+      ],
+      "third_party_deps": []
+    },
+    "status-line": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start",
+        "turn_end",
+        "turn_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "subagent": {
+      "registration_types": [
+        "event_hook",
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "exec",
+        "read",
+        "write"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "child_process",
+        "fs",
+        "os",
+        "path"
+      ],
+      "third_party_deps": []
+    },
+    "summarize": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "system-prompt-header": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "timed-confirm": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "titlebar-spinner": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [
+        "path",
+        "process"
+      ],
+      "third_party_deps": []
+    },
+    "todo": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "tool-override": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [
+        "read",
+        "write"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "fs",
+        "os",
+        "path"
+      ],
+      "third_party_deps": []
+    },
+    "tools": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "trigger-compact": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "turn_end"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "truncated-tool": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()"
+      ],
+      "capabilities_required": [
+        "exec",
+        "read",
+        "write"
+      ],
+      "events_listened": [],
+      "node_apis": [
+        "child_process",
+        "fs",
+        "os",
+        "path"
+      ],
+      "third_party_deps": []
+    },
+    "widget-placement": {
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "capabilities_required": [],
+      "events_listened": [
+        "session_start"
+      ],
+      "node_apis": [],
+      "third_party_deps": []
+    },
+    "with-deps": {
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [],
+      "capabilities_required": [],
+      "events_listened": [],
+      "node_apis": [],
+      "third_party_deps": [
+        "ms"
+      ]
+    }
+  }
+}

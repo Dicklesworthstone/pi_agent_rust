@@ -1,0 +1,1036 @@
+{
+  "schema": "pi.ext.priority.v1",
+  "generated_at": "2026-02-05T06:38:00Z",
+  "total": 60,
+  "first_25_summary": "Testable with minimal infrastructure (simple tools, event hooks, slash commands)",
+  "last_25_summary": "Requires advanced mocks, UI overlays, provider shims, or npm dependencies",
+  "rankings": [
+    {
+      "rank": 1,
+      "id": "git-checkpoint",
+      "score": 34,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_before_fork",
+        "tool_result",
+        "turn_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 2,
+      "id": "ssh",
+      "score": 33,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "event_hook",
+        "flag",
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 3,
+      "id": "plan-mode",
+      "score": 29,
+      "complexity": "large",
+      "runtime_tier": "multi-file",
+      "registration_types": [
+        "flag",
+        "shortcut"
+      ],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start",
+        "tool_call",
+        "turn_end"
+      ],
+      "file_count": 3,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 4,
+      "id": "preset",
+      "score": 29,
+      "complexity": "large",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "flag",
+        "shortcut"
+      ],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start",
+        "turn_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 5,
+      "id": "truncated-tool",
+      "score": 29,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 6,
+      "id": "antigravity-image-gen",
+      "score": 28,
+      "complexity": "large",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 7,
+      "id": "auto-commit-on-exit",
+      "score": 28,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 8,
+      "id": "sandbox",
+      "score": 28,
+      "complexity": "large",
+      "runtime_tier": "pkg-with-deps",
+      "registration_types": [
+        "event_hook",
+        "flag",
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 4,
+      "has_third_party_deps": true,
+      "testability_notes": "Needs npm deps installed or shimmed"
+    },
+    {
+      "rank": 9,
+      "id": "custom-provider-anthropic",
+      "score": 27,
+      "complexity": "large",
+      "runtime_tier": "pkg-with-deps",
+      "registration_types": [
+        "provider"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "events": [
+        "stop",
+        "tool_result"
+      ],
+      "file_count": 4,
+      "has_third_party_deps": true,
+      "testability_notes": "Needs npm deps installed or shimmed"
+    },
+    {
+      "rank": 10,
+      "id": "dirty-repo-guard",
+      "score": 27,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_before_fork"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 11,
+      "id": "mac-system-theme",
+      "score": 27,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 12,
+      "id": "rpc-demo",
+      "score": 27,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start",
+        "tool_call",
+        "turn_end",
+        "turn_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 13,
+      "id": "shutdown-command",
+      "score": 27,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 14,
+      "id": "status-line",
+      "score": 27,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start",
+        "turn_end",
+        "turn_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 15,
+      "id": "bash-spawn-hook",
+      "score": 26,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 16,
+      "id": "confirm-destructive",
+      "score": 26,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_before_fork"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 17,
+      "id": "todo",
+      "score": 26,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 18,
+      "id": "custom-provider-qwen-cli",
+      "score": 25,
+      "complexity": "large",
+      "runtime_tier": "pkg-with-deps",
+      "registration_types": [
+        "event_hook",
+        "provider"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "events": [],
+      "file_count": 3,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 19,
+      "id": "event-bus",
+      "score": 25,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "event_hook"
+      ],
+      "hostcalls": [
+        "pi.events()"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 20,
+      "id": "file-trigger",
+      "score": 25,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 21,
+      "id": "hello",
+      "score": 25,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 22,
+      "id": "inline-bash",
+      "score": 25,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [
+        "input"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 23,
+      "id": "bookmark",
+      "score": 24,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 24,
+      "id": "custom-provider-gitlab-duo",
+      "score": 24,
+      "complexity": "large",
+      "runtime_tier": "pkg-with-deps",
+      "registration_types": [
+        "provider"
+      ],
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "events": [],
+      "file_count": 4,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 25,
+      "id": "interactive-shell",
+      "score": 24,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 26,
+      "id": "qna",
+      "score": 24,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [
+        "stop"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 27,
+      "id": "session-name",
+      "score": 24,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 28,
+      "id": "subagent",
+      "score": 24,
+      "complexity": "large",
+      "runtime_tier": "multi-file",
+      "registration_types": [
+        "event_hook",
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 10,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 29,
+      "id": "titlebar-spinner",
+      "score": 24,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 30,
+      "id": "tools",
+      "score": 24,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 31,
+      "id": "input-transform",
+      "score": 23,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "input"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 32,
+      "id": "message-renderer",
+      "score": 23,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 33,
+      "id": "notify",
+      "score": 23,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 34,
+      "id": "permission-gate",
+      "score": 23,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "tool_call"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 35,
+      "id": "protected-paths",
+      "score": 23,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "tool_call"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 36,
+      "id": "snake",
+      "score": 23,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 37,
+      "id": "tool-override",
+      "score": 23,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 38,
+      "id": "trigger-compact",
+      "score": 23,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "turn_end"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 39,
+      "id": "widget-placement",
+      "score": 23,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 40,
+      "id": "claude-rules",
+      "score": 22,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 41,
+      "id": "custom-compaction",
+      "score": 22,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 42,
+      "id": "custom-footer",
+      "score": 22,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 43,
+      "id": "handoff",
+      "score": 22,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 44,
+      "id": "summarize",
+      "score": 22,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 45,
+      "id": "custom-header",
+      "score": 21,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 46,
+      "id": "doom-overlay",
+      "score": 21,
+      "complexity": "large",
+      "runtime_tier": "multi-file",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.http()",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 11,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 47,
+      "id": "dynamic-resources",
+      "score": 21,
+      "complexity": "medium",
+      "runtime_tier": "multi-file",
+      "registration_types": [],
+      "hostcalls": [],
+      "events": [
+        "resources_discover"
+      ],
+      "file_count": 4,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 48,
+      "id": "modal-editor",
+      "score": 21,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 49,
+      "id": "model-status",
+      "score": 21,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 50,
+      "id": "overlay-qa-tests",
+      "score": 21,
+      "complexity": "large",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.exec()",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 51,
+      "id": "pirate",
+      "score": 21,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 52,
+      "id": "question",
+      "score": 21,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 53,
+      "id": "rainbow-editor",
+      "score": 21,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [
+        "session_start"
+      ],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 54,
+      "id": "system-prompt-header",
+      "score": 21,
+      "complexity": "small",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Easy: small, no deps, quick to validate"
+    },
+    {
+      "rank": 55,
+      "id": "with-deps",
+      "score": 21,
+      "complexity": "medium",
+      "runtime_tier": "pkg-with-deps",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [],
+      "events": [],
+      "file_count": 4,
+      "has_third_party_deps": true,
+      "testability_notes": "Needs npm deps installed or shimmed"
+    },
+    {
+      "rank": 56,
+      "id": "space-invaders",
+      "score": 20,
+      "complexity": "large",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.session.*",
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 57,
+      "id": "overlay-test",
+      "score": 19,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 58,
+      "id": "questionnaire",
+      "score": 19,
+      "complexity": "large",
+      "runtime_tier": "legacy-js",
+      "registration_types": [
+        "tool"
+      ],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Complex: large codebase, may need advanced mocks"
+    },
+    {
+      "rank": 59,
+      "id": "send-user-message",
+      "score": 19,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    },
+    {
+      "rank": 60,
+      "id": "timed-confirm",
+      "score": 19,
+      "complexity": "medium",
+      "runtime_tier": "legacy-js",
+      "registration_types": [],
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "events": [],
+      "file_count": 1,
+      "has_third_party_deps": false,
+      "testability_notes": "Moderate: medium complexity, may need mocks"
+    }
+  ]
+}
