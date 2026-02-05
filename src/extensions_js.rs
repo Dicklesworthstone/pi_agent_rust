@@ -2459,7 +2459,10 @@ export default bash;
         "bunfig".to_string(),
         r"
 export function define(_schema) { return {}; }
-export function loadConfig(_opts) { return {}; }
+export async function loadConfig(opts) {
+  const defaults = (opts && opts.defaultConfig) ? opts.defaultConfig : {};
+  return { ...defaults };
+}
 export default { define, loadConfig };
 "
         .trim()
@@ -5315,7 +5318,11 @@ function __pi_register_command(name, spec) {
     if (!spec || typeof spec !== 'object') {
         throw new Error('registerCommand: spec must be an object');
     }
-    if (typeof spec.handler !== 'function') {
+    // Accept both spec.handler and spec.fn (PiCommand compat)
+    const handler = typeof spec.handler === 'function' ? spec.handler
+        : typeof spec.fn === 'function' ? spec.fn
+        : undefined;
+    if (!handler) {
         throw new Error('registerCommand: spec.handler must be a function');
     }
 
@@ -5335,7 +5342,7 @@ function __pi_register_command(name, spec) {
         extensionId: ext.id,
         name: cmd,
         description: cmdSpec.description,
-        handler: spec.handler,
+        handler: handler,
         spec: cmdSpec,
     };
     ext.commands.set(cmd, record);

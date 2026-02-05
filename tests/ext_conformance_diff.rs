@@ -1987,7 +1987,6 @@ fn diff_npm_manifest() {
 /// Use `PI_THIRDPARTY_FILTER` env var to filter by name substring.
 /// Use `PI_THIRDPARTY_MAX` env var to limit the number of extensions to test.
 #[test]
-#[ignore = "bd-22r2: third-party extensions not yet expected to pass; run manually with --ignored"]
 fn diff_thirdparty_manifest() {
     let filter = std::env::var("PI_THIRDPARTY_FILTER").ok();
     let max = std::env::var("PI_THIRDPARTY_MAX")
@@ -2033,25 +2032,48 @@ fn diff_thirdparty_manifest() {
         );
     }
 
-    // Separate TS oracle failures from Rust-side failures
-    let (ts_oracle_failures, rust_failures): (Vec<String>, Vec<String>) = failures
-        .into_iter()
-        .partition(|f| f.contains("ts_oracle_failed"));
+    // Known-unfixable third-party extensions:
+    // - Extensions that import unavailable npm packages (no package in corpus)
+    // - Extensions that read adjacent non-TS files via readFileSync at load time
+    //   (VFS is in-memory only; adding real-FS fallthrough is a separate epic)
+    let known_unfixable: &[&str] = &[
+        "kcosr",        // readFileSync("apply_patch_prompt.md") — adjacent .md file
+        "marckrenn",    // imports @marckrenn/pi-sub-shared (private package)
+        "ogulcancelik", // readFileSync("sketch.html") — adjacent .html file
+        "qualisero",    // imports @sourcegraph/scip-typescript (external package)
+    ];
 
-    let total_failures = ts_oracle_failures.len() + rust_failures.len();
+    // Separate failures into: TS oracle, known-unfixable, unexpected Rust bugs
+    let mut ts_oracle_failures = Vec::new();
+    let mut known_failures = Vec::new();
+    let mut unexpected_failures = Vec::new();
+    for f in failures {
+        if f.contains("ts_oracle_failed") {
+            ts_oracle_failures.push(f);
+        } else if known_unfixable.iter().any(|k| f.contains(k)) {
+            known_failures.push(f);
+        } else {
+            unexpected_failures.push(f);
+        }
+    }
+
+    let total_skip = ts_oracle_failures.len() + known_failures.len();
+    let total_failures = total_skip + unexpected_failures.len();
     eprintln!(
-        "[diff_thirdparty_manifest] Results: {} passed, {} failed ({} TS oracle, {} Rust) out of {} total",
+        "[diff_thirdparty_manifest] Results: {} passed, {} failed ({} TS oracle, {} known-unfixable, {} unexpected) out of {} total",
         passes,
         total_failures,
         ts_oracle_failures.len(),
-        rust_failures.len(),
+        known_failures.len(),
+        unexpected_failures.len(),
         selected.len()
     );
 
     if total_failures > 0 {
         let all: Vec<&str> = ts_oracle_failures
             .iter()
-            .chain(rust_failures.iter())
+            .chain(known_failures.iter())
+            .chain(unexpected_failures.iter())
             .map(String::as_str)
             .collect();
         eprintln!(
@@ -2060,22 +2082,24 @@ fn diff_thirdparty_manifest() {
         );
     }
 
-    let testable = u32::try_from(selected.len() - ts_oracle_failures.len()).unwrap_or(u32::MAX);
+    let testable = u32::try_from(selected.len() - total_skip).unwrap_or(u32::MAX);
     let pass_rate = if testable == 0 {
         100.0
     } else {
         f64::from(passes) / f64::from(testable) * 100.0
     };
     eprintln!(
-        "[diff_thirdparty_manifest] Pass rate: {pass_rate:.1}% ({passes}/{testable} testable, {} TS oracle skipped)",
-        ts_oracle_failures.len()
+        "[diff_thirdparty_manifest] Pass rate: {pass_rate:.1}% ({passes}/{testable} testable, {} skipped ({} TS oracle + {} known-unfixable))",
+        total_skip,
+        ts_oracle_failures.len(),
+        known_failures.len()
     );
 
-    // Assert: zero Rust-side failures
+    // Assert: zero unexpected Rust-side failures
     assert!(
-        rust_failures.is_empty(),
-        "Rust-side third-party conformance failures ({}):\n{}",
-        rust_failures.len(),
-        rust_failures.join("\n")
+        unexpected_failures.is_empty(),
+        "Unexpected third-party conformance failures ({}):\n{}",
+        unexpected_failures.len(),
+        unexpected_failures.join("\n")
     );
 }
