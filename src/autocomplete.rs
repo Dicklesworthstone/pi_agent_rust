@@ -177,6 +177,7 @@ impl AutocompleteProvider {
         None
     }
 
+    #[allow(clippy::too_many_lines)]
     fn suggest_slash(&self, token: &TokenAtCursor<'_>) -> AutocompleteResponse {
         let query = token.text.trim_start_matches('/');
 

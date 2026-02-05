@@ -5665,7 +5665,7 @@ async fn dispatch_hostcall_events(
             let description = payload
                 .get("description")
                 .and_then(Value::as_str)
-                .map(|s| s.to_string());
+                .map(ToString::to_string);
             manager.register_command(&name, description.as_deref());
             HostcallOutcome::Success(Value::Null)
         }

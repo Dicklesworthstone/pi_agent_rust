@@ -13,6 +13,7 @@
 
 mod common;
 
+use asupersync::runtime::RuntimeBuilder;
 use common::TestHarness;
 use pi::http::client::Client;
 use pi::model::{Message, StopReason, StreamEvent, ThinkingLevel, UserContent, UserMessage};
@@ -22,6 +23,7 @@ use pi::vcr::{VcrMode, VcrRecorder};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -46,6 +48,18 @@ fn user_text(text: &str) -> Message {
         content: UserContent::Text(text.to_string()),
         timestamp: 0,
     })
+}
+
+fn run_test_value<F, Fut, T>(f: F) -> T
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = T>,
+{
+    asupersync::test_utils::init_test_logging();
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("failed to build test runtime");
+    runtime.block_on(f())
 }
 
 // ─── Event ordering validation ───────────────────────────────────────────────
@@ -717,71 +731,74 @@ fn e2e_anthropic_streaming_all_scenarios() {
     });
 
     let scenarios = all_anthropic_scenarios();
-    let mut results = Vec::new();
-    let mut passed = 0usize;
-    let mut skipped = 0usize;
-    let mut failed = 0usize;
 
-    for scenario in &scenarios {
-        harness.section(&format!("Scenario: {}", scenario.cassette_name));
+    asupersync::test_utils::run_test(|| {
+        let model = model.clone();
+        let harness_ref = &harness;
+        let scenarios_ref = &scenarios;
+        async move {
+            let mut results = Vec::new();
+            let mut passed = 0usize;
+            let mut skipped = 0usize;
+            let mut failed = 0usize;
 
-        let result = asupersync::test_utils::run_test(|| {
-            let model = model.clone();
-            let harness_ref = &harness;
-            async move { run_e2e_scenario(scenario, harness_ref, &model).await }
-        });
+            for scenario in scenarios_ref {
+                harness_ref.section(&format!("Scenario: {}", scenario.cassette_name));
+                let result = run_e2e_scenario(scenario, harness_ref, &model).await;
 
-        let status = result
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        match status {
-            "pass" => passed += 1,
-            "skipped" => skipped += 1,
-            _ => failed += 1,
+                let status = result
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                match status {
+                    "pass" => passed += 1,
+                    "skipped" => skipped += 1,
+                    _ => failed += 1,
+                }
+                results.push(result);
+            }
+
+            // Write JSONL summary
+            let summary_path = harness_ref.temp_path("e2e_streaming_results.jsonl");
+            let mut summary_content = String::new();
+            for result in &results {
+                let _ = writeln!(
+                    summary_content,
+                    "{}",
+                    serde_json::to_string(result).unwrap_or_default()
+                );
+            }
+            std::fs::write(&summary_path, &summary_content).expect("write summary jsonl");
+            harness_ref.record_artifact("e2e_streaming_results.jsonl", &summary_path);
+
+            // Write JSONL logs
+            let log_path = harness_ref.temp_path("e2e_streaming_log.jsonl");
+            harness_ref
+                .write_jsonl_logs(&log_path)
+                .expect("write jsonl log");
+            harness_ref.record_artifact("e2e_streaming_log.jsonl", &log_path);
+
+            // Write artifact index
+            let artifact_path = harness_ref.temp_path("e2e_streaming_artifacts.jsonl");
+            harness_ref
+                .write_artifact_index_jsonl(&artifact_path)
+                .expect("write artifact index");
+            harness_ref.record_artifact("e2e_streaming_artifacts.jsonl", &artifact_path);
+
+            harness_ref.log().info_ctx("e2e", "Suite completed", |ctx| {
+                ctx.push(("total".into(), scenarios_ref.len().to_string()));
+                ctx.push(("passed".into(), passed.to_string()));
+                ctx.push(("skipped".into(), skipped.to_string()));
+                ctx.push(("failed".into(), failed.to_string()));
+            });
+
+            assert_eq!(
+                failed, 0,
+                "E2E streaming suite: {failed} scenarios failed out of {}",
+                scenarios_ref.len()
+            );
         }
-        results.push(result);
-    }
-
-    // Write JSONL summary
-    let summary_path = harness.temp_path("e2e_streaming_results.jsonl");
-    let mut summary_content = String::new();
-    for result in &results {
-        let _ = writeln!(
-            summary_content,
-            "{}",
-            serde_json::to_string(result).unwrap_or_default()
-        );
-    }
-    std::fs::write(&summary_path, &summary_content).expect("write summary jsonl");
-    harness.record_artifact("e2e_streaming_results.jsonl", &summary_path);
-
-    // Write JSONL logs
-    let log_path = harness.temp_path("e2e_streaming_log.jsonl");
-    harness
-        .write_jsonl_logs(&log_path)
-        .expect("write jsonl log");
-    harness.record_artifact("e2e_streaming_log.jsonl", &log_path);
-
-    // Write artifact index
-    let artifact_path = harness.temp_path("e2e_streaming_artifacts.jsonl");
-    harness
-        .write_artifact_index_jsonl(&artifact_path)
-        .expect("write artifact index");
-    harness.record_artifact("e2e_streaming_artifacts.jsonl", &artifact_path);
-
-    harness.log().info_ctx("e2e", "Suite completed", |ctx| {
-        ctx.push(("total".into(), scenarios.len().to_string()));
-        ctx.push(("passed".into(), passed.to_string()));
-        ctx.push(("skipped".into(), skipped.to_string()));
-        ctx.push(("failed".into(), failed.to_string()));
     });
-
-    assert_eq!(
-        failed, 0,
-        "E2E streaming suite: {failed} scenarios failed out of {}",
-        scenarios.len()
-    );
 }
 
 /// Verify that running the same cassette twice produces identical content hashes
@@ -806,30 +823,35 @@ fn e2e_anthropic_streaming_determinism() {
         expect_stop_reasons: vec![StopReason::Stop],
     };
 
-    let run = |label: &str| -> Option<String> {
-        harness.section(label);
-        let result = asupersync::test_utils::run_test(|| {
-            let model = model.clone();
-            let harness_ref = &harness;
-            async move { run_e2e_scenario(&scenario, harness_ref, &model).await }
-        });
-        result
-            .get("content_hash")
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    };
+    asupersync::test_utils::run_test(|| {
+        let model = model.clone();
+        let harness_ref = &harness;
+        let scenario_ref = &scenario;
+        async move {
+            harness_ref.section("Run 1");
+            let result1 = run_e2e_scenario(scenario_ref, harness_ref, &model).await;
+            let hash1 = result1
+                .get("content_hash")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
-    let hash1 = run("Run 1");
-    let hash2 = run("Run 2");
+            harness_ref.section("Run 2");
+            let result2 = run_e2e_scenario(scenario_ref, harness_ref, &model).await;
+            let hash2 = result2
+                .get("content_hash")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
-    if let (Some(h1), Some(h2)) = (&hash1, &hash2) {
-        harness.log().info_ctx("determinism", "Hash comparison", |ctx| {
-            ctx.push(("run1".into(), h1.clone()));
-            ctx.push(("run2".into(), h2.clone()));
-            ctx.push(("match".into(), (h1 == h2).to_string()));
-        });
-        assert_eq!(h1, h2, "Content hashes differ between runs (non-deterministic)");
-    }
+            if let (Some(h1), Some(h2)) = (&hash1, &hash2) {
+                harness_ref.log().info_ctx("determinism", "Hash comparison", |ctx| {
+                    ctx.push(("run1".into(), h1.clone()));
+                    ctx.push(("run2".into(), h2.clone()));
+                    ctx.push(("match".into(), (h1 == h2).to_string()));
+                });
+                assert_eq!(h1, h2, "Content hashes differ between runs (non-deterministic)");
+            }
+        }
+    });
 }
 
 /// Verify that all error scenarios produce errors with appropriate HTTP status codes.
