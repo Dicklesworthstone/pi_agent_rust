@@ -5545,9 +5545,9 @@ pub fn extension_event_from_agent(
     event: &AgentEvent,
 ) -> Option<(ExtensionEventName, Option<Value>)> {
     let name = match event {
-        AgentEvent::AgentStart => ExtensionEventName::AgentStart,
+        AgentEvent::AgentStart { .. } => ExtensionEventName::AgentStart,
         AgentEvent::AgentEnd { .. } => ExtensionEventName::AgentEnd,
-        AgentEvent::TurnStart => ExtensionEventName::TurnStart,
+        AgentEvent::TurnStart { .. } => ExtensionEventName::TurnStart,
         AgentEvent::TurnEnd { .. } => ExtensionEventName::TurnEnd,
         AgentEvent::MessageStart { .. } => ExtensionEventName::MessageStart,
         AgentEvent::MessageUpdate { .. } => ExtensionEventName::MessageUpdate,
