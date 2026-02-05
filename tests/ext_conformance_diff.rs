@@ -108,12 +108,10 @@ fn run_ts_oracle(extension_path: &Path) -> Value {
     );
 
     serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
-        assert!(
-            false,
+        unreachable!(
             "TS oracle returned invalid JSON for {}:\n  error: {e}\n  stdout: {stdout}\n  stderr: {stderr}",
             extension_path.display()
-        );
-        Value::Null
+        )
     })
 }
 
@@ -499,10 +497,8 @@ fn run_differential_test(extension_name: &str, entry_file: &str) {
     }
 
     // Run Rust runtime
-    let rust_result = load_rust_snapshot(&ext_path).unwrap_or_else(|err| {
-        assert!(false, "Rust runtime failed for {extension_name}: {err}");
-        Value::Null
-    });
+    let rust_result = load_rust_snapshot(&ext_path)
+        .unwrap_or_else(|err| unreachable!("Rust runtime failed for {extension_name}: {err}"));
 
     // Compare
     let diffs = diff_snapshots(&ts_result, &rust_result);
@@ -520,8 +516,7 @@ fn run_differential_test(extension_name: &str, entry_file: &str) {
             "\nRust snapshot:\n{}",
             serde_json::to_string_pretty(&rust_result).unwrap()
         );
-        assert!(
-            false,
+        unreachable!(
             "Differential conformance failed for {extension_name}: {} differences",
             diffs.len()
         );

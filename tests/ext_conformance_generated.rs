@@ -168,11 +168,7 @@ fn load_manifest() -> &'static Manifest {
 fn run_conformance_test(ext_id: &str) {
     let manifest = load_manifest();
     let Some(entry) = manifest.find(ext_id) else {
-        assert!(
-            false,
-            "Extension '{ext_id}' not found in VALIDATED_MANIFEST.json"
-        );
-        unreachable!()
+        unreachable!("Extension '{ext_id}' not found in VALIDATED_MANIFEST.json");
     };
 
     let harness = common::TestHarness::new(format!("conformance_{}", ext_id.replace('/', "_")));
@@ -196,12 +192,10 @@ fn run_conformance_test(ext_id: &str) {
 
     // Create the load spec.
     let spec = JsExtensionLoadSpec::from_entry_path(&entry_file).unwrap_or_else(|e| {
-        assert!(
-            false,
+        unreachable!(
             "Failed to create JsExtensionLoadSpec for '{ext_id}' at {}: {e}",
             entry_file.display()
-        );
-        unreachable!()
+        )
     });
 
     // Start JS runtime and load the extension.
@@ -230,9 +224,7 @@ fn run_conformance_test(ext_id: &str) {
             manager
                 .load_js_extensions(vec![spec])
                 .await
-                .unwrap_or_else(|e| {
-                    assert!(false, "Failed to load extension '{ext_id_owned}': {e}");
-                });
+                .unwrap_or_else(|e| unreachable!("Failed to load extension '{ext_id_owned}': {e}"));
         }
     });
 
