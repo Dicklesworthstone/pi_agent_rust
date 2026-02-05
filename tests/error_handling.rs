@@ -455,6 +455,266 @@ mod provider_http_errors {
             assert!(msg.contains("HTTP 429"), "got: {msg}");
         });
     }
+
+    // --- HTTP 400 Bad Request (all providers) ---
+
+    #[test]
+    fn anthropic_http_400_reports_bad_request() {
+        let body = json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": "messages: required field missing" }
+        });
+        let (client, _dir) = vcr_client(
+            "anthropic_http_400",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            400,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("anthropic_http_400");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 400"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn openai_http_400_reports_bad_request() {
+        let body = json!({
+            "error": { "message": "Invalid model specified", "type": "invalid_request_error" }
+        });
+        let (client, _dir) = vcr_client(
+            "openai_http_400",
+            "https://api.openai.com/v1/chat/completions",
+            openai_body("test"),
+            400,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("openai_http_400");
+            let provider =
+                pi::providers::openai::OpenAIProvider::new("gpt-test").with_client(client);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 400"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn gemini_http_400_reports_bad_request() {
+        let url = gemini_url("gemini-test", "test-key");
+        let body = json!({
+            "error": { "code": 400, "message": "Invalid value at 'contents'", "status": "INVALID_ARGUMENT" }
+        });
+        let (client, _dir) = vcr_client(
+            "gemini_http_400",
+            &url,
+            gemini_body("test"),
+            400,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("gemini_http_400");
+            let provider =
+                pi::providers::gemini::GeminiProvider::new("gemini-test").with_client(client);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 400"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn azure_http_400_reports_bad_request() {
+        let endpoint = azure_url("gpt-test");
+        let body = json!({
+            "error": { "message": "Invalid model deployment", "type": "invalid_request_error" }
+        });
+        let (client, _dir) = vcr_client(
+            "azure_http_400",
+            &endpoint,
+            azure_body("test"),
+            400,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("azure_http_400");
+            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", "gpt-test")
+                .with_client(client)
+                .with_endpoint_url(endpoint);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 400"), "got: {msg}");
+        });
+    }
+
+    // --- Missing 403 / 500 combinations ---
+
+    #[test]
+    fn openai_http_403_reports_forbidden() {
+        let body = json!({
+            "error": { "message": "You do not have access to this model", "type": "forbidden" }
+        });
+        let (client, _dir) = vcr_client(
+            "openai_http_403",
+            "https://api.openai.com/v1/chat/completions",
+            openai_body("test"),
+            403,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("openai_http_403");
+            let provider =
+                pi::providers::openai::OpenAIProvider::new("gpt-test").with_client(client);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 403"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn gemini_http_403_reports_forbidden() {
+        let url = gemini_url("gemini-test", "test-key");
+        let body = json!({
+            "error": { "code": 403, "message": "Permission denied", "status": "PERMISSION_DENIED" }
+        });
+        let (client, _dir) = vcr_client(
+            "gemini_http_403",
+            &url,
+            gemini_body("test"),
+            403,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("gemini_http_403");
+            let provider =
+                pi::providers::gemini::GeminiProvider::new("gemini-test").with_client(client);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 403"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn azure_http_403_reports_forbidden() {
+        let endpoint = azure_url("gpt-test");
+        let (client, _dir) = vcr_client(
+            "azure_http_403",
+            &endpoint,
+            azure_body("test"),
+            403,
+            text_headers(),
+            vec!["Access denied".to_string()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("azure_http_403");
+            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", "gpt-test")
+                .with_client(client)
+                .with_endpoint_url(endpoint);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 403"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn gemini_http_500_reports_server_error() {
+        let url = gemini_url("gemini-test", "test-key");
+        let body = json!({
+            "error": { "code": 500, "message": "Internal error", "status": "INTERNAL" }
+        });
+        let (client, _dir) = vcr_client(
+            "gemini_http_500",
+            &url,
+            gemini_body("test"),
+            500,
+            json_headers(),
+            vec![serde_json::to_string(&body).unwrap()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("gemini_http_500");
+            let provider =
+                pi::providers::gemini::GeminiProvider::new("gemini-test").with_client(client);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 500"), "got: {msg}");
+        });
+    }
+
+    #[test]
+    fn azure_http_500_reports_server_error() {
+        let endpoint = azure_url("gpt-test");
+        let (client, _dir) = vcr_client(
+            "azure_http_500",
+            &endpoint,
+            azure_body("test"),
+            500,
+            text_headers(),
+            vec!["Internal server error".to_string()],
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("azure_http_500");
+            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", "gpt-test")
+                .with_client(client)
+                .with_endpoint_url(endpoint);
+            let err = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .err()
+                .expect("expected error");
+            let msg = err.to_string();
+            harness.log().info("verify", &msg);
+            assert!(msg.contains("HTTP 500"), "got: {msg}");
+        });
+    }
 }
 
 // ============================================================================
@@ -611,6 +871,154 @@ mod malformed_responses {
                         found_error || event_count == 0,
                         "expected error or empty stream, got {event_count} events"
                     );
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn anthropic_sse_error_event_in_stream() {
+        use pi::model::{StopReason, StreamEvent};
+
+        // Anthropic can return HTTP 200 with an error event mid-stream.
+        // The provider maps it to StreamEvent::Error (not Err), with
+        // stop_reason = Error and error_message populated.
+        let error_event = json!({
+            "type": "error",
+            "error": { "type": "overloaded_error", "message": "Overloaded" }
+        });
+        let chunks = vec![format!(
+            "event: error\ndata: {}\n\n",
+            serde_json::to_string(&error_event).unwrap()
+        )];
+        let (client, _dir) = vcr_client(
+            "anthropic_sse_error_event",
+            "https://api.anthropic.com/v1/messages",
+            anthropic_body("test"),
+            200,
+            sse_headers(),
+            chunks,
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("anthropic_sse_error_event");
+            let provider =
+                pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
+            let mut stream = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await
+                .expect("stream should open");
+
+            let mut found_error = false;
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(StreamEvent::Error { reason, error }) => {
+                        found_error = true;
+                        harness.log().info_ctx("verify", "sse error event", |ctx| {
+                            ctx.push(("reason".into(), format!("{reason:?}")));
+                            ctx.push((
+                                "error_message".into(),
+                                error.error_message.clone().unwrap_or_default(),
+                            ));
+                        });
+                        assert_eq!(reason, StopReason::Error, "expected Error stop reason");
+                        let msg = error.error_message.unwrap_or_default();
+                        assert!(
+                            msg.contains("Overloaded"),
+                            "expected Overloaded in error_message, got: {msg}"
+                        );
+                        break;
+                    }
+                    Err(err) => {
+                        found_error = true;
+                        harness.log().info("verify", err.to_string());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(found_error, "expected an error event in the stream");
+        });
+    }
+
+    #[test]
+    fn openai_empty_body_200_reports_error() {
+        let (client, _dir) = vcr_client(
+            "openai_empty_body_200",
+            "https://api.openai.com/v1/chat/completions",
+            openai_body("test"),
+            200,
+            sse_headers(),
+            Vec::new(),
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("openai_empty_body_200");
+            let provider =
+                pi::providers::openai::OpenAIProvider::new("gpt-test").with_client(client);
+            let result = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await;
+
+            match result {
+                Err(err) => {
+                    harness.log().info("verify", err.to_string());
+                }
+                Ok(mut stream) => {
+                    let mut event_count = 0;
+                    while let Some(item) = stream.next().await {
+                        event_count += 1;
+                        if let Err(err) = item {
+                            harness.log().info("verify", err.to_string());
+                            break;
+                        }
+                    }
+                    harness
+                        .log()
+                        .info_ctx("verify", "openai empty body stream", |ctx| {
+                            ctx.push(("event_count".into(), event_count.to_string()));
+                        });
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn azure_empty_body_200_reports_error() {
+        let endpoint = azure_url("gpt-test");
+        let (client, _dir) = vcr_client(
+            "azure_empty_body_200",
+            &endpoint,
+            azure_body("test"),
+            200,
+            sse_headers(),
+            Vec::new(),
+        );
+        common::run_async(async move {
+            let harness = TestHarness::new("azure_empty_body_200");
+            let provider = pi::providers::azure::AzureOpenAIProvider::new("unused", "gpt-test")
+                .with_client(client)
+                .with_endpoint_url(endpoint);
+            let result = provider
+                .stream(&context_for("test"), &options_with_key("test-key"))
+                .await;
+
+            match result {
+                Err(err) => {
+                    harness.log().info("verify", err.to_string());
+                }
+                Ok(mut stream) => {
+                    let mut event_count = 0;
+                    while let Some(item) = stream.next().await {
+                        event_count += 1;
+                        if let Err(err) = item {
+                            harness.log().info("verify", err.to_string());
+                            break;
+                        }
+                    }
+                    harness
+                        .log()
+                        .info_ctx("verify", "azure empty body stream", |ctx| {
+                            ctx.push(("event_count".into(), event_count.to_string()));
+                        });
                 }
             }
         });

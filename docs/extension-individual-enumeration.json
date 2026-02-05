@@ -1,0 +1,2254 @@
+{
+  "$schema": "pi.ext.individual-enumeration.v1",
+  "generated": "2026-02-05",
+  "total_individual_extensions": 214,
+  "total_before_dedup": 280,
+  "by_tier": {
+    "agents-mikeastock": 3,
+    "community": 55,
+    "npm-registry": 37,
+    "official-pi-mono": 60,
+    "third-party-github": 59
+  },
+  "by_capability": {
+    "export_default": 214,
+    "ExtensionAPI_import": 212,
+    "event_hook": 91,
+    "ui_header": 55,
+    "registerTool": 52,
+    "exec_api": 26,
+    "ui_overlay": 19,
+    "registerShortcut": 17,
+    "session_api": 12,
+    "events_api": 12,
+    "registerFlag": 9,
+    "registerProvider": 4,
+    "streamSimple": 3
+  },
+  "extensions": [
+    {
+      "id": "antigravity-image-gen",
+      "source_tier": "official-pi-mono",
+      "entry_file": "antigravity-image-gen.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "source_tier": "official-pi-mono",
+      "entry_file": "auto-commit-on-exit.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default"
+      ]
+    },
+    {
+      "id": "bash-spawn-hook",
+      "source_tier": "official-pi-mono",
+      "entry_file": "bash-spawn-hook.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "bookmark",
+      "source_tier": "official-pi-mono",
+      "entry_file": "bookmark.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "claude-rules",
+      "source_tier": "official-pi-mono",
+      "entry_file": "claude-rules.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "confirm-destructive",
+      "source_tier": "official-pi-mono",
+      "entry_file": "confirm-destructive.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "custom-compaction",
+      "source_tier": "official-pi-mono",
+      "entry_file": "custom-compaction.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "session_api"
+      ]
+    },
+    {
+      "id": "custom-footer",
+      "source_tier": "official-pi-mono",
+      "entry_file": "custom-footer.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "custom-header",
+      "source_tier": "official-pi-mono",
+      "entry_file": "custom-header.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerProvider",
+        "streamSimple",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "custom-provider-gitlab-duo",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerProvider",
+        "streamSimple",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerProvider",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "dirty-repo-guard",
+      "source_tier": "official-pi-mono",
+      "entry_file": "dirty-repo-guard.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default"
+      ]
+    },
+    {
+      "id": "doom-overlay",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_overlay"
+      ]
+    },
+    {
+      "id": "dynamic-resources",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "event-bus",
+      "source_tier": "official-pi-mono",
+      "entry_file": "event-bus.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "export_default"
+      ]
+    },
+    {
+      "id": "file-trigger",
+      "source_tier": "official-pi-mono",
+      "entry_file": "file-trigger.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "git-checkpoint",
+      "source_tier": "official-pi-mono",
+      "entry_file": "git-checkpoint.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default"
+      ]
+    },
+    {
+      "id": "handoff",
+      "source_tier": "official-pi-mono",
+      "entry_file": "handoff.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "hello",
+      "source_tier": "official-pi-mono",
+      "entry_file": "hello.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "inline-bash",
+      "source_tier": "official-pi-mono",
+      "entry_file": "inline-bash.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default"
+      ]
+    },
+    {
+      "id": "input-transform",
+      "source_tier": "official-pi-mono",
+      "entry_file": "input-transform.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "interactive-shell",
+      "source_tier": "official-pi-mono",
+      "entry_file": "interactive-shell.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "mac-system-theme",
+      "source_tier": "official-pi-mono",
+      "entry_file": "mac-system-theme.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "message-renderer",
+      "source_tier": "official-pi-mono",
+      "entry_file": "message-renderer.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "modal-editor",
+      "source_tier": "official-pi-mono",
+      "entry_file": "modal-editor.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "model-status",
+      "source_tier": "official-pi-mono",
+      "entry_file": "model-status.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "notify",
+      "source_tier": "official-pi-mono",
+      "entry_file": "notify.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "overlay-qa-tests",
+      "source_tier": "official-pi-mono",
+      "entry_file": "overlay-qa-tests.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ]
+    },
+    {
+      "id": "overlay-test",
+      "source_tier": "official-pi-mono",
+      "entry_file": "overlay-test.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_overlay"
+      ]
+    },
+    {
+      "id": "permission-gate",
+      "source_tier": "official-pi-mono",
+      "entry_file": "permission-gate.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "pirate",
+      "source_tier": "official-pi-mono",
+      "entry_file": "pirate.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "plan-mode",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerFlag",
+        "registerShortcut",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "preset",
+      "source_tier": "official-pi-mono",
+      "entry_file": "preset.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerFlag",
+        "registerShortcut",
+        "session_api",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "protected-paths",
+      "source_tier": "official-pi-mono",
+      "entry_file": "protected-paths.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "qna",
+      "source_tier": "official-pi-mono",
+      "entry_file": "qna.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "question",
+      "source_tier": "official-pi-mono",
+      "entry_file": "question.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "questionnaire",
+      "source_tier": "official-pi-mono",
+      "entry_file": "questionnaire.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "rainbow-editor",
+      "source_tier": "official-pi-mono",
+      "entry_file": "rainbow-editor.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "rpc-demo",
+      "source_tier": "official-pi-mono",
+      "entry_file": "rpc-demo.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "sandbox",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerFlag",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "send-user-message",
+      "source_tier": "official-pi-mono",
+      "entry_file": "send-user-message.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "session-name",
+      "source_tier": "official-pi-mono",
+      "entry_file": "session-name.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "session_api"
+      ]
+    },
+    {
+      "id": "shutdown-command",
+      "source_tier": "official-pi-mono",
+      "entry_file": "shutdown-command.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "snake",
+      "source_tier": "official-pi-mono",
+      "entry_file": "snake.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "space-invaders",
+      "source_tier": "official-pi-mono",
+      "entry_file": "space-invaders.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "ssh",
+      "source_tier": "official-pi-mono",
+      "entry_file": "ssh.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerFlag",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "status-line",
+      "source_tier": "official-pi-mono",
+      "entry_file": "status-line.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "subagent",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "summarize",
+      "source_tier": "official-pi-mono",
+      "entry_file": "summarize.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "session_api"
+      ]
+    },
+    {
+      "id": "system-prompt-header",
+      "source_tier": "official-pi-mono",
+      "entry_file": "system-prompt-header.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "timed-confirm",
+      "source_tier": "official-pi-mono",
+      "entry_file": "timed-confirm.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "titlebar-spinner",
+      "source_tier": "official-pi-mono",
+      "entry_file": "titlebar-spinner.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "session_api"
+      ]
+    },
+    {
+      "id": "todo",
+      "source_tier": "official-pi-mono",
+      "entry_file": "todo.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ]
+    },
+    {
+      "id": "tool-override",
+      "source_tier": "official-pi-mono",
+      "entry_file": "tool-override.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "tools",
+      "source_tier": "official-pi-mono",
+      "entry_file": "tools.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "trigger-compact",
+      "source_tier": "official-pi-mono",
+      "entry_file": "trigger-compact.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "truncated-tool",
+      "source_tier": "official-pi-mono",
+      "entry_file": "truncated-tool.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "widget-placement",
+      "source_tier": "official-pi-mono",
+      "entry_file": "widget-placement.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "with-deps",
+      "source_tier": "official-pi-mono",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ]
+    },
+    {
+      "id": "community/ferologics-notify/ferologics-notify",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-clipboard/clipboard",
+      "entry_file": "clipboard.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-cost-tracker/cost-tracker",
+      "entry_file": "cost-tracker.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-flicker-corp/flicker-corp",
+      "entry_file": "flicker-corp.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-funny-working-message/funny-working-message",
+      "entry_file": "funny-working-message.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-loop/loop",
+      "entry_file": "loop.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-memory-mode/memory-mode",
+      "entry_file": "memory-mode.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-oracle/oracle",
+      "entry_file": "oracle.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-resistance/resistance",
+      "entry_file": "resistance.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-speedreading/speedreading",
+      "entry_file": "speedreading.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-status-widget/status-widget",
+      "entry_file": "status-widget.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-ultrathink/ultrathink",
+      "entry_file": "ultrathink.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/hjanuschka-usage-bar/usage-bar",
+      "entry_file": "usage-bar.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/jyaunches-canvas/jyaunches-canvas",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-answer/answer",
+      "entry_file": "answer.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-control/control",
+      "entry_file": "control.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerFlag",
+        "registerTool",
+        "session_api",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-cwd-history/cwd-history",
+      "entry_file": "cwd-history.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-files/files",
+      "entry_file": "files.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-review/review",
+      "entry_file": "review.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-todos/todos",
+      "entry_file": "todos.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-uv/uv",
+      "entry_file": "uv.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/mitsuhiko-whimsical/whimsical",
+      "entry_file": "whimsical.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/nicobailon-interactive-shell/nicobailon-interactive-shell",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "export_default",
+        "registerTool",
+        "ui_overlay"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/nicobailon-interview-tool/nicobailon-interview-tool",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/nicobailon-mcp-adapter/nicobailon-mcp-adapter",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerFlag",
+        "registerTool",
+        "ui_overlay"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/nicobailon-powerline-footer/nicobailon-powerline-footer",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/nicobailon-rewind-hook/nicobailon-rewind-hook",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/nicobailon-subagents/nicobailon-subagents",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "export_default",
+        "registerTool",
+        "ui_overlay"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/ogulcancelik-ghostty-theme-sync/ogulcancelik-ghostty-theme-sync",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/prateekmedia-checkpoint/checkpoint",
+      "entry_file": "checkpoint.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/prateekmedia-lsp/lsp-tool",
+      "entry_file": "lsp-tool.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/prateekmedia-lsp/lsp",
+      "entry_file": "lsp.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/prateekmedia-permission/permission",
+      "entry_file": "permission.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/prateekmedia-ralph-loop/ralph-loop",
+      "entry_file": "ralph-loop.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/prateekmedia-repeat/repeat",
+      "entry_file": "repeat.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/prateekmedia-token-rate/token-rate",
+      "entry_file": "token-rate.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/qualisero-background-notify/qualisero-background-notify",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/qualisero-compact-config/compact-config",
+      "entry_file": "compact-config.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "session_api"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/qualisero-pi-agent-scip/extension",
+      "entry_file": "src/extension.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/qualisero-safe-git/qualisero-safe-git",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/qualisero-safe-rm/qualisero-safe-rm",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/qualisero-session-color/qualisero-session-color",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/qualisero-session-emoji/qualisero-session-emoji",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-agent-guidance/agent-guidance",
+      "entry_file": "agent-guidance.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-arcade-mario-not/mario-not",
+      "entry_file": "mario-not.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-arcade-picman/picman",
+      "entry_file": "picman.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-arcade-ping/ping",
+      "entry_file": "ping.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-arcade-spice-invaders/spice-invaders",
+      "entry_file": "spice-invaders.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-arcade-tetris/tetris",
+      "entry_file": "tetris.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-code-actions/tmustier-code-actions",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-files-widget/tmustier-files-widget",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-ralph-wiggum/tmustier-ralph-wiggum",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-raw-paste/tmustier-raw-paste",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-tab-status/tab-status",
+      "entry_file": "tab-status.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "community/tmustier-usage-extension/tmustier-usage-extension",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "community"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/mac-app",
+      "entry_file": "mac-app/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/neovim",
+      "entry_file": "neovim/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/processes",
+      "entry_file": "processes/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/defaults",
+      "entry_file": "defaults/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/presenter",
+      "entry_file": "presenter/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/extension-dev",
+      "entry_file": "extension-dev/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/specialized-subagents",
+      "entry_file": "specialized-subagents/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/planning",
+      "entry_file": "planning/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/the-dumb-zone",
+      "entry_file": "the-dumb-zone/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_overlay"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions/session-management",
+      "entry_file": "session-management/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/ben-vargas-pi-packages/extensions",
+      "entry_file": "pi-ancestor-discovery/extensions/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/charles-cooper-pi-extensions/taskman-compaction",
+      "entry_file": "taskman-compaction.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/charles-cooper-pi-extensions/per-model-system-prompt",
+      "entry_file": "per-model-system-prompt.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/cv-pi-ssh-remote",
+      "source_tier": "third-party-github",
+      "entry_file": "src/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default",
+        "registerFlag"
+      ]
+    },
+    {
+      "id": "third-party/graffioh-pi-screenshots-picker/graffioh-pi-screenshots-picker",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerShortcut",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/graffioh-pi-super-curl/graffioh-pi-super-curl",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/jyaunches-pi-canvas/jyaunches-pi-canvas",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions/apply-patch-tool",
+      "entry_file": "apply-patch-tool/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions/assistant",
+      "entry_file": "assistant/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions/codemap",
+      "entry_file": "codemap/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_overlay"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions/skill-picker",
+      "entry_file": "skill-picker/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/limouren-agent-things/notify-on-idle",
+      "entry_file": "notify-on-idle.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/lsj5031-pi-notification-extension/notification",
+      "entry_file": "notification.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/marckrenn-pi-sub/sub-core",
+      "entry_file": "sub-core/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/marckrenn-pi-sub/sub-bar",
+      "entry_file": "sub-bar/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "exec_api",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/michalvavra-agents/security",
+      "entry_file": "security.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/michalvavra-agents/skill-dollar",
+      "entry_file": "skill-dollar.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/michalvavra-agents/bell",
+      "entry_file": "bell.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/michalvavra-agents/filter-output",
+      "entry_file": "filter-output.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/ogulcancelik-pi-sketch/ogulcancelik-pi-sketch",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/openclaw-openclaw/diff",
+      "entry_file": "extensions/diff.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/openclaw-openclaw/prompt-url-widget",
+      "entry_file": "extensions/prompt-url-widget.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default",
+        "session_api"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/openclaw-openclaw/redraws",
+      "entry_file": "extensions/redraws.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/pasky-pi-amplike/session-query",
+      "entry_file": "session-query.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/raunovillberg-pi-stuffed/reddit",
+      "entry_file": "extensions/reddit.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/rytswd-direnv/rytswd-direnv",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/rytswd-questionnaire/rytswd-questionnaire",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/rytswd-slow-mode/rytswd-slow-mode",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/vtemian-pi-config/token-aware-truncation",
+      "entry_file": "hooks/token-aware-truncation.ts",
+      "capabilities": [
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/vtemian-pi-config/comment-checker",
+      "entry_file": "hooks/comment-checker.ts",
+      "capabilities": [
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/dedup-agents-files",
+      "entry_file": "dedup-agents-files.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/md",
+      "entry_file": "md.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/branch-term",
+      "entry_file": "branch-term.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default",
+        "registerFlag"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/repoprompt-cli",
+      "entry_file": "repoprompt-cli.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/ephemeral-mode",
+      "entry_file": "ephemeral-mode.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/command-center",
+      "entry_file": "command-center/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerShortcut",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/model-sysprompt-appendix",
+      "entry_file": "model-sysprompt-appendix/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/pi-prompt-template-model",
+      "entry_file": "pi-prompt-template-model/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "session_api",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/rp-native-tools-lock",
+      "entry_file": "rp-native-tools-lock/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/vog",
+      "entry_file": "vog/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/guardrails",
+      "entry_file": "guardrails/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/brave-search",
+      "entry_file": "brave-search/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/agentic-compaction",
+      "entry_file": "agentic-compaction/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "session_api"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/editor-enhancements",
+      "entry_file": "editor-enhancements/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerShortcut",
+        "ui_overlay"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/skill-palette",
+      "entry_file": "skill-palette/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/code-actions",
+      "entry_file": "code-actions/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/poly-notify",
+      "entry_file": "poly-notify/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/rewind",
+      "entry_file": "rewind/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "third-party/w-winter-dot314/session-ask",
+      "entry_file": "session-ask/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "third-party-github"
+    },
+    {
+      "id": "npm/aliou-pi-extension-dev/aliou-pi-extension-dev",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/aliou-pi-linkup",
+      "source_tier": "npm-registry",
+      "entry_file": "src/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "npm/aliou-pi-processes/aliou-pi-processes",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/juanibiapina-pi-extension-settings",
+      "source_tier": "npm-registry",
+      "entry_file": "dist/index.d.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "events_api",
+        "export_default"
+      ]
+    },
+    {
+      "id": "npm/juanibiapina-pi-files",
+      "source_tier": "npm-registry",
+      "entry_file": "dist/index.d.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "npm/juanibiapina-pi-gob",
+      "source_tier": "npm-registry",
+      "entry_file": "dist/index.d.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-bar/marckrenn-pi-sub-bar",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "exec_api",
+        "export_default",
+        "registerShortcut"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-core/marckrenn-pi-sub-core",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "events_api",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-agentic-compaction/pi-agentic-compaction",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "session_api"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-annotate/pi-annotate",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-bash-confirm/bash-confirm",
+      "entry_file": "extensions/bash-confirm.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-bash-confirm/test-extension",
+      "entry_file": "examples/test-extension.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-mermaid/pi-mermaid",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-messenger/pi-messenger",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-multicodex/pi-multicodex",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default",
+        "registerProvider",
+        "session_api",
+        "streamSimple",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-notify/pi-notify",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-repoprompt-mcp",
+      "source_tier": "npm-registry",
+      "entry_file": "extensions/repoprompt-mcp/src/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header",
+        "ui_overlay"
+      ]
+    },
+    {
+      "id": "npm/pi-review-loop/pi-review-loop",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-screenshots-picker/pi-screenshots-picker",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerShortcut",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-search-agent/pi-search-agent",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerShortcut",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-shadow-git/shadow-git",
+      "entry_file": "extensions/shadow-git.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-shell-completions/pi-shell-completions",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-skill-palette/pi-skill-palette",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "ui_header",
+        "ui_overlay"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-subdir-context",
+      "source_tier": "npm-registry",
+      "entry_file": "dist/index.d.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default"
+      ]
+    },
+    {
+      "id": "npm/pi-super-curl/pi-super-curl",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-threads/pi-threads",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "exec_api",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-wakatime",
+      "source_tier": "npm-registry",
+      "entry_file": "src/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ]
+    },
+    {
+      "id": "npm/pi-watch/pi-watch",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerFlag"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/pi-web-access/pi-web-access",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerShortcut",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/vaayne-agent-kit/powerline-status",
+      "entry_file": "extensions/powerline-status.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/vaayne-agent-kit/mcp",
+      "entry_file": "extensions/mcp/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "exec_api",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/vaayne-pi-mcp/vaayne-pi-mcp",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/vaayne-pi-subagent/vaayne-pi-subagent",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "event_hook",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/vaayne-pi-web-tools/vaayne-pi-web-tools",
+      "entry_file": "index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool",
+        "ui_header"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/vpellegrino-pi-skills/bash-compat",
+      "entry_file": "pi-extensions/bash-compat.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/walterra-pi-charts/vega-chart",
+      "entry_file": "extensions/vega-chart/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "npm/walterra-pi-graphviz/graphviz-chart",
+      "entry_file": "extensions/graphviz-chart/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "npm-registry"
+    },
+    {
+      "id": "agents-mikeastock/extensions/terraform-apply-gate",
+      "entry_file": "pi/terraform-apply-gate/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "events_api",
+        "export_default"
+      ],
+      "source_tier": "agents-mikeastock"
+    },
+    {
+      "id": "agents-mikeastock/extensions/agent-status",
+      "entry_file": "pi/agent-status/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "events_api",
+        "export_default"
+      ],
+      "source_tier": "agents-mikeastock"
+    },
+    {
+      "id": "agents-mikeastock/extensions/AskUserQuestion",
+      "entry_file": "pi/AskUserQuestion/index.ts",
+      "capabilities": [
+        "ExtensionAPI_import",
+        "events_api",
+        "export_default",
+        "registerTool"
+      ],
+      "source_tier": "agents-mikeastock"
+    }
+  ]
+}

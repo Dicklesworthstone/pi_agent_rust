@@ -4827,51 +4827,81 @@ impl JsExtensionRuntimeHandle {
         &self,
         specs: Vec<JsExtensionLoadSpec>,
     ) -> Result<Vec<JsExtensionSnapshot>> {
-        let cx = cx_with_deadline(EXTENSION_LOAD_BUDGET_MS);
+        let timeout_ms = EXTENSION_LOAD_BUDGET_MS;
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::LoadExtensions {
-                    specs,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::LoadExtensions {
+            specs,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime load timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
-        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
+        let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::GetRegisteredTools { reply: reply_tx },
-            )
+        let command = JsRuntimeCommand::GetRegisteredTools { reply: reply_tx };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime tools query timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn pump_once(&self) -> Result<bool> {
-        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
+        let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(&cx, JsRuntimeCommand::PumpOnce { reply: reply_tx })
+        let command = JsRuntimeCommand::PumpOnce { reply: reply_tx };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime pump timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn dispatch_event(
@@ -4883,23 +4913,31 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<Value> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::DispatchEvent {
-                    event_name,
-                    event_payload,
-                    ctx_payload,
-                    timeout_ms,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::DispatchEvent {
+            event_name,
+            event_payload,
+            ctx_payload,
+            timeout_ms,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime event timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn execute_tool(
@@ -4912,24 +4950,32 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<Value> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::ExecuteTool {
-                    tool_name,
-                    tool_call_id,
-                    input,
-                    ctx_payload,
-                    timeout_ms,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::ExecuteTool {
+            tool_name,
+            tool_call_id,
+            input,
+            ctx_payload,
+            timeout_ms,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime tool timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn execute_command(
@@ -4941,23 +4987,31 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<Value> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::ExecuteCommand {
-                    command_name,
-                    args,
-                    ctx_payload,
-                    timeout_ms,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::ExecuteCommand {
+            command_name,
+            args,
+            ctx_payload,
+            timeout_ms,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime command timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn execute_shortcut(
@@ -4968,22 +5022,30 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<Value> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::ExecuteShortcut {
-                    key_id,
-                    ctx_payload,
-                    timeout_ms,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::ExecuteShortcut {
+            key_id,
+            ctx_payload,
+            timeout_ms,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime shortcut timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn set_flag_value(
@@ -4992,24 +5054,33 @@ impl JsExtensionRuntimeHandle {
         flag_name: String,
         value: Value,
     ) -> Result<()> {
-        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
+        let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::SetFlagValue {
-                    extension_id,
-                    flag_name,
-                    value,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::SetFlagValue {
+            extension_id,
+            flag_name,
+            value,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime flag update timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn provider_stream_simple_start(
@@ -5022,24 +5093,32 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<String> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::ProviderStreamSimpleStart {
-                    provider_id,
-                    model,
-                    context,
-                    options,
-                    timeout_ms,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::ProviderStreamSimpleStart {
+            provider_id,
+            model,
+            context,
+            options,
+            timeout_ms,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime provider stream start timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn provider_stream_simple_next(
@@ -5049,21 +5128,29 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<Option<Value>> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::ProviderStreamSimpleNext {
-                    stream_id,
-                    timeout_ms,
-                    reply: reply_tx,
-                },
-            )
+        let command = JsRuntimeCommand::ProviderStreamSimpleNext {
+            stream_id,
+            timeout_ms,
+            reply: reply_tx,
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime provider stream next timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub async fn provider_stream_simple_cancel(
@@ -5073,21 +5160,29 @@ impl JsExtensionRuntimeHandle {
     ) -> Result<()> {
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.sender
-            .send(
-                &cx,
-                JsRuntimeCommand::ProviderStreamSimpleCancel {
-                    stream_id,
-                    timeout_ms,
-                    reply: Some(reply_tx),
-                },
-            )
+        let command = JsRuntimeCommand::ProviderStreamSimpleCancel {
+            stream_id,
+            timeout_ms,
+            reply: Some(reply_tx),
+        };
+        let fut = async move {
+            self.sender
+                .send(&cx, command)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+            reply_rx
+                .recv(&cx)
+                .await
+                .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+        };
+
+        timeout(wall_now(), Duration::from_millis(timeout_ms), Box::pin(fut))
             .await
-            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
-        reply_rx
-            .recv(&cx)
-            .await
-            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+            .unwrap_or_else(|_| {
+                Err(Error::extension(format!(
+                    "JS extension runtime provider stream cancel timed out after {timeout_ms}ms"
+                )))
+            })
     }
 
     pub fn provider_stream_simple_cancel_best_effort(&self, stream_id: String) {
@@ -11562,6 +11657,170 @@ mod tests {
     }
 
     // ========================================================================
+    // LabRuntime deterministic testing (bd-48tv)
+    // ========================================================================
+
+    mod lab_runtime_tests {
+        use super::*;
+        use asupersync::{LabConfig, LabRuntime};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        /// Create a LabRuntime configured for extension testing.
+        fn ext_lab(seed: u64) -> LabRuntime {
+            LabRuntime::new(LabConfig::new(seed).trace_capacity(4096))
+        }
+
+        #[test]
+        fn lab_oneshot_recv_completes_under_virtual_time() {
+            let mut runtime = ext_lab(42);
+            let root = runtime.state.create_root_region(Budget::INFINITE);
+
+            let (tx, rx) = oneshot::channel::<String>();
+            let received = Arc::new(std::sync::Mutex::new(None));
+            let received_clone = received.clone();
+
+            // Sender task: send a value immediately.
+            let (send_task, _) = runtime
+                .state
+                .create_task(root, Budget::INFINITE, async move {
+                    let cx = Cx::current().expect("cx");
+                    tx.send(&cx, "hello".to_string()).expect("send");
+                })
+                .expect("create send task");
+            runtime.scheduler.lock().unwrap().schedule(send_task, 0);
+
+            // Receiver task: receive with infinite budget.
+            let (recv_task, _) = runtime
+                .state
+                .create_task(root, Budget::INFINITE, async move {
+                    let cx = Cx::current().expect("cx");
+                    if let Ok(val) = rx.recv(&cx).await {
+                        *received_clone.lock().unwrap() = Some(val);
+                    }
+                })
+                .expect("create recv task");
+            runtime.scheduler.lock().unwrap().schedule(recv_task, 0);
+
+            runtime.run_until_quiescent();
+
+            let val = received.lock().unwrap().take();
+            assert_eq!(val.as_deref(), Some("hello"));
+        }
+
+        #[test]
+        fn lab_sender_drop_unblocks_receiver() {
+            // Simulates extension runtime shutdown: when the JS runtime
+            // thread exits, it drops the reply sender. The ExtensionManager
+            // method (receiver) should see an error, not hang.
+            let mut runtime = ext_lab(0xDEAD);
+            let root = runtime.state.create_root_region(Budget::INFINITE);
+
+            let (tx, rx) = oneshot::channel::<String>();
+            let got_error = Arc::new(AtomicBool::new(false));
+            let got_error_clone = got_error.clone();
+
+            // Task 1: drop the sender (simulates runtime exit).
+            let (drop_task, _) = runtime
+                .state
+                .create_task(root, Budget::INFINITE, async move {
+                    drop(tx);
+                })
+                .expect("create drop task");
+            runtime.scheduler.lock().unwrap().schedule(drop_task, 0);
+
+            // Task 2: try to recv (should fail because sender was dropped).
+            let (recv_task, _) = runtime
+                .state
+                .create_task(root, Budget::INFINITE, async move {
+                    let cx = Cx::current().expect("cx");
+                    if rx.recv(&cx).await.is_err() {
+                        got_error_clone.store(true, Ordering::SeqCst);
+                    }
+                })
+                .expect("create recv task");
+            runtime.scheduler.lock().unwrap().schedule(recv_task, 0);
+
+            runtime.run_until_quiescent();
+
+            assert!(
+                got_error.load(Ordering::SeqCst),
+                "recv should fail when sender is dropped (runtime shutdown)"
+            );
+        }
+
+        #[test]
+        fn lab_extension_dispatch_deterministic_across_runs() {
+            // Running the same scenario with the same seed must produce
+            // identical results — verifying deterministic scheduling.
+            fn run_once(seed: u64) -> Vec<String> {
+                let mut runtime = ext_lab(seed);
+                let root = runtime.state.create_root_region(Budget::INFINITE);
+
+                let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+                for i in 0..5 {
+                    let log = Arc::clone(&log);
+                    let (task_id, _) = runtime
+                        .state
+                        .create_task(root, Budget::INFINITE, async move {
+                            let cx = Cx::current().expect("cx");
+                            // Simulate extension dispatch: send/recv on a channel.
+                            let (tx, rx) = oneshot::channel::<u32>();
+                            tx.send(&cx, i).expect("send");
+                            let val = rx.recv(&cx).await.expect("recv");
+                            log.lock().unwrap().push(format!("task-{val}"));
+                        })
+                        .expect("create task");
+                    runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+                }
+
+                runtime.run_until_quiescent();
+                log.lock().unwrap().clone()
+            }
+
+            let run_a = run_once(0xCAFE);
+            let run_b = run_once(0xCAFE);
+            assert_eq!(run_a, run_b, "same seed must produce same execution order");
+        }
+
+        #[test]
+        fn lab_multiworker_extension_dispatch_deterministic() {
+            // Under multi-worker scheduling, same seed must still produce
+            // deterministic results.
+            fn run_multi(seed: u64) -> Vec<String> {
+                let config = LabConfig::new(seed).worker_count(4).trace_capacity(4096);
+                let mut runtime = LabRuntime::new(config);
+                let root = runtime.state.create_root_region(Budget::INFINITE);
+
+                let log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+
+                for i in 0..8 {
+                    let log = Arc::clone(&log);
+                    let (task_id, _) = runtime
+                        .state
+                        .create_task(root, Budget::INFINITE, async move {
+                            // Yield to interleave with other tasks.
+                            asupersync::runtime::yield_now().await;
+                            log.lock().unwrap().push(format!("w-{i}"));
+                        })
+                        .expect("create task");
+                    runtime.scheduler.lock().unwrap().schedule(task_id, 0);
+                }
+
+                runtime.run_until_quiescent();
+                log.lock().unwrap().clone()
+            }
+
+            let run_a = run_multi(0xF00D);
+            let run_b = run_multi(0xF00D);
+            assert_eq!(
+                run_a, run_b,
+                "multi-worker execution must be deterministic with same seed"
+            );
+        }
+    }
+
+    // ========================================================================
     // Extension lifecycle / structured concurrency tests (bd-2vie)
     // ========================================================================
 
@@ -11842,21 +12101,15 @@ mod tests {
         #[test]
         fn tight_deadline_cancels_blocked_recv() {
             asupersync::test_utils::run_test(|| async {
-                // Create a oneshot and only send after the deadline has expired.
-                // This ensures the recv future gets woken so it can observe cancellation.
-                let (tx, rx) = oneshot::channel::<()>();
+                // Create a oneshot where nobody will send.
+                let (_tx, rx) = oneshot::channel::<()>();
                 let cx = cx_with_deadline(50); // 50ms deadline
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(200));
-                    let cx = Cx::for_request();
-                    let _ = tx.send(&cx, ());
-                });
                 let start = wall_now();
-                let result = rx.recv(&cx).await;
+                let result = timeout(wall_now(), Duration::from_millis(50), rx.recv(&cx)).await;
                 let elapsed = Duration::from_nanos(wall_now().duration_since(start));
                 assert!(
-                    result.is_err(),
-                    "recv should fail once the deadline is exceeded; got: {result:?}"
+                    result.is_err() || matches!(result, Ok(Err(_))),
+                    "recv should fail when the deadline is exceeded; got: {result:?}"
                 );
                 // Should not hang forever.
                 assert!(

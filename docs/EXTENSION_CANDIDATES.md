@@ -34,6 +34,108 @@ This is a **source-first, unfiltered** candidate inventory for extension samplin
 
 ---
 
+## Discovery Playbook (Repeatable Queries) (bd‑19rf)
+
+Goal: provide a deterministic checklist of **discovery channels + copy/paste queries** so future agents can repeat online research and converge on the same candidate set.
+
+### A) Official Pi sources (baseline)
+
+- `pi-mono` examples/extensions list (local snapshot):  
+  `legacy_pi_mono_code/pi-mono/packages/coding-agent/examples/extensions/README.md`
+- `pi-mono` seed extensions (local snapshot):  
+  `legacy_pi_mono_code/pi-mono/.pi/extensions/`
+- buildwithpi packages + docs:  
+  https://buildwithpi.ai/  
+  https://buildwithpi.ai/packages
+- `badlogic` gists (extensions):  
+  https://gist.github.com/badlogic
+
+### B) GitHub repo discovery (keyword-based “broad net”)
+
+Run as GitHub UI searches or via `gh search repos`. Record **date/time**, the exact query, and the number of candidate repos reviewed.
+
+Suggested queries (tune language filters to reduce noise):
+
+- `"buildwithpi" extension`
+- `"pi-mono" extension`
+- `"pi agent" extension language:TypeScript`
+- `"pi agent" extension language:JavaScript`
+- `"Pi Agent" extension`
+
+`gh` examples:
+
+```bash
+gh search repos '"buildwithpi" extension' --limit 200
+gh search repos '"pi-mono" extension' --limit 200
+gh search repos '"pi agent" extension language:TypeScript' --limit 200
+gh search repos '"pi agent" extension language:JavaScript' --limit 200
+```
+
+### C) GitHub code discovery (signature-based “find real entrypoints”)
+
+Goal: find repositories that contain actual Pi extension registration code, not just mentions.
+
+Suggested code search patterns (run each in GitHub Code Search or via `gh search code`):
+
+- `registerTool(` (tools)
+- `registerCommand(` (slash commands)
+- `registerProvider(` (custom providers)
+- `resources_discover` / `resourcesDiscover` (dynamic resources hooks)
+- `tool_call` / `tool_result` / `turn_start` / `turn_end` (lifecycle events)
+
+`gh` examples:
+
+```bash
+gh search code 'registerTool(' --limit 200
+gh search code 'registerCommand(' --limit 200
+gh search code 'registerProvider(' --limit 200
+gh search code 'resources_discover' --limit 200
+```
+
+Validation heuristic (recommended): for each hit, confirm the repo has an extension entrypoint (e.g., a file exporting a default function that receives a Pi context object, or an obvious extension package layout).
+
+### D) npm discovery (distribution layer)
+
+Goal: find npm packages that ship Pi extensions or integrate with Pi Agent.
+
+Suggested queries (via npm UI or CLI):
+
+```bash
+npm search "pi agent extension" --json | jq '.[0:50] | map({name,version,description})'
+npm search buildwithpi --json | jq '.[0:50] | map({name,version,description})'
+npm search pi-mono --json | jq '.[0:50] | map({name,version,description})'
+```
+
+For each promising package, record popularity evidence (downloads, dependents) and extract any linked repo/gist.
+
+### E) Marketplace ecosystems (OpenClaw / ClawHub)
+
+Goal: locate any marketplace/directory indexes that list extensions in bulk.
+
+Checklist:
+
+- Identify the canonical OpenClaw org/repo and any associated “hub / marketplace / directory”.
+- Prefer machine-readable indexes (JSON feeds, GraphQL endpoints, API responses) over scraping HTML.
+- Export raw dumps with timestamps so inventory can be regenerated.
+
+### F) Curated lists + cross-reference mining (mentions)
+
+Goal: find “hidden” extensions referenced by other extension authors.
+
+Suggested queries:
+
+- GitHub repo search: `awesome "pi agent"` / `awesome buildwithpi` / `awesome pi-mono`
+- GitHub code search across discovered repos: `pi extension`, `buildwithpi`, `pi-mono`, `registerTool(`, `registerCommand(`
+- Issues/PR search in `pi-mono` and buildwithpi repos for “extension”, “packages”, “marketplace”
+
+### Noise notes (practical filters)
+
+- The query `pi extension` is usually too broad; add an anchor (`buildwithpi`, `pi-mono`, `registerTool(`).
+- Prefer signature searches (`registerTool(` / `registerCommand(` / `registerProvider(`) to reduce false positives.
+- When GitHub search results are noisy, filter by language (TS/JS first), and by last-updated recency.
+
+---
+
 ## Candidate Metadata Fields
 
 - **Name/Path**: extension name or directory.

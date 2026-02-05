@@ -82,6 +82,10 @@ pub fn normalize_cli(cli: &mut cli::Cli) {
     if cli.print {
         cli.no_session = true;
     }
+
+    if let Some(provider) = &mut cli.provider {
+        *provider = provider.to_ascii_lowercase();
+    }
 }
 
 pub fn validate_rpc_args(cli: &cli::Cli) -> Result<()> {
@@ -357,7 +361,9 @@ pub fn select_model_and_thinking(
     let mut fallback_message = None;
 
     if let (Some(provider), Some(model_id)) = (cli.provider.as_deref(), cli.model.as_deref()) {
-        let found = registry.find(provider, model_id);
+        let found = registry
+            .find(provider, model_id)
+            .or_else(|| crate::models::ad_hoc_model_entry(provider, model_id));
         if found.is_none() {
             bail!("Model {provider}/{model_id} not found");
         }
@@ -554,20 +560,18 @@ fn restore_model_from_session(
     current_model: Option<ModelEntry>,
     registry: &ModelRegistry,
 ) -> RestoreResult {
-    let restored = registry.find(saved_provider, saved_model_id);
+    let restored = registry
+        .find(saved_provider, saved_model_id)
+        .or_else(|| crate::models::ad_hoc_model_entry(saved_provider, saved_model_id));
 
-    if restored.as_ref().is_some_and(|m| m.api_key.is_some()) {
+    if restored.is_some() {
         return RestoreResult {
             model: restored,
             fallback_message: None,
         };
     }
 
-    let reason = if restored.is_none() {
-        "model no longer exists"
-    } else {
-        "no API key available"
-    };
+    let reason = "model no longer exists";
 
     if let Some(current) = current_model {
         return RestoreResult {

@@ -437,7 +437,11 @@ impl PiApp {
                     self.status_message = Some(format!("Updated autocompleteMaxVisible: {next}"));
                 }
             }
-            SettingsUiEntry::Summary | SettingsUiEntry::Theme => {}
+            SettingsUiEntry::Theme => {
+                self.settings_ui = None;
+                self.theme_picker = Some(ThemePickerOverlay::new(&self.cwd));
+            }
+            SettingsUiEntry::Summary => {}
         }
     }
 
@@ -1510,6 +1514,74 @@ impl PiApp {
             self.styles
                 .muted_italic
                 .render("↑/↓/j/k: navigate  Enter: select  Esc/q: cancel")
+        );
+
+        output
+    }
+
+    fn render_theme_picker(&self, picker: &ThemePickerOverlay) -> String {
+        let mut output = String::new();
+
+        let _ = writeln!(output, "\n  {}\n", self.styles.title.render("Select Theme"));
+
+        if picker.themes.is_empty() {
+            let _ = writeln!(output, "  {}", self.styles.muted.render("No themes found."));
+        } else {
+            let offset = picker.scroll_offset();
+            let visible_count = picker.max_visible.min(picker.themes.len());
+            let end = (offset + visible_count).min(picker.themes.len());
+
+            for (idx, path) in picker.themes[offset..end].iter().enumerate() {
+                let global_idx = offset + idx;
+                let is_selected = global_idx == picker.selected;
+
+                let prefix = if is_selected { ">" } else { " " };
+                // Load theme to get name, or fallback to file stem
+                // Performance note: repetitive load, but themes are small JSON files.
+                let name = Theme::load(path).map_or_else(
+                    |_| {
+                        path.file_stem().map_or_else(
+                            || "unknown".to_string(),
+                            |s| s.to_string_lossy().to_string(),
+                        )
+                    },
+                    |t| t.name,
+                );
+
+                let active = name.eq_ignore_ascii_case(&self.theme.name);
+                let marker = if active { " *" } else { "" };
+
+                let row = format!(" {name}{marker}");
+                let rendered = if is_selected {
+                    self.styles.selection.render(&row)
+                } else {
+                    row
+                };
+
+                let _ = writeln!(output, "{prefix} {rendered}");
+            }
+
+            if picker.themes.len() > visible_count {
+                let _ = writeln!(
+                    output,
+                    "  {}",
+                    self.styles.muted.render(&format!(
+                        "({}-{} of {})",
+                        offset + 1,
+                        end,
+                        picker.themes.len()
+                    ))
+                );
+            }
+        }
+
+        output.push('\n');
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted_italic
+                .render("↑/↓/j/k: navigate  Enter: select  Esc/q: back")
         );
 
         output
@@ -3738,6 +3810,9 @@ pub struct PiApp {
     // Settings UI overlay for /settings
     settings_ui: Option<SettingsUiState>,
 
+    // Theme picker overlay
+    theme_picker: Option<ThemePickerOverlay>,
+
     // Tree navigation UI state (for /tree command)
     tree_ui: Option<TreeUiState>,
 }
@@ -3846,6 +3921,51 @@ enum SettingsUiEntry {
     DoubleEscapeAction,
     EditorPaddingX,
     AutocompleteMaxVisible,
+}
+
+#[derive(Debug)]
+struct ThemePickerOverlay {
+    themes: Vec<PathBuf>,
+    selected: usize,
+    max_visible: usize,
+}
+
+impl ThemePickerOverlay {
+    fn new(cwd: &Path) -> Self {
+        let themes = Theme::discover_themes(cwd);
+        Self {
+            themes,
+            selected: 0,
+            max_visible: 10,
+        }
+    }
+
+    fn select_next(&mut self) {
+        if !self.themes.is_empty() {
+            self.selected = (self.selected + 1) % self.themes.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.themes.is_empty() {
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(self.themes.len() - 1);
+        }
+    }
+
+    const fn scroll_offset(&self) -> usize {
+        if self.selected < self.max_visible {
+            0
+        } else {
+            self.selected - self.max_visible + 1
+        }
+    }
+
+    fn selected_theme_path(&self) -> Option<&PathBuf> {
+        self.themes.get(self.selected)
+    }
 }
 
 #[derive(Debug)]
@@ -4399,6 +4519,7 @@ impl PiApp {
             autocomplete,
             session_picker: None,
             settings_ui: None,
+            theme_picker: None,
             tree_ui: None,
         };
 
@@ -4480,6 +4601,52 @@ impl PiApp {
             // /tree modal captures all input while active.
             if self.tree_ui.is_some() {
                 return self.handle_tree_ui_key(key);
+            }
+
+            // Theme picker modal captures all input while active.
+            if self.theme_picker.is_some() {
+                let mut picker = self
+                    .theme_picker
+                    .take()
+                    .expect("checked theme_picker is_some");
+                match key.key_type {
+                    KeyType::Up => picker.select_prev(),
+                    KeyType::Down => picker.select_next(),
+                    KeyType::Runes if key.runes == ['k'] => picker.select_prev(),
+                    KeyType::Runes if key.runes == ['j'] => picker.select_next(),
+                    KeyType::Enter => {
+                        if let Some(path) = picker.selected_theme_path() {
+                            if let Ok(theme) = Theme::load(path) {
+                                self.apply_theme(theme.clone());
+                                if let Err(e) = self.persist_project_theme(&theme.name) {
+                                    self.status_message =
+                                        Some(format!("Failed to persist theme: {e}"));
+                                } else {
+                                    self.status_message =
+                                        Some(format!("Switched to theme: {}", theme.name));
+                                }
+                            } else {
+                                self.status_message =
+                                    Some("Failed to load selected theme".to_string());
+                            }
+                        }
+                        self.theme_picker = None;
+                        return None;
+                    }
+                    KeyType::Esc => {
+                        self.theme_picker = None;
+                        self.settings_ui = Some(SettingsUiState::new());
+                        return None;
+                    }
+                    KeyType::Runes if key.runes == ['q'] => {
+                        self.theme_picker = None;
+                        self.settings_ui = Some(SettingsUiState::new());
+                        return None;
+                    }
+                    _ => {}
+                }
+                self.theme_picker = Some(picker);
+                return None;
             }
 
             // /settings modal captures all input while active.
@@ -4803,10 +4970,16 @@ impl PiApp {
             output.push_str(&self.render_settings_ui(settings_ui));
         }
 
+        // Theme picker overlay (if open)
+        if let Some(ref picker) = self.theme_picker {
+            output.push_str(&self.render_theme_picker(picker));
+        }
+
         // Input area (only when idle and no overlay open)
         if self.agent_state == AgentState::Idle
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
+            && self.theme_picker.is_none()
         {
             output.push_str(&self.render_input());
 
@@ -7666,6 +7839,25 @@ impl PiApp {
                 });
 
                 if matches.is_empty() {
+                    if let Some((provider, model_id)) = pattern.split_once('/') {
+                        let provider = provider.trim().to_ascii_lowercase();
+                        let model_id = model_id.trim();
+                        if !provider.is_empty() && !model_id.is_empty() {
+                            if let Some(mut entry) =
+                                crate::models::ad_hoc_model_entry(&provider, model_id)
+                            {
+                                let auth_path = crate::config::Config::auth_path();
+                                let resolved_key = crate::auth::AuthStorage::load(auth_path)
+                                    .ok()
+                                    .and_then(|auth| auth.resolve_api_key(&provider, None));
+                                entry.api_key = resolved_key;
+                                matches.push(entry);
+                            }
+                        }
+                    }
+                }
+
+                if matches.is_empty() {
                     self.status_message = Some(format!("Model not found: {pattern}"));
                     return None;
                 }
@@ -7689,6 +7881,22 @@ impl PiApp {
 
                 let next = matches.into_iter().next().expect("matches is non-empty");
 
+                let resolved_api_key = if next.api_key.is_some() {
+                    next.api_key.clone()
+                } else {
+                    let auth_path = crate::config::Config::auth_path();
+                    crate::auth::AuthStorage::load(auth_path)
+                        .ok()
+                        .and_then(|auth| auth.resolve_api_key(&next.model.provider, None))
+                };
+                if resolved_api_key.is_none() {
+                    self.status_message = Some(format!(
+                        "Missing API key for provider {}",
+                        next.model.provider
+                    ));
+                    return None;
+                }
+
                 if next.model.provider == self.model_entry.model.provider
                     && next.model.id == self.model_entry.model.id
                 {
@@ -7710,6 +7918,8 @@ impl PiApp {
                     return None;
                 };
                 agent_guard.set_provider(provider_impl);
+                agent_guard.stream_options_mut().api_key = resolved_api_key;
+                agent_guard.stream_options_mut().headers = next.headers.clone();
                 drop(agent_guard);
 
                 let Ok(mut session_guard) = self.session.try_lock() else {

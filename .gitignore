@@ -12,3 +12,6 @@ rustc-ice-*.txt
 
 # local Pi agent config (may contain API keys)
 .pi/
+
+# generated test artifacts
+tests/ext_conformance/artifacts/entry-point-scan.json

@@ -66,7 +66,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 | `tests/provider_streaming.rs` | Conformance | `src/providers/*`, `src/vcr.rs` | ❌ | VCR-backed streaming fixtures (multi-provider). |
 | `tests/e2e_provider_streaming.rs` | E2E | `src/providers/anthropic.rs` | ✅ | Anthropic VCR scenarios with artifact logging. |
 | `tests/provider_factory.rs` | Integration | `src/providers/mod.rs` | ❌ | Provider creation + ExtensionStreamSimpleProvider. |
-| `tests/provider_error_paths.rs` | Integration | `src/providers/*` | ❌ | Provider error handling paths via `MockHttpServer` (replacement tracked by bd-2x78). |
+| `tests/provider_error_paths.rs` | Integration | `src/providers/*` | ❌ | Provider error handling: VCR-only (HTTP 500 × 4 providers, malformed SSE × 4 providers). One allowlisted `MockHttpServer` test for invalid UTF-8 injection (VCR cannot represent raw bytes). (bd-2x78 complete.) |
 | `tests/e2e_cli.rs` | E2E | `src/main.rs`, `src/cli.rs` | ✅ | Offline CLI runs with JSONL logs + artifact index; npm/git stubs for package flows (bd-27t/bd-2fz9/bd-2z22/bd-1ub). |
 | `tests/main_cli_selection.rs` | Integration | `src/main.rs` | ❌ | CLI flag/arg selection. |
 | `tests/e2e_tui.rs` | E2E | `src/interactive.rs`, `src/tui.rs` | ✅ | tmux-driven interactive E2E with JSONL artifacts (bd-3hp; VCR playback coverage in bd-dvgl). |
@@ -91,7 +91,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 | `tests/model_registry.rs` | Integration | `src/models.rs` | ❌ | Registry parsing + defaults. |
 | `tests/config_precedence.rs` | Integration | `src/config.rs` | ❌ | Config file precedence rules. |
 | `tests/error_types.rs` | Integration | `src/error.rs` | ❌ | Error type formatting. |
-| `tests/error_handling.rs` | Integration | `src/error.rs` | ❌ | Error handling paths via `MockHttpServer` (offline HTTP matrix). |
+| `tests/error_handling.rs` | Integration | `src/error.rs`, `src/providers/*`, `src/tools.rs` | ❌ | Fully VCR-based: HTTP 400/401/403/429/500/529 × 4 providers, malformed SSE, SSE error events, empty-body, error hints taxonomy, tool error paths. No `MockHttpServer`. (bd-2x78 complete.) |
 | `tests/session_index_tests.rs` | Integration | `src/session_index.rs` | ❌ | Indexing + retrieval. |
 | `tests/session_sqlite.rs` | Integration | `src/session_index.rs` | ❌ | SQLite storage backend. |
 | `tests/compaction.rs` | Integration | `src/compaction.rs` | ❌ | Session compaction. |
@@ -118,7 +118,7 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 **Found mock usage:** none (mock frameworks), but there are allowlisted stubs.
 
 **Allowlisted exceptions (audited):**
-- `tests/common/harness.rs`: `MockHttp{Server,Request,Response}` — real local TCP server used by `tests/provider_error_paths.rs` + `tests/error_handling.rs` for deterministic offline HTTP. Replacement tracked by `bd-2x78` / `bd-3kl0` under `bd-102`.
+- `tests/common/harness.rs`: `MockHttp{Server,Request,Response}` — real local TCP server. Used by: (1) `tests/provider_error_paths.rs::openai_invalid_utf8_in_sse_is_reported` for raw byte injection (VCR cassettes store `body_chunks: Vec<String>` and cannot represent invalid UTF-8; this is the only legitimate use in provider tests); (2) `tests/extensions_provider_oauth.rs` for OAuth token-exchange flows. `tests/error_handling.rs` is fully VCR — no `MockHttpServer` usage. (bd-2x78 complete; bd-3kl0 closed.)
 - `tests/e2e_cli.rs`: `PackageCommandStubs` (npm/git) for offline package-manager E2E; logs to `npm-invocations.jsonl` / `git-invocations.jsonl` (bd-27t/bd-2fz9/bd-2z22).
 - `tests/e2e_message_session_control.rs`: `RecordingHostActions` + `RecordingSession` stubs (bd-m9rk).
 - `tests/extensions_message_session.rs`: `RecordingSession` stub (bd-m9rk).
@@ -161,9 +161,9 @@ Tests with JSONL log + artifact index output:
    WASM host + QuickJS runtime parity with fixture-based conformance.  
    _Beads: `bd-1gl`, `bd-nom`, `bd-1f5`, `bd-6vcm`._
 
-4. **No-mock replacements (P1)**  
-   Replace MockHttpServer + RecordingSession/HostActions with real-path/VCR tests.  
-   _Beads: `bd-2x78`, `bd-3kl0`, `bd-m9rk` (workstream `bd-102`)._
+4. **No-mock replacements (P1)**
+   Replace MockHttpServer + RecordingSession/HostActions with real-path/VCR tests.
+   _Beads: ~~`bd-2x78`~~ (complete), ~~`bd-3kl0`~~ (closed), `bd-m9rk` (workstream `bd-102`)._
 
 5. **JSONL logging expansion (P2)**  
    Extend JSONL logs + artifact index to remaining test files as part of `bd-c4q` / `bd-26s`.

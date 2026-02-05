@@ -567,3 +567,236 @@ fn resolve_api_key_precedence_and_error_paths() {
             .contains("No API key found for provider custom")
     );
 }
+
+// ────────────────────────────────────────────────────────────────
+// CLI input plumbing: additional coverage (bd-2q2v)
+// ────────────────────────────────────────────────────────────────
+
+#[test]
+fn prepare_initial_message_no_files_returns_none() {
+    let harness = TestHarness::new("prepare_initial_message_no_files_returns_none");
+    let mut messages = vec!["hello".to_string()];
+    let result =
+        prepare_initial_message(harness.temp_dir(), &[], &mut messages, false).expect("ok");
+    assert!(result.is_none());
+    // messages are untouched when no file args
+    assert_eq!(messages, vec!["hello".to_string()]);
+}
+
+#[test]
+fn prepare_initial_message_files_only_no_messages() {
+    let harness = TestHarness::new("prepare_initial_message_files_only_no_messages");
+    let file_path = harness.create_file("data.txt", "payload\n");
+    let mut messages: Vec<String> = Vec::new();
+    let file_args = vec![file_path.to_string_lossy().to_string()];
+
+    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
+        .expect("prepare initial")
+        .expect("initial message present");
+
+    assert!(initial.text.contains("payload"));
+    assert!(initial.text.contains("<file name=\""));
+    assert!(messages.is_empty());
+}
+
+#[test]
+fn prepare_initial_message_empty_file_returns_none() {
+    let harness = TestHarness::new("prepare_initial_message_empty_file_returns_none");
+    let file_path = harness.create_file("empty.txt", "");
+    let mut messages: Vec<String> = Vec::new();
+    let file_args = vec![file_path.to_string_lossy().to_string()];
+
+    let result =
+        prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false).expect("ok");
+    // Empty file produces no text and no images → returns None
+    assert!(result.is_none());
+}
+
+#[test]
+fn process_file_arguments_multiple_text_files() {
+    let harness = TestHarness::new("process_file_arguments_multiple_text_files");
+    let a = harness.create_file("a.txt", "alpha\n");
+    let b = harness.create_file("b.txt", "bravo\n");
+    let c = harness.create_file("c.txt", "charlie\n");
+    let args: Vec<String> = [&a, &b, &c]
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+
+    assert!(processed.text.contains("alpha"));
+    assert!(processed.text.contains("bravo"));
+    assert!(processed.text.contains("charlie"));
+    assert_eq!(processed.images.len(), 0);
+
+    // Each file gets its own <file> tag
+    let file_tag_count = processed.text.matches("<file name=\"").count();
+    assert_eq!(file_tag_count, 3);
+}
+
+#[test]
+fn process_file_arguments_empty_file_skipped() {
+    let harness = TestHarness::new("process_file_arguments_empty_file_skipped");
+    let empty = harness.create_file("empty.txt", "");
+    let nonempty = harness.create_file("data.txt", "content\n");
+    let args: Vec<String> = [&empty, &nonempty]
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+
+    assert!(processed.text.contains("content"));
+    // Only non-empty file gets a <file> tag
+    let file_tag_count = processed.text.matches("<file name=\"").count();
+    assert_eq!(file_tag_count, 1);
+}
+
+#[test]
+fn process_file_arguments_mixed_text_and_image() {
+    let harness = TestHarness::new("process_file_arguments_mixed_text_and_image");
+    let png_base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMBAA7x2FoAAAAASUVORK5CYII=";
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(png_base64)
+        .expect("decode png");
+
+    let text_file = harness.create_file("notes.txt", "some notes\n");
+    let image_file = harness.create_file("img.png", &bytes);
+    let args: Vec<String> = [&text_file, &image_file]
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+
+    assert!(processed.text.contains("some notes"));
+    assert_eq!(processed.images.len(), 1);
+    assert_eq!(processed.images[0].mime_type, "image/png");
+    // Both files produce <file> tags
+    let file_tag_count = processed.text.matches("<file name=\"").count();
+    assert_eq!(file_tag_count, 2);
+}
+
+#[test]
+fn process_file_arguments_unicode_content_preserved() {
+    let harness = TestHarness::new("process_file_arguments_unicode_content_preserved");
+    let file_path = harness.create_file("unicode.txt", "hello 世界\nこんにちは\n");
+    let args = vec![file_path.to_string_lossy().to_string()];
+
+    let processed = process_file_arguments(&args, harness.temp_dir(), false).expect("ok");
+
+    assert!(processed.text.contains("hello 世界"));
+    assert!(processed.text.contains("こんにちは"));
+}
+
+#[test]
+fn cli_file_args_and_message_args_separation() {
+    let cli = cli::Cli::parse_from(["pi", "@a.txt", "hello", "@b.md", "world", "@c.rs"]);
+    assert_eq!(cli.file_args(), vec!["a.txt", "b.md", "c.rs"]);
+    assert_eq!(cli.message_args(), vec!["hello", "world"]);
+}
+
+#[test]
+fn cli_file_args_empty_when_no_at_prefix() {
+    let cli = cli::Cli::parse_from(["pi", "hello", "world"]);
+    assert!(cli.file_args().is_empty());
+    assert_eq!(cli.message_args(), vec!["hello", "world"]);
+}
+
+#[test]
+fn cli_message_args_empty_when_only_files() {
+    let cli = cli::Cli::parse_from(["pi", "@a.txt", "@b.txt"]);
+    assert_eq!(cli.file_args(), vec!["a.txt", "b.txt"]);
+    assert!(cli.message_args().is_empty());
+}
+
+#[test]
+fn apply_piped_stdin_empty_content_no_op() {
+    let mut cli = cli::Cli::parse_from(["pi", "hello"]);
+    apply_piped_stdin(&mut cli, Some(String::new()));
+    assert!(!cli.print);
+    assert_eq!(cli.message_args(), vec!["hello"]);
+}
+
+#[test]
+fn apply_piped_stdin_whitespace_only_no_op() {
+    let mut cli = cli::Cli::parse_from(["pi", "hello"]);
+    apply_piped_stdin(&mut cli, Some("\n\n\r\n".to_string()));
+    assert!(!cli.print);
+    assert_eq!(cli.message_args(), vec!["hello"]);
+}
+
+#[test]
+fn apply_piped_stdin_trims_trailing_newlines() {
+    let mut cli = cli::Cli::parse_from(["pi"]);
+    apply_piped_stdin(&mut cli, Some("some input\n\n".to_string()));
+    assert!(cli.print);
+    assert_eq!(cli.message_args(), vec!["some input"]);
+}
+
+#[test]
+fn normalize_cli_no_session_flag_directly() {
+    let mut cli = cli::Cli::parse_from(["pi", "--no-session", "hello"]);
+    assert!(cli.no_session);
+    assert!(!cli.print);
+    // normalize_cli doesn't change no_session when print is false
+    normalize_cli(&mut cli);
+    assert!(cli.no_session);
+    assert!(!cli.print);
+}
+
+#[test]
+fn validate_rpc_args_accepts_plain_messages() {
+    let cli = cli::Cli::parse_from(["pi", "--mode", "rpc", "hello"]);
+    validate_rpc_args(&cli).expect("plain messages in rpc should be ok");
+}
+
+#[test]
+fn validate_rpc_args_accepts_no_args() {
+    let cli = cli::Cli::parse_from(["pi", "--mode", "rpc"]);
+    validate_rpc_args(&cli).expect("no args in rpc should be ok");
+}
+
+#[test]
+fn prepare_initial_message_multiple_files_with_message() {
+    let harness = TestHarness::new("prepare_initial_message_multiple_files_with_message");
+    let a = harness.create_file("a.txt", "alpha\n");
+    let b = harness.create_file("b.txt", "bravo\n");
+    let mut messages = vec!["summarize these".to_string(), "extra".to_string()];
+    let file_args: Vec<String> = [&a, &b]
+        .iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect();
+
+    let initial = prepare_initial_message(harness.temp_dir(), &file_args, &mut messages, false)
+        .expect("prepare initial")
+        .expect("initial message present");
+
+    // Both file contents present
+    assert!(initial.text.contains("alpha"));
+    assert!(initial.text.contains("bravo"));
+    // First message appended, second remains
+    assert!(initial.text.contains("summarize these"));
+    assert_eq!(messages, vec!["extra".to_string()]);
+
+    let blocks = build_initial_content(&initial);
+    assert_eq!(blocks.len(), 1);
+    assert!(matches!(&blocks[0], ContentBlock::Text(_)));
+}
+
+#[test]
+fn cli_enabled_tools_default() {
+    let cli = cli::Cli::parse_from(["pi"]);
+    let tools = cli.enabled_tools();
+    assert!(tools.contains(&"read"));
+    assert!(tools.contains(&"bash"));
+    assert!(tools.contains(&"edit"));
+    assert!(tools.contains(&"write"));
+}
+
+#[test]
+fn cli_no_tools_returns_empty() {
+    let cli = cli::Cli::parse_from(["pi", "--no-tools"]);
+    assert!(cli.enabled_tools().is_empty());
+}

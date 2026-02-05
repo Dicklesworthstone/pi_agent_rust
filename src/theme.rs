@@ -204,13 +204,39 @@ impl Theme {
         };
 
         config.document.style.color = Some(self.colors.foreground.clone());
-        config.heading.style.color = Some(self.colors.accent.clone());
-        config.link.color = Some(self.colors.accent.clone());
-        config.link_text.color = Some(self.colors.accent.clone());
+
+        // Headings use accent color
+        let accent = Some(self.colors.accent.clone());
+        config.heading.style.color.clone_from(&accent);
+        config.h1.style.color.clone_from(&accent);
+        config.h2.style.color.clone_from(&accent);
+        config.h3.style.color.clone_from(&accent);
+        config.h4.style.color.clone_from(&accent);
+        config.h5.style.color.clone_from(&accent);
+        config.h6.style.color.clone_from(&accent);
+
+        // Links
+        config.link.color.clone_from(&accent);
+        config.link_text.color = accent;
+
+        // Emphasis (bold/italic) uses foreground
+        config.strong.color = Some(self.colors.foreground.clone());
+        config.emph.color = Some(self.colors.foreground.clone());
 
         // Basic code styling (syntax-highlighting is controlled by glamour feature flags).
-        config.code.style.color = Some(self.syntax.string.clone());
-        config.code_block.block.style.color = Some(self.syntax.string.clone());
+        let code_color = Some(self.syntax.string.clone());
+        config.code.style.color.clone_from(&code_color);
+        config.code_block.block.style.color = code_color;
+
+        // Blockquotes use muted color
+        config.block_quote.style.color = Some(self.colors.muted.clone());
+
+        // Horizontal rules use muted color
+        config.horizontal_rule.color = Some(self.colors.muted.clone());
+
+        // Lists use foreground
+        config.item.color = Some(self.colors.foreground.clone());
+        config.enumeration.color = Some(self.colors.foreground.clone());
 
         config
     }

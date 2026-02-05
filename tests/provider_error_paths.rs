@@ -314,6 +314,86 @@ fn azure_invalid_json_event_fails_stream() {
 }
 
 // ---------------------------------------------------------------------------
+// Anthropic / Gemini Malformed SSE (VCR)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn anthropic_invalid_json_event_fails_stream() {
+    let (client, _dir) = vcr_client(
+        "anthropic_invalid_json_event_fails_stream",
+        "https://api.anthropic.com/v1/messages",
+        anthropic_body("claude-test", "Trigger invalid json."),
+        200,
+        sse_headers(),
+        vec!["event: message_start\ndata: {not json}\n\n".to_string()],
+    );
+    common::run_async(async move {
+        let provider =
+            pi::providers::anthropic::AnthropicProvider::new("claude-test").with_client(client);
+        let mut stream = provider
+            .stream(
+                &context_for("Trigger invalid json."),
+                &options_with_key("test-key"),
+            )
+            .await
+            .expect("stream");
+        let mut found_error = false;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                found_error = true;
+                let message = err.to_string();
+                assert!(
+                    message.contains("JSON") || message.contains("parse"),
+                    "unexpected stream error: {message}"
+                );
+                break;
+            }
+        }
+        assert!(found_error, "expected a stream error for invalid JSON");
+    });
+}
+
+#[test]
+fn gemini_invalid_json_event_fails_stream() {
+    let model = "gemini-test";
+    let api_key = "test-key";
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse&key={api_key}"
+    );
+    let (client, _dir) = vcr_client(
+        "gemini_invalid_json_event_fails_stream",
+        &url,
+        gemini_body("Trigger invalid json."),
+        200,
+        sse_headers(),
+        vec!["data: {broken json\n\n".to_string()],
+    );
+    common::run_async(async move {
+        let provider = pi::providers::gemini::GeminiProvider::new(model).with_client(client);
+        let mut stream = provider
+            .stream(
+                &context_for("Trigger invalid json."),
+                &options_with_key(api_key),
+            )
+            .await
+            .expect("stream");
+        let mut found_error = false;
+        while let Some(item) = stream.next().await {
+            if let Err(err) = item {
+                found_error = true;
+                let message = err.to_string();
+                assert!(
+                    message.contains("JSON") || message.contains("parse"),
+                    "unexpected stream error: {message}"
+                );
+                break;
+            }
+        }
+        assert!(found_error, "expected a stream error for invalid JSON");
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Invalid UTF-8 Test (MockHttpServer — allowlisted)
 //
 // VCR cassettes store body_chunks as UTF-8 strings and cannot represent raw

@@ -3,103 +3,19 @@
 //!
 //! These tests exercise the `ExtensionManager` public API for session attachment,
 //! model/thinking-level caching, active-tool filtering, and provider registration
-//! integration. A lightweight `RecordingSession` impl is used for session-dependent tests.
-//! Note: `RecordingSession` is intentionally not prefixed with `Mock` to comply
-//! with the project's no-mock naming policy.
+//! integration. Session-dependent tests use real `SessionHandle` backed by an
+//! in-memory `Session`, exercising the full session persistence plumbing.
 
-use async_trait::async_trait;
 use pi::extensions::{ExtensionManager, ExtensionSession, PROTOCOL_VERSION, RegisterPayload};
+use pi::session::{Session, SessionHandle};
 use serde_json::{Value, json};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-// ─── RecordingSession ────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// In-memory session mock that records mutations for assertion.
-struct RecordingSession {
-    name: Mutex<Option<String>>,
-    entries: Mutex<Vec<(String, Option<Value>)>>,
-    model: Mutex<(Option<String>, Option<String>)>,
-    thinking_level: Mutex<Option<String>>,
-    labels: Mutex<Vec<(String, Option<String>)>>,
-}
-
-impl RecordingSession {
-    const fn new() -> Self {
-        Self {
-            name: Mutex::new(None),
-            entries: Mutex::new(Vec::new()),
-            model: Mutex::new((None, None)),
-            thinking_level: Mutex::new(None),
-            labels: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-#[async_trait]
-impl ExtensionSession for RecordingSession {
-    async fn get_state(&self) -> Value {
-        let name = self.name.lock().unwrap().clone();
-        let (provider, model_id) = self.model.lock().unwrap().clone();
-        let level = self.thinking_level.lock().unwrap().clone();
-        json!({
-            "sessionName": name,
-            "model": { "provider": provider, "id": model_id },
-            "thinkingLevel": level.unwrap_or_else(|| "off".to_string()),
-        })
-    }
-
-    async fn get_messages(&self) -> Vec<pi::session::SessionMessage> {
-        Vec::new()
-    }
-
-    async fn get_entries(&self) -> Vec<Value> {
-        Vec::new()
-    }
-
-    async fn get_branch(&self) -> Vec<Value> {
-        Vec::new()
-    }
-
-    async fn set_name(&self, name: String) -> pi::error::Result<()> {
-        *self.name.lock().unwrap() = Some(name);
-        Ok(())
-    }
-
-    async fn append_message(&self, _message: pi::session::SessionMessage) -> pi::error::Result<()> {
-        Ok(())
-    }
-
-    async fn append_custom_entry(
-        &self,
-        custom_type: String,
-        data: Option<Value>,
-    ) -> pi::error::Result<()> {
-        self.entries.lock().unwrap().push((custom_type, data));
-        Ok(())
-    }
-
-    async fn set_model(&self, provider: String, model_id: String) -> pi::error::Result<()> {
-        *self.model.lock().unwrap() = (Some(provider), Some(model_id));
-        Ok(())
-    }
-
-    async fn get_model(&self) -> (Option<String>, Option<String>) {
-        self.model.lock().unwrap().clone()
-    }
-
-    async fn set_thinking_level(&self, level: String) -> pi::error::Result<()> {
-        *self.thinking_level.lock().unwrap() = Some(level);
-        Ok(())
-    }
-
-    async fn get_thinking_level(&self) -> Option<String> {
-        self.thinking_level.lock().unwrap().clone()
-    }
-
-    async fn set_label(&self, target_id: String, label: Option<String>) -> pi::error::Result<()> {
-        self.labels.lock().unwrap().push((target_id, label));
-        Ok(())
-    }
+/// Create a real `SessionHandle` backed by an in-memory `Session`.
+fn create_test_session() -> SessionHandle {
+    SessionHandle(Arc::new(asupersync::sync::Mutex::new(Session::create())))
 }
 
 fn empty_payload(name: &str) -> RegisterPayload {
@@ -244,8 +160,8 @@ fn session_handle_defaults_to_none() {
 #[test]
 fn set_session_attaches_handle() {
     let mgr = ExtensionManager::new();
-    let session = Arc::new(RecordingSession::new());
-    mgr.set_session(session as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     assert!(mgr.session_handle().is_some());
 }
@@ -253,13 +169,13 @@ fn set_session_attaches_handle() {
 #[test]
 fn session_get_state_via_handle() {
     let mgr = ExtensionManager::new();
-    let session = Arc::new(RecordingSession::new());
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            let state = handle.get_state().await;
+            let state = session.get_state().await;
             assert!(state.get("sessionName").is_some());
         }
     });
@@ -267,18 +183,18 @@ fn session_get_state_via_handle() {
 
 #[test]
 fn session_set_name_persists() {
-    let session = Arc::new(RecordingSession::new());
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle
+            session
                 .set_name("My Test Session".to_string())
                 .await
                 .unwrap();
-            let state = handle.get_state().await;
+            let state = session.get_state().await;
             assert_eq!(state["sessionName"], "My Test Session");
         }
     });
@@ -286,15 +202,14 @@ fn session_set_name_persists() {
 
 #[test]
 fn session_append_custom_entry() {
-    let session = Arc::new(RecordingSession::new());
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
-        let session_ref = &session;
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle
+            session
                 .append_custom_entry(
                     "ext.note".to_string(),
                     Some(json!({"text": "Hello from extension"})),
@@ -302,33 +217,33 @@ fn session_append_custom_entry() {
                 .await
                 .unwrap();
 
-            {
-                let entries = session_ref.entries.lock().unwrap();
-                assert_eq!(entries.len(), 1);
-                assert_eq!(entries[0].0, "ext.note");
-                assert_eq!(entries[0].1, Some(json!({"text": "Hello from extension"})));
-                drop(entries);
-            }
+            let entries = session.get_entries().await;
+            let custom = entries
+                .iter()
+                .find(|e| e.get("type").and_then(Value::as_str) == Some("custom"));
+            assert!(custom.is_some(), "custom entry should exist in session");
+            let custom = custom.unwrap();
+            assert_eq!(custom["customType"], "ext.note");
+            assert_eq!(custom["data"]["text"], "Hello from extension");
         }
     });
 }
 
 #[test]
 fn session_set_model_persists() {
-    let session = Arc::new(RecordingSession::new());
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
-        let session_ref = &session;
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle
+            session
                 .set_model("openai".to_string(), "gpt-4o".to_string())
                 .await
                 .unwrap();
 
-            let (provider, model_id) = session_ref.model.lock().unwrap().clone();
+            let (provider, model_id) = session.get_model().await;
             assert_eq!(provider.as_deref(), Some("openai"));
             assert_eq!(model_id.as_deref(), Some("gpt-4o"));
         }
@@ -337,19 +252,23 @@ fn session_set_model_persists() {
 
 #[test]
 fn session_get_model_returns_stored_value() {
-    let session = Arc::new(RecordingSession::new());
-    *session.model.lock().unwrap() = (
-        Some("anthropic".to_string()),
-        Some("claude-opus-4-5-20251101".to_string()),
-    );
-
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            let (provider, model_id) = handle.get_model().await;
+            // Set model via the real session path, then verify read-back
+            session
+                .set_model(
+                    "anthropic".to_string(),
+                    "claude-opus-4-5-20251101".to_string(),
+                )
+                .await
+                .unwrap();
+
+            let (provider, model_id) = session.get_model().await;
             assert_eq!(provider.as_deref(), Some("anthropic"));
             assert_eq!(model_id.as_deref(), Some("claude-opus-4-5-20251101"));
         }
@@ -358,16 +277,18 @@ fn session_get_model_returns_stored_value() {
 
 #[test]
 fn session_set_thinking_level_persists() {
-    let session = Arc::new(RecordingSession::new());
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
-        let session_ref = &session;
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle.set_thinking_level("high".to_string()).await.unwrap();
-            let level = session_ref.thinking_level.lock().unwrap().clone();
+            session
+                .set_thinking_level("high".to_string())
+                .await
+                .unwrap();
+            let level = session.get_thinking_level().await;
             assert_eq!(level.as_deref(), Some("high"));
         }
     });
@@ -375,16 +296,19 @@ fn session_set_thinking_level_persists() {
 
 #[test]
 fn session_get_thinking_level_returns_stored_value() {
-    let session = Arc::new(RecordingSession::new());
-    *session.thinking_level.lock().unwrap() = Some("medium".to_string());
-
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            let level = handle.get_thinking_level().await;
+            // Set thinking level via the real session path, then verify read-back
+            session
+                .set_thinking_level("medium".to_string())
+                .await
+                .unwrap();
+            let level = session.get_thinking_level().await;
             assert_eq!(level.as_deref(), Some("medium"));
         }
     });
@@ -392,52 +316,81 @@ fn session_get_thinking_level_returns_stored_value() {
 
 #[test]
 fn session_set_label_records_mutation() {
-    let session = Arc::new(RecordingSession::new());
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
-        let session_ref = &session;
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle
-                .set_label("entry-42".to_string(), Some("important".to_string()))
+            // First create a custom entry so we have a valid target ID for the label
+            session
+                .append_custom_entry("note".to_string(), Some(json!({"text": "target"})))
                 .await
                 .unwrap();
 
-            {
-                let labels = session_ref.labels.lock().unwrap();
-                assert_eq!(labels.len(), 1);
-                assert_eq!(labels[0].0, "entry-42");
-                assert_eq!(labels[0].1, Some("important".to_string()));
-                drop(labels);
-            }
+            // Find the custom entry's ID
+            let entries = session.get_entries().await;
+            let target_id = entries
+                .iter()
+                .find(|e| e.get("type").and_then(Value::as_str) == Some("custom"))
+                .and_then(|e| e.get("id").and_then(Value::as_str))
+                .expect("custom entry should have an id")
+                .to_string();
+
+            // Set label on that entry
+            session
+                .set_label(target_id.clone(), Some("important".to_string()))
+                .await
+                .unwrap();
+
+            // Verify via entries
+            let entries = session.get_entries().await;
+            let label_entry = entries
+                .iter()
+                .find(|e| e.get("type").and_then(Value::as_str) == Some("label"));
+            assert!(label_entry.is_some(), "label entry should exist");
+            let label_entry = label_entry.unwrap();
+            assert_eq!(label_entry["targetId"], target_id);
+            assert_eq!(label_entry["label"], "important");
         }
     });
 }
 
 #[test]
 fn session_set_label_can_remove_label() {
-    let session = Arc::new(RecordingSession::new());
     let mgr = ExtensionManager::new();
-    mgr.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
-        let session_ref = &session;
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle
-                .set_label("entry-99".to_string(), None)
+            // Create a target entry
+            session
+                .append_custom_entry("note".to_string(), Some(json!({"text": "target"})))
                 .await
                 .unwrap();
 
-            {
-                let labels = session_ref.labels.lock().unwrap();
-                assert_eq!(labels.len(), 1);
-                assert_eq!(labels[0].0, "entry-99");
-                assert!(labels[0].1.is_none());
-                drop(labels);
-            }
+            let entries = session.get_entries().await;
+            let target_id = entries
+                .iter()
+                .find(|e| e.get("type").and_then(Value::as_str) == Some("custom"))
+                .and_then(|e| e.get("id").and_then(Value::as_str))
+                .expect("custom entry should have an id")
+                .to_string();
+
+            // Set label = None (remove)
+            session.set_label(target_id.clone(), None).await.unwrap();
+
+            let entries = session.get_entries().await;
+            let label_entry = entries
+                .iter()
+                .find(|e| e.get("type").and_then(Value::as_str) == Some("label"));
+            assert!(label_entry.is_some(), "label entry should exist");
+            let label_entry = label_entry.unwrap();
+            assert_eq!(label_entry["targetId"], target_id);
+            assert!(label_entry.get("label").is_none() || label_entry["label"].is_null());
         }
     });
 }
@@ -455,8 +408,8 @@ fn model_cache_independent_of_session() {
     );
 
     // Attach session afterward
-    let session = Arc::new(RecordingSession::new());
-    mgr.set_session(session as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     // Cache should still hold value
     let (provider, model_id) = mgr.current_model();
@@ -469,8 +422,8 @@ fn thinking_level_cache_independent_of_session() {
     let mgr = ExtensionManager::new();
     mgr.set_current_thinking_level(Some("xhigh".to_string()));
 
-    let session = Arc::new(RecordingSession::new());
-    mgr.set_session(session as Arc<dyn ExtensionSession>);
+    let handle = create_test_session();
+    mgr.set_session(Arc::new(handle) as Arc<dyn ExtensionSession>);
 
     assert_eq!(mgr.current_thinking_level().as_deref(), Some("xhigh"));
 }
@@ -479,36 +432,37 @@ fn thinking_level_cache_independent_of_session() {
 fn multiple_sessions_can_be_swapped() {
     let mgr = ExtensionManager::new();
 
-    let session_a = Arc::new(RecordingSession::new());
-    mgr.set_session(Arc::clone(&session_a) as Arc<dyn ExtensionSession>);
+    let handle_a = create_test_session();
+    let verify_a = handle_a.clone();
+    mgr.set_session(Arc::new(handle_a) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle.set_name("Session A".to_string()).await.unwrap();
+            session.set_name("Session A".to_string()).await.unwrap();
         }
     });
 
     // Swap to session B
-    let session_b = Arc::new(RecordingSession::new());
-    mgr.set_session(Arc::clone(&session_b) as Arc<dyn ExtensionSession>);
+    let handle_b = create_test_session();
+    let verify_b = handle_b.clone();
+    mgr.set_session(Arc::new(handle_b) as Arc<dyn ExtensionSession>);
 
     asupersync::test_utils::run_test(|| {
-        let handle = mgr.session_handle().expect("session attached");
+        let session = mgr.session_handle().expect("session attached");
         async move {
-            handle.set_name("Session B".to_string()).await.unwrap();
+            session.set_name("Session B".to_string()).await.unwrap();
         }
     });
 
-    // Verify both sessions recorded their respective names
-    assert_eq!(
-        *session_a.name.lock().unwrap(),
-        Some("Session A".to_string())
-    );
-    assert_eq!(
-        *session_b.name.lock().unwrap(),
-        Some("Session B".to_string())
-    );
+    // Verify both sessions recorded their respective names via the real Session
+    asupersync::test_utils::run_test(|| async move {
+        let state_a = verify_a.get_state().await;
+        assert_eq!(state_a["sessionName"], "Session A");
+
+        let state_b = verify_b.get_state().await;
+        assert_eq!(state_b["sessionName"], "Session B");
+    });
 }
 
 #[test]

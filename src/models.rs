@@ -438,3 +438,172 @@ fn resolve_shell(cmd: &str) -> Option<String> {
 pub fn default_models_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("models.json")
 }
+
+// === Ad-hoc model support ===
+
+#[derive(Debug, Clone, Copy)]
+struct AdHocProviderDefaults {
+    api: &'static str,
+    base_url: &'static str,
+    reasoning: bool,
+    input: &'static [InputType],
+    context_window: u32,
+    max_tokens: u32,
+}
+
+const INPUT_TEXT: [InputType; 1] = [InputType::Text];
+const INPUT_TEXT_IMAGE: [InputType; 2] = [InputType::Text, InputType::Image];
+
+#[allow(clippy::too_many_lines)]
+fn ad_hoc_provider_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
+    match provider {
+        // Built-in providers.
+        "anthropic" => Some(AdHocProviderDefaults {
+            api: "anthropic-messages",
+            base_url: "https://api.anthropic.com/v1/messages",
+            reasoning: true,
+            input: &INPUT_TEXT_IMAGE,
+            context_window: 200_000,
+            max_tokens: 8192,
+        }),
+        "openai" => Some(AdHocProviderDefaults {
+            api: "openai-responses",
+            base_url: "https://api.openai.com/v1",
+            reasoning: true,
+            input: &INPUT_TEXT_IMAGE,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "google" => Some(AdHocProviderDefaults {
+            api: "google-generative-ai",
+            base_url: "https://generativelanguage.googleapis.com/v1beta",
+            reasoning: true,
+            input: &INPUT_TEXT_IMAGE,
+            context_window: 128_000,
+            max_tokens: 8192,
+        }),
+
+        // OpenAI-compatible providers (chat/completions).
+        // Sources: Vercel AI SDK + opencode fixture.
+        "groq" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.groq.com/openai/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "cerebras" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.cerebras.ai/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "openrouter" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://openrouter.ai/api/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "mistral" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.mistral.ai/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        // MoonshotAI is the API behind "Kimi".
+        "moonshotai" | "moonshot" | "kimi" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.moonshot.ai/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        // Qwen models via DashScope OpenAI-compatible endpoint.
+        "alibaba" | "dashscope" | "qwen" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "deepseek" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.deepseek.com",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "fireworks" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.fireworks.ai/inference/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "togetherai" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.together.xyz/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "perplexity" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.perplexity.ai",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "xai" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.x.ai/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        _ => None,
+    }
+}
+
+pub(crate) fn ad_hoc_model_entry(provider: &str, model_id: &str) -> Option<ModelEntry> {
+    let defaults = ad_hoc_provider_defaults(provider)?;
+    Some(ModelEntry {
+        model: Model {
+            id: model_id.to_string(),
+            name: model_id.to_string(),
+            api: defaults.api.to_string(),
+            provider: provider.to_string(),
+            base_url: defaults.base_url.to_string(),
+            reasoning: defaults.reasoning,
+            input: defaults.input.to_vec(),
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: defaults.context_window,
+            max_tokens: defaults.max_tokens,
+            headers: HashMap::new(),
+        },
+        api_key: None,
+        headers: HashMap::new(),
+        auth_header: defaults.api.starts_with("openai-"),
+        compat: None,
+        oauth_config: None,
+    })
+}
