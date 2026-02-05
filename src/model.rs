@@ -271,7 +271,7 @@ pub enum StreamEvent {
 // ============================================================================
 
 /// Streaming event emitted for assistant message updates.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AssistantMessageEvent {
     #[serde(rename = "start")]

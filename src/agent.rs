@@ -1515,8 +1515,12 @@ impl AgentSessionHostActions {
             return;
         };
         match deliver_as {
-            ExtensionDeliverAs::FollowUp => queue.push_follow_up(message),
-            ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => queue.push_steering(message),
+            ExtensionDeliverAs::FollowUp => {
+                queue.push_follow_up(message);
+            }
+            ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => {
+                queue.push_steering(message);
+            }
         }
     }
 
@@ -1738,7 +1742,11 @@ mod extensions_integration_tests {
             }
         }
 
-        fn assistant_message(&self, stop_reason: StopReason, content: Vec<ContentBlock>) -> AssistantMessage {
+        fn assistant_message(
+            &self,
+            stop_reason: StopReason,
+            content: Vec<ContentBlock>,
+        ) -> AssistantMessage {
             AssistantMessage {
                 content,
                 api: self.api().to_string(),
@@ -1965,6 +1973,85 @@ mod extensions_integration_tests {
                         Message::Custom(CustomMessage { custom_type, content, display, details, .. })
                             if custom_type == "note"
                                 && content == "hello"
+                                && *display
+                                && details.as_ref().and_then(|v| v.get("from").and_then(Value::as_str)) == Some("test")
+                    )
+                }),
+                "expected custom message to be persisted, got {messages:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn extension_send_message_persists_custom_message_entry_when_idle_after_await() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "emit_message",
+                    label: "emit_message",
+                    description: "emit a custom message",
+                    parameters: { type: "object" },
+                    execute: async () => {
+                      await Promise.resolve();
+                      pi.sendMessage({
+                        customType: "note",
+                        content: "hello-after-await",
+                        display: true,
+                        details: { from: "test" }
+                      }, {});
+                      return { content: [{ type: "text", text: "ok" }], isError: false };
+                    }
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&[], Path::new("."), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Arc::new(Mutex::new(Session::in_memory()));
+            let mut agent_session = AgentSession::new(agent, Arc::clone(&session), false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool = agent_session
+                .agent
+                .tools
+                .get("emit_message")
+                .expect("emit_message registered");
+
+            let _ = tool
+                .execute("call-1", json!({}), None)
+                .await
+                .expect("execute tool");
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session_guard = session
+                .lock(cx.cx())
+                .await
+                .expect("lock session");
+            let messages = session_guard.to_messages_for_current_path();
+
+            assert!(
+                messages.iter().any(|msg| {
+                    matches!(
+                        msg,
+                        Message::Custom(CustomMessage { custom_type, content, display, details, .. })
+                            if custom_type == "note"
+                                && content == "hello-after-await"
                                 && *display
                                 && details.as_ref().and_then(|v| v.get("from").and_then(Value::as_str)) == Some("test")
                     )

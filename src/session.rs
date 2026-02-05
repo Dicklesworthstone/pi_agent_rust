@@ -18,7 +18,6 @@ use asupersync::Cx;
 use asupersync::channel::oneshot;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
-use rich_rust::Theme;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -181,6 +180,17 @@ impl ExtensionSession for SessionHandle {
             return None;
         };
         session.header.thinking_level.clone()
+    }
+
+    async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
+        let cx = Cx::for_request();
+        let mut session = self
+            .0
+            .lock(&cx)
+            .await
+            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
+        session.add_label(&target_id, label);
+        Ok(())
     }
 }
 
@@ -407,8 +417,7 @@ impl Session {
         let max_entries = 20usize.min(entries.len());
         let entries = entries.into_iter().take(max_entries).collect::<Vec<_>>();
 
-        let theme = Self::resolve_console_theme(config, &cwd);
-        let console = PiConsole::new_with_theme(theme);
+        let console = PiConsole::new();
         console.render_info("Select a session to resume:");
 
         let mut rows: Vec<Vec<String>> = Vec::new();
@@ -469,35 +478,6 @@ impl Session {
                 }
             }
         }
-    }
-
-    fn resolve_console_theme(config: &Config, cwd: &Path) -> Option<Theme> {
-        let name = config.theme.as_deref()?;
-        if name.trim().is_empty() {
-            return None;
-        }
-
-        let direct_path = Path::new(name);
-        if direct_path.exists() {
-            if let Ok(theme) = Theme::read(direct_path, true) {
-                return Some(theme);
-            }
-        }
-
-        let project_dir = cwd.join(Config::project_dir()).join("themes");
-        let global_dir = Config::global_dir().join("themes");
-        for base in [project_dir, global_dir] {
-            for ext in ["ini", "theme"] {
-                let path = base.join(format!("{name}.{ext}"));
-                if path.exists() {
-                    if let Ok(theme) = Theme::read(&path, true) {
-                        return Some(theme);
-                    }
-                }
-            }
-        }
-
-        None
     }
 
     /// Create an in-memory (ephemeral) session.
