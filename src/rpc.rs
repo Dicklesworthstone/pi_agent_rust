@@ -1297,7 +1297,10 @@ pub async fn run(
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    fork_messages(&guard.session)
+                    let inner_session = guard.session.lock(&cx).await.map_err(|err| {
+                        Error::session(format!("inner session lock failed: {err}"))
+                    })?;
+                    fork_messages(&inner_session)
                 };
                 let _ = out_tx.send(response_ok(
                     id,
@@ -1854,9 +1857,20 @@ async fn maybe_auto_compact(
         let Ok(mut guard) = session.lock(&cx).await else {
             return;
         };
-        guard.session.ensure_entry_ids();
-        let Some(entry) = current_model_entry(&guard.session, &options) else {
-            return;
+        let (path_entries, context_window) = {
+            let Ok(mut inner_session) = guard.session.lock(&cx).await else {
+                return;
+            };
+            inner_session.ensure_entry_ids();
+            let Some(entry) = current_model_entry(&inner_session, &options) else {
+                return;
+            };
+            let path_entries = inner_session
+                .entries_for_current_path()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            (path_entries, entry.model.context_window)
         };
 
         let reserve_tokens = options.config.compaction_reserve_tokens();
@@ -1866,16 +1880,9 @@ async fn maybe_auto_compact(
             keep_recent_tokens: options.config.compaction_keep_recent_tokens(),
         };
 
-        let path_entries = guard
-            .session
-            .entries_for_current_path()
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-
         (
             path_entries,
-            entry.model.context_window,
+            context_window,
             reserve_tokens,
             settings,
         )
@@ -1935,15 +1942,20 @@ async fn maybe_auto_compact(
             let Ok(mut guard) = session.lock(&cx).await else {
                 return;
             };
-            guard.session.append_compaction(
-                result.summary.clone(),
-                result.first_kept_entry_id.clone(),
-                result.tokens_before,
-                Some(details_value.clone()),
-                None,
-            );
+            let messages = {
+                let Ok(mut inner_session) = guard.session.lock(&cx).await else {
+                    return;
+                };
+                inner_session.append_compaction(
+                    result.summary.clone(),
+                    result.first_kept_entry_id.clone(),
+                    result.tokens_before,
+                    Some(details_value.clone()),
+                    None,
+                );
+                inner_session.to_messages_for_current_path()
+            };
             let _ = guard.persist_session().await;
-            let messages = guard.session.to_messages_for_current_path();
             guard.agent.replace_messages(messages);
             drop(guard);
 
