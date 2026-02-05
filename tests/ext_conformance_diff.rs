@@ -42,6 +42,10 @@ fn ts_harness_script() -> PathBuf {
     project_root().join("tests/ext_conformance/ts_harness/run_extension.ts")
 }
 
+fn ts_event_dispatch_bench_script() -> PathBuf {
+    project_root().join("tests/ext_conformance/ts_harness/bench_event_dispatch.ts")
+}
+
 fn ts_default_mock_spec() -> PathBuf {
     project_root().join("tests/ext_conformance/mock_specs/mock_spec_default.json")
 }
@@ -64,6 +68,14 @@ fn manifest_path() -> PathBuf {
 
 fn determinism_extension_path() -> PathBuf {
     project_root().join("tests/fixtures/determinism_extension.ts")
+}
+
+fn event_dispatch_bench_extension_path() -> PathBuf {
+    project_root().join("tests/fixtures/event_dispatch_bench_extension.ts")
+}
+
+fn event_payloads_path() -> PathBuf {
+    project_root().join("tests/ext_conformance/event_payloads/event_payloads.json")
 }
 
 const fn bun_path() -> &'static str {
@@ -156,8 +168,10 @@ fn ts_oracle_timeout() -> Duration {
     std::env::var("PI_TS_ORACLE_TIMEOUT_SECS")
         .ok()
         .and_then(|val| val.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(DEFAULT_TS_ORACLE_TIMEOUT_SECS))
+        .map_or(
+            Duration::from_secs(DEFAULT_TS_ORACLE_TIMEOUT_SECS),
+            Duration::from_secs,
+        )
 }
 
 fn ensure_deterministic_dirs(settings: &DeterministicSettings) {
@@ -301,9 +315,7 @@ fn validated_manifest_has_all_tiers() {
 
 /// Run the TS oracle harness on an extension and parse the JSON output.
 fn run_ts_oracle(extension_path: &Path) -> Value {
-    run_ts_oracle_result(extension_path).unwrap_or_else(|err| {
-        panic!("{err}");
-    })
+    run_ts_oracle_result(extension_path).unwrap_or_else(|err| unreachable!("{err}"))
 }
 
 fn run_ts_oracle_result(extension_path: &Path) -> Result<Value, String> {
@@ -509,6 +521,114 @@ fn run_ts_harness_result(extension_path: &Path) -> Result<Value, String> {
     })
 }
 
+fn run_ts_event_dispatch_bench_result(
+    extension_path: &Path,
+    payloads_path: &Path,
+    iters: usize,
+    warmup: usize,
+) -> Result<Value, String> {
+    let settings = deterministic_settings_for(extension_path);
+    ensure_deterministic_dirs(&settings);
+    let node_path: Cow<'_, str> = match std::env::var("NODE_PATH") {
+        Ok(existing) if !existing.trim().is_empty() => Cow::Owned(format!(
+            "{}:{}:{}",
+            ts_oracle_node_path().display(),
+            pi_mono_node_modules().display(),
+            existing
+        )),
+        _ => Cow::Owned(format!(
+            "{}:{}",
+            ts_oracle_node_path().display(),
+            pi_mono_node_modules().display()
+        )),
+    };
+
+    let mut cmd = Command::new(bun_path());
+    cmd.arg("run")
+        .arg(ts_event_dispatch_bench_script())
+        .arg(extension_path)
+        .arg(payloads_path)
+        .arg(&settings.cwd)
+        .current_dir(pi_mono_root())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("NODE_PATH", node_path.as_ref())
+        .env("PI_EVENT_BENCH_ITERS", iters.to_string())
+        .env("PI_EVENT_BENCH_WARMUP", warmup.to_string())
+        .env("PI_DETERMINISTIC_TIME_MS", &settings.time_ms)
+        .env("PI_DETERMINISTIC_TIME_STEP_MS", &settings.time_step_ms)
+        .env("PI_DETERMINISTIC_CWD", &settings.cwd)
+        .env("PI_DETERMINISTIC_HOME", &settings.home);
+    if let Some(random_value) = settings.random_value.as_deref() {
+        cmd.env("PI_DETERMINISTIC_RANDOM", random_value);
+    } else {
+        cmd.env("PI_DETERMINISTIC_RANDOM_SEED", &settings.random_seed);
+    }
+
+    let timeout = ts_oracle_timeout();
+    let mut child = cmd
+        .spawn()
+        .map_err(|err| format!("failed to spawn TS event dispatch bench: {err}"))?;
+    let start = Instant::now();
+    loop {
+        if start.elapsed() >= timeout {
+            let _ = child.kill();
+            let output = child.wait_with_output().map_err(|err| {
+                format!("failed to capture TS event dispatch bench output: {err}")
+            })?;
+            return Ok(serde_json::json!({
+                "success": false,
+                "error": format!("timeout after {}s", timeout.as_secs()),
+                "stdout": String::from_utf8_lossy(&output.stdout).trim(),
+                "stderr": String::from_utf8_lossy(&output.stderr).trim(),
+            }));
+        }
+
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                return Err(format!(
+                    "TS event dispatch bench wait error for {}: {err}",
+                    extension_path.display()
+                ));
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    let output = child.wait_with_output().map_err(|err| {
+        format!("failed to capture TS event dispatch bench output: {err}")
+    })?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !output.status.success() && stdout.trim().is_empty() {
+        return Err(format!(
+            "TS event dispatch bench crashed for {}:\nstderr: {stderr}",
+            extension_path.display()
+        ));
+    }
+
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "TS event dispatch bench returned empty stdout for {}:\nstderr: {stderr}",
+            extension_path.display()
+        ));
+    }
+
+    serde_json::from_str(trimmed).map_err(|e| {
+        format!(
+            "TS event dispatch bench returned invalid JSON for {}:\n  error: {e}\n  stdout: {stdout}\n  stderr: {stderr}",
+            extension_path.display()
+        )
+    })
+}
+
 // ─── Rust runtime loader ─────────────────────────────────────────────────────
 
 /// Load an extension through the Rust swc+`QuickJS` pipeline and return its
@@ -520,7 +640,7 @@ fn load_rust_snapshot(extension_path: &Path) -> Result<Value, String> {
 }
 
 fn load_rust_snapshot_timed(extension_path: &Path) -> Result<(Value, u64), String> {
-    let settings = deterministic_settings();
+    let settings = deterministic_settings_for(extension_path);
     ensure_deterministic_dirs(&settings);
     let cwd = PathBuf::from(&settings.cwd);
 
@@ -638,6 +758,22 @@ fn summarize_ratios(values: &[f64]) -> Value {
         "p50": sorted[percentile_index(sorted.len(), 1, 2)],
         "p95": sorted[percentile_index(sorted.len(), 95, 100)],
         "p99": sorted[percentile_index(sorted.len(), 99, 100)],
+    })
+}
+
+fn summarize_us(values: &[u64]) -> Value {
+    if values.is_empty() {
+        return serde_json::json!({ "count": 0 });
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    serde_json::json!({
+        "count": sorted.len(),
+        "min_us": sorted[0],
+        "max_us": *sorted.last().unwrap(),
+        "p50_us": sorted[percentile_index(sorted.len(), 1, 2)],
+        "p95_us": sorted[percentile_index(sorted.len(), 95, 100)],
+        "p99_us": sorted[percentile_index(sorted.len(), 99, 100)],
     })
 }
 
@@ -1323,9 +1459,9 @@ fn diff_custom_provider_anthropic() {
 
 #[test]
 fn diff_deterministic_globals() {
-    let settings = deterministic_settings();
-    ensure_deterministic_dirs(&settings);
     let ext_path = determinism_extension_path();
+    let settings = deterministic_settings_for(&ext_path);
+    ensure_deterministic_dirs(&settings);
     let ts_result = run_ts_oracle(&ext_path);
     let ts_success = ts_result
         .get("success")
