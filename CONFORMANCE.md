@@ -97,17 +97,38 @@ Location: `tests/*.rs`
 **Planned:**
 - Fixture-based RPC conformance harness comparing Rust RPC responses/events against the TypeScript reference (`legacy_pi_mono_code/pi-mono/packages/coding-agent/docs/rpc.md`).
 
-### 4. Extension Conformance (Partial)
+### 4. Extension Conformance (Differential Oracle)
 
-Location: `tests/ext_conformance/` + legacy capture tool `src/bin/pi_legacy_capture.rs`
+Location: `tests/ext_conformance_diff.rs` + `tests/ext_conformance/`
 
-**Purpose:** Validate extension runtime behavior (registration/events/hostcalls) against the TypeScript reference.
+**Purpose:** Validate extension runtime behavior (registration/events/hostcalls) against the TypeScript reference by running the SAME extension in BOTH the TS oracle (Bun + jiti) and Rust QuickJS runtime, then comparing registration snapshots.
+
+**Results (2026-02-05):**
+
+| Corpus | Passed | Total | Rate | Notes |
+|--------|--------|-------|------|-------|
+| Official | 60 | 60 | 100% | All pass, test runs in CI |
+| Community | 53 | 58 | 91.4% | 53/53 testable pass; 5 TS oracle env failures |
+
+**Community TS oracle failures (environment issues, not Rust bugs):**
+- `nicobailon-interactive-shell`: requires native `pty.node` module
+- `nicobailon-interview-tool`: missing `form/index.html` file
+- `qualisero-background-notify`: missing `../../shared` module
+- `qualisero-pi-agent-scip`: missing `./dist/extension.js`
+- `qualisero-safe-git`: missing `../../shared` module
+
+**Key runtime features enabling conformance:**
+- In-memory virtual filesystem (`__pi_vfs`) for `node:fs`
+- CJS-to-ESM transformation shim for CommonJS extensions
+- `createRequire` resolves actual builtin modules
+- Virtual module stubs: `shell-quote`, `vscode-languageserver-protocol`, `@modelcontextprotocol/sdk`
+- Comprehensive node polyfills: `fs`, `path`, `os`, `crypto`, `url`, `process`, `buffer`, `child_process`
 
 Current building blocks:
-- Pinned legacy sample set + vendored artifacts (`tests/ext_conformance/artifacts/*`) with checksum enforcement (`tests/ext_conformance_artifacts.rs`)
-- Legacy capture runner that generates golden fixtures (`src/bin/pi_legacy_capture.rs`)
-- Normalization + diff triage utilities for extension logs (`tests/ext_conformance.rs`)
-- Deterministic PiJS scheduler conformance fixtures (`tests/event_loop_conformance.rs`)
+- Differential test runner (`tests/ext_conformance_diff.rs`)
+- TS oracle harness (`tests/ext_conformance/ts_harness/run_extension.ts`)
+- Vendored artifacts (`tests/ext_conformance/artifacts/*`)
+- Deterministic PiJS scheduler conformance (`tests/event_loop_conformance.rs`)
 
 ### 4A. Extension Conformance Matrix + Test Plan (bd-2kyq)
 
