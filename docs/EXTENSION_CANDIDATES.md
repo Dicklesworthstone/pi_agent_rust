@@ -43,9 +43,66 @@ This is a **source-first, unfiltered** candidate inventory for extension samplin
 - **Capabilities (likely)**: `read` / `write` / `exec` / `http` / `env` (approximate from descriptions).
 - **I/O Pattern**: FS‑heavy, network‑heavy, CPU‑heavy, or UI‑centric.
 - **Last update**: from source listing where available; otherwise TBD.
+- **Popularity score**: 0‑100 score (see rubric below).
+- **Popularity evidence**: links/metrics backing the score (stars, downloads, docs mentions).
+- **Compatibility status**: `unmodified` / `modified` / `blocked` (see requirements below).
+- **Compatibility notes**: short reason when not `unmodified`.
 - **Notes**: short rationale for inclusion.
 
 > Capabilities are **inferred from descriptions**. A static scan can refine this later.
+
+---
+
+## Inclusion Criteria & Popularity Scoring (bd‑29ko)
+
+This rubric defines what “popular” means for extension selection and what qualifies as
+**unmodified** compatibility (no hand edits). The goal is deterministic, auditable selection.
+
+### Popularity Score (0‑100)
+
+**Total = Popularity (0‑35) + Adoption (0‑25) + Coverage (0‑25) + Recency (0‑15).**
+
+| Dimension | Points | How to Score |
+|---|---:|---|
+| **Popularity** | 0‑35 | Attention signals: GitHub stars/forks, gist stars, buildwithpi package installs, npm downloads, or repeated community mentions. |
+| **Adoption** | 0‑25 | Evidence of real usage: official docs/examples, referenced in multiple repos, used in published workflows or packages. |
+| **Coverage** | 0‑25 | Unique surface area: distinct interaction tags (tool/command/event/ui/provider) + capability diversity (read/write/exec/http/env). |
+| **Recency** | 0‑15 | Last update: 15 (<3 months), 10 (<12 months), 5 (<24 months), 0 (older/unknown). |
+
+**Popular** = score ≥ 65 **or** top quartile within its source tier.  
+Official examples are **always eligible** regardless of score.
+
+### Evidence Sources (non‑exhaustive)
+
+- buildwithpi packages listing + install counts (if exposed)
+- GitHub stars/forks + repo activity
+- Gist stars/forks + last updated
+- npm download stats (weekly/monthly)
+- Mentions in official docs, examples, or community posts
+
+### Unmodified Compatibility Requirements
+
+**Unmodified** means the extension runs through the generic `extc` pipeline with **no per‑extension
+source edits** and **no special‑case runtime shims**. Acceptable transforms are:
+
+- Deterministic bundling/minification/TS→JS compilation
+- Generic import rewrites (e.g., `node:*` → `pi:node/*`)
+- Generic polyfills/shims provided by Pi (e.g., `pi:node/fs`, `process.env`, `Buffer`)
+- Configuration via manifest or environment variables
+- Deterministic test stubbing (VCR/network stubs) **without** modifying the extension source
+
+**Not allowed** (moves candidate to `modified` or `blocked`):
+
+- Editing extension source to remove/replace APIs
+- Per‑extension compatibility patches or bespoke shims
+- Node/Bun runtime dependencies or native addons
+- Dynamic `require`/`eval` patterns that cannot be handled by generic rewrites
+
+**Status definitions**
+
+- `unmodified`: loads, registers, and can execute at least one scenario via generic pipeline
+- `modified`: requires per‑extension edits or bespoke shims
+- `blocked`: depends on unsupported/unsafe APIs that cannot be safely shimmed
 
 ---
 

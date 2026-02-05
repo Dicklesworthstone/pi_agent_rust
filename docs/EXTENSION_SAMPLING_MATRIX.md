@@ -1,6 +1,6 @@
 ## Stratified Extension Sampling Matrix
 
-This matrix uses **deterministic sampling criteria** from `CONFORMANCE.md` (target sample size **16**, min **12**, max **20**) and the raw candidate pool from `docs/EXTENSION_CANDIDATES.md`. It defines **axes + quotas** and maps **every candidate** to the axes so selection can be mechanical and reproducible.
+This matrix uses **deterministic sampling criteria** from `docs/EXTENSION_CANDIDATES.md` (popularity rubric + compatibility status), plus the raw candidate pool and coverage tags, to select a target sample size of **16** (min **12**, max **20**). It defines **axes + quotas** and maps **every candidate** to the axes so selection can be mechanical and reproducible.
 
 > **Note:** Tags below are **inferred** from README/descriptions. A static scan should validate and adjust before final selection.
 
@@ -172,8 +172,8 @@ I/O = `fs-heavy`, `network-heavy`, `ui-centric`, `cpu-heavy`, `os-heavy`
 
 ## 3) How to Apply the Matrix (for bd‑ic9)
 
-1. Rank candidates by score (per `CONFORMANCE.md`) within each source tier.  
-2. Select built‑ins/official examples first, then fill by rank to target size.  
-3. Enforce diversity quotas above by swapping in the highest‑ranked candidate that covers a missing tag.  
-4. Document any quota exceptions with rationale.
-
+1. Rank candidates by **popularity score** (rubric in `docs/EXTENSION_CANDIDATES.md`) within each source tier.  
+2. Filter to `unmodified` compatibility unless explicitly doing a modified sample.  
+3. Select built‑ins/official examples first, then fill by rank to target size.  
+4. Enforce diversity quotas above by swapping in the highest‑ranked candidate that covers a missing tag.  
+5. Document any quota exceptions with rationale.
