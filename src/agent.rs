@@ -1442,15 +1442,15 @@ mod extensions_integration_tests {
                 .expect("execute tool");
 
             assert!(!output.is_error);
-            if let [ContentBlock::Text(text)] = output.content.as_slice() {
-                assert_eq!(text.text, "hello pi");
-            } else {
-                assert!(
-                    false,
-                    "Expected single text content block, got {:?}",
-                    output.content
-                );
-            }
+            assert!(
+                matches!(output.content.as_slice(), [ContentBlock::Text(_)]),
+                "Expected single text content block, got {:?}",
+                output.content
+            );
+            let [ContentBlock::Text(text)] = output.content.as_slice() else {
+                return;
+            };
+            assert_eq!(text.text, "hello pi");
 
             let details = output.details.expect("details present");
             assert_eq!(
@@ -1700,16 +1700,20 @@ mod turn_event_tests {
 
             assert!(assistant_message_end < turn_end_indices[0]);
 
-            match &events[turn_end_indices[0]] {
-                AgentEvent::TurnEnd {
-                    message,
-                    tool_results,
-                } => {
-                    assert!(matches!(message, Message::Assistant(_)));
-                    assert!(tool_results.is_empty());
-                }
-                other => assert!(false, "Expected TurnEnd event, got {other:?}"),
-            }
+            let turn_end_event = &events[turn_end_indices[0]];
+            assert!(
+                matches!(turn_end_event, AgentEvent::TurnEnd { .. }),
+                "Expected TurnEnd event, got {turn_end_event:?}"
+            );
+            let AgentEvent::TurnEnd {
+                message,
+                tool_results,
+            } = turn_end_event
+            else {
+                return;
+            };
+            assert!(matches!(message, Message::Assistant(_)));
+            assert!(tool_results.is_empty());
         });
     }
 }
@@ -1875,14 +1879,22 @@ mod tests {
     }
 
     fn assert_user_text(message: &Message, expected: &str) {
+        assert!(
+            matches!(
+                message,
+                Message::User(UserMessage {
+                    content: UserContent::Text(_),
+                    ..
+                })
+            ),
+            "expected user text message, got {message:?}"
+        );
         if let Message::User(UserMessage {
             content: UserContent::Text(text),
             ..
         }) = message
         {
             assert_eq!(text, expected);
-        } else {
-            assert!(false, "expected user text message, got {message:?}");
         }
     }
 

@@ -2671,16 +2671,18 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
 
     let mut reset_msg = None;
     let mut editor_msg = None;
+    let mut fork_err = None;
     for msg in events {
         match msg {
             PiMsg::ConversationReset { .. } => reset_msg = Some(msg),
             PiMsg::SetEditorText(_) => editor_msg = Some(msg),
             PiMsg::AgentError(err) => {
-                assert!(false, "Unexpected fork error: {err}");
+                fork_err = Some(err);
             }
             _ => {}
         }
     }
+    assert!(fork_err.is_none(), "Unexpected fork error: {fork_err:?}");
 
     let reset = reset_msg.expect("expected ConversationReset after fork");
     let step = apply_pi(&harness, &mut app, "PiMsg::ConversationReset", reset);
