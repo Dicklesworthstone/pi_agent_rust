@@ -16,20 +16,23 @@ use crate::error::{Error, Result};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionLoadSpec, ExtensionManager,
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
+    ExtensionLoadSpec, ExtensionManager, ExtensionSendMessage, ExtensionSendUserMessage,
     JsExtensionRuntimeHandle, resolve_extension_load_spec,
 };
 #[cfg(feature = "wasm-host")]
 use crate::extensions::{ExtensionPolicy, WasmExtensionHost, WasmExtensionLoadSpec};
 use crate::extensions_js::PiJsRuntimeConfig;
 use crate::model::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, ImageContent, Message, StopReason,
-    StreamEvent, TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message,
+    StopReason, StreamEvent, TextContent, ToolCall, ToolResultMessage, Usage, UserContent,
+    UserMessage,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::session::{Session, SessionHandle};
 use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::sync::{Mutex, Notify};
+use async_trait::async_trait;
 use chrono::Utc;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -38,6 +41,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // ============================================================================
@@ -1470,6 +1474,104 @@ pub struct AgentSession {
     pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
     pub extensions: Option<ExtensionManager>,
+    extensions_is_streaming: Arc<AtomicBool>,
+}
+
+#[derive(Debug, Default)]
+struct ExtensionInjectedQueue {
+    steering: VecDeque<Message>,
+    follow_up: VecDeque<Message>,
+}
+
+impl ExtensionInjectedQueue {
+    fn push_steering(&mut self, message: Message) {
+        self.steering.push_back(message);
+    }
+
+    fn push_follow_up(&mut self, message: Message) {
+        self.follow_up.push_back(message);
+    }
+
+    fn pop_steering(&mut self) -> Vec<Message> {
+        self.steering.drain(..).collect()
+    }
+
+    fn pop_follow_up(&mut self) -> Vec<Message> {
+        self.follow_up.drain(..).collect()
+    }
+}
+
+#[derive(Clone)]
+struct AgentSessionHostActions {
+    session: Arc<Mutex<Session>>,
+    injected: Arc<StdMutex<ExtensionInjectedQueue>>,
+    is_streaming: Arc<AtomicBool>,
+}
+
+impl AgentSessionHostActions {
+    fn enqueue(&self, deliver_as: Option<ExtensionDeliverAs>, message: Message) {
+        let deliver_as = deliver_as.unwrap_or(ExtensionDeliverAs::Steer);
+        let Ok(mut queue) = self.injected.lock() else {
+            return;
+        };
+        match deliver_as {
+            ExtensionDeliverAs::FollowUp => queue.push_follow_up(message),
+            ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => queue.push_steering(message),
+        }
+    }
+
+    async fn append_to_session(&self, message: Message) -> Result<()> {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = self
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|e| Error::session(e.to_string()))?;
+        session.append_model_message(message);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ExtensionHostActions for AgentSessionHostActions {
+    async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
+        let custom_message = Message::Custom(CustomMessage {
+            content: message.content,
+            custom_type: message.custom_type,
+            display: message.display,
+            details: message.details,
+            timestamp: Utc::now().timestamp_millis(),
+        });
+
+        if matches!(message.deliver_as, Some(ExtensionDeliverAs::NextTurn)) {
+            return self.append_to_session(custom_message).await;
+        }
+
+        if self.is_streaming.load(Ordering::SeqCst) {
+            self.enqueue(message.deliver_as, custom_message);
+            return Ok(());
+        }
+
+        // Non-streaming, best-effort: persist to session. Triggering a new turn is handled by the
+        // interactive layer; non-interactive modes will pick this up on the next prompt.
+        let _ = message.trigger_turn;
+        self.append_to_session(custom_message).await
+    }
+
+    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
+        let user_message = Message::User(UserMessage {
+            content: UserContent::Text(message.text),
+            timestamp: Utc::now().timestamp_millis(),
+        });
+
+        if self.is_streaming.load(Ordering::SeqCst) {
+            self.enqueue(message.deliver_as, user_message);
+            return Ok(());
+        }
+
+        // Non-streaming, best-effort: persist to session. Interactive mode triggers turns via UI.
+        self.append_to_session(user_message).await
+    }
 }
 
 #[cfg(test)]
@@ -2529,12 +2631,13 @@ mod turn_event_tests {
 }
 
 impl AgentSession {
-    pub const fn new(agent: Agent, session: Arc<Mutex<Session>>, save_enabled: bool) -> Self {
+    pub fn new(agent: Agent, session: Arc<Mutex<Session>>, save_enabled: bool) -> Self {
         Self {
             agent,
             session,
             save_enabled,
             extensions: None,
+            extensions_is_streaming: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -2553,6 +2656,40 @@ impl AgentSession {
         let manager = ExtensionManager::new();
         manager.set_cwd(cwd.display().to_string());
         manager.set_session(Arc::new(SessionHandle(self.session.clone())));
+
+        let injected = Arc::new(StdMutex::new(ExtensionInjectedQueue::default()));
+        let host_actions = AgentSessionHostActions {
+            session: Arc::clone(&self.session),
+            injected: Arc::clone(&injected),
+            is_streaming: Arc::clone(&self.extensions_is_streaming),
+        };
+        manager.set_host_actions(Arc::new(host_actions));
+        {
+            let steering_queue = Arc::clone(&injected);
+            let follow_up_queue = Arc::clone(&injected);
+            let steering_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+                let steering_queue = Arc::clone(&steering_queue);
+                Box::pin(async move {
+                    let Ok(mut queue) = steering_queue.lock() else {
+                        return Vec::new();
+                    };
+                    queue.pop_steering()
+                })
+            };
+            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
+                let follow_up_queue = Arc::clone(&follow_up_queue);
+                Box::pin(async move {
+                    let Ok(mut queue) = follow_up_queue.lock() else {
+                        return Vec::new();
+                    };
+                    queue.pop_follow_up()
+                })
+            };
+            self.agent.set_message_fetchers(
+                Some(Arc::new(steering_fetcher)),
+                Some(Arc::new(follow_up_fetcher)),
+            );
+        }
 
         let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config));
         let js_runtime = JsExtensionRuntimeHandle::start(
@@ -2801,7 +2938,10 @@ impl AgentSession {
         };
         self.agent.replace_messages(history);
         let start_len = self.agent.messages().len();
-        let result = self.agent.run_with_abort(input, abort, on_event).await?;
+        self.extensions_is_streaming.store(true, Ordering::SeqCst);
+        let result = self.agent.run_with_abort(input, abort, on_event).await;
+        self.extensions_is_streaming.store(false, Ordering::SeqCst);
+        let result = result?;
         self.persist_new_messages(start_len).await?;
         Ok(result)
     }
@@ -2823,10 +2963,13 @@ impl AgentSession {
         };
         self.agent.replace_messages(history);
         let start_len = self.agent.messages().len();
+        self.extensions_is_streaming.store(true, Ordering::SeqCst);
         let result = self
             .agent
             .run_with_content_with_abort(content, abort, on_event)
-            .await?;
+            .await;
+        self.extensions_is_streaming.store(false, Ordering::SeqCst);
+        let result = result?;
         self.persist_new_messages(start_len).await?;
         Ok(result)
     }

@@ -2582,6 +2582,7 @@ const __pi_tool_index = new Map();      // tool_name -> { extensionId, spec, exe
 const __pi_command_index = new Map();   // command_name -> { extensionId, name, description, handler }
 const __pi_hook_index = new Map();      // event_name -> [{ extensionId, handler }, ...]
 const __pi_provider_index = new Map();  // provider_id -> { extensionId, spec }
+const __pi_shortcut_index = new Map();  // key_id -> { extensionId, key, description, handler }
 
 // Async task tracking for Rust-driven calls (tool exec, command exec, event dispatch).
 // task_id -> { status: 'pending'|'resolved'|'rejected', value?, error? }

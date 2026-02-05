@@ -5782,6 +5782,49 @@ async fn dispatch_hostcall_events(
             manager.register_command(&name, description.as_deref());
             HostcallOutcome::Success(Value::Null)
         }
+        "registerprovider" | "register_provider" => {
+            let id = payload
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "registerProvider: id is required".to_string(),
+                };
+            }
+            let api = payload
+                .get("api")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if api.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "registerProvider: api is required".to_string(),
+                };
+            }
+            // Validate api type.
+            match api.as_str() {
+                "anthropic-messages" | "openai-completions" | "openai-responses"
+                | "google-generative-ai" => {}
+                other => {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: format!(
+                            "registerProvider: unsupported api type: {other}. \
+                             Supported: anthropic-messages, openai-completions, \
+                             openai-responses, google-generative-ai"
+                        ),
+                    };
+                }
+            }
+            manager.register_provider(payload);
+            HostcallOutcome::Success(Value::Null)
+        }
         "getmodel" | "get_model" => {
             // Prefer session-authoritative state; fall back to in-memory cache.
             let (provider, model_id) = if let Some(session) = manager.session_handle() {
@@ -6073,6 +6116,7 @@ impl ExtensionManager {
 
         let mut payloads = Vec::new();
         let mut active_tools: Option<Vec<String>> = None;
+        let mut all_providers = Vec::new();
         for snapshot in snapshots {
             let JsExtensionSnapshot {
                 id,
@@ -6086,7 +6130,7 @@ impl ExtensionManager {
                 event_hooks,
                 active_tools: ext_active_tools,
             } = snapshot;
-            let _ = providers;
+            all_providers.extend(providers);
             if let Some(list) = ext_active_tools {
                 active_tools = Some(list);
             }
@@ -6111,6 +6155,7 @@ impl ExtensionManager {
             let mut guard = self.inner.lock().unwrap();
             guard.extensions = payloads;
             guard.active_tools = active_tools;
+            guard.providers = all_providers;
         }
         Ok(())
     }
@@ -8302,5 +8347,171 @@ mod tests {
                     .is_some_and(|value| value.contains("default_caps"))
             );
         }
+    }
+
+    #[test]
+    fn events_get_active_tools_returns_all_when_none_set() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools =
+                crate::tools::ToolRegistry::new(&["read", "bash", "edit"], Path::new("."), None);
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "getActiveTools", json!({}))
+                    .await;
+
+            let HostcallOutcome::Success(value) = outcome else {
+                panic!("expected success");
+            };
+            let tool_names: Vec<String> = value
+                .get("tools")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(tool_names, vec!["read", "bash", "edit"]);
+        });
+    }
+
+    #[test]
+    fn events_get_active_tools_returns_filtered_list() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools =
+                crate::tools::ToolRegistry::new(&["read", "bash", "edit"], Path::new("."), None);
+
+            manager.set_active_tools(vec!["read".to_string(), "bash".to_string()]);
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "get_active_tools", json!({}))
+                    .await;
+
+            let HostcallOutcome::Success(value) = outcome else {
+                panic!("expected success");
+            };
+            let tool_names: Vec<String> = value
+                .get("tools")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(tool_names, vec!["read", "bash"]);
+        });
+    }
+
+    #[test]
+    fn events_get_all_tools_returns_builtin_tools() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools =
+                crate::tools::ToolRegistry::new(&["read", "bash"], Path::new("."), None);
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "getAllTools", json!({}))
+                    .await;
+
+            let HostcallOutcome::Success(value) = outcome else {
+                panic!("expected success");
+            };
+            let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
+            assert_eq!(tool_list.len(), 2);
+
+            let names: Vec<&str> = tool_list
+                .iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str))
+                .collect();
+            assert!(names.contains(&"read"));
+            assert!(names.contains(&"bash"));
+
+            // Each tool should have a description
+            for tool in tool_list {
+                assert!(tool.get("description").and_then(Value::as_str).is_some());
+            }
+        });
+    }
+
+    #[test]
+    fn events_get_all_tools_includes_extension_tools() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            // Register an extension with a custom tool
+            manager.register(RegisterPayload {
+                name: "test-ext".to_string(),
+                version: "1.0.0".to_string(),
+                api_version: PROTOCOL_VERSION.to_string(),
+                capabilities: Vec::new(),
+                capability_manifest: None,
+                tools: vec![json!({
+                    "name": "custom_tool",
+                    "label": "Custom Tool",
+                    "description": "A custom extension tool",
+                    "parameters": { "type": "object" }
+                })],
+                slash_commands: Vec::new(),
+                shortcuts: Vec::new(),
+                event_hooks: Vec::new(),
+            });
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "get_all_tools", json!({}))
+                    .await;
+
+            let HostcallOutcome::Success(value) = outcome else {
+                panic!("expected success");
+            };
+            let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
+            assert_eq!(tool_list.len(), 2); // 1 built-in + 1 extension
+
+            let names: Vec<&str> = tool_list
+                .iter()
+                .filter_map(|t| t.get("name").and_then(Value::as_str))
+                .collect();
+            assert!(names.contains(&"read"));
+            assert!(names.contains(&"custom_tool"));
+        });
+    }
+
+    #[test]
+    fn events_set_active_tools_changes_get_active_tools_result() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools =
+                crate::tools::ToolRegistry::new(&["read", "bash", "edit"], Path::new("."), None);
+
+            // Set active tools via hostcall
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setActiveTools",
+                json!({ "tools": ["edit"] }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            // Verify getActiveTools reflects the change
+            let outcome =
+                dispatch_hostcall_events("call-2", &manager, &tools, "getActiveTools", json!({}))
+                    .await;
+
+            let HostcallOutcome::Success(value) = outcome else {
+                panic!("expected success");
+            };
+            let tool_names: Vec<String> = value
+                .get("tools")
+                .and_then(Value::as_array)
+                .unwrap()
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(tool_names, vec!["edit"]);
+        });
     }
 }

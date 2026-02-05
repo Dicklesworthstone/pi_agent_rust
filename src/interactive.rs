@@ -4488,6 +4488,16 @@ impl PiApp {
                         return None;
                     }
                 }
+
+                // Extension shortcuts: check if unhandled key matches an extension shortcut
+                if self.agent_state == AgentState::Idle {
+                    let key_id = binding.to_string().to_lowercase();
+                    if let Some(manager) = &self.extensions {
+                        if manager.has_shortcut(&key_id) {
+                            return self.dispatch_extension_shortcut(&key_id);
+                        }
+                    }
+                }
             }
 
             // Handle raw keys that don't map to actions but need special behavior
@@ -5676,6 +5686,62 @@ impl PiApp {
                     let _ = event_tx.try_send(PiMsg::ExtensionCommandDone {
                         command: cmd_for_msg,
                         display: format!("Extension command error: {err}"),
+                        is_error: true,
+                    });
+                }
+            }
+        });
+
+        None
+    }
+
+    fn dispatch_extension_shortcut(&mut self, key_id: &str) -> Option<Cmd> {
+        let Some(manager) = &self.extensions else {
+            self.status_message = Some("Extensions are disabled".to_string());
+            return None;
+        };
+
+        let Some(runtime) = manager.js_runtime() else {
+            self.status_message = Some("Extension shortcut not available (runtime not enabled)".to_string());
+            return None;
+        };
+
+        self.agent_state = AgentState::ToolRunning;
+        self.current_tool = Some(format!("shortcut:{key_id}"));
+
+        let key_id_owned = key_id.to_string();
+        let cwd = self.cwd.display().to_string();
+        let event_tx = self.event_tx.clone();
+        let runtime_handle = self.runtime_handle.clone();
+
+        let ctx_payload = serde_json::json!({
+            "cwd": cwd,
+            "hasUI": true,
+        });
+
+        let key_for_msg = key_id_owned.clone();
+        runtime_handle.spawn(async move {
+            let result = runtime
+                .execute_shortcut(
+                    key_id_owned,
+                    ctx_payload,
+                    crate::extensions::EXTENSION_EVENT_TIMEOUT_MS,
+                )
+                .await;
+
+            match result {
+                Ok(_) => {
+                    let display = format!("Shortcut [{key_for_msg}] executed.");
+                    let _ = event_tx.try_send(PiMsg::ExtensionCommandDone {
+                        command: key_for_msg,
+                        display,
+                        is_error: false,
+                    });
+                }
+                Err(err) => {
+                    let _ = event_tx.try_send(PiMsg::ExtensionCommandDone {
+                        command: key_for_msg,
+                        display: format!("Shortcut error: {err}"),
                         is_error: true,
                     });
                 }
