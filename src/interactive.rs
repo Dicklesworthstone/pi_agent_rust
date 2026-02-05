@@ -1529,7 +1529,7 @@ fn run_command_output(
     use std::time::Duration;
 
     let child = Command::new(program)
-        .args(&args)
+        .args(args)
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1554,7 +1554,7 @@ fn run_command_output(
 
         match rx.recv_timeout(tick) {
             Ok(result) => return result,
-            Err(std_mpsc::RecvTimeoutError::Timeout) => {},
+            Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 return Err(std::io::Error::other("command output channel disconnected"));
             }
@@ -8285,7 +8285,7 @@ impl PiApp {
                         .unwrap_or_else(|| "gh".to_string());
 
                     let auth_args = vec![OsString::from("auth"), OsString::from("status")];
-                    match run_command_output(&gh, auth_args, &cwd, &abort_signal) {
+                    match run_command_output(&gh, &auth_args, &cwd, &abort_signal) {
                         Ok(output) => {
                             if !output.status.success() {
                                 let details = format_command_output(&output);
