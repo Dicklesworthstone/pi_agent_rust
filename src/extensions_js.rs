@@ -207,7 +207,8 @@ pub struct HostcallRequest {
 #[derive(Debug, Clone, serde::Deserialize, PartialEq)]
 pub struct ExtensionToolDef {
     pub name: String,
-    pub label: String,
+    #[serde(default)]
+    pub label: Option<String>,
     pub description: String,
     pub parameters: serde_json::Value,
 }
@@ -1398,8 +1399,13 @@ export const Type = {
   Any: (opts = {}) => ({ ...opts }),
   Union: (schemas, opts = {}) => ({ anyOf: schemas, ...opts }),
   Enum: (values, opts = {}) => ({ enum: values, ...opts }),
+  Integer: (opts = {}) => ({ type: "integer", ...opts }),
   Null: (opts = {}) => ({ type: "null", ...opts }),
   Unknown: (opts = {}) => ({ ...opts }),
+  Tuple: (items, opts = {}) => ({ type: "array", items, minItems: items.length, maxItems: items.length, ...opts }),
+  Record: (keySchema, valueSchema, opts = {}) => ({ type: "object", additionalProperties: valueSchema, ...opts }),
+  Ref: (ref, opts = {}) => ({ $ref: ref, ...opts }),
+  Intersect: (schemas, opts = {}) => ({ allOf: schemas, ...opts }),
 };
 export default { Type };
 "#
@@ -1458,7 +1464,15 @@ export function getModels() {
   return ["claude-sonnet-4-5", "claude-haiku-3-5"];
 }
 
-export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, complete, completeSimple, getModel, getApiProvider, getModels };
+export async function loginOpenAICodex(_opts = {}) {
+  return { accessToken: "", refreshToken: "", expiresAt: Date.now() + 3600000 };
+}
+
+export async function refreshOpenAICodexToken(_refreshToken) {
+  return { accessToken: "", refreshToken: "", expiresAt: Date.now() + 3600000 };
+}
+
+export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, complete, completeSimple, getModel, getApiProvider, getModels, loginOpenAICodex, refreshOpenAICodexToken };
 "#
         .trim()
         .to_string(),
@@ -1667,7 +1681,15 @@ export class CancellableLoader {
   }
 }
 
-export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
+export class Image {
+  constructor(src, _opts = {}) {
+    this.src = String(src ?? "");
+    this.width = 0;
+    this.height = 0;
+  }
+}
+
+export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, Container, Markdown, Spacer, Editor, Box, SelectList, Input, Image, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
 "#
         .trim()
         .to_string(),
@@ -1839,6 +1861,10 @@ export function getSettingsListTheme() {
   return {};
 }
 
+export function getSelectListTheme() {
+  return {};
+}
+
 export class DynamicBorder {
   constructor(..._args) {}
 }
@@ -1891,6 +1917,43 @@ export function createReadTool(_cwd, _opts = {}) {
         limit: { type: "number", description: "Maximum number of lines to read" },
       },
       required: ["path"],
+    },
+    async execute(_id, _params) {
+      return { content: [{ type: "text", text: "" }], details: {} };
+    },
+  };
+}
+
+export function createLsTool(_cwd, _opts = {}) {
+  return {
+    name: "ls",
+    label: "ls",
+    description: "List files and directories. Returns names, sizes, and metadata.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "The path to list" },
+      },
+      required: ["path"],
+    },
+    async execute(_id, _params) {
+      return { content: [{ type: "text", text: "" }], details: {} };
+    },
+  };
+}
+
+export function createGrepTool(_cwd, _opts = {}) {
+  return {
+    name: "grep",
+    label: "grep",
+    description: "Search file contents using regular expressions.",
+    parameters: {
+      type: "object",
+      properties: {
+        pattern: { type: "string", description: "The regex pattern to search for" },
+        path: { type: "string", description: "The path to search in" },
+      },
+      required: ["pattern"],
     },
     async execute(_id, _params) {
       return { content: [{ type: "text", text: "" }], details: {} };
@@ -2012,6 +2075,30 @@ export class UserMessageComponent {
   }
 }
 
+export class SessionManager {
+  constructor() {}
+  getSessionFile() { return ""; }
+  getSessionDir() { return ""; }
+}
+
+export function highlightCode(code, _lang, _theme) {
+  return String(code ?? "");
+}
+
+export function getLanguageFromPath(filePath) {
+  const ext = String(filePath ?? "").split(".").pop() || "";
+  const map = { ts: "typescript", js: "javascript", py: "python", rs: "rust", go: "go", md: "markdown", json: "json", html: "html", css: "css", sh: "bash" };
+  return map[ext] || ext;
+}
+
+export function isBashToolResult(result) {
+  return result && typeof result === "object" && result.name === "bash";
+}
+
+export async function loadSkills() {
+  return [];
+}
+
 export default {
   VERSION,
   DEFAULT_MAX_LINES,
@@ -2025,11 +2112,14 @@ export default {
   parseFrontmatter,
   getMarkdownTheme,
   getSettingsListTheme,
+  getSelectListTheme,
   DynamicBorder,
   BorderedLoader,
   CustomEditor,
   createBashTool,
   createReadTool,
+  createLsTool,
+  createGrepTool,
   createWriteTool,
   createEditTool,
   copyToClipboard,
@@ -2039,6 +2129,11 @@ export default {
   AssistantMessageComponent,
   ToolExecutionComponent,
   UserMessageComponent,
+  SessionManager,
+  highlightCode,
+  getLanguageFromPath,
+  isBashToolResult,
+  loadSkills,
 };
 "#
         .trim()
@@ -2273,6 +2368,126 @@ export class SSEClientTransport {
         );
     }
 
+    // ── glob ────────────────────────────────────────────────────────
+    modules.insert(
+        "glob".to_string(),
+        r#"
+export function globSync(pattern, _opts = {}) { return []; }
+export function glob(pattern, optsOrCb, cb) {
+  const callback = typeof optsOrCb === "function" ? optsOrCb : cb;
+  if (typeof callback === "function") callback(null, []);
+  return Promise.resolve([]);
+}
+export class Glob {
+  constructor(_pattern, _opts = {}) { this.found = []; }
+  on() { return this; }
+}
+export default { globSync, glob, Glob };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // ── uuid ────────────────────────────────────────────────────────
+    modules.insert(
+        "uuid".to_string(),
+        r#"
+function randomHex(n) {
+  let out = "";
+  for (let i = 0; i < n; i++) out += Math.floor(Math.random() * 16).toString(16);
+  return out;
+}
+export function v4() {
+  return [randomHex(8), randomHex(4), "4" + randomHex(3), ((8 + Math.floor(Math.random() * 4)).toString(16)) + randomHex(3), randomHex(12)].join("-");
+}
+export function v7() {
+  const ts = Date.now().toString(16).padStart(12, "0");
+  return [ts.slice(0, 8), ts.slice(8) + randomHex(1), "7" + randomHex(3), ((8 + Math.floor(Math.random() * 4)).toString(16)) + randomHex(3), randomHex(12)].join("-");
+}
+export function v1() { return v4(); }
+export function v3() { return v4(); }
+export function v5() { return v4(); }
+export function validate(uuid) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(uuid ?? "")); }
+export function version(uuid) { return parseInt(String(uuid ?? "").charAt(14), 16) || 0; }
+export default { v1, v3, v4, v5, v7, validate, version };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // ── diff ────────────────────────────────────────────────────────
+    modules.insert(
+        "diff".to_string(),
+        r#"
+export function createTwoFilesPatch(oldFile, newFile, oldStr, newStr, _oldHeader, _newHeader, _opts) {
+  const oldLines = String(oldStr ?? "").split("\n");
+  const newLines = String(newStr ?? "").split("\n");
+  let patch = `--- ${oldFile}\n+++ ${newFile}\n@@ -1,${oldLines.length} +1,${newLines.length} @@\n`;
+  for (const line of oldLines) patch += `-${line}\n`;
+  for (const line of newLines) patch += `+${line}\n`;
+  return patch;
+}
+export function createPatch(fileName, oldStr, newStr, oldH, newH, opts) {
+  return createTwoFilesPatch(fileName, fileName, oldStr, newStr, oldH, newH, opts);
+}
+export function diffLines(oldStr, newStr) {
+  return [{ value: String(oldStr ?? ""), removed: true, added: false }, { value: String(newStr ?? ""), removed: false, added: true }];
+}
+export function diffChars(o, n) { return diffLines(o, n); }
+export function diffWords(o, n) { return diffLines(o, n); }
+export function applyPatch() { return false; }
+export default { createTwoFilesPatch, createPatch, diffLines, diffChars, diffWords, applyPatch };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // ── just-bash ──────────────────────────────────────────────────
+    modules.insert(
+        "just-bash".to_string(),
+        r#"
+export function bash(_cmd, _opts) { return Promise.resolve({ stdout: "", stderr: "", exitCode: 0 }); }
+export { bash as Bash };
+export default bash;
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // ── bunfig ─────────────────────────────────────────────────────
+    modules.insert(
+        "bunfig".to_string(),
+        r"
+export function define(_schema) { return {}; }
+export function loadConfig(_opts) { return {}; }
+export default { define, loadConfig };
+"
+        .trim()
+        .to_string(),
+    );
+
+    // ── dotenv ─────────────────────────────────────────────────────
+    modules.insert(
+        "dotenv".to_string(),
+        r#"
+export function config(_opts) { return { parsed: {} }; }
+export function parse(src) {
+  const result = {};
+  for (const line of String(src ?? "").split("\n")) {
+    const idx = line.indexOf("=");
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    const val = line.slice(idx + 1).trim().replace(/^["']|["']$/g, "");
+    if (key) result[key] = val;
+  }
+  return result;
+}
+export default { config, parse };
+"#
+        .trim()
+        .to_string(),
+    );
+
     modules.insert(
         "node:path".to_string(),
         r#"
@@ -2428,12 +2643,220 @@ export default { homedir, tmpdir, hostname, platform, arch, type, release };
     modules.insert(
         "node:child_process".to_string(),
         r#"
-export function spawn() {
-  throw new Error("node:child_process.spawn is not available in PiJS");
+const __pi_child_process_state = (() => {
+  if (globalThis.__pi_child_process_state) {
+    return globalThis.__pi_child_process_state;
+  }
+  const state = {
+    nextPid: 1000,
+    children: new Map(),
+  };
+  globalThis.__pi_child_process_state = state;
+  return state;
+})();
+
+function __makeEmitter() {
+  const listeners = new Map();
+  const emitter = {
+    on(event, listener) {
+      const key = String(event);
+      if (!listeners.has(key)) listeners.set(key, []);
+      listeners.get(key).push(listener);
+      return emitter;
+    },
+    once(event, listener) {
+      const wrapper = (...args) => {
+        emitter.off(event, wrapper);
+        listener(...args);
+      };
+      return emitter.on(event, wrapper);
+    },
+    off(event, listener) {
+      const key = String(event);
+      const bucket = listeners.get(key);
+      if (!bucket) return emitter;
+      const idx = bucket.indexOf(listener);
+      if (idx >= 0) bucket.splice(idx, 1);
+      if (bucket.length === 0) listeners.delete(key);
+      return emitter;
+    },
+    removeListener(event, listener) {
+      return emitter.off(event, listener);
+    },
+    emit(event, ...args) {
+      const key = String(event);
+      const bucket = listeners.get(key) || [];
+      for (const listener of [...bucket]) {
+        try {
+          listener(...args);
+        } catch (_) {}
+      }
+      return emitter;
+    },
+  };
+  return emitter;
+}
+
+function __emitCloseOnce(child, code) {
+  if (child.__pi_done) return;
+  child.__pi_done = true;
+  __pi_child_process_state.children.delete(child.pid);
+  child.emit("close", code);
+}
+
+function __parseSpawnOptions(raw) {
+  const options = raw && typeof raw === "object" ? raw : {};
+  const allowed = new Set(["cwd", "detached", "shell", "stdio"]);
+  for (const key of Object.keys(options)) {
+    if (!allowed.has(key)) {
+      throw new Error(`node:child_process.spawn: unsupported option '${key}'`);
+    }
+  }
+
+  if (options.shell !== undefined && options.shell !== false) {
+    throw new Error("node:child_process.spawn: only shell=false is supported in PiJS");
+  }
+
+  let stdio = ["pipe", "pipe", "pipe"];
+  if (options.stdio !== undefined) {
+    if (!Array.isArray(options.stdio)) {
+      throw new Error("node:child_process.spawn: options.stdio must be an array");
+    }
+    if (options.stdio.length !== 3) {
+      throw new Error("node:child_process.spawn: options.stdio must have exactly 3 entries");
+    }
+    stdio = options.stdio.map((entry, idx) => {
+      const value = String(entry ?? "");
+      if (value !== "ignore" && value !== "pipe") {
+        throw new Error(
+          `node:child_process.spawn: unsupported stdio[${idx}] value '${value}'`,
+        );
+      }
+      return value;
+    });
+  }
+
+  const cwd =
+    typeof options.cwd === "string" && options.cwd.trim().length > 0
+      ? options.cwd
+      : undefined;
+
+  return {
+    cwd,
+    detached: Boolean(options.detached),
+    stdio,
+  };
+}
+
+function __installProcessKillBridge() {
+  globalThis.__pi_process_kill_impl = (pidValue, signal = "SIGTERM") => {
+    const pidNumeric = Number(pidValue);
+    if (!Number.isFinite(pidNumeric) || pidNumeric === 0) {
+      const err = new Error(`kill EINVAL: invalid pid ${String(pidValue)}`);
+      err.code = "EINVAL";
+      throw err;
+    }
+    const pid = Math.abs(Math.trunc(pidNumeric));
+    const child = __pi_child_process_state.children.get(pid);
+    if (!child) {
+      const err = new Error(`kill ESRCH: no such process ${pid}`);
+      err.code = "ESRCH";
+      throw err;
+    }
+    child.kill(signal);
+    return true;
+  };
+}
+
+__installProcessKillBridge();
+
+export function spawn(command, args = [], options = {}) {
+  const cmd = String(command ?? "").trim();
+  if (!cmd) {
+    throw new Error("node:child_process.spawn: command is required");
+  }
+  if (!Array.isArray(args)) {
+    throw new Error("node:child_process.spawn: args must be an array");
+  }
+
+  const argv = args.map((arg) => String(arg));
+  const opts = __parseSpawnOptions(options);
+
+  const child = __makeEmitter();
+  child.pid = __pi_child_process_state.nextPid++;
+  child.killed = false;
+  child.__pi_done = false;
+  child.__pi_kill_resolver = null;
+  child.stdout = opts.stdio[1] === "pipe" ? __makeEmitter() : null;
+  child.stderr = opts.stdio[2] === "pipe" ? __makeEmitter() : null;
+  child.stdin = opts.stdio[0] === "pipe" ? __makeEmitter() : null;
+
+  child.kill = (signal = "SIGTERM") => {
+    if (child.__pi_done) return false;
+    child.killed = true;
+    if (typeof child.__pi_kill_resolver === "function") {
+      child.__pi_kill_resolver({
+        kind: "killed",
+        signal: String(signal || "SIGTERM"),
+      });
+      child.__pi_kill_resolver = null;
+    }
+    __emitCloseOnce(child, null);
+    return true;
+  };
+
+  __pi_child_process_state.children.set(child.pid, child);
+
+  const execPromise = pi.exec(cmd, argv, { cwd: opts.cwd }).then(
+    (result) => ({ kind: "result", result }),
+    (error) => ({ kind: "error", error }),
+  );
+
+  const killPromise = new Promise((resolve) => {
+    child.__pi_kill_resolver = resolve;
+  });
+
+  Promise.race([execPromise, killPromise]).then((outcome) => {
+    if (!outcome || child.__pi_done) return;
+
+    if (outcome.kind === "result") {
+      const result = outcome.result || {};
+      if (child.stdout && result.stdout !== undefined && result.stdout !== null && result.stdout !== "") {
+        child.stdout.emit("data", String(result.stdout));
+      }
+      if (child.stderr && result.stderr !== undefined && result.stderr !== null && result.stderr !== "") {
+        child.stderr.emit("data", String(result.stderr));
+      }
+      if (result.killed) {
+        child.killed = true;
+      }
+      const code =
+        typeof result.code === "number" && Number.isFinite(result.code)
+          ? result.code
+          : 0;
+      __emitCloseOnce(child, code);
+      return;
+    }
+
+    if (outcome.kind === "error") {
+      const source = outcome.error || {};
+      const error =
+        source instanceof Error
+          ? source
+          : new Error(String(source.message || source || "spawn failed"));
+      if (!error.code && source && source.code !== undefined) {
+        error.code = String(source.code);
+      }
+      child.emit("error", error);
+      __emitCloseOnce(child, 1);
+    }
+  });
+
+  return child;
 }
 
 export function spawnSync() {
-  throw new Error("node:child_process.spawnSync is not available in PiJS");
+  throw new Error("node:child_process.spawnSync is not available in PiJS; use spawn()");
 }
 
 export function execSync() {
@@ -2441,15 +2864,41 @@ export function execSync() {
 }
 
 export function exec(_cmd, _opts, callback) {
-  // exec is async with callback - invoke callback with error to indicate unavailability
   if (typeof callback === "function") {
-    setTimeout(() => callback(new Error("node:child_process.exec is not available in PiJS"), "", ""), 0);
+    setTimeout(
+      () =>
+        callback(
+          new Error("node:child_process.exec is not available in PiJS"),
+          "",
+          "",
+        ),
+      0,
+    );
   } else if (typeof _opts === "function") {
-    setTimeout(() => _opts(new Error("node:child_process.exec is not available in PiJS"), "", ""), 0);
+    setTimeout(
+      () =>
+        _opts(new Error("node:child_process.exec is not available in PiJS"), "", ""),
+      0,
+    );
   }
 }
 
-export default { spawn, spawnSync, execSync, exec };
+export function execFileSync(_file, _args, _opts) {
+  throw new Error("node:child_process.execFileSync is not available in PiJS");
+}
+
+export function execFile(_file, _args, _opts, callback) {
+  const cb = typeof _opts === "function" ? _opts : (typeof _args === "function" ? _args : callback);
+  if (typeof cb === "function") {
+    setTimeout(() => cb(new Error("node:child_process.execFile is not available in PiJS"), "", ""), 0);
+  }
+}
+
+export function fork(_modulePath, _args, _opts) {
+  throw new Error("node:child_process.fork is not available in PiJS");
+}
+
+export default { spawn, spawnSync, execSync, execFileSync, exec, execFile, fork };
 "#
         .trim()
         .to_string(),
@@ -2939,7 +3388,16 @@ export async function stat(path) { return fs.promises.stat(path); }
 export async function realpath(path, opts) { return fs.promises.realpath(path, opts); }
 export async function readdir(path, opts) { return fs.promises.readdir(path, opts); }
 export async function rm(path, opts) { return fs.promises.rm(path, opts); }
-export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, rmdir, stat, realpath, readdir, rm };
+export async function lstat(path) { return fs.promises.stat(path); }
+export async function copyFile(src, dest) { return; }
+export async function rename(oldPath, newPath) { return; }
+export async function chmod(path, mode) { return; }
+export async function chown(path, uid, gid) { return; }
+export async function utimes(path, atime, mtime) { return; }
+export async function appendFile(path, data, opts) { return fs.promises.writeFile(path, data, opts); }
+export async function open(path, flags, mode) { return { close: async () => {} }; }
+export async function truncate(path, len) { return; }
+export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, rmdir, stat, lstat, realpath, readdir, rm, copyFile, rename, chmod, chown, utimes, appendFile, open, truncate };
 "
         .trim()
         .to_string(),
@@ -4817,10 +5275,12 @@ function __pi_register_tool(spec) {
 
     const toolSpec = {
         name: name,
-        label: spec.label != null ? String(spec.label) : name,
         description: spec.description ? String(spec.description) : '',
         parameters: spec.parameters || { type: 'object', properties: {} },
     };
+    if (typeof spec.label === 'string') {
+        toolSpec.label = spec.label;
+    }
 
     if (__pi_tool_index.has(name)) {
         const existing = __pi_tool_index.get(name);
@@ -6161,6 +6621,56 @@ if (typeof globalThis.URLSearchParams === 'undefined') {
     globalThis.URLSearchParams = URLSearchParams;
 }
 
+if (typeof globalThis.URL === 'undefined') {
+    class URL {
+        constructor(input, base) {
+            const s = base ? new URL(base).href.replace(/\/[^/]*$/, '/') + String(input ?? '') : String(input ?? '');
+            const m = s.match(/^([a-zA-Z][a-zA-Z0-9+.-]*):\/\/([^/?#]*)([^?#]*)(\?[^#]*)?(#.*)?$/);
+            if (m) {
+                this.protocol = m[1] + ':';
+                const auth = m[2];
+                const atIdx = auth.lastIndexOf('@');
+                if (atIdx !== -1) {
+                    const userinfo = auth.slice(0, atIdx);
+                    const ci = userinfo.indexOf(':');
+                    this.username = ci === -1 ? userinfo : userinfo.slice(0, ci);
+                    this.password = ci === -1 ? '' : userinfo.slice(ci + 1);
+                    this.host = auth.slice(atIdx + 1);
+                } else {
+                    this.username = '';
+                    this.password = '';
+                    this.host = auth;
+                }
+                const hi = this.host.indexOf(':');
+                this.hostname = hi === -1 ? this.host : this.host.slice(0, hi);
+                this.port = hi === -1 ? '' : this.host.slice(hi + 1);
+                this.pathname = m[3] || '/';
+                this.search = m[4] || '';
+                this.hash = m[5] || '';
+            } else {
+                this.protocol = '';
+                this.username = '';
+                this.password = '';
+                this.host = '';
+                this.hostname = '';
+                this.port = '';
+                this.pathname = s;
+                this.search = '';
+                this.hash = '';
+            }
+            this.searchParams = new globalThis.URLSearchParams(this.search.replace(/^\?/, ''));
+            this.origin = this.protocol ? `${this.protocol}//${this.host}` : '';
+            this.href = this.toString();
+        }
+        toString() {
+            const auth = this.username ? `${this.username}${this.password ? ':' + this.password : ''}@` : '';
+            return this.protocol ? `${this.protocol}//${auth}${this.host}${this.pathname}${this.search}${this.hash}` : this.pathname;
+        }
+        toJSON() { return this.toString(); }
+    }
+    globalThis.URL = URL;
+}
+
 if (typeof globalThis.Buffer === 'undefined') {
     class Buffer extends Uint8Array {
         static from(input, encoding) {
@@ -6354,8 +6864,14 @@ if (typeof globalThis.process === 'undefined') {
         hrtime: Object.assign((_prev) => [0, 0], {
             bigint: () => BigInt(0),
         }),
-        kill: (_pid, _sig) => {
-            throw new Error('process.kill is not available in PiJS');
+        kill: (pid, sig) => {
+            const impl = globalThis.__pi_process_kill_impl;
+            if (typeof impl === 'function') {
+                return impl(pid, sig);
+            }
+            const err = new Error('process.kill is not available in PiJS');
+            err.code = 'ENOSYS';
+            throw err;
         },
         exit: (_code) => {
             throw new Error('process.exit is not available in PiJS');
@@ -6830,7 +7346,7 @@ mod tests {
                 tools[0],
                 ExtensionToolDef {
                     name: "my_tool".to_string(),
-                    label: "My Tool".to_string(),
+                    label: Some("My Tool".to_string()),
                     description: "Does stuff".to_string(),
                     parameters: serde_json::json!({
                         "type": "object",
@@ -8429,6 +8945,240 @@ mod tests {
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["readText"], serde_json::json!("value"));
             assert_eq!(r["names"], serde_json::json!(["value.txt"]));
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_spawn_emits_data_and_close() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.childProcessResult = { events: [] };
+                    import('node:child_process').then(({ spawn }) => {
+                        const child = spawn('pi', ['--version'], {
+                            shell: false,
+                            stdio: ['ignore', 'pipe', 'pipe'],
+                        });
+                        let stdout = '';
+                        let stderr = '';
+                        child.stdout?.on('data', (chunk) => {
+                            stdout += chunk.toString();
+                            globalThis.childProcessResult.events.push('stdout');
+                        });
+                        child.stderr?.on('data', (chunk) => {
+                            stderr += chunk.toString();
+                            globalThis.childProcessResult.events.push('stderr');
+                        });
+                        child.on('error', (err) => {
+                            globalThis.childProcessResult.error =
+                                String((err && err.message) || err || '');
+                            globalThis.childProcessResult.done = true;
+                        });
+                        child.on('close', (code) => {
+                            globalThis.childProcessResult.events.push('close');
+                            globalThis.childProcessResult.code = code;
+                            globalThis.childProcessResult.stdout = stdout;
+                            globalThis.childProcessResult.stderr = stderr;
+                            globalThis.childProcessResult.killed = child.killed;
+                            globalThis.childProcessResult.pid = child.pid;
+                            globalThis.childProcessResult.done = true;
+                        });
+                    });
+                    ",
+                )
+                .await
+                .expect("eval child_process spawn script");
+
+            let mut requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let request = requests.pop_front().expect("exec hostcall");
+            match request.kind {
+                HostcallKind::Exec { cmd } => assert_eq!(cmd, "pi"),
+                other => panic!("unexpected hostcall kind: {other:?}"),
+            }
+
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(serde_json::json!({
+                    "stdout": "line-1\n",
+                    "stderr": "warn-1\n",
+                    "code": 0,
+                    "killed": false
+                })),
+            );
+
+            drain_until_idle(&runtime, &clock).await;
+            let r = get_global_json(&runtime, "childProcessResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["code"], serde_json::json!(0));
+            assert_eq!(r["stdout"], serde_json::json!("line-1\n"));
+            assert_eq!(r["stderr"], serde_json::json!("warn-1\n"));
+            assert_eq!(r["killed"], serde_json::json!(false));
+            assert_eq!(
+                r["events"],
+                serde_json::json!(["stdout", "stderr", "close"])
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_process_kill_targets_spawned_pid() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.childKillResult = {};
+                    import('node:child_process').then(({ spawn }) => {
+                        const child = spawn('pi', ['--version'], {
+                            shell: false,
+                            detached: true,
+                            stdio: ['ignore', 'pipe', 'pipe'],
+                        });
+                        globalThis.childKillResult.pid = child.pid;
+                        child.on('close', (code) => {
+                            globalThis.childKillResult.code = code;
+                            globalThis.childKillResult.killed = child.killed;
+                            globalThis.childKillResult.done = true;
+                        });
+                        try {
+                            globalThis.childKillResult.killOk = process.kill(-child.pid, 'SIGKILL') === true;
+                        } catch (err) {
+                            globalThis.childKillResult.killErrorCode = String((err && err.code) || '');
+                            globalThis.childKillResult.killErrorMessage = String((err && err.message) || err || '');
+                        }
+                    });
+                    ",
+                )
+                .await
+                .expect("eval child_process kill script");
+
+            let mut requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let request = requests.pop_front().expect("exec hostcall");
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(serde_json::json!({
+                    "stdout": "",
+                    "stderr": "",
+                    "code": 0,
+                    "killed": false
+                })),
+            );
+
+            drain_until_idle(&runtime, &clock).await;
+            let r = get_global_json(&runtime, "childKillResult").await;
+            assert_eq!(r["killOk"], serde_json::json!(true));
+            assert_eq!(r["killed"], serde_json::json!(true));
+            assert_eq!(r["code"], serde_json::Value::Null);
+            assert_eq!(r["done"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_denied_exec_emits_error_and_close() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.childDeniedResult = {};
+                    import('node:child_process').then(({ spawn }) => {
+                        const child = spawn('pi', ['--version'], {
+                            shell: false,
+                            stdio: ['ignore', 'pipe', 'pipe'],
+                        });
+                        child.on('error', (err) => {
+                            globalThis.childDeniedResult.errorCode = String((err && err.code) || '');
+                            globalThis.childDeniedResult.errorMessage = String((err && err.message) || err || '');
+                        });
+                        child.on('close', (code) => {
+                            globalThis.childDeniedResult.code = code;
+                            globalThis.childDeniedResult.killed = child.killed;
+                            globalThis.childDeniedResult.done = true;
+                        });
+                    });
+                    ",
+                )
+                .await
+                .expect("eval child_process denied script");
+
+            let mut requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let request = requests.pop_front().expect("exec hostcall");
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: "Capability 'exec' denied by policy".to_string(),
+                },
+            );
+
+            drain_until_idle(&runtime, &clock).await;
+            let r = get_global_json(&runtime, "childDeniedResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["errorCode"], serde_json::json!("denied"));
+            assert_eq!(
+                r["errorMessage"],
+                serde_json::json!("Capability 'exec' denied by policy")
+            );
+            assert_eq!(r["code"], serde_json::json!(1));
+            assert_eq!(r["killed"], serde_json::json!(false));
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_rejects_unsupported_shell_option() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.childOptionResult = {};
+                    import('node:child_process').then(({ spawn }) => {
+                        try {
+                            spawn('pi', ['--version'], { shell: true });
+                            globalThis.childOptionResult.threw = false;
+                        } catch (err) {
+                            globalThis.childOptionResult.threw = true;
+                            globalThis.childOptionResult.message = String((err && err.message) || err || '');
+                        }
+                        globalThis.childOptionResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval child_process unsupported shell script");
+
+            drain_until_idle(&runtime, &clock).await;
+            let r = get_global_json(&runtime, "childOptionResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["threw"], serde_json::json!(true));
+            assert_eq!(
+                r["message"],
+                serde_json::json!(
+                    "node:child_process.spawn: only shell=false is supported in PiJS"
+                )
+            );
+            assert_eq!(runtime.drain_hostcall_requests().len(), 0);
         });
     }
 }

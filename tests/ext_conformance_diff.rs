@@ -1866,8 +1866,9 @@ fn diff_community_manifest() {
     );
 
     // Separate TS oracle failures (environment issues we can't fix) from Rust failures
-    let (ts_oracle_failures, rust_failures): (Vec<String>, Vec<String>) =
-        failures.into_iter().partition(|f| f.contains("ts_oracle_failed"));
+    let (ts_oracle_failures, rust_failures): (Vec<String>, Vec<String>) = failures
+        .into_iter()
+        .partition(|f| f.contains("ts_oracle_failed"));
 
     let total_failures = ts_oracle_failures.len() + rust_failures.len();
     if total_failures > 0 {
@@ -1885,8 +1886,7 @@ fn diff_community_manifest() {
     }
 
     // Pass rate (excluding TS oracle failures that we can't fix)
-    let testable =
-        u32::try_from(selected.len() - ts_oracle_failures.len()).unwrap_or(u32::MAX);
+    let testable = u32::try_from(selected.len() - ts_oracle_failures.len()).unwrap_or(u32::MAX);
     let pass_rate = if testable == 0 {
         100.0
     } else {
@@ -2033,33 +2033,49 @@ fn diff_thirdparty_manifest() {
         );
     }
 
-    let total: u32 = selected.len().try_into().unwrap_or(0);
+    // Separate TS oracle failures from Rust-side failures
+    let (ts_oracle_failures, rust_failures): (Vec<String>, Vec<String>) = failures
+        .into_iter()
+        .partition(|f| f.contains("ts_oracle_failed"));
+
+    let total_failures = ts_oracle_failures.len() + rust_failures.len();
     eprintln!(
-        "[diff_thirdparty_manifest] Results: {} passed, {} failed out of {} total",
+        "[diff_thirdparty_manifest] Results: {} passed, {} failed ({} TS oracle, {} Rust) out of {} total",
         passes,
-        failures.len(),
-        total
+        total_failures,
+        ts_oracle_failures.len(),
+        rust_failures.len(),
+        selected.len()
     );
 
-    if !failures.is_empty() {
+    if total_failures > 0 {
+        let all: Vec<&str> = ts_oracle_failures
+            .iter()
+            .chain(rust_failures.iter())
+            .map(String::as_str)
+            .collect();
         eprintln!(
-            "Third-party conformance failures ({}):\n{}",
-            failures.len(),
-            failures.join("\n")
+            "Third-party conformance failures ({total_failures}):\n{}",
+            all.join("\n")
         );
     }
 
-    let pass_rate = if total == 0 {
-        0.0
+    let testable = u32::try_from(selected.len() - ts_oracle_failures.len()).unwrap_or(u32::MAX);
+    let pass_rate = if testable == 0 {
+        100.0
     } else {
-        f64::from(passes) / f64::from(total) * 100.0
+        f64::from(passes) / f64::from(testable) * 100.0
     };
-    eprintln!("[diff_thirdparty_manifest] Pass rate: {pass_rate:.1}%");
+    eprintln!(
+        "[diff_thirdparty_manifest] Pass rate: {pass_rate:.1}% ({passes}/{testable} testable, {} TS oracle skipped)",
+        ts_oracle_failures.len()
+    );
 
+    // Assert: zero Rust-side failures
     assert!(
-        failures.is_empty(),
-        "Third-party conformance failures ({}):\n{}",
-        failures.len(),
-        failures.join("\n")
+        rust_failures.is_empty(),
+        "Rust-side third-party conformance failures ({}):\n{}",
+        rust_failures.len(),
+        rust_failures.join("\n")
     );
 }

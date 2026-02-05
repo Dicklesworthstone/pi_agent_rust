@@ -150,7 +150,7 @@ impl Tool for ExtensionToolWrapper {
     }
 
     fn label(&self) -> &str {
-        &self.def.label
+        self.def.label.as_deref().unwrap_or(&self.def.name)
     }
 
     fn description(&self) -> &str {
@@ -196,7 +196,7 @@ impl Tool for WasmExtensionToolWrapper {
     }
 
     fn label(&self) -> &str {
-        &self.def.label
+        self.def.label.as_deref().unwrap_or(&self.def.name)
     }
 
     fn description(&self) -> &str {
