@@ -14,7 +14,10 @@
 
 use crate::error::{Error, Result};
 use crate::extension_tools::collect_extension_tool_wrappers;
-use crate::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+use crate::extensions::{
+    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, JsExtensionLoadSpec,
+    JsExtensionRuntimeHandle,
+};
 use crate::extensions_js::PiJsRuntimeConfig;
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Message, StopReason, StreamEvent,
@@ -310,6 +313,9 @@ pub struct Agent {
     /// Agent configuration.
     config: AgentConfig,
 
+    /// Optional extension manager for tool/event hooks.
+    extensions: Option<ExtensionManager>,
+
     /// Message history.
     messages: Vec<Message>,
 
@@ -330,6 +336,7 @@ impl Agent {
             provider,
             tools,
             config,
+            extensions: None,
             messages: Vec::new(),
             steering_fetcher: None,
             follow_up_fetcher: None,
@@ -1147,6 +1154,52 @@ impl Agent {
         tool_call: &ToolCall,
         on_event: &Arc<dyn Fn(AgentEvent) + Send + Sync>,
     ) -> (ToolOutput, bool) {
+        if let Some(extensions) = self.extensions.clone() {
+            let response = extensions
+                .dispatch_event_with_response(
+                    ExtensionEventName::ToolCall,
+                    Some(serde_json::json!({
+                        "toolName": tool_call.name.clone(),
+                        "toolCallId": tool_call.id.clone(),
+                        "input": tool_call.arguments.clone(),
+                    })),
+                    EXTENSION_EVENT_TIMEOUT_MS,
+                )
+                .await;
+
+            match response {
+                Ok(Some(value)) => {
+                    let blocked = value
+                        .get("block")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false);
+                    if blocked {
+                        let reason = value
+                            .get("reason")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|reason| !reason.is_empty())
+                            .unwrap_or("Tool execution was blocked by an extension");
+
+                        return (
+                            ToolOutput {
+                                content: vec![ContentBlock::Text(TextContent::new(format!(
+                                    "Tool execution blocked: {reason}"
+                                )))],
+                                details: None,
+                                is_error: true,
+                            },
+                            true,
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!("tool_call extension hook failed (fail-open): {err}");
+                }
+            }
+        }
+
         // Find the tool
         let Some(tool) = self.tools.get(&tool_call.name) else {
             return (
@@ -1356,6 +1409,7 @@ mod extensions_integration_tests {
     use serde_json::json;
     use std::path::Path;
     use std::pin::Pin;
+    use std::sync::atomic::AtomicUsize;
 
     #[derive(Debug)]
     struct NoopProvider;
@@ -1383,6 +1437,45 @@ mod extensions_integration_tests {
             Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
         > {
             Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct CountingTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Tool for CountingTool {
+        fn name(&self) -> &str {
+            "count_tool"
+        }
+
+        fn label(&self) -> &str {
+            "count_tool"
+        }
+
+        fn description(&self) -> &str {
+            "counting tool"
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            _tool_call_id: &str,
+            _input: serde_json::Value,
+            _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+        ) -> Result<ToolOutput> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("ok"))],
+                details: None,
+                is_error: false,
+            })
         }
     }
 
@@ -1456,6 +1549,284 @@ mod extensions_integration_tests {
             assert_eq!(
                 details.get("from").and_then(serde_json::Value::as_str),
                 Some("extension")
+            );
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_can_block_tool_execution() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async (event) => {
+                    if (event && event.toolName === "count_tool") {
+                      return { block: true, reason: "blocked in test" };
+                    }
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Session::in_memory();
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(&tool_call, &on_event)
+                .await;
+
+            assert!(is_error);
+            assert!(output.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+            assert!(
+                matches!(output.content.as_slice(), [ContentBlock::Text(_)]),
+                "Expected text output, got {:?}",
+                output.content
+            );
+            if let [ContentBlock::Text(text)] = output.content.as_slice() {
+                assert!(text.text.contains("blocked"));
+            }
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_errors_fail_open() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async (_event) => {
+                    throw new Error("boom");
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Session::in_memory();
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(&tool_call, &on_event)
+                .await;
+
+            assert!(!is_error);
+            assert!(!output.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_absent_allows_tool_execution() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(_pi) {}
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Session::in_memory();
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(&tool_call, &on_event)
+                .await;
+
+            assert!(!is_error);
+            assert!(!output.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_returns_empty_allows_tool_execution() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async (_event) => ({}));
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let calls = Arc::new(AtomicUsize::new(0));
+            let tools = ToolRegistry::from_tools(vec![Box::new(CountingTool {
+                calls: Arc::clone(&calls),
+            })]);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Session::in_memory();
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "count_tool".to_string(),
+                arguments: json!({}),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(&tool_call, &on_event)
+                .await;
+
+            assert!(!is_error);
+            assert!(!output.is_error);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn tool_call_hook_can_block_bash_tool_execution() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let entry_path = temp_dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.on("tool_call", async (event) => {
+                    const name = event && event.toolName ? String(event.toolName) : "";
+                    if (name === "bash") return { block: true, reason: "blocked bash in test" };
+                    return {};
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let provider = Arc::new(NoopProvider);
+            let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
+            let agent = Agent::new(provider, tools, AgentConfig::default());
+            let session = Session::in_memory();
+            let mut agent_session = AgentSession::new(agent, session, false);
+
+            agent_session
+                .enable_extensions(&["bash"], temp_dir.path(), None, &[entry_path])
+                .await
+                .expect("enable extensions");
+
+            let tool_call = ToolCall {
+                id: "call-1".to_string(),
+                name: "bash".to_string(),
+                arguments: json!({ "command": "printf 'hi' > blocked.txt" }),
+                thought_signature: None,
+            };
+
+            let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(|_| {});
+            let (output, is_error) = agent_session
+                .agent
+                .execute_tool(&tool_call, &on_event)
+                .await;
+
+            assert!(is_error);
+            assert!(output.is_error);
+            assert!(
+                !temp_dir.path().join("blocked.txt").exists(),
+                "expected bash command not to run when blocked"
             );
         });
     }
@@ -1772,6 +2143,7 @@ impl AgentSession {
         let ctx_payload = serde_json::json!({ "cwd": cwd.display().to_string() });
         let wrappers = collect_extension_tool_wrappers(&manager, ctx_payload).await?;
         self.agent.extend_tools(wrappers);
+        self.agent.extensions = Some(manager.clone());
         self.extensions = Some(manager);
         Ok(())
     }

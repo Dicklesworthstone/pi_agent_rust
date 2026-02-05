@@ -7,6 +7,7 @@ use crate::agent::AgentEvent;
 use crate::connectors::Connector;
 use crate::connectors::http::HttpConnector;
 use crate::error::{Error, Result};
+use crate::extension_events::ToolCallEventResult;
 use crate::extensions_js::{
     ExtensionToolDef, HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig, js_to_json,
     json_to_js,
@@ -3507,6 +3508,8 @@ pub enum ExtensionEventName {
     ToolExecutionUpdate,
     /// Tool execution end.
     ToolExecutionEnd,
+    /// Tool call (pre-exec; can block).
+    ToolCall,
     /// Session before switch.
     SessionBeforeSwitch,
     /// Session switched.
@@ -3536,6 +3539,7 @@ impl std::fmt::Display for ExtensionEventName {
             Self::ToolExecutionStart => "tool_execution_start",
             Self::ToolExecutionUpdate => "tool_execution_update",
             Self::ToolExecutionEnd => "tool_execution_end",
+            Self::ToolCall => "tool_call",
             Self::SessionBeforeSwitch => "session_before_switch",
             Self::SessionSwitch => "session_switch",
             Self::SessionBeforeFork => "session_before_fork",
@@ -5246,96 +5250,15 @@ impl ExtensionManager {
         tx.is_some_and(|sender| sender.send(&cx, response).is_ok())
     }
 
-    /// Dispatch an event to all registered extensions.
-    pub async fn dispatch_event(
-        &self,
-        event: ExtensionEventName,
-        data: Option<Value>,
-    ) -> Result<()> {
-        let event_name = event.to_string();
-        let Some(runtime) = self.js_runtime() else {
-            return Ok(());
-        };
-
-        let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
-            let guard = self.inner.lock().unwrap();
-            let has_hook = guard
-                .extensions
-                .iter()
-                .any(|ext| ext.event_hooks.iter().any(|hook| hook == &event_name));
-            (
-                guard.ui_sender.is_some(),
-                guard.session.clone(),
-                guard.cwd.clone(),
-                guard.model_registry_values.clone(),
-                has_hook,
-            )
-        };
-
-        if !has_hook {
-            return Ok(());
-        }
-
-        let mut ctx = serde_json::Map::new();
-        ctx.insert("hasUI".to_string(), Value::Bool(has_ui));
-        if let Some(cwd) = cwd_override.or_else(|| {
-            std::env::current_dir()
-                .ok()
-                .map(|p| p.display().to_string())
-        }) {
-            ctx.insert("cwd".to_string(), Value::String(cwd));
-        }
-
-        if !model_registry_values.is_empty() {
-            let mut map = serde_json::Map::new();
-            for (key, value) in model_registry_values {
-                map.insert(key, Value::String(value));
-            }
-            ctx.insert("modelRegistry".to_string(), Value::Object(map));
-        }
-
-        if let Some(session) = session {
-            let state = session.get_state().await;
-            let entries = session.get_entries().await;
-            let branch = session.get_branch().await;
-            let leaf_entry = entries.last().cloned().unwrap_or(Value::Null);
-            ctx.insert("sessionState".to_string(), state);
-            ctx.insert("sessionEntries".to_string(), Value::Array(entries));
-            ctx.insert("sessionBranch".to_string(), Value::Array(branch));
-            ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
-        }
-
-        let event_payload = match data {
-            None => json!({ "type": event_name }),
-            Some(Value::Object(mut map)) => {
-                map.insert("type".to_string(), Value::String(event_name.clone()));
-                Value::Object(map)
-            }
-            Some(other) => json!({ "type": event_name, "data": other }),
-        };
-
-        let _ = runtime
-            .dispatch_event(
-                event_name,
-                event_payload,
-                Value::Object(ctx),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await?;
-
-        Ok(())
-    }
-
-    /// Dispatch a cancellable event to all registered extensions.
-    pub async fn dispatch_cancellable_event(
+    async fn dispatch_event_value(
         &self,
         event: ExtensionEventName,
         data: Option<Value>,
         timeout_ms: u64,
-    ) -> Result<bool> {
+    ) -> Result<Option<Value>> {
         let event_name = event.to_string();
         let Some(runtime) = self.js_runtime() else {
-            return Ok(false);
+            return Ok(None);
         };
 
         let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
@@ -5354,7 +5277,7 @@ impl ExtensionManager {
         };
 
         if !has_hook {
-            return Ok(false);
+            return Ok(None);
         }
 
         let mut ctx = serde_json::Map::new();
@@ -5399,6 +5322,42 @@ impl ExtensionManager {
             .dispatch_event(event_name, event_payload, Value::Object(ctx), timeout_ms)
             .await?;
 
+        Ok(Some(response))
+    }
+
+    /// Dispatch an event to all registered extensions.
+    pub async fn dispatch_event(
+        &self,
+        event: ExtensionEventName,
+        data: Option<Value>,
+    ) -> Result<()> {
+        let _ = self
+            .dispatch_event_value(event, data, EXTENSION_EVENT_TIMEOUT_MS)
+            .await?;
+        Ok(())
+    }
+
+    /// Dispatch an event to all registered extensions and return the raw response (if any).
+    pub async fn dispatch_event_with_response(
+        &self,
+        event: ExtensionEventName,
+        data: Option<Value>,
+        timeout_ms: u64,
+    ) -> Result<Option<Value>> {
+        self.dispatch_event_value(event, data, timeout_ms).await
+    }
+
+    /// Dispatch a cancellable event to all registered extensions.
+    pub async fn dispatch_cancellable_event(
+        &self,
+        event: ExtensionEventName,
+        data: Option<Value>,
+        timeout_ms: u64,
+    ) -> Result<bool> {
+        let Some(response) = self.dispatch_event_value(event, data, timeout_ms).await? else {
+            return Ok(false);
+        };
+
         Ok(response.as_bool() == Some(false)
             || response
                 .get("cancelled")
@@ -5408,6 +5367,91 @@ impl ExtensionManager {
                 .get("cancel")
                 .and_then(Value::as_bool)
                 .unwrap_or(false))
+    }
+
+    /// Dispatch a `tool_call` event to registered extensions and return the first
+    /// blocking response (if any).
+    pub async fn dispatch_tool_call(
+        &self,
+        tool_call: &crate::model::ToolCall,
+        timeout_ms: u64,
+    ) -> Result<Option<ToolCallEventResult>> {
+        let event_name = "tool_call".to_string();
+        let Some(runtime) = self.js_runtime() else {
+            return Ok(None);
+        };
+
+        let (has_ui, session, cwd_override, model_registry_values, has_hook) = {
+            let guard = self.inner.lock().unwrap();
+            let has_hook = guard
+                .extensions
+                .iter()
+                .any(|ext| ext.event_hooks.iter().any(|hook| hook == &event_name));
+            (
+                guard.ui_sender.is_some(),
+                guard.session.clone(),
+                guard.cwd.clone(),
+                guard.model_registry_values.clone(),
+                has_hook,
+            )
+        };
+
+        if !has_hook {
+            return Ok(None);
+        }
+
+        let mut ctx = serde_json::Map::new();
+        ctx.insert("hasUI".to_string(), Value::Bool(has_ui));
+        if let Some(cwd) = cwd_override.or_else(|| {
+            std::env::current_dir()
+                .ok()
+                .map(|p| p.display().to_string())
+        }) {
+            ctx.insert("cwd".to_string(), Value::String(cwd));
+        }
+
+        if !model_registry_values.is_empty() {
+            let mut map = serde_json::Map::new();
+            for (key, value) in model_registry_values {
+                map.insert(key, Value::String(value));
+            }
+            ctx.insert("modelRegistry".to_string(), Value::Object(map));
+        }
+
+        if let Some(session) = session {
+            let state = session.get_state().await;
+            let entries = session.get_entries().await;
+            let branch = session.get_branch().await;
+            let leaf_entry = entries.last().cloned().unwrap_or(Value::Null);
+            ctx.insert("sessionState".to_string(), state);
+            ctx.insert("sessionEntries".to_string(), Value::Array(entries));
+            ctx.insert("sessionBranch".to_string(), Value::Array(branch));
+            ctx.insert("sessionLeafEntry".to_string(), leaf_entry);
+        }
+
+        let event_payload = json!({
+            "type": "tool_call",
+            "toolName": tool_call.name.clone(),
+            "toolCallId": tool_call.id.clone(),
+            "input": tool_call.arguments.clone()
+        });
+
+        let response = runtime
+            .dispatch_event(
+                event_name,
+                event_payload,
+                Value::Object(ctx),
+                timeout_ms,
+            )
+            .await?;
+
+        if response.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(
+                serde_json::from_value(response).map_err(|err| Error::extension(err.to_string()))?,
+            ))
+        }
     }
 }
 
