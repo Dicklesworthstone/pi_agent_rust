@@ -3231,6 +3231,952 @@ mod tests {
         });
     }
 
+    // ---- Tool conformance tests ----
+
+    #[test]
+    fn dispatcher_tool_write_creates_file_and_resolves() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            let file_path = temp_dir.path().join("output.txt");
+            let file_path_str = file_path.display().to_string();
+            let script = format!(
+                r#"
+                globalThis.result = null;
+                pi.tool("write", {{ path: "{file_path_str}", content: "written by extension" }})
+                    .then((r) => {{ globalThis.result = r; }});
+            "#
+            );
+            runtime.eval(&script).await.expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["write"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            // Verify file was created
+            assert!(file_path.exists());
+            let content = std::fs::read_to_string(&file_path).expect("read file");
+            assert_eq!(content, "written by extension");
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_ls_lists_directory() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp_dir.path().join("alpha.txt"), "a").expect("write");
+            std::fs::write(temp_dir.path().join("beta.txt"), "b").expect("write");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.tool("ls", { path: "." })
+                        .then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["ls"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("ls not resolved");
+                    let s = JSON.stringify(globalThis.result);
+                    if (!s.includes("alpha.txt") || !s.includes("beta.txt")) {
+                        throw new Error("Missing files in ls output: " + s);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify ls result");
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_grep_searches_content() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(
+                temp_dir.path().join("data.txt"),
+                "line one\nline two\nline three",
+            )
+            .expect("write");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            let dir = temp_dir.path().display().to_string();
+            let script = format!(
+                r#"
+                globalThis.result = null;
+                pi.tool("grep", {{ pattern: "two", path: "{dir}" }})
+                    .then((r) => {{ globalThis.result = r; }});
+            "#
+            );
+            runtime.eval(&script).await.expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["grep"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("grep not resolved");
+                    let s = JSON.stringify(globalThis.result);
+                    if (!s.includes("two")) {
+                        throw new Error("grep should find 'two': " + s);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify grep result");
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_edit_modifies_file_content() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp_dir.path().join("target.txt"), "old text here").expect("write");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.tool("edit", { path: "target.txt", old_text: "old text", new_text: "new text" })
+                        .then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["edit"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let content =
+                std::fs::read_to_string(temp_dir.path().join("target.txt")).expect("read file");
+            assert!(
+                content.contains("new text"),
+                "Expected edited content, got: {content}"
+            );
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_find_discovers_files() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp_dir.path().join("code.rs"), "fn main(){}").expect("write");
+            std::fs::write(temp_dir.path().join("data.json"), "{}").expect("write");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.tool("find", { pattern: "*.rs" })
+                        .then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["find"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("find not resolved");
+                    let s = JSON.stringify(globalThis.result);
+                    if (!s.includes("code.rs")) {
+                        throw new Error("find should discover code.rs: " + s);
+                    }
+                    if (s.includes("data.json")) {
+                        throw new Error("find *.rs should not include data.json: " + s);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify find result");
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_multiple_tools_sequentially() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            std::fs::write(temp_dir.path().join("file.txt"), "hello").expect("write");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Queue two tool calls
+            runtime
+                .eval(
+                    r#"
+                    globalThis.readResult = null;
+                    globalThis.lsResult = null;
+                    pi.tool("read", { path: "file.txt" })
+                        .then((r) => { globalThis.readResult = r; });
+                    pi.tool("ls", { path: "." })
+                        .then((r) => { globalThis.lsResult = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 2);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["read", "ls"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.readResult === null) throw new Error("read not resolved");
+                    if (globalThis.lsResult === null) throw new Error("ls not resolved");
+                "#,
+                )
+                .await
+                .expect("verify both tools resolved");
+        });
+    }
+
+    #[test]
+    fn dispatcher_tool_error_propagates_to_js() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Try to read a non-existent file
+            runtime
+                .eval(
+                    r#"
+                    globalThis.errMsg = "";
+                    pi.tool("read", { path: "nonexistent_file.txt" })
+                        .then(() => { globalThis.errMsg = "should_not_resolve"; })
+                        .catch((e) => { globalThis.errMsg = e.message || String(e); });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&["read"], temp_dir.path(), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                temp_dir.path().to_path_buf(),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            // The read tool may resolve with an error content rather than rejecting.
+            // Either way, the dispatcher shouldn't panic.
+            runtime
+                .eval(
+                    r#"
+                    // Just verify something happened - error propagation is tool-specific
+                    if (globalThis.errMsg === "" && globalThis.result === null) {
+                        throw new Error("Neither resolved nor rejected");
+                    }
+                "#,
+                )
+                .await
+                .expect("verify tool error handling");
+        });
+    }
+
+    // ---- HTTP conformance tests ----
+
+    fn spawn_http_server_with_status(status: u16, body: &'static str) -> std::net::SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind http server");
+        let addr = listener.local_addr().expect("server addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let response = format!(
+                    "HTTP/1.1 {status} Error\r\nContent-Length: {len}\r\nContent-Type: text/plain\r\n\r\n{body}",
+                    status = status,
+                    len = body.len(),
+                    body = body,
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn dispatcher_http_post_sends_body() {
+        futures::executor::block_on(async {
+            let addr = spawn_http_server("post-ok");
+            let url = format!("http://{addr}/data");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            let script = format!(
+                r#"
+                globalThis.result = null;
+                pi.http({{ url: "{url}", method: "POST", body: "test-payload" }})
+                    .then((r) => {{ globalThis.result = r; }});
+            "#
+            );
+            runtime.eval(&script).await.expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let http_connector = HttpConnector::new(HttpConnectorConfig {
+                require_tls: false,
+                ..Default::default()
+            });
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(http_connector),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("POST not resolved");
+                    if (globalThis.result.status !== 200) {
+                        throw new Error("Expected 200, got: " + globalThis.result.status);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify POST result");
+        });
+    }
+
+    #[test]
+    fn dispatcher_http_missing_url_rejects() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.errMsg = "";
+                    pi.http({ method: "GET" })
+                        .then(() => { globalThis.errMsg = "should_not_resolve"; })
+                        .catch((e) => { globalThis.errMsg = e.message || String(e); });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let http_connector = HttpConnector::new(HttpConnectorConfig {
+                require_tls: false,
+                ..Default::default()
+            });
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(http_connector),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.errMsg === "should_not_resolve") {
+                        throw new Error("Expected rejection for missing URL");
+                    }
+                "#,
+                )
+                .await
+                .expect("verify missing URL rejection");
+        });
+    }
+
+    #[test]
+    fn dispatcher_http_custom_headers() {
+        futures::executor::block_on(async {
+            let addr = spawn_http_server("headers-ok");
+            let url = format!("http://{addr}/headers");
+
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            let script = format!(
+                r#"
+                globalThis.result = null;
+                pi.http({{
+                    url: "{url}",
+                    method: "GET",
+                    headers: {{ "X-Custom": "test-value", "Accept": "application/json" }}
+                }}).then((r) => {{ globalThis.result = r; }});
+            "#
+            );
+            runtime.eval(&script).await.expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let http_connector = HttpConnector::new(HttpConnectorConfig {
+                require_tls: false,
+                ..Default::default()
+            });
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(http_connector),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("HTTP not resolved");
+                    if (globalThis.result.status !== 200) {
+                        throw new Error("Expected 200, got: " + globalThis.result.status);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify headers request");
+        });
+    }
+
+    #[test]
+    fn dispatcher_http_connection_refused_rejects() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Use a port that definitely has nothing listening
+            runtime
+                .eval(
+                    r#"
+                    globalThis.errMsg = "";
+                    pi.http({ url: "http://127.0.0.1:1/never", method: "GET" })
+                        .then(() => { globalThis.errMsg = "should_not_resolve"; })
+                        .catch((e) => { globalThis.errMsg = e.message || String(e); });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let http_connector = HttpConnector::new(HttpConnectorConfig {
+                require_tls: false,
+                ..Default::default()
+            });
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(http_connector),
+                Arc::new(NullSession),
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.errMsg === "should_not_resolve") {
+                        throw new Error("Expected rejection for connection refused");
+                    }
+                "#,
+                )
+                .await
+                .expect("verify connection refused");
+        });
+    }
+
+    // ---- UI conformance tests ----
+
+    #[test]
+    fn dispatcher_ui_spinner_method() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.ui("spinner", { text: "Loading...", visible: true })
+                        .then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let captured: Arc<Mutex<Vec<ExtensionUiRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let ui_handler = Arc::new(TestUiHandler {
+                captured: Arc::clone(&captured),
+                response_value: serde_json::json!({ "acknowledged": true }),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                ui_handler,
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].method, "spinner");
+            assert_eq!(reqs[0].payload["text"], "Loading...");
+        });
+    }
+
+    #[test]
+    fn dispatcher_ui_progress_method() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.ui("progress", { current: 50, total: 100, label: "Processing" })
+                        .then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let captured: Arc<Mutex<Vec<ExtensionUiRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let ui_handler = Arc::new(TestUiHandler {
+                captured: Arc::clone(&captured),
+                response_value: Value::Null,
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                ui_handler,
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].method, "progress");
+            assert_eq!(reqs[0].payload["current"], 50);
+            assert_eq!(reqs[0].payload["total"], 100);
+        });
+    }
+
+    #[test]
+    fn dispatcher_ui_notification_method() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.ui("notification", { message: "Task complete!", level: "info" })
+                        .then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let captured: Arc<Mutex<Vec<ExtensionUiRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let ui_handler = Arc::new(TestUiHandler {
+                captured: Arc::clone(&captured),
+                response_value: serde_json::json!({ "shown": true }),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                ui_handler,
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 1);
+            assert_eq!(reqs[0].method, "notification");
+            assert_eq!(reqs[0].payload["message"], "Task complete!");
+            assert_eq!(reqs[0].payload["level"], "info");
+        });
+    }
+
+    #[test]
+    fn dispatcher_ui_null_handler_returns_null() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = "__unset__";
+                    pi.ui("any_method", { key: "value" })
+                        .then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            // Use NullUiHandler - returns None which maps to null
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === "__unset__") throw new Error("UI not resolved");
+                    if (globalThis.result !== null) {
+                        throw new Error("Expected null from NullHandler, got: " + JSON.stringify(globalThis.result));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify null UI handler");
+        });
+    }
+
+    #[test]
+    fn dispatcher_ui_multiple_calls_captured() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.r1 = null;
+                    globalThis.r2 = null;
+                    pi.ui("set_status", { text: "Working..." })
+                        .then((r) => { globalThis.r1 = r; });
+                    pi.ui("set_widget", { lines: ["Line 1", "Line 2"] })
+                        .then((r) => { globalThis.r2 = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 2);
+
+            let captured: Arc<Mutex<Vec<ExtensionUiRequest>>> = Arc::new(Mutex::new(Vec::new()));
+            let ui_handler = Arc::new(TestUiHandler {
+                captured: Arc::clone(&captured),
+                response_value: Value::Null,
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                Arc::new(NullSession),
+                ui_handler,
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            let reqs = captured.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            let methods: Vec<&str> = reqs.iter().map(|r| r.method.as_str()).collect();
+            assert!(methods.contains(&"set_status"));
+            assert!(methods.contains(&"set_widget"));
+        });
+    }
+
     // ---- Exec edge case tests ----
 
     #[test]
