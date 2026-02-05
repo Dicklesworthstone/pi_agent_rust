@@ -92,74 +92,88 @@ We compute a **base score (0–100)** and then subtract a **reliability‑risk p
 
 The inventory should store **all inputs** used to compute the score and a short rationale.
 
-### 2.1 Popularity (0–40)
+### 2.1 Popularity (0–30)
 
-Add up the following components (cap at 40):
+Add up the following components (cap at 30). Missing metrics score **0** and
+are recorded as “missing”, but do **not** exclude the candidate.
 
-1) **Official / first-party visibility (0–15)**
-- Listed on `buildwithpi.ai/packages` (or official docs): +15
-- Shipped as a pi-mono example extension: +10
-- badlogic-authored gist referenced by official docs: +8
+1) **Official / first‑party visibility (0–10)** (take the **max**, not sum)
+- Listed on `buildwithpi.ai/packages` (or official docs): +10
+- Shipped as a pi‑mono example extension: +8
+- badlogic‑authored gist referenced by official docs: +6
 
-2) **GitHub stars (0–15)** (repo or gist mirror if applicable)
-- ≥ 5,000: +15
-- ≥ 2,000: +13
-- ≥ 1,000: +11
-- ≥ 500: +9
-- ≥ 200: +7
-- ≥ 50: +4
+2) **GitHub stars (0–10)** (repo or gist mirror if applicable)
+- ≥ 5,000: +10
+- ≥ 2,000: +9
+- ≥ 1,000: +8
+- ≥ 500: +6
+- ≥ 200: +4
+- ≥ 50: +2
 - otherwise: +0
 
-3) **Community references (0–10)** (count distinct sources)
-- ≥ 10 distinct references: +10
-- ≥ 5: +7
-- ≥ 2: +4
+3) **Marketplace visibility (0–6)** (OpenClaw / ClawHub)
+- Rank ≤ 10: +6
+- Rank ≤ 50: +4
+- Rank ≤ 100: +2
+- otherwise: +0  
+**Featured badge:** +2 (cap at 6 total for marketplace visibility)
+
+4) **Community references (0–4)** (count distinct sources)
+- ≥ 10 distinct references: +4
+- ≥ 5: +3
+- ≥ 2: +2
 - otherwise: +0
 
 Examples of “references”: other repos linking it, blog posts, curated lists, Discord snippets with
 links. (The inventory must capture URLs.)
 
-### 2.2 Adoption (0–20)
+### 2.2 Adoption (0–15)
 
-Pick the best available signals for the source type; store raw numbers.
+Pick the best available signals for the source type; store raw numbers. Missing
+metrics score **0** and are recorded as “missing”.
 
-1) **npm downloads (0–12)** (if published on npm)
-- ≥ 50k / month: +12
-- ≥ 10k / month: +10
-- ≥ 2k / month: +7
-- ≥ 500 / month: +4
+1) **npm downloads (0–8)** (if published on npm)
+- ≥ 50k / month: +8
+- ≥ 10k / month: +6
+- ≥ 2k / month: +4
+- ≥ 500 / month: +2
 - otherwise: +0
 
-2) **Forks / derivative usage (0–8)** (GitHub)
-- forks ≥ 500: +8
-- ≥ 200: +6
-- ≥ 50: +3
+2) **Marketplace installs (0–5)** (OpenClaw / ClawHub)
+- ≥ 10k / month: +5
+- ≥ 2k / month: +4
+- ≥ 500 / month: +2
+- ≥ 100 / month: +1
 - otherwise: +0
 
-If neither npm nor forks apply, score Adoption as 0 and note “signal unavailable”.
+3) **Forks / derivative usage (0–2)** (GitHub)
+- forks ≥ 500: +2
+- ≥ 200: +1
+- ≥ 50: +1
+- otherwise: +0
 
-### 2.3 Coverage (0–25)
+### 2.3 Coverage (0–20)
 
 Coverage is about maximizing proof value, not “popularity”. Score by tags:
 
-1) **Runtime tier (0–8)**
-- pkg-with-deps: +8
-- multi-file: +6
-- legacy-js (single file): +4
+1) **Runtime tier (0–6)**
+- pkg-with-deps **or** provider-ext: +6
+- multi-file: +4
+- legacy-js (single file): +2
 
-2) **Interaction model breadth (0–9)**
-- provider: +4
+2) **Interaction model breadth (0–8)**
+- provider: +3
 - ui_integration: +2
 - event_hook: +2
 - slash_command: +1
 - tool_only: +1
 
-(cap at 9; use tags as in `docs/EXTENSION_SAMPLING_MATRIX.md`.)
+(cap at 8; use tags as in `docs/EXTENSION_SAMPLING_MATRIX.md`.)
 
-3) **Hostcall mix (0–8)** (capabilities used)
+3) **Hostcall mix (0–6)** (capabilities used)
 - uses `exec`: +2
 - uses `http`: +2
-- uses `read`/`write`/`edit`: +2
+- uses `read`/`write`/`edit`: +1
 - uses `ui`: +1
 - uses session mutation APIs: +1
 
@@ -198,6 +212,43 @@ Suggested penalty bands:
 - **5** — Moderate deps or network use, but reproducible with mocks/VCR.
 - **10** — High risk: OAuth flows, heavy UI timing sensitivity, large dep trees.
 - **15** — Critical risk: native binaries, non‑deterministic side effects, unclear license.
+
+### 2.7 Worked Examples (marketplace signals)
+
+Assume `as_of = 2026‑02‑01` for Activity scoring.
+
+**Example A — “OpenClaw Featured Tool” (pkg‑with‑deps)**
+- Signals: GitHub stars **1,200**, marketplace rank **8**, featured **true**, references **6**
+- Popularity = 0 (official) + 8 (stars) + 6 (marketplace) + 3 (references) = **17**
+- Adoption = 6 (npm 12k/mo) + 5 (marketplace installs 15k/mo) + 1 (forks 220) = **12**
+- Coverage = 6 (runtime pkg‑with‑deps) + 5 (tool + event + UI) + 6 (exec+http+fs+ui) = **17**
+- Activity = **15** (updated 2026‑01‑15)
+- Compatibility = **15** (generic shims required)
+- Base = 17 + 12 + 17 + 15 + 15 = **76**
+- Risk penalty = **5** (moderate, network‑heavy)
+- **Final = 71 → Tier‑1**
+
+**Example B — “Niche GitHub Script” (legacy‑js)**
+- Signals: GitHub stars **120**, references **1**, no marketplace
+- Popularity = 0 (official) + 2 (stars) + 0 (marketplace) + 0 (refs) = **2**
+- Adoption = **0** (no npm/marketplace installs, forks 12)
+- Coverage = 2 (runtime legacy‑js) + 1 (tool_only) + 1 (fs) = **4**
+- Activity = **0** (updated 2023‑01‑01)
+- Compatibility = **20** (clean unmodified)
+- Base = 2 + 0 + 4 + 0 + 20 = **26**
+- Risk penalty = **0**
+- **Final = 26 → Excluded**
+
+**Example C — “Official pi‑mono Example”**
+- Signals: pi‑mono example **true**, GitHub stars **7,000**, references **12**
+- Popularity = 8 (official) + 10 (stars) + 0 (marketplace) + 4 (refs) = **22**
+- Adoption = **2** (forks 720)
+- Coverage = 2 (runtime legacy‑js) + 4 (event + UI) + 4 (exec+ui+session) = **10**
+- Activity = **15** (updated 2026‑01‑20)
+- Compatibility = **20** (clean unmodified)
+- Base = 22 + 2 + 10 + 15 + 20 = **69**
+- Risk penalty = **0**
+- **Final = 69 → Tier‑2 by score, but Tier‑0 baseline due to official status**
 
 ---
 
