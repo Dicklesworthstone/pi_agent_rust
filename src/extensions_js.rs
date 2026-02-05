@@ -2817,13 +2817,23 @@ function __pi_register_provider(provider_id, spec) {
         return out;
     }) : [];
 
+    const hasStreamSimple = typeof spec.streamSimple === 'function';
+    if (spec.streamSimple !== undefined && spec.streamSimple !== null && !hasStreamSimple) {
+        throw new Error('registerProvider: spec.streamSimple must be a function');
+    }
+
     const providerSpec = {
         id: id,
         baseUrl: spec.baseUrl ? String(spec.baseUrl) : '',
         apiKey: spec.apiKey ? String(spec.apiKey) : '',
         api: spec.api ? String(spec.api) : '',
         models: models,
+        hasStreamSimple: hasStreamSimple,
     };
+
+    if (hasStreamSimple && !providerSpec.api) {
+        throw new Error('registerProvider: api is required when registering streamSimple');
+    }
 
     if (__pi_provider_index.has(id)) {
         const existing = __pi_provider_index.get(id);
@@ -2832,9 +2842,111 @@ function __pi_register_provider(provider_id, spec) {
         }
     }
 
-    const record = { extensionId: ext.id, spec: providerSpec };
+    const record = {
+        extensionId: ext.id,
+        spec: providerSpec,
+        streamSimple: hasStreamSimple ? spec.streamSimple : null,
+    };
     ext.providers.set(id, record);
     __pi_provider_index.set(id, record);
+}
+
+// ============================================================================
+// Provider Streaming (streamSimple bridge)
+// ============================================================================
+
+let __pi_provider_stream_seq = 0;
+const __pi_provider_streams = new Map(); // stream_id -> { iterator, controller }
+
+function __pi_make_abort_controller() {
+    const listeners = new Set();
+    const signal = {
+        aborted: false,
+        addEventListener: (type, cb) => {
+            if (type !== 'abort') return;
+            if (typeof cb === 'function') listeners.add(cb);
+        },
+        removeEventListener: (type, cb) => {
+            if (type !== 'abort') return;
+            listeners.delete(cb);
+        },
+    };
+    return {
+        signal,
+        abort: () => {
+            if (signal.aborted) return;
+            signal.aborted = true;
+            for (const cb of listeners) {
+                try {
+                    cb();
+                } catch (_) {}
+            }
+        },
+    };
+}
+
+async function __pi_provider_stream_simple_start(provider_id, model, context, options) {
+    const id = String(provider_id || '').trim();
+    if (!id) {
+        throw new Error('providerStreamSimple.start: provider_id is required');
+    }
+    const record = __pi_provider_index.get(id);
+    if (!record) {
+        throw new Error('providerStreamSimple.start: unknown provider: ' + id);
+    }
+    if (!record.streamSimple || typeof record.streamSimple !== 'function') {
+        throw new Error('providerStreamSimple.start: provider has no streamSimple handler: ' + id);
+    }
+
+    const controller = __pi_make_abort_controller();
+    const mergedOptions = Object.assign({}, options || {}, { signal: controller.signal });
+
+    const stream = record.streamSimple(model, context, mergedOptions);
+    const iterator = stream && stream[Symbol.asyncIterator] ? stream[Symbol.asyncIterator]() : stream;
+    if (!iterator || typeof iterator.next !== 'function') {
+        throw new Error('providerStreamSimple.start: streamSimple must return an async iterator');
+    }
+
+    const stream_id = 'provider-stream-' + String(++__pi_provider_stream_seq);
+    __pi_provider_streams.set(stream_id, { iterator, controller });
+    return stream_id;
+}
+
+async function __pi_provider_stream_simple_next(stream_id) {
+    const id = String(stream_id || '').trim();
+    const record = __pi_provider_streams.get(id);
+    if (!record) {
+        return { done: true, value: null };
+    }
+
+    const result = await record.iterator.next();
+    if (!result || result.done) {
+        __pi_provider_streams.delete(id);
+        return { done: true, value: null };
+    }
+
+    return { done: false, value: result.value };
+}
+
+async function __pi_provider_stream_simple_cancel(stream_id) {
+    const id = String(stream_id || '').trim();
+    const record = __pi_provider_streams.get(id);
+    if (!record) {
+        return false;
+    }
+
+    try {
+        record.controller.abort();
+    } catch (_) {}
+
+    try {
+        if (record.iterator && typeof record.iterator.return === 'function') {
+            await record.iterator.return();
+        }
+    } catch (_) {}
+
+    __pi_provider_streams.delete(id);
+    return true;
 }
 
 const __pi_reserved_keys = new Set(['ctrl+c', 'ctrl+d', 'ctrl+l', 'ctrl+z']);
@@ -2977,6 +3089,24 @@ function __pi_set_thinking_level(level) {
     return pi.events('setThinkingLevel', { thinkingLevel: l });
 }
 
+function __pi_get_session_name() {
+    return pi.session('get_name', {});
+}
+
+function __pi_set_session_name(name) {
+    const n = name != null ? String(name) : '';
+    return pi.session('set_name', { name: n });
+}
+
+function __pi_set_label(entryId, label) {
+    const eid = String(entryId || '').trim();
+    if (!eid) {
+        throw new Error('setLabel: entryId is required');
+    }
+    const l = label != null ? String(label).trim() : null;
+    return pi.session('set_label', { targetId: eid, label: l || undefined });
+}
+
 function __pi_append_entry(custom_type, data) {
     const ext = __pi_current_extension_or_throw();
     const customType = String(custom_type || '').trim();
@@ -3041,6 +3171,16 @@ function __pi_snapshot_extensions() {
             shortcuts.push(shortcut.spec);
         }
 
+        const flags = [];
+        for (const [flagName, flagSpec] of ext.flags.entries()) {
+            flags.push({
+                name: flagName,
+                description: flagSpec.description ? String(flagSpec.description) : '',
+                type: flagSpec.type ? String(flagSpec.type) : 'string',
+                default: flagSpec.default !== undefined ? flagSpec.default : null,
+            });
+        }
+
         out.push({
             id: id,
             name: ext.name,
@@ -3050,6 +3190,7 @@ function __pi_snapshot_extensions() {
             slash_commands: commands,
             providers: providers,
             shortcuts: shortcuts,
+            flags: flags,
             event_hooks: event_hooks,
             active_tools: Array.isArray(ext.activeTools) ? ext.activeTools.slice() : null,
         });
@@ -3535,6 +3676,9 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     appendEntry: __pi_append_entry,
 	    sendMessage: __pi_send_message,
 	    sendUserMessage: __pi_send_user_message,
+	    getSessionName: __pi_get_session_name,
+	    setSessionName: __pi_set_session_name,
+	    setLabel: __pi_set_label,
 	};
 
 	// Convenience API: pi.events.emit/on (inter-extension bus).

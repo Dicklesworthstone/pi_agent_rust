@@ -771,7 +771,13 @@ impl Default for ExtensionPolicy {
         Self {
             mode: ExtensionPolicyMode::Prompt,
             max_memory_mb: 256,
-            default_caps: vec!["read".to_string(), "write".to_string(), "http".to_string()],
+            default_caps: vec![
+                "read".to_string(),
+                "write".to_string(),
+                "http".to_string(),
+                "events".to_string(),
+                "session".to_string(),
+            ],
             deny_caps: vec!["exec".to_string(), "env".to_string()],
         }
     }
@@ -1555,6 +1561,8 @@ pub struct RegisterPayload {
     #[serde(default)]
     pub shortcuts: Vec<Value>,
     #[serde(default)]
+    pub flags: Vec<Value>,
+    #[serde(default)]
     pub event_hooks: Vec<String>,
 }
 
@@ -1841,6 +1849,7 @@ pub trait ExtensionSession: Send + Sync {
     async fn get_model(&self) -> (Option<String>, Option<String>);
     async fn set_thinking_level(&self, level: String) -> Result<()>;
     async fn get_thinking_level(&self) -> Option<String>;
+    async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3124,6 +3133,7 @@ mod wasm_host {
                 tools: Vec::new(),
                 slash_commands: Vec::new(),
                 shortcuts: Vec::new(),
+                flags: Vec::new(),
                 event_hooks: Vec::new(),
             }
         }
@@ -4293,6 +4303,8 @@ struct JsExtensionSnapshot {
     #[serde(default)]
     providers: Vec<Value>,
     #[serde(default)]
+    flags: Vec<Value>,
+    #[serde(default)]
     event_hooks: Vec<String>,
     #[serde(default)]
     active_tools: Option<Vec<String>>,
@@ -4463,6 +4475,30 @@ enum JsRuntimeCommand {
         timeout_ms: u64,
         reply: oneshot::Sender<Result<Value>>,
     },
+    ProviderStreamSimpleStart {
+        provider_id: String,
+        model: Value,
+        context: Value,
+        options: Value,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    ProviderStreamSimpleNext {
+        stream_id: String,
+        timeout_ms: u64,
+        reply: oneshot::Sender<Result<Option<Value>>>,
+    },
+    ProviderStreamSimpleCancel {
+        stream_id: String,
+        timeout_ms: u64,
+        reply: Option<oneshot::Sender<Result<()>>>,
+    },
+    SetFlagValue {
+        extension_id: String,
+        flag_name: String,
+        value: Value,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 #[derive(Clone)]
@@ -4589,6 +4625,77 @@ impl JsExtensionRuntimeHandle {
                                 timeout_ms,
                             )
                             .await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::ProviderStreamSimpleStart {
+                            provider_id,
+                            model,
+                            context,
+                            options,
+                            timeout_ms,
+                            reply,
+                        } => {
+                            let result = start_extension_provider_stream_simple(
+                                &js_runtime,
+                                &host,
+                                &provider_id,
+                                model,
+                                context,
+                                options,
+                                timeout_ms,
+                            )
+                            .await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::ProviderStreamSimpleNext {
+                            stream_id,
+                            timeout_ms,
+                            reply,
+                        } => {
+                            let result = next_extension_provider_stream_simple(
+                                &js_runtime,
+                                &host,
+                                &stream_id,
+                                timeout_ms,
+                            )
+                            .await;
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::ProviderStreamSimpleCancel {
+                            stream_id,
+                            timeout_ms,
+                            reply,
+                        } => {
+                            let result = cancel_extension_provider_stream_simple(
+                                &js_runtime,
+                                &host,
+                                &stream_id,
+                                timeout_ms,
+                            )
+                            .await;
+                            if let Some(reply) = reply {
+                                let _ = reply.send(&cx, result);
+                            }
+                        }
+                        JsRuntimeCommand::SetFlagValue {
+                            extension_id,
+                            flag_name,
+                            value,
+                            reply,
+                        } => {
+                            let result = js_runtime
+                                .with_ctx(|ctx| {
+                                    let global = ctx.globals();
+                                    let set_fn: rquickjs::Function<'_> =
+                                        global.get("__pi_set_flag_value")?;
+                                    let _: rquickjs::Value<'_> = set_fn.call((
+                                        extension_id.as_str(),
+                                        flag_name.as_str(),
+                                        json_to_js(&ctx, &value)?,
+                                    ))?;
+                                    Ok(())
+                                })
+                                .await;
                             let _ = reply.send(&cx, result);
                         }
                     }
@@ -4767,6 +4874,148 @@ impl JsExtensionRuntimeHandle {
             .await
             .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
     }
+
+    pub async fn set_flag_value(
+        &self,
+        extension_id: String,
+        flag_name: String,
+        value: Value,
+    ) -> Result<()> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::SetFlagValue {
+                    extension_id,
+                    flag_name,
+                    value,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn provider_stream_simple_start(
+        &self,
+        provider_id: String,
+        model: Value,
+        context: Value,
+        options: Value,
+        timeout_ms: u64,
+    ) -> Result<String> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ProviderStreamSimpleStart {
+                    provider_id,
+                    model,
+                    context,
+                    options,
+                    timeout_ms,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn provider_stream_simple_next(
+        &self,
+        stream_id: String,
+        timeout_ms: u64,
+    ) -> Result<Option<Value>> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ProviderStreamSimpleNext {
+                    stream_id,
+                    timeout_ms,
+                    reply: reply_tx,
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub async fn provider_stream_simple_cancel(
+        &self,
+        stream_id: String,
+        timeout_ms: u64,
+    ) -> Result<()> {
+        let cx = Cx::for_request();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.sender
+            .send(
+                &cx,
+                JsRuntimeCommand::ProviderStreamSimpleCancel {
+                    stream_id,
+                    timeout_ms,
+                    reply: Some(reply_tx),
+                },
+            )
+            .await
+            .map_err(|_| Error::extension("JS extension runtime channel closed"))?;
+        reply_rx
+            .recv(&cx)
+            .await
+            .map_err(|_| Error::extension("JS extension runtime task cancelled"))?
+    }
+
+    pub fn provider_stream_simple_cancel_best_effort(&self, stream_id: String) {
+        let timeout_ms = 5000;
+        if self
+            .sender
+            .try_send(JsRuntimeCommand::ProviderStreamSimpleCancel {
+                stream_id: stream_id.clone(),
+                timeout_ms,
+                reply: None,
+            })
+            .is_ok()
+        {
+            return;
+        }
+
+        // Fall back to an async send if the command channel is full.
+        let sender = self.sender.clone();
+        let _ = std::thread::Builder::new()
+            .name("pi-js-stream-cancel".to_owned())
+            .spawn(move || {
+            let Ok(runtime) = asupersync::runtime::RuntimeBuilder::current_thread().build() else {
+                return;
+            };
+            runtime.block_on(async move {
+                let cx = Cx::for_request();
+                let _ = sender
+                    .send(
+                        &cx,
+                        JsRuntimeCommand::ProviderStreamSimpleCancel {
+                            stream_id,
+                            timeout_ms,
+                            reply: None,
+                        },
+                    )
+                    .await;
+            });
+        });
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -4938,17 +5187,141 @@ async fn execute_extension_shortcut(
     await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
 }
 
+#[derive(Debug, Deserialize)]
+struct JsProviderStreamNext {
+    done: bool,
+    #[serde(default)]
+    value: Option<Value>,
+}
+
+#[allow(clippy::future_not_send)]
+async fn start_extension_provider_stream_simple(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    provider_id: &str,
+    model: Value,
+    context: Value,
+    options: Value,
+    timeout_ms: u64,
+) -> Result<String> {
+    let task_id = format!("task-provider-stream-start-{}", Uuid::new_v4());
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let start_fn: rquickjs::Function<'_> =
+                global.get("__pi_provider_stream_simple_start")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let model_js = json_to_js(&ctx, &model)?;
+            let context_js = json_to_js(&ctx, &context)?;
+            let options_js = json_to_js(&ctx, &options)?;
+            let promise: rquickjs::Value<'_> =
+                start_fn.call((provider_id.to_string(), model_js, context_js, options_js))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    let value = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .ok_or_else(|| Error::extension("provider stream start: expected stream id".to_string()))
+}
+
+#[allow(clippy::future_not_send)]
+async fn next_extension_provider_stream_simple(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    stream_id: &str,
+    timeout_ms: u64,
+) -> Result<Option<Value>> {
+    let task_id = format!("task-provider-stream-next-{}", Uuid::new_v4());
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let next_fn: rquickjs::Function<'_> = global.get("__pi_provider_stream_simple_next")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let promise: rquickjs::Value<'_> = next_fn.call((stream_id.to_string(),))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    let value = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    let result: JsProviderStreamNext = serde_json::from_value(value)
+        .map_err(|err| Error::extension(format!("provider stream next: {err}")))?;
+    if result.done {
+        return Ok(None);
+    }
+    let Some(value) = result.value else {
+        return Err(Error::extension(
+            "provider stream next: missing value".to_string(),
+        ));
+    };
+    Ok(Some(value))
+}
+
+#[allow(clippy::future_not_send)]
+async fn cancel_extension_provider_stream_simple(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    stream_id: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    let task_id = format!("task-provider-stream-cancel-{}", Uuid::new_v4());
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let cancel_fn: rquickjs::Function<'_> =
+                global.get("__pi_provider_stream_simple_cancel")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let promise: rquickjs::Value<'_> = cancel_fn.call((stream_id.to_string(),))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    let _ = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    Ok(())
+}
+
 #[allow(clippy::future_not_send)]
 async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Result<bool> {
-    let mut pending = runtime.drain_hostcall_requests();
-    while let Some(req) = pending.pop_front() {
-        let call_id = req.call_id.clone();
-        let outcome = dispatch_hostcall(host, req).await;
-        runtime.complete_hostcall(call_id, outcome);
+    fn drain_requests(runtime: &PiJsRuntime) -> std::collections::VecDeque<HostcallRequest> {
+        runtime.drain_hostcall_requests()
     }
 
+    async fn dispatch_requests(
+        runtime: &PiJsRuntime,
+        host: &JsRuntimeHost,
+        mut pending: std::collections::VecDeque<HostcallRequest>,
+    ) {
+        while let Some(req) = pending.pop_front() {
+            let call_id = req.call_id.clone();
+            let outcome = dispatch_hostcall(host, req).await;
+            runtime.complete_hostcall(call_id, outcome);
+        }
+    }
+
+    // Process any hostcalls already queued before we advance the event loop.
+    dispatch_requests(runtime, host, drain_requests(runtime)).await;
+
+    // Advance the event loop (may schedule hostcalls while running a task's microtasks).
     let _ = runtime.tick().await?;
     let _ = runtime.drain_microtasks().await?;
+
+    // Process hostcalls scheduled during the tick/microtask phase. Without this, fire-and-forget
+    // calls (e.g. `pi.sendMessage()` without `await`) can be lost when a JS task resolves quickly.
+    let after_tick = drain_requests(runtime);
+    let has_after_tick = !after_tick.is_empty();
+    dispatch_requests(runtime, host, after_tick).await;
+
+    // If we dispatched any hostcalls, run another tick so their completions are delivered and
+    // microtasks reach a fixpoint before the caller observes the outcome.
+    if has_after_tick {
+        let _ = runtime.tick().await?;
+        let _ = runtime.drain_microtasks().await?;
+    }
 
     Ok(runtime.has_pending())
 }
@@ -5520,11 +5893,37 @@ async fn dispatch_hostcall_session(
                 .get("customType")
                 .and_then(Value::as_str)
                 .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+                .or_else(|| payload.get("customtype").and_then(Value::as_str))
                 .unwrap_or_default()
                 .to_string();
             let data = payload.get("data").cloned();
             session
                 .append_custom_entry(custom_type, data)
+                .await
+                .map(|()| Value::Null)
+        }
+        "set_label" | "setlabel" => {
+            let target_id = payload
+                .get("targetId")
+                .and_then(Value::as_str)
+                .or_else(|| payload.get("target_id").and_then(Value::as_str))
+                .or_else(|| payload.get("entryId").and_then(Value::as_str))
+                .or_else(|| payload.get("entry_id").and_then(Value::as_str))
+                .unwrap_or_default()
+                .to_string();
+            if target_id.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "setLabel: targetId is required".to_string(),
+                };
+            }
+            let label = payload
+                .get("label")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            session
+                .set_label(target_id, label)
                 .await
                 .map(|()| Value::Null)
         }
@@ -5630,6 +6029,7 @@ async fn dispatch_hostcall_events(
                 .get("customType")
                 .and_then(Value::as_str)
                 .or_else(|| payload.get("custom_type").and_then(Value::as_str))
+                .or_else(|| payload.get("customtype").and_then(Value::as_str))
                 .unwrap_or_default()
                 .to_string();
             let data = payload.get("data").cloned();
@@ -5809,7 +6209,9 @@ async fn dispatch_hostcall_events(
             }
             // Validate api type.
             match api.as_str() {
-                "anthropic-messages" | "openai-completions" | "openai-responses"
+                "anthropic-messages"
+                | "openai-completions"
+                | "openai-responses"
                 | "google-generative-ai" => {}
                 other => {
                     return HostcallOutcome::Error {
@@ -5899,7 +6301,51 @@ async fn dispatch_hostcall_events(
             }
             HostcallOutcome::Success(Value::Null)
         }
-        _ => HostcallOutcome::Success(Value::Null),
+        "registerflag" | "register_flag" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "registerFlag: name is required".to_string(),
+                };
+            }
+            manager.register_flag(payload);
+            HostcallOutcome::Success(Value::Null)
+        }
+        "getflag" | "get_flag" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "getFlag: name is required".to_string(),
+                };
+            }
+            let all_flags = manager.list_flags();
+            let flag = all_flags
+                .iter()
+                .find(|f| f.get("name").and_then(Value::as_str).unwrap_or_default() == name);
+            flag.map_or(HostcallOutcome::Success(Value::Null), |f| {
+                HostcallOutcome::Success(f.clone())
+            })
+        }
+        "listflags" | "list_flags" => {
+            let flags = manager.list_flags();
+            HostcallOutcome::Success(json!(flags))
+        }
+        _ => HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: format!("Unknown events op: {}", op.trim()),
+        },
     }
 }
 
@@ -6010,6 +6456,7 @@ struct ExtensionManagerInner {
     session: Option<Arc<dyn ExtensionSession>>,
     active_tools: Option<Vec<String>>,
     providers: Vec<Value>,
+    flags: Vec<Value>,
     cwd: Option<String>,
     model_registry_values: HashMap<String, String>,
     current_provider: Option<String>,
@@ -6117,6 +6564,7 @@ impl ExtensionManager {
         let mut payloads = Vec::new();
         let mut active_tools: Option<Vec<String>> = None;
         let mut all_providers = Vec::new();
+        let mut all_flags = Vec::new();
         for snapshot in snapshots {
             let JsExtensionSnapshot {
                 id,
@@ -6127,10 +6575,12 @@ impl ExtensionManager {
                 slash_commands,
                 providers,
                 shortcuts,
+                flags,
                 event_hooks,
                 active_tools: ext_active_tools,
             } = snapshot;
             all_providers.extend(providers);
+            all_flags.extend(flags.clone());
             if let Some(list) = ext_active_tools {
                 active_tools = Some(list);
             }
@@ -6147,6 +6597,7 @@ impl ExtensionManager {
                 tools,
                 slash_commands,
                 shortcuts,
+                flags,
                 event_hooks,
             });
         }
@@ -6156,6 +6607,7 @@ impl ExtensionManager {
             guard.extensions = payloads;
             guard.active_tools = active_tools;
             guard.providers = all_providers;
+            guard.flags = all_flags;
         }
         Ok(())
     }
@@ -6292,6 +6744,7 @@ impl ExtensionManager {
                 tools: Vec::new(),
                 slash_commands: vec![entry],
                 shortcuts: Vec::new(),
+                flags: Vec::new(),
                 event_hooks: Vec::new(),
             });
         }
@@ -6301,6 +6754,17 @@ impl ExtensionManager {
     pub fn register_provider(&self, payload: Value) {
         let mut guard = self.inner.lock().unwrap();
         guard.providers.push(payload);
+    }
+
+    /// Dynamically register a flag at runtime (from a hostcall).
+    pub fn register_flag(&self, spec: Value) {
+        let mut guard = self.inner.lock().unwrap();
+        let name = spec.get("name").and_then(Value::as_str).unwrap_or_default();
+        // Deduplicate: replace existing flag with the same name.
+        guard
+            .flags
+            .retain(|f| f.get("name").and_then(Value::as_str).unwrap_or_default() != name);
+        guard.flags.push(spec);
     }
 
     /// Execute an extension slash command via the JS runtime.
@@ -6327,6 +6791,27 @@ impl ExtensionManager {
     pub fn extension_providers(&self) -> Vec<Value> {
         let guard = self.inner.lock().unwrap();
         guard.providers.clone()
+    }
+
+    /// Return true if an extension provider is backed by a JS `streamSimple` handler.
+    pub fn provider_has_stream_simple(&self, provider_id: &str) -> bool {
+        let needle = provider_id.trim();
+        if needle.is_empty() {
+            return false;
+        }
+
+        let guard = self.inner.lock().unwrap();
+        guard.providers.iter().any(|provider_spec| {
+            provider_spec
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id == needle)
+                && provider_spec
+                    .get("hasStreamSimple")
+                    .and_then(Value::as_bool)
+                    .or_else(|| provider_spec.get("streamSimple").and_then(Value::as_bool))
+                    .unwrap_or(false)
+        })
     }
 
     /// Convert extension-registered providers into model entries suitable for
@@ -6519,6 +7004,64 @@ impl ExtensionManager {
         shortcuts
     }
 
+    pub fn list_flags(&self) -> Vec<Value> {
+        let guard = self.inner.lock().unwrap();
+        let mut flags = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        // Collect from dynamically registered flags first (higher priority).
+        for flag in &guard.flags {
+            let name = flag
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if !name.is_empty() {
+                seen.insert(name.clone());
+                let description = flag
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let flag_type = flag.get("type").and_then(Value::as_str).unwrap_or("string");
+                flags.push(json!({
+                    "name": name,
+                    "description": description,
+                    "type": flag_type,
+                    "default": flag.get("default").cloned(),
+                    "source": "extension",
+                }));
+            }
+        }
+
+        // Collect from snapshot-loaded extension payloads (skip duplicates).
+        for ext in &guard.extensions {
+            for flag in &ext.flags {
+                let name = flag
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !name.is_empty() && seen.insert(name.clone()) {
+                    let description = flag
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    let flag_type = flag.get("type").and_then(Value::as_str).unwrap_or("string");
+                    flags.push(json!({
+                        "name": name,
+                        "description": description,
+                        "type": flag_type,
+                        "default": flag.get("default").cloned(),
+                        "source": "extension",
+                    }));
+                }
+            }
+        }
+
+        drop(guard);
+        flags
+    }
+
     /// Execute an extension shortcut via the JS runtime.
     pub async fn execute_shortcut(
         &self,
@@ -6531,6 +7074,21 @@ impl ExtensionManager {
             .ok_or_else(|| Error::extension("JS extension runtime not configured"))?;
         runtime
             .execute_shortcut(key_id.to_string(), ctx_payload, timeout_ms)
+            .await
+    }
+
+    /// Set a flag value in the JS runtime for a specific extension.
+    pub async fn set_flag_value(
+        &self,
+        extension_id: &str,
+        flag_name: &str,
+        value: Value,
+    ) -> Result<()> {
+        let runtime = self
+            .js_runtime()
+            .ok_or_else(|| Error::extension("JS extension runtime not configured"))?;
+        runtime
+            .set_flag_value(extension_id.to_string(), flag_name.to_string(), value)
             .await
     }
 
@@ -7151,6 +7709,7 @@ mod tests {
                         tools: Vec::new(),
                         slash_commands: Vec::new(),
                         shortcuts: Vec::new(),
+                        flags: Vec::new(),
                         event_hooks: Vec::new(),
                     }),
                 },
@@ -8505,8 +9064,12 @@ mod tests {
                 dispatch_hostcall_events("call-1", &manager, &tools, "getActiveTools", json!({}))
                     .await;
 
-            let HostcallOutcome::Success(value) = outcome else {
-                panic!("expected success");
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -8533,8 +9096,12 @@ mod tests {
                 dispatch_hostcall_events("call-1", &manager, &tools, "get_active_tools", json!({}))
                     .await;
 
-            let HostcallOutcome::Success(value) = outcome else {
-                panic!("expected success");
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -8552,15 +9119,18 @@ mod tests {
     fn events_get_all_tools_returns_builtin_tools() {
         asupersync::test_utils::run_test(|| async {
             let manager = ExtensionManager::new();
-            let tools =
-                crate::tools::ToolRegistry::new(&["read", "bash"], Path::new("."), None);
+            let tools = crate::tools::ToolRegistry::new(&["read", "bash"], Path::new("."), None);
 
             let outcome =
                 dispatch_hostcall_events("call-1", &manager, &tools, "getAllTools", json!({}))
                     .await;
 
-            let HostcallOutcome::Success(value) = outcome else {
-                panic!("expected success");
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
             assert_eq!(tool_list.len(), 2);
@@ -8600,6 +9170,7 @@ mod tests {
                 })],
                 slash_commands: Vec::new(),
                 shortcuts: Vec::new(),
+                flags: Vec::new(),
                 event_hooks: Vec::new(),
             });
 
@@ -8607,8 +9178,12 @@ mod tests {
                 dispatch_hostcall_events("call-1", &manager, &tools, "get_all_tools", json!({}))
                     .await;
 
-            let HostcallOutcome::Success(value) = outcome else {
-                panic!("expected success");
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
             assert_eq!(tool_list.len(), 2); // 1 built-in + 1 extension
@@ -8645,8 +9220,12 @@ mod tests {
                 dispatch_hostcall_events("call-2", &manager, &tools, "getActiveTools", json!({}))
                     .await;
 
-            let HostcallOutcome::Success(value) = outcome else {
-                panic!("expected success");
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -8658,5 +9237,2146 @@ mod tests {
                 .collect();
             assert_eq!(tool_names, vec!["edit"]);
         });
+    }
+
+    // ========================================================================
+    // Extension Registration API tests (bd-1yh7)
+    // ========================================================================
+
+    // --- registerCommand tests ---
+
+    #[test]
+    fn register_command_stores_metadata() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerCommand",
+                json!({ "name": "deploy", "description": "Deploy the app" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+            assert!(manager.has_command("deploy"));
+
+            let commands = manager.list_commands();
+            let cmd = commands
+                .iter()
+                .find(|c| c.get("name").and_then(Value::as_str) == Some("deploy"))
+                .expect("deploy command should exist");
+            assert_eq!(
+                cmd.get("description").and_then(Value::as_str),
+                Some("Deploy the app")
+            );
+        });
+    }
+
+    #[test]
+    fn register_command_empty_name_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerCommand",
+                json!({ "name": "" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+            if let HostcallOutcome::Error { code, message } = outcome {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("name is required"));
+            }
+        });
+    }
+
+    #[test]
+    fn register_command_missing_name_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "registerCommand", json!({}))
+                    .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+        });
+    }
+
+    #[test]
+    fn register_command_no_description_ok() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerCommand",
+                json!({ "name": "build" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+            assert!(manager.has_command("build"));
+        });
+    }
+
+    #[test]
+    fn register_command_multiple_commands() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            for name in &["deploy", "build", "test"] {
+                let outcome = dispatch_hostcall_events(
+                    "call-1",
+                    &manager,
+                    &tools,
+                    "registerCommand",
+                    json!({ "name": name }),
+                )
+                .await;
+                assert!(matches!(outcome, HostcallOutcome::Success(_)));
+            }
+
+            assert!(manager.has_command("deploy"));
+            assert!(manager.has_command("build"));
+            assert!(manager.has_command("test"));
+            assert_eq!(manager.list_commands().len(), 3);
+        });
+    }
+
+    #[test]
+    fn register_command_via_register_payload() {
+        let manager = ExtensionManager::new();
+        manager.register(RegisterPayload {
+            name: "test-ext".to_string(),
+            version: "1.0.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: vec![
+                json!({ "name": "deploy", "description": "Deploy" }),
+                json!({ "name": "rollback", "description": "Rollback" }),
+            ],
+            shortcuts: Vec::new(),
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+
+        assert!(manager.has_command("deploy"));
+        assert!(manager.has_command("rollback"));
+        assert!(!manager.has_command("nonexistent"));
+
+        let commands = manager.list_commands();
+        assert_eq!(commands.len(), 2);
+    }
+
+    // --- registerFlag tests ---
+
+    #[test]
+    fn register_flag_stores_spec() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "verbose", "type": "bool", "default": false, "description": "Enable verbose output" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let flags = manager.list_flags();
+            assert_eq!(flags.len(), 1);
+            let flag = &flags[0];
+            assert_eq!(flag.get("name").and_then(Value::as_str), Some("verbose"));
+            assert_eq!(flag.get("type").and_then(Value::as_str), Some("bool"));
+            assert_eq!(flag.get("default").and_then(Value::as_bool), Some(false));
+        });
+    }
+
+    #[test]
+    fn register_flag_empty_name_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "", "type": "string" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+            if let HostcallOutcome::Error { code, message } = outcome {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("name is required"));
+            }
+        });
+    }
+
+    #[test]
+    fn register_flag_hostcall_deduplicates_by_name() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "output", "type": "string", "default": "json" }),
+            )
+            .await;
+
+            dispatch_hostcall_events(
+                "call-2",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "output", "type": "string", "default": "yaml" }),
+            )
+            .await;
+
+            let flags = manager.list_flags();
+            assert_eq!(flags.len(), 1);
+            assert_eq!(
+                flags[0].get("default").and_then(Value::as_str),
+                Some("yaml")
+            );
+        });
+    }
+
+    #[test]
+    fn register_flag_multiple_types() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            for (name, ty, default) in [
+                ("verbose", "bool", json!(false)),
+                ("timeout", "number", json!(30)),
+                ("format", "string", json!("json")),
+            ] {
+                dispatch_hostcall_events(
+                    "call-1",
+                    &manager,
+                    &tools,
+                    "registerFlag",
+                    json!({ "name": name, "type": ty, "default": default }),
+                )
+                .await;
+            }
+
+            let flags = manager.list_flags();
+            assert_eq!(flags.len(), 3);
+        });
+    }
+
+    #[test]
+    fn register_flag_via_register_payload() {
+        let manager = ExtensionManager::new();
+        manager.register(RegisterPayload {
+            name: "test-ext".to_string(),
+            version: "1.0.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: Vec::new(),
+            flags: vec![
+                json!({ "name": "verbose", "type": "bool", "default": false }),
+                json!({ "name": "format", "type": "string", "default": "json" }),
+            ],
+            event_hooks: Vec::new(),
+        });
+
+        let flags = manager.list_flags();
+        assert_eq!(flags.len(), 2);
+    }
+
+    // --- registerProvider tests ---
+
+    #[test]
+    fn register_provider_stores_config() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "my-llm",
+                    "api": "openai-completions",
+                    "baseUrl": "https://api.example.com/v1",
+                    "apiKey": "MY_API_KEY",
+                    "models": [{ "id": "fast-1", "name": "Fast Model" }]
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let providers = manager.extension_providers();
+            assert_eq!(providers.len(), 1);
+            assert_eq!(
+                providers[0].get("id").and_then(Value::as_str),
+                Some("my-llm")
+            );
+        });
+    }
+
+    #[test]
+    fn register_provider_missing_id_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({ "api": "openai-completions" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+            if let HostcallOutcome::Error { code, message } = outcome {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("id is required"));
+            }
+        });
+    }
+
+    #[test]
+    fn register_provider_missing_api_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({ "id": "my-llm" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+            if let HostcallOutcome::Error { code, message } = outcome {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("api is required"));
+            }
+        });
+    }
+
+    #[test]
+    fn register_provider_unsupported_api_type_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({ "id": "my-llm", "api": "custom-nonsense" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+            if let HostcallOutcome::Error { code, message } = outcome {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("unsupported api type"));
+            }
+        });
+    }
+
+    #[test]
+    fn register_provider_all_valid_api_types() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            for api in [
+                "anthropic-messages",
+                "openai-completions",
+                "openai-responses",
+                "google-generative-ai",
+            ] {
+                let outcome = dispatch_hostcall_events(
+                    "call-1",
+                    &manager,
+                    &tools,
+                    "registerProvider",
+                    json!({ "id": format!("provider-{api}"), "api": api }),
+                )
+                .await;
+                assert!(
+                    matches!(outcome, HostcallOutcome::Success(_)),
+                    "api type {api} should be accepted"
+                );
+            }
+
+            assert_eq!(manager.extension_providers().len(), 4);
+        });
+    }
+
+    #[test]
+    fn register_provider_model_entries() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "my-llm",
+                    "api": "openai-completions",
+                    "baseUrl": "https://api.example.com/v1",
+                    "models": [
+                        { "id": "fast-1", "name": "Fast Model" },
+                        { "id": "slow-1", "name": "Slow Model", "reasoning": true }
+                    ]
+                }),
+            )
+            .await;
+
+            let entries = manager.extension_model_entries();
+            assert_eq!(entries.len(), 2);
+        });
+    }
+
+    // --- registerShortcut tests ---
+
+    #[test]
+    fn register_shortcut_via_payload() {
+        let manager = ExtensionManager::new();
+        manager.register(RegisterPayload {
+            name: "test-ext".to_string(),
+            version: "1.0.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: vec![json!({
+                "key": "Ctrl+Shift+D",
+                "key_id": "ctrl+shift+d",
+                "description": "Deploy shortcut"
+            })],
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+
+        assert!(manager.has_shortcut("ctrl+shift+d"));
+        assert!(!manager.has_shortcut("ctrl+x"));
+
+        let shortcuts = manager.list_shortcuts();
+        assert_eq!(shortcuts.len(), 1);
+        assert_eq!(
+            shortcuts[0].get("description").and_then(Value::as_str),
+            Some("Deploy shortcut")
+        );
+    }
+
+    #[test]
+    fn register_shortcut_case_insensitive_lookup() {
+        let manager = ExtensionManager::new();
+        manager.register(RegisterPayload {
+            name: "test-ext".to_string(),
+            version: "1.0.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: vec![json!({
+                "key": "Ctrl+K",
+                "key_id": "ctrl+k",
+                "description": "Quick action"
+            })],
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+
+        assert!(manager.has_shortcut("ctrl+k"));
+        assert!(manager.has_shortcut("Ctrl+K"));
+        assert!(manager.has_shortcut("CTRL+K"));
+    }
+
+    #[test]
+    fn register_shortcut_multiple() {
+        let manager = ExtensionManager::new();
+        manager.register(RegisterPayload {
+            name: "test-ext".to_string(),
+            version: "1.0.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: vec![
+                json!({ "key": "Ctrl+K", "key_id": "ctrl+k", "description": "Action 1" }),
+                json!({ "key": "Alt+D", "key_id": "alt+d", "description": "Action 2" }),
+                json!({ "key": "F5", "key_id": "f5", "description": "Action 3" }),
+            ],
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+
+        assert_eq!(manager.list_shortcuts().len(), 3);
+        assert!(manager.has_shortcut("ctrl+k"));
+        assert!(manager.has_shortcut("alt+d"));
+        assert!(manager.has_shortcut("f5"));
+    }
+
+    // --- Combined registration tests ---
+
+    #[test]
+    fn register_all_apis_on_single_extension() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            // Register extension with commands, shortcuts, flags, and a tool
+            manager.register(RegisterPayload {
+                name: "full-ext".to_string(),
+                version: "2.0.0".to_string(),
+                api_version: PROTOCOL_VERSION.to_string(),
+                capabilities: Vec::new(),
+                capability_manifest: None,
+                tools: vec![json!({
+                    "name": "ext_tool",
+                    "label": "Extension Tool",
+                    "description": "A tool",
+                    "parameters": { "type": "object" }
+                })],
+                slash_commands: vec![json!({ "name": "deploy", "description": "Deploy" })],
+                shortcuts: vec![json!({
+                    "key": "Ctrl+D",
+                    "key_id": "ctrl+d",
+                    "description": "Deploy shortcut"
+                })],
+                flags: vec![json!({ "name": "verbose", "type": "bool", "default": false })],
+                event_hooks: vec!["tool_call".to_string()],
+            });
+
+            // Also register a provider via hostcall
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerProvider",
+                json!({
+                    "id": "my-llm",
+                    "api": "anthropic-messages",
+                    "models": [{ "id": "model-1" }]
+                }),
+            )
+            .await;
+
+            // Verify everything is accessible
+            assert!(manager.has_command("deploy"));
+            assert!(manager.has_shortcut("ctrl+d"));
+            assert_eq!(manager.list_commands().len(), 1);
+            assert_eq!(manager.list_shortcuts().len(), 1);
+            assert_eq!(manager.list_flags().len(), 1);
+            assert_eq!(manager.extension_providers().len(), 1);
+            assert_eq!(manager.extension_model_entries().len(), 1);
+        });
+    }
+
+    // ========================================================================
+    // Model Control API tests (bd-1rqs / bd-vs72)
+    // ========================================================================
+
+    #[test]
+    fn events_get_model_returns_null_when_no_session() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "getModel", json!({})).await;
+
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            assert!(value.get("provider").unwrap().is_null());
+            assert!(value.get("modelId").unwrap().is_null());
+        });
+    }
+
+    #[test]
+    fn events_set_model_updates_in_memory_state() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            // Set model via hostcall.
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setModel",
+                json!({ "provider": "anthropic", "modelId": "claude-opus-4-5-20251101" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            // In-memory state should reflect the change.
+            let (provider, model_id) = manager.current_model();
+            assert_eq!(provider.as_deref(), Some("anthropic"));
+            assert_eq!(model_id.as_deref(), Some("claude-opus-4-5-20251101"));
+        });
+    }
+
+    #[test]
+    fn events_get_thinking_level_returns_null_when_not_set() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "getThinkingLevel", json!({}))
+                    .await;
+
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            assert!(value.get("thinkingLevel").unwrap().is_null());
+        });
+    }
+
+    #[test]
+    fn events_set_thinking_level_updates_and_reflects() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            // Set thinking level.
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setThinkingLevel",
+                json!({ "thinkingLevel": "high" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            // In-memory state should reflect the change.
+            assert_eq!(manager.current_thinking_level().as_deref(), Some("high"));
+
+            // Getting via hostcall should also reflect.
+            let outcome =
+                dispatch_hostcall_events("call-2", &manager, &tools, "getThinkingLevel", json!({}))
+                    .await;
+
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            assert_eq!(
+                value.get("thinkingLevel").and_then(Value::as_str),
+                Some("high")
+            );
+        });
+    }
+
+    #[test]
+    fn events_set_model_snake_case_variant() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "set_model",
+                json!({ "provider": "openai", "model_id": "gpt-5.2" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let (provider, model_id) = manager.current_model();
+            assert_eq!(provider.as_deref(), Some("openai"));
+            assert_eq!(model_id.as_deref(), Some("gpt-5.2"));
+        });
+    }
+
+    #[test]
+    fn events_set_thinking_level_empty_becomes_none() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            // Set a level first.
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setThinkingLevel",
+                json!({ "thinkingLevel": "medium" }),
+            )
+            .await;
+            assert_eq!(manager.current_thinking_level().as_deref(), Some("medium"));
+
+            // Set empty string should clear (filter removes empty).
+            dispatch_hostcall_events(
+                "call-2",
+                &manager,
+                &tools,
+                "setThinkingLevel",
+                json!({ "thinkingLevel": "" }),
+            )
+            .await;
+            assert!(manager.current_thinking_level().is_none());
+        });
+    }
+
+    // ========================================================================
+    // Session dispatch tests (bd-1rqs)
+    // ========================================================================
+
+    /// Minimal test session for session dispatch testing.
+    struct MockSession {
+        name: std::sync::Mutex<Option<String>>,
+        labels: std::sync::Mutex<Vec<(String, Option<String>)>>,
+        model: std::sync::Mutex<(Option<String>, Option<String>)>,
+        thinking_level: std::sync::Mutex<Option<String>>,
+    }
+
+    impl MockSession {
+        fn new() -> Self {
+            Self {
+                name: std::sync::Mutex::new(None),
+                labels: std::sync::Mutex::new(Vec::new()),
+                model: std::sync::Mutex::new((None, None)),
+                thinking_level: std::sync::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExtensionSession for MockSession {
+        async fn get_state(&self) -> Value {
+            let name = self.name.lock().unwrap().clone();
+            json!({ "sessionName": name })
+        }
+        async fn get_messages(&self) -> Vec<crate::session::SessionMessage> {
+            Vec::new()
+        }
+        async fn get_entries(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        async fn get_branch(&self) -> Vec<Value> {
+            Vec::new()
+        }
+        async fn set_name(&self, name: String) -> Result<()> {
+            *self.name.lock().unwrap() = Some(name);
+            Ok(())
+        }
+        async fn append_message(&self, _message: crate::session::SessionMessage) -> Result<()> {
+            Ok(())
+        }
+        async fn append_custom_entry(
+            &self,
+            _custom_type: String,
+            _data: Option<Value>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
+            *self.model.lock().unwrap() = (Some(provider), Some(model_id));
+            Ok(())
+        }
+        async fn get_model(&self) -> (Option<String>, Option<String>) {
+            self.model.lock().unwrap().clone()
+        }
+        async fn set_thinking_level(&self, level: String) -> Result<()> {
+            *self.thinking_level.lock().unwrap() = Some(level);
+            Ok(())
+        }
+        async fn get_thinking_level(&self) -> Option<String> {
+            self.thinking_level.lock().unwrap().clone()
+        }
+        async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
+            self.labels.lock().unwrap().push((target_id, label));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn session_set_name_and_get_name() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            // Set name via session dispatch.
+            let outcome = dispatch_hostcall_session(
+                "call-1",
+                &manager,
+                "set_name",
+                json!({ "name": "My Feature Work" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            // Get name via session dispatch.
+            let outcome =
+                dispatch_hostcall_session("call-2", &manager, "get_name", json!({})).await;
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            assert_eq!(value.as_str(), Some("My Feature Work"));
+        });
+    }
+
+    #[test]
+    fn session_set_label_dispatches_to_session() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let outcome = dispatch_hostcall_session(
+                "call-1",
+                &manager,
+                "set_label",
+                json!({ "targetId": "entry-42", "label": "important" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            {
+                let labels = session.labels.lock().unwrap();
+                assert_eq!(labels.len(), 1);
+                assert_eq!(labels[0].0, "entry-42");
+                assert_eq!(labels[0].1.as_deref(), Some("important"));
+                drop(labels);
+            }
+        });
+    }
+
+    #[test]
+    fn session_set_label_requires_target_id() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let outcome = dispatch_hostcall_session(
+                "call-1",
+                &manager,
+                "set_label",
+                json!({ "label": "important" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+        });
+    }
+
+    #[test]
+    fn session_set_label_null_label_clears() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let outcome = dispatch_hostcall_session(
+                "call-1",
+                &manager,
+                "set_label",
+                json!({ "targetId": "entry-99" }),
+            )
+            .await;
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            {
+                let labels = session.labels.lock().unwrap();
+                assert_eq!(labels.len(), 1);
+                assert_eq!(labels[0].0, "entry-99");
+                assert!(labels[0].1.is_none());
+                drop(labels);
+            }
+        });
+    }
+
+    #[test]
+    fn session_dispatch_fails_without_session() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+
+            let outcome =
+                dispatch_hostcall_session("call-1", &manager, "get_name", json!({})).await;
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+        });
+    }
+
+    #[test]
+    fn session_model_control_via_session_dispatch() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            // setModel via events should persist to session.
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setModel",
+                json!({ "provider": "anthropic", "modelId": "claude-opus-4-5-20251101" }),
+            )
+            .await;
+
+            // Verify session was updated.
+            let (provider, model_id) = session.model.lock().unwrap().clone();
+            assert_eq!(provider.as_deref(), Some("anthropic"));
+            assert_eq!(model_id.as_deref(), Some("claude-opus-4-5-20251101"));
+
+            // getModel via events should read from session.
+            let outcome =
+                dispatch_hostcall_events("call-2", &manager, &tools, "getModel", json!({})).await;
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            assert_eq!(
+                value.get("provider").and_then(Value::as_str),
+                Some("anthropic")
+            );
+            assert_eq!(
+                value.get("modelId").and_then(Value::as_str),
+                Some("claude-opus-4-5-20251101")
+            );
+        });
+    }
+
+    #[test]
+    fn session_thinking_level_via_session_dispatch() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            // setThinkingLevel via events should persist to session.
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "setThinkingLevel",
+                json!({ "thinkingLevel": "low" }),
+            )
+            .await;
+
+            // Verify session was updated.
+            let level = session.thinking_level.lock().unwrap().clone();
+            assert_eq!(level.as_deref(), Some("low"));
+
+            // getThinkingLevel via events should read from session.
+            let outcome =
+                dispatch_hostcall_events("call-2", &manager, &tools, "getThinkingLevel", json!({}))
+                    .await;
+            let value = match outcome {
+                HostcallOutcome::Success(value) => value,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            assert_eq!(
+                value.get("thinkingLevel").and_then(Value::as_str),
+                Some("low")
+            );
+        });
+    }
+
+    // ========================================================================
+    // MockHostActions for sendMessage / sendUserMessage tests
+    // ========================================================================
+
+    struct MockHostActions {
+        messages: std::sync::Mutex<Vec<ExtensionSendMessage>>,
+        user_messages: std::sync::Mutex<Vec<ExtensionSendUserMessage>>,
+    }
+
+    impl MockHostActions {
+        fn new() -> Self {
+            Self {
+                messages: std::sync::Mutex::new(Vec::new()),
+                user_messages: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExtensionHostActions for MockHostActions {
+        async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
+            self.messages.lock().unwrap().push(message);
+            Ok(())
+        }
+        async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
+            self.user_messages.lock().unwrap().push(message);
+            Ok(())
+        }
+    }
+
+    // ========================================================================
+    // sendMessage tests (bd-1rqs)
+    // ========================================================================
+
+    #[test]
+    fn events_send_message_dispatches_to_host_actions() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let actions = Arc::new(MockHostActions::new());
+            manager.set_host_actions(actions.clone());
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "sendMessage",
+                json!({
+                    "message": {
+                        "customType": "status-update",
+                        "content": "Deployment succeeded",
+                        "display": true,
+                        "details": { "version": "1.2.3" }
+                    },
+                    "options": {
+                        "deliverAs": "followUp",
+                        "triggerTurn": true
+                    }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+            {
+                let msgs = actions.messages.lock().unwrap();
+                assert_eq!(msgs.len(), 1);
+                assert_eq!(msgs[0].custom_type, "status-update");
+                assert_eq!(msgs[0].content, "Deployment succeeded");
+                assert!(msgs[0].display);
+                assert!(msgs[0].trigger_turn);
+                assert!(msgs[0].details.is_some());
+                drop(msgs);
+            }
+        });
+    }
+
+    #[test]
+    fn events_send_message_requires_custom_type() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let actions = Arc::new(MockHostActions::new());
+            manager.set_host_actions(actions.clone());
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "sendMessage",
+                json!({
+                    "message": {
+                        "content": "No type here"
+                    }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+            // No message should have been dispatched.
+            assert!(actions.messages.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn events_send_message_without_host_actions_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "sendMessage",
+                json!({
+                    "message": {
+                        "customType": "test",
+                        "content": "hello"
+                    }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+        });
+    }
+
+    // ========================================================================
+    // sendUserMessage tests (bd-1rqs)
+    // ========================================================================
+
+    #[test]
+    fn events_send_user_message_dispatches_to_host_actions() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let actions = Arc::new(MockHostActions::new());
+            manager.set_host_actions(actions.clone());
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "sendUserMessage",
+                json!({
+                    "text": "Please review the PR",
+                    "options": {
+                        "deliverAs": "steer"
+                    }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+            {
+                let msgs = actions.user_messages.lock().unwrap();
+                assert_eq!(msgs.len(), 1);
+                assert_eq!(msgs[0].text, "Please review the PR");
+                drop(msgs);
+            }
+        });
+    }
+
+    #[test]
+    fn events_send_user_message_empty_text_succeeds_noop() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let actions = Arc::new(MockHostActions::new());
+            manager.set_host_actions(actions.clone());
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "sendUserMessage",
+                json!({ "text": "  " }),
+            )
+            .await;
+
+            // Empty text returns Success(null) without dispatching.
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+            assert!(actions.user_messages.lock().unwrap().is_empty());
+        });
+    }
+
+    // ========================================================================
+    // appendEntry tests (bd-1rqs)
+    // ========================================================================
+
+    #[test]
+    fn session_append_entry_dispatches_to_session() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let outcome = dispatch_hostcall_session(
+                "call-1",
+                &manager,
+                "append_entry",
+                json!({
+                    "customType": "bookmark",
+                    "data": { "line": 42, "file": "main.rs" }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        });
+    }
+
+    #[test]
+    fn events_append_entry_dispatches_to_session() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "appendEntry",
+                json!({
+                    "customType": "annotation",
+                    "data": { "note": "refactor candidate" }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+        });
+    }
+
+    #[test]
+    fn events_append_entry_without_session_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "appendEntry",
+                json!({
+                    "customType": "annotation",
+                    "data": { "note": "test" }
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+        });
+    }
+
+    #[test]
+    fn session_unknown_op_returns_error() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let session = Arc::new(MockSession::new());
+            manager.set_session(session.clone());
+
+            let outcome =
+                dispatch_hostcall_session("call-1", &manager, "nonexistent_op", json!({})).await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+        });
+    }
+
+    // --- registerFlag hostcall tests ---
+
+    #[test]
+    fn register_flag_via_hostcall() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({
+                    "name": "verbose",
+                    "description": "Enable verbose output",
+                    "type": "boolean",
+                    "default": false
+                }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Success(_)));
+
+            let flags = manager.list_flags();
+            assert_eq!(flags.len(), 1);
+            assert_eq!(
+                flags[0].get("name").and_then(Value::as_str),
+                Some("verbose")
+            );
+            assert_eq!(
+                flags[0].get("type").and_then(Value::as_str),
+                Some("boolean")
+            );
+        });
+    }
+
+    #[test]
+    fn register_flag_missing_name_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "description": "No name" }),
+            )
+            .await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+            if let HostcallOutcome::Error { code, message } = outcome {
+                assert_eq!(code, "invalid_request");
+                assert!(message.contains("name is required"));
+            }
+        });
+    }
+
+    #[test]
+    fn register_flag_dedup_last_write_wins() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "flag-a", "type": "string", "default": "v1" }),
+            )
+            .await;
+
+            dispatch_hostcall_events(
+                "call-2",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "flag-a", "type": "string", "default": "v2" }),
+            )
+            .await;
+
+            let flags = manager.list_flags();
+            assert_eq!(flags.len(), 1);
+            assert_eq!(flags[0].get("default").and_then(Value::as_str), Some("v2"));
+        });
+    }
+
+    #[test]
+    fn get_flag_returns_registered_flag() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "registerFlag",
+                json!({ "name": "output-dir", "type": "string", "default": "/tmp" }),
+            )
+            .await;
+
+            let outcome = dispatch_hostcall_events(
+                "call-2",
+                &manager,
+                &tools,
+                "getFlag",
+                json!({ "name": "output-dir" }),
+            )
+            .await;
+
+            let val = match outcome {
+                HostcallOutcome::Success(val) => val,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            assert_eq!(val.get("name").and_then(Value::as_str), Some("output-dir"));
+            assert_eq!(val.get("type").and_then(Value::as_str), Some("string"));
+        });
+    }
+
+    #[test]
+    fn get_flag_missing_name_fails() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome =
+                dispatch_hostcall_events("call-1", &manager, &tools, "getFlag", json!({})).await;
+
+            assert!(matches!(outcome, HostcallOutcome::Error { .. }));
+        });
+    }
+
+    #[test]
+    fn get_flag_unknown_returns_null() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            let outcome = dispatch_hostcall_events(
+                "call-1",
+                &manager,
+                &tools,
+                "getFlag",
+                json!({ "name": "nonexistent" }),
+            )
+            .await;
+
+            let val = match outcome {
+                HostcallOutcome::Success(val) => val,
+                other => {
+                    assert!(false, "expected success with null, got {other:?}");
+                    return;
+                }
+            };
+            assert!(val.is_null());
+        });
+    }
+
+    #[test]
+    fn list_flags_hostcall_returns_all() {
+        asupersync::test_utils::run_test(|| async {
+            let manager = ExtensionManager::new();
+            let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+
+            for flag_name in ["alpha", "beta", "gamma"] {
+                dispatch_hostcall_events(
+                    "call-1",
+                    &manager,
+                    &tools,
+                    "registerFlag",
+                    json!({ "name": flag_name, "type": "string" }),
+                )
+                .await;
+            }
+
+            let outcome =
+                dispatch_hostcall_events("call-2", &manager, &tools, "listFlags", json!({})).await;
+
+            let val = match outcome {
+                HostcallOutcome::Success(val) => val,
+                other => {
+                    assert!(false, "expected success, got {other:?}");
+                    return;
+                }
+            };
+            let arr = val.as_array().expect("expected array");
+            assert_eq!(arr.len(), 3);
+        });
+    }
+
+    // --- provider_has_stream_simple tests ---
+
+    #[test]
+    fn provider_has_stream_simple_detects_flag() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(json!({
+            "id": "custom-provider",
+            "api": "openai-completions",
+            "hasStreamSimple": true,
+        }));
+
+        assert!(manager.provider_has_stream_simple("custom-provider"));
+        assert!(!manager.provider_has_stream_simple("nonexistent"));
+    }
+
+    #[test]
+    fn provider_has_stream_simple_false_when_not_set() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(json!({
+            "id": "standard-provider",
+            "api": "openai-completions",
+        }));
+
+        assert!(!manager.provider_has_stream_simple("standard-provider"));
+    }
+
+    #[test]
+    fn provider_has_stream_simple_empty_id_returns_false() {
+        let manager = ExtensionManager::new();
+        manager.register_provider(json!({
+            "id": "custom-provider",
+            "api": "openai-completions",
+            "hasStreamSimple": true,
+        }));
+
+        assert!(!manager.provider_has_stream_simple(""));
+        assert!(!manager.provider_has_stream_simple("  "));
+    }
+
+    // --- streamSimple JS runtime integration tests ---
+
+    #[test]
+    fn stream_simple_yields_chunks_in_order() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let entry_path = dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                    pi.registerProvider("stream-test", {
+                        api: "openai-completions",
+                        baseUrl: "https://not-used.example.com",
+                        models: [{ id: "test-model", name: "Test Model" }],
+                        streamSimple: async function*(model, context, options) {
+                            yield "Hello";
+                            yield " ";
+                            yield "World";
+                        }
+                    });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let tools = Arc::new(crate::tools::ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+
+            assert!(manager.provider_has_stream_simple("stream-test"));
+
+            let stream_id = js_runtime
+                .provider_stream_simple_start(
+                    "stream-test".to_string(),
+                    json!({"id": "test-model"}),
+                    json!({"messages": []}),
+                    json!({}),
+                    30_000,
+                )
+                .await
+                .expect("start stream");
+
+            let mut chunks = Vec::new();
+            while let Some(val) = js_runtime
+                .provider_stream_simple_next(stream_id.clone(), 30_000)
+                .await
+                .expect("next")
+            {
+                chunks.push(val.as_str().unwrap_or_default().to_string());
+            }
+
+            assert_eq!(chunks, vec!["Hello", " ", "World"]);
+        });
+    }
+
+    #[test]
+    fn stream_simple_error_in_js_propagates() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let entry_path = dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                    pi.registerProvider("error-provider", {
+                        api: "openai-completions",
+                        baseUrl: "https://not-used.example.com",
+                        models: [{ id: "err-model", name: "Error Model" }],
+                        streamSimple: async function*(model, context, options) {
+                            yield "partial";
+                            throw new Error("stream explosion");
+                        }
+                    });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let tools = Arc::new(crate::tools::ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+
+            let stream_id = js_runtime
+                .provider_stream_simple_start(
+                    "error-provider".to_string(),
+                    json!({"id": "err-model"}),
+                    json!({"messages": []}),
+                    json!({}),
+                    30_000,
+                )
+                .await
+                .expect("start stream");
+
+            // First chunk should succeed.
+            let first = js_runtime
+                .provider_stream_simple_next(stream_id.clone(), 30_000)
+                .await
+                .expect("first next");
+            assert!(first.is_some());
+            assert_eq!(first.unwrap().as_str().unwrap_or_default(), "partial");
+
+            // Second call should fail with the JS error.
+            let result = js_runtime
+                .provider_stream_simple_next(stream_id.clone(), 30_000)
+                .await;
+            assert!(result.is_err(), "expected error from JS throw");
+        });
+    }
+
+    #[test]
+    fn stream_simple_cancel_stops_iteration() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let entry_path = dir.path().join("ext.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                    pi.registerProvider("cancel-provider", {
+                        api: "openai-completions",
+                        baseUrl: "https://not-used.example.com",
+                        models: [{ id: "cancel-model", name: "Cancel Model" }],
+                        streamSimple: async function*(model, context, options) {
+                            yield "chunk-1";
+                            yield "chunk-2";
+                            yield "chunk-3";
+                            yield "chunk-4";
+                        }
+                    });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let tools = Arc::new(crate::tools::ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load extension");
+
+            let stream_id = js_runtime
+                .provider_stream_simple_start(
+                    "cancel-provider".to_string(),
+                    json!({"id": "cancel-model"}),
+                    json!({"messages": []}),
+                    json!({}),
+                    30_000,
+                )
+                .await
+                .expect("start stream");
+
+            // Read first chunk.
+            let first = js_runtime
+                .provider_stream_simple_next(stream_id.clone(), 30_000)
+                .await
+                .expect("first next");
+            assert!(first.is_some());
+
+            // Cancel the stream.
+            js_runtime
+                .provider_stream_simple_cancel(stream_id.clone(), 30_000)
+                .await
+                .expect("cancel");
+
+            // After cancel, next should return done.
+            let after_cancel = js_runtime
+                .provider_stream_simple_next(stream_id, 30_000)
+                .await
+                .expect("next after cancel");
+            assert!(after_cancel.is_none(), "expected None after cancellation");
+        });
+    }
+
+    // ========================================================================
+    // Property-based tests for hostcall dispatch (bd-3pcw)
+    // ========================================================================
+
+    mod proptest_dispatch {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn op_strategy() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just("getActiveTools".to_string()),
+                Just("getAllTools".to_string()),
+                Just("setActiveTools".to_string()),
+                Just("appendEntry".to_string()),
+                Just("sendMessage".to_string()),
+                Just("sendUserMessage".to_string()),
+                Just("registerCommand".to_string()),
+                Just("registerProvider".to_string()),
+                Just("registerFlag".to_string()),
+                Just("getModel".to_string()),
+                Just("setModel".to_string()),
+                Just("getThinkingLevel".to_string()),
+                Just("setThinkingLevel".to_string()),
+                Just("getFlag".to_string()),
+                Just("listFlags".to_string()),
+                Just("get_state".to_string()),
+                Just("get_name".to_string()),
+                Just("set_name".to_string()),
+                Just("set_label".to_string()),
+                Just("append_entry".to_string()),
+                Just("get_messages".to_string()),
+                "[a-zA-Z_]{0,30}".prop_map(|s| s),
+            ]
+        }
+
+        fn json_leaf() -> impl Strategy<Value = Value> {
+            prop_oneof![
+                Just(Value::Null),
+                any::<bool>().prop_map(Value::Bool),
+                any::<i64>().prop_map(|n| json!(n)),
+                ".{0,64}".prop_map(|s| json!(s)),
+            ]
+        }
+
+        fn json_value() -> impl Strategy<Value = Value> {
+            json_leaf().prop_recursive(3, 64, 8, |inner| {
+                prop_oneof![
+                    prop::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                    prop::collection::btree_map("[a-zA-Z0-9_]{1,10}", inner, 0..4).prop_map(
+                        |map| {
+                            let mut out = serde_json::Map::new();
+                            for (key, value) in map {
+                                out.insert(key, value);
+                            }
+                            Value::Object(out)
+                        }
+                    ),
+                ]
+            })
+        }
+
+        fn unicode_string() -> impl Strategy<Value = String> {
+            prop_oneof![
+                Just(String::new()),
+                Just("\u{0}".to_string()),
+                Just("\u{FEFF}BOM-prefixed".to_string()),
+                Just("café résumé naïve".to_string()),
+                Just("\u{200B}zero-width\u{200B}".to_string()),
+                Just("\u{1F600}\u{1F4A9}\u{1F680}".to_string()),
+                Just("日本語テスト".to_string()),
+                Just("مرحبا".to_string()),
+                "\\PC{1,100}".prop_map(|s| s),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 512,
+                max_shrink_iters: 0,
+                .. ProptestConfig::default()
+            })]
+
+            #[test]
+            fn events_dispatch_never_panics(op in op_strategy(), payload in json_value()) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    let _outcome = dispatch_hostcall_events(
+                        "prop-call", &manager, &tools, &op, payload,
+                    ).await;
+                });
+            }
+
+            #[test]
+            fn session_dispatch_never_panics(op in op_strategy(), payload in json_value()) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let session = Arc::new(MockSession::new());
+                    manager.set_session(session);
+                    let _outcome = dispatch_hostcall_session(
+                        "prop-call", &manager, &op, payload,
+                    ).await;
+                });
+            }
+
+            #[test]
+            fn events_unknown_op_returns_error(
+                op in "[a-z]{1,20}".prop_filter("not a known op", |s| {
+                    let norm = s.trim().to_ascii_lowercase();
+                    !matches!(
+                        norm.as_str(),
+                        "getactivetools" | "get_active_tools"
+                            | "getalltools" | "get_all_tools"
+                            | "setactivetools" | "set_active_tools"
+                            | "appendentry" | "append_entry"
+                            | "sendmessage" | "send_message"
+                            | "sendusermessage" | "send_user_message"
+                            | "registercommand" | "register_command"
+                            | "registershortcut" | "register_shortcut"
+                            | "registerprovider" | "register_provider"
+                            | "registerflag" | "register_flag"
+                            | "getmodel" | "get_model"
+                            | "setmodel" | "set_model"
+                            | "getthinkinglevel" | "get_thinking_level"
+                            | "setthinkinglevel" | "set_thinking_level"
+                            | "getflag" | "get_flag"
+                            | "listflags" | "list_flags"
+                            | "emit"
+                    )
+                }),
+                payload in json_value(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    let outcome = dispatch_hostcall_events(
+                        "prop-call", &manager, &tools, &op, payload,
+                    ).await;
+                    assert!(
+                        matches!(outcome, HostcallOutcome::Error { .. }),
+                        "unknown op '{op}' should produce error, got: {outcome:?}"
+                    );
+                });
+            }
+
+            #[test]
+            fn session_unknown_op_returns_error(
+                op in "[a-z]{1,20}".prop_filter("not a known session op", |s| {
+                    let norm = s.trim().to_ascii_lowercase();
+                    !matches!(
+                        norm.as_str(),
+                        "get_state" | "getstate"
+                            | "get_messages" | "getmessages"
+                            | "get_entries" | "getentries"
+                            | "get_branch" | "getbranch"
+                            | "get_file" | "getfile"
+                            | "get_name" | "getname"
+                            | "set_name" | "setname"
+                            | "append_message" | "appendmessage"
+                            | "append_entry" | "appendentry"
+                            | "set_label" | "setlabel"
+                    )
+                }),
+                payload in json_value(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let session = Arc::new(MockSession::new());
+                    manager.set_session(session);
+                    let outcome = dispatch_hostcall_session(
+                        "prop-call", &manager, &op, payload,
+                    ).await;
+                    assert!(
+                        matches!(outcome, HostcallOutcome::Error { .. }),
+                        "unknown session op '{op}' should produce error, got: {outcome:?}"
+                    );
+                });
+            }
+
+            #[test]
+            fn events_unicode_payloads_safe(
+                op in op_strategy(),
+                key in unicode_string(),
+                value in unicode_string(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&["read"], Path::new("."), None);
+                    let actions = Arc::new(MockHostActions::new());
+                    manager.set_host_actions(actions);
+                    let session = Arc::new(MockSession::new());
+                    manager.set_session(session);
+                    let payload = json!({ key: value });
+                    let _outcome = dispatch_hostcall_events(
+                        "prop-call", &manager, &tools, &op, payload,
+                    ).await;
+                });
+            }
+
+            #[test]
+            fn session_unicode_payloads_safe(
+                op in op_strategy(),
+                key in unicode_string(),
+                value in unicode_string(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let session = Arc::new(MockSession::new());
+                    manager.set_session(session);
+                    let payload = json!({ key: value });
+                    let _outcome = dispatch_hostcall_session(
+                        "prop-call", &manager, &op, payload,
+                    ).await;
+                });
+            }
+
+            #[test]
+            fn events_send_message_requires_custom_type(payload in json_value()) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    let actions = Arc::new(MockHostActions::new());
+                    manager.set_host_actions(actions.clone());
+                    let message = match payload {
+                        Value::Object(map) => {
+                            let mut filtered = map;
+                            filtered.remove("customType");
+                            filtered.remove("custom_type");
+                            Value::Object(filtered)
+                        }
+                        other => other,
+                    };
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("message".to_string(), message);
+                    let outcome = dispatch_hostcall_events(
+                        "prop-call", &manager, &tools, "sendMessage",
+                        Value::Object(obj),
+                    ).await;
+                    assert!(
+                        matches!(outcome, HostcallOutcome::Error { .. }),
+                        "sendMessage without customType should error, got: {outcome:?}"
+                    );
+                    assert_eq!(actions.messages.lock().unwrap().len(), 0);
+                });
+            }
+
+            #[test]
+            fn session_dispatch_without_session_returns_error(
+                op in op_strategy(),
+                payload in json_value(),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let outcome = dispatch_hostcall_session(
+                        "prop-call", &manager, &op, payload,
+                    ).await;
+                    assert!(
+                        matches!(outcome, HostcallOutcome::Error { .. }),
+                        "session dispatch without session should error, got: {outcome:?}"
+                    );
+                });
+            }
+
+            #[test]
+            fn events_model_state_consistent(
+                providers in prop::collection::vec("[a-z]{1,10}", 1..8),
+                models in prop::collection::vec("[a-z]{1,10}", 1..8),
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    let count = providers.len().min(models.len());
+                    for i in 0..count {
+                        let _ = dispatch_hostcall_events(
+                            "prop-call", &manager, &tools, "setModel",
+                            json!({ "provider": providers[i], "modelId": models[i] }),
+                        ).await;
+                    }
+                    let outcome = dispatch_hostcall_events(
+                        "prop-call", &manager, &tools, "getModel", json!({}),
+                    ).await;
+                    if let HostcallOutcome::Success(value) = outcome {
+                        let last = count - 1;
+                        assert_eq!(
+                            value.get("provider").and_then(Value::as_str),
+                            Some(providers[last].as_str())
+                        );
+                        assert_eq!(
+                            value.get("modelId").and_then(Value::as_str),
+                            Some(models[last].as_str())
+                        );
+                    }
+                });
+            }
+
+            #[test]
+            fn events_thinking_level_state_consistent(
+                levels in prop::collection::vec(
+                    prop_oneof![
+                        Just("low".to_string()),
+                        Just("medium".to_string()),
+                        Just("high".to_string()),
+                        Just("xhigh".to_string()),
+                        "[a-z]{1,10}".prop_map(|s| s),
+                    ],
+                    1..10,
+                )
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    for level in &levels {
+                        let _ = dispatch_hostcall_events(
+                            "prop-call", &manager, &tools, "setThinkingLevel",
+                            json!({ "thinkingLevel": level }),
+                        ).await;
+                    }
+                    let outcome = dispatch_hostcall_events(
+                        "prop-call", &manager, &tools, "getThinkingLevel", json!({}),
+                    ).await;
+                    if let HostcallOutcome::Success(value) = outcome {
+                        assert_eq!(
+                            value.get("thinkingLevel").and_then(Value::as_str),
+                            Some(levels.last().unwrap().as_str())
+                        );
+                    }
+                });
+            }
+
+            #[test]
+            fn events_active_tools_roundtrip(
+                tools_list in prop::collection::vec("[a-z]{1,10}", 0..8)
+            ) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let tools = crate::tools::ToolRegistry::new(&[], Path::new("."), None);
+                    let _ = dispatch_hostcall_events(
+                        "prop-call", &manager, &tools, "setActiveTools",
+                        json!({ "tools": tools_list }),
+                    ).await;
+                    let expected = manager.active_tools();
+                    assert_eq!(expected, Some(tools_list));
+                });
+            }
+
+            #[test]
+            fn session_set_label_requires_target_id(label in ".*") {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let session = Arc::new(MockSession::new());
+                    manager.set_session(session);
+                    let outcome = dispatch_hostcall_session(
+                        "prop-call", &manager, "set_label",
+                        json!({ "targetId": "", "label": label }),
+                    ).await;
+                    assert!(
+                        matches!(outcome, HostcallOutcome::Error { .. }),
+                        "set_label with empty targetId should error"
+                    );
+                    let outcome2 = dispatch_hostcall_session(
+                        "prop-call", &manager, "set_label",
+                        json!({ "label": label }),
+                    ).await;
+                    assert!(
+                        matches!(outcome2, HostcallOutcome::Error { .. }),
+                        "set_label without targetId should error"
+                    );
+                });
+            }
+
+            #[test]
+            fn session_name_roundtrip(name in unicode_string()) {
+                asupersync::test_utils::run_test(|| async move {
+                    let manager = ExtensionManager::new();
+                    let session = Arc::new(MockSession::new());
+                    manager.set_session(session);
+                    let _ = dispatch_hostcall_session(
+                        "prop-call", &manager, "set_name",
+                        json!({ "name": name }),
+                    ).await;
+                    let outcome = dispatch_hostcall_session(
+                        "prop-call", &manager, "get_name", json!({}),
+                    ).await;
+                    if let HostcallOutcome::Success(value) = outcome {
+                        let got = value.as_str().unwrap_or_default();
+                        assert_eq!(got, &name);
+                    }
+                });
+            }
+        }
     }
 }

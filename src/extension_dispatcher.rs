@@ -838,6 +838,10 @@ mod tests {
         async fn get_thinking_level(&self) -> Option<String> {
             None
         }
+
+        async fn set_label(&self, _target_id: String, _label: Option<String>) -> Result<()> {
+            Ok(())
+        }
     }
 
     struct NullUiHandler;
@@ -973,6 +977,10 @@ mod tests {
                 .map(String::from);
             drop(state);
             level
+        }
+
+        async fn set_label(&self, _target_id: String, _label: Option<String>) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -2017,6 +2025,877 @@ mod tests {
                 )
                 .await
                 .expect("verify list");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_model_resolves_and_persists() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.setResult = null;
+                    pi.session("set_model", { provider: "anthropic", modelId: "claude-sonnet-4-20250514" })
+                        .then((r) => { globalThis.setResult = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({})));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.setResult !== true) {
+                        throw new Error("set_model should resolve to true, got: " + JSON.stringify(globalThis.setResult));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify set_model result");
+
+            let final_state = state.lock().unwrap().clone();
+            assert_eq!(
+                final_state.get("provider").and_then(Value::as_str),
+                Some("anthropic")
+            );
+            assert_eq!(
+                final_state.get("modelId").and_then(Value::as_str),
+                Some("claude-sonnet-4-20250514")
+            );
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_get_model_resolves_provider_and_model_id() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.model = null;
+                    pi.session("get_model", {}).then((r) => { globalThis.model = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({
+                "provider": "openai",
+                "modelId": "gpt-4o",
+            })));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.model) throw new Error("get_model not resolved");
+                    if (globalThis.model.provider !== "openai") {
+                        throw new Error("Wrong provider: " + globalThis.model.provider);
+                    }
+                    if (globalThis.model.modelId !== "gpt-4o") {
+                        throw new Error("Wrong modelId: " + globalThis.model.modelId);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify get_model result");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_model_missing_fields_rejects() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.errNoProvider = null;
+                    globalThis.errNoModelId = null;
+                    globalThis.errEmpty = null;
+                    pi.session("set_model", { modelId: "claude-sonnet-4-20250514" })
+                        .catch((e) => { globalThis.errNoProvider = e.code; });
+                    pi.session("set_model", { provider: "anthropic" })
+                        .catch((e) => { globalThis.errNoModelId = e.code; });
+                    pi.session("set_model", {})
+                        .catch((e) => { globalThis.errEmpty = e.code; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 3);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.errNoProvider !== "invalid_request") {
+                        throw new Error("Missing provider should reject: " + globalThis.errNoProvider);
+                    }
+                    if (globalThis.errNoModelId !== "invalid_request") {
+                        throw new Error("Missing modelId should reject: " + globalThis.errNoModelId);
+                    }
+                    if (globalThis.errEmpty !== "invalid_request") {
+                        throw new Error("Empty payload should reject: " + globalThis.errEmpty);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify validation errors");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_then_get_model_round_trip() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Phase 1: set_model
+            runtime
+                .eval(
+                    r#"
+                    globalThis.setDone = false;
+                    pi.session("set_model", { provider: "gemini", modelId: "gemini-2.0-flash" })
+                        .then(() => { globalThis.setDone = true; });
+                "#,
+                )
+                .await
+                .expect("eval set");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({})));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session as Arc<dyn ExtensionSession + Send + Sync>,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            // Phase 2: get_model
+            runtime
+                .eval(
+                    r#"
+                    globalThis.model = null;
+                    pi.session("get_model", {}).then((r) => { globalThis.model = r; });
+                "#,
+                )
+                .await
+                .expect("eval get");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.model) throw new Error("get_model not resolved");
+                    if (globalThis.model.provider !== "gemini") {
+                        throw new Error("Wrong provider: " + globalThis.model.provider);
+                    }
+                    if (globalThis.model.modelId !== "gemini-2.0-flash") {
+                        throw new Error("Wrong modelId: " + globalThis.model.modelId);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify round trip");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_thinking_level_resolves() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.setDone = false;
+                    pi.session("set_thinking_level", { level: "high" })
+                        .then(() => { globalThis.setDone = true; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({})));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            // set_thinking_level resolves to null (not true like set_model)
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.setDone !== true) {
+                        throw new Error("set_thinking_level not resolved");
+                    }
+                "#,
+                )
+                .await
+                .expect("verify set_thinking_level");
+
+            let final_state = state.lock().unwrap().clone();
+            assert_eq!(
+                final_state.get("thinkingLevel").and_then(Value::as_str),
+                Some("high")
+            );
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_get_thinking_level_resolves() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.level = "__unset__";
+                    pi.session("get_thinking_level", {}).then((r) => { globalThis.level = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({
+                "thinkingLevel": "medium",
+            })));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.level !== "medium") {
+                        throw new Error("Wrong thinking level: " + JSON.stringify(globalThis.level));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify get_thinking_level");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_get_thinking_level_null_when_unset() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.level = "__unset__";
+                    pi.session("get_thinking_level", {}).then((r) => { globalThis.level = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.level !== null) {
+                        throw new Error("Unset thinking level should be null, got: " + JSON.stringify(globalThis.level));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify null thinking level");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_thinking_level_missing_level_rejects() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.session("set_thinking_level", {})
+                        .catch((e) => { globalThis.err = e.code; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err !== "invalid_request") {
+                        throw new Error("Missing level should reject: " + globalThis.err);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify validation error");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_then_get_thinking_level_round_trip() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Phase 1: set
+            runtime
+                .eval(
+                    r#"
+                    globalThis.setDone = false;
+                    pi.session("set_thinking_level", { level: "low" })
+                        .then(() => { globalThis.setDone = true; });
+                "#,
+                )
+                .await
+                .expect("eval set");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({})));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session as Arc<dyn ExtensionSession + Send + Sync>,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            // Phase 2: get
+            runtime
+                .eval(
+                    r#"
+                    globalThis.level = "__unset__";
+                    pi.session("get_thinking_level", {}).then((r) => { globalThis.level = r; });
+                "#,
+                )
+                .await
+                .expect("eval get");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.level !== "low") {
+                        throw new Error("Round trip failed, got: " + JSON.stringify(globalThis.level));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify round trip");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_model_ops_accept_camel_case_aliases() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.setDone = false;
+                    globalThis.model = null;
+                    globalThis.thinkingSet = false;
+                    globalThis.thinking = "__unset__";
+                    pi.session("setmodel", { provider: "azure", modelId: "gpt-4" })
+                        .then(() => { globalThis.setDone = true; });
+                    pi.session("getmodel", {}).then((r) => { globalThis.model = r; });
+                    pi.session("setthinkinglevel", { level: "high" })
+                        .then(() => { globalThis.thinkingSet = true; });
+                    pi.session("getthinkinglevel", {}).then((r) => { globalThis.thinking = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 4);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({})));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session as Arc<dyn ExtensionSession + Send + Sync>,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.setDone) throw new Error("setmodel not resolved");
+                    if (!globalThis.thinkingSet) throw new Error("setthinkinglevel not resolved");
+                "#,
+                )
+                .await
+                .expect("verify camelCase aliases");
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_model_accepts_model_id_snake_case() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.setDone = false;
+                    pi.session("set_model", { provider: "anthropic", model_id: "claude-opus-4-20250514" })
+                        .then(() => { globalThis.setDone = true; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({})));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.setDone) throw new Error("set_model with model_id not resolved");
+                "#,
+                )
+                .await
+                .expect("verify model_id snake_case");
+
+            let final_state = state.lock().unwrap().clone();
+            assert_eq!(
+                final_state.get("modelId").and_then(Value::as_str),
+                Some("claude-opus-4-20250514")
+            );
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_set_thinking_level_accepts_alt_keys() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Test thinkingLevel key
+            runtime
+                .eval(
+                    r#"
+                    globalThis.done1 = false;
+                    globalThis.done2 = false;
+                    pi.session("set_thinking_level", { thinkingLevel: "medium" })
+                        .then(() => { globalThis.done1 = true; });
+                    pi.session("set_thinking_level", { thinking_level: "low" })
+                        .then(() => { globalThis.done2 = true; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 2);
+
+            let state = Arc::new(Mutex::new(serde_json::json!({})));
+            let session = Arc::new(TestSession {
+                state: Arc::clone(&state),
+                messages: Arc::new(Mutex::new(Vec::new())),
+                entries: Arc::new(Mutex::new(Vec::new())),
+                branch: Arc::new(Mutex::new(Vec::new())),
+                name: Arc::new(Mutex::new(None)),
+                custom_entries: Arc::new(Mutex::new(Vec::new())),
+            });
+
+            let dispatcher = ExtensionDispatcher::new(
+                Rc::clone(&runtime),
+                Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
+                Arc::new(HttpConnector::with_defaults()),
+                session,
+                Arc::new(NullUiHandler),
+                PathBuf::from("."),
+            );
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.done1) throw new Error("thinkingLevel key not resolved");
+                    if (!globalThis.done2) throw new Error("thinking_level key not resolved");
+                "#,
+                )
+                .await
+                .expect("verify alt keys");
+
+            // Last write wins, so "low" should be the final value
+            let final_state = state.lock().unwrap().clone();
+            assert_eq!(
+                final_state.get("thinkingLevel").and_then(Value::as_str),
+                Some("low")
+            );
+        });
+    }
+
+    #[test]
+    fn dispatcher_session_get_model_null_when_unset() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.model = "__unset__";
+                    pi.session("get_model", {}).then((r) => { globalThis.model = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            // NullSession returns (None, None) for get_model
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.model) throw new Error("get_model not resolved");
+                    if (globalThis.model.provider !== null) {
+                        throw new Error("Unset provider should be null, got: " + JSON.stringify(globalThis.model.provider));
+                    }
+                    if (globalThis.model.modelId !== null) {
+                        throw new Error("Unset modelId should be null, got: " + JSON.stringify(globalThis.model.modelId));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify null model");
         });
     }
 
