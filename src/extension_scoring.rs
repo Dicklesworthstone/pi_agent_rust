@@ -146,7 +146,6 @@ pub enum CompatStatus {
     Unknown,
 }
 
-
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LicenseInfo {
@@ -383,10 +382,7 @@ fn score_popularity(
     )
 }
 
-fn score_adoption(
-    signals: &Signals,
-    missing: &mut BTreeSet<String>,
-) -> (u32, AdoptionComponents) {
+fn score_adoption(signals: &Signals, missing: &mut BTreeSet<String>) -> (u32, AdoptionComponents) {
     let npm_downloads = score_npm_downloads(signals, missing);
     let marketplace_installs = score_marketplace_installs(signals, missing);
     let forks = score_forks(signals, missing);
@@ -466,7 +462,11 @@ fn score_marketplace_visibility(signals: &Signals, missing: &mut BTreeSet<String
             0
         }
     };
-    let featured_points = if marketplace.featured.unwrap_or(false) { 2 } else { 0 };
+    let featured_points = if marketplace.featured.unwrap_or(false) {
+        2
+    } else {
+        0
+    };
     (rank_points + featured_points).min(6)
 }
 
@@ -548,21 +548,13 @@ fn score_interaction(tags: &Tags) -> u32 {
     if tags.interaction.iter().any(|tag| tag == "provider") {
         score += 3;
     }
-    if tags
-        .interaction
-        .iter()
-        .any(|tag| tag == "ui_integration")
-    {
+    if tags.interaction.iter().any(|tag| tag == "ui_integration") {
         score += 2;
     }
     if tags.interaction.iter().any(|tag| tag == "event_hook") {
         score += 2;
     }
-    if tags
-        .interaction
-        .iter()
-        .any(|tag| tag == "slash_command")
-    {
+    if tags.interaction.iter().any(|tag| tag == "slash_command") {
         score += 1;
     }
     if tags.interaction.iter().any(|tag| tag == "tool_only") {
@@ -665,14 +657,8 @@ fn compute_gates(candidate: &CandidateInput) -> GateStatus {
 }
 
 fn compute_tier(candidate: &CandidateInput, gates: &GateStatus, final_total: u32) -> String {
-    let is_official = candidate
-        .signals
-        .pi_mono_example
-        .unwrap_or(false)
-        || matches!(
-            candidate.source_tier.as_deref(),
-            Some("official-pi-mono")
-        );
+    let is_official = candidate.signals.pi_mono_example.unwrap_or(false)
+        || matches!(candidate.source_tier.as_deref(), Some("official-pi-mono"));
     if is_official {
         if let Some(override_tier) = candidate
             .manual_override
@@ -743,13 +729,13 @@ fn build_summary(items: &[ScoredCandidate], top_n: usize) -> ScoringSummary {
     let manual_overrides = items
         .iter()
         .filter_map(|item| {
-            item.manual_override.as_ref().map(|override_spec| {
-                ManualOverrideEntry {
+            item.manual_override
+                .as_ref()
+                .map(|override_spec| ManualOverrideEntry {
                     id: item.id.clone(),
                     reason: override_spec.reason.clone(),
                     tier: override_spec.tier.clone(),
-                }
-            })
+                })
         })
         .collect::<Vec<_>>();
 

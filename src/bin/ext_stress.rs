@@ -36,16 +36,16 @@ struct Args {
     /// Event dispatch rate (events per second).
     #[arg(long, default_value_t = 100)]
     events_per_sec: u64,
-    /// Extension event name to dispatch (e.g. agent_start, input).
+    /// Extension event name to dispatch (e.g. `agent_start`, `input`).
     #[arg(long, default_value = "agent_start")]
     event: String,
-    /// Index into the event payload list (if defined in event_payloads file).
+    /// Index into the event payload list (if defined in `event_payloads` file).
     #[arg(long, default_value_t = 0)]
     payload_index: usize,
     /// Maximum number of extensions to load.
     #[arg(long)]
     max_extensions: Option<usize>,
-    /// Override path to VALIDATED_MANIFEST.json.
+    /// Override path to `VALIDATED_MANIFEST.json`.
     #[arg(long)]
     manifest_path: Option<PathBuf>,
     /// Override artifacts root dir.
@@ -80,6 +80,7 @@ fn main_impl() -> Result<()> {
     runtime.block_on(join)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run(args: Args) -> Result<()> {
     if args.events_per_sec == 0 {
         bail!("--events-per-sec must be > 0");
@@ -244,10 +245,9 @@ async fn run_loop(
 
     let pid = get_current_pid().map_err(|err| anyhow::anyhow!(err))?;
     let refresh = ProcessRefreshKind::nothing().with_memory();
-    let mut system =
-        System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+    let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
     system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, refresh);
-    let initial_rss_kb = system.process(pid).map_or(0, |p| p.memory());
+    let initial_rss_kb = system.process(pid).map_or(0, sysinfo::Process::memory);
     let mut max_rss_kb = initial_rss_kb;
     let mut rss_samples: Vec<Value> = Vec::new();
     let mut next_rss = if rss_interval_secs == 0 {
@@ -301,7 +301,7 @@ async fn run_loop(
                     }
                     if collect {
                         rss_samples.push(serde_json::json!({
-                            "t_s": u64::try_from(start.elapsed().as_secs()).unwrap_or(u64::MAX),
+                            "t_s": start.elapsed().as_secs(),
                             "rss_kb": rss_kb,
                         }));
                     }
@@ -325,7 +325,7 @@ async fn run_loop(
         None
     };
 
-    let rss_ok = rss_growth_pct.map_or(true, |growth| growth <= 0.10);
+    let rss_ok = rss_growth_pct.is_none_or(|growth| growth <= 0.10);
     let latency_ok = match (p99_first, p99_last) {
         (Some(first), Some(last)) if first > 0 => last <= first.saturating_mul(2),
         _ => true,

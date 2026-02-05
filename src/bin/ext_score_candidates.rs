@@ -45,8 +45,7 @@ struct InputDocument {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let bytes =
-        fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
+    let bytes = fs::read(&args.input).with_context(|| format!("read {}", args.input.display()))?;
     let input: InputFile =
         serde_json::from_slice(&bytes).context("parse candidate scoring input")?;
 
@@ -57,7 +56,11 @@ fn main() -> Result<()> {
 
     let as_of = parse_timestamp(args.as_of, "as_of")?.unwrap_or_else(Utc::now);
     let generated_at = parse_timestamp(args.generated_at, "generated_at")?
-        .or_else(|| parse_timestamp(embedded_generated_at, "generated_at").ok().flatten())
+        .or_else(|| {
+            parse_timestamp(embedded_generated_at, "generated_at")
+                .ok()
+                .flatten()
+        })
         .unwrap_or(as_of);
 
     let report = score_candidates(&candidates, as_of, generated_at, args.top_n);
@@ -91,7 +94,7 @@ fn parse_timestamp(value: Option<String>, label: &str) -> Result<Option<DateTime
     let Some(value) = value else {
         return Ok(None);
     };
-    let parsed = DateTime::parse_from_rfc3339(&value)
-        .with_context(|| format!("parse {label} timestamp"))?;
+    let parsed =
+        DateTime::parse_from_rfc3339(&value).with_context(|| format!("parse {label} timestamp"))?;
     Ok(Some(parsed.with_timezone(&Utc)))
 }
