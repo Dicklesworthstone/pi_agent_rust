@@ -7921,7 +7921,10 @@ impl PiApp {
                 };
                 agent_guard.set_provider(provider_impl);
                 agent_guard.stream_options_mut().api_key = resolved_api_key;
-                agent_guard.stream_options_mut().headers = next.headers.clone();
+                agent_guard
+                    .stream_options_mut()
+                    .headers
+                    .clone_from(&next.headers);
                 drop(agent_guard);
 
                 let Ok(mut session_guard) = self.session.try_lock() else {
