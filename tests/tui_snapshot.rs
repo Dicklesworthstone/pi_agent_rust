@@ -94,7 +94,7 @@ fn build_app(harness: &TestHarness) -> PiApp {
     let tools = ToolRegistry::new(&[], &cwd, Some(&config));
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(provider, tools, AgentConfig::default());
-    let session = Session::in_memory();
+    let session = Arc::new(asupersync::sync::Mutex::new(Session::in_memory()));
     let resources = ResourceLoader::empty(config.enable_skill_commands());
     let resource_cli = ResourceCliOptions {
         no_skills: false,
@@ -127,6 +127,8 @@ fn build_app(harness: &TestHarness) -> PiApp {
         true,
         None,
         Some(KeyBindings::new()),
+        Vec::new(),
+        Usage::default(),
     );
     app.set_terminal_size(80, 24);
     app

@@ -1,6 +1,6 @@
 ---
 source: tests/tui_snapshot.rs
-assertion_line: 205
+assertion_line: 207
 expression: view
 ---
   Pi (dummy/dummy-model)
@@ -12,4 +12,4 @@ expression: view
 
   ⣾  Processing...
 
-  Tokens: 0 in / 0 out  |  Shift+Enter: newline  |  Alt+Enter: multi-line  |  /help  |  Ctrl+C: quit
+  Tokens: 0 in / 0 out  |  /help  |  Ctrl+C: quit
