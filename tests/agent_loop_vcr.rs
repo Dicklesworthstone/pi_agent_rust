@@ -79,7 +79,8 @@ fn format_event(event: &AgentEvent) -> serde_json::Value {
 
 #[test]
 fn agent_loop_openai_vcr_basic() {
-    let harness = TestHarness::new("agent_loop_openai_basic");
+    let test_name = "agent_loop_openai_basic";
+    let harness = TestHarness::new(test_name);
 
     run_async(async move {
         let cassette_dir = cassette_root();
@@ -176,6 +177,8 @@ fn agent_loop_openai_vcr_basic() {
                 ctx.push(("cassette".into(), cassette_name.to_string()));
                 ctx.push(("response".into(), text));
             });
+
+        write_jsonl_artifacts(&harness, test_name, &["test-key", "vcr-playback"]);
     });
 }
 
@@ -194,11 +197,69 @@ fn write_timeline(harness: &TestHarness, timeline: &Arc<Mutex<Vec<serde_json::Va
     harness.record_artifact("agent_loop.timeline.jsonl", &timeline_path);
 }
 
+fn write_jsonl_artifacts(harness: &TestHarness, test_name: &str, forbidden: &[&str]) {
+    let log_path = harness.temp_path(format!("{test_name}.log.jsonl"));
+    harness
+        .write_jsonl_logs(&log_path)
+        .expect("write jsonl log");
+    assert!(log_path.exists(), "jsonl log should exist");
+    harness.record_artifact(format!("{test_name}.log.jsonl"), &log_path);
+
+    let normalized_log_path = harness.temp_path(format!("{test_name}.log.normalized.jsonl"));
+    harness
+        .write_jsonl_logs_normalized(&normalized_log_path)
+        .expect("write normalized jsonl log");
+    assert!(
+        normalized_log_path.exists(),
+        "normalized jsonl log should exist"
+    );
+    harness.record_artifact(
+        format!("{test_name}.log.normalized.jsonl"),
+        &normalized_log_path,
+    );
+
+    let artifacts_path = harness.temp_path(format!("{test_name}.artifacts.jsonl"));
+    harness
+        .write_artifact_index_jsonl(&artifacts_path)
+        .expect("write artifact index jsonl");
+    assert!(artifacts_path.exists(), "artifact index should exist");
+    harness.record_artifact(format!("{test_name}.artifacts.jsonl"), &artifacts_path);
+
+    let normalized_artifacts_path =
+        harness.temp_path(format!("{test_name}.artifacts.normalized.jsonl"));
+    harness
+        .write_artifact_index_jsonl_normalized(&normalized_artifacts_path)
+        .expect("write normalized artifact index jsonl");
+    assert!(
+        normalized_artifacts_path.exists(),
+        "normalized artifact index should exist"
+    );
+    harness.record_artifact(
+        format!("{test_name}.artifacts.normalized.jsonl"),
+        &normalized_artifacts_path,
+    );
+
+    let log_contents = std::fs::read_to_string(&log_path).expect("read jsonl log");
+    let normalized_contents =
+        std::fs::read_to_string(&normalized_log_path).expect("read normalized jsonl log");
+    for needle in forbidden {
+        assert!(
+            !log_contents.contains(needle),
+            "jsonl logs should redact {needle}"
+        );
+        assert!(
+            !normalized_contents.contains(needle),
+            "normalized jsonl logs should redact {needle}"
+        );
+    }
+}
+
 /// Agent loop: simple text response via Anthropic VCR cassette.
 /// Verifies end-to-end: user message → provider stream → text response → session persist.
 #[test]
 fn agent_loop_anthropic_simple_text() {
-    let harness = TestHarness::new("agent_loop_anthropic_simple_text");
+    let test_name = "agent_loop_anthropic_simple_text";
+    let harness = TestHarness::new(test_name);
 
     run_async(async move {
         let cassette_dir = cassette_root();
@@ -279,6 +340,8 @@ fn agent_loop_anthropic_simple_text() {
                 ctx.push(("stop_reason".into(), format!("{:?}", result.stop_reason)));
                 ctx.push(("response".into(), text));
             });
+
+        write_jsonl_artifacts(&harness, test_name, &["test-key", "vcr-playback"]);
     });
 }
 
@@ -287,7 +350,8 @@ fn agent_loop_anthropic_simple_text() {
 /// through the event callback and result.
 #[test]
 fn agent_loop_anthropic_error_stream() {
-    let harness = TestHarness::new("agent_loop_anthropic_error_stream");
+    let test_name = "agent_loop_anthropic_error_stream";
+    let harness = TestHarness::new(test_name);
 
     run_async(async move {
         let cassette_dir = cassette_root();
@@ -351,6 +415,8 @@ fn agent_loop_anthropic_error_stream() {
                 ctx.push(("cassette".into(), cassette_name.to_string()));
                 ctx.push(("error".into(), err_msg));
             });
+
+        write_jsonl_artifacts(&harness, test_name, &["test-key", "vcr-playback"]);
     });
 }
 
@@ -359,7 +425,8 @@ fn agent_loop_anthropic_error_stream() {
 /// Uses `max_tool_iterations=0` to avoid executing tools (no follow-up cassette needed).
 #[test]
 fn agent_loop_anthropic_tool_call_stop() {
-    let harness = TestHarness::new("agent_loop_anthropic_tool_call_stop");
+    let test_name = "agent_loop_anthropic_tool_call_stop";
+    let harness = TestHarness::new(test_name);
 
     run_async(async move {
         let cassette_dir = cassette_root();
@@ -436,5 +503,7 @@ fn agent_loop_anthropic_tool_call_stop() {
                     Err(e) => ctx.push(("error".into(), e.to_string())),
                 }
             });
+
+        write_jsonl_artifacts(&harness, test_name, &["test-key", "vcr-playback"]);
     });
 }
