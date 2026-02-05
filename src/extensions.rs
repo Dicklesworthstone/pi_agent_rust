@@ -4998,23 +4998,24 @@ impl JsExtensionRuntimeHandle {
         let _ = std::thread::Builder::new()
             .name("pi-js-stream-cancel".to_owned())
             .spawn(move || {
-            let Ok(runtime) = asupersync::runtime::RuntimeBuilder::current_thread().build() else {
-                return;
-            };
-            runtime.block_on(async move {
-                let cx = Cx::for_request();
-                let _ = sender
-                    .send(
-                        &cx,
-                        JsRuntimeCommand::ProviderStreamSimpleCancel {
-                            stream_id,
-                            timeout_ms,
-                            reply: None,
-                        },
-                    )
-                    .await;
+                let Ok(runtime) = asupersync::runtime::RuntimeBuilder::current_thread().build()
+                else {
+                    return;
+                };
+                runtime.block_on(async move {
+                    let cx = Cx::for_request();
+                    let _ = sender
+                        .send(
+                            &cx,
+                            JsRuntimeCommand::ProviderStreamSimpleCancel {
+                                stream_id,
+                                timeout_ms,
+                                reply: None,
+                            },
+                        )
+                        .await;
+                });
             });
-        });
     }
 }
 
