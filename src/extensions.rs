@@ -3731,8 +3731,41 @@ impl WasmExtensionHost {
 // Extension Event System
 // ============================================================================
 
-/// Timeout for extension events in milliseconds.
-pub const EXTENSION_EVENT_TIMEOUT_MS: u64 = 5000;
+/// Default cancellation budget for extension event handlers (ms).
+pub const EXTENSION_EVENT_TIMEOUT_MS: u64 = 5_000;
+
+/// Default cancellation budget for extension tool execution (ms).
+pub const EXTENSION_TOOL_BUDGET_MS: u64 = 30_000;
+
+/// Default cancellation budget for extension command execution (ms).
+pub const EXTENSION_COMMAND_BUDGET_MS: u64 = 30_000;
+
+/// Default cancellation budget for extension shortcut execution (ms).
+pub const EXTENSION_SHORTCUT_BUDGET_MS: u64 = 30_000;
+
+/// Default cancellation budget for UI dialog operations (ms).
+pub const EXTENSION_UI_BUDGET_MS: u64 = 1_000;
+
+/// Default cancellation budget for provider stream operations (ms).
+pub const EXTENSION_PROVIDER_BUDGET_MS: u64 = 120_000;
+
+/// Default cancellation budget for extension queries (get tools, pump, flags) (ms).
+pub const EXTENSION_QUERY_BUDGET_MS: u64 = 10_000;
+
+/// Default cancellation budget for extension loading (ms).
+pub const EXTENSION_LOAD_BUDGET_MS: u64 = 60_000;
+
+/// Create a [`Cx`] with a deadline budget derived from `timeout_ms`.
+///
+/// The returned context will cancel any async operation that exceeds the
+/// deadline, integrating with asupersync's structured concurrency protocol.
+fn cx_with_deadline(timeout_ms: u64) -> Cx {
+    let budget = Budget {
+        deadline: Some(wall_now() + Duration::from_millis(timeout_ms)),
+        ..Budget::INFINITE
+    };
+    Cx::for_request_with_budget(budget)
+}
 
 /// Event names for the extension lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4794,7 +4827,7 @@ impl JsExtensionRuntimeHandle {
         &self,
         specs: Vec<JsExtensionLoadSpec>,
     ) -> Result<Vec<JsExtensionSnapshot>> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(EXTENSION_LOAD_BUDGET_MS);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -4813,7 +4846,7 @@ impl JsExtensionRuntimeHandle {
     }
 
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -4829,7 +4862,7 @@ impl JsExtensionRuntimeHandle {
     }
 
     pub async fn pump_once(&self) -> Result<bool> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(&cx, JsRuntimeCommand::PumpOnce { reply: reply_tx })
@@ -4848,7 +4881,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Value,
         timeout_ms: u64,
     ) -> Result<Value> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -4877,7 +4910,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Value,
         timeout_ms: u64,
     ) -> Result<Value> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -4906,7 +4939,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Value,
         timeout_ms: u64,
     ) -> Result<Value> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -4933,7 +4966,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Value,
         timeout_ms: u64,
     ) -> Result<Value> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -4959,7 +4992,7 @@ impl JsExtensionRuntimeHandle {
         flag_name: String,
         value: Value,
     ) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -4987,7 +5020,7 @@ impl JsExtensionRuntimeHandle {
         options: Value,
         timeout_ms: u64,
     ) -> Result<String> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -5014,7 +5047,7 @@ impl JsExtensionRuntimeHandle {
         stream_id: String,
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -5038,7 +5071,7 @@ impl JsExtensionRuntimeHandle {
         stream_id: String,
         timeout_ms: u64,
     ) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, reply_rx) = oneshot::channel();
         self.sender
             .send(
@@ -6719,6 +6752,23 @@ impl ExtensionManager {
         }
     }
 
+    /// Compute the effective timeout for an operation, taking the minimum of
+    /// the per-operation timeout and the remaining manager-level budget deadline.
+    ///
+    /// When the manager has a constrained budget (e.g. during shutdown), this
+    /// ensures individual operations don't outlast the overall budget.
+    fn effective_timeout(&self, operation_timeout_ms: u64) -> u64 {
+        let budget = self.budget();
+        match budget.deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(wall_now());
+                let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+                operation_timeout_ms.min(remaining_ms)
+            }
+            None => operation_timeout_ms,
+        }
+    }
+
     /// Shut down the extension runtime with a cleanup budget.
     ///
     /// Sends a graceful shutdown to the JS runtime thread and waits up to
@@ -7115,6 +7165,37 @@ impl ExtensionManager {
                     .or_else(|| Some(api_key_ref.to_string()))
             };
 
+            // Extract OAuth config if present.
+            let oauth_config = provider_spec
+                .get("oauth")
+                .and_then(Value::as_object)
+                .and_then(|oauth| {
+                    let auth_url = oauth.get("authUrl")?.as_str()?.to_string();
+                    let token_url = oauth.get("tokenUrl")?.as_str()?.to_string();
+                    let client_id = oauth.get("clientId")?.as_str()?.to_string();
+                    let scopes = oauth
+                        .get("scopes")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .map(ToString::to_string)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let redirect_uri = oauth
+                        .get("redirectUri")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    Some(crate::models::OAuthConfig {
+                        auth_url,
+                        token_url,
+                        client_id,
+                        scopes,
+                        redirect_uri,
+                    })
+                });
+
             let models = provider_spec
                 .get("models")
                 .and_then(Value::as_array)
@@ -7195,6 +7276,7 @@ impl ExtensionManager {
                     headers: HashMap::new(),
                     auth_header: true,
                     compat: None,
+                    oauth_config: oauth_config.clone(),
                 });
             }
         }
@@ -7422,6 +7504,7 @@ impl ExtensionManager {
         data: Option<Value>,
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
         let event_name = event.to_string();
         let (runtime, has_ui, session, cwd_override, model_registry_values, has_hook) = {
             let guard = self.inner.lock().unwrap();
@@ -7611,6 +7694,7 @@ impl ExtensionManager {
         tool_call: &crate::model::ToolCall,
         timeout_ms: u64,
     ) -> Result<Option<ToolCallEventResult>> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
         let event_name = "tool_call".to_string();
         let (runtime, has_ui, session, cwd_override, model_registry_values, has_hook_js) = {
             let guard = self.inner.lock().unwrap();
@@ -7749,6 +7833,7 @@ impl ExtensionManager {
         is_error: bool,
         timeout_ms: u64,
     ) -> Result<Option<ToolResultEventResult>> {
+        let timeout_ms = self.effective_timeout(timeout_ms);
         let event_name = "tool_result".to_string();
         let (runtime, has_ui, session, cwd_override, model_registry_values, has_hook_js) = {
             let guard = self.inner.lock().unwrap();
@@ -11283,6 +11368,329 @@ mod tests {
             let ok = manager.shutdown(Duration::from_secs(1)).await;
             assert!(ok, "shutdown without runtime should succeed");
         });
+    }
+
+    // ========================================================================
+    // Extension lifecycle / structured concurrency tests (bd-2vie)
+    // ========================================================================
+
+    mod lifecycle {
+        use super::*;
+
+        #[test]
+        fn region_shutdown_returns_true_when_no_runtime() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let region = ExtensionRegion::new(manager);
+                let ok = region.shutdown().await;
+                assert!(ok, "shutdown should succeed when no JS runtime is running");
+            });
+        }
+
+        #[test]
+        fn region_shutdown_is_idempotent() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let region = ExtensionRegion::new(manager);
+                assert!(region.shutdown().await);
+                assert!(region.shutdown().await, "second shutdown should be no-op");
+                assert!(region.shutdown().await, "third shutdown should be no-op");
+            });
+        }
+
+        #[test]
+        fn manager_shutdown_clears_js_runtime_handle() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let tools = Arc::new(crate::tools::ToolRegistry::new(
+                    &[],
+                    Path::new("/tmp"),
+                    None,
+                ));
+
+                let runtime = JsExtensionRuntimeHandle::start(
+                    PiJsRuntimeConfig {
+                        cwd: "/tmp".to_string(),
+                        ..Default::default()
+                    },
+                    Arc::clone(&tools),
+                    manager.clone(),
+                )
+                .await
+                .expect("start js runtime");
+                manager.set_js_runtime(runtime);
+
+                assert!(
+                    manager.js_runtime().is_some(),
+                    "runtime should be set before shutdown"
+                );
+
+                let ok = manager.shutdown(Duration::from_secs(5)).await;
+                assert!(ok, "shutdown should succeed");
+                assert!(
+                    manager.js_runtime().is_none(),
+                    "runtime should be cleared after shutdown"
+                );
+            });
+        }
+
+        #[test]
+        fn region_with_runtime_shuts_down_cleanly() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let tools = Arc::new(crate::tools::ToolRegistry::new(
+                    &[],
+                    Path::new("/tmp"),
+                    None,
+                ));
+
+                let runtime = JsExtensionRuntimeHandle::start(
+                    PiJsRuntimeConfig {
+                        cwd: "/tmp".to_string(),
+                        ..Default::default()
+                    },
+                    Arc::clone(&tools),
+                    manager.clone(),
+                )
+                .await
+                .expect("start js runtime");
+                manager.set_js_runtime(runtime);
+
+                let region = ExtensionRegion::new(manager);
+                let ok = region.shutdown().await;
+                assert!(ok, "region shutdown with active runtime should succeed");
+                assert!(
+                    region.manager().js_runtime().is_none(),
+                    "runtime should be cleared after region shutdown"
+                );
+            });
+        }
+
+        #[test]
+        fn region_with_custom_budget() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let region = ExtensionRegion::with_budget(manager, Duration::from_millis(100));
+                assert!(region.shutdown().await);
+            });
+        }
+
+        #[test]
+        fn region_drop_after_explicit_shutdown_is_silent() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let tools = Arc::new(crate::tools::ToolRegistry::new(
+                    &[],
+                    Path::new("/tmp"),
+                    None,
+                ));
+
+                let runtime = JsExtensionRuntimeHandle::start(
+                    PiJsRuntimeConfig {
+                        cwd: "/tmp".to_string(),
+                        ..Default::default()
+                    },
+                    Arc::clone(&tools),
+                    manager.clone(),
+                )
+                .await
+                .expect("start js runtime");
+                manager.set_js_runtime(runtime);
+
+                let region = ExtensionRegion::new(manager);
+                region.shutdown().await;
+                // Drop should be silent (no warning) since shutdown was called.
+                drop(region);
+            });
+        }
+
+        #[test]
+        fn region_into_inner_prevents_drop_shutdown() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let region = ExtensionRegion::new(manager);
+                let _manager = region.into_inner();
+                // into_inner marks shutdown_done=true, so drop is silent.
+            });
+        }
+
+        #[test]
+        fn weak_ref_breaks_arc_cycle() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let weak = Arc::downgrade(&manager.inner);
+                let tools = Arc::new(crate::tools::ToolRegistry::new(
+                    &[],
+                    Path::new("/tmp"),
+                    None,
+                ));
+
+                let runtime = JsExtensionRuntimeHandle::start(
+                    PiJsRuntimeConfig {
+                        cwd: "/tmp".to_string(),
+                        ..Default::default()
+                    },
+                    Arc::clone(&tools),
+                    manager.clone(),
+                )
+                .await
+                .expect("start js runtime");
+                manager.set_js_runtime(runtime.clone());
+
+                // Shut down the runtime so the thread exits
+                // and drops its host (which held a Weak, not Arc).
+                let ok = runtime.shutdown(Duration::from_secs(5)).await;
+                assert!(ok, "shutdown should succeed");
+
+                // Give the thread a moment to fully exit.
+                asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(50))
+                    .await;
+
+                // Now drop the manager — Arc should be the only strong ref.
+                drop(manager);
+                assert!(
+                    weak.upgrade().is_none(),
+                    "After shutdown + drop, the inner Arc should be deallocated \
+                     (Weak breaks the cycle)"
+                );
+            });
+        }
+
+        #[test]
+        fn runtime_processes_commands_before_shutdown() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let tools = Arc::new(crate::tools::ToolRegistry::new(
+                    &[],
+                    Path::new("/tmp"),
+                    None,
+                ));
+
+                let runtime = JsExtensionRuntimeHandle::start(
+                    PiJsRuntimeConfig {
+                        cwd: "/tmp".to_string(),
+                        ..Default::default()
+                    },
+                    Arc::clone(&tools),
+                    manager.clone(),
+                )
+                .await
+                .expect("start js runtime");
+                manager.set_js_runtime(runtime.clone());
+
+                // Send a command (get_registered_tools) that the runtime
+                // thread must process before we shut down.
+                let tool_defs = runtime.get_registered_tools().await;
+                assert!(
+                    tool_defs.is_ok(),
+                    "get_registered_tools should succeed on a fresh runtime"
+                );
+                assert!(tool_defs.unwrap().is_empty(), "no tools registered yet");
+
+                // Pump the runtime to verify it's responsive.
+                let pump = runtime.pump_once().await;
+                assert!(pump.is_ok(), "pump_once should succeed");
+
+                // Now shut down.
+                let ok = runtime.shutdown(Duration::from_secs(5)).await;
+                assert!(ok, "shutdown after command processing should succeed");
+            });
+        }
+    }
+
+    // ========================================================================
+    // Cancellation budget tests (bd-1yr1)
+    // ========================================================================
+
+    mod budget_tests {
+        use super::*;
+        use asupersync::sync::oneshot;
+
+        #[test]
+        fn cx_with_deadline_has_finite_budget() {
+            asupersync::test_utils::run_test(|| async {
+                let before = wall_now();
+                let cx = cx_with_deadline(500);
+                let budget = cx.budget();
+                assert!(
+                    budget.deadline.is_some(),
+                    "cx_with_deadline should set a deadline"
+                );
+                let deadline = budget.deadline.unwrap();
+                let expected = before + Duration::from_millis(500);
+                // Deadline should be within 100ms of expected (accounting for wall clock drift).
+                assert!(
+                    deadline >= expected - Duration::from_millis(100)
+                        && deadline <= expected + Duration::from_millis(100),
+                    "deadline {deadline:?} should be ~500ms after {before:?}"
+                );
+            });
+        }
+
+        #[test]
+        fn budget_constants_are_reasonable() {
+            assert!(EXTENSION_EVENT_TIMEOUT_MS >= 1_000);
+            assert!(EXTENSION_EVENT_TIMEOUT_MS <= 60_000);
+            assert!(EXTENSION_TOOL_BUDGET_MS >= 5_000);
+            assert!(EXTENSION_TOOL_BUDGET_MS <= 300_000);
+            assert!(EXTENSION_COMMAND_BUDGET_MS >= 5_000);
+            assert!(EXTENSION_SHORTCUT_BUDGET_MS >= 5_000);
+            assert!(EXTENSION_UI_BUDGET_MS >= 100);
+            assert!(EXTENSION_UI_BUDGET_MS <= 10_000);
+            assert!(EXTENSION_PROVIDER_BUDGET_MS >= 30_000);
+            assert!(EXTENSION_QUERY_BUDGET_MS >= 1_000);
+            assert!(EXTENSION_LOAD_BUDGET_MS >= 10_000);
+        }
+
+        #[test]
+        fn tight_deadline_cancels_blocked_recv() {
+            asupersync::test_utils::run_test(|| async {
+                // Create a oneshot where nobody will send.
+                let (_tx, rx) = oneshot::channel::<()>();
+                let cx = cx_with_deadline(50); // 50ms deadline
+                let start = wall_now();
+                let result = rx.recv(&cx).await;
+                let elapsed = wall_now() - start;
+                assert!(result.is_err(), "recv should fail when deadline expires");
+                // Should complete in roughly 50ms, not hang forever.
+                assert!(
+                    elapsed < Duration::from_millis(500),
+                    "recv should be cancelled quickly, took {elapsed:?}"
+                );
+            });
+        }
+
+        #[test]
+        fn tight_deadline_cancels_runtime_send() {
+            asupersync::test_utils::run_test(|| async {
+                let manager = ExtensionManager::new();
+                let tools = Arc::new(crate::tools::ToolRegistry::new(
+                    &[],
+                    Path::new("/tmp"),
+                    None,
+                ));
+
+                let runtime = JsExtensionRuntimeHandle::start(
+                    PiJsRuntimeConfig {
+                        cwd: "/tmp".to_string(),
+                        ..Default::default()
+                    },
+                    Arc::clone(&tools),
+                    manager.clone(),
+                )
+                .await
+                .expect("start js runtime");
+                manager.set_js_runtime(runtime.clone());
+
+                // Shut down the runtime first so channels close.
+                runtime.shutdown(Duration::from_secs(2)).await;
+
+                // Now try get_registered_tools — the send should fail
+                // because the channel is closed, regardless of budget.
+                let result = runtime.get_registered_tools().await;
+                assert!(result.is_err(), "send to shut-down runtime should fail");
+            });
+        }
     }
 
     // ========================================================================
