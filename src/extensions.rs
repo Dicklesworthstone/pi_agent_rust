@@ -4912,6 +4912,31 @@ async fn execute_extension_command(
 }
 
 #[allow(clippy::future_not_send)]
+async fn execute_extension_shortcut(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    key_id: &str,
+    ctx_payload: Value,
+    timeout_ms: u64,
+) -> Result<Value> {
+    let task_id = format!("task-shortcut-{}", Uuid::new_v4());
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
+            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+            let ctx_js = json_to_js(&ctx, &ctx_payload)?;
+            let promise: rquickjs::Value<'_> =
+                exec_fn.call((key_id.to_string(), ctx_js))?;
+            let _task: String = task_start.call((task_id.clone(), promise))?;
+            Ok(())
+        })
+        .await?;
+
+    await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
+}
+
+#[allow(clippy::future_not_send)]
 async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Result<bool> {
     let mut pending = runtime.drain_hostcall_requests();
     while let Some(req) = pending.pop_front() {
@@ -6055,6 +6080,7 @@ impl ExtensionManager {
                 tools,
                 slash_commands,
                 providers,
+                shortcuts,
                 event_hooks,
                 active_tools: ext_active_tools,
             } = snapshot;
@@ -6074,6 +6100,7 @@ impl ExtensionManager {
                 capability_manifest: None,
                 tools,
                 slash_commands,
+                shortcuts,
                 event_hooks,
             });
         }
