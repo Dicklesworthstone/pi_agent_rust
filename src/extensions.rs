@@ -5649,6 +5649,26 @@ async fn dispatch_hostcall_events(
                 },
             }
         }
+        "registercommand" | "register_command" => {
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: "registerCommand: name is required".to_string(),
+                };
+            }
+            let description = payload
+                .get("description")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            manager.register_command(&name, description.as_deref());
+            HostcallOutcome::Success(Value::Null)
+        }
         _ => HostcallOutcome::Success(Value::Null),
     }
 }
