@@ -226,9 +226,7 @@ struct ScenarioExpectation {
 struct SampleItem {
     id: String,
     name: String,
-    #[allow(dead_code)]
     source_tier: String,
-    #[allow(dead_code)]
     runtime_tier: String,
 }
 
@@ -241,12 +239,16 @@ struct ScenarioResult {
     kind: String,
     summary: String,
     status: String, // "pass", "fail", "skip", "error"
+    source_tier: String,
+    runtime_tier: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     diffs: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skip_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output: Option<Value>,
     duration_ms: u64,
 }
 
@@ -777,15 +779,19 @@ fn run_scenario(
     items: &[SampleItem],
 ) -> ScenarioResult {
     let start = Instant::now();
+    let item = items.iter().find(|i| i.id == ext.extension_id);
     let base = ScenarioResult {
         scenario_id: scenario.id.clone(),
         extension_id: ext.extension_id.clone(),
         kind: scenario.kind.clone(),
         summary: scenario.summary.clone(),
         status: String::new(),
+        source_tier: item.map_or_else(|| "unknown".to_string(), |i| i.source_tier.clone()),
+        runtime_tier: item.map_or_else(|| "unknown".to_string(), |i| i.runtime_tier.clone()),
         diffs: Vec::new(),
         error: None,
         skip_reason: None,
+        output: None,
         duration_ms: 0,
     };
 
@@ -887,6 +893,12 @@ fn run_scenario(
         }
     };
 
+    // Capture output for logging
+    let output = match &result {
+        Ok(val) => Some(val.clone()),
+        Err(err) => Some(Value::String(err.clone())),
+    };
+
     // Check expectations
     let diffs = scenario.expect.as_ref().map_or_else(Vec::new, |expect| {
         check_expectations(expect, &result, &loaded)
@@ -900,6 +912,8 @@ fn run_scenario(
         },
         diffs,
         error: result.as_ref().err().cloned(),
+        skip_reason: None,
+        output,
         duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
         ..base
     }
@@ -953,6 +967,115 @@ fn write_summary_report(results: &[ScenarioResult], report_path: &Path) {
     let _ = fs::write(
         report_path,
         serde_json::to_string_pretty(&summary).unwrap_or_default(),
+    );
+}
+
+/// Write per-extension JSONL log files for triage.
+fn write_per_extension_logs(results: &[ScenarioResult], base_dir: &Path) {
+    let ext_dir = base_dir.join("extensions");
+    let _ = fs::create_dir_all(&ext_dir);
+
+    // Group results by extension_id
+    let mut by_ext: HashMap<String, Vec<&ScenarioResult>> = HashMap::new();
+    for r in results {
+        by_ext.entry(r.extension_id.clone()).or_default().push(r);
+    }
+
+    for (ext_id, ext_results) in &by_ext {
+        let path = ext_dir.join(format!("{ext_id}.jsonl"));
+        let mut lines = Vec::new();
+        for r in ext_results {
+            let event = serde_json::json!({
+                "schema": "pi.ext.smoke.v1",
+                "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                "extension_id": r.extension_id,
+                "scenario_id": r.scenario_id,
+                "event_type": r.kind,
+                "source_tier": r.source_tier,
+                "runtime_tier": r.runtime_tier,
+                "status": r.status,
+                "duration_ms": r.duration_ms,
+                "output": r.output,
+                "diffs": r.diffs,
+                "error": r.error,
+                "skip_reason": r.skip_reason,
+            });
+            if let Ok(json) = serde_json::to_string(&event) {
+                lines.push(json);
+            }
+        }
+        let _ = fs::write(&path, lines.join("\n") + "\n");
+    }
+}
+
+/// Write a triage-oriented summary for CI consumption.
+fn write_triage_report(results: &[ScenarioResult], report_path: &Path) {
+    let pass = results.iter().filter(|r| r.status == "pass").count();
+    let fail = results.iter().filter(|r| r.status == "fail").count();
+    let skip = results.iter().filter(|r| r.status == "skip").count();
+    let error = results.iter().filter(|r| r.status == "error").count();
+    let total_ms: u64 = results.iter().map(|r| r.duration_ms).sum();
+
+    // Per-extension summaries
+    let mut ext_summaries: HashMap<String, Value> = HashMap::new();
+    for r in results {
+        let entry = ext_summaries
+            .entry(r.extension_id.clone())
+            .or_insert_with(|| {
+                serde_json::json!({
+                    "extension_id": r.extension_id,
+                    "source_tier": r.source_tier,
+                    "runtime_tier": r.runtime_tier,
+                    "pass": 0, "fail": 0, "skip": 0, "error": 0,
+                    "total_ms": 0,
+                    "failures": [],
+                })
+            });
+        if let Some(obj) = entry.as_object_mut() {
+            let key = r.status.as_str();
+            if let Some(count) = obj.get(key).and_then(Value::as_u64) {
+                obj.insert(key.to_string(), Value::from(count + 1));
+            }
+            if let Some(ms) = obj.get("total_ms").and_then(Value::as_u64) {
+                obj.insert("total_ms".to_string(), Value::from(ms + r.duration_ms));
+            }
+            if r.status == "fail" {
+                if let Some(arr) = obj.get_mut("failures").and_then(Value::as_array_mut) {
+                    arr.push(serde_json::json!({
+                        "scenario_id": r.scenario_id,
+                        "diffs": r.diffs,
+                    }));
+                }
+            }
+        }
+    }
+
+    let report = serde_json::json!({
+        "schema": "pi.ext.smoke_triage.v1",
+        "generated_at": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        "counts": {
+            "total": results.len(),
+            "pass": pass,
+            "fail": fail,
+            "skip": skip,
+            "error": error,
+        },
+        "pass_rate_pct": if results.len() - skip == 0 {
+            100.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            { (pass as f64) / ((results.len() - skip) as f64) * 100.0 }
+        },
+        "total_duration_ms": total_ms,
+        "extensions": ext_summaries.values().collect::<Vec<_>>(),
+    });
+
+    if let Some(parent) = report_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(
+        report_path,
+        serde_json::to_string_pretty(&report).unwrap_or_default(),
     );
 }
 
@@ -1022,8 +1145,11 @@ fn scenario_conformance_suite() {
     // Write reports
     let jsonl_path = reports_dir().join("scenario_conformance.jsonl");
     let summary_path = reports_dir().join("scenario_conformance.json");
+    let triage_path = reports_dir().join("smoke_triage.json");
     write_jsonl_report(&all_results, &jsonl_path);
     write_summary_report(&all_results, &summary_path);
+    write_per_extension_logs(&all_results, &reports_dir());
+    write_triage_report(&all_results, &triage_path);
 
     eprintln!(
         "[scenario_conformance] Wrote JSONL to {}",
@@ -1032,6 +1158,14 @@ fn scenario_conformance_suite() {
     eprintln!(
         "[scenario_conformance] Wrote summary to {}",
         summary_path.display()
+    );
+    eprintln!(
+        "[scenario_conformance] Wrote triage to {}",
+        triage_path.display()
+    );
+    eprintln!(
+        "[scenario_conformance] Wrote per-extension logs to {}",
+        reports_dir().join("extensions").display()
     );
 
     // Summary
@@ -1225,5 +1359,152 @@ fn scenario_sandbox_tool_registered() {
         result.status, "pass",
         "sandbox tool registration scenario failed: {:?}",
         result.diffs
+    );
+}
+
+// ─── E2E Smoke Suite (bd-2ni) ───────────────────────────────────────────────
+
+/// E2E smoke suite: loads every extension from extension-sample.json, runs
+/// all scenarios with verbose structured logging, and produces per-extension
+/// JSONL logs + a triage report suitable for CI consumption.
+///
+/// This is the main entry point for bd-2ni. It differs from
+/// `scenario_conformance_suite` by producing richer per-event logs with
+/// correlation IDs, source/runtime tier metadata, and captured outputs.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn smoke_runtime_suite() {
+    let sample = load_sample_json();
+    let run_id = format!(
+        "smoke-{}",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+    let smoke_dir = reports_dir().join("smoke");
+    let _ = fs::create_dir_all(&smoke_dir);
+
+    eprintln!("[smoke] run_id={run_id}");
+    eprintln!(
+        "[smoke] extensions={}, scenarios={}",
+        sample.scenario_suite.items.len(),
+        sample
+            .scenario_suite
+            .items
+            .iter()
+            .map(|e| e.scenarios.len())
+            .sum::<usize>(),
+    );
+
+    let mut all_results = Vec::new();
+    let mut events: Vec<Value> = Vec::new();
+
+    for ext in &sample.scenario_suite.items {
+        let item = sample.items.iter().find(|i| i.id == ext.extension_id);
+        let source_tier = item.map_or("unknown", |i| &i.source_tier);
+        let runtime_tier = item.map_or("unknown", |i| &i.runtime_tier);
+
+        eprintln!(
+            "[smoke] extension={} source_tier={source_tier} runtime_tier={runtime_tier} scenarios={}",
+            ext.extension_id,
+            ext.scenarios.len()
+        );
+
+        for scenario in &ext.scenarios {
+            let event_start = Utc::now();
+            let result = run_scenario(ext, scenario, &sample.items);
+
+            // Build per-event log entry
+            let event = serde_json::json!({
+                "schema": "pi.ext.smoke.v1",
+                "run_id": run_id,
+                "ts": event_start.to_rfc3339_opts(SecondsFormat::Millis, true),
+                "extension_id": ext.extension_id,
+                "scenario_id": scenario.id,
+                "event_type": scenario.kind,
+                "tool_name": scenario.tool_name,
+                "command_name": scenario.command_name,
+                "event_name": scenario.event_name,
+                "source_tier": source_tier,
+                "runtime_tier": runtime_tier,
+                "status": result.status,
+                "duration_ms": result.duration_ms,
+                "output": result.output,
+                "diffs": result.diffs,
+                "error": result.error,
+                "skip_reason": result.skip_reason,
+            });
+            events.push(event);
+
+            // Verbose console output
+            let status_tag = match result.status.as_str() {
+                "pass" => "PASS",
+                "fail" => "FAIL",
+                "skip" => "SKIP",
+                "error" => "ERR ",
+                _ => "????",
+            };
+            eprintln!(
+                "  [{status_tag}] {} ({}) - {} [{}ms]",
+                scenario.id, scenario.kind, scenario.summary, result.duration_ms
+            );
+            if result.status == "fail" {
+                for diff in &result.diffs {
+                    eprintln!("         diff: {diff}");
+                }
+            }
+            if let Some(err) = &result.error {
+                eprintln!("         error: {err}");
+            }
+
+            all_results.push(result);
+        }
+    }
+
+    // Write global smoke JSONL (all events)
+    let smoke_jsonl = smoke_dir.join("smoke_events.jsonl");
+    let lines: Vec<String> = events
+        .iter()
+        .filter_map(|e| serde_json::to_string(e).ok())
+        .collect();
+    let _ = fs::write(&smoke_jsonl, lines.join("\n") + "\n");
+
+    // Write per-extension JSONL
+    write_per_extension_logs(&all_results, &smoke_dir);
+
+    // Write triage report
+    let triage_path = smoke_dir.join("triage.json");
+    write_triage_report(&all_results, &triage_path);
+
+    // Summary
+    let pass = all_results.iter().filter(|r| r.status == "pass").count();
+    let fail = all_results.iter().filter(|r| r.status == "fail").count();
+    let skip = all_results.iter().filter(|r| r.status == "skip").count();
+    let error = all_results.iter().filter(|r| r.status == "error").count();
+
+    eprintln!("[smoke] Results: {pass} pass, {fail} fail, {skip} skip, {error} error");
+    eprintln!("[smoke] Events JSONL: {}", smoke_jsonl.display());
+    eprintln!("[smoke] Triage: {}", triage_path.display());
+    eprintln!(
+        "[smoke] Per-ext logs: {}",
+        smoke_dir.join("extensions").display()
+    );
+
+    // Fail on scenario failures (not errors/skips)
+    let failures: Vec<&ScenarioResult> =
+        all_results.iter().filter(|r| r.status == "fail").collect();
+    assert!(
+        failures.is_empty(),
+        "Smoke suite failures ({}):\n{}",
+        failures.len(),
+        failures
+            .iter()
+            .map(|r| format!(
+                "  {} ({}/{}): {}",
+                r.scenario_id,
+                r.extension_id,
+                r.runtime_tier,
+                r.diffs.join("; ")
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
     );
 }
