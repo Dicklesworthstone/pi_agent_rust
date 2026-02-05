@@ -603,9 +603,314 @@ fn render_diffs(diffs: &[DiffItem]) -> String {
     out
 }
 
+// ============================================================================
+// Conformance Report Generation (bd-2jha)
+// ============================================================================
+
+pub mod report {
+    use chrono::{SecondsFormat, Utc};
+    use serde::{Deserialize, Serialize};
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ConformanceStatus {
+        Pass,
+        Fail,
+        Skip,
+        Error,
+    }
+
+    impl ConformanceStatus {
+        #[must_use]
+        pub const fn as_upper_str(self) -> &'static str {
+            match self {
+                Self::Pass => "PASS",
+                Self::Fail => "FAIL",
+                Self::Skip => "SKIP",
+                Self::Error => "ERROR",
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ConformanceDiffEntry {
+        pub category: String,
+        pub path: String,
+        pub message: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ExtensionConformanceResult {
+        pub id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tier: Option<u32>,
+        pub status: ConformanceStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub ts_time_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub rust_time_ms: Option<u64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub diffs: Vec<ConformanceDiffEntry>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub notes: Option<String>,
+    }
+
+    fn ratio(passed: u64, total: u64) -> f64 {
+        if total == 0 {
+            0.0
+        } else {
+            #[allow(clippy::cast_precision_loss)]
+            {
+                passed as f64 / total as f64
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct TierSummary {
+        pub total: u64,
+        pub passed: u64,
+        pub failed: u64,
+        pub skipped: u64,
+        pub errors: u64,
+        pub pass_rate: f64,
+    }
+
+    impl TierSummary {
+        fn from_results(results: &[ExtensionConformanceResult]) -> Self {
+            let total = results.len() as u64;
+            let passed = results
+                .iter()
+                .filter(|r| r.status == ConformanceStatus::Pass)
+                .count() as u64;
+            let failed = results
+                .iter()
+                .filter(|r| r.status == ConformanceStatus::Fail)
+                .count() as u64;
+            let skipped = results
+                .iter()
+                .filter(|r| r.status == ConformanceStatus::Skip)
+                .count() as u64;
+            let errors = results
+                .iter()
+                .filter(|r| r.status == ConformanceStatus::Error)
+                .count() as u64;
+
+            let pass_rate = ratio(passed, total);
+
+            Self {
+                total,
+                passed,
+                failed,
+                skipped,
+                errors,
+                pass_rate,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ConformanceSummary {
+        pub total: u64,
+        pub passed: u64,
+        pub failed: u64,
+        pub skipped: u64,
+        pub errors: u64,
+        pub pass_rate: f64,
+        pub by_tier: BTreeMap<String, TierSummary>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct ConformanceReport {
+        pub run_id: String,
+        pub timestamp: String,
+        pub summary: ConformanceSummary,
+        pub extensions: Vec<ExtensionConformanceResult>,
+    }
+
+    fn tier_key(tier: Option<u32>) -> String {
+        tier.map_or_else(|| "tier_unknown".to_string(), |tier| format!("tier{tier}"))
+    }
+
+    fn now_timestamp_string() -> String {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    /// Build a report from per-extension results.
+    ///
+    /// - `timestamp` defaults to `Utc::now()` if `None`.
+    /// - Results are sorted by (tier, id) for deterministic output.
+    #[must_use]
+    pub fn generate_report(
+        run_id: impl Into<String>,
+        timestamp: Option<String>,
+        mut results: Vec<ExtensionConformanceResult>,
+    ) -> ConformanceReport {
+        results.sort_by(|left, right| {
+            let left_tier = left.tier.unwrap_or(u32::MAX);
+            let right_tier = right.tier.unwrap_or(u32::MAX);
+            (left_tier, &left.id).cmp(&(right_tier, &right.id))
+        });
+
+        let total = results.len() as u64;
+        let passed = results
+            .iter()
+            .filter(|r| r.status == ConformanceStatus::Pass)
+            .count() as u64;
+        let failed = results
+            .iter()
+            .filter(|r| r.status == ConformanceStatus::Fail)
+            .count() as u64;
+        let skipped = results
+            .iter()
+            .filter(|r| r.status == ConformanceStatus::Skip)
+            .count() as u64;
+        let errors = results
+            .iter()
+            .filter(|r| r.status == ConformanceStatus::Error)
+            .count() as u64;
+
+        let pass_rate = ratio(passed, total);
+
+        let mut by_tier: BTreeMap<String, Vec<ExtensionConformanceResult>> = BTreeMap::new();
+        for result in &results {
+            by_tier
+                .entry(tier_key(result.tier))
+                .or_default()
+                .push(result.clone());
+        }
+
+        let by_tier = by_tier
+            .into_iter()
+            .map(|(key, items)| (key, TierSummary::from_results(&items)))
+            .collect::<BTreeMap<_, _>>();
+
+        ConformanceReport {
+            run_id: run_id.into(),
+            timestamp: timestamp.unwrap_or_else(now_timestamp_string),
+            summary: ConformanceSummary {
+                total,
+                passed,
+                failed,
+                skipped,
+                errors,
+                pass_rate,
+                by_tier,
+            },
+            extensions: results,
+        }
+    }
+
+    impl ConformanceReport {
+        /// Render a human-readable Markdown report.
+        #[must_use]
+        pub fn render_markdown(&self) -> String {
+            let mut out = String::new();
+            let pass_rate_pct = self.summary.pass_rate * 100.0;
+            let _ = writeln!(out, "# Extension Conformance Report");
+            let _ = writeln!(out, "Generated: {}", self.timestamp);
+            let _ = writeln!(out, "Run ID: {}", self.run_id);
+            let _ = writeln!(out);
+            let _ = writeln!(
+                out,
+                "Pass Rate: {:.1}% ({}/{})",
+                pass_rate_pct, self.summary.passed, self.summary.total
+            );
+            let _ = writeln!(out);
+            let _ = writeln!(out, "## Summary");
+            let _ = writeln!(out, "- Total: {}", self.summary.total);
+            let _ = writeln!(out, "- Passed: {}", self.summary.passed);
+            let _ = writeln!(out, "- Failed: {}", self.summary.failed);
+            let _ = writeln!(out, "- Skipped: {}", self.summary.skipped);
+            let _ = writeln!(out, "- Errors: {}", self.summary.errors);
+            let _ = writeln!(out);
+
+            let _ = writeln!(out, "## By Tier");
+            for (tier, summary) in &self.summary.by_tier {
+                let tier_label = match tier.strip_prefix("tier") {
+                    Some(num) if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
+                        format!("Tier {num}")
+                    }
+                    _ => tier.clone(),
+                };
+                let _ = writeln!(
+                    out,
+                    "### {tier_label}: {:.1}% ({}/{})",
+                    summary.pass_rate * 100.0,
+                    summary.passed,
+                    summary.total
+                );
+                let _ = writeln!(out);
+                let _ = writeln!(out, "| Extension | Status | TS Time | Rust Time | Notes |");
+                let _ = writeln!(out, "|---|---|---:|---:|---|");
+                for result in self.extensions.iter().filter(|r| &tier_key(r.tier) == tier) {
+                    let ts_time = result
+                        .ts_time_ms
+                        .map_or_else(String::new, |v| format!("{v}ms"));
+                    let rust_time = result
+                        .rust_time_ms
+                        .map_or_else(String::new, |v| format!("{v}ms"));
+                    let notes = result.notes.as_deref().unwrap_or("");
+                    let _ = writeln!(
+                        out,
+                        "| {} | {} | {} | {} | {} |",
+                        result.id,
+                        result.status.as_upper_str(),
+                        ts_time,
+                        rust_time,
+                        notes
+                    );
+                }
+                let _ = writeln!(out);
+            }
+
+            let failures = self
+                .extensions
+                .iter()
+                .filter(|r| matches!(r.status, ConformanceStatus::Fail | ConformanceStatus::Error))
+                .collect::<Vec<_>>();
+
+            let _ = writeln!(out, "## Failures");
+            if failures.is_empty() {
+                let _ = writeln!(out, "(none)");
+                return out;
+            }
+
+            for failure in failures {
+                let tier = failure
+                    .tier
+                    .map_or_else(|| "unknown".to_string(), |v| v.to_string());
+                let _ = writeln!(out, "### {} (Tier {})", failure.id, tier);
+                if let Some(notes) = failure.notes.as_deref().filter(|v| !v.is_empty()) {
+                    let _ = writeln!(out, "**Notes**: {notes}");
+                }
+                if failure.diffs.is_empty() {
+                    let _ = writeln!(out, "- (no diff details)");
+                } else {
+                    for diff in &failure.diffs {
+                        let _ = writeln!(out, "- `{}`: {}", diff.path, diff.message);
+                    }
+                }
+                let _ = writeln!(out);
+            }
+
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::compare_conformance_output;
+    use super::report::generate_report;
+    use super::report::{ConformanceDiffEntry, ConformanceStatus, ExtensionConformanceResult};
     use serde_json::json;
 
     #[test]
@@ -823,5 +1128,64 @@ mod tests {
         });
 
         compare_conformance_output(&expected, &actual).unwrap();
+    }
+
+    #[test]
+    fn conformance_report_summarizes_and_renders_markdown() {
+        let results = vec![
+            ExtensionConformanceResult {
+                id: "hello".to_string(),
+                tier: Some(1),
+                status: ConformanceStatus::Pass,
+                ts_time_ms: Some(42),
+                rust_time_ms: Some(38),
+                diffs: Vec::new(),
+                notes: None,
+            },
+            ExtensionConformanceResult {
+                id: "event-bus".to_string(),
+                tier: Some(2),
+                status: ConformanceStatus::Fail,
+                ts_time_ms: Some(55),
+                rust_time_ms: Some(60),
+                diffs: vec![ConformanceDiffEntry {
+                    category: "registration.event_hooks".to_string(),
+                    path: "registrations.event_hooks".to_string(),
+                    message: "extra hook in Rust".to_string(),
+                }],
+                notes: Some("registration mismatch".to_string()),
+            },
+            ExtensionConformanceResult {
+                id: "ui-heavy".to_string(),
+                tier: Some(6),
+                status: ConformanceStatus::Skip,
+                ts_time_ms: None,
+                rust_time_ms: None,
+                diffs: Vec::new(),
+                notes: Some("ignored in CI".to_string()),
+            },
+        ];
+
+        let report = generate_report(
+            "run-test",
+            Some("2026-02-05T00:00:00Z".to_string()),
+            results,
+        );
+
+        assert_eq!(report.summary.total, 3);
+        assert_eq!(report.summary.passed, 1);
+        assert_eq!(report.summary.failed, 1);
+        assert_eq!(report.summary.skipped, 1);
+        assert_eq!(report.summary.errors, 0);
+        assert!(report.summary.by_tier.contains_key("tier1"));
+        assert!(report.summary.by_tier.contains_key("tier2"));
+        assert!(report.summary.by_tier.contains_key("tier6"));
+
+        let md = report.render_markdown();
+        assert!(md.contains("# Extension Conformance Report"));
+        assert!(md.contains("Run ID: run-test"));
+        assert!(md.contains("| hello | PASS | 42ms | 38ms |"));
+        assert!(md.contains("## Failures"));
+        assert!(md.contains("### event-bus (Tier 2)"));
     }
 }
