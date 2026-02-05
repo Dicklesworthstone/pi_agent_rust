@@ -1043,6 +1043,9 @@ impl JsModuleResolver for PiJsResolver {
             "assert" => "node:assert",
             "stream" => "node:stream",
             "module" => "node:module",
+            "string_decoder" => "node:string_decoder",
+            "querystring" => "node:querystring",
+            "process" => "node:process",
             other => other,
         };
 
@@ -1351,7 +1354,12 @@ export function getModel() {
   return "claude-sonnet-4-5";
 }
 
-export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, complete, completeSimple, getModel };
+export function getApiProvider() {
+  // Return a default provider identifier
+  return "anthropic";
+}
+
+export default { StringEnum, calculateCost, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, complete, completeSimple, getModel, getApiProvider };
 "#
         .trim()
         .to_string(),
@@ -2077,10 +2085,56 @@ export function relative(from, to) {
   return result.join("/") || ".";
 }
 
+export function isAbsolute(p) {
+  return String(p ?? "").startsWith("/");
+}
+
+export function extname(p) {
+  const s = String(p ?? "").replace(/\\/g, "/");
+  const b = s.lastIndexOf("/");
+  const name = b === -1 ? s : s.slice(b + 1);
+  const dot = name.lastIndexOf(".");
+  if (dot <= 0) return "";
+  return name.slice(dot);
+}
+
+export function normalize(p) {
+  const s = String(p ?? "").replace(/\\/g, "/");
+  const isAbs = s.startsWith("/");
+  const parts = s.split("/").filter(Boolean);
+  const out = [];
+  for (const part of parts) {
+    if (part === "..") { if (out.length > 0 && out[out.length - 1] !== "..") out.pop(); else if (!isAbs) out.push(part); }
+    else if (part !== ".") out.push(part);
+  }
+  const result = out.join("/");
+  return isAbs ? "/" + result : result || ".";
+}
+
+export function parse(p) {
+  const s = String(p ?? "").replace(/\\/g, "/");
+  const isAbs = s.startsWith("/");
+  const lastSlash = s.lastIndexOf("/");
+  const dir = lastSlash === -1 ? "" : s.slice(0, lastSlash) || (isAbs ? "/" : "");
+  const base = lastSlash === -1 ? s : s.slice(lastSlash + 1);
+  const ext = extname(base);
+  const name = ext ? base.slice(0, -ext.length) : base;
+  const root = isAbs ? "/" : "";
+  return { root, dir, base, ext, name };
+}
+
+export function format(pathObj) {
+  const dir = pathObj.dir || pathObj.root || "";
+  const base = pathObj.base || (pathObj.name || "") + (pathObj.ext || "");
+  if (!dir) return base;
+  return dir === pathObj.root ? dir + base : dir + "/" + base;
+}
+
 export const sep = "/";
 export const delimiter = ":";
+export const posix = { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter };
 
-export default { join, dirname, resolve, basename, relative, sep, delimiter };
+export default { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter, posix };
 "#
         .trim()
         .to_string(),
@@ -2189,6 +2243,20 @@ export function rmdirSync(_path, _opts) { return; }
 export function copyFileSync(_src, _dest, _mode) { return; }
 export function renameSync(_oldPath, _newPath) { return; }
 export function mkdirSync(_path, _opts) { return; }
+export function accessSync(_path, _mode) { throw new Error("ENOENT: no such file or directory"); }
+export function lstatSync(_path) { throw new Error("lstatSync unavailable"); }
+export function readFile(_path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  if (typeof callback === 'function') callback(null, '');
+}
+export function writeFile(_path, _data, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  if (typeof callback === 'function') callback(null);
+}
+export function access(_path, modeOrCb, cb) {
+  const callback = typeof modeOrCb === 'function' ? modeOrCb : cb;
+  if (typeof callback === 'function') callback(new Error("ENOENT: no such file or directory"));
+}
 export const promises = {
   access: async (_path, _mode) => {},
   mkdir: async (_path, _opts) => {},
@@ -2205,7 +2273,7 @@ export const promises = {
   readdir: async (_path, _opts) => [],
   rm: async (_path, _opts) => {},
 };
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, copyFileSync, renameSync, mkdirSync, promises };
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, copyFileSync, renameSync, mkdirSync, accessSync, lstatSync, readFile, writeFile, access, promises };
 "#
         .trim()
         .to_string(),
@@ -2639,6 +2707,92 @@ class PassThrough extends Transform {
 
 export { Stream, Readable, Writable, Duplex, Transform, PassThrough };
 export default { Stream, Readable, Writable, Duplex, Transform, PassThrough };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // node:string_decoder — often imported by stream consumers
+    modules.insert(
+        "node:string_decoder".to_string(),
+        r#"
+export class StringDecoder {
+  constructor(encoding) { this.encoding = encoding || 'utf8'; }
+  write(buf) { return typeof buf === 'string' ? buf : String(buf ?? ''); }
+  end(buf) { return buf ? this.write(buf) : ''; }
+}
+export default { StringDecoder };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // node:querystring — URL query string encoding/decoding
+    modules.insert(
+        "node:querystring".to_string(),
+        r#"
+export function parse(qs, sep, eq) {
+  const s = String(qs ?? '');
+  const sepStr = sep || '&';
+  const eqStr = eq || '=';
+  const result = {};
+  if (!s) return result;
+  for (const pair of s.split(sepStr)) {
+    const idx = pair.indexOf(eqStr);
+    const key = idx === -1 ? decodeURIComponent(pair) : decodeURIComponent(pair.slice(0, idx));
+    const val = idx === -1 ? '' : decodeURIComponent(pair.slice(idx + eqStr.length));
+    if (Object.prototype.hasOwnProperty.call(result, key)) {
+      if (Array.isArray(result[key])) result[key].push(val);
+      else result[key] = [result[key], val];
+    } else {
+      result[key] = val;
+    }
+  }
+  return result;
+}
+export function stringify(obj, sep, eq) {
+  const sepStr = sep || '&';
+  const eqStr = eq || '=';
+  if (!obj || typeof obj !== 'object') return '';
+  return Object.entries(obj).map(([k, v]) => {
+    if (Array.isArray(v)) return v.map(i => encodeURIComponent(k) + eqStr + encodeURIComponent(i)).join(sepStr);
+    return encodeURIComponent(k) + eqStr + encodeURIComponent(v ?? '');
+  }).join(sepStr);
+}
+export const decode = parse;
+export const encode = stringify;
+export function escape(str) { return encodeURIComponent(str); }
+export function unescape(str) { return decodeURIComponent(str); }
+export default { parse, stringify, decode, encode, escape, unescape };
+"#
+        .trim()
+        .to_string(),
+    );
+
+    // node:process — re-exports globalThis.process
+    modules.insert(
+        "node:process".to_string(),
+        r#"
+const p = globalThis.process || {};
+export const env = p.env || {};
+export const argv = p.argv || [];
+export const cwd = typeof p.cwd === 'function' ? p.cwd : () => '/';
+export const platform = p.platform || 'linux';
+export const arch = p.arch || 'x64';
+export const version = p.version || 'v20.0.0';
+export const versions = p.versions || {};
+export const pid = p.pid || 1;
+export const ppid = p.ppid || 0;
+export const stdout = p.stdout || { write() {} };
+export const stderr = p.stderr || { write() {} };
+export const stdin = p.stdin || {};
+export const nextTick = p.nextTick || ((fn, ...a) => Promise.resolve().then(() => fn(...a)));
+export const hrtime = p.hrtime || Object.assign(() => [0, 0], { bigint: () => BigInt(0) });
+export const exit = p.exit || (() => {});
+export const kill = p.kill || (() => {});
+export const on = p.on || (() => {});
+export const off = p.off || (() => {});
+export default p;
 "#
         .trim()
         .to_string(),
@@ -5503,17 +5657,35 @@ if (typeof globalThis.process === 'undefined') {
         },
     );
 
+    const noop = () => {};
+    const noopWrite = { write: noop, end: noop, on: noop, once: noop, pipe: noop };
     globalThis.process = {
         env: envProxy,
         argv: __pi_process_args_native(),
         cwd: () => detCwd || __pi_process_cwd_native(),
         platform: String(platform).split('-')[0],
+        arch: 'x64',
+        version: 'v20.0.0',
+        versions: { node: '20.0.0', v8: '0.0.0', modules: '0' },
+        pid: 1,
+        ppid: 0,
+        stdout: noopWrite,
+        stderr: noopWrite,
+        stdin: { on: noop, once: noop, read: noop, resume: noop, pause: noop },
+        nextTick: (fn, ...args) => { Promise.resolve().then(() => fn(...args)); },
+        hrtime: Object.assign((_prev) => [0, 0], {
+            bigint: () => BigInt(0),
+        }),
         kill: (_pid, _sig) => {
             throw new Error('process.kill is not available in PiJS');
         },
         exit: (_code) => {
             throw new Error('process.exit is not available in PiJS');
         },
+        on: noop,
+        off: noop,
+        once: noop,
+        removeListener: noop,
     };
 
     try { Object.freeze(envProxy); } catch (_) {}
@@ -7329,6 +7501,105 @@ mod tests {
                 get_global_json(&runtime, "bare_events_ok").await,
                 serde_json::json!(true)
             );
+        });
+    }
+
+    #[test]
+    fn pijs_path_extended_functions() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.pathResults = {};
+                    import('node:path').then((path) => {
+                        globalThis.pathResults.isAbsRoot = path.isAbsolute('/foo/bar');
+                        globalThis.pathResults.isAbsRel = path.isAbsolute('foo/bar');
+                        globalThis.pathResults.extJs = path.extname('/a/b/file.js');
+                        globalThis.pathResults.extNone = path.extname('/a/b/noext');
+                        globalThis.pathResults.extDot = path.extname('.hidden');
+                        globalThis.pathResults.norm = path.normalize('/a/b/../c/./d');
+                        globalThis.pathResults.parseBase = path.parse('/home/user/file.txt').base;
+                        globalThis.pathResults.parseExt = path.parse('/home/user/file.txt').ext;
+                        globalThis.pathResults.parseName = path.parse('/home/user/file.txt').name;
+                        globalThis.pathResults.parseDir = path.parse('/home/user/file.txt').dir;
+                        globalThis.pathResults.hasPosix = typeof path.posix === 'object';
+                        globalThis.pathResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval path extended");
+
+            let r = get_global_json(&runtime, "pathResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["isAbsRoot"], serde_json::json!(true));
+            assert_eq!(r["isAbsRel"], serde_json::json!(false));
+            assert_eq!(r["extJs"], serde_json::json!(".js"));
+            assert_eq!(r["extNone"], serde_json::json!(""));
+            assert_eq!(r["extDot"], serde_json::json!(""));
+            assert_eq!(r["norm"], serde_json::json!("/a/c/d"));
+            assert_eq!(r["parseBase"], serde_json::json!("file.txt"));
+            assert_eq!(r["parseExt"], serde_json::json!(".txt"));
+            assert_eq!(r["parseName"], serde_json::json!("file"));
+            assert_eq!(r["parseDir"], serde_json::json!("/home/user"));
+            assert_eq!(r["hasPosix"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_callback_apis() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.fsResults = {};
+                    import('node:fs').then((fs) => {
+                        // readFile callback
+                        fs.readFile('/fake', 'utf8', (err, data) => {
+                            globalThis.fsResults.readFileCallbackCalled = true;
+                            globalThis.fsResults.readFileData = data;
+                        });
+                        // writeFile callback
+                        fs.writeFile('/fake', 'data', (err) => {
+                            globalThis.fsResults.writeFileCallbackCalled = true;
+                        });
+                        // accessSync throws
+                        try {
+                            fs.accessSync('/nonexistent');
+                            globalThis.fsResults.accessSyncThrew = false;
+                        } catch (e) {
+                            globalThis.fsResults.accessSyncThrew = true;
+                        }
+                        // access callback with error
+                        fs.access('/nonexistent', (err) => {
+                            globalThis.fsResults.accessCallbackErr = !!err;
+                        });
+                        globalThis.fsResults.hasLstatSync = typeof fs.lstatSync === 'function';
+                        globalThis.fsResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval fs callbacks");
+
+            let r = get_global_json(&runtime, "fsResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["readFileCallbackCalled"], serde_json::json!(true));
+            assert_eq!(r["readFileData"], serde_json::json!(""));
+            assert_eq!(r["writeFileCallbackCalled"], serde_json::json!(true));
+            assert_eq!(r["accessSyncThrew"], serde_json::json!(true));
+            assert_eq!(r["accessCallbackErr"], serde_json::json!(true));
+            assert_eq!(r["hasLstatSync"], serde_json::json!(true));
         });
     }
 }
