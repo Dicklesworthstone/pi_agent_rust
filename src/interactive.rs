@@ -7683,6 +7683,7 @@ impl PiApp {
                 } else {
                     args.to_string()
                 };
+                let provider = provider.trim().to_ascii_lowercase();
 
                 // Look up OAuth config: built-in (anthropic) or extension-registered.
                 let oauth_result = if provider == "anthropic" {
@@ -7753,6 +7754,7 @@ impl PiApp {
                 } else {
                     args.to_string()
                 };
+                let provider = provider.trim().to_ascii_lowercase();
 
                 let auth_path = crate::config::Config::auth_path();
                 match crate::auth::AuthStorage::load(auth_path) {
@@ -7933,6 +7935,13 @@ impl PiApp {
                 drop(session_guard);
                 self.spawn_save_session();
 
+                if !self
+                    .available_models
+                    .iter()
+                    .any(|entry| model_entry_matches(entry, &next))
+                {
+                    self.available_models.push(next.clone());
+                }
                 self.model_entry = next.clone();
                 if let Ok(mut guard) = self.model_entry_shared.lock() {
                     *guard = next.clone();

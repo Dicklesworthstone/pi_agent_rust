@@ -916,7 +916,7 @@ fn hints_io_connection_refused() {
 
 #[test]
 fn hints_io_fallback() {
-    let io_err = io::Error::new(ErrorKind::Other, "some other io error");
+    let io_err = io::Error::other("some other io error");
     let err: Error = io_err.into();
     let h = err.hints();
     assert_summary_contains(&h, "I/O error");
@@ -956,8 +956,10 @@ fn hints_all_variants_produce_nonempty_summary() {
         Error::tool("t", "test"),
         Error::validation("test"),
         Error::extension("test"),
-        io::Error::new(ErrorKind::Other, "test").into(),
-        serde_json::from_str::<serde_json::Value>("bad").unwrap_err().into(),
+        io::Error::other("test").into(),
+        serde_json::from_str::<serde_json::Value>("bad")
+            .unwrap_err()
+            .into(),
         Error::Aborted,
         Error::api("test"),
     ];
@@ -985,8 +987,10 @@ fn hints_context_always_has_details_or_path() {
         Error::tool("t", "test"),
         Error::validation("test"),
         Error::extension("test"),
-        io::Error::new(ErrorKind::Other, "test").into(),
-        serde_json::from_str::<serde_json::Value>("bad").unwrap_err().into(),
+        io::Error::other("test").into(),
+        serde_json::from_str::<serde_json::Value>("bad")
+            .unwrap_err()
+            .into(),
         Error::api("test"),
     ];
 
