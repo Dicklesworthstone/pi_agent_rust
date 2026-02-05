@@ -4665,11 +4665,12 @@ mod tests {
                     .expect("runtime"),
             );
 
+            // pi.exec(cmd, args, options) - args is the second positional arg
             runtime
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.exec("echo", { args: ["hello", "world"] })
+                    pi.exec("echo", ["hello", "world"], {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
                 "#,
@@ -4771,7 +4772,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.errMsg = "";
-                    pi.exec("echo", { args: "not-an-array" })
+                    pi.exec("echo", "not-an-array", {})
                         .then(() => { globalThis.errMsg = "should_not_resolve"; })
                         .catch((e) => { globalThis.errMsg = e.message || String(e); });
                 "#,
@@ -4822,7 +4823,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.exec("sh", { args: ["-c", "echo OUT && echo ERR >&2"] })
+                    pi.exec("sh", ["-c", "echo OUT && echo ERR >&2"], {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
                 "#,
@@ -4874,7 +4875,7 @@ mod tests {
                 .eval(
                     r#"
                     globalThis.result = null;
-                    pi.exec("sh", { args: ["-c", "exit 42"] })
+                    pi.exec("sh", ["-c", "exit 42"], {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
                 "#,

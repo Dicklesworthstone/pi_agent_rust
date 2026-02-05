@@ -801,6 +801,7 @@ fn e2e_tui_basic_chat_vcr() {
     session.set_env(VCR_ENV_MODE, "playback");
     session.set_env(VCR_ENV_DIR, &cassette_dir_str);
     session.set_env("PI_VCR_TEST_NAME", VCR_BASIC_CHAT_TEST_NAME);
+    session.set_env("PI_TEST_MODE", "1");
 
     session.harness.section("launch");
     session.launch(&vcr_interactive_args_no_tools());
@@ -923,6 +924,7 @@ fn e2e_tui_vcr_tool_read() {
     session.set_env(VCR_ENV_DIR, &cassette_dir_str);
     session.set_env("PI_VCR_TEST_NAME", VCR_TEST_NAME);
     session.set_env("VCR_DEBUG_BODY", "1");
+    session.set_env("PI_TEST_MODE", "1");
 
     session.launch(&vcr_interactive_args());
     session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
