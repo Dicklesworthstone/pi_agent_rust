@@ -361,6 +361,32 @@ impl VcrRecorder {
                 message.push('\n');
             }
 
+            // Always dump debug bodies to a file when VCR_DEBUG_BODY_FILE is set
+            if let Ok(debug_path) = std::env::var("VCR_DEBUG_BODY_FILE") {
+                use std::fmt::Write as _;
+
+                let mut debug = String::new();
+                if let Some(body) = &request.body {
+                    let mut redacted = body.clone();
+                    redact_json(&mut redacted);
+                    if let Ok(pretty) = serde_json::to_string_pretty(&redacted) {
+                        debug.push_str("=== INCOMING (redacted) ===\n");
+                        debug.push_str(&pretty);
+                        debug.push('\n');
+                    }
+                }
+                for (idx, interaction) in cassette.interactions.iter().enumerate() {
+                    if let Some(body) = &interaction.request.body {
+                        if let Ok(pretty) = serde_json::to_string_pretty(body) {
+                            let _ = write!(debug, "=== RECORDED [{idx}] ===\n");
+                            debug.push_str(&pretty);
+                            debug.push('\n');
+                        }
+                    }
+                }
+                let _ = std::fs::write(&debug_path, &debug);
+            }
+
             if env_truthy("VCR_DEBUG_BODY") {
                 use std::fmt::Write as _;
 
