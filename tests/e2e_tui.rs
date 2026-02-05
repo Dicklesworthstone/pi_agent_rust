@@ -89,14 +89,21 @@ fn build_vcr_system_prompt(workdir: &Path, env_root: &Path) -> String {
     let enabled_tools = cli.enabled_tools();
     let global_dir = env_root.join("agent");
     let package_dir = env_root.join("packages");
-    build_system_prompt(
+    let previous = std::env::var_os("PI_TEST_MODE");
+    std::env::set_var("PI_TEST_MODE", "1");
+    let prompt = build_system_prompt(
         &cli,
         workdir,
         &enabled_tools,
         None,
         &global_dir,
         &package_dir,
-    )
+    );
+    match previous {
+        Some(value) => std::env::set_var("PI_TEST_MODE", value),
+        None => std::env::remove_var("PI_TEST_MODE"),
+    }
+    prompt
 }
 
 fn read_output_for_sample(cwd: &Path, path: &str) -> String {
@@ -597,8 +604,7 @@ fn e2e_tui_artifact_format() {
         let parsed: serde_json::Value = match serde_json::from_str(line) {
             Ok(parsed) => parsed,
             Err(err) => {
-                assert!(false, "Invalid JSONL line: {err}\n{line}");
-                return;
+                panic!("Invalid JSONL line: {err}\n{line}");
             }
         };
         assert!(parsed.get("label").is_some(), "Missing 'label' in step");
@@ -624,8 +630,7 @@ fn e2e_tui_artifact_format() {
         let _parsed: serde_json::Value = match serde_json::from_str(line) {
             Ok(parsed) => parsed,
             Err(err) => {
-                assert!(false, "Invalid log JSONL line: {err}\n{line}");
-                return;
+                panic!("Invalid log JSONL line: {err}\n{line}");
             }
         };
     }
@@ -705,7 +710,7 @@ fn build_mock_anthropic_text_sse(text: &str) -> String {
     sse
 }
 
-/// Build SSE body for a tool_use response.
+/// Build SSE body for a `tool_use` response.
 fn build_mock_anthropic_tool_call_sse(tool_name: &str, tool_id: &str, args_json: &str) -> String {
     let sse_chunk = |event: &str, data: serde_json::Value| -> String {
         let payload = serde_json::to_string(&data).expect("serialize sse payload");

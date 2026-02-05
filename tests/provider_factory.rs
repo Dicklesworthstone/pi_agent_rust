@@ -224,10 +224,7 @@ fn create_provider_rejects_azure_without_deployment() {
     let harness = TestHarness::new("create_provider_rejects_azure_without_deployment");
     let entry = make_model_entry("azure-openai", "gpt-4o", "https://example.openai.azure.com");
     let err = match create_provider(&entry, None) {
-        Ok(_) => {
-            assert!(false, "expected azure-openai error");
-            return;
-        }
+        Ok(_) => panic!("expected azure-openai error"),
         Err(err) => err,
     };
     harness.log().info_ctx("provider", "azure error", |ctx| {
@@ -239,7 +236,7 @@ fn create_provider_rejects_azure_without_deployment() {
             assert_eq!(provider, "azure-openai");
             assert!(message.contains("resource+deployment"));
         }
-        other => assert!(false, "unexpected error: {other}"),
+        other => panic!("unexpected error: {other}"),
     }
 }
 
@@ -248,10 +245,7 @@ fn create_provider_rejects_unknown_provider() {
     let harness = TestHarness::new("create_provider_rejects_unknown_provider");
     let entry = make_model_entry("mystery", "mystery-model", "https://example.com/v1");
     let err = match create_provider(&entry, None) {
-        Ok(_) => {
-            assert!(false, "expected unknown provider error");
-            return;
-        }
+        Ok(_) => panic!("expected unknown provider error"),
         Err(err) => err,
     };
     harness.log().info_ctx("provider", "unknown error", |ctx| {
@@ -263,7 +257,7 @@ fn create_provider_rejects_unknown_provider() {
             assert_eq!(provider, "mystery");
             assert!(message.contains("not implemented"));
         }
-        other => assert!(false, "unexpected error: {other}"),
+        other => panic!("unexpected error: {other}"),
     }
 }
 
