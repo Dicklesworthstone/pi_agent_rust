@@ -3123,6 +3123,7 @@ mod wasm_host {
                 }),
                 tools: Vec::new(),
                 slash_commands: Vec::new(),
+                shortcuts: Vec::new(),
                 event_hooks: Vec::new(),
             }
         }
@@ -4926,8 +4927,7 @@ async fn execute_extension_shortcut(
             let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
             let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
             let ctx_js = json_to_js(&ctx, &ctx_payload)?;
-            let promise: rquickjs::Value<'_> =
-                exec_fn.call((key_id.to_string(), ctx_js))?;
+            let promise: rquickjs::Value<'_> = exec_fn.call((key_id.to_string(), ctx_js))?;
             let _task: String = task_start.call((task_id.clone(), promise))?;
             Ok(())
         })
@@ -6244,6 +6244,7 @@ impl ExtensionManager {
                 capability_manifest: None,
                 tools: Vec::new(),
                 slash_commands: vec![entry],
+                shortcuts: Vec::new(),
                 event_hooks: Vec::new(),
             });
         }
@@ -6289,6 +6290,56 @@ impl ExtensionManager {
 
         drop(guard);
         commands
+    }
+
+    pub fn has_shortcut(&self, key_id: &str) -> bool {
+        let needle = key_id.to_lowercase();
+        let guard = self.inner.lock().unwrap();
+        guard
+            .extensions
+            .iter()
+            .flat_map(|ext| ext.shortcuts.iter())
+            .filter_map(|s| s.get("key_id").and_then(Value::as_str))
+            .any(|id| id == needle)
+    }
+
+    pub fn list_shortcuts(&self) -> Vec<Value> {
+        let guard = self.inner.lock().unwrap();
+        let mut shortcuts = Vec::new();
+
+        for ext in &guard.extensions {
+            for shortcut in &ext.shortcuts {
+                let key_id = shortcut
+                    .get("key_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let description = shortcut.get("description").and_then(Value::as_str);
+                shortcuts.push(json!({
+                    "key_id": key_id,
+                    "key": shortcut.get("key"),
+                    "description": description,
+                    "source": "extension",
+                }));
+            }
+        }
+
+        drop(guard);
+        shortcuts
+    }
+
+    /// Execute an extension shortcut via the JS runtime.
+    pub async fn execute_shortcut(
+        &self,
+        key_id: &str,
+        ctx_payload: Value,
+        timeout_ms: u64,
+    ) -> Result<Value> {
+        let runtime = self
+            .js_runtime()
+            .ok_or_else(|| Error::extension("JS extension runtime not configured"))?;
+        runtime
+            .execute_shortcut(key_id.to_string(), ctx_payload, timeout_ms)
+            .await
     }
 
     pub async fn request_ui(
@@ -6907,6 +6958,7 @@ mod tests {
                         capability_manifest: None,
                         tools: Vec::new(),
                         slash_commands: Vec::new(),
+                        shortcuts: Vec::new(),
                         event_hooks: Vec::new(),
                     }),
                 },
