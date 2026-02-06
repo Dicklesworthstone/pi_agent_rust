@@ -33,8 +33,13 @@ use std::time::{Duration, Instant};
 
 /// Default iterations per event type.
 const ITERATIONS: u64 = 200;
-/// P99 budget in microseconds (5ms = 5000us).
-const P99_BUDGET_US: u64 = 5_000;
+/// P99 budget in microseconds — release target is 5ms, debug is relaxed to 200ms
+/// because debug builds have ~10-50x overhead from bounds checks and no inlining.
+const P99_BUDGET_US: u64 = if cfg!(debug_assertions) {
+    200_000
+} else {
+    5_000
+};
 /// Warmup iterations before measurement.
 const WARMUP: u64 = 10;
 
