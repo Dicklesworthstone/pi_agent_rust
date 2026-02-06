@@ -15,7 +15,6 @@ use crate::extensions_js::{
 use crate::permissions::PermissionStore;
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
-use crate::sse::SseStream;
 use crate::tools::ToolRegistry;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeBuilder;
@@ -25,12 +24,11 @@ use asupersync::time::{sleep, timeout, wall_now};
 use asupersync::{Budget, Cx};
 use async_trait::async_trait;
 use base64::Engine as _;
-use futures::{FutureExt as _, StreamExt as _};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest as _;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -2286,77 +2284,7 @@ mod wasm_host {
                     None,
                     None,
                 )),
-                HostcallOutcome::StreamChunk {
-                    sequence,
-                    chunk,
-                    is_final,
-                } => {
-                    let value = json!({
-                        "stream": true,
-                        "sequence": sequence,
-                        "chunk": chunk,
-                        "isFinal": is_final,
-                    });
-
-                    serde_json::to_string(&value).map_err(|err| {
-                        Self::host_error_json(
-                            HostCallErrorCode::Internal,
-                            format!("Failed to serialize hostcall stream chunk: {err}"),
-                            None,
-                            None,
-                        )
-                    })
-                }
             }
-        }
-
-        fn host_result_payload_to_result(
-            result: HostResultPayload,
-        ) -> std::result::Result<String, String> {
-            if result.is_error {
-                let err = result.error.unwrap_or_else(|| HostCallError {
-                    code: HostCallErrorCode::Internal,
-                    message: "Hostcall failed with missing error payload".to_string(),
-                    details: None,
-                    retryable: None,
-                });
-
-                return Err(serde_json::to_string(&err).unwrap_or_else(|_| {
-                    Self::host_error_json(
-                        HostCallErrorCode::Internal,
-                        "Failed to serialize hostcall error payload",
-                        None,
-                        None,
-                    )
-                }));
-            }
-
-            if let Some(chunk) = result.chunk {
-                let value = json!({
-                    "stream": true,
-                    "sequence": chunk.index,
-                    "chunk": result.output,
-                    "isFinal": chunk.is_last,
-                });
-
-                return serde_json::to_string(&value).map_err(|err| {
-                    Self::host_error_json(
-                        HostCallErrorCode::Internal,
-                        format!("Failed to serialize hostcall stream chunk: {err}"),
-                        None,
-                        None,
-                    )
-                });
-            }
-
-            serde_json::to_string(&result.output).map_err(|err| {
-                Self::host_error_json(
-                    HostCallErrorCode::Internal,
-                    format!("Failed to serialize hostcall output: {err}"),
-                    None,
-                    None,
-                )
-            })
         }
 
         async fn resolve_policy_decision(
@@ -2814,20 +2742,211 @@ mod wasm_host {
                 ));
             }
 
-            let manager = self.manager();
-            let ctx = HostCallContext {
-                runtime: "wasm",
-                extension_id: self.extension_id.as_deref(),
-                policy: &self.policy,
-                tools: self.tools.as_ref(),
-                http: &self.http,
-                fs: Some(&self.fs),
-                env_allowlist: Some(&self.env_allowlist),
-                manager: manager.as_ref(),
+            let Some(required) = required_capability_for_host_call(&payload) else {
+                return Err(Self::host_error_json(
+                    HostCallErrorCode::InvalidRequest,
+                    format!("Unknown host_call method: {}", payload.method),
+                    Some(json!({ "method": payload.method })),
+                    None,
+                ));
             };
 
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            Self::host_result_payload_to_result(result)
+            if !payload.capability.trim().eq_ignore_ascii_case(&required) {
+                return Err(Self::host_error_json(
+                    HostCallErrorCode::InvalidRequest,
+                    "Capability mismatch: declared capability does not match derived capability",
+                    Some(json!({
+                        "declared": payload.capability,
+                        "required": required,
+                        "method": payload.method,
+                    })),
+                    None,
+                ));
+            }
+
+            let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
+            let params_hash = Self::hostcall_params_hash(&payload.method, &payload.params);
+            let started_at = Instant::now();
+
+            tracing::info!(
+                event = "host_call.start",
+                runtime = "wasm",
+                call_id = %payload.call_id,
+                extension_id = ?self.extension_id.as_deref(),
+                capability = %required,
+                method = %payload.method,
+                params_hash = %params_hash,
+                timeout_ms = call_timeout_ms,
+                "Hostcall start"
+            );
+
+            let (decision, reason, capability) = self.resolve_policy_decision(&required).await;
+            if decision == PolicyDecision::Allow {
+                tracing::info!(
+                    event = "policy.decision",
+                    runtime = "wasm",
+                    call_id = %payload.call_id,
+                    extension_id = ?self.extension_id.as_deref(),
+                    capability = %capability,
+                    decision = ?decision,
+                    reason = %reason,
+                    params_hash = %params_hash,
+                    "Hostcall allowed by policy"
+                );
+            } else {
+                tracing::warn!(
+                    event = "policy.decision",
+                    runtime = "wasm",
+                    call_id = %payload.call_id,
+                    extension_id = ?self.extension_id.as_deref(),
+                    capability = %capability,
+                    decision = ?decision,
+                    reason = %reason,
+                    params_hash = %params_hash,
+                    "Hostcall denied by policy"
+                );
+            }
+
+            let method = payload.method.trim().to_ascii_lowercase();
+            let outcome = if decision == PolicyDecision::Allow {
+                let dispatch = async {
+                    match method.as_str() {
+                        "tool" => self.dispatch_tool(&payload).await,
+                        "http" => self.dispatch_http(&payload).await,
+                        "exec" => self.dispatch_exec(&payload).await,
+                        "fs" => self.dispatch_fs(&payload).await,
+                        "env" => self.dispatch_env(&payload).await,
+                        "session" | "ui" | "events" => {
+                            let op = Self::hostcall_op(&payload.params).ok_or_else(|| {
+                                Self::host_error_json(
+                                    HostCallErrorCode::InvalidRequest,
+                                    format!("Missing host_call op for {method}"),
+                                    Some(json!({ "method": method })),
+                                    None,
+                                )
+                            })?;
+                            let manager = self.manager().ok_or_else(|| {
+                                Self::host_error_json(
+                                    HostCallErrorCode::Denied,
+                                    "No extension manager configured for host_call",
+                                    Some(json!({ "method": method })),
+                                    None,
+                                )
+                            })?;
+                            let outcome = match method.as_str() {
+                                "session" => {
+                                    dispatch_hostcall_session(
+                                        &payload.call_id,
+                                        &manager,
+                                        &op,
+                                        payload.params.clone(),
+                                    )
+                                    .await
+                                }
+                                "ui" => {
+                                    dispatch_hostcall_ui(
+                                        &payload.call_id,
+                                        &manager,
+                                        &op,
+                                        payload.params.clone(),
+                                    )
+                                    .await
+                                }
+                                "events" => {
+                                    dispatch_hostcall_events(
+                                        &payload.call_id,
+                                        &manager,
+                                        self.tools.as_ref(),
+                                        &op,
+                                        payload.params.clone(),
+                                    )
+                                    .await
+                                }
+                                _ => HostcallOutcome::Error {
+                                    code: "invalid_request".to_string(),
+                                    message: format!("Unsupported host_call method: {method}"),
+                                },
+                            };
+                            Self::hostcall_outcome_to_result(outcome)
+                        }
+                        _ => Err(Self::host_error_json(
+                            HostCallErrorCode::InvalidRequest,
+                            format!("Unsupported host_call method: {method}"),
+                            Some(json!({ "method": method })),
+                            None,
+                        )),
+                    }
+                };
+
+                match call_timeout_ms {
+                    Some(timeout_ms) => timeout(
+                        wall_now(),
+                        Duration::from_millis(timeout_ms),
+                        Box::pin(dispatch),
+                    )
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(Self::host_error_json(
+                            HostCallErrorCode::Timeout,
+                            format!("Hostcall timed out after {timeout_ms}ms"),
+                            Some(json!({ "capability": required, "method": method })),
+                            Some(true),
+                        ))
+                    }),
+                    None => dispatch.await,
+                }
+            } else {
+                Err(Self::host_error_json(
+                    HostCallErrorCode::Denied,
+                    format!("Capability '{capability}' denied by policy ({reason})"),
+                    Some(json!({
+                        "capability": capability,
+                        "decision": format!("{:?}", decision),
+                        "reason": reason,
+                    })),
+                    None,
+                ))
+            };
+
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let (is_error, error_code) = match &outcome {
+                Ok(_) => (false, None),
+                Err(err_json) => (
+                    true,
+                    serde_json::from_str::<HostCallError>(err_json)
+                        .ok()
+                        .map(|err| err.code),
+                ),
+            };
+
+            if is_error {
+                tracing::warn!(
+                    event = "host_call.end",
+                    runtime = "wasm",
+                    call_id = %payload.call_id,
+                    extension_id = ?self.extension_id.as_deref(),
+                    capability = %required,
+                    method = %payload.method,
+                    params_hash = %params_hash,
+                    duration_ms,
+                    error_code = ?error_code,
+                    "Hostcall end (error)"
+                );
+            } else {
+                tracing::info!(
+                    event = "host_call.end",
+                    runtime = "wasm",
+                    call_id = %payload.call_id,
+                    extension_id = ?self.extension_id.as_deref(),
+                    capability = %required,
+                    method = %payload.method,
+                    params_hash = %params_hash,
+                    duration_ms,
+                    "Hostcall end (success)"
+                );
+            }
+
+            outcome
         }
     }
 
@@ -2937,6 +3056,7 @@ mod wasm_host {
     mod tests {
         use super::*;
         use crate::connectors::http::HttpConnectorConfig;
+        use crate::model::ContentBlock;
         use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
         use asupersync::runtime::RuntimeBuilder;
         use asupersync::time::{sleep, wall_now};
@@ -3410,7 +3530,6 @@ mod wasm_host {
             let err_json = outcome.expect_err("tool hostcall timeout");
             let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
             assert_eq!(err.code, HostCallErrorCode::Timeout);
-            assert_eq!(err.retryable, Some(true));
             assert_policy_decision_logged(&events, &call.call_id, "tool", "Allow");
         }
 
@@ -3428,7 +3547,7 @@ mod wasm_host {
                 call_id: "call-exec-deny".to_string(),
                 capability: "exec".to_string(),
                 method: "exec".to_string(),
-                params: json!({ "command": "sh", "args": ["-c", "echo hi"] }),
+                params: json!({ "command": "echo hi" }),
                 timeout_ms: None,
                 cancel_token: None,
                 context: None,
@@ -3462,7 +3581,7 @@ mod wasm_host {
                 call_id: "call-exec-ok".to_string(),
                 capability: "exec".to_string(),
                 method: "exec".to_string(),
-                params: json!({ "command": "sh", "args": ["-c", "printf hello"] }),
+                params: json!({ "command": "echo hello" }),
                 timeout_ms: None,
                 cancel_token: None,
                 context: None,
@@ -3474,12 +3593,18 @@ mod wasm_host {
                     .expect("exec ok")
             };
 
-            let output: Value = serde_json::from_str(&out_json).expect("parse exec output");
-            let stdout = output
-                .get("stdout")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            assert!(stdout.contains("hello"), "stdout: {stdout:?}");
+            let output: ToolOutput = serde_json::from_str(&out_json).expect("parse tool output");
+            assert!(!output.is_error);
+            let text = output
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("hello"));
         }
 
         #[test]
@@ -3530,91 +3655,6 @@ mod wasm_host {
             assert_eq!(out.get("body").and_then(Value::as_str), Some("ok"));
 
             join.join().expect("server thread join");
-        }
-
-        #[test]
-        fn wasm_host_session_denied_without_manager_is_taxonomy_correct() {
-            let dir = tempdir().expect("tempdir");
-            let cwd = dir.path().to_path_buf();
-
-            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
-            state
-                .apply_registration(&registration_payload())
-                .expect("apply registration");
-
-            let call = HostCallPayload {
-                call_id: "call-session-no-manager".to_string(),
-                capability: "session".to_string(),
-                method: "session".to_string(),
-                params: json!({}),
-                timeout_ms: None,
-                cancel_token: None,
-                context: None,
-            };
-
-            let json = serde_json::to_string(&call).expect("serialize hostcall");
-            let err_json = run_async(async {
-                host::Host::call(&mut state, "session".to_string(), json).await
-            })
-            .expect_err("session denied");
-            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
-            assert_eq!(err.code, HostCallErrorCode::Denied);
-        }
-
-        #[test]
-        fn wasm_host_ui_denied_without_manager_is_taxonomy_correct() {
-            let dir = tempdir().expect("tempdir");
-            let cwd = dir.path().to_path_buf();
-
-            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
-            state
-                .apply_registration(&registration_payload())
-                .expect("apply registration");
-
-            let call = HostCallPayload {
-                call_id: "call-ui-no-manager".to_string(),
-                capability: "ui".to_string(),
-                method: "ui".to_string(),
-                params: json!({}),
-                timeout_ms: None,
-                cancel_token: None,
-                context: None,
-            };
-
-            let json = serde_json::to_string(&call).expect("serialize hostcall");
-            let err_json =
-                run_async(async { host::Host::call(&mut state, "ui".to_string(), json).await })
-                    .expect_err("ui denied");
-            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
-            assert_eq!(err.code, HostCallErrorCode::Denied);
-        }
-
-        #[test]
-        fn wasm_host_events_denied_without_manager_is_taxonomy_correct() {
-            let dir = tempdir().expect("tempdir");
-            let cwd = dir.path().to_path_buf();
-
-            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
-            state
-                .apply_registration(&registration_payload())
-                .expect("apply registration");
-
-            let call = HostCallPayload {
-                call_id: "call-events-no-manager".to_string(),
-                capability: "events".to_string(),
-                method: "events".to_string(),
-                params: json!({}),
-                timeout_ms: None,
-                cancel_token: None,
-                context: None,
-            };
-
-            let json = serde_json::to_string(&call).expect("serialize hostcall");
-            let err_json =
-                run_async(async { host::Host::call(&mut state, "events".to_string(), json).await })
-                    .expect_err("events denied");
-            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
-            assert_eq!(err.code, HostCallErrorCode::Denied);
         }
     }
 }
@@ -4424,132 +4464,6 @@ pub trait HostcallInterceptor: Send + Sync {
     fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome>;
 }
 
-// =============================================================================
-// Streaming exec hostcalls (bd-2tl1.3)
-// =============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecStreamSource {
-    Stdout,
-    Stderr,
-}
-
-#[derive(Debug)]
-enum ExecStreamMessage {
-    Data {
-        source: ExecStreamSource,
-        bytes: Vec<u8>,
-    },
-    Exit {
-        code: i32,
-        killed: bool,
-    },
-    Error {
-        code: String,
-        message: String,
-    },
-}
-
-#[derive(Debug)]
-struct ExecStreamLogContext {
-    runtime: &'static str,
-    call_id: String,
-    extension_id: Option<String>,
-    capability: String,
-    method: String,
-    params_hash: String,
-    started_at: Instant,
-}
-
-#[derive(Debug)]
-struct RunningExecStream {
-    rx: std::sync::mpsc::Receiver<ExecStreamMessage>,
-    abort_tx: std::sync::mpsc::Sender<()>,
-    next_sequence: u64,
-    log: ExecStreamLogContext,
-}
-
-#[derive(Debug, Default)]
-struct ExecStreamRegistry {
-    streams: HashMap<String, RunningExecStream>,
-}
-
-// =============================================================================
-// Streaming HTTP hostcalls (bd-2tl1.4)
-// =============================================================================
-
-enum HttpStreamBody {
-    Sse(SseStream<HttpByteStream>),
-    Text {
-        stream: HttpByteStream,
-        utf8_buffer: Vec<u8>,
-    },
-    Bytes {
-        stream: HttpByteStream,
-    },
-}
-
-type HttpByteStream =
-    std::pin::Pin<Box<dyn futures::Stream<Item = std::io::Result<Vec<u8>>> + Send>>;
-
-struct HttpStreamLogContext {
-    runtime: &'static str,
-    call_id: String,
-    extension_id: Option<String>,
-    capability: String,
-    method: String,
-    params_hash: String,
-    started_at: Instant,
-}
-
-struct RunningHttpStream {
-    body: HttpStreamBody,
-    head_pending: Option<Value>,
-    next_sequence: u64,
-    log: HttpStreamLogContext,
-}
-
-#[derive(Default)]
-struct HttpStreamRegistry {
-    streams: HashMap<String, RunningHttpStream>,
-}
-
-fn connectors_result_into_shared(
-    result: crate::connectors::HostResultPayload,
-) -> HostResultPayload {
-    let error = result.error.map(|err| {
-        let code = match err.code {
-            crate::connectors::HostCallErrorCode::Timeout => HostCallErrorCode::Timeout,
-            crate::connectors::HostCallErrorCode::Denied => HostCallErrorCode::Denied,
-            crate::connectors::HostCallErrorCode::Io => HostCallErrorCode::Io,
-            crate::connectors::HostCallErrorCode::InvalidRequest => {
-                HostCallErrorCode::InvalidRequest
-            }
-            crate::connectors::HostCallErrorCode::Internal => HostCallErrorCode::Internal,
-        };
-        HostCallError {
-            code,
-            message: err.message,
-            details: err.details,
-            retryable: err.retryable,
-        }
-    });
-
-    let chunk = result.chunk.map(|chunk| HostStreamChunk {
-        index: chunk.index,
-        is_last: chunk.is_last,
-        backpressure: None,
-    });
-
-    HostResultPayload {
-        call_id: result.call_id,
-        output: result.output,
-        is_error: result.is_error,
-        error,
-        chunk,
-    }
-}
-
 #[derive(Clone)]
 struct JsRuntimeHost {
     tools: Arc<ToolRegistry>,
@@ -4560,8 +4474,6 @@ struct JsRuntimeHost {
     http: Arc<HttpConnector>,
     policy: ExtensionPolicy,
     interceptor: Option<Arc<dyn HostcallInterceptor>>,
-    exec_streams: Arc<Mutex<ExecStreamRegistry>>,
-    http_streams: Arc<Mutex<HttpStreamRegistry>>,
 }
 
 impl JsRuntimeHost {
@@ -4703,8 +4615,6 @@ impl JsExtensionRuntimeHandle {
             http: Arc::new(HttpConnector::with_defaults()),
             policy: ExtensionPolicy::default(),
             interceptor,
-            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         thread::spawn(move || {
@@ -4728,10 +4638,7 @@ impl JsExtensionRuntimeHandle {
 
                 while let Ok(cmd) = rx.recv(&cx).await {
                     match cmd {
-                        JsRuntimeCommand::Shutdown => {
-                            abort_all_exec_streams(&host.exec_streams);
-                            break;
-                        }
+                        JsRuntimeCommand::Shutdown => break,
                         JsRuntimeCommand::LoadExtensions { specs, reply } => {
                             let result = load_all_extensions(&js_runtime, &host, &specs).await;
                             let _ = reply.send(&cx, result);
@@ -5682,37 +5589,13 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     ) {
         while let Some(req) = pending.pop_front() {
             let call_id = req.call_id.clone();
-            if is_streaming_exec_request(&req) {
-                match dispatch_streaming_exec_start(host, req).await {
-                    Ok(()) => {}
-                    Err(outcome) => runtime.complete_hostcall(call_id, outcome),
-                }
-                continue;
-            }
-
-            if is_streaming_http_request(&req) {
-                match dispatch_streaming_http_start(host, req).await {
-                    Ok(()) => {}
-                    Err(outcome) => runtime.complete_hostcall(call_id, outcome),
-                }
-                continue;
-            }
-
             let outcome = dispatch_hostcall(host, req).await;
             runtime.complete_hostcall(call_id, outcome);
         }
     }
 
-    // Deliver any pending streaming hostcall output that arrived since the last pump.
-    flush_streaming_exec(runtime, host);
-    flush_streaming_http(runtime, host);
-
     // Process any hostcalls already queued before we advance the event loop.
     dispatch_requests(runtime, host, drain_requests(runtime)).await;
-
-    // Streaming hostcalls might have produced output while we were dispatching other hostcalls.
-    flush_streaming_exec(runtime, host);
-    flush_streaming_http(runtime, host);
 
     // Advance the event loop (may schedule hostcalls while running a task's microtasks).
     let _ = runtime.tick().await?;
@@ -5723,8 +5606,6 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     let after_tick = drain_requests(runtime);
     let has_after_tick = !after_tick.is_empty();
     dispatch_requests(runtime, host, after_tick).await;
-    flush_streaming_exec(runtime, host);
-    flush_streaming_http(runtime, host);
 
     // If we dispatched any hostcalls, run another tick so their completions are delivered and
     // microtasks reach a fixpoint before the caller observes the outcome.
@@ -5734,1151 +5615,6 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     }
 
     Ok(runtime.has_pending())
-}
-
-fn is_streaming_exec_request(request: &HostcallRequest) -> bool {
-    if !matches!(request.kind, HostcallKind::Exec { .. }) {
-        return false;
-    }
-
-    let options = request
-        .payload
-        .get("options")
-        .or_else(|| request.payload.get("opts"));
-    options
-        .and_then(Value::as_object)
-        .and_then(|map| map.get("stream"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-}
-
-fn is_streaming_http_request(request: &HostcallRequest) -> bool {
-    matches!(request.kind, HostcallKind::Http)
-        && request
-            .payload
-            .get("stream")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-}
-
-#[allow(clippy::future_not_send)]
-#[allow(clippy::too_many_lines)]
-async fn dispatch_streaming_exec_start(
-    host: &JsRuntimeHost,
-    request: HostcallRequest,
-) -> std::result::Result<(), HostcallOutcome> {
-    // Test interceptor: short-circuit before streaming logic.
-    if let Some(ref interceptor) = host.interceptor {
-        if let Some(outcome) = interceptor.intercept(&request) {
-            return Err(outcome);
-        }
-    }
-
-    let payload = hostcall_request_to_payload(&request);
-    let call_id = payload.call_id.clone();
-    let started_at = Instant::now();
-
-    // Validate payload (method/capability/params shape).
-    if let Err(err) = validate_host_call(&payload) {
-        let result =
-            shared_result_err(&call_id, HostCallErrorCode::InvalidRequest, err.to_string());
-        log_shared_hostcall_end(
-            "js",
-            &call_id,
-            request.extension_id.as_deref(),
-            "exec",
-            payload.method.as_str(),
-            &shared_params_hash(payload.method.as_str(), &payload.params),
-            0,
-            &result,
-        );
-        return Err(HostcallOutcome::Error {
-            code: "invalid_request".to_string(),
-            message: err.to_string(),
-        });
-    }
-
-    let Some(required) = required_capability_for_host_call(&payload) else {
-        return Err(HostcallOutcome::Error {
-            code: "invalid_request".to_string(),
-            message: "Unable to derive required capability".to_string(),
-        });
-    };
-
-    let method = payload.method.trim().to_ascii_lowercase();
-    let params_hash = shared_params_hash(&method, &payload.params);
-    let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
-    let extension_id = request.extension_id.clone();
-
-    // Build execution context from JsRuntimeHost.
-    let manager = host.manager();
-    let ctx = HostCallContext {
-        runtime: "js",
-        extension_id: extension_id.as_deref(),
-        policy: &host.policy,
-        tools: &host.tools,
-        http: &host.http,
-        fs: None,
-        env_allowlist: None,
-        manager: manager.as_ref(),
-    };
-
-    log_shared_hostcall_start(
-        ctx.runtime,
-        &call_id,
-        ctx.extension_id,
-        &required,
-        &method,
-        &params_hash,
-        call_timeout_ms,
-    );
-
-    let (decision, reason, capability) = resolve_shared_policy_decision(&ctx, &required).await;
-    log_shared_policy_decision(
-        ctx.runtime,
-        &call_id,
-        ctx.extension_id,
-        &capability,
-        &decision,
-        &reason,
-        &params_hash,
-    );
-
-    if decision != PolicyDecision::Allow {
-        let result = shared_result_err_with_details(
-            &call_id,
-            HostCallErrorCode::Denied,
-            format!("Capability '{capability}' denied by policy ({reason})"),
-            json!({
-                "capability": capability,
-                "decision": format!("{decision:?}"),
-                "reason": reason,
-            }),
-            None,
-        );
-        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        log_shared_hostcall_end(
-            ctx.runtime,
-            &call_id,
-            ctx.extension_id,
-            &required,
-            &method,
-            &params_hash,
-            duration_ms,
-            &result,
-        );
-        return Err(HostcallOutcome::Error {
-            code: "denied".to_string(),
-            message: result
-                .error
-                .as_ref()
-                .map_or_else(|| "Denied by policy".to_string(), |e| e.message.clone()),
-        });
-    }
-
-    let HostcallKind::Exec { cmd } = request.kind else {
-        unreachable!("checked by is_streaming_exec_request");
-    };
-
-    let args_value = payload.params.get("args").cloned().unwrap_or(Value::Null);
-    let args_array = match args_value {
-        Value::Null => Vec::new(),
-        Value::Array(items) => items,
-        _ => {
-            let result = shared_result_err(
-                &call_id,
-                HostCallErrorCode::InvalidRequest,
-                "exec args must be an array",
-            );
-            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                ctx.runtime,
-                &call_id,
-                ctx.extension_id,
-                &required,
-                &method,
-                &params_hash,
-                duration_ms,
-                &result,
-            );
-            return Err(HostcallOutcome::Error {
-                code: "invalid_request".to_string(),
-                message: "exec args must be an array".to_string(),
-            });
-        }
-    };
-
-    let args = args_array
-        .iter()
-        .map(|value| {
-            value
-                .as_str()
-                .map_or_else(|| value.to_string(), ToString::to_string)
-        })
-        .collect::<Vec<_>>();
-
-    let options = payload
-        .params
-        .get("options")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let cwd = options
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ToString::to_string);
-
-    let (stream_tx, stream_rx) = std::sync::mpsc::sync_channel::<ExecStreamMessage>(128);
-    let (abort_tx, abort_rx) = std::sync::mpsc::channel::<()>();
-
-    // Spawn the process and streaming pumps on a dedicated thread (keep JS runtime responsive).
-    let call_id_for_thread = call_id.clone();
-    thread::spawn(move || {
-        let mut command = Command::new(&cmd);
-        command
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        if let Some(cwd) = cwd.as_ref() {
-            command.current_dir(cwd);
-        }
-
-        let mut child = match command.spawn() {
-            Ok(child) => child,
-            Err(err) => {
-                let _ = stream_tx.send(ExecStreamMessage::Error {
-                    code: "io".to_string(),
-                    message: err.to_string(),
-                });
-                return;
-            }
-        };
-
-        let pid = child.id();
-        let Some(stdout) = child.stdout.take() else {
-            let _ = stream_tx.send(ExecStreamMessage::Error {
-                code: "internal".to_string(),
-                message: "Missing stdout pipe".to_string(),
-            });
-            return;
-        };
-        let Some(stderr) = child.stderr.take() else {
-            let _ = stream_tx.send(ExecStreamMessage::Error {
-                code: "internal".to_string(),
-                message: "Missing stderr pipe".to_string(),
-            });
-            return;
-        };
-
-        let stdout_tx = stream_tx.clone();
-        let stderr_tx = stream_tx.clone();
-
-        let stdout_handle = thread::spawn(move || {
-            pump_exec_stream(stdout, ExecStreamSource::Stdout, &stdout_tx);
-        });
-        let stderr_handle = thread::spawn(move || {
-            pump_exec_stream(stderr, ExecStreamSource::Stderr, &stderr_tx);
-        });
-
-        let start = Instant::now();
-        let mut killed = false;
-        let mut cancelled = false;
-
-        let status = loop {
-            if abort_rx.try_recv().is_ok() {
-                cancelled = true;
-                crate::tools::kill_process_tree(Some(pid));
-                let _ = child.kill();
-                break child.wait();
-            }
-
-            if let Ok(Some(status)) = child.try_wait() {
-                break Ok(status);
-            }
-
-            if let Some(timeout_ms) = call_timeout_ms {
-                if start.elapsed() >= Duration::from_millis(timeout_ms) {
-                    killed = true;
-                    crate::tools::kill_process_tree(Some(pid));
-                    let _ = child.kill();
-                    break child.wait();
-                }
-            }
-
-            thread::sleep(Duration::from_millis(10));
-        };
-
-        let _ = stdout_handle.join();
-        let _ = stderr_handle.join();
-
-        match status {
-            Ok(status) => {
-                if killed {
-                    let timeout_ms = call_timeout_ms.unwrap_or(0);
-                    let _ = stream_tx.send(ExecStreamMessage::Error {
-                        code: "timeout".to_string(),
-                        message: format!("exec timed out after {timeout_ms}ms"),
-                    });
-                } else if cancelled {
-                    let _ = stream_tx.send(ExecStreamMessage::Error {
-                        code: "cancelled".to_string(),
-                        message: "exec cancelled".to_string(),
-                    });
-                } else {
-                    let code = status.code().unwrap_or(-1);
-                    let _ = stream_tx.send(ExecStreamMessage::Exit {
-                        code,
-                        killed: false,
-                    });
-                }
-            }
-            Err(err) => {
-                let _ = stream_tx.send(ExecStreamMessage::Error {
-                    code: "io".to_string(),
-                    message: err.to_string(),
-                });
-            }
-        }
-
-        tracing::trace!(
-            event = "host_call.exec_stream.thread_exit",
-            call_id = %call_id_for_thread,
-            pid,
-            killed,
-            cancelled,
-            "Exec stream thread exited"
-        );
-    });
-
-    // Track stream state for subsequent pump() calls.
-    let log = ExecStreamLogContext {
-        runtime: "js",
-        call_id: call_id.clone(),
-        extension_id,
-        capability: required.clone(),
-        method: method.clone(),
-        params_hash,
-        started_at,
-    };
-
-    {
-        let mut guard = host
-            .exec_streams
-            .lock()
-            .expect("exec_streams mutex poisoned");
-        guard.streams.insert(
-            call_id.clone(),
-            RunningExecStream {
-                rx: stream_rx,
-                abort_tx,
-                next_sequence: 0,
-                log,
-            },
-        );
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::future_not_send)]
-#[allow(clippy::too_many_lines)]
-async fn dispatch_streaming_http_start(
-    host: &JsRuntimeHost,
-    request: HostcallRequest,
-) -> std::result::Result<(), HostcallOutcome> {
-    // Test interceptor: short-circuit before streaming logic.
-    if let Some(ref interceptor) = host.interceptor {
-        if let Some(outcome) = interceptor.intercept(&request) {
-            return Err(outcome);
-        }
-    }
-
-    let extension_id = request.extension_id.clone();
-    let payload = hostcall_request_to_payload(&request);
-    let call_id = payload.call_id.clone();
-    let started_at = Instant::now();
-
-    // Validate payload (method/capability/params shape).
-    if let Err(err) = validate_host_call(&payload) {
-        let result =
-            shared_result_err(&call_id, HostCallErrorCode::InvalidRequest, err.to_string());
-        log_shared_hostcall_end(
-            "js",
-            &call_id,
-            request.extension_id.as_deref(),
-            "http",
-            payload.method.as_str(),
-            &shared_params_hash(payload.method.as_str(), &payload.params),
-            0,
-            &result,
-        );
-        return Err(HostcallOutcome::Error {
-            code: "invalid_request".to_string(),
-            message: err.to_string(),
-        });
-    }
-
-    let Some(required) = required_capability_for_host_call(&payload) else {
-        return Err(HostcallOutcome::Error {
-            code: "invalid_request".to_string(),
-            message: "Unable to derive required capability".to_string(),
-        });
-    };
-
-    let method = payload.method.trim().to_ascii_lowercase();
-    let params_hash = shared_params_hash(&method, &payload.params);
-    let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
-
-    // Build execution context from JsRuntimeHost.
-    let manager = host.manager();
-    let ctx = HostCallContext {
-        runtime: "js",
-        extension_id: request.extension_id.as_deref(),
-        policy: &host.policy,
-        tools: &host.tools,
-        http: &host.http,
-        fs: None,
-        env_allowlist: None,
-        manager: manager.as_ref(),
-    };
-
-    log_shared_hostcall_start(
-        ctx.runtime,
-        &call_id,
-        ctx.extension_id,
-        &required,
-        &method,
-        &params_hash,
-        call_timeout_ms,
-    );
-
-    let (decision, reason, capability) = resolve_shared_policy_decision(&ctx, &required).await;
-    log_shared_policy_decision(
-        ctx.runtime,
-        &call_id,
-        ctx.extension_id,
-        &capability,
-        &decision,
-        &reason,
-        &params_hash,
-    );
-
-    if decision != PolicyDecision::Allow {
-        let result = shared_result_err_with_details(
-            &call_id,
-            HostCallErrorCode::Denied,
-            format!("Capability '{capability}' denied by policy ({reason})"),
-            json!({
-                "capability": capability,
-                "decision": format!("{decision:?}"),
-                "reason": reason,
-            }),
-            None,
-        );
-        let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-        log_shared_hostcall_end(
-            ctx.runtime,
-            &call_id,
-            ctx.extension_id,
-            &required,
-            &method,
-            &params_hash,
-            duration_ms,
-            &result,
-        );
-        return Err(HostcallOutcome::Error {
-            code: "denied".to_string(),
-            message: result
-                .error
-                .as_ref()
-                .map_or_else(|| "Denied by policy".to_string(), |e| e.message.clone()),
-        });
-    }
-
-    let connector_call = crate::connectors::HostCallPayload {
-        call_id: payload.call_id.clone(),
-        capability: payload.capability.clone(),
-        method: payload.method.clone(),
-        params: payload.params.clone(),
-        timeout_ms: payload.timeout_ms,
-        cancel_token: payload.cancel_token.clone(),
-        context: payload.context.clone(),
-    };
-
-    let response = match host.http.dispatch_streaming(&connector_call).await {
-        Ok(response) => response,
-        Err(payload) => {
-            let shared_payload = connectors_result_into_shared(payload);
-            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                ctx.runtime,
-                &call_id,
-                ctx.extension_id,
-                &required,
-                &method,
-                &params_hash,
-                duration_ms,
-                &shared_payload,
-            );
-            return Err(host_result_to_outcome(&shared_payload));
-        }
-    };
-
-    let content_type_header = response
-        .headers
-        .iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("content-type"))
-        .map(|(_, v)| v.clone());
-    let content_type = content_type_header.as_deref().and_then(|value| {
-        let (value, _) = value.split_once(';').unwrap_or((value, ""));
-        let value = value.trim();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value.to_ascii_lowercase())
-        }
-    });
-
-    let head = if let Some(ref ct) = content_type {
-        json!({
-            "kind": "head",
-            "status": response.status,
-            "headers": response.headers,
-            "contentType": ct,
-        })
-    } else {
-        json!({
-            "kind": "head",
-            "status": response.status,
-            "headers": response.headers,
-        })
-    };
-
-    let is_sse = content_type.as_deref() == Some("text/event-stream");
-    let is_text = !is_sse
-        && content_type
-            .as_deref()
-            .is_some_and(|ct| ct.starts_with("text/") || ct.contains("json"));
-
-    let body = if is_sse {
-        HttpStreamBody::Sse(SseStream::new(response.stream))
-    } else if is_text {
-        HttpStreamBody::Text {
-            stream: response.stream,
-            utf8_buffer: Vec::new(),
-        }
-    } else {
-        HttpStreamBody::Bytes {
-            stream: response.stream,
-        }
-    };
-
-    let log = HttpStreamLogContext {
-        runtime: "js",
-        call_id: call_id.clone(),
-        extension_id,
-        capability: required.clone(),
-        method: method.clone(),
-        params_hash,
-        started_at,
-    };
-
-    {
-        let mut guard = host
-            .http_streams
-            .lock()
-            .expect("http_streams mutex poisoned");
-        guard.streams.insert(
-            call_id.clone(),
-            RunningHttpStream {
-                body,
-                head_pending: Some(head),
-                next_sequence: 0,
-                log,
-            },
-        );
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines)]
-fn flush_streaming_exec(runtime: &PiJsRuntime, host: &JsRuntimeHost) {
-    const MAX_CHUNKS_PER_PUMP: usize = 128;
-
-    let mut produced = 0usize;
-    let mut finished: Vec<(String, HostResultPayload)> = Vec::new();
-    let mut errored: Vec<(String, HostcallOutcome, HostResultPayload)> = Vec::new();
-    let mut cancelled: Vec<(String, HostResultPayload)> = Vec::new();
-
-    let mut guard = host
-        .exec_streams
-        .lock()
-        .expect("exec_streams mutex poisoned");
-
-    let keys = guard.streams.keys().cloned().collect::<Vec<_>>();
-    for call_id in keys {
-        if produced >= MAX_CHUNKS_PER_PUMP {
-            break;
-        }
-
-        // If the JS-side promise has already resolved/rejected (timeout/cancel), stop producing
-        // and kill the underlying process promptly to avoid zombies.
-        if !runtime.is_hostcall_pending(&call_id) {
-            if let Some(stream) = guard.streams.get(&call_id) {
-                let _ = stream.abort_tx.send(());
-            }
-            cancelled.push((
-                call_id.clone(),
-                shared_result_err(
-                    &call_id,
-                    HostCallErrorCode::Timeout,
-                    "Hostcall no longer pending",
-                ),
-            ));
-            continue;
-        }
-
-        let Some(stream) = guard.streams.get_mut(&call_id) else {
-            continue;
-        };
-
-        loop {
-            if produced >= MAX_CHUNKS_PER_PUMP {
-                break;
-            }
-            match stream.rx.try_recv() {
-                Ok(ExecStreamMessage::Data { source, bytes }) => {
-                    let chunk = exec_stream_bytes_to_chunk(source, &bytes);
-                    let outcome = HostcallOutcome::StreamChunk {
-                        sequence: stream.next_sequence,
-                        chunk,
-                        is_final: false,
-                    };
-                    stream.next_sequence = stream.next_sequence.saturating_add(1);
-                    runtime.complete_hostcall(call_id.clone(), outcome);
-                    produced += 1;
-                }
-                Ok(ExecStreamMessage::Exit { code, killed }) => {
-                    let chunk = json!({ "code": code, "killed": killed });
-                    let outcome = HostcallOutcome::StreamChunk {
-                        sequence: stream.next_sequence,
-                        chunk: chunk.clone(),
-                        is_final: true,
-                    };
-                    stream.next_sequence = stream.next_sequence.saturating_add(1);
-                    runtime.complete_hostcall(call_id.clone(), outcome);
-                    produced += 1;
-
-                    finished.push((call_id.clone(), shared_result_ok(&call_id, chunk)));
-                    break;
-                }
-                Ok(ExecStreamMessage::Error { code, message }) => {
-                    let outcome = HostcallOutcome::Error {
-                        code: code.clone(),
-                        message: message.clone(),
-                    };
-                    runtime.complete_hostcall(call_id.clone(), outcome.clone());
-                    produced += 1;
-
-                    let result = match code.as_str() {
-                        "timeout" => {
-                            shared_result_err(&call_id, HostCallErrorCode::Timeout, message)
-                        }
-                        "denied" => shared_result_err(&call_id, HostCallErrorCode::Denied, message),
-                        "invalid_request" => {
-                            shared_result_err(&call_id, HostCallErrorCode::InvalidRequest, message)
-                        }
-                        "internal" => {
-                            shared_result_err(&call_id, HostCallErrorCode::Internal, message)
-                        }
-                        _ => shared_result_err(&call_id, HostCallErrorCode::Io, message),
-                    };
-                    errored.push((call_id.clone(), outcome, result));
-                    break;
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    let outcome = HostcallOutcome::Error {
-                        code: "internal".to_string(),
-                        message: "exec stream disconnected".to_string(),
-                    };
-                    runtime.complete_hostcall(call_id.clone(), outcome.clone());
-                    produced += 1;
-                    let result = shared_result_err(
-                        &call_id,
-                        HostCallErrorCode::Internal,
-                        "exec stream disconnected",
-                    );
-                    errored.push((call_id.clone(), outcome, result));
-                    break;
-                }
-            }
-        }
-    }
-
-    for (call_id, result) in cancelled {
-        if let Some(stream) = guard.streams.remove(&call_id) {
-            let duration_ms =
-                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                stream.log.runtime,
-                &call_id,
-                stream.log.extension_id.as_deref(),
-                &stream.log.capability,
-                &stream.log.method,
-                &stream.log.params_hash,
-                duration_ms,
-                &result,
-            );
-        }
-    }
-
-    for (call_id, result) in finished {
-        if let Some(stream) = guard.streams.remove(&call_id) {
-            let duration_ms =
-                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                stream.log.runtime,
-                &call_id,
-                stream.log.extension_id.as_deref(),
-                &stream.log.capability,
-                &stream.log.method,
-                &stream.log.params_hash,
-                duration_ms,
-                &result,
-            );
-        }
-    }
-
-    for (call_id, _outcome, result) in errored {
-        if let Some(stream) = guard.streams.remove(&call_id) {
-            let duration_ms =
-                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                stream.log.runtime,
-                &call_id,
-                stream.log.extension_id.as_deref(),
-                &stream.log.capability,
-                &stream.log.method,
-                &stream.log.params_hash,
-                duration_ms,
-                &result,
-            );
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-fn flush_streaming_http(runtime: &PiJsRuntime, host: &JsRuntimeHost) {
-    const MAX_CHUNKS_PER_PUMP: usize = 128;
-
-    let mut produced = 0usize;
-    let mut finished: Vec<(String, HostResultPayload)> = Vec::new();
-    let mut errored: Vec<(String, HostcallOutcome, HostResultPayload)> = Vec::new();
-    let mut cancelled: Vec<(String, HostResultPayload)> = Vec::new();
-
-    let mut guard = host
-        .http_streams
-        .lock()
-        .expect("http_streams mutex poisoned");
-
-    let keys = guard.streams.keys().cloned().collect::<Vec<_>>();
-    for call_id in keys {
-        if produced >= MAX_CHUNKS_PER_PUMP {
-            break;
-        }
-
-        if !runtime.is_hostcall_pending(&call_id) {
-            cancelled.push((
-                call_id.clone(),
-                shared_result_err(
-                    &call_id,
-                    HostCallErrorCode::Timeout,
-                    "Hostcall no longer pending",
-                ),
-            ));
-            continue;
-        }
-
-        let Some(stream) = guard.streams.get_mut(&call_id) else {
-            continue;
-        };
-
-        if produced < MAX_CHUNKS_PER_PUMP {
-            if let Some(head) = stream.head_pending.take() {
-                let outcome = HostcallOutcome::StreamChunk {
-                    sequence: stream.next_sequence,
-                    chunk: head,
-                    is_final: false,
-                };
-                stream.next_sequence = stream.next_sequence.saturating_add(1);
-                runtime.complete_hostcall(call_id.clone(), outcome);
-                produced += 1;
-            }
-        }
-
-        loop {
-            if produced >= MAX_CHUNKS_PER_PUMP {
-                break;
-            }
-
-            match &mut stream.body {
-                HttpStreamBody::Sse(sse_stream) => match sse_stream.next().now_or_never() {
-                    None => break,
-                    Some(Some(Ok(event))) => {
-                        let chunk = json!({
-                            "kind": "sse",
-                            "event": event.event,
-                            "data": event.data,
-                            "id": event.id,
-                            "retry": event.retry,
-                        });
-                        let outcome = HostcallOutcome::StreamChunk {
-                            sequence: stream.next_sequence,
-                            chunk,
-                            is_final: false,
-                        };
-                        stream.next_sequence = stream.next_sequence.saturating_add(1);
-                        runtime.complete_hostcall(call_id.clone(), outcome);
-                        produced += 1;
-                    }
-                    Some(Some(Err(err))) => {
-                        let outcome = HostcallOutcome::Error {
-                            code: "io".to_string(),
-                            message: err.to_string(),
-                        };
-                        runtime.complete_hostcall(call_id.clone(), outcome.clone());
-                        produced += 1;
-                        let result =
-                            shared_result_err(&call_id, HostCallErrorCode::Io, err.to_string());
-                        errored.push((call_id.clone(), outcome, result));
-                        break;
-                    }
-                    Some(None) => {
-                        let outcome = HostcallOutcome::StreamChunk {
-                            sequence: stream.next_sequence,
-                            chunk: Value::Null,
-                            is_final: true,
-                        };
-                        stream.next_sequence = stream.next_sequence.saturating_add(1);
-                        runtime.complete_hostcall(call_id.clone(), outcome);
-                        produced += 1;
-
-                        finished.push((call_id.clone(), shared_result_ok(&call_id, Value::Null)));
-                        break;
-                    }
-                },
-                HttpStreamBody::Bytes {
-                    stream: body_stream,
-                } => {
-                    let next = body_stream.next().now_or_never();
-                    let Some(next) = next else {
-                        break;
-                    };
-                    match next {
-                        Some(Ok(bytes)) => {
-                            if bytes.is_empty() {
-                                continue;
-                            }
-                            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            let chunk = json!({
-                                "kind": "bytes",
-                                "encoding": "base64",
-                                "data": data,
-                            });
-                            let outcome = HostcallOutcome::StreamChunk {
-                                sequence: stream.next_sequence,
-                                chunk,
-                                is_final: false,
-                            };
-                            stream.next_sequence = stream.next_sequence.saturating_add(1);
-                            runtime.complete_hostcall(call_id.clone(), outcome);
-                            produced += 1;
-                        }
-                        Some(Err(err)) => {
-                            let outcome = HostcallOutcome::Error {
-                                code: "io".to_string(),
-                                message: err.to_string(),
-                            };
-                            runtime.complete_hostcall(call_id.clone(), outcome.clone());
-                            produced += 1;
-                            let result =
-                                shared_result_err(&call_id, HostCallErrorCode::Io, err.to_string());
-                            errored.push((call_id.clone(), outcome, result));
-                            break;
-                        }
-                        None => {
-                            let outcome = HostcallOutcome::StreamChunk {
-                                sequence: stream.next_sequence,
-                                chunk: Value::Null,
-                                is_final: true,
-                            };
-                            stream.next_sequence = stream.next_sequence.saturating_add(1);
-                            runtime.complete_hostcall(call_id.clone(), outcome);
-                            produced += 1;
-
-                            finished
-                                .push((call_id.clone(), shared_result_ok(&call_id, Value::Null)));
-                            break;
-                        }
-                    }
-                }
-                HttpStreamBody::Text {
-                    stream: body_stream,
-                    utf8_buffer,
-                } => {
-                    let next = body_stream.next().now_or_never();
-                    let Some(next) = next else {
-                        break;
-                    };
-                    match next {
-                        Some(Ok(bytes)) => {
-                            if bytes.is_empty() {
-                                continue;
-                            }
-                            utf8_buffer.extend_from_slice(&bytes);
-
-                            let parsed = match std::str::from_utf8(utf8_buffer) {
-                                Ok(s) => {
-                                    let out = s.to_string();
-                                    utf8_buffer.clear();
-                                    Some(out)
-                                }
-                                Err(e) => {
-                                    if e.error_len().is_some() {
-                                        let outcome = HostcallOutcome::Error {
-                                            code: "io".to_string(),
-                                            message: "Invalid UTF-8 in text HTTP stream"
-                                                .to_string(),
-                                        };
-                                        runtime.complete_hostcall(call_id.clone(), outcome.clone());
-                                        produced += 1;
-                                        let result = shared_result_err(
-                                            &call_id,
-                                            HostCallErrorCode::Io,
-                                            "Invalid UTF-8 in text HTTP stream",
-                                        );
-                                        errored.push((call_id.clone(), outcome, result));
-                                        break;
-                                    }
-
-                                    let valid_len = e.valid_up_to();
-                                    if valid_len == 0 {
-                                        None
-                                    } else {
-                                        let s =
-                                            std::str::from_utf8(&utf8_buffer[..valid_len]).unwrap();
-                                        let out = s.to_string();
-                                        utf8_buffer.drain(..valid_len);
-                                        Some(out)
-                                    }
-                                }
-                            };
-
-                            let Some(text) = parsed else {
-                                continue;
-                            };
-                            if text.is_empty() {
-                                continue;
-                            }
-
-                            let chunk = json!({
-                                "kind": "text",
-                                "text": text,
-                            });
-                            let outcome = HostcallOutcome::StreamChunk {
-                                sequence: stream.next_sequence,
-                                chunk,
-                                is_final: false,
-                            };
-                            stream.next_sequence = stream.next_sequence.saturating_add(1);
-                            runtime.complete_hostcall(call_id.clone(), outcome);
-                            produced += 1;
-                        }
-                        Some(Err(err)) => {
-                            let outcome = HostcallOutcome::Error {
-                                code: "io".to_string(),
-                                message: err.to_string(),
-                            };
-                            runtime.complete_hostcall(call_id.clone(), outcome.clone());
-                            produced += 1;
-                            let result =
-                                shared_result_err(&call_id, HostCallErrorCode::Io, err.to_string());
-                            errored.push((call_id.clone(), outcome, result));
-                            break;
-                        }
-                        None => {
-                            if !utf8_buffer.is_empty() {
-                                let outcome = HostcallOutcome::Error {
-                                    code: "io".to_string(),
-                                    message: "HTTP stream ended with incomplete UTF-8 sequence"
-                                        .to_string(),
-                                };
-                                runtime.complete_hostcall(call_id.clone(), outcome.clone());
-                                produced += 1;
-                                let result = shared_result_err(
-                                    &call_id,
-                                    HostCallErrorCode::Io,
-                                    "HTTP stream ended with incomplete UTF-8 sequence",
-                                );
-                                errored.push((call_id.clone(), outcome, result));
-                                break;
-                            }
-
-                            let outcome = HostcallOutcome::StreamChunk {
-                                sequence: stream.next_sequence,
-                                chunk: Value::Null,
-                                is_final: true,
-                            };
-                            stream.next_sequence = stream.next_sequence.saturating_add(1);
-                            runtime.complete_hostcall(call_id.clone(), outcome);
-                            produced += 1;
-
-                            finished
-                                .push((call_id.clone(), shared_result_ok(&call_id, Value::Null)));
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    for (call_id, result) in cancelled {
-        if let Some(stream) = guard.streams.remove(&call_id) {
-            let duration_ms =
-                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                stream.log.runtime,
-                &call_id,
-                stream.log.extension_id.as_deref(),
-                &stream.log.capability,
-                &stream.log.method,
-                &stream.log.params_hash,
-                duration_ms,
-                &result,
-            );
-        }
-    }
-
-    for (call_id, result) in finished {
-        if let Some(stream) = guard.streams.remove(&call_id) {
-            let duration_ms =
-                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                stream.log.runtime,
-                &call_id,
-                stream.log.extension_id.as_deref(),
-                &stream.log.capability,
-                &stream.log.method,
-                &stream.log.params_hash,
-                duration_ms,
-                &result,
-            );
-        }
-    }
-
-    for (call_id, _outcome, result) in errored {
-        if let Some(stream) = guard.streams.remove(&call_id) {
-            let duration_ms =
-                u64::try_from(stream.log.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            log_shared_hostcall_end(
-                stream.log.runtime,
-                &call_id,
-                stream.log.extension_id.as_deref(),
-                &stream.log.capability,
-                &stream.log.method,
-                &stream.log.params_hash,
-                duration_ms,
-                &result,
-            );
-        }
-    }
-}
-
-fn exec_stream_bytes_to_chunk(source: ExecStreamSource, bytes: &[u8]) -> Value {
-    let (key_text, key_b64) = match source {
-        ExecStreamSource::Stdout => ("stdout", "stdoutBase64"),
-        ExecStreamSource::Stderr => ("stderr", "stderrBase64"),
-    };
-
-    std::str::from_utf8(bytes).map_or_else(
-        |_| {
-            let data = base64::engine::general_purpose::STANDARD.encode(bytes);
-            let mut map = serde_json::Map::new();
-            map.insert("encoding".to_string(), Value::String("base64".to_string()));
-            map.insert(key_b64.to_string(), Value::String(data));
-            Value::Object(map)
-        },
-        |text| {
-            let mut map = serde_json::Map::new();
-            map.insert(key_text.to_string(), Value::String(text.to_string()));
-            Value::Object(map)
-        },
-    )
-}
-
-fn pump_exec_stream<R: std::io::Read>(
-    mut reader: R,
-    source: ExecStreamSource,
-    tx: &std::sync::mpsc::SyncSender<ExecStreamMessage>,
-) {
-    const MAX_CHUNK_BYTES: usize = 4096;
-    let mut buf = [0u8; 4096];
-    let mut acc: Vec<u8> = Vec::new();
-
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-
-        acc.extend_from_slice(&buf[..n]);
-        loop {
-            if let Some(pos) = acc.iter().position(|b| *b == b'\n') {
-                let chunk: Vec<u8> = acc.drain(..=pos).collect();
-                if tx
-                    .send(ExecStreamMessage::Data {
-                        source,
-                        bytes: chunk,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                continue;
-            }
-            if acc.len() >= MAX_CHUNK_BYTES {
-                let chunk: Vec<u8> = acc.drain(..MAX_CHUNK_BYTES).collect();
-                if tx
-                    .send(ExecStreamMessage::Data {
-                        source,
-                        bytes: chunk,
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                continue;
-            }
-            break;
-        }
-    }
-
-    if !acc.is_empty() {
-        let _ = tx.send(ExecStreamMessage::Data { source, bytes: acc });
-    }
-}
-
-fn abort_all_exec_streams(exec_streams: &Arc<Mutex<ExecStreamRegistry>>) {
-    let guard = exec_streams.lock().expect("exec_streams mutex poisoned");
-    for stream in guard.streams.values() {
-        let _ = stream.abort_tx.send(());
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -6935,8 +5671,7 @@ async fn prompt_capability_once(
     });
     let request = ExtensionUiRequest::new("", "confirm", payload);
 
-    let result = manager.request_ui(request).await;
-    match result {
+    match manager.request_ui(request).await {
         Ok(Some(response)) => {
             response
                 .value
@@ -6950,116 +5685,270 @@ async fn prompt_capability_once(
 }
 
 #[allow(clippy::future_not_send)]
-/// Convert a [`HostcallRequest`] (JS tier) into a canonical [`HostCallPayload`]
-/// suitable for the shared dispatcher.
-fn hostcall_request_to_payload(request: &HostcallRequest) -> HostCallPayload {
-    let method = request.method().to_string();
-    let capability = request.required_capability();
-    let timeout_ms = js_hostcall_timeout_ms(request);
+async fn resolve_js_hostcall_policy_decision(
+    host: &JsRuntimeHost,
+    extension_id: Option<&str>,
+    required: &str,
+) -> (PolicyDecision, String, String) {
+    const UNKNOWN_EXTENSION_ID: &str = "<unknown>";
+    let PolicyCheck {
+        mut decision,
+        capability,
+        mut reason,
+    } = host.policy.evaluate(required);
 
-    // Build canonical params from the JS-tier kind + payload.
-    let params = match &request.kind {
-        HostcallKind::Tool { name } => {
-            // Canonical: { "name": "tool_name", "input": <payload> }
-            json!({ "name": name, "input": request.payload.clone() })
-        }
-        HostcallKind::Exec { cmd } => {
-            // Canonical: { "cmd": "<command>", ...payload_fields }
-            // Normalize legacy "command" alias to "cmd".
-            let mut obj = match &request.payload {
-                Value::Object(map) => {
-                    let mut m = map.clone();
-                    m.remove("command"); // drop legacy alias if present
-                    m
-                }
-                _ => serde_json::Map::new(),
+    if decision != PolicyDecision::Prompt {
+        return (decision, reason, capability);
+    }
+
+    if let Some(extension_id) = extension_id {
+        if let Some(allow) = host
+            .manager()
+            .and_then(|m| m.cached_policy_prompt_decision(extension_id, &capability))
+        {
+            decision = if allow {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
             };
-            obj.insert("cmd".to_string(), Value::String(cmd.clone()));
-            Value::Object(obj)
-        }
-        HostcallKind::Http => {
-            // Params is the request object as-is.
-            request.payload.clone()
-        }
-        HostcallKind::Session { op } | HostcallKind::Ui { op } | HostcallKind::Events { op } => {
-            // Canonical: { "op": "op_name", ...payload_fields }
-            let mut obj = match &request.payload {
-                Value::Object(map) => map.clone(),
-                _ => serde_json::Map::new(),
+            reason = if allow {
+                "prompt_cache_allow".to_string()
+            } else {
+                "prompt_cache_deny".to_string()
             };
-            obj.insert("op".to_string(), Value::String(op.clone()));
-            Value::Object(obj)
+            return (decision, reason, capability);
         }
+    }
+
+    let prompt_extension_id = extension_id.unwrap_or(UNKNOWN_EXTENSION_ID);
+    let Some(manager) = host.manager() else {
+        return (PolicyDecision::Deny, "shutdown".to_string(), capability);
+    };
+    let allow = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
+    if let Some(extension_id) = extension_id {
+        manager.cache_policy_prompt_decision(extension_id, &capability, allow);
+    }
+    decision = if allow {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::Deny
+    };
+    reason = if allow {
+        "prompt_user_allow".to_string()
+    } else {
+        "prompt_user_deny".to_string()
+    };
+    (decision, reason, capability)
+}
+
+fn log_js_hostcall_start(
+    call_id: &str,
+    extension_id: Option<&str>,
+    required: &str,
+    method: &str,
+    params_hash: &str,
+    call_timeout_ms: Option<u64>,
+) {
+    tracing::info!(
+        event = "host_call.start",
+        runtime = "js",
+        call_id = %call_id,
+        extension_id = ?extension_id,
+        capability = %required,
+        method = %method,
+        params_hash = %params_hash,
+        timeout_ms = call_timeout_ms,
+        "Hostcall start"
+    );
+}
+
+fn log_js_policy_decision(
+    call_id: &str,
+    extension_id: Option<&str>,
+    capability: &str,
+    decision: &PolicyDecision,
+    reason: &str,
+    params_hash: &str,
+) {
+    if *decision == PolicyDecision::Allow {
+        tracing::info!(
+            event = "policy.decision",
+            runtime = "js",
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %capability,
+            decision = ?decision,
+            reason = %reason,
+            params_hash = %params_hash,
+            "Hostcall allowed by policy"
+        );
+    } else {
+        tracing::warn!(
+            event = "policy.decision",
+            runtime = "js",
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %capability,
+            decision = ?decision,
+            reason = %reason,
+            params_hash = %params_hash,
+            "Hostcall denied by policy"
+        );
+    }
+}
+
+fn log_js_hostcall_end(
+    call_id: &str,
+    extension_id: Option<&str>,
+    required: &str,
+    method: &str,
+    params_hash: &str,
+    duration_ms: u64,
+    outcome: &HostcallOutcome,
+) {
+    let (is_error, error_code) = match outcome {
+        HostcallOutcome::Success(_) => (false, None),
+        HostcallOutcome::Error { code, .. } => (true, Some(code.as_str())),
     };
 
-    HostCallPayload {
-        call_id: request.call_id.clone(),
-        capability,
-        method,
-        params,
-        timeout_ms,
-        cancel_token: None,
-        context: None,
-    }
-}
-
-/// Convert a [`HostResultPayload`] from the shared dispatcher back to
-/// [`HostcallOutcome`] for JS Promise completion.
-fn host_result_to_outcome(result: &HostResultPayload) -> HostcallOutcome {
-    if result.is_error {
-        let (code, message) = result.error.as_ref().map_or_else(
-            || ("internal".to_string(), "Unknown error".to_string()),
-            |e| {
-                // Use serde to get the snake_case code string (e.g. "invalid_request").
-                let code_str = serde_json::to_value(e.code)
-                    .ok()
-                    .and_then(|v| v.as_str().map(String::from))
-                    .unwrap_or_else(|| "internal".to_string());
-                (code_str, e.message.clone())
-            },
+    if is_error {
+        tracing::warn!(
+            event = "host_call.end",
+            runtime = "js",
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %required,
+            method = %method,
+            params_hash = %params_hash,
+            duration_ms,
+            error_code = error_code,
+            "Hostcall end (error)"
         );
-        HostcallOutcome::Error { code, message }
     } else {
-        HostcallOutcome::Success(result.output.clone())
+        tracing::info!(
+            event = "host_call.end",
+            runtime = "js",
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %required,
+            method = %method,
+            params_hash = %params_hash,
+            duration_ms,
+            "Hostcall end (success)"
+        );
     }
 }
 
-/// Dispatch a JS hostcall through the shared dispatcher.
-///
-/// Preserves test interceptors as a hook *around* the shared dispatcher.
-/// All policy, logging, timeout, and taxonomy enforcement is handled by
-/// [`dispatch_host_call_shared`].
 #[allow(clippy::future_not_send)]
-async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
-    // Test interceptor: short-circuit before shared dispatch.
+async fn dispatch_hostcall_allowed(
+    host: &JsRuntimeHost,
+    request: HostcallRequest,
+) -> HostcallOutcome {
+    // Allow test interceptors to short-circuit before real dispatch.
     if let Some(ref interceptor) = host.interceptor {
         if let Some(outcome) = interceptor.intercept(&request) {
             return outcome;
         }
     }
 
-    // Convert JS request to canonical payload.
-    let payload = hostcall_request_to_payload(&request);
+    let HostcallRequest {
+        call_id,
+        kind,
+        payload,
+        ..
+    } = request;
 
-    // Build execution context from JsRuntimeHost.
-    let manager = host.manager();
-    let ctx = HostCallContext {
-        runtime: "js",
-        extension_id: request.extension_id.as_deref(),
-        policy: &host.policy,
-        tools: &host.tools,
-        http: &host.http,
-        fs: None,
-        env_allowlist: None,
-        manager: manager.as_ref(),
+    match (kind, payload) {
+        (HostcallKind::Tool { name }, payload) => {
+            dispatch_hostcall_tool(&host.tools, &call_id, &name, payload).await
+        }
+        (HostcallKind::Exec { cmd }, payload) => {
+            dispatch_hostcall_exec(&call_id, &cmd, payload).await
+        }
+        (HostcallKind::Http, payload) => {
+            dispatch_hostcall_http(&call_id, &host.http, payload).await
+        }
+        (HostcallKind::Session { op }, payload) => {
+            let Some(manager) = host.manager() else {
+                return HostcallOutcome::Error {
+                    code: "SHUTDOWN".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_session(&call_id, &manager, &op, payload).await
+        }
+        (HostcallKind::Ui { op }, payload) => {
+            let Some(manager) = host.manager() else {
+                return HostcallOutcome::Error {
+                    code: "SHUTDOWN".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_ui(&call_id, &manager, &op, payload).await
+        }
+        (HostcallKind::Events { op }, payload) => {
+            let Some(manager) = host.manager() else {
+                return HostcallOutcome::Error {
+                    code: "SHUTDOWN".to_string(),
+                    message: "Extension manager is shutting down".to_string(),
+                };
+            };
+            dispatch_hostcall_events(&call_id, &manager, &host.tools, &op, payload).await
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
+    let call_id = request.call_id.clone();
+    let extension_id = request.extension_id.clone();
+    let method = request.method();
+    let required = request.required_capability();
+    let params_hash = request.params_hash();
+    let call_timeout_ms = js_hostcall_timeout_ms(&request);
+    let started_at = Instant::now();
+
+    log_js_hostcall_start(
+        &call_id,
+        extension_id.as_deref(),
+        &required,
+        method,
+        &params_hash,
+        call_timeout_ms,
+    );
+
+    let (decision, reason, capability) =
+        resolve_js_hostcall_policy_decision(host, extension_id.as_deref(), &required).await;
+    log_js_policy_decision(
+        &call_id,
+        extension_id.as_deref(),
+        &capability,
+        &decision,
+        &reason,
+        &params_hash,
+    );
+
+    let outcome = if decision == PolicyDecision::Allow {
+        dispatch_hostcall_allowed(host, request).await
+    } else {
+        HostcallOutcome::Error {
+            code: "denied".to_string(),
+            message: format!("Capability '{capability}' denied by policy ({reason})"),
+        }
     };
 
-    // Dispatch through the shared dispatcher (handles validation, policy,
-    // timeout, logging, and taxonomy enforcement).
-    let result = dispatch_host_call_shared(&ctx, &payload).await;
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    log_js_hostcall_end(
+        &call_id,
+        extension_id.as_deref(),
+        &required,
+        method,
+        &params_hash,
+        duration_ms,
+        &outcome,
+    );
 
-    // Convert back to HostcallOutcome for Promise completion.
-    host_result_to_outcome(&result)
+    outcome
 }
 
 #[allow(clippy::future_not_send)]
@@ -7085,7 +5974,7 @@ async fn dispatch_hostcall_tool(
             },
         },
         Err(err) => HostcallOutcome::Error {
-            code: "io".to_string(),
+            code: "tool_error".to_string(),
             message: err.to_string(),
         },
     }
@@ -7368,7 +6257,7 @@ async fn dispatch_hostcall_session(
             let message_value = payload.get("message").cloned().unwrap_or(payload);
             match serde_json::from_value(message_value) {
                 Ok(message) => session.append_message(message).await.map(|()| Value::Null),
-                Err(err) => Err(Error::validation(format!("Parse message: {err}"))),
+                Err(err) => Err(Error::extension(format!("Parse message: {err}"))),
             }
         }
         "append_entry" | "appendentry" => {
@@ -7410,18 +6299,15 @@ async fn dispatch_hostcall_session(
                 .await
                 .map(|()| Value::Null)
         }
-        _ => Err(Error::validation(format!("Unknown session op: {op}"))),
+        _ => Err(Error::extension(format!("Unknown session op: {op}"))),
     };
 
     match result {
         Ok(value) => HostcallOutcome::Success(value),
-        Err(err) => {
-            let code = err.hostcall_error_code().to_string();
-            HostcallOutcome::Error {
-                code,
-                message: err.to_string(),
-            }
-        }
+        Err(err) => HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: err.to_string(),
+        },
     }
 }
 
@@ -8090,7 +6976,6 @@ impl ExtensionManager {
     }
 
     /// Load persisted permission decisions into the inner state.
-    #[cfg(not(test))]
     fn load_persisted_permissions(inner: &mut ExtensionManagerInner) {
         match PermissionStore::open_default() {
             Ok(store) => {
@@ -8103,13 +6988,6 @@ impl ExtensionManager {
             }
         }
     }
-
-    /// Unit tests must not read/write the real user permissions file.
-    ///
-    /// Tests that need persisted-permission behavior should open a `PermissionStore`
-    /// at an explicit temp path and wire it into the manager.
-    #[cfg(test)]
-    const fn load_persisted_permissions(_inner: &mut ExtensionManagerInner) {}
 
     /// Set the budget for extension operations.
     pub fn set_budget(&self, budget: Budget) {
@@ -9446,668 +8324,6 @@ fn normalize_command(name: &str) -> String {
     name.trim_start_matches('/').trim().to_ascii_lowercase()
 }
 
-// ============================================================================
-// Shared Hostcall Dispatcher (bd-1uy.1.1)
-// ============================================================================
-//
-// Single source of truth for hostcall execution across all runtimes (JS, WASM,
-// protocol). Takes `HostCallPayload` + execution context, performs validation,
-// capability derivation, policy check, timeout-wrapped dispatch, and structured
-// logging. Returns `HostResultPayload` with strict error taxonomy.
-
-/// Canonicalize a JSON value for stable hashing (sort object keys recursively).
-fn canonicalize_json_for_hash(value: &Value) -> Value {
-    match value {
-        Value::Object(map) => {
-            let mut keys = map.keys().cloned().collect::<Vec<_>>();
-            keys.sort();
-            let mut out = serde_json::Map::new();
-            for key in keys {
-                if let Some(v) = map.get(&key) {
-                    out.insert(key, canonicalize_json_for_hash(v));
-                }
-            }
-            Value::Object(out)
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_for_hash).collect()),
-        other => other.clone(),
-    }
-}
-
-/// SHA-256 hex digest of an input string.
-fn sha256_hex_str(input: &str) -> String {
-    let mut hasher = sha2::Sha256::new();
-    hasher.update(input.as_bytes());
-    let digest = hasher.finalize();
-    format!("{digest:x}")
-}
-
-/// Compute a stable hash of hostcall method + params for logging.
-///
-/// Never logs raw params; only this hash is emitted.
-pub(crate) fn shared_params_hash(method: &str, params: &Value) -> String {
-    let canonical = canonicalize_json_for_hash(&json!({ "method": method, "params": params }));
-    let encoded = serde_json::to_string(&canonical)
-        .unwrap_or_else(|_| r#"{"error":"canonical_failed"}"#.to_string());
-    sha256_hex_str(&encoded)
-}
-
-/// Execution context for the shared hostcall dispatcher.
-///
-/// Bundles all runtime resources needed to dispatch a hostcall. Callers
-/// from JS, WASM, or protocol tiers construct this from their own state.
-pub struct HostCallContext<'a> {
-    /// Runtime identifier for logging: `"js"`, `"wasm"`, `"protocol"`.
-    pub runtime: &'a str,
-    /// Extension that issued the hostcall (for logging and policy cache).
-    pub extension_id: Option<&'a str>,
-    /// Policy to evaluate capabilities against.
-    pub policy: &'a ExtensionPolicy,
-    /// Tool registry for `"tool"` method dispatch.
-    pub tools: &'a ToolRegistry,
-    /// HTTP connector for `"http"` method dispatch.
-    pub http: &'a HttpConnector,
-    /// FS connector for `"fs"` method dispatch.
-    pub fs: Option<&'a FsConnector>,
-    /// Environment variable allowlist for `"env"` method dispatch.
-    pub env_allowlist: Option<&'a BTreeSet<String>>,
-    /// Extension manager for session/ui/events dispatch + policy prompt cache.
-    pub manager: Option<&'a ExtensionManager>,
-}
-
-/// Create a successful [`HostResultPayload`].
-fn shared_result_ok(call_id: &str, output: Value) -> HostResultPayload {
-    HostResultPayload {
-        call_id: call_id.to_string(),
-        output,
-        is_error: false,
-        error: None,
-        chunk: None,
-    }
-}
-
-/// Create an error [`HostResultPayload`] with the given taxonomy code.
-fn shared_result_err(
-    call_id: &str,
-    code: HostCallErrorCode,
-    message: impl Into<String>,
-) -> HostResultPayload {
-    HostResultPayload {
-        call_id: call_id.to_string(),
-        output: json!({}),
-        is_error: true,
-        error: Some(HostCallError {
-            code,
-            message: message.into(),
-            details: None,
-            retryable: None,
-        }),
-        chunk: None,
-    }
-}
-
-/// Create an error [`HostResultPayload`] with details and optional retryable flag.
-fn shared_result_err_with_details(
-    call_id: &str,
-    code: HostCallErrorCode,
-    message: impl Into<String>,
-    details: Value,
-    retryable: Option<bool>,
-) -> HostResultPayload {
-    HostResultPayload {
-        call_id: call_id.to_string(),
-        output: json!({}),
-        is_error: true,
-        error: Some(HostCallError {
-            code,
-            message: message.into(),
-            details: Some(details),
-            retryable,
-        }),
-        chunk: None,
-    }
-}
-
-/// Convert [`HostcallOutcome`] (used by individual dispatchers) to
-/// [`HostResultPayload`] with strict error taxonomy.
-fn outcome_to_host_result(call_id: &str, outcome: HostcallOutcome) -> HostResultPayload {
-    match outcome {
-        HostcallOutcome::Success(value) => shared_result_ok(call_id, value),
-        HostcallOutcome::Error { code, message } => {
-            let error_code = match code.to_ascii_lowercase().as_str() {
-                "timeout" | "cancelled" => HostCallErrorCode::Timeout,
-                "denied" => HostCallErrorCode::Denied,
-                "io" | "tool_error" => HostCallErrorCode::Io,
-                "invalid_request" => HostCallErrorCode::InvalidRequest,
-                // shutdown/internal/unknown codes map to Internal (not user-facing denial)
-                _ => HostCallErrorCode::Internal,
-            };
-            shared_result_err(call_id, error_code, message)
-        }
-        HostcallOutcome::StreamChunk {
-            chunk,
-            sequence,
-            is_final,
-        } => HostResultPayload {
-            call_id: call_id.to_string(),
-            output: chunk,
-            is_error: false,
-            error: None,
-            chunk: Some(HostStreamChunk {
-                index: sequence,
-                is_last: is_final,
-                backpressure: None,
-            }),
-        },
-    }
-}
-
-/// Resolve policy decision, including prompt-cache lookup and user prompting.
-#[allow(clippy::future_not_send)]
-async fn resolve_shared_policy_decision(
-    ctx: &HostCallContext<'_>,
-    required: &str,
-) -> (PolicyDecision, String, String) {
-    let PolicyCheck {
-        mut decision,
-        capability,
-        mut reason,
-    } = ctx.policy.evaluate(required);
-
-    if decision != PolicyDecision::Prompt {
-        return (decision, reason, capability);
-    }
-
-    // Check prompt cache if we have a manager and extension_id.
-    if let (Some(extension_id), Some(manager)) = (ctx.extension_id, ctx.manager) {
-        if let Some(allow) = manager.cached_policy_prompt_decision(extension_id, &capability) {
-            decision = if allow {
-                PolicyDecision::Allow
-            } else {
-                PolicyDecision::Deny
-            };
-            reason = if allow {
-                "prompt_cache_allow".to_string()
-            } else {
-                "prompt_cache_deny".to_string()
-            };
-            return (decision, reason, capability);
-        }
-    }
-
-    // Prompt the user if we have a manager.
-    if let Some(manager) = ctx.manager {
-        let prompt_ext_id = ctx.extension_id.unwrap_or("<unknown>");
-        let allow = prompt_capability_once(manager, prompt_ext_id, &capability).await;
-        if let Some(extension_id) = ctx.extension_id {
-            manager.cache_policy_prompt_decision(extension_id, &capability, allow);
-        }
-        decision = if allow {
-            PolicyDecision::Allow
-        } else {
-            PolicyDecision::Deny
-        };
-        reason = if allow {
-            "prompt_user_allow".to_string()
-        } else {
-            "prompt_user_deny".to_string()
-        };
-    } else {
-        decision = PolicyDecision::Deny;
-        reason = "no_manager_for_prompt".to_string();
-    }
-
-    (decision, reason, capability)
-}
-
-fn log_shared_hostcall_start(
-    runtime: &str,
-    call_id: &str,
-    extension_id: Option<&str>,
-    capability: &str,
-    method: &str,
-    params_hash: &str,
-    timeout_ms: Option<u64>,
-) {
-    tracing::info!(
-        event = "host_call.start",
-        runtime = %runtime,
-        call_id = %call_id,
-        extension_id = ?extension_id,
-        capability = %capability,
-        method = %method,
-        params_hash = %params_hash,
-        timeout_ms = timeout_ms,
-        "Hostcall start"
-    );
-}
-
-fn log_shared_policy_decision(
-    runtime: &str,
-    call_id: &str,
-    extension_id: Option<&str>,
-    capability: &str,
-    decision: &PolicyDecision,
-    reason: &str,
-    params_hash: &str,
-) {
-    if *decision == PolicyDecision::Allow {
-        tracing::info!(
-            event = "policy.decision",
-            runtime = %runtime,
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %capability,
-            decision = ?decision,
-            reason = %reason,
-            params_hash = %params_hash,
-            "Hostcall allowed by policy"
-        );
-    } else {
-        tracing::warn!(
-            event = "policy.decision",
-            runtime = %runtime,
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %capability,
-            decision = ?decision,
-            reason = %reason,
-            params_hash = %params_hash,
-            "Hostcall denied by policy"
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn log_shared_hostcall_end(
-    runtime: &str,
-    call_id: &str,
-    extension_id: Option<&str>,
-    capability: &str,
-    method: &str,
-    params_hash: &str,
-    duration_ms: u64,
-    result: &HostResultPayload,
-) {
-    let error_code = result.error.as_ref().map(|e| format!("{:?}", e.code));
-
-    if result.is_error {
-        tracing::warn!(
-            event = "host_call.end",
-            runtime = %runtime,
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %capability,
-            method = %method,
-            params_hash = %params_hash,
-            duration_ms,
-            error_code = error_code.as_deref(),
-            "Hostcall end (error)"
-        );
-    } else {
-        tracing::info!(
-            event = "host_call.end",
-            runtime = %runtime,
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %capability,
-            method = %method,
-            params_hash = %params_hash,
-            duration_ms,
-            "Hostcall end (success)"
-        );
-    }
-}
-
-/// Dispatch an `"env"` hostcall (reads environment variables within allowlist).
-fn dispatch_hostcall_env_shared(
-    call_id: &str,
-    env_allowlist: &BTreeSet<String>,
-    params: &Value,
-) -> HostResultPayload {
-    let mut names = Vec::new();
-    if let Some(name) = params.get("name").and_then(Value::as_str) {
-        let name = name.trim();
-        if !name.is_empty() {
-            names.push(name.to_string());
-        }
-    } else if let Some(items) = params.get("names").and_then(Value::as_array) {
-        for item in items {
-            if let Some(name) = item.as_str() {
-                let name = name.trim();
-                if !name.is_empty() {
-                    names.push(name.to_string());
-                }
-            }
-        }
-    }
-
-    if names.is_empty() {
-        return shared_result_err(
-            call_id,
-            HostCallErrorCode::InvalidRequest,
-            "Missing env var name(s)",
-        );
-    }
-
-    if env_allowlist.is_empty() {
-        return shared_result_err(
-            call_id,
-            HostCallErrorCode::Denied,
-            "Env access not configured (no allowlist)",
-        );
-    }
-
-    let mut denied_hashes = Vec::new();
-    for name in &names {
-        if !env_allowlist.contains(name) {
-            denied_hashes.push(sha256_hex_str(name));
-        }
-    }
-
-    if !denied_hashes.is_empty() {
-        return shared_result_err_with_details(
-            call_id,
-            HostCallErrorCode::Denied,
-            "Env var not allowed by scope",
-            json!({ "denied_hashes": denied_hashes }),
-            None,
-        );
-    }
-
-    let mut values = serde_json::Map::new();
-    for name in names {
-        match std::env::var_os(&name) {
-            None => {
-                values.insert(name, Value::Null);
-            }
-            Some(value) => match value.into_string() {
-                Ok(v) => {
-                    values.insert(name, Value::String(v));
-                }
-                Err(_) => {
-                    return shared_result_err_with_details(
-                        call_id,
-                        HostCallErrorCode::Io,
-                        "Env var value is not valid UTF-8",
-                        json!({ "name_hash": sha256_hex_str(&name) }),
-                        None,
-                    );
-                }
-            },
-        }
-    }
-
-    shared_result_ok(call_id, json!({ "values": Value::Object(values) }))
-}
-
-/// Dispatch a `"log"` hostcall — structured extension log emission.
-fn dispatch_hostcall_log_shared(
-    call_id: &str,
-    extension_id: Option<&str>,
-    params: &Value,
-) -> HostResultPayload {
-    let level = params
-        .get("level")
-        .and_then(Value::as_str)
-        .unwrap_or("info")
-        .trim()
-        .to_ascii_lowercase();
-
-    let message = params.get("message").and_then(Value::as_str).unwrap_or("");
-
-    let data = params.get("data");
-
-    match level.as_str() {
-        "error" => tracing::error!(
-            event = "extension.log",
-            extension_id = ?extension_id,
-            level = "error",
-            data = ?data,
-            "{message}"
-        ),
-        "warn" | "warning" => tracing::warn!(
-            event = "extension.log",
-            extension_id = ?extension_id,
-            level = "warn",
-            data = ?data,
-            "{message}"
-        ),
-        "debug" => tracing::debug!(
-            event = "extension.log",
-            extension_id = ?extension_id,
-            level = "debug",
-            data = ?data,
-            "{message}"
-        ),
-        _ => tracing::info!(
-            event = "extension.log",
-            extension_id = ?extension_id,
-            level = "info",
-            data = ?data,
-            "{message}"
-        ),
-    }
-
-    shared_result_ok(call_id, json!({ "logged": true }))
-}
-
-/// Route an allowed hostcall to the appropriate method handler.
-#[allow(clippy::too_many_lines, clippy::future_not_send)]
-async fn dispatch_shared_allowed(
-    ctx: &HostCallContext<'_>,
-    payload: &HostCallPayload,
-) -> HostResultPayload {
-    let call_id = &payload.call_id;
-    let method = payload.method.trim().to_ascii_lowercase();
-    let params = &payload.params;
-
-    match method.as_str() {
-        "tool" => {
-            let Some(name) = params.get("name").and_then(Value::as_str) else {
-                return shared_result_err(
-                    call_id,
-                    HostCallErrorCode::InvalidRequest,
-                    "Missing tool name in params",
-                );
-            };
-            let name = name.trim();
-            if name.is_empty() {
-                return shared_result_err(
-                    call_id,
-                    HostCallErrorCode::InvalidRequest,
-                    "Empty tool name",
-                );
-            }
-            let input = params
-                .get("input")
-                .cloned()
-                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
-            let outcome = dispatch_hostcall_tool(ctx.tools, call_id, name, input).await;
-            outcome_to_host_result(call_id, outcome)
-        }
-        "exec" => {
-            let cmd = params
-                .get("cmd")
-                .and_then(Value::as_str)
-                .or_else(|| params.get("command").and_then(Value::as_str))
-                .unwrap_or_default()
-                .trim();
-            if cmd.is_empty() {
-                return shared_result_err(
-                    call_id,
-                    HostCallErrorCode::InvalidRequest,
-                    "Missing exec command",
-                );
-            }
-            let outcome = dispatch_hostcall_exec(call_id, cmd, params.clone()).await;
-            outcome_to_host_result(call_id, outcome)
-        }
-        "http" => {
-            let outcome = dispatch_hostcall_http(call_id, ctx.http, params.clone()).await;
-            outcome_to_host_result(call_id, outcome)
-        }
-        "fs" => {
-            let Some(fs) = ctx.fs else {
-                return shared_result_err(
-                    call_id,
-                    HostCallErrorCode::Denied,
-                    "FS connector not configured",
-                );
-            };
-            fs.handle_host_call(payload)
-        }
-        "env" => {
-            let Some(env_allowlist) = ctx.env_allowlist else {
-                return shared_result_err(
-                    call_id,
-                    HostCallErrorCode::Denied,
-                    "Env access not configured",
-                );
-            };
-            dispatch_hostcall_env_shared(call_id, env_allowlist, params)
-        }
-        "session" | "ui" | "events" => {
-            let Some(manager) = ctx.manager else {
-                return shared_result_err(
-                    call_id,
-                    HostCallErrorCode::Denied,
-                    "No extension manager configured",
-                );
-            };
-            let op = params
-                .get("op")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase();
-            if op.is_empty() {
-                return shared_result_err(
-                    call_id,
-                    HostCallErrorCode::InvalidRequest,
-                    format!("Missing op for {method}"),
-                );
-            }
-            let outcome = match method.as_str() {
-                "session" => dispatch_hostcall_session(call_id, manager, &op, params.clone()).await,
-                "ui" => dispatch_hostcall_ui(call_id, manager, &op, params.clone()).await,
-                "events" => {
-                    dispatch_hostcall_events(call_id, manager, ctx.tools, &op, params.clone()).await
-                }
-                _ => unreachable!(),
-            };
-            outcome_to_host_result(call_id, outcome)
-        }
-        "log" => dispatch_hostcall_log_shared(call_id, ctx.extension_id, params),
-        _ => shared_result_err(
-            call_id,
-            HostCallErrorCode::InvalidRequest,
-            format!("Unsupported hostcall method: {method}"),
-        ),
-    }
-}
-
-/// Shared hostcall dispatcher — single source of truth for all runtimes.
-///
-/// Takes a [`HostCallPayload`] plus execution context, performs validation,
-/// capability derivation, policy check, timeout-wrapped dispatch, and
-/// structured logging. Returns [`HostResultPayload`] with strict error
-/// taxonomy codes: `timeout | denied | io | invalid_request | internal`.
-#[allow(clippy::future_not_send)]
-pub async fn dispatch_host_call_shared(
-    ctx: &HostCallContext<'_>,
-    payload: &HostCallPayload,
-) -> HostResultPayload {
-    let call_id = &payload.call_id;
-
-    // 1. Validate payload (call_id, method, params, capability match).
-    if let Err(e) = validate_host_call(payload) {
-        return shared_result_err(call_id, HostCallErrorCode::InvalidRequest, e.to_string());
-    }
-
-    // 2. Derive capability and compute params hash for logging.
-    // Safe to unwrap: validate_host_call ensures method is valid.
-    let required = required_capability_for_host_call(payload)
-        .expect("validate_host_call ensures method is valid");
-    let method = payload.method.trim().to_ascii_lowercase();
-    let params_hash = shared_params_hash(&method, &payload.params);
-    let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
-
-    // 3. Log start.
-    log_shared_hostcall_start(
-        ctx.runtime,
-        call_id,
-        ctx.extension_id,
-        &required,
-        &method,
-        &params_hash,
-        call_timeout_ms,
-    );
-
-    // 4. Policy check.
-    let (decision, reason, capability) = resolve_shared_policy_decision(ctx, &required).await;
-    log_shared_policy_decision(
-        ctx.runtime,
-        call_id,
-        ctx.extension_id,
-        &capability,
-        &decision,
-        &reason,
-        &params_hash,
-    );
-
-    let started_at = Instant::now();
-
-    // 5. Dispatch or deny.
-    let result = if decision == PolicyDecision::Allow {
-        let dispatch = dispatch_shared_allowed(ctx, payload);
-        match call_timeout_ms {
-            Some(ms) => timeout(wall_now(), Duration::from_millis(ms), Box::pin(dispatch))
-                .await
-                .unwrap_or_else(|_| {
-                    shared_result_err_with_details(
-                        call_id,
-                        HostCallErrorCode::Timeout,
-                        format!("Hostcall timed out after {ms}ms"),
-                        json!({
-                            "capability": required,
-                            "method": method,
-                        }),
-                        Some(true),
-                    )
-                }),
-            None => dispatch.await,
-        }
-    } else {
-        shared_result_err_with_details(
-            call_id,
-            HostCallErrorCode::Denied,
-            format!("Capability '{capability}' denied by policy ({reason})"),
-            json!({
-                "capability": capability,
-                "decision": format!("{decision:?}"),
-                "reason": reason,
-            }),
-            None,
-        )
-    };
-
-    // 6. Log end.
-    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    log_shared_hostcall_end(
-        ctx.runtime,
-        call_id,
-        ctx.extension_id,
-        &required,
-        &method,
-        &params_hash,
-        duration_ms,
-        &result,
-    );
-
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -10491,7 +8707,7 @@ mod tests {
 
     #[test]
     fn js_hostcall_prompt_mode_asks_once_per_capability() {
-        let manager = ExtensionManager::new();
+        let manager = extension_manager_no_persisted_permissions();
         let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
             .build()
             .expect("runtime build");
@@ -10531,8 +8747,6 @@ mod tests {
                     deny_caps: Vec::new(),
                 },
                 interceptor: None,
-                exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-                http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
             };
 
             let request = HostcallRequest {
@@ -11228,6 +9442,18 @@ mod tests {
         runtime.block_on(future)
     }
 
+    fn extension_manager_no_persisted_permissions() -> ExtensionManager {
+        let manager = ExtensionManager::new();
+        {
+            let mut guard = manager.inner.lock().expect("extension manager lock");
+            // Unit tests should be deterministic and should never mutate the user's
+            // global permissions file.
+            guard.permission_store = None;
+            guard.policy_prompt_cache.clear();
+        }
+        manager
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn js_hostcall_prompt_policy_caches_user_allow_and_never_logs_raw_params() {
@@ -11236,7 +9462,7 @@ mod tests {
         let dir = tempdir().expect("tempdir");
         let cwd = dir.path().to_path_buf();
 
-        let manager = ExtensionManager::new();
+        let manager = extension_manager_no_persisted_permissions();
 
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
@@ -11249,8 +9475,6 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
-            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let request = crate::extensions_js::HostcallRequest {
@@ -11277,36 +9501,45 @@ mod tests {
         };
 
         let ((first, second), events) = capture_tracing_events(|| {
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build asupersync runtime");
-            let handle = runtime.handle();
+            run_async(async {
+                use asupersync::time::{timeout, wall_now};
+                use std::time::Duration;
 
-            runtime.block_on(async {
+                let cx = asupersync::Cx::for_request();
                 let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(8);
                 manager.set_ui_sender(ui_tx);
 
-                // Respond to any capability prompt(s). We expect 1 prompt here; if caching is broken
-                // and we see >1, respond anyway so the test fails via assertions instead of hanging.
-                let responder = manager.clone();
-                handle.spawn(async move {
-                    let cx = asupersync::Cx::for_request();
-                    while let Ok(request) = ui_rx.recv(&cx).await {
-                        assert_eq!(request.method, "confirm");
-                        assert!(
-                            responder.respond_ui(ExtensionUiResponse {
-                                id: request.id,
-                                value: Some(serde_json::Value::Bool(true)),
-                                cancelled: false,
-                            }),
-                            "respond_ui"
-                        );
-                    }
-                });
+                let ui_task = async {
+                    let ui_request = timeout(wall_now(), Duration::from_secs(2), ui_rx.recv(&cx))
+                        .await
+                        .expect("timed out waiting for ui request")
+                        .expect("ui request");
+                    assert_eq!(ui_request.method, "confirm");
 
-                let first = super::dispatch_hostcall(&host, request).await;
-                let second = super::dispatch_hostcall(&host, request_cached).await;
-                manager.clear_ui_sender();
+                    assert!(
+                        manager.respond_ui(ExtensionUiResponse {
+                            id: ui_request.id,
+                            value: Some(serde_json::Value::Bool(true)),
+                            cancelled: false,
+                        }),
+                        "respond_ui"
+                    );
+
+                    // Ensure the allow decision is cached (second hostcall should not prompt again).
+                    if let Ok(Ok(_)) =
+                        timeout(wall_now(), Duration::from_millis(200), ui_rx.recv(&cx)).await
+                    {
+                        panic!("unexpected second ui prompt");
+                    }
+                };
+
+                let hostcalls = async {
+                    let first = super::dispatch_hostcall(&host, request).await;
+                    let second = super::dispatch_hostcall(&host, request_cached).await;
+                    (first, second)
+                };
+
+                let ((), (first, second)) = futures::join!(ui_task, hostcalls);
                 (first, second)
             })
         });
@@ -11382,8 +9615,6 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
-            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let request = crate::extensions_js::HostcallRequest {
@@ -11459,10 +9690,8 @@ mod tests {
                         "unexpected denial message: {message}"
                     );
                 }
-                other => {
-                    unreachable!(
-                        "expected denied outcome for capability={capability}, got {other:?}"
-                    );
+                other @ HostcallOutcome::Success(_) => {
+                    panic!("expected denied outcome for capability={capability}, got {other:?}");
                 }
             }
         }
@@ -11529,8 +9758,6 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
-            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let strict_cases = vec![
@@ -11606,7 +9833,7 @@ mod tests {
         }
 
         // Prompt: non-default capabilities trigger UI, simulate user deny for each capability.
-        let manager_prompt = ExtensionManager::new();
+        let manager_prompt = extension_manager_no_persisted_permissions();
 
         let host_prompt = JsRuntimeHost {
             tools: Arc::clone(&tools),
@@ -11619,8 +9846,6 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
-            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let prompt_cases = strict_cases
@@ -11643,37 +9868,53 @@ mod tests {
             .collect::<Vec<_>>();
 
         let (prompt_outcomes, prompt_events) = capture_tracing_events(|| {
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build asupersync runtime");
-            let handle = runtime.handle();
+            run_async(async {
+                use asupersync::time::{timeout, wall_now};
+                use std::time::Duration;
 
-            runtime.block_on(async {
+                let cx = asupersync::Cx::for_request();
                 let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(16);
                 manager_prompt.set_ui_sender(ui_tx);
+                let prompt_count = prompt_cases.len();
 
-                let responder = manager_prompt.clone();
-                handle.spawn(async move {
-                    let cx = asupersync::Cx::for_request();
-                    while let Ok(request) = ui_rx.recv(&cx).await {
-                        assert_eq!(request.method, "confirm");
+                let ui_task = async {
+                    for _ in 0..prompt_count {
+                        let ui_request =
+                            timeout(wall_now(), Duration::from_secs(2), ui_rx.recv(&cx))
+                                .await
+                                .expect("timed out waiting for ui request")
+                                .expect("ui request");
+                        assert_eq!(ui_request.method, "confirm");
+
                         assert!(
-                            responder.respond_ui(ExtensionUiResponse {
-                                id: request.id,
+                            manager_prompt.respond_ui(ExtensionUiResponse {
+                                id: ui_request.id,
                                 value: Some(serde_json::Value::Bool(false)),
                                 cancelled: false,
                             }),
                             "respond_ui"
                         );
                     }
-                });
 
-                let mut out = Vec::new();
-                for case in &prompt_cases {
-                    let outcome = super::dispatch_hostcall(&host_prompt, to_request(case)).await;
-                    out.push((case.call_id, case.capability, case.reason, outcome));
-                }
-                manager_prompt.clear_ui_sender();
+                    // Ensure we don't leak an extra prompt that would hang on future runs.
+                    if let Ok(Ok(_)) =
+                        timeout(wall_now(), Duration::from_millis(200), ui_rx.recv(&cx)).await
+                    {
+                        panic!("unexpected extra ui prompt");
+                    }
+                };
+
+                let hostcalls = async {
+                    let mut out = Vec::new();
+                    for case in &prompt_cases {
+                        let outcome =
+                            super::dispatch_hostcall(&host_prompt, to_request(case)).await;
+                        out.push((case.call_id, case.capability, case.reason, outcome));
+                    }
+                    out
+                };
+
+                let ((), out) = futures::join!(ui_task, hostcalls);
                 out
             })
         });
@@ -11696,8 +9937,6 @@ mod tests {
                 deny_caps: vec!["http".to_string()],
             },
             interceptor: None,
-            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let perm_case = DenyCase {
@@ -11744,8 +9983,6 @@ mod tests {
                 deny_caps: Vec::new(),
             },
             interceptor: None,
-            exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-            http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
         };
 
         let write_request = crate::extensions_js::HostcallRequest {
@@ -11794,7 +10031,6 @@ mod tests {
                 );
                 return;
             }
-            HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
         };
 
         let encoded = serde_json::to_string(&value).expect("serialize read output");
@@ -11821,380 +10057,6 @@ mod tests {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    #[test]
-    fn js_streaming_exec_emits_stdout_chunks_and_final_exit() {
-        use std::sync::Arc;
-
-        #[derive(Clone)]
-        struct Recorder {
-            seen: Arc<Mutex<Vec<(String, Value)>>>,
-        }
-
-        impl HostcallInterceptor for Recorder {
-            fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
-                match &request.kind {
-                    HostcallKind::Tool { name } if name == "__report" || name == "__done" => {
-                        self.seen
-                            .lock()
-                            .expect("seen mutex poisoned")
-                            .push((name.clone(), request.payload.clone()));
-                        Some(HostcallOutcome::Success(Value::Null))
-                    }
-                    _ => None,
-                }
-            }
-        }
-
-        fn normalized_stdout(payload: &Value) -> Option<String> {
-            payload
-                .get("chunk")
-                .and_then(|v| v.get("stdout"))
-                .and_then(Value::as_str)
-                .map(|s| s.replace("\r\n", "\n"))
-        }
-
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let dir = tempdir().expect("tempdir");
-            let cwd = dir.path().to_path_buf();
-
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let recorder = Arc::new(Recorder {
-                seen: Arc::clone(&seen),
-            });
-
-            let host = JsRuntimeHost {
-                tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
-                manager_ref: Arc::downgrade(&manager.inner),
-                http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
-                policy: ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    max_memory_mb: 256,
-                    default_caps: Vec::new(),
-                    deny_caps: Vec::new(),
-                },
-                interceptor: Some(recorder),
-                exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-                http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
-            };
-
-            let runtime = PiJsRuntime::new().await.expect("create runtime");
-
-            let (cmd, args) = if cfg!(windows) {
-                // `powershell` is available on GitHub Actions Windows runners.
-                (
-                    "powershell",
-                    vec![
-                        "-NoProfile",
-                        "-Command",
-                        "Write-Output 'one'; Start-Sleep -Milliseconds 200; Write-Output 'two'",
-                    ],
-                )
-            } else {
-                (
-                    "sh",
-                    vec!["-c", "printf 'one\\n'; sleep 0.2; printf 'two\\n'"],
-                )
-            };
-            let cmd_json = serde_json::to_string(cmd).expect("serialize cmd");
-            let args_json = serde_json::to_string(&args).expect("serialize args");
-
-            runtime
-                .eval(&format!(
-                    r#"
-globalThis.__done = false;
-(async () => {{
-  try {{
-    await pi.exec({cmd_json}, {args_json}, {{
-      stream: true,
-      onChunk: (chunk, isFinal) => {{ pi.tool("__report", {{ chunk, isFinal }}); }},
-    }});
-    await pi.tool("__done", {{ ok: true }});
-  }} catch (e) {{
-    await pi.tool("__done", {{ ok: false, message: e.message, code: e.code ?? null }});
-  }}
-  globalThis.__done = true;
-}})();
-"#,
-                ))
-                .await
-                .expect("eval");
-
-            let start = Instant::now();
-            loop {
-                assert!(
-                    start.elapsed() <= Duration::from_secs(5),
-                    "timed out waiting for streaming exec to finish"
-                );
-
-                let _ = super::pump_js_runtime_once(&runtime, &host)
-                    .await
-                    .expect("pump_js_runtime_once");
-
-                let done = runtime
-                    .get_global_json("__done")
-                    .await
-                    .expect("get_global_json");
-                if done.as_bool() == Some(true) {
-                    break;
-                }
-
-                sleep(wall_now(), Duration::from_millis(1)).await;
-            }
-
-            let observed = {
-                let guard = seen.lock().expect("seen mutex poisoned");
-                guard.clone()
-            };
-
-            let reports = observed
-                .iter()
-                .filter(|(name, _)| name == "__report")
-                .map(|(_, payload)| payload.clone())
-                .collect::<Vec<_>>();
-
-            assert!(
-                reports.iter().all(|payload| payload.get("chunk").is_some()),
-                "sanity: chunk should be present in __report payloads"
-            );
-
-            let saw_one = reports.iter().any(|payload| {
-                payload.get("isFinal").and_then(Value::as_bool) == Some(false)
-                    && normalized_stdout(payload).as_deref() == Some("one\n")
-            });
-            let saw_two = reports.iter().any(|payload| {
-                payload.get("isFinal").and_then(Value::as_bool) == Some(false)
-                    && normalized_stdout(payload).as_deref() == Some("two\n")
-            });
-            let saw_final = reports.iter().any(|payload| {
-                payload.get("isFinal").and_then(Value::as_bool) == Some(true)
-                    && payload
-                        .get("chunk")
-                        .and_then(|v| v.get("code"))
-                        .and_then(Value::as_i64)
-                        == Some(0)
-            });
-
-            assert!(saw_one, "missing stdout chunk for first line: {reports:#?}");
-            assert!(
-                saw_two,
-                "missing stdout chunk for second line: {reports:#?}"
-            );
-            assert!(saw_final, "missing final exit chunk: {reports:#?}");
-
-            let done_payload = observed
-                .iter()
-                .find_map(|(name, payload)| (name == "__done").then(|| payload.clone()));
-            let done_payload = done_payload.expect("missing __done tool call");
-            assert_eq!(done_payload.get("ok").and_then(Value::as_bool), Some(true));
-        });
-    }
-
-    #[allow(clippy::too_many_lines)]
-    #[test]
-    fn js_streaming_http_sse_emits_head_and_events() {
-        use std::io::Write;
-        use std::net::TcpListener;
-        use std::sync::Arc;
-
-        #[derive(Clone)]
-        struct Recorder {
-            seen: Arc<Mutex<Vec<(String, Value)>>>,
-        }
-
-        impl HostcallInterceptor for Recorder {
-            fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
-                match &request.kind {
-                    HostcallKind::Tool { name } if name == "__report" || name == "__done" => {
-                        self.seen
-                            .lock()
-                            .expect("seen mutex poisoned")
-                            .push((name.clone(), request.payload.clone()));
-                        Some(HostcallOutcome::Success(Value::Null))
-                    }
-                    _ => None,
-                }
-            }
-        }
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test listener");
-        let addr = listener.local_addr().expect("listener addr");
-
-        let join = thread::spawn(move || {
-            let (mut stream, _peer) = listener.accept().expect("accept");
-            let body = "event: message\ndata: one\n\nevent: message\ndata: two\n\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("write response");
-        });
-
-        asupersync::test_utils::run_test(|| async move {
-            let manager = ExtensionManager::new();
-            let dir = tempdir().expect("tempdir");
-            let cwd = dir.path().to_path_buf();
-
-            let seen = Arc::new(Mutex::new(Vec::new()));
-            let recorder = Arc::new(Recorder {
-                seen: Arc::clone(&seen),
-            });
-
-            let host = JsRuntimeHost {
-                tools: Arc::new(crate::tools::ToolRegistry::new(
-                    &["__report", "__done"],
-                    &cwd,
-                    None,
-                )),
-                manager_ref: Arc::downgrade(&manager.inner),
-                http: Arc::new(crate::connectors::http::HttpConnector::new(
-                    crate::connectors::http::HttpConnectorConfig {
-                        require_tls: false,
-                        ..Default::default()
-                    },
-                )),
-                policy: ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    max_memory_mb: 256,
-                    default_caps: Vec::new(),
-                    deny_caps: Vec::new(),
-                },
-                interceptor: Some(recorder),
-                exec_streams: Arc::new(Mutex::new(ExecStreamRegistry::default())),
-                http_streams: Arc::new(Mutex::new(HttpStreamRegistry::default())),
-            };
-
-            let runtime = PiJsRuntime::new().await.expect("create runtime");
-            let url = format!("http://{addr}/");
-            let url_json = serde_json::to_string(&url).expect("serialize url");
-
-            runtime
-                .eval(&format!(
-                    r#"
-globalThis.__done = false;
-(async () => {{
-  try {{
-    await pi.http({{
-      url: {url_json},
-      stream: true,
-      onChunk: (chunk, isFinal) => {{ pi.tool("__report", {{ chunk, isFinal }}); }},
-    }});
-    await pi.tool("__done", {{ ok: true }});
-  }} catch (e) {{
-    await pi.tool("__done", {{ ok: false, message: e.message, code: e.code ?? null }});
-  }}
-  globalThis.__done = true;
-}})();
-"#,
-                ))
-                .await
-                .expect("eval");
-
-            let start = Instant::now();
-            loop {
-                assert!(
-                    start.elapsed() <= Duration::from_secs(5),
-                    "timed out waiting for streaming http to finish"
-                );
-
-                let _ = super::pump_js_runtime_once(&runtime, &host)
-                    .await
-                    .expect("pump_js_runtime_once");
-
-                let done = runtime
-                    .get_global_json("__done")
-                    .await
-                    .expect("get_global_json");
-                if done.as_bool() == Some(true) {
-                    break;
-                }
-
-                sleep(wall_now(), Duration::from_millis(1)).await;
-            }
-
-            let observed = {
-                let guard = seen.lock().expect("seen mutex poisoned");
-                guard.clone()
-            };
-
-            let reports = observed
-                .iter()
-                .filter(|(name, _)| name == "__report")
-                .map(|(_, payload)| payload.clone())
-                .collect::<Vec<_>>();
-
-            assert!(
-                reports.iter().any(|payload| {
-                    payload.get("isFinal").and_then(Value::as_bool) == Some(false)
-                        && payload
-                            .get("chunk")
-                            .and_then(|v| v.get("kind"))
-                            .and_then(Value::as_str)
-                            == Some("head")
-                        && payload
-                            .get("chunk")
-                            .and_then(|v| v.get("status"))
-                            .and_then(Value::as_i64)
-                            == Some(200)
-                }),
-                "missing head chunk: {reports:#?}"
-            );
-
-            assert!(
-                reports.iter().any(|payload| {
-                    payload.get("isFinal").and_then(Value::as_bool) == Some(false)
-                        && payload
-                            .get("chunk")
-                            .and_then(|v| v.get("kind"))
-                            .and_then(Value::as_str)
-                            == Some("sse")
-                        && payload
-                            .get("chunk")
-                            .and_then(|v| v.get("data"))
-                            .and_then(Value::as_str)
-                            == Some("one")
-                }),
-                "missing first sse event: {reports:#?}"
-            );
-
-            assert!(
-                reports.iter().any(|payload| {
-                    payload.get("isFinal").and_then(Value::as_bool) == Some(false)
-                        && payload
-                            .get("chunk")
-                            .and_then(|v| v.get("kind"))
-                            .and_then(Value::as_str)
-                            == Some("sse")
-                        && payload
-                            .get("chunk")
-                            .and_then(|v| v.get("data"))
-                            .and_then(Value::as_str)
-                            == Some("two")
-                }),
-                "missing second sse event: {reports:#?}"
-            );
-
-            assert!(
-                reports.iter().any(|payload| {
-                    payload.get("isFinal").and_then(Value::as_bool) == Some(true)
-                        && payload.get("chunk").is_some_and(Value::is_null)
-                }),
-                "missing final null chunk: {reports:#?}"
-            );
-
-            let done_payload = observed
-                .iter()
-                .find_map(|(name, payload)| (name == "__done").then(|| payload.clone()));
-            let done_payload = done_payload.expect("missing __done tool call");
-            assert_eq!(done_payload.get("ok").and_then(Value::as_bool), Some(true));
-        });
-
-        let _ = join.join();
-    }
-
     #[test]
     fn events_get_active_tools_returns_all_when_none_set() {
         asupersync::test_utils::run_test(|| async {
@@ -12211,7 +10073,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -12243,7 +10104,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -12272,7 +10132,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
             assert_eq!(tool_list.len(), 2);
@@ -12325,7 +10184,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
             assert_eq!(tool_list.len(), 2); // 1 built-in + 1 extension
@@ -12367,7 +10225,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -13124,7 +10981,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert!(value.get("provider").unwrap().is_null());
             assert!(value.get("modelId").unwrap().is_null());
@@ -13170,7 +11026,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert!(value.get("thinkingLevel").unwrap().is_null());
         });
@@ -13206,7 +11061,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(
                 value.get("thinkingLevel").and_then(Value::as_str),
@@ -13364,7 +11218,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(value.as_str(), Some("My Feature Work"));
         });
@@ -13483,7 +11336,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(
                 value.get("provider").and_then(Value::as_str),
@@ -13527,7 +11379,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(
                 value.get("thinkingLevel").and_then(Value::as_str),
@@ -13808,276 +11659,6 @@ globalThis.__done = false;
         });
     }
 
-    // --- Table-driven session dispatch taxonomy parity tests ---
-
-    /// Helper: extract (code, message) from a `HostcallOutcome::Error`, panics otherwise.
-    fn expect_error(outcome: HostcallOutcome) -> (String, String) {
-        match outcome {
-            HostcallOutcome::Error { code, message } => (code, message),
-            HostcallOutcome::Success(v) => panic!("expected error, got success: {v}"),
-            HostcallOutcome::StreamChunk { .. } => panic!("expected error, got stream chunk"),
-        }
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_no_session_returns_denied() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-
-            // Every op should return "denied" when no session is configured.
-            let ops: &[(&str, Value)] = &[
-                ("get_state", json!({})),
-                ("get_name", json!({})),
-                ("set_name", json!({ "name": "x" })),
-                ("get_model", json!({})),
-                ("set_model", json!({ "provider": "a", "modelId": "b" })),
-                ("get_thinking_level", json!({})),
-                ("set_thinking_level", json!({ "level": "high" })),
-                ("set_label", json!({ "targetId": "e1", "label": "L" })),
-                ("append_message", json!({ "message": { "role": "user", "content": "hi" } })),
-                ("append_entry", json!({ "customType": "note", "data": {} })),
-            ];
-
-            for (op, payload) in ops {
-                let outcome =
-                    dispatch_hostcall_session("call-t", &manager, op, payload.clone()).await;
-                let (code, msg) = expect_error(outcome);
-                assert_eq!(
-                    code, "denied",
-                    "op={op}: expected 'denied', got '{code}': {msg}"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_unknown_op_returns_invalid_request() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let session = Arc::new(MockSession::new());
-            manager.set_session(session);
-
-            let outcome =
-                dispatch_hostcall_session("call-t", &manager, "bogus_op", json!({})).await;
-            let (code, msg) = expect_error(outcome);
-            assert_eq!(
-                code, "invalid_request",
-                "unknown op should be invalid_request, got '{code}': {msg}"
-            );
-            assert!(
-                msg.contains("bogus_op"),
-                "error message should mention the bad op name"
-            );
-        });
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_set_model_missing_fields() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let session = Arc::new(MockSession::new());
-            manager.set_session(session);
-
-            // Missing modelId.
-            let outcome = dispatch_hostcall_session(
-                "call-t",
-                &manager,
-                "set_model",
-                json!({ "provider": "anthropic" }),
-            )
-            .await;
-            let (code, _) = expect_error(outcome);
-            assert_eq!(code, "invalid_request", "missing modelId → invalid_request");
-
-            // Missing provider.
-            let outcome = dispatch_hostcall_session(
-                "call-t",
-                &manager,
-                "set_model",
-                json!({ "modelId": "claude-sonnet-4-5" }),
-            )
-            .await;
-            let (code, _) = expect_error(outcome);
-            assert_eq!(
-                code, "invalid_request",
-                "missing provider → invalid_request"
-            );
-
-            // Both empty strings.
-            let outcome = dispatch_hostcall_session(
-                "call-t",
-                &manager,
-                "set_model",
-                json!({ "provider": "", "modelId": "" }),
-            )
-            .await;
-            let (code, _) = expect_error(outcome);
-            assert_eq!(
-                code, "invalid_request",
-                "empty provider+modelId → invalid_request"
-            );
-        });
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_set_thinking_level_missing() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let session = Arc::new(MockSession::new());
-            manager.set_session(session);
-
-            let outcome = dispatch_hostcall_session(
-                "call-t",
-                &manager,
-                "set_thinking_level",
-                json!({}),
-            )
-            .await;
-            let (code, _) = expect_error(outcome);
-            assert_eq!(
-                code, "invalid_request",
-                "missing level → invalid_request"
-            );
-        });
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_set_label_missing_target_id() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let session = Arc::new(MockSession::new());
-            manager.set_session(session);
-
-            let outcome = dispatch_hostcall_session(
-                "call-t",
-                &manager,
-                "set_label",
-                json!({ "label": "important" }),
-            )
-            .await;
-            let (code, _) = expect_error(outcome);
-            assert_eq!(
-                code, "invalid_request",
-                "missing targetId → invalid_request"
-            );
-        });
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_success_ops() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let session = Arc::new(MockSession::new());
-            manager.set_session(session);
-
-            // All these ops should succeed with a proper session.
-            let success_cases: &[(&str, Value)] = &[
-                ("get_state", json!({})),
-                ("get_name", json!({})),
-                ("get_file", json!({})),
-                ("get_messages", json!({})),
-                ("get_entries", json!({})),
-                ("get_branch", json!({})),
-                ("get_model", json!({})),
-                ("get_thinking_level", json!({})),
-                ("set_name", json!({ "name": "test-session" })),
-                (
-                    "set_model",
-                    json!({ "provider": "openai", "modelId": "gpt-4o" }),
-                ),
-                ("set_thinking_level", json!({ "level": "high" })),
-                ("set_label", json!({ "targetId": "e1", "label": "ok" })),
-                (
-                    "append_entry",
-                    json!({ "customType": "note", "data": { "x": 1 } }),
-                ),
-            ];
-
-            for (op, payload) in success_cases {
-                let outcome =
-                    dispatch_hostcall_session("call-t", &manager, op, payload.clone()).await;
-                assert!(
-                    matches!(outcome, HostcallOutcome::Success(_)),
-                    "op={op}: expected success, got {outcome:?}"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_camel_and_snake_case_parity() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let session = Arc::new(MockSession::new());
-            manager.set_session(session);
-
-            // Both camelCase and snake_case variants should route to the same handler.
-            let pairs: &[(&str, &str, Value)] = &[
-                ("get_state", "getState", json!({})),
-                ("get_name", "getName", json!({})),
-                ("set_name", "setName", json!({ "name": "n" })),
-                ("get_model", "getModel", json!({})),
-                (
-                    "set_model",
-                    "setModel",
-                    json!({ "provider": "a", "modelId": "b" }),
-                ),
-                ("get_thinking_level", "getThinkingLevel", json!({})),
-                (
-                    "set_thinking_level",
-                    "setThinkingLevel",
-                    json!({ "level": "high" }),
-                ),
-                ("get_messages", "getMessages", json!({})),
-                ("get_entries", "getEntries", json!({})),
-                ("get_branch", "getBranch", json!({})),
-                ("get_file", "getFile", json!({})),
-                (
-                    "set_label",
-                    "setLabel",
-                    json!({ "targetId": "e1", "label": "L" }),
-                ),
-            ];
-
-            for (snake, camel, payload) in pairs {
-                let out_snake =
-                    dispatch_hostcall_session("c1", &manager, snake, payload.clone()).await;
-                let out_camel =
-                    dispatch_hostcall_session("c2", &manager, camel, payload.clone()).await;
-
-                let snake_ok = matches!(&out_snake, HostcallOutcome::Success(_));
-                let camel_ok = matches!(&out_camel, HostcallOutcome::Success(_));
-                assert_eq!(
-                    snake_ok, camel_ok,
-                    "op '{snake}' vs '{camel}': success parity mismatch"
-                );
-            }
-        });
-    }
-
-    #[test]
-    fn session_dispatch_taxonomy_append_message_bad_payload_returns_invalid_request() {
-        asupersync::test_utils::run_test(|| async {
-            let manager = ExtensionManager::new();
-            let session = Arc::new(MockSession::new());
-            manager.set_session(session);
-
-            // Send a payload that cannot be deserialized as a SessionMessage.
-            let outcome = dispatch_hostcall_session(
-                "call-t",
-                &manager,
-                "append_message",
-                json!({ "message": { "not_a_valid_field": 42 } }),
-            )
-            .await;
-            let (code, _) = expect_error(outcome);
-            assert_eq!(
-                code, "invalid_request",
-                "bad append_message payload should be invalid_request"
-            );
-        });
-    }
-
     // --- registerFlag hostcall tests ---
 
     #[test]
@@ -14197,7 +11778,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(val.get("name").and_then(Value::as_str), Some("output-dir"));
             assert_eq!(val.get("type").and_then(Value::as_str), Some("string"));
@@ -14237,7 +11817,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success with null, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert!(val.is_null());
         });
@@ -14268,7 +11847,6 @@ globalThis.__done = false;
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
-                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let arr = val.as_array().expect("expected array");
             assert_eq!(arr.len(), 3);
@@ -15532,1906 +13110,5 @@ globalThis.__done = false;
                 });
             }
         }
-    }
-
-    // ====================================================================
-    // Shared Hostcall Dispatcher Tests (bd-1uy.1.1)
-    // ====================================================================
-
-    fn make_payload(
-        call_id: &str,
-        capability: &str,
-        method: &str,
-        params: Value,
-    ) -> HostCallPayload {
-        HostCallPayload {
-            call_id: call_id.to_string(),
-            capability: capability.to_string(),
-            method: method.to_string(),
-            params,
-            timeout_ms: None,
-            cancel_token: None,
-            context: None,
-        }
-    }
-
-    fn make_ctx<'a>(
-        policy: &'a ExtensionPolicy,
-        tools: &'a ToolRegistry,
-        http: &'a HttpConnector,
-    ) -> HostCallContext<'a> {
-        HostCallContext {
-            runtime: "test",
-            extension_id: Some("test-ext"),
-            policy,
-            tools,
-            http,
-            fs: None,
-            env_allowlist: None,
-            manager: None,
-        }
-    }
-
-    // --- Validation ---
-
-    #[test]
-    fn shared_dispatcher_rejects_empty_call_id() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload("", "read", "tool", json!({ "name": "read" }));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::InvalidRequest
-            );
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_rejects_capability_mismatch() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            // Declare "exec" but method is "tool" which requires "read"/"write"/etc.
-            let payload = make_payload("cap-mismatch", "exec", "tool", json!({ "name": "read" }));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::InvalidRequest
-            );
-            assert!(result.error.as_ref().unwrap().message.contains("mismatch"));
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_rejects_unknown_method() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload("unknown-method", "read", "unknown_method_xyz", json!({}));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::InvalidRequest
-            );
-        });
-    }
-
-    // --- Policy: Denied ---
-
-    #[test]
-    fn shared_dispatcher_denies_by_strict_policy() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Strict,
-                max_memory_mb: 256,
-                default_caps: vec!["read".to_string()],
-                deny_caps: Vec::new(),
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            // "exec" not in default_caps → denied
-            let payload = make_payload(
-                "denied-exec",
-                "exec",
-                "exec",
-                json!({ "cmd": "echo hello" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_denies_by_deny_caps() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                max_memory_mb: 256,
-                default_caps: Vec::new(),
-                deny_caps: vec!["http".to_string()],
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload(
-                "denied-http",
-                "http",
-                "http",
-                json!({ "url": "https://example.com" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-            let details = result.error.as_ref().unwrap().details.as_ref().unwrap();
-            assert_eq!(details["capability"], "http");
-        });
-    }
-
-    // --- Log method ---
-
-    #[test]
-    fn shared_dispatcher_log_success() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload(
-                "log-1",
-                "log",
-                "log",
-                json!({ "level": "info", "message": "test log" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(!result.is_error);
-            assert_eq!(result.output["logged"], true);
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_log_denied_by_policy() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Strict,
-                max_memory_mb: 256,
-                default_caps: Vec::new(),
-                deny_caps: vec!["log".to_string()],
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload(
-                "log-denied",
-                "log",
-                "log",
-                json!({ "level": "info", "message": "should not log" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    // --- Env method ---
-
-    #[test]
-    fn shared_dispatcher_env_success() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                deny_caps: Vec::new(),
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let mut allowlist = BTreeSet::new();
-            allowlist.insert("HOME".to_string());
-            let mut ctx = make_ctx(&policy, &tools, &http);
-            ctx.env_allowlist = Some(&allowlist);
-
-            let payload = make_payload("env-1", "env", "env", json!({ "name": "HOME" }));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(!result.is_error);
-            assert!(result.output["values"]["HOME"].is_string());
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_env_denied_not_in_allowlist() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let mut allowlist = BTreeSet::new();
-            allowlist.insert("HOME".to_string());
-            let mut ctx = make_ctx(&policy, &tools, &http);
-            ctx.env_allowlist = Some(&allowlist);
-
-            let payload = make_payload("env-denied", "env", "env", json!({ "name": "SECRET_KEY" }));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_env_no_connector() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-            // env_allowlist is None
-
-            let payload = make_payload("env-no-conn", "env", "env", json!({ "name": "HOME" }));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    // --- FS method ---
-
-    #[test]
-    fn shared_dispatcher_fs_no_connector() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload(
-                "fs-no-conn",
-                "read",
-                "fs",
-                json!({ "op": "read", "path": "/tmp/test.txt" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_fs_read_write_roundtrip() {
-        asupersync::test_utils::run_test(|| async {
-            let dir = tempdir().expect("tempdir");
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let scopes = FsScopes::for_cwd(dir.path()).expect("scopes");
-            let fs_connector =
-                FsConnector::new(dir.path(), policy.clone(), scopes).expect("fs connector");
-            let tools = ToolRegistry::new(&[], dir.path(), None);
-            let http = HttpConnector::with_defaults();
-            let mut ctx = make_ctx(&policy, &tools, &http);
-            ctx.fs = Some(&fs_connector);
-
-            // Write a file
-            let write_payload = make_payload(
-                "fs-write",
-                "write",
-                "fs",
-                json!({ "op": "write", "path": dir.path().join("hello.txt").to_str().unwrap(), "data": "hello world" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &write_payload).await;
-            assert!(!result.is_error, "fs write failed: {result:?}");
-
-            // Read it back
-            let read_payload = make_payload(
-                "fs-read",
-                "read",
-                "fs",
-                json!({ "op": "read", "path": dir.path().join("hello.txt").to_str().unwrap() }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &read_payload).await;
-            assert!(!result.is_error, "fs read failed: {result:?}");
-            assert!(result.output.to_string().contains("hello world"));
-        });
-    }
-
-    // --- Session/UI/Events: no manager ---
-
-    #[test]
-    fn shared_dispatcher_session_no_manager() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload(
-                "session-no-mgr",
-                "session",
-                "session",
-                json!({ "op": "get_name" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_events_no_manager() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload(
-                "events-no-mgr",
-                "events",
-                "events",
-                json!({ "op": "list_tools" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    // --- Tool method ---
-
-    #[test]
-    fn shared_dispatcher_tool_missing_name() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            // tool method but no "name" in params
-            let payload = make_payload("tool-no-name", "read", "tool", json!({ "input": {} }));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::InvalidRequest
-            );
-        });
-    }
-
-    // --- Exec method ---
-
-    #[test]
-    fn shared_dispatcher_exec_missing_cmd() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                deny_caps: Vec::new(),
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload("exec-no-cmd", "exec", "exec", json!({ "args": ["hello"] }));
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::InvalidRequest
-            );
-        });
-    }
-
-    #[test]
-    fn shared_dispatcher_exec_denied_by_policy() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Strict,
-                max_memory_mb: 256,
-                default_caps: vec!["read".to_string()],
-                deny_caps: vec!["exec".to_string()],
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            let payload = make_payload(
-                "exec-denied",
-                "exec",
-                "exec",
-                json!({ "cmd": "echo hello" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Denied
-            );
-        });
-    }
-
-    // --- Outcome conversion ---
-
-    #[test]
-    fn outcome_to_host_result_success() {
-        let outcome = HostcallOutcome::Success(json!({ "data": 42 }));
-        let result = outcome_to_host_result("call-ok", outcome);
-        assert!(!result.is_error);
-        assert_eq!(result.output["data"], 42);
-        assert_eq!(result.call_id, "call-ok");
-    }
-
-    #[test]
-    fn outcome_to_host_result_error_taxonomy() {
-        let cases = vec![
-            ("timeout", HostCallErrorCode::Timeout),
-            ("denied", HostCallErrorCode::Denied),
-            ("SHUTDOWN", HostCallErrorCode::Internal),
-            ("shutdown", HostCallErrorCode::Internal),
-            ("CANCELLED", HostCallErrorCode::Timeout),
-            ("cancelled", HostCallErrorCode::Timeout),
-            ("io", HostCallErrorCode::Io),
-            ("tool_error", HostCallErrorCode::Io),
-            ("invalid_request", HostCallErrorCode::InvalidRequest),
-            ("something_else", HostCallErrorCode::Internal),
-        ];
-        for (code, expected) in cases {
-            let outcome = HostcallOutcome::Error {
-                code: code.to_string(),
-                message: "test".to_string(),
-            };
-            let result = outcome_to_host_result("call-err", outcome);
-            assert!(result.is_error);
-            assert_eq!(result.error.as_ref().unwrap().code, expected, "code={code}");
-            // Verify output is always an object (spec requirement)
-            assert!(
-                result.output.is_object(),
-                "error result output must be object for code={code}"
-            );
-        }
-    }
-
-    // --- Params hash ---
-
-    #[test]
-    fn shared_params_hash_stable_for_key_ordering() {
-        let first = json!({ "b": 2, "a": 1 });
-        let second = json!({ "a": 1, "b": 2 });
-        assert_eq!(
-            shared_params_hash("http", &first),
-            shared_params_hash("http", &second)
-        );
-        assert_ne!(
-            shared_params_hash("http", &first),
-            shared_params_hash("tool", &first)
-        );
-    }
-
-    // --- Canonical params shapes (bd-1uy.1.1.2) ---
-
-    #[test]
-    fn canonical_params_tool_shape() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c1".into(),
-            kind: HostcallKind::Tool {
-                name: "read".into(),
-            },
-            payload: json!({"path": "/tmp/foo"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.method, "tool");
-        assert_eq!(payload.params["name"], "read");
-        assert_eq!(payload.params["input"]["path"], "/tmp/foo");
-        let hp = request.params_for_hash();
-        assert_eq!(hp["name"], "read");
-        assert_eq!(hp["input"]["path"], "/tmp/foo");
-    }
-
-    #[test]
-    fn canonical_params_exec_shape() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c2".into(),
-            kind: HostcallKind::Exec { cmd: "ls".into() },
-            payload: json!({"args": ["-la"], "cwd": "/home"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.params["cmd"], "ls");
-        assert_eq!(payload.params["args"][0], "-la");
-        assert_eq!(payload.params["cwd"], "/home");
-        let hp = request.params_for_hash();
-        assert_eq!(hp["cmd"], "ls");
-        assert_eq!(hp["args"][0], "-la");
-    }
-
-    #[test]
-    fn canonical_params_exec_command_alias_normalized() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c2b".into(),
-            kind: HostcallKind::Exec { cmd: "git".into() },
-            payload: json!({"command": "git", "args": ["status"]}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.params["cmd"], "git");
-        assert!(
-            payload.params.get("command").is_none(),
-            "legacy 'command' must be normalized"
-        );
-        let hp = request.params_for_hash();
-        assert!(hp.get("command").is_none());
-        assert_eq!(hp["cmd"], "git");
-    }
-
-    #[test]
-    fn canonical_params_exec_non_object_payload() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c2c".into(),
-            kind: HostcallKind::Exec { cmd: "echo".into() },
-            payload: json!("hello"),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.params["cmd"], "echo");
-        assert!(payload.params.is_object());
-    }
-
-    #[test]
-    fn canonical_params_http_shape() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c3".into(),
-            kind: HostcallKind::Http,
-            payload: json!({"url": "https://example.com", "method": "GET"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.params["url"], "https://example.com");
-        let hp = request.params_for_hash();
-        assert_eq!(hp, request.payload);
-    }
-
-    #[test]
-    fn canonical_params_session_flattened() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c4".into(),
-            kind: HostcallKind::Session {
-                op: "set_model".into(),
-            },
-            payload: json!({"provider": "anthropic", "modelId": "claude-sonnet-4-5"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.params["op"], "set_model");
-        assert_eq!(payload.params["provider"], "anthropic");
-        assert!(payload.params.get("args").is_none(), "must be flattened");
-        let hp = request.params_for_hash();
-        assert_eq!(hp["op"], "set_model");
-        assert_eq!(hp["provider"], "anthropic");
-    }
-
-    #[test]
-    fn canonical_params_ui_flattened() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c5".into(),
-            kind: HostcallKind::Ui { op: "toast".into() },
-            payload: json!({"message": "Done!", "level": "info"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.params["op"], "toast");
-        assert_eq!(payload.params["message"], "Done!");
-        let hp = request.params_for_hash();
-        assert_eq!(hp["op"], "toast");
-        assert_eq!(hp["message"], "Done!");
-    }
-
-    #[test]
-    fn canonical_params_events_flattened() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let request = HostcallRequest {
-            call_id: "c6".into(),
-            kind: HostcallKind::Events {
-                op: "subscribe".into(),
-            },
-            payload: json!({"event": "tool_start"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let payload = hostcall_request_to_payload(&request);
-        assert_eq!(payload.params["op"], "subscribe");
-        assert_eq!(payload.params["event"], "tool_start");
-        let hp = request.params_for_hash();
-        assert_eq!(hp["op"], "subscribe");
-        assert_eq!(hp["event"], "tool_start");
-    }
-
-    // --- Params hash parity: JS-tier vs shared dispatcher ---
-
-    #[test]
-    fn params_hash_parity_tool() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let r = HostcallRequest {
-            call_id: "p1".into(),
-            kind: HostcallKind::Tool {
-                name: "bash".into(),
-            },
-            payload: json!({"command": "ls -la"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let p = hostcall_request_to_payload(&r);
-        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
-    }
-
-    #[test]
-    fn params_hash_parity_exec() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let r = HostcallRequest {
-            call_id: "p2".into(),
-            kind: HostcallKind::Exec { cmd: "git".into() },
-            payload: json!({"args": ["status", "--short"]}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let p = hostcall_request_to_payload(&r);
-        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
-    }
-
-    #[test]
-    fn params_hash_parity_http() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let r = HostcallRequest {
-            call_id: "p3".into(),
-            kind: HostcallKind::Http,
-            payload: json!({"url": "https://api.example.com", "method": "POST", "body": "data"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let p = hostcall_request_to_payload(&r);
-        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
-    }
-
-    #[test]
-    fn params_hash_parity_session() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let r = HostcallRequest {
-            call_id: "p4".into(),
-            kind: HostcallKind::Session {
-                op: "set_model".into(),
-            },
-            payload: json!({"provider": "anthropic", "modelId": "claude-sonnet-4-5"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let p = hostcall_request_to_payload(&r);
-        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
-    }
-
-    #[test]
-    fn params_hash_parity_ui() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let r = HostcallRequest {
-            call_id: "p5".into(),
-            kind: HostcallKind::Ui { op: "toast".into() },
-            payload: json!({"message": "hello"}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let p = hostcall_request_to_payload(&r);
-        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
-    }
-
-    #[test]
-    fn params_hash_parity_events() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let r = HostcallRequest {
-            call_id: "p6".into(),
-            kind: HostcallKind::Events {
-                op: "subscribe".into(),
-            },
-            payload: json!({"event": "tool_end", "filter": {"name": "bash"}}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let p = hostcall_request_to_payload(&r);
-        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
-    }
-
-    #[test]
-    fn params_hash_parity_exec_command_alias() {
-        use crate::extensions_js::{HostcallKind, HostcallRequest};
-        let r = HostcallRequest {
-            call_id: "p7".into(),
-            kind: HostcallKind::Exec { cmd: "npm".into() },
-            payload: json!({"command": "npm", "args": ["install"]}),
-            trace_id: 0,
-            extension_id: None,
-        };
-        let p = hostcall_request_to_payload(&r);
-        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
-    }
-
-    #[test]
-    fn params_hash_different_methods_differ() {
-        let params = json!({"op": "get_state"});
-        let h1 = shared_params_hash("session", &params);
-        let h2 = shared_params_hash("ui", &params);
-        let h3 = shared_params_hash("events", &params);
-        assert_ne!(h1, h2);
-        assert_ne!(h2, h3);
-        assert_ne!(h1, h3);
-    }
-
-    #[test]
-    fn params_hash_nested_key_order_independent() {
-        let a = json!({"op": "test", "config": {"z": 1, "a": 2}, "list": [3, 2, 1]});
-        let b = json!({"config": {"a": 2, "z": 1}, "op": "test", "list": [3, 2, 1]});
-        assert_eq!(
-            shared_params_hash("session", &a),
-            shared_params_hash("session", &b)
-        );
-        let c = json!({"op": "test", "config": {"z": 1, "a": 2}, "list": [1, 2, 3]});
-        assert_ne!(
-            shared_params_hash("session", &a),
-            shared_params_hash("session", &c)
-        );
-    }
-
-    #[test]
-    fn canonicalize_json_for_hash_idempotent() {
-        let input = json!({"z": {"b": 2, "a": 1}, "a": [3, {"x": 1, "a": 0}]});
-        let once = canonicalize_json_for_hash(&input);
-        let twice = canonicalize_json_for_hash(&once);
-        assert_eq!(once, twice);
-    }
-
-    // --- Timeout ---
-
-    #[test]
-    fn shared_dispatcher_timeout_fires() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                deny_caps: Vec::new(),
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            // exec with a sleep that exceeds timeout
-            let mut payload = make_payload(
-                "timeout-test",
-                "exec",
-                "exec",
-                json!({ "cmd": "sleep", "args": ["10"] }),
-            );
-            payload.timeout_ms = Some(50); // 50ms timeout
-
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::Timeout
-            );
-            assert_eq!(result.error.as_ref().unwrap().retryable, Some(true));
-        });
-    }
-
-    // --- Unsupported method through dispatch ---
-
-    #[test]
-    fn shared_dispatcher_unsupported_method_through_allowed() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-            let ctx = make_ctx(&policy, &tools, &http);
-
-            // "log" method with "log" capability — validation passes, should succeed
-            let payload = make_payload(
-                "log-through",
-                "log",
-                "log",
-                json!({ "level": "debug", "message": "hi" }),
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(!result.is_error);
-        });
-    }
-
-    // --- Session missing op ---
-
-    #[test]
-    fn shared_dispatcher_session_missing_op() {
-        asupersync::test_utils::run_test(|| async {
-            let policy = ExtensionPolicy {
-                mode: ExtensionPolicyMode::Permissive,
-                ..ExtensionPolicy::default()
-            };
-            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-            let http = HttpConnector::with_defaults();
-
-            // We need a manager for session, but with a missing op
-            let mgr = ExtensionManager::new();
-            let mut ctx = make_ctx(&policy, &tools, &http);
-            ctx.manager = Some(&mgr);
-
-            let payload = make_payload(
-                "session-no-op",
-                "session",
-                "session",
-                json!({}), // no "op" field
-            );
-            let result = dispatch_host_call_shared(&ctx, &payload).await;
-            assert!(result.is_error);
-            assert_eq!(
-                result.error.as_ref().unwrap().code,
-                HostCallErrorCode::InvalidRequest
-            );
-        });
-    }
-
-    // ================================================================
-    // Log ledger helpers + tests (bd-1uy.1.1.4)
-    // ================================================================
-
-    const TAXONOMY: &[HostCallErrorCode] = &[
-        HostCallErrorCode::Timeout,
-        HostCallErrorCode::Denied,
-        HostCallErrorCode::Io,
-        HostCallErrorCode::InvalidRequest,
-        HostCallErrorCode::Internal,
-    ];
-
-    fn assert_taxonomy(result: &HostResultPayload) {
-        if let Some(ref err) = result.error {
-            assert!(
-                TAXONOMY
-                    .iter()
-                    .any(|c| std::mem::discriminant(c) == std::mem::discriminant(&err.code)),
-                "error code {:?} is not in the taxonomy",
-                err.code
-            );
-        }
-    }
-
-    fn events_named<'a>(events: &'a [CapturedEvent], name: &'a str) -> Vec<&'a CapturedEvent> {
-        events
-            .iter()
-            .filter(|e| e.fields.get("event").is_some_and(|v| v == name))
-            .collect()
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn assert_log_ledger(events: &[CapturedEvent], expected_call_id: &str, expected_method: &str) {
-        let starts = events_named(events, "host_call.start");
-        assert_eq!(
-            starts.len(),
-            1,
-            "expected 1 host_call.start, got {}",
-            starts.len()
-        );
-        let start = starts[0];
-        assert_eq!(
-            start.fields.get("call_id").map(String::as_str),
-            Some(expected_call_id)
-        );
-        assert_eq!(
-            start.fields.get("method").map(String::as_str),
-            Some(expected_method)
-        );
-        assert!(
-            start.fields.contains_key("runtime"),
-            "start missing runtime"
-        );
-        assert!(
-            start.fields.contains_key("capability"),
-            "start missing capability"
-        );
-        assert!(
-            start.fields.contains_key("params_hash"),
-            "start missing params_hash"
-        );
-        let decisions = events_named(events, "policy.decision");
-        assert_eq!(
-            decisions.len(),
-            1,
-            "expected 1 policy.decision, got {}",
-            decisions.len()
-        );
-        let dec = decisions[0];
-        assert_eq!(
-            dec.fields.get("call_id").map(String::as_str),
-            Some(expected_call_id)
-        );
-        assert!(
-            dec.fields.contains_key("capability"),
-            "decision missing capability"
-        );
-        assert!(
-            dec.fields.contains_key("decision"),
-            "decision missing decision"
-        );
-        assert!(
-            dec.fields.contains_key("params_hash"),
-            "decision missing params_hash"
-        );
-        let ends = events_named(events, "host_call.end");
-        assert_eq!(
-            ends.len(),
-            1,
-            "expected 1 host_call.end, got {}",
-            ends.len()
-        );
-        let end = ends[0];
-        assert_eq!(
-            end.fields.get("call_id").map(String::as_str),
-            Some(expected_call_id)
-        );
-        assert_eq!(
-            end.fields.get("method").map(String::as_str),
-            Some(expected_method)
-        );
-        assert!(end.fields.contains_key("runtime"), "end missing runtime");
-        assert!(
-            end.fields.contains_key("capability"),
-            "end missing capability"
-        );
-        assert!(
-            end.fields.contains_key("params_hash"),
-            "end missing params_hash"
-        );
-        assert!(
-            end.fields.contains_key("duration_ms"),
-            "end missing duration_ms"
-        );
-    }
-
-    fn assert_no_raw_params(events: &[CapturedEvent], raw_values: &[&str]) {
-        for event in events {
-            for (key, val) in &event.fields {
-                if key == "params_hash" || key == "message" {
-                    continue;
-                }
-                for raw in raw_values {
-                    assert!(
-                        !val.contains(raw),
-                        "raw param value {raw:?} leaked into log field {key}={val}"
-                    );
-                }
-            }
-        }
-    }
-
-    // --- Spec-valid host_result payloads (bd-1uy.1.1.1) ---
-
-    #[test]
-    fn shared_result_err_constructors_produce_valid_payloads() {
-        let err1 = shared_result_err("err-test-1", HostCallErrorCode::Internal, "test error");
-        assert!(validate_host_result(&err1).is_ok());
-        let err2 = shared_result_err_with_details(
-            "err-test-2",
-            HostCallErrorCode::Io,
-            "io error",
-            json!({ "detail": "x" }),
-            Some(true),
-        );
-        assert!(validate_host_result(&err2).is_ok());
-    }
-
-    #[test]
-    fn shared_result_ok_produces_valid_payload() {
-        let ok = shared_result_ok("ok-test-1", json!({ "data": 42 }));
-        assert!(validate_host_result(&ok).is_ok());
-        assert!(!ok.is_error);
-    }
-
-    #[test]
-    fn validate_host_result_rejects_null_output() {
-        let bad = HostResultPayload {
-            call_id: "null-output".to_string(),
-            output: Value::Null,
-            is_error: false,
-            error: None,
-            chunk: None,
-        };
-        assert!(
-            validate_host_result(&bad).is_err(),
-            "null output must be rejected"
-        );
-    }
-
-    // --- Ledger tests (bd-1uy.1.1.4) ---
-
-    #[test]
-    fn ledger_log_success() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-log-1",
-                    "log",
-                    "log",
-                    json!({ "level": "info", "message": "test-msg-secret" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(!result.is_error);
-        assert_log_ledger(&events, "ledger-log-1", "log");
-        assert_no_raw_params(&events, &["test-msg-secret"]);
-    }
-
-    #[test]
-    fn ledger_log_denied_by_strict_policy() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Strict,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-log-denied",
-                    "log",
-                    "log",
-                    json!({ "level": "warn", "message": "deny-me" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-log-denied", "log");
-    }
-
-    #[test]
-    fn ledger_env_success() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    deny_caps: vec![],
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let allowlist: BTreeSet<String> = std::iter::once("HOME".to_string()).collect();
-                let mut ctx = make_ctx(&policy, &tools, &http);
-                ctx.env_allowlist = Some(&allowlist);
-                let payload = make_payload("ledger-env-1", "env", "env", json!({ "name": "HOME" }));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(!result.is_error);
-        assert_log_ledger(&events, "ledger-env-1", "env");
-    }
-
-    #[test]
-    fn ledger_env_denied_not_in_allowlist() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    deny_caps: vec![],
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let allowlist: BTreeSet<String> = std::iter::once("HOME".to_string()).collect();
-                let mut ctx = make_ctx(&policy, &tools, &http);
-                ctx.env_allowlist = Some(&allowlist);
-                let payload = make_payload(
-                    "ledger-env-denied",
-                    "env",
-                    "env",
-                    json!({ "name": "SECRET_KEY_12345" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_log_ledger(&events, "ledger-env-denied", "env");
-        assert_no_raw_params(&events, &["SECRET_KEY_12345"]);
-    }
-
-    #[test]
-    fn ledger_env_no_connector() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    deny_caps: vec![],
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload =
-                    make_payload("ledger-env-noconn", "env", "env", json!({ "name": "PATH" }));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-env-noconn", "env");
-    }
-
-    #[test]
-    fn ledger_tool_missing_name() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload("ledger-tool-noname", "tool", "tool", json!({}));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::InvalidRequest
-        );
-        let starts = events_named(&events, "host_call.start");
-        assert!(starts.is_empty(), "validation error should produce no log");
-    }
-
-    #[test]
-    fn ledger_tool_unknown_tool() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-tool-unk",
-                    "tool",
-                    "tool",
-                    json!({ "name": "nonexistent_tool_xyz" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_log_ledger(&events, "ledger-tool-unk", "tool");
-        assert_no_raw_params(&events, &["nonexistent_tool_xyz"]);
-    }
-
-    #[test]
-    fn ledger_tool_denied_by_policy() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    deny_caps: vec!["read".to_string()],
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload =
-                    make_payload("ledger-tool-pol", "read", "tool", json!({ "name": "read" }));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-tool-pol", "tool");
-    }
-
-    #[test]
-    fn ledger_exec_missing_cmd() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    deny_caps: vec![],
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload("ledger-exec-nocmd", "exec", "exec", json!({}));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::InvalidRequest
-        );
-        assert_log_ledger(&events, "ledger-exec-nocmd", "exec");
-    }
-
-    #[test]
-    fn ledger_exec_denied_by_strict_policy() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Strict,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-exec-denied",
-                    "exec",
-                    "exec",
-                    json!({ "cmd": "echo secret_password_42" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-exec-denied", "exec");
-        assert_no_raw_params(&events, &["secret_password_42"]);
-    }
-
-    #[test]
-    fn ledger_http_denied_by_policy() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    deny_caps: vec!["http".to_string()],
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-http-denied",
-                    "http",
-                    "http",
-                    json!({ "url": "https://secret.example.com/api" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-http-denied", "http");
-        assert_no_raw_params(&events, &["secret.example.com"]);
-    }
-
-    #[test]
-    fn ledger_session_no_manager() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-sess-nomgr",
-                    "session",
-                    "session",
-                    json!({ "op": "getState" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-sess-nomgr", "session");
-    }
-
-    #[test]
-    fn ledger_session_missing_op() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let manager = ExtensionManager::new();
-                let mut ctx = make_ctx(&policy, &tools, &http);
-                ctx.manager = Some(&manager);
-                let payload = make_payload("ledger-sess-noop", "session", "session", json!({}));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::InvalidRequest
-        );
-        assert_log_ledger(&events, "ledger-sess-noop", "session");
-    }
-
-    #[test]
-    fn ledger_ui_no_manager() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-ui-nomgr",
-                    "ui",
-                    "ui",
-                    json!({ "op": "showToast", "message": "hello" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-ui-nomgr", "ui");
-        assert_no_raw_params(&events, &["showToast", "hello"]);
-    }
-
-    #[test]
-    fn ledger_events_no_manager() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-ev-nomgr",
-                    "events",
-                    "events",
-                    json!({ "op": "getModel" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-ev-nomgr", "events");
-    }
-
-    #[test]
-    fn ledger_fs_no_connector() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-fs-noconn",
-                    "read",
-                    "fs",
-                    json!({ "op": "read", "path": "/tmp/secret_file.txt" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::Denied
-        );
-        assert_log_ledger(&events, "ledger-fs-noconn", "fs");
-        assert_no_raw_params(&events, &["secret_file.txt"]);
-    }
-
-    #[test]
-    fn ledger_unsupported_method() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload("ledger-unsup", "banana", "banana", json!({}));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::InvalidRequest
-        );
-        let starts = events_named(&events, "host_call.start");
-        assert!(starts.is_empty(), "validation error should produce no log");
-    }
-
-    #[test]
-    fn ledger_empty_call_id() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload("", "log", "log", json!({}));
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::InvalidRequest
-        );
-        let starts = events_named(&events, "host_call.start");
-        assert!(starts.is_empty());
-    }
-
-    #[test]
-    fn ledger_capability_mismatch() {
-        let (result, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-cap-mismatch",
-                    "exec",
-                    "log",
-                    json!({ "level": "info", "message": "mismatch" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        assert!(validate_host_result(&result).is_ok());
-        assert!(result.is_error);
-        assert_taxonomy(&result);
-        assert_eq!(
-            result.error.as_ref().unwrap().code,
-            HostCallErrorCode::InvalidRequest
-        );
-        let starts = events_named(&events, "host_call.start");
-        assert!(starts.is_empty());
-    }
-
-    #[test]
-    #[allow(clippy::too_many_lines)]
-    fn ledger_full_cycle_all_methods() {
-        struct Case {
-            call_id: &'static str,
-            capability: &'static str,
-            method: &'static str,
-            params: Value,
-        }
-        let cases = vec![
-            Case {
-                call_id: "fc-log",
-                capability: "log",
-                method: "log",
-                params: json!({ "level": "debug", "message": "test" }),
-            },
-            Case {
-                call_id: "fc-env",
-                capability: "env",
-                method: "env",
-                params: json!({ "name": "SHELL" }),
-            },
-            Case {
-                call_id: "fc-tool",
-                capability: "tool",
-                method: "tool",
-                params: json!({ "name": "unknown_for_test" }),
-            },
-            Case {
-                call_id: "fc-exec",
-                capability: "exec",
-                method: "exec",
-                params: json!({ "cmd": "true" }),
-            },
-            Case {
-                call_id: "fc-http",
-                capability: "http",
-                method: "http",
-                params: json!({ "url": "https://invalid.test" }),
-            },
-            Case {
-                call_id: "fc-session",
-                capability: "session",
-                method: "session",
-                params: json!({ "op": "getState" }),
-            },
-            Case {
-                call_id: "fc-ui",
-                capability: "ui",
-                method: "ui",
-                params: json!({ "op": "showToast" }),
-            },
-            Case {
-                call_id: "fc-events",
-                capability: "events",
-                method: "events",
-                params: json!({ "op": "getModel" }),
-            },
-            Case {
-                call_id: "fc-fs",
-                capability: "read",
-                method: "fs",
-                params: json!({ "op": "read", "path": "/nonexistent" }),
-            },
-        ];
-        for case in &cases {
-            let (result, events) = capture_tracing_events(|| {
-                run_async(async {
-                    let policy = ExtensionPolicy {
-                        mode: ExtensionPolicyMode::Permissive,
-                        deny_caps: vec![],
-                        ..ExtensionPolicy::default()
-                    };
-                    let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                    let http = HttpConnector::with_defaults();
-                    let allowlist: BTreeSet<String> =
-                        std::iter::once("SHELL".to_string()).collect();
-                    let manager = ExtensionManager::new();
-                    let mut ctx = make_ctx(&policy, &tools, &http);
-                    ctx.env_allowlist = Some(&allowlist);
-                    ctx.manager = Some(&manager);
-                    let payload = make_payload(
-                        case.call_id,
-                        case.capability,
-                        case.method,
-                        case.params.clone(),
-                    );
-                    dispatch_host_call_shared(&ctx, &payload).await
-                })
-            });
-            assert!(
-                validate_host_result(&result).is_ok(),
-                "validate failed for {}",
-                case.call_id
-            );
-            assert_taxonomy(&result);
-            assert_log_ledger(&events, case.call_id, case.method);
-        }
-    }
-
-    #[test]
-    fn ledger_params_hash_is_opaque() {
-        let secret_value = "absolutely_secret_value_98765";
-        let (_, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    deny_caps: vec![],
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let allowlist: BTreeSet<String> =
-                    std::iter::once(secret_value.to_string()).collect();
-                let mut ctx = make_ctx(&policy, &tools, &http);
-                ctx.env_allowlist = Some(&allowlist);
-                let payload = make_payload(
-                    "ledger-hash-opaque",
-                    "env",
-                    "env",
-                    json!({ "name": secret_value }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        let starts = events_named(&events, "host_call.start");
-        assert_eq!(starts.len(), 1);
-        let hash = starts[0]
-            .fields
-            .get("params_hash")
-            .expect("params_hash field");
-        assert_eq!(hash.len(), 64, "params_hash should be 64 hex chars");
-        assert!(
-            hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "params_hash should be hex only"
-        );
-        assert!(
-            !hash.contains(secret_value),
-            "params_hash must not contain raw param"
-        );
-        assert_no_raw_params(&events, &[secret_value]);
-    }
-
-    #[test]
-    fn ledger_duration_ms_is_numeric() {
-        let (_, events) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-dur-num",
-                    "log",
-                    "log",
-                    json!({ "level": "info", "message": "timing" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        let ends = events_named(&events, "host_call.end");
-        assert_eq!(ends.len(), 1);
-        let dur = ends[0]
-            .fields
-            .get("duration_ms")
-            .expect("duration_ms field");
-        assert!(
-            dur.parse::<u64>().is_ok(),
-            "duration_ms should parse as u64, got: {dur}"
-        );
-    }
-
-    #[test]
-    fn ledger_policy_decision_level_varies() {
-        let (_, events_allow) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-lvl-allow",
-                    "log",
-                    "log",
-                    json!({ "level": "info", "message": "x" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        let allow_decs = events_named(&events_allow, "policy.decision");
-        assert_eq!(allow_decs.len(), 1);
-        assert_eq!(allow_decs[0].level, tracing::Level::INFO);
-        let (_, events_deny) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Strict,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-lvl-deny",
-                    "log",
-                    "log",
-                    json!({ "level": "info", "message": "x" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        let deny_decs = events_named(&events_deny, "policy.decision");
-        assert_eq!(deny_decs.len(), 1);
-        assert_eq!(deny_decs[0].level, tracing::Level::WARN);
-    }
-
-    #[test]
-    fn ledger_end_level_varies_by_outcome() {
-        let (_, events_ok) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Permissive,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-end-ok",
-                    "log",
-                    "log",
-                    json!({ "level": "info", "message": "x" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        let ends_ok = events_named(&events_ok, "host_call.end");
-        assert_eq!(ends_ok.len(), 1);
-        assert_eq!(ends_ok[0].level, tracing::Level::INFO);
-        let (_, events_err) = capture_tracing_events(|| {
-            run_async(async {
-                let policy = ExtensionPolicy {
-                    mode: ExtensionPolicyMode::Strict,
-                    ..ExtensionPolicy::default()
-                };
-                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
-                let http = HttpConnector::with_defaults();
-                let ctx = make_ctx(&policy, &tools, &http);
-                let payload = make_payload(
-                    "ledger-end-err",
-                    "log",
-                    "log",
-                    json!({ "level": "info", "message": "x" }),
-                );
-                dispatch_host_call_shared(&ctx, &payload).await
-            })
-        });
-        let ends_err = events_named(&events_err, "host_call.end");
-        assert_eq!(ends_err.len(), 1);
-        assert_eq!(ends_err[0].level, tracing::Level::WARN);
     }
 }
