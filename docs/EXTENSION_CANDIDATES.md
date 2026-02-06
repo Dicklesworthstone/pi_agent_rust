@@ -576,15 +576,125 @@ npm search pi-mono --json | jq '.[0:50] | map({name,version,description})'
 
 For each promising package, record popularity evidence (downloads, dependents) and extract any linked repo/gist.
 
-### E) Marketplace ecosystems (OpenClaw / ClawHub)
+### E) Marketplace ecosystems (OpenClaw / ClawHub) — Researched 2026‑02‑06 (bd‑2m6d)
 
-Goal: locate any marketplace/directory indexes that list extensions in bulk.
+**Status: RESEARCHED.** Canonical sources identified. Compatibility assessed. See below.
 
-Checklist:
+#### Canonical Sources
 
-- Identify the canonical OpenClaw org/repo and any associated “hub / marketplace / directory”.
-- Prefer machine-readable indexes (JSON feeds, GraphQL endpoints, API responses) over scraping HTML.
-- Export raw dumps with timestamps so inventory can be regenerated.
+| Resource | URL | Type |
+|----------|-----|------|
+| OpenClaw GitHub org | https://github.com/openclaw | Organization |
+| OpenClaw main repo | https://github.com/openclaw/openclaw | Source (167k stars) |
+| ClawHub registry repo | https://github.com/openclaw/clawhub | Registry source |
+| ClawHub website | https://clawhub.ai/ | SPA (TanStack Start + Convex) |
+| ClawHub docs | https://docs.openclaw.ai/tools/clawhub | Documentation |
+| Skills archive | https://github.com/openclaw/skills | All ClawHub skills backup |
+| Awesome list | https://github.com/VoltAgent/awesome-openclaw-skills | 1,715+ curated skills |
+
+#### API Endpoints (machine-readable)
+
+ClawHub v1 REST API (Convex-backed):
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/skills` | GET | List skills (supports `sort=installs,trending,stars,newest,name`; max 200 items) |
+| `/api/v1/skills` | POST | Publish skill (multipart) |
+| `/api/v1/skills/{slug}` | GET | Fetch skill metadata + version info |
+| `/api/v1/stars/{slug}` | POST/DELETE | Idempotent star management |
+
+Search uses OpenAI embeddings (`text-embedding-3-small`) + Convex vector search.
+CLI: `clawhub search "query"` / `clawhub install <slug>` / `clawhub sync`
+
+**Rate limits apply.** GitHub OAuth required for authenticated operations.
+OpenAPI spec is available for v1 endpoints.
+
+#### Scale
+
+- **3,000+ total skills** in ClawHub registry (as of 2026-02-02)
+- **1,715+ curated** in the awesome-openclaw-skills list (filtered for quality)
+- **30+ categories**: Web/Frontend (46), Coding Agents/IDEs (55), DevOps/Cloud (144), AI/LLMs (159), Search/Research (148), CLI Utils (88), Marketing/Sales (94), Productivity (93), Communication (58), Smart Home/IoT (50), plus 15+ more
+- **Skills archive repo** (`openclaw/skills`): Python 43.9%, JS 25.6%, Shell 11.6%, TS 11.2%
+
+#### Relationship: Pi ↔ OpenClaw
+
+Per Armin Ronacher's analysis (https://lucumr.pocoo.org/2026/1/31/pi/):
+> "What's under the hood of OpenClaw is a little coding agent called Pi."
+
+OpenClaw uses Pi as its underlying coding agent runtime (via RPC mode). Pi's extension system (`ExtensionAPI`, `registerTool`, `registerProvider`, etc.) is the foundation that OpenClaw's agent uses for code execution.
+
+OpenClaw extends this with its own **plugin architecture** (4 types: channels, tools, providers, memory) that wraps Pi's agent in a Gateway WebSocket control plane. OpenClaw plugins use `openclaw.extensions` in `package.json` manifests and are discovered from `extensions/*` workspace directories.
+
+#### Compatibility Assessment
+
+**ClawHub skills (SKILL.md text bundles) vs Pi skills:**
+
+| Aspect | Pi Skills | ClawHub Skills | Compatible? |
+|--------|-----------|----------------|-------------|
+| File format | SKILL.md (YAML frontmatter + markdown) | SKILL.md (metadata + markdown) | PARTIAL |
+| Frontmatter | YAML: `name`, `description`, `disable-model-invocation` | Table/YAML: `metadata.clawdbot.secrets`, `nix.plugin` | NEEDS NORMALIZATION |
+| Body content | Markdown instructions/prompts | Markdown instructions/prompts | YES (direct) |
+| Load path | `~/.pi/agent/skills/*/SKILL.md` | `~/.openclaw/skills/*/SKILL.md` | TRIVIAL REMAP |
+| Invocation | `/skill:name` | Automatic (agent discovers and loads) | COMPATIBLE |
+
+**Verdict on SKILL.md compatibility:**
+- The markdown body of ClawHub skills IS directly usable as Pi skill content
+- Frontmatter metadata differs: ClawHub uses `metadata.clawdbot` namespace with secrets/config; Pi uses flat YAML with `name`/`description`/`disable-model-invocation`
+- A normalizer that strips ClawHub-specific metadata and maps `name`/`description` fields would make ~90% of skills directly compatible
+
+**OpenClaw code extensions vs Pi code extensions:**
+
+| Aspect | Pi Extensions | OpenClaw Plugins | Compatible? |
+|--------|--------------|------------------|-------------|
+| API import | `import { ExtensionAPI } from "@mariozechner/pi-coding-agent"` | `openclaw.extensions` manifest in package.json | NO (different APIs) |
+| Registration | `pi.registerTool()`, `pi.registerProvider()`, etc. | Gateway plugin lifecycle (discovery/validation/loading/init/runtime) | NO |
+| Runtime | QuickJS/WASM in pi_agent_rust | Node.js process in OpenClaw Gateway | NO |
+| Tool calls | Pi tool registry | OpenClaw Gateway tool routing | STRUCTURAL OVERLAP |
+
+**Verdict on code extension compatibility:**
+- **OpenClaw uses a DIFFERENT extension API** than Pi's `ExtensionAPI`
+- OpenClaw's 4-type plugin system (channels/tools/providers/memory) has structural overlap with Pi's extension types but different registration mechanisms
+- A compatibility layer is NOT feasible without significant bridge work
+- **Recommendation: focus on SKILL.md skills only for the "openclaw" tier**
+
+#### Candidate Classification
+
+For the master catalog pipeline:
+
+- **"true Pi extension" candidates**: ClawHub skills that are text-based SKILL.md bundles containing instructions/prompts (estimated 2,500+ of 3,000+)
+- **"non-extension" bucket**: OpenClaw-specific plugins (channel integrations, Gateway tools, memory backends) that use the `openclaw.extensions` manifest — NOT Pi-protocol-compatible
+- **Excluded**: Skills flagged as malicious (341 per Koi Security), leaky credentials (283 per Snyk/Evo scanner)
+
+#### Security Considerations
+
+The ClawHub marketplace has faced significant security incidents (as of Feb 2026):
+- **341 malicious skills** identified by Koi Security ("ClawHavoc" campaign targeting macOS with Atomic Stealer)
+- **283 skills with credential exposure** (7.1% of registry, per Snyk/Evo Agent Security Analyzer)
+- ClawHub allows anyone with a 1-week-old GitHub account to publish skills
+- **Recommendation**: apply strict provenance validation; only include skills from the curated awesome list or with verified publisher history
+
+#### Reproducibility Queries
+
+```bash
+# 1. Enumerate ClawHub skills via REST API (trending, paginated)
+curl -s "https://clawhub.ai/api/v1/skills?sort=installs&limit=200" > openclaw_trending_$(date +%Y%m%d).json
+
+# 2. Clone the skills archive (all versions of all published skills)
+git clone --depth 1 https://github.com/openclaw/skills.git openclaw_skills_archive/
+
+# 3. Clone the curated awesome list
+git clone --depth 1 https://github.com/VoltAgent/awesome-openclaw-skills.git
+
+# 4. Enumerate via clawhub CLI (requires npm install)
+npx clawhub@latest search --json "" > clawhub_search_all.json
+```
+
+#### Downstream Data
+
+This inventory feeds:
+- **bd-28ov** (Validate + dedupe candidates): openclaw tier candidates ready for classification
+- **bd-hhzv** (Build candidate extension inventory): openclaw marketplace as a discovery source
+- **bd-250p** (License + policy screening): security findings require extra scrutiny for openclaw tier
 
 ### F) Curated lists + cross-reference mining (mentions)
 

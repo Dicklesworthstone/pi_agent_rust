@@ -207,6 +207,39 @@
       "notes": "Monitor for new extension types, API changes, and officially listed extensions."
     },
     {
+      "id": "openclaw-clawhub",
+      "name": "OpenClaw / ClawHub Skills Marketplace",
+      "type": "skills_marketplace",
+      "priority": "high",
+      "update_frequency": "daily",
+      "api_available": true,
+      "queries": [
+        {
+          "endpoint": "https://clawhub.ai/api/v1/skills?sort=newest&limit=200",
+          "description": "List all skills (paginated, max 200 per request)"
+        },
+        {
+          "endpoint": "https://clawhub.ai/api/v1/skills/{slug}",
+          "description": "Individual skill metadata by slug"
+        },
+        {
+          "url": "https://github.com/openclaw/skills",
+          "description": "Complete offline archive of all skill versions (12,830+ commits)"
+        },
+        {
+          "url": "https://github.com/openclaw/clawhub",
+          "description": "ClawHub platform source (Convex backend, TanStack Start frontend)"
+        }
+      ],
+      "sort_options": ["newest", "downloads", "stars", "installs", "installsAllTime", "trending"],
+      "thresholds": {
+        "min_stars": 0,
+        "exclude_malicious": true,
+        "security_note": "341 malicious skills (ClawHavoc campaign) and 283 credential-leaking skills reported Feb 2026. Treat all marketplace content as untrusted."
+      },
+      "notes": "ClawHub hosts 3,000-4,000 SKILL.md skills. Skills are Pi-skill-compatible (same Agent Skills standard) but are NOT Pi TypeScript extensions. OpenClaw platform plugins (channels/tools/providers/memory via openclaw.extensions) use a separate, incompatible API. Classify ClawHub items as 'skill' type, not 'extension' type."
+    },
+    {
       "id": "editor-stores",
       "name": "Editor Extension Stores",
       "type": "extension_store",
