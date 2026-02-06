@@ -90,12 +90,27 @@ jobs:
           set -euxo pipefail
           cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture 2>&1 | tee conformance-fast.log
 
+      - name: Generated conformance tests (tier 1-2)
+        run: |
+          set -euxo pipefail
+          cargo test --test ext_conformance_generated --features ext-conformance -- --nocapture 2>&1 | tee conformance-generated.log
+
+      - name: Negative conformance tests
+        run: |
+          set -euxo pipefail
+          cargo test --test extensions_policy_negative -- --nocapture 2>&1 | tee negative-conformance.log
+
       - name: Upload conformance logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: conformance-fast-${{ github.sha }}
-          path: pi_agent_rust/conformance-fast.log
+          path: |
+            pi_agent_rust/conformance-fast.log
+            pi_agent_rust/conformance-generated.log
+            pi_agent_rust/negative-conformance.log
+            pi_agent_rust/tests/ext_conformance/reports/**/*.json
+            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
           if-no-files-found: warn
 
   conformance-full:
@@ -171,12 +186,127 @@ jobs:
           set -euxo pipefail
           cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture 2>&1 | tee conformance-full.log
 
+      - name: Generated conformance tests (all tiers)
+        run: |
+          set -euxo pipefail
+          cargo test --test ext_conformance_generated --features ext-conformance -- --include-ignored --nocapture 2>&1 | tee conformance-generated-full.log
+
       - name: Upload conformance logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: conformance-full-${{ github.sha }}
-          path: pi_agent_rust/conformance-full.log
+          path: |
+            pi_agent_rust/conformance-full.log
+            pi_agent_rust/conformance-generated-full.log
+            pi_agent_rust/tests/ext_conformance/reports/**/*.json
+            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
+          if-no-files-found: warn
+
+  conformance-full-scenario:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+
+      - name: Checkout asupersync
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/asupersync
+          path: asupersync
+          fetch-depth: 1
+
+      - name: Checkout rich_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/rich_rust
+          path: rich_rust
+          fetch-depth: 1
+
+      - name: Checkout charmed_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/charmed_rust
+          path: charmed_rust
+          fetch-depth: 1
+
+      - name: Checkout sqlmodel_rust
+        uses: actions/checkout@v4
+        with:
+          repository: Dicklesworthstone/sqlmodel_rust
+          path: sqlmodel_rust
+          fetch-depth: 1
+
+      - name: Install system deps (fd, rg) [linux]
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y fd-find ripgrep
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+
+      - name: Install Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: "1.3.8"
+
+      - name: Install pi-mono dependencies
+        working-directory: pi_agent_rust/legacy_pi_mono_code/pi-mono
+        run: npm ci
+
+      - name: Symlink bun for conformance tests
+        run: |
+          set -euxo pipefail
+          sudo mkdir -p /home/ubuntu/.bun/bin
+          sudo ln -sf "$(command -v bun)" /home/ubuntu/.bun/bin/bun
+
+      - name: Negative conformance tests
+        run: cargo test --test extensions_policy_negative -- --nocapture 2>&1 | tee negative-conformance.log
+
+      - name: Scenario conformance tests
+        run: |
+          set -euxo pipefail
+          cargo test --test ext_conformance_scenarios --features ext-conformance -- --nocapture 2>&1 | tee scenario-conformance.log
+
+      - name: Generated conformance tests (all tiers)
+        run: |
+          set -euxo pipefail
+          cargo test --test ext_conformance_generated --features ext-conformance -- --include-ignored --nocapture 2>&1 | tee conformance-generated-nightly.log
+
+      - name: Fixture schema validation
+        run: |
+          set -euxo pipefail
+          cargo test --test ext_conformance_fixture_schema -- --nocapture 2>&1 | tee fixture-schema.log
+
+      - name: Artifact checksum validation
+        run: |
+          set -euxo pipefail
+          cargo test --test ext_conformance_artifacts -- --nocapture 2>&1 | tee artifact-checksums.log
+
+      - name: Upload scenario conformance artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-scenarios-${{ github.sha }}
+          path: |
+            pi_agent_rust/negative-conformance.log
+            pi_agent_rust/scenario-conformance.log
+            pi_agent_rust/conformance-generated-nightly.log
+            pi_agent_rust/fixture-schema.log
+            pi_agent_rust/artifact-checksums.log
+            pi_agent_rust/tests/ext_conformance/reports/**/*.json
+            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
           if-no-files-found: warn
 
   conformance-weekly:
@@ -257,5 +387,8 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: conformance-weekly-${{ github.sha }}
-          path: pi_agent_rust/conformance-weekly.log
+          path: |
+            pi_agent_rust/conformance-weekly.log
+            pi_agent_rust/tests/ext_conformance/reports/**/*.json
+            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
           if-no-files-found: warn

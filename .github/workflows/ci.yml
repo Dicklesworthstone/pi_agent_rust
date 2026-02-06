@@ -169,3 +169,13 @@ jobs:
             pi_agent_rust/llvm-cov-summary.txt
             pi_agent_rust/lcov.info
             pi_agent_rust/target/llvm-cov/html
+
+      - name: Upload conformance reports
+        if: runner.os == 'Linux' && always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-reports
+          path: |
+            pi_agent_rust/tests/ext_conformance/reports/**/*.json
+            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
+          if-no-files-found: ignore

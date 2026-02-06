@@ -79,7 +79,11 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 | `tests/extensions_manifest.rs` | Integration | `src/extensions.rs` | ❌ | Protocol/schema + validation. |
 | `tests/ext_conformance.rs` | Conformance | `src/extensions.rs` | ❌ | Extension conformance testing. |
 | `tests/ext_conformance_artifacts.rs` | Integration | `src/extensions.rs` | ❌ | Pinned legacy artifacts + compat ledger. |
+| `tests/ext_conformance_diff.rs` | Conformance | `src/extensions.rs`, `src/extensions_js.rs` | ✅ | Differential TS↔Rust oracle: 209 extensions across 6 tiers. Requires `--features ext-conformance`. |
+| `tests/ext_conformance_scenarios.rs` | Conformance | `src/extensions.rs`, `src/extensions_js.rs` | ✅ | Scenario execution: tool calls, commands, events. Requires `--features ext-conformance`. |
+| `tests/ext_conformance_generated.rs` | Conformance | `src/extensions.rs` | ✅ | Auto-generated per-extension tests from validated manifest. JSONL logs via TestHarness. Requires `--features ext-conformance`. (bd-15jg, bd-1nq.) |
 | `tests/ext_conformance_fixture_schema.rs` | Conformance | `src/extensions.rs` | ❌ | Fixture schema validation. |
+| `tests/extensions_policy_negative.rs` | Conformance | `src/extensions.rs` | ✅ | 51 tests: policy evaluation across modes, hostcall-to-capability mapping, integration with JS extension (exec denied, session allowed, event handler denial). JSONL report to `tests/ext_conformance/reports/negative/`. (bd-2ce complete.) |
 | `tests/ext_proptest.rs` | Property | `src/extensions.rs` | ❌ | Property-based extension tests. |
 | `tests/extensions_provider_streaming.rs` | Integration | `src/extensions_js.rs`, `src/providers/mod.rs` | ❌ | Extension provider streamSimple tests. |
 | `tests/extensions_message_session.rs` | Integration | `src/session.rs`, `src/extensions.rs` | ❌ | Extension message/session API using RecordingSession stub (bd-m9rk). |
@@ -144,6 +148,7 @@ Tests with JSONL log + artifact index output:
 | `tests/rpc_mode.rs` | VCR cassette path, event timeline, session stats |
 | `tests/e2e_provider_streaming.rs` | VCR cassette, stream events, scenario parameters |
 | `tests/http_client.rs` | Raw request bytes, VCR cassette file, JSONL logs for header/body parsing and timeout scenarios |
+| `tests/extensions_policy_negative.rs` | Negative conformance JSONL report (`negative_events.jsonl`), triage summary (`triage.json`) in `tests/ext_conformance/reports/negative/` |
 
 **Planned (workstream `bd-c4q` under `bd-26s`):** finish VCR-backed interactive E2E (bd-dvgl), extension runtime E2E (bd-1gl), RPC JSONL script (bd-kh2), and remaining CLI scenarios (bd-1o4, bd-idw).
 
@@ -181,11 +186,77 @@ Tests with JSONL log + artifact index output:
 
 ---
 
-## 7) Coverage Tooling
+## 7) Running Extension Conformance Tests
+
+Extension conformance tests validate that the Rust QuickJS runtime behaves identically to the TypeScript pi-mono runtime for all supported extensions.
+
+### Quick Reference
+
+```bash
+# Policy enforcement tests (no feature flag, runs in default cargo test)
+cargo test --test extensions_policy_negative
+
+# Negative conformance report generation
+cargo test --test extensions_policy_negative negative_conformance_report -- --nocapture
+
+# Generated per-extension registration tests (tier 1-2 by default)
+cargo test --test ext_conformance_generated --features ext-conformance
+
+# Generated tests including all tiers (3-5 are ignored by default)
+cargo test --test ext_conformance_generated --features ext-conformance -- --include-ignored
+
+# Differential TS↔Rust oracle (requires ext-conformance feature + Bun)
+cargo test --test ext_conformance_diff --features ext-conformance
+
+# Official extensions only (fast, ~5 extensions)
+PI_OFFICIAL_MAX=5 cargo test --test ext_conformance_diff --features ext-conformance
+
+# Specific extension filter
+PI_OFFICIAL_FILTER=hello cargo test --test ext_conformance_diff --features ext-conformance
+
+# Scenario execution tests
+cargo test --test ext_conformance_scenarios --features ext-conformance
+
+# Community + npm + third-party (ignored by default, use --ignored)
+cargo test --test ext_conformance_diff --features ext-conformance -- --ignored
+
+# Fixture schema validation (no feature flag)
+cargo test --test ext_conformance_fixture_schema
+
+# Artifact checksum validation (no feature flag)
+cargo test --test ext_conformance_artifacts
+
+# All conformance-related tests (default set, no feature flag)
+cargo test conformance
+cargo test extensions_policy_negative
+```
+
+### CI Integration
+
+| Workflow | Trigger | Scope | Artifacts |
+|----------|---------|-------|-----------|
+| `ci.yml` | PR / push to main | Non-gated tests (policy, negative, artifacts, schema) | Standard test output |
+| `conformance.yml` (fast) | PR | 5 official diff + generated tier 1-2 + negative | Logs + JSONL reports |
+| `conformance.yml` (full) | Nightly / manual | All 60 official diff + generated all tiers | Logs + JSONL reports |
+| `conformance.yml` (scenarios) | Nightly / manual | Negative + scenario + generated + fixture schema + artifact checksums | Logs + JSONL reports |
+| `conformance.yml` (weekly) | Saturday | Community + npm + third-party (differential) | Logs + JSONL reports |
+
+### Report Locations
+
+After running conformance tests, reports are written to:
+- `tests/ext_conformance/reports/negative/` — policy denial conformance
+- `tests/ext_conformance/reports/parity/` — TS↔Rust parity diffs
+- `tests/ext_conformance/reports/smoke/` — smoke test results
+- `tests/ext_conformance/reports/scenario_conformance.json` — scenario pass rates
+- `tests/ext_conformance/reports/load_time_benchmark.json` — extension load time stats
+
+---
+
+## 8) Coverage Tooling
 
 Coverage reports are generated with `cargo-llvm-cov` (see the **Coverage** section in `README.md`).
 
 Baseline (2026-02-03): **31.07% line coverage** from `cargo llvm-cov --all-targets --workspace --summary-only`.
-CI currently gates on **>= 30% line coverage** (see `.github/workflows/ci.yml`).
+CI currently gates on **>= 50% line coverage** (see `.github/workflows/ci.yml`).
 
 CI runs llvm-cov in VCR playback mode (`VCR_MODE=playback`) and uploads artifacts (summary + LCOV + HTML) via `.github/workflows/ci.yml`.
