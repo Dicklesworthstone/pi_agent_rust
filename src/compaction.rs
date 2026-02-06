@@ -769,6 +769,12 @@ pub fn prepare_compaction(
         }
     }
 
+    // No-op compaction: if there's nothing to summarize, don't issue an LLM call and don't append a
+    // compaction entry. This can happen early in a session (e.g. session header entries only).
+    if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
+        return None;
+    }
+
     let previous_summary = prev_compaction_index.and_then(|idx| match &path_entries[idx] {
         SessionEntry::Compaction(entry) => Some(entry.summary.clone()),
         _ => None,

@@ -11,6 +11,7 @@ use clap::Parser;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::auth::AuthStorage;
 use pi::cli;
+use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::models::{ModelRegistry, default_models_path};
 use pi::package_manager::PackageManager;
@@ -216,10 +217,16 @@ async fn run_debug(mut cli: cli::Cli, _runtime_handle: RuntimeHandle) -> Result<
     };
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
     let session_arc = Arc::new(Mutex::new(session));
+    let compaction_settings = ResolvedCompactionSettings {
+        enabled: config.compaction_enabled(),
+        reserve_tokens: config.compaction_reserve_tokens(),
+        keep_recent_tokens: config.compaction_keep_recent_tokens(),
+    };
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),
         session_arc,
         !cli.no_session,
+        compaction_settings,
     );
     step!("    Agent built");
 

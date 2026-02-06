@@ -519,7 +519,12 @@ mod tests {
             agent.extend_tools(wrappers);
 
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session = AgentSession::new(
+                agent,
+                session,
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
             let message = agent_session
                 .run_text("hi".to_string(), |_event: AgentEvent| {})
                 .await

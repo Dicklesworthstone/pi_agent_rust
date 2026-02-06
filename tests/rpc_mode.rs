@@ -171,7 +171,12 @@ fn rpc_get_state_and_prompt() {
         session.header.thinking_level = Some("off".to_string());
         let session = Arc::new(asupersync::sync::Mutex::new(session));
 
-        let agent_session = AgentSession::new(agent, session, false);
+        let agent_session = AgentSession::new(
+            agent,
+            session,
+            false,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
 
         let auth_dir = tempfile::tempdir().unwrap();
         let auth = AuthStorage::load(auth_dir.path().join("auth.json")).unwrap();
@@ -468,7 +473,12 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
         });
 
         let session = Arc::new(asupersync::sync::Mutex::new(session));
-        let agent_session = AgentSession::new(agent, session, false);
+        let agent_session = AgentSession::new(
+            agent,
+            session,
+            false,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
 
         let auth_dir = tempfile::tempdir().unwrap();
         let auth = AuthStorage::load(auth_dir.path().join("auth.json")).unwrap();

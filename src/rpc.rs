@@ -1737,7 +1737,12 @@ mod retry_tests {
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let inner_session = Arc::new(Mutex::new(Session::in_memory()));
-            let agent_session = AgentSession::new(agent, inner_session, false);
+            let agent_session = AgentSession::new(
+                agent,
+                inner_session,
+                false,
+                crate::compaction::ResolvedCompactionSettings::default(),
+            );
 
             let session = Arc::new(Mutex::new(agent_session));
 

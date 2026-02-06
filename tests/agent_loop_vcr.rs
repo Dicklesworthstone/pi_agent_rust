@@ -119,7 +119,12 @@ fn agent_loop_openai_vcr_basic() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(harness.temp_dir().to_path_buf()),
         )));
-        let mut agent_session = AgentSession::new(agent, session, true);
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            true,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
 
         let timeline: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let timeline_ref = Arc::clone(&timeline);
@@ -294,7 +299,12 @@ fn agent_loop_anthropic_simple_text() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(harness.temp_dir().to_path_buf()),
         )));
-        let mut agent_session = AgentSession::new(agent, session, true);
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            true,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
 
         let timeline: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let timeline_ref = Arc::clone(&timeline);
@@ -386,7 +396,12 @@ fn agent_loop_anthropic_error_stream() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(harness.temp_dir().to_path_buf()),
         )));
-        let mut agent_session = AgentSession::new(agent, session, true);
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            true,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
 
         let timeline: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let timeline_ref = Arc::clone(&timeline);
@@ -461,7 +476,12 @@ fn agent_loop_anthropic_tool_call_stop() {
         let session = Arc::new(asupersync::sync::Mutex::new(Session::create_with_dir(
             Some(harness.temp_dir().to_path_buf()),
         )));
-        let mut agent_session = AgentSession::new(agent, session, true);
+        let mut agent_session = AgentSession::new(
+            agent,
+            session,
+            true,
+            pi::compaction::ResolvedCompactionSettings::default(),
+        );
 
         let timeline: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
         let timeline_ref = Arc::clone(&timeline);
