@@ -1,0 +1,175 @@
+{
+  "schema": "pi.ext.perf_comparison.v1",
+  "generated_at": "2026-02-01T01:09:56Z",
+  "summary": {
+    "faster_count": 0,
+    "slower_count": 6,
+    "comparable_count": 0,
+    "overall_verdict": "ACCEPTABLE REGRESSIONS — see analysis below"
+  },
+  "rows": [
+    {
+      "category": "Load Time (60 exts)",
+      "metric": "Rust mean cold load",
+      "rust_value": "103.3ms",
+      "legacy_value": "N/A (measured per-ext below)",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "INFO"
+    },
+    {
+      "category": "Load Time (60 exts)",
+      "metric": "Rust-to-TS ratio (p50)",
+      "rust_value": "102x",
+      "legacy_value": "1x",
+      "delta": "102x slower",
+      "delta_pct": "+10100%",
+      "verdict": "SLOWER"
+    },
+    {
+      "category": "Load Time",
+      "metric": "hello cold-start p50",
+      "rust_value": "96.0ms",
+      "legacy_value": "21.4ms",
+      "delta": "+74.6ms",
+      "delta_pct": "+349%",
+      "verdict": "SLOWER"
+    },
+    {
+      "category": "Load Time",
+      "metric": "pirate cold-start p50",
+      "rust_value": "98.0ms",
+      "legacy_value": "12.9ms",
+      "delta": "+85.1ms",
+      "delta_pct": "+662%",
+      "verdict": "SLOWER"
+    },
+    {
+      "category": "Tool Call",
+      "metric": "hello per-call latency",
+      "rust_value": "44.0us",
+      "legacy_value": "1.6us",
+      "delta": "+42.4us",
+      "delta_pct": "+2596%",
+      "verdict": "SLOWER"
+    },
+    {
+      "category": "Tool Call",
+      "metric": "hello calls/sec",
+      "rust_value": "22716",
+      "legacy_value": "612776",
+      "delta": "-590060",
+      "delta_pct": "-96%",
+      "verdict": "SLOWER"
+    },
+    {
+      "category": "Event Hook",
+      "metric": "before_agent_start per-call latency",
+      "rust_value": "44.0us (tool_call proxy)",
+      "legacy_value": "1.7us",
+      "delta": "+42.3us",
+      "delta_pct": "+2461%",
+      "verdict": "SLOWER"
+    },
+    {
+      "category": "Event Hook",
+      "metric": "legacy event calls/sec",
+      "rust_value": "N/A (see tool call)",
+      "legacy_value": "582092",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "INFO"
+    },
+    {
+      "category": "E2E Process",
+      "metric": "200 iters x 1 tool (hyperfine median)",
+      "rust_value": "16.8ms",
+      "legacy_value": "N/A",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "INFO"
+    },
+    {
+      "category": "E2E Process",
+      "metric": "200 iters x 10 tools (hyperfine median)",
+      "rust_value": "94.8ms",
+      "legacy_value": "N/A",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "INFO"
+    },
+    {
+      "category": "Stress",
+      "metric": "30s sustained load (15 exts, 50 evt/s)",
+      "rust_value": "1313 events, 0 errors",
+      "legacy_value": "N/A",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "PASS"
+    },
+    {
+      "category": "Stress",
+      "metric": "RSS growth under load",
+      "rust_value": "0.00%",
+      "legacy_value": "N/A",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "PASS"
+    },
+    {
+      "category": "Stress",
+      "metric": "Dispatch p50 latency",
+      "rust_value": "16689us",
+      "legacy_value": "N/A",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "INFO"
+    },
+    {
+      "category": "Stress",
+      "metric": "Dispatch p99 latency",
+      "rust_value": "31272us",
+      "legacy_value": "N/A",
+      "delta": "-",
+      "delta_pct": "-",
+      "verdict": "PASS"
+    }
+  ],
+  "hypotheses": [
+    {
+      "category": "Load Time",
+      "observation": "Rust cold-start load is ~5x slower for hello, ~8x slower for pirate vs legacy Node.js",
+      "hypothesis": "QuickJS lacks V8's JIT compiler and optimizing tiers. The SWC TypeScript-to-JavaScript transpilation happens eagerly at load time in Rust, whereas Node.js jiti defers/caches transpilation.",
+      "acceptable": true,
+      "rationale": "Extension loading is a one-time cost amortized over the entire agent session (minutes to hours). Even at 100ms, the load time is imperceptible relative to LLM API round-trip latency (~1-5 seconds)."
+    },
+    {
+      "category": "Load Time (oracle 1ms)",
+      "observation": "The conformance oracle reports TS load time as ~1ms, giving ratio ~100x. The real legacy benchmark measures ~12-21ms for the same extensions.",
+      "hypothesis": "The TS oracle uses an in-process, pre-warmed jiti runtime where module resolution and transpilation are cached. The 1ms timing reflects only the extension's activate() call, not cold-start loading. The real legacy benchmark (fresh process per run) gives a fairer comparison.",
+      "acceptable": true,
+      "rationale": "Use the legacy benchmark (p50: 12-21ms) as the true baseline, not the oracle timing. The real ratio is ~5-8x, not ~100x."
+    },
+    {
+      "category": "Tool Call Latency",
+      "observation": "Rust tool calls take ~44us vs legacy ~1.7us (~26x slower).",
+      "hypothesis": "QuickJS function calls and JS-to-Rust bridge marshalling add overhead per invocation. V8 inlines and JIT-compiles hot call paths. The Rust bridge serializes/deserializes JSON for each tool call crossing the FFI boundary.",
+      "acceptable": true,
+      "rationale": "At 44us per tool call, a tool-heavy agent turn with 20 tool calls adds only 0.88ms total latency. LLM inference takes 1-10 seconds per turn, so tool call overhead is <0.1% of turn time. The absolute latency is well within acceptable bounds for interactive use."
+    },
+    {
+      "category": "Memory Stability",
+      "observation": "RSS growth under 30s sustained load is <2%, no errors.",
+      "hypothesis": "QuickJS has deterministic reference counting GC with low memory overhead. The Rust wrapper correctly manages object lifetimes.",
+      "acceptable": true,
+      "rationale": "Excellent memory stability is a significant advantage of the Rust + QuickJS approach over Node.js, which relies on V8's generational GC and can exhibit higher memory variance under sustained load."
+    },
+    {
+      "category": "Functional Parity",
+      "observation": "60/60 official extensions pass conformance (100% pass rate).",
+      "hypothesis": "N/A — no regression.",
+      "acceptable": true,
+      "rationale": "Full functional compatibility with the legacy runtime for all official extensions. No behavioral regressions detected."
+    }
+  ]
+}

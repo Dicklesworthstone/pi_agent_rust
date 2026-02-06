@@ -1,8 +1,8 @@
-{"rss_kb":57942016,"schema":"pi.ext.stress_rss.v1","t_s":0,"ts":"2026-02-06T00:38:18.645Z"}
-{"rss_kb":58392576,"schema":"pi.ext.stress_rss.v1","t_s":5,"ts":"2026-02-06T00:38:18.645Z"}
-{"rss_kb":56692736,"schema":"pi.ext.stress_rss.v1","t_s":10,"ts":"2026-02-06T00:38:18.645Z"}
-{"rss_kb":56692736,"schema":"pi.ext.stress_rss.v1","t_s":15,"ts":"2026-02-06T00:38:18.645Z"}
-{"rss_kb":56700928,"schema":"pi.ext.stress_rss.v1","t_s":20,"ts":"2026-02-06T00:38:18.645Z"}
-{"rss_kb":56700928,"schema":"pi.ext.stress_rss.v1","t_s":25,"ts":"2026-02-06T00:38:18.645Z"}
-{"rss_kb":56692736,"schema":"pi.ext.stress_rss.v1","t_s":30,"ts":"2026-02-06T00:38:18.645Z"}
-{"duration_secs":30,"error_count":0,"event_count":1409,"extensions_loaded":15,"initial_rss_kb":57942016,"latency_ok":true,"latency_summary":{"count":1409,"max":65288,"mean":16943,"min":7223,"p50":16219,"p95":19840,"p99":23580},"max_rss_kb":58392576,"p99_first_us":25348,"p99_last_us":18842,"rss_growth_pct":0.007776049766718507,"rss_ok":true,"schema":"pi.ext.stress_summary.v1","ts":"2026-02-06T00:38:18.645Z"}
+{"rss_kb":59760640,"schema":"pi.ext.stress_rss.v1","t_s":0,"ts":"2026-02-06T01:09:56.226Z"}
+{"rss_kb":59539456,"schema":"pi.ext.stress_rss.v1","t_s":5,"ts":"2026-02-06T01:09:56.226Z"}
+{"rss_kb":57847808,"schema":"pi.ext.stress_rss.v1","t_s":10,"ts":"2026-02-06T01:09:56.226Z"}
+{"rss_kb":57851904,"schema":"pi.ext.stress_rss.v1","t_s":15,"ts":"2026-02-06T01:09:56.226Z"}
+{"rss_kb":57843712,"schema":"pi.ext.stress_rss.v1","t_s":20,"ts":"2026-02-06T01:09:56.226Z"}
+{"rss_kb":57843712,"schema":"pi.ext.stress_rss.v1","t_s":25,"ts":"2026-02-06T01:09:56.226Z"}
+{"rss_kb":57843712,"schema":"pi.ext.stress_rss.v1","t_s":30,"ts":"2026-02-06T01:09:56.226Z"}
+{"duration_secs":30,"error_count":0,"event_count":1313,"extensions_loaded":15,"initial_rss_kb":59760640,"latency_ok":true,"latency_summary":{"count":1313,"max":79874,"mean":17779,"min":7266,"p50":16689,"p95":22157,"p99":31272},"max_rss_kb":59760640,"p99_first_us":30762,"p99_last_us":18934,"rss_growth_pct":0.0,"rss_ok":true,"schema":"pi.ext.stress_summary.v1","ts":"2026-02-06T01:09:56.226Z"}
