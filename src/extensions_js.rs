@@ -1546,8 +1546,8 @@ const _gid = {gid};
 const _username = "{username}";
 const _shell = "{shell}";
 const _numCpus = {num_cpus};
-const _cpuEntry = {{ model: "cpu", speed: 2400, times: {{ user: 0, nice: 0, sys: 0, idle: 0, irq: 0 }} }};
-const _cpus = Array.from({{ length: _numCpus }}, () => ({{ ...(_cpuEntry) }}));
+const _cpus = [];
+for (let i = 0; i < _numCpus; i++) _cpus.push({{ model: "cpu", speed: 2400, times: {{ user: 0, nice: 0, sys: 0, idle: 0, irq: 0 }} }});
 
 export function homedir() {{
   const env_home =
@@ -2856,7 +2856,7 @@ export default { join, dirname, resolve, basename, relative, isAbsolute, extname
         .to_string(),
     );
 
-    // node:os module is registered by build_node_os_module() above.
+    modules.insert("node:os".to_string(), build_node_os_module());
 
     modules.insert(
         "node:child_process".to_string(),
@@ -3529,7 +3529,15 @@ const __pi_vfs = (() => {
   function makeStat(path) {
     const normalized = normalizePath(path);
     const isDir = state.dirs.has(normalized);
-    const bytes = state.files.get(normalized);
+    let bytes = state.files.get(normalized);
+    if (!isDir && bytes === undefined && typeof globalThis.__pi_host_read_file_sync === "function") {
+      try {
+        const content = globalThis.__pi_host_read_file_sync(normalized);
+        bytes = toBytes(content);
+        ensureDir(dirname(normalized));
+        state.files.set(normalized, bytes);
+      } catch (_e) { /* not on host FS */ }
+    }
     const isFile = bytes !== undefined;
     if (!isDir && !isFile) {
       throw new Error(`ENOENT: no such file or directory, stat '${String(path ?? "")}'`);
@@ -3756,13 +3764,114 @@ export function createReadStream(_path, _opts) {
 export function createWriteStream(_path, _opts) {
   return { on() { return this; }, write() { return true; }, end() {}, destroy() {}, cork() {}, uncork() {} };
 }
-export function readFile(_path, optOrCb, cb) {
+export function readFile(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
-  if (typeof callback === 'function') callback(null, '');
+  const encoding = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { callback(null, readFileSync(path, encoding)); }
+    catch (err) { callback(err); }
+  }
 }
-export function writeFile(_path, _data, optOrCb, cb) {
+export function writeFile(path, data, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
-  if (typeof callback === 'function') callback(null);
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { writeFileSync(path, data, opts); callback(null); }
+    catch (err) { callback(err); }
+  }
+}
+export function stat(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  if (typeof callback === 'function') {
+    try { callback(null, statSync(path)); }
+    catch (err) { callback(err); }
+  }
+}
+export function readdir(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { callback(null, readdirSync(path, opts)); }
+    catch (err) { callback(err); }
+  }
+}
+export function mkdir(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { callback(null, mkdirSync(path, opts)); }
+    catch (err) { callback(err); }
+  }
+}
+export function unlink(path, cb) {
+  if (typeof cb === 'function') {
+    try { unlinkSync(path); cb(null); }
+    catch (err) { cb(err); }
+  }
+}
+export function lstat(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  if (typeof callback === 'function') {
+    try { callback(null, lstatSync(path)); }
+    catch (err) { callback(err); }
+  }
+}
+export function rmdir(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { rmdirSync(path, opts); callback(null); }
+    catch (err) { callback(err); }
+  }
+}
+export function rm(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { rmSync(path, opts); callback(null); }
+    catch (err) { callback(err); }
+  }
+}
+export function rename(oldPath, newPath, cb) {
+  if (typeof cb === 'function') {
+    try { renameSync(oldPath, newPath); cb(null); }
+    catch (err) { cb(err); }
+  }
+}
+export function copyFile(src, dest, flagsOrCb, cb) {
+  const callback = typeof flagsOrCb === 'function' ? flagsOrCb : cb;
+  if (typeof callback === 'function') {
+    try { copyFileSync(src, dest); callback(null); }
+    catch (err) { callback(err); }
+  }
+}
+export function appendFile(path, data, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { appendFileSync(path, data, opts); callback(null); }
+    catch (err) { callback(err); }
+  }
+}
+export function chmod(path, mode, cb) {
+  if (typeof cb === 'function') {
+    try { chmodSync(path, mode); cb(null); }
+    catch (err) { cb(err); }
+  }
+}
+export function chown(path, uid, gid, cb) {
+  if (typeof cb === 'function') {
+    try { chownSync(path, uid, gid); cb(null); }
+    catch (err) { cb(err); }
+  }
+}
+export function realpath(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { callback(null, realpathSync(path, opts)); }
+    catch (err) { callback(err); }
+  }
 }
 export function access(_path, modeOrCb, cb) {
   const callback = typeof modeOrCb === 'function' ? modeOrCb : cb;
@@ -3792,9 +3901,10 @@ export const promises = {
   rm: async (path, opts) => rmSync(path, opts),
   rename: async (oldPath, newPath) => renameSync(oldPath, newPath),
   copyFile: async (src, dest, mode) => copyFileSync(src, dest, mode),
+  appendFile: async (path, data, opts) => appendFileSync(path, data, opts),
   chmod: async (_path, _mode) => {},
 };
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, access, promises };
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, stat, lstat, readdir, mkdir, unlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, realpath, access, promises };
 "#
         .trim()
         .to_string(),
@@ -3817,8 +3927,8 @@ export async function realpath(path, opts) { return fs.promises.realpath(path, o
 export async function readdir(path, opts) { return fs.promises.readdir(path, opts); }
 export async function rm(path, opts) { return fs.promises.rm(path, opts); }
 export async function lstat(path) { return fs.promises.stat(path); }
-export async function copyFile(src, dest) { return; }
-export async function rename(oldPath, newPath) { return; }
+export async function copyFile(src, dest) { return fs.promises.copyFile(src, dest); }
+export async function rename(oldPath, newPath) { return fs.promises.rename(oldPath, newPath); }
 export async function chmod(path, mode) { return; }
 export async function chown(path, uid, gid) { return; }
 export async function utimes(path, atime, mtime) { return; }
@@ -10708,6 +10818,24 @@ mod tests {
             assert_eq!(r["type"].as_str().unwrap(), expected_type);
             assert_eq!(r["release"], serde_json::json!("6.0.0"));
         });
+    }
+
+    #[test]
+    fn build_node_os_module_produces_valid_js() {
+        let source = super::build_node_os_module();
+        // Verify basic structure - has expected exports
+        assert!(source.contains("export function platform()"), "missing platform");
+        assert!(source.contains("export function cpus()"), "missing cpus");
+        assert!(source.contains("_numCpus"), "missing _numCpus");
+        // Print first few lines for debugging
+        for (i, line) in source.lines().enumerate().take(20) {
+            eprintln!("  {i}: {line}");
+        }
+        let num_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+        assert!(
+            source.contains(&format!("const _numCpus = {num_cpus}")),
+            "expected _numCpus = {num_cpus} in module"
+        );
     }
 
     #[test]
