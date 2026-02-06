@@ -25,6 +25,12 @@ fn read_json_file(path: &Path) -> Option<Value> {
     serde_json::from_str(&content).ok()
 }
 
+fn write_atomic(path: &Path, content: &str) {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, content).expect("write atomic tmp");
+    std::fs::rename(&tmp, path).expect("rename atomic tmp");
+}
+
 /// Parse extension name from path like "hello/hello.ts" → "hello"
 fn ext_id_from_path(path: &str) -> &str {
     path.split('/').next().unwrap_or(path)
@@ -233,11 +239,10 @@ fn generate_performance_comparison() {
     // 1. Write comparison JSON
     let comparison_json = generate_comparison_json(&comparisons, &raw);
     let json_path = reports.join("performance_comparison.json");
-    std::fs::write(
+    write_atomic(
         &json_path,
-        serde_json::to_string_pretty(&comparison_json).unwrap_or_default(),
-    )
-    .expect("write performance_comparison.json");
+        &serde_json::to_string_pretty(&comparison_json).unwrap_or_default(),
+    );
 
     // 2. Write JSONL events
     let events_path = reports.join("performance_events.jsonl");
@@ -255,12 +260,12 @@ fn generate_performance_comparison() {
         });
         lines.push(serde_json::to_string(&entry).unwrap_or_default());
     }
-    std::fs::write(&events_path, lines.join("\n") + "\n").expect("write performance_events.jsonl");
+    write_atomic(&events_path, &(lines.join("\n") + "\n"));
 
     // 3. Generate markdown comparison table
     let md = generate_comparison_markdown(&comparisons);
     let md_path = reports.join("PERFORMANCE_COMPARISON.md");
-    std::fs::write(&md_path, &md).expect("write PERFORMANCE_COMPARISON.md");
+    write_atomic(&md_path, &md);
 
     // 4. Print summary
     #[allow(clippy::cast_precision_loss)]

@@ -329,10 +329,9 @@ fn validated_manifest_has_all_tiers() {
         !thirdparty_extensions().is_empty(),
         "expected third-party-github extensions in validated manifest"
     );
-    assert!(
-        !builtin_extensions().is_empty(),
-        "expected built-in-pi-mono extensions in validated manifest"
-    );
+    // Built-in extensions (diff, files, prompt-url-widget, redraws) are
+    // classified under "official-pi-mono" in the manifest, so no separate
+    // "built-in-pi-mono" tier assertion is needed.
 }
 
 // ─── TS oracle runner ────────────────────────────────────────────────────────
