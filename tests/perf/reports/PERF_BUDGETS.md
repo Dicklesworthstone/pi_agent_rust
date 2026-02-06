@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-06T11:30:30Z
+> Generated: 2026-02-06T14:02:00Z
 
 ## Summary
 
