@@ -718,12 +718,19 @@ impl PiApp {
             chrome += 8;
         }
 
+        // Branch picker overlay: header + N visible branches + help line + padding.
+        if let Some(ref picker) = self.branch_picker {
+            let visible = picker.branches.len().min(picker.max_visible);
+            chrome += 3 + visible + 2; // title + header + separator + items + help + blank
+        }
+
         // Input area vs processing spinner.
         let show_input = self.agent_state == AgentState::Idle
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
             && self.theme_picker.is_none()
-            && self.capability_prompt.is_none();
+            && self.capability_prompt.is_none()
+            && self.branch_picker.is_none();
 
         if show_input {
             // render_input: "\n  header\n" (2 rows) + input.height() rows.
@@ -1070,10 +1077,31 @@ impl PiApp {
 
     fn render_header(&self) -> String {
         let model_label = format!("({})", self.model);
+
+        // Branch indicator: show "Branch N/M" when session has multiple leaves.
+        let branch_indicator = self
+            .session
+            .try_lock()
+            .ok()
+            .and_then(|guard| {
+                let info = guard.branch_summary();
+                if info.leaf_count <= 1 {
+                    return None;
+                }
+                let current_idx = info
+                    .current_leaf
+                    .as_ref()
+                    .and_then(|leaf| info.leaves.iter().position(|l| l == leaf))
+                    .map_or(1, |i| i + 1);
+                Some(format!(" [branch {current_idx}/{}]", info.leaf_count))
+            })
+            .unwrap_or_default();
+
         format!(
-            "  {} {}\n",
+            "  {} {}{}\n",
             self.styles.title.render("Pi"),
-            self.styles.muted.render(&model_label)
+            self.styles.muted.render(&model_label),
+            self.styles.accent.render(&branch_indicator),
         )
     }
 
@@ -1917,7 +1945,9 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
         match block {
             ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
             ContentBlock::Image(image) => {
-                push_line(&mut output, &format!("[image: {}]", image.mime_type));
+                let rendered =
+                    crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
+                push_line(&mut output, &rendered);
             }
             ContentBlock::Thinking(thinking_block) => {
                 push_line(&mut output, &thinking_block.thinking);
@@ -2176,14 +2206,12 @@ fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
     let mut pre_diff_lines: Vec<&str> = Vec::new();
     let mut found_diff_header = false;
     for line in text.lines() {
-        if !found_diff_header {
-            if line.trim() == "Diff:" {
-                found_diff_header = true;
-            } else {
-                pre_diff_lines.push(line);
-            }
-        } else {
+        if found_diff_header {
             diff_lines.push(line);
+        } else if line.trim() == "Diff:" {
+            found_diff_header = true;
+        } else {
+            pre_diff_lines.push(line);
         }
     }
 
@@ -2224,10 +2252,10 @@ fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
     let visible_lines = if truncated {
         // Show head + tail with separator.
         let mut visible = Vec::with_capacity(DIFF_TRUNCATE_HEAD + DIFF_TRUNCATE_TAIL + 1);
-        visible.extend_from_slice(
-            &diff_lines[..DIFF_TRUNCATE_HEAD.min(diff_lines.len())],
-        );
-        let omitted = diff_lines.len().saturating_sub(DIFF_TRUNCATE_HEAD + DIFF_TRUNCATE_TAIL);
+        visible.extend_from_slice(&diff_lines[..DIFF_TRUNCATE_HEAD.min(diff_lines.len())]);
+        let omitted = diff_lines
+            .len()
+            .saturating_sub(DIFF_TRUNCATE_HEAD + DIFF_TRUNCATE_TAIL);
         if omitted > 0 {
             // We'll render a separator inline.
             visible.push(""); // placeholder for separator
@@ -2236,7 +2264,7 @@ fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
         }
         visible
     } else {
-        diff_lines.iter().copied().collect()
+        diff_lines
     };
 
     // Collect diff lines for word-level highlighting.
@@ -2246,12 +2274,7 @@ fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
 }
 
 /// Render diff lines with word-level highlighting for paired -/+ lines.
-fn render_diff_lines(
-    lines: &[&str],
-    truncated: bool,
-    styles: &TuiStyles,
-    out: &mut String,
-) {
+fn render_diff_lines(lines: &[&str], truncated: bool, styles: &TuiStyles, out: &mut String) {
     let mut i = 0;
     let mut rendered_separator = false;
     while i < lines.len() {
@@ -2293,12 +2316,7 @@ fn render_diff_lines(
 ///
 /// The line format from `generate_diff_string` is: `-NN content` / `+NN content`.
 /// We diff the content portions and bold just the changed segments.
-fn render_word_diff_pair(
-    removed: &str,
-    added: &str,
-    styles: &TuiStyles,
-    out: &mut String,
-) {
+fn render_word_diff_pair(removed: &str, added: &str, styles: &TuiStyles, out: &mut String) {
     // Extract the prefix (e.g. "-  3 ") and the content after it.
     let (rem_prefix, rem_content) = split_diff_prefix(removed);
     let (add_prefix, add_content) = split_diff_prefix(added);
@@ -2358,18 +2376,17 @@ fn split_diff_prefix(line: &str) -> (&str, &str) {
     let rest = &line[1..]; // skip +/-
     // Find the first non-whitespace-non-digit character after the prefix.
     // The prefix is: sign + digits/spaces + one space separator.
-    if let Some(content_start) = rest.find(|c: char| !c.is_ascii_digit() && c != ' ') {
-        // Include the sign character in the prefix.
-        let prefix_end = 1 + content_start;
-        (&line[..prefix_end], &line[prefix_end..])
-    } else {
-        (line, "")
-    }
+    rest.find(|c: char| !c.is_ascii_digit() && c != ' ')
+        .map_or((line, ""), |content_start| {
+            // Include the sign character in the prefix.
+            let prefix_end = 1 + content_start;
+            (&line[..prefix_end], &line[prefix_end..])
+        })
 }
 
 #[cfg(test)]
 mod render_tool_message_tests {
-    use super::render_tool_message;
+    use super::*;
     use crate::theme::Theme;
 
     #[test]
@@ -2384,6 +2401,80 @@ mod render_tool_message_tests {
         assert!(rendered.contains(&styles.error_bold.render("-removed")));
         assert!(rendered.contains(&styles.muted.render(" 1 ctx")));
     }
+
+    #[test]
+    fn file_path_header_extracted() {
+        let styles = Theme::dark().tui_styles();
+        let input = "Successfully replaced text in src/main.rs.\nDiff:\n+ 1 new line";
+        let rendered = render_tool_message(input, &styles);
+        assert!(
+            rendered.contains(&styles.muted_bold.render("@@ src/main.rs @@")),
+            "Expected @@ src/main.rs @@ header, got: {rendered}"
+        );
+        assert!(!rendered.contains(&styles.muted_bold.render("Diff:")));
+    }
+
+    #[test]
+    fn fallback_diff_header_when_no_path() {
+        let styles = Theme::dark().tui_styles();
+        let input = "Some other tool output.\nDiff:\n+ 1 added";
+        let rendered = render_tool_message(input, &styles);
+        assert!(
+            rendered.contains(&styles.muted_bold.render("Diff:")),
+            "Expected fallback Diff: header, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn word_level_diff_for_paired_lines() {
+        let styles = Theme::dark().tui_styles();
+        let input =
+            "Successfully replaced text in foo.rs.\nDiff:\n- 1 let x = old;\n+ 1 let x = new;";
+        let rendered = render_tool_message(input, &styles);
+        let underline_old = styles.error_bold.underline();
+        let underline_new = styles.success_bold.underline();
+        assert!(
+            rendered.contains(&underline_old.render("old;")),
+            "Expected underlined 'old;' in removed line, got: {rendered}"
+        );
+        assert!(
+            rendered.contains(&underline_new.render("new;")),
+            "Expected underlined 'new;' in added line, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn split_diff_prefix_basic() {
+        assert_eq!(
+            split_diff_prefix("-  3 let x = 1;"),
+            ("-  3 ", "let x = 1;")
+        );
+        assert_eq!(split_diff_prefix("+ 12 new text"), ("+ 12 ", "new text"));
+    }
+
+    #[test]
+    fn split_diff_prefix_edge_cases() {
+        assert_eq!(split_diff_prefix("-"), ("-", ""));
+        assert_eq!(split_diff_prefix("+  1 "), ("+  1 ", ""));
+        assert_eq!(split_diff_prefix(""), ("", ""));
+    }
+
+    #[test]
+    fn large_diff_truncation() {
+        let styles = Theme::dark().tui_styles();
+        let mut lines = vec!["Successfully replaced text in big.rs.".to_string()];
+        lines.push("Diff:".to_string());
+        for i in 1..=60 {
+            lines.push(format!("- {i} old line {i}"));
+            lines.push(format!("+ {i} new line {i}"));
+        }
+        let input = lines.join("\n");
+        let rendered = render_tool_message(&input, &styles);
+        assert!(
+            rendered.contains("diff truncated"),
+            "Expected truncation marker, got: {rendered}"
+        );
+    }
 }
 
 fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: bool) -> String {
@@ -2395,7 +2486,9 @@ fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: bool) -> St
             ContentBlock::Text(text_block) => push_line(&mut output, &text_block.text),
             ContentBlock::Image(image) => {
                 if show_images {
-                    push_line(&mut output, &format!("[image: {}]", image.mime_type));
+                    let rendered =
+                        crate::terminal_images::render_inline(&image.data, &image.mime_type, 72);
+                    push_line(&mut output, &rendered);
                 } else {
                     hidden_images = hidden_images.saturating_add(1);
                 }
@@ -4301,6 +4394,9 @@ pub struct PiApp {
 
     // Capability prompt overlay (extension permission request)
     capability_prompt: Option<CapabilityPromptOverlay>,
+
+    // Branch picker overlay (Ctrl+B quick branch switching)
+    branch_picker: Option<BranchPickerOverlay>,
 }
 
 /// Autocomplete dropdown state.
@@ -4628,6 +4724,55 @@ impl CapabilityPromptOverlay {
         request.method == "confirm"
             && request.payload.get("capability").is_some()
             && request.payload.get("extension_id").is_some()
+    }
+}
+
+/// Branch picker overlay for quick branch switching (Ctrl+B).
+#[derive(Debug)]
+struct BranchPickerOverlay {
+    /// Sibling branches at the nearest fork point.
+    branches: Vec<crate::session::SiblingBranch>,
+    /// Which branch is currently selected in the picker.
+    selected: usize,
+    /// Maximum visible rows before scrolling.
+    max_visible: usize,
+}
+
+impl BranchPickerOverlay {
+    fn new(branches: Vec<crate::session::SiblingBranch>) -> Self {
+        let current_idx = branches.iter().position(|b| b.is_current).unwrap_or(0);
+        Self {
+            branches,
+            selected: current_idx,
+            max_visible: 10,
+        }
+    }
+
+    fn select_next(&mut self) {
+        if !self.branches.is_empty() {
+            self.selected = (self.selected + 1) % self.branches.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.branches.is_empty() {
+            self.selected = self
+                .selected
+                .checked_sub(1)
+                .unwrap_or(self.branches.len() - 1);
+        }
+    }
+
+    const fn scroll_offset(&self) -> usize {
+        if self.selected < self.max_visible {
+            0
+        } else {
+            self.selected - self.max_visible + 1
+        }
+    }
+
+    fn selected_branch(&self) -> Option<&crate::session::SiblingBranch> {
+        self.branches.get(self.selected)
     }
 }
 
@@ -5161,6 +5306,7 @@ impl PiApp {
             theme_picker: None,
             tree_ui: None,
             capability_prompt: None,
+            branch_picker: None,
         };
 
         if let Some(manager) = app.extensions.clone() {
@@ -5246,6 +5392,11 @@ impl PiApp {
             // Capability prompt modal captures all input while active.
             if self.capability_prompt.is_some() {
                 return self.handle_capability_prompt_key(key);
+            }
+
+            // Branch picker modal captures all input while active.
+            if self.branch_picker.is_some() {
+                return self.handle_branch_picker_key(key);
             }
 
             // Theme picker modal captures all input while active.
@@ -5670,12 +5821,18 @@ impl PiApp {
             output.push_str(&self.render_capability_prompt(prompt));
         }
 
+        // Branch picker overlay (if open)
+        if let Some(ref picker) = self.branch_picker {
+            output.push_str(&self.render_branch_picker(picker));
+        }
+
         // Input area (only when idle and no overlay open)
         if self.agent_state == AgentState::Idle
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
             && self.theme_picker.is_none()
             && self.capability_prompt.is_none()
+            && self.branch_picker.is_none()
         {
             output.push_str(&self.render_input());
 
@@ -5753,6 +5910,174 @@ impl PiApp {
         }
 
         None
+    }
+
+    /// Handle keyboard input when the branch picker overlay is active.
+    fn handle_branch_picker_key(&mut self, key: &KeyMsg) -> Option<Cmd> {
+        let picker = self.branch_picker.as_mut()?;
+
+        match key.key_type {
+            KeyType::Up => picker.select_prev(),
+            KeyType::Down => picker.select_next(),
+            KeyType::Runes if key.runes == ['k'] => picker.select_prev(),
+            KeyType::Runes if key.runes == ['j'] => picker.select_next(),
+            KeyType::Enter => {
+                if let Some(branch) = picker.selected_branch().cloned() {
+                    self.branch_picker = None;
+                    return self.switch_to_branch_leaf(&branch.leaf_id);
+                }
+                self.branch_picker = None;
+            }
+            KeyType::Esc | KeyType::CtrlC => {
+                self.branch_picker = None;
+                self.status_message = Some("Branch picker cancelled".to_string());
+            }
+            KeyType::Runes if key.runes == ['q'] => {
+                self.branch_picker = None;
+            }
+            _ => {} // consume all other input while picker is open
+        }
+
+        None
+    }
+
+    /// Render the branch picker overlay.
+    fn render_branch_picker(&self, picker: &BranchPickerOverlay) -> String {
+        use std::fmt::Write;
+        let mut output = String::new();
+
+        let _ = writeln!(
+            output,
+            "\n  {}",
+            self.styles.title.render("Select a branch")
+        );
+        let _ = writeln!(
+            output,
+            "  {}",
+            self.styles
+                .muted
+                .render("-------------------------------------------")
+        );
+
+        if picker.branches.is_empty() {
+            let _ = writeln!(
+                output,
+                "  {}",
+                self.styles.muted_italic.render("No branches found.")
+            );
+        } else {
+            let offset = picker.scroll_offset();
+            let visible_count = picker.max_visible.min(picker.branches.len());
+            let end = (offset + visible_count).min(picker.branches.len());
+
+            for (idx, branch) in picker.branches[offset..end].iter().enumerate() {
+                let global_idx = offset + idx;
+                let is_selected = global_idx == picker.selected;
+                let prefix = if is_selected { ">" } else { " " };
+
+                let current_marker = if branch.is_current { " *" } else { "" };
+                let msg_count = format!("({} msgs)", branch.message_count);
+                let preview = if branch.preview.len() > 40 {
+                    format!("{}...", &branch.preview[..37])
+                } else {
+                    branch.preview.clone()
+                };
+
+                let row = format!("{prefix} {preview:<42} {msg_count:>10}{current_marker}");
+                let rendered = if is_selected {
+                    self.styles.accent_bold.render(&row)
+                } else if branch.is_current {
+                    self.styles.accent.render(&row)
+                } else {
+                    self.styles.muted.render(&row)
+                };
+                let _ = writeln!(output, "  {rendered}");
+            }
+        }
+
+        let _ = writeln!(
+            output,
+            "\n  {}",
+            self.styles
+                .muted_italic
+                .render("\u{2191}/\u{2193}/j/k: navigate  Enter: switch  Esc: cancel  * = current")
+        );
+        output
+    }
+
+    /// Switch the active branch to a different leaf. Reloads the conversation.
+    fn switch_to_branch_leaf(&mut self, leaf_id: &str) -> Option<Cmd> {
+        let (session_id, old_leaf_id) = self
+            .session
+            .try_lock()
+            .ok()
+            .map(|g| (g.header.id.clone(), g.leaf_id.clone()))
+            .unwrap_or_default();
+
+        let pending = PendingTreeNavigation {
+            session_id,
+            old_leaf_id,
+            selected_entry_id: leaf_id.to_string(),
+            new_leaf_id: Some(leaf_id.to_string()),
+            editor_text: None,
+            entries_to_summarize: Vec::new(),
+            summary_from_id: String::new(),
+            api_key_present: false,
+        };
+        self.start_tree_navigation(pending, TreeSummaryChoice::NoSummary, None);
+        None
+    }
+
+    /// Open the branch picker if the session has sibling branches.
+    fn open_branch_picker(&mut self) {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot switch branches while processing".to_string());
+            return;
+        }
+
+        let branches = self
+            .session
+            .try_lock()
+            .ok()
+            .and_then(|guard| guard.sibling_branches().map(|(_, b)| b));
+
+        match branches {
+            Some(branches) if branches.len() > 1 => {
+                self.branch_picker = Some(BranchPickerOverlay::new(branches));
+            }
+            _ => {
+                self.status_message =
+                    Some("No branches to pick (use /fork to create one)".to_string());
+            }
+        }
+    }
+
+    /// Cycle to the next or previous sibling branch (Ctrl+Right / Ctrl+Left).
+    fn cycle_sibling_branch(&mut self, forward: bool) {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot switch branches while processing".to_string());
+            return;
+        }
+
+        let target = self.session.try_lock().ok().and_then(|guard| {
+            let (_, branches) = guard.sibling_branches()?;
+            if branches.len() <= 1 {
+                return None;
+            }
+            let current_idx = branches.iter().position(|b| b.is_current)?;
+            let next_idx = if forward {
+                (current_idx + 1) % branches.len()
+            } else {
+                current_idx.checked_sub(1).unwrap_or(branches.len() - 1)
+            };
+            Some(branches[next_idx].leaf_id.clone())
+        });
+
+        if let Some(leaf_id) = target {
+            self.switch_to_branch_leaf(&leaf_id);
+        } else {
+            self.status_message = Some("No sibling branches to cycle through".to_string());
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8415,6 +8740,22 @@ impl PiApp {
             }
 
             // =========================================================
+            // Branch navigation
+            // =========================================================
+            AppAction::BranchPicker => {
+                self.open_branch_picker();
+                None
+            }
+            AppAction::BranchNextSibling => {
+                self.cycle_sibling_branch(true);
+                None
+            }
+            AppAction::BranchPrevSibling => {
+                self.cycle_sibling_branch(false);
+                None
+            }
+
+            // =========================================================
             // Actions not yet implemented - let through to component
             // =========================================================
             _ => {
@@ -8464,7 +8805,10 @@ impl PiApp {
             | AppAction::PasteImage
             | AppAction::Suspend
             | AppAction::ExternalEditor
-            | AppAction::Tab => true,
+            | AppAction::Tab
+            | AppAction::BranchPicker
+            | AppAction::BranchNextSibling
+            | AppAction::BranchPrevSibling => true,
 
             // Other actions pass through to TextArea
             _ => false,

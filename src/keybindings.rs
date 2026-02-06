@@ -243,6 +243,9 @@ pub enum AppAction {
     NewSession,
     Tree,
     Fork,
+    BranchPicker,
+    BranchNextSibling,
+    BranchPrevSibling,
 
     // Models & Thinking
     SelectModel,
@@ -327,6 +330,9 @@ impl AppAction {
             Self::NewSession => "Start a new session",
             Self::Tree => "Open session tree navigator",
             Self::Fork => "Fork current session",
+            Self::BranchPicker => "Open branch picker",
+            Self::BranchNextSibling => "Switch to next sibling branch",
+            Self::BranchPrevSibling => "Switch to previous sibling branch",
 
             // Models & Thinking
             Self::SelectModel => "Open model selector",
@@ -394,7 +400,12 @@ impl AppAction {
                 ActionCategory::Application
             }
 
-            Self::NewSession | Self::Tree | Self::Fork => ActionCategory::Session,
+            Self::NewSession
+            | Self::Tree
+            | Self::Fork
+            | Self::BranchPicker
+            | Self::BranchNextSibling
+            | Self::BranchPrevSibling => ActionCategory::Session,
 
             Self::SelectModel
             | Self::CycleModelForward
@@ -476,6 +487,9 @@ impl AppAction {
             Self::NewSession,
             Self::Tree,
             Self::Fork,
+            Self::BranchPicker,
+            Self::BranchNextSibling,
+            Self::BranchPrevSibling,
             // Models & Thinking
             Self::SelectModel,
             Self::CycleModelForward,
@@ -1377,6 +1391,12 @@ impl KeyBindings {
         m.insert(AppAction::NewSession, vec![]);
         m.insert(AppAction::Tree, vec![]);
         m.insert(AppAction::Fork, vec![]);
+        m.insert(AppAction::BranchPicker, vec![KeyBinding::ctrl("b")]);
+        m.insert(
+            AppAction::BranchNextSibling,
+            vec![KeyBinding::ctrl("right")],
+        );
+        m.insert(AppAction::BranchPrevSibling, vec![KeyBinding::ctrl("left")]);
 
         // Models & Thinking
         m.insert(AppAction::SelectModel, vec![KeyBinding::ctrl("l")]);

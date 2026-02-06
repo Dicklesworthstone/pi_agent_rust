@@ -1375,6 +1375,108 @@ impl Session {
         messages
     }
 
+    /// Find the nearest ancestor that is a fork point (has multiple children)
+    /// and return its children (sibling branch roots). Each sibling is represented
+    /// by its branch-root entry ID plus the leaf ID reachable from that root.
+    ///
+    /// Returns `(fork_point_id, sibling_leaves)` where each sibling leaf is
+    /// a leaf entry ID reachable through the fork point's children. The current
+    /// leaf is included in the list.
+    pub fn sibling_branches(&self) -> Option<(Option<String>, Vec<SiblingBranch>)> {
+        let children_map = self.build_children_map();
+        let leaf_id = self.leaf_id.as_ref()?;
+        let path = self.get_path_to_entry(leaf_id);
+        if path.is_empty() {
+            return None;
+        }
+
+        // Walk backwards from current leaf's path to find the nearest fork point.
+        // A fork point is any entry whose parent has >1 children, OR None (root)
+        // with >1 root entries.
+        // We check each entry's parent to see if the parent has multiple children.
+        for (idx, entry_id) in path.iter().enumerate().rev() {
+            let parent_of_entry = self
+                .get_entry(entry_id)
+                .and_then(|e| e.base().parent_id.clone());
+
+            let siblings_at_parent = children_map
+                .get(&parent_of_entry)
+                .cloned()
+                .unwrap_or_default();
+
+            if siblings_at_parent.len() > 1 {
+                // This is a fork point. Collect all leaves reachable from each sibling.
+                let mut branches = Vec::new();
+                for sibling_root in &siblings_at_parent {
+                    let leaf = Self::deepest_leaf_from(&children_map, sibling_root);
+                    let preview = self.entry_preview(&leaf);
+                    let msg_count = self.count_messages_on_path(&leaf);
+                    let is_current = path[idx..].contains(sibling_root);
+                    branches.push(SiblingBranch {
+                        root_id: sibling_root.clone(),
+                        leaf_id: leaf,
+                        preview,
+                        message_count: msg_count,
+                        is_current,
+                    });
+                }
+                return Some((parent_of_entry, branches));
+            }
+        }
+
+        None
+    }
+
+    /// Follow the first child chain to reach the deepest leaf from a starting entry.
+    fn deepest_leaf_from(
+        children_map: &HashMap<Option<String>, Vec<String>>,
+        start_id: &str,
+    ) -> String {
+        let mut current = start_id.to_string();
+        loop {
+            let children = children_map.get(&Some(current.clone()));
+            match children.and_then(|c| c.first()) {
+                Some(child) => current.clone_from(child),
+                None => return current,
+            }
+        }
+    }
+
+    /// Get a short preview string for an entry (first user message text on
+    /// the path from root to the given leaf).
+    fn entry_preview(&self, leaf_id: &str) -> String {
+        let path = self.get_path_to_entry(leaf_id);
+        for id in &path {
+            if let Some(SessionEntry::Message(msg)) = self.get_entry(id) {
+                if let SessionMessage::User { content, .. } = &msg.message {
+                    let text = user_content_to_text(content);
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return if trimmed.len() > 60 {
+                            format!("{}...", &trimmed[..57])
+                        } else {
+                            trimmed.to_string()
+                        };
+                    }
+                }
+            }
+        }
+        String::from("(empty)")
+    }
+
+    /// Count message entries along the path to a leaf.
+    fn count_messages_on_path(&self, leaf_id: &str) -> usize {
+        let path = self.get_path_to_entry(leaf_id);
+        let path_set: HashSet<&str> = path.iter().map(String::as_str).collect();
+        self.entries
+            .iter()
+            .filter(|e| {
+                matches!(e, SessionEntry::Message(_))
+                    && e.base_id().is_some_and(|id| path_set.contains(id.as_str()))
+            })
+            .count()
+    }
+
     /// Get a summary of branches in this session.
     pub fn branch_summary(&self) -> BranchInfo {
         let leaves = self.list_leaves();
@@ -1432,6 +1534,21 @@ pub struct BranchInfo {
     pub current_leaf: Option<String>,
     pub leaves: Vec<String>,
     pub branch_points: Vec<String>,
+}
+
+/// A sibling branch at a fork point.
+#[derive(Debug, Clone)]
+pub struct SiblingBranch {
+    /// Entry ID of the branch root (child of the fork point).
+    pub root_id: String,
+    /// Leaf entry ID reachable from this branch root.
+    pub leaf_id: String,
+    /// Short preview of the first user message on this branch.
+    pub preview: String,
+    /// Number of message entries along the path.
+    pub message_count: usize,
+    /// Whether the current session leaf is on this branch.
+    pub is_current: bool,
 }
 
 #[derive(Debug, Clone)]
