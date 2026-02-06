@@ -103,7 +103,6 @@ wasmtime = { version = "29.0", features = ["component-model"], optional = true }
 
 # Image processing (optional)
 image = { version = "0.25", optional = true }
-memchr = "2.7.6"
 
 [build-dependencies]
 vergen-gix = { version = "1", features = ["build", "cargo", "rustc"] }

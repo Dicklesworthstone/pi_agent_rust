@@ -377,9 +377,25 @@ fn normalize_dashes(s: &str) -> String {
 }
 
 fn normalize_for_match(s: &str) -> String {
-    let s = normalize_unicode_spaces(s);
-    let s = normalize_quotes(&s);
-    normalize_dashes(&s)
+    // Single-pass normalization: spaces, quotes, and dashes in one allocation.
+    // Avoids 3 intermediate String allocations from chained replace calls.
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            // Unicode spaces → ASCII space
+            c if is_special_unicode_space(c) => out.push(' '),
+            // Curly single quotes → straight apostrophe
+            '\u{2018}' | '\u{2019}' => out.push('\''),
+            // Curly double quotes → straight double quote
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => out.push('"'),
+            // Various dashes → ASCII hyphen
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => out.push('-'),
+            // Everything else passes through
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn normalize_line_for_match(line: &str) -> String {

@@ -1243,7 +1243,10 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     // Extract all require() specifiers
     let mut specifiers: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
-    let re = regex::Regex::new(r#"require\(\s*["']([^"']+)["']\s*\)"#).unwrap();
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r#"require\(\s*["']([^"']+)["']\s*\)"#).expect("require regex")
+    });
     for cap in re.captures_iter(source) {
         let spec = cap[1].to_string();
         if seen.insert(spec.clone()) {
