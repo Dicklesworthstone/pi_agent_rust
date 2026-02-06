@@ -145,6 +145,7 @@ impl PiApp {
         let mut names = Vec::new();
         names.push("dark".to_string());
         names.push("light".to_string());
+        names.push("solarized".to_string());
 
         for path in Theme::discover_themes(&self.cwd) {
             if let Ok(theme) = Theme::load(&path) {
@@ -1524,34 +1525,42 @@ impl PiApp {
 
         let _ = writeln!(output, "\n  {}\n", self.styles.title.render("Select Theme"));
 
-        if picker.themes.is_empty() {
+        if picker.items.is_empty() {
             let _ = writeln!(output, "  {}", self.styles.muted.render("No themes found."));
         } else {
             let offset = picker.scroll_offset();
-            let visible_count = picker.max_visible.min(picker.themes.len());
-            let end = (offset + visible_count).min(picker.themes.len());
+            let visible_count = picker.max_visible.min(picker.items.len());
+            let end = (offset + visible_count).min(picker.items.len());
 
-            for (idx, path) in picker.themes[offset..end].iter().enumerate() {
+            for (idx, item) in picker.items[offset..end].iter().enumerate() {
                 let global_idx = offset + idx;
                 let is_selected = global_idx == picker.selected;
 
                 let prefix = if is_selected { ">" } else { " " };
-                // Load theme to get name, or fallback to file stem
-                // Performance note: repetitive load, but themes are small JSON files.
-                let name = Theme::load(path).map_or_else(
-                    |_| {
-                        path.file_stem().map_or_else(
-                            || "unknown".to_string(),
-                            |s| s.to_string_lossy().to_string(),
-                        )
-                    },
-                    |t| t.name,
-                );
+                let (name, label) = match item {
+                    ThemePickerItem::BuiltIn(name) => {
+                        (name.to_string(), format!("{name} (built-in)"))
+                    }
+                    ThemePickerItem::File(path) => {
+                        // Load theme to get name, or fallback to file stem.
+                        // Performance note: repetitive load, but themes are small JSON files.
+                        let name = Theme::load(path).map_or_else(
+                            |_| {
+                                path.file_stem().map_or_else(
+                                    || "unknown".to_string(),
+                                    |s| s.to_string_lossy().to_string(),
+                                )
+                            },
+                            |t| t.name,
+                        );
+                        (name.clone(), format!("{name} (custom)"))
+                    }
+                };
 
                 let active = name.eq_ignore_ascii_case(&self.theme.name);
                 let marker = if active { " *" } else { "" };
 
-                let row = format!(" {name}{marker}");
+                let row = format!(" {label}{marker}");
                 let rendered = if is_selected {
                     self.styles.selection.render(&row)
                 } else {
@@ -1561,7 +1570,7 @@ impl PiApp {
                 let _ = writeln!(output, "{prefix} {rendered}");
             }
 
-            if picker.themes.len() > visible_count {
+            if picker.items.len() > visible_count {
                 let _ = writeln!(
                     output,
                     "  {}",
@@ -1569,7 +1578,7 @@ impl PiApp {
                         "({}-{} of {})",
                         offset + 1,
                         end,
-                        picker.themes.len()
+                        picker.items.len()
                     ))
                 );
             }
@@ -3923,35 +3932,46 @@ enum SettingsUiEntry {
     AutocompleteMaxVisible,
 }
 
+#[derive(Debug, Clone)]
+enum ThemePickerItem {
+    BuiltIn(&'static str),
+    File(PathBuf),
+}
+
 #[derive(Debug)]
 struct ThemePickerOverlay {
-    themes: Vec<PathBuf>,
+    items: Vec<ThemePickerItem>,
     selected: usize,
     max_visible: usize,
 }
 
 impl ThemePickerOverlay {
     fn new(cwd: &Path) -> Self {
-        let themes = Theme::discover_themes(cwd);
+        let mut items = Vec::new();
+        items.push(ThemePickerItem::BuiltIn("dark"));
+        items.push(ThemePickerItem::BuiltIn("light"));
+        items.push(ThemePickerItem::BuiltIn("solarized"));
+        items.extend(
+            Theme::discover_themes(cwd)
+                .into_iter()
+                .map(ThemePickerItem::File),
+        );
         Self {
-            themes,
+            items,
             selected: 0,
             max_visible: 10,
         }
     }
 
     fn select_next(&mut self) {
-        if !self.themes.is_empty() {
-            self.selected = (self.selected + 1) % self.themes.len();
+        if !self.items.is_empty() {
+            self.selected = (self.selected + 1) % self.items.len();
         }
     }
 
     fn select_prev(&mut self) {
-        if !self.themes.is_empty() {
-            self.selected = self
-                .selected
-                .checked_sub(1)
-                .unwrap_or(self.themes.len() - 1);
+        if !self.items.is_empty() {
+            self.selected = self.selected.checked_sub(1).unwrap_or(self.items.len() - 1);
         }
     }
 
@@ -3963,8 +3983,8 @@ impl ThemePickerOverlay {
         }
     }
 
-    fn selected_theme_path(&self) -> Option<&PathBuf> {
-        self.themes.get(self.selected)
+    fn selected_item(&self) -> Option<&ThemePickerItem> {
+        self.items.get(self.selected)
     }
 }
 
@@ -4615,19 +4635,33 @@ impl PiApp {
                     KeyType::Runes if key.runes == ['k'] => picker.select_prev(),
                     KeyType::Runes if key.runes == ['j'] => picker.select_next(),
                     KeyType::Enter => {
-                        if let Some(path) = picker.selected_theme_path() {
-                            if let Ok(theme) = Theme::load(path) {
-                                self.apply_theme(theme.clone());
-                                if let Err(e) = self.persist_project_theme(&theme.name) {
-                                    self.status_message =
-                                        Some(format!("Failed to persist theme: {e}"));
-                                } else {
-                                    self.status_message =
-                                        Some(format!("Switched to theme: {}", theme.name));
+                        if let Some(item) = picker.selected_item() {
+                            let loaded = match item {
+                                ThemePickerItem::BuiltIn(name) => Ok(match *name {
+                                    "light" => Theme::light(),
+                                    "solarized" => Theme::solarized(),
+                                    _ => Theme::dark(),
+                                }),
+                                ThemePickerItem::File(path) => Theme::load(path),
+                            };
+
+                            match loaded {
+                                Ok(theme) => {
+                                    let theme_name = theme.name.clone();
+                                    self.apply_theme(theme);
+                                    self.config.theme = Some(theme_name.clone());
+                                    if let Err(e) = self.persist_project_theme(&theme_name) {
+                                        self.status_message =
+                                            Some(format!("Failed to persist theme: {e}"));
+                                    } else {
+                                        self.status_message =
+                                            Some(format!("Switched to theme: {theme_name}"));
+                                    }
                                 }
-                            } else {
-                                self.status_message =
-                                    Some("Failed to load selected theme".to_string());
+                                Err(_) => {
+                                    self.status_message =
+                                        Some("Failed to load selected theme".to_string());
+                                }
                             }
                         }
                         self.theme_picker = None;
@@ -4688,10 +4722,6 @@ impl PiApp {
                                     self.scroll_to_bottom();
                                     self.status_message =
                                         Some("Selected setting: Summary".to_string());
-                                }
-                                SettingsUiEntry::Theme => {
-                                    self.status_message =
-                                        Some("Selected setting: Theme".to_string());
                                 }
                                 _ => {
                                     self.toggle_settings_entry(selected);
@@ -8165,6 +8195,8 @@ impl PiApp {
                     Theme::dark()
                 } else if name.eq_ignore_ascii_case("light") {
                     Theme::light()
+                } else if name.eq_ignore_ascii_case("solarized") {
+                    Theme::solarized()
                 } else {
                     match Theme::load_by_name(name, &self.cwd) {
                         Ok(theme) => theme,

@@ -2146,11 +2146,24 @@ fn tui_state_slash_settings_opens_selector_and_restores_editor() {
     assert_after_contains(&harness, &step, "Summary");
     assert_after_not_contains(&harness, &step, SINGLE_LINE_HINT);
 
-    // Navigate and confirm selection (scaffold: returns to editor).
+    // Navigate to Theme and open the picker.
     press_down(&harness, &mut app);
     let step = press_enter(&harness, &mut app);
-    assert_after_contains(&harness, &step, "Selected setting: Theme");
+    assert_after_contains(&harness, &step, "Select Theme");
+    assert_after_contains(&harness, &step, "dark (built-in)");
+    assert_after_contains(&harness, &step, "light (built-in)");
+    assert_after_not_contains(&harness, &step, SINGLE_LINE_HINT);
+
+    // Switch to `light` and ensure it persists to .pi/settings.json.
+    press_down(&harness, &mut app);
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched to theme: light");
     assert_after_contains(&harness, &step, SINGLE_LINE_HINT);
+
+    let settings_path = harness.temp_dir().join(".pi/settings.json");
+    let content = std::fs::read_to_string(&settings_path).expect("read settings.json");
+    let value: serde_json::Value = serde_json::from_str(&content).expect("parse settings.json");
+    assert_eq!(value["theme"], "light");
 
     // Reopen and toggle a delivery mode (should persist to .pi/settings.json).
     type_text(&harness, &mut app, "/settings");
