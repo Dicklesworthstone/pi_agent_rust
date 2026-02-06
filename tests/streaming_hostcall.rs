@@ -18,7 +18,7 @@ fn drain_one(runtime: &PiJsRuntime<DeterministicClock>) -> HostcallRequest {
 fn assert_tool(req: &HostcallRequest, expected_name: &str) {
     match &req.kind {
         HostcallKind::Tool { name } => assert_eq!(name, expected_name),
-        other => panic!("expected tool hostcall {expected_name}, got {other:?}"),
+        other => unreachable!("expected tool hostcall {expected_name}, got {other:?}"),
     }
 }
 
@@ -283,7 +283,7 @@ fn streaming_callback_receives_chunks() {
                     assert_eq!(req.payload, json!({ "value": "chunk-B" }));
                     seen_resolved = true;
                 }
-                other => panic!("unexpected hostcall after final chunk: {other:?}"),
+                other => unreachable!("unexpected hostcall after final chunk: {other:?}"),
             }
             runtime.complete_hostcall(req.call_id, HostcallOutcome::Success(Value::Null));
         }

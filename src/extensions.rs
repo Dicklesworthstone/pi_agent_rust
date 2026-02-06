@@ -3473,18 +3473,12 @@ mod wasm_host {
                     .expect("exec ok")
             };
 
-            let output: ToolOutput = serde_json::from_str(&out_json).expect("parse tool output");
-            assert!(!output.is_error);
-            let text = output
-                .content
-                .iter()
-                .filter_map(|block| match block {
-                    ContentBlock::Text(text) => Some(text.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(text.contains("hello"));
+            let output: Value = serde_json::from_str(&out_json).expect("parse exec output");
+            let stdout = output
+                .get("stdout")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert!(stdout.contains("hello"), "stdout: {stdout:?}");
         }
 
         #[test]
