@@ -5123,9 +5123,7 @@ impl PiApp {
 
         // Scroll indicator
         if conversation_lines.len() > effective_vp {
-            let total = conversation_lines
-                .len()
-                .saturating_sub(effective_vp);
+            let total = conversation_lines.len().saturating_sub(effective_vp);
             let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
             let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
             output.push_str(&self.styles.muted.render(&indicator));
@@ -9373,10 +9371,7 @@ mod tests {
     fn clamp_to_terminal_height_noop_when_fits() {
         let input = "line1\nline2\nline3".to_string();
         // 2 newlines → 3 rows; term_height=4 allows 3 newlines → fits.
-        assert_eq!(
-            clamp_to_terminal_height(input.clone(), 4),
-            input
-        );
+        assert_eq!(clamp_to_terminal_height(input.clone(), 4), input);
     }
 
     #[test]
@@ -9397,10 +9392,7 @@ mod tests {
     fn clamp_to_terminal_height_exact_fit() {
         // term_height=3 → max 2 newlines.  Input has exactly 2 → fits.
         let input = "a\nb\nc".to_string();
-        assert_eq!(
-            clamp_to_terminal_height(input.clone(), 3),
-            input
-        );
+        assert_eq!(clamp_to_terminal_height(input.clone(), 3), input);
     }
 
     #[test]

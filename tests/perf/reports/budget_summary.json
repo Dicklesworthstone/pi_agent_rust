@@ -120,7 +120,7 @@
   ],
   "ci_enforced": 8,
   "fail": 0,
-  "generated_at": "2026-02-06T03:20:22.337078468+00:00",
+  "generated_at": "2026-02-06T06:21:55.570648472+00:00",
   "no_data": 8,
   "pass": 5,
   "schema": "pi.perf.budget_summary.v1",

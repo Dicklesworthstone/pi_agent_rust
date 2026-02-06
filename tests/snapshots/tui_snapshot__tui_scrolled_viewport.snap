@@ -1,6 +1,5 @@
 ---
 source: tests/tui_snapshot.rs
-assertion_line: 207
 expression: view
 ---
   Pi (dummy/dummy-model)
@@ -19,8 +18,7 @@ expression: view
 
 
 
-  You: User message 11
-  [82%] ↑/↓ PgUp/PgDn to scroll
+  [81%] ↑/↓ PgUp/PgDn to scroll
 
   Enter: send  Shift+Enter: newline  Alt+Enter: multi-line  [thinking: off]
   │ > Type a message... (/help, /exit)
