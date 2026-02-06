@@ -19,7 +19,7 @@ use pi::tools::ToolRegistry;
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -81,18 +81,15 @@ fn load_guard_extension(ext_id: &str, entry_file: &str) -> Result<LoadedExtensio
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
 
     let mut env = HashMap::new();
-    env.insert(
-        "PI_DETERMINISTIC_TIME_MS".to_string(),
-        settings.time_ms.clone(),
-    );
+    env.insert("PI_DETERMINISTIC_TIME_MS".to_string(), settings.time_ms);
     env.insert("PI_DETERMINISTIC_TIME_STEP_MS".to_string(), "1".to_string());
     env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
     env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
-    env.insert("HOME".to_string(), settings.home.clone());
+    env.insert("HOME".to_string(), settings.home);
     env.insert("PI_DETERMINISTIC_RANDOM".to_string(), "0.5".to_string());
 
     let js_config = PiJsRuntimeConfig {
-        cwd: settings.cwd.clone(),
+        cwd: settings.cwd,
         env,
         ..Default::default()
     };
@@ -153,30 +150,6 @@ fn dispatch_event(
                 .map_err(|e| format!("dispatch_event: {e}"))
         }
     })
-}
-
-// ─── Extract text from tool/event result ────────────────────────────────────
-
-fn extract_text(result: &Value) -> String {
-    result.get("content").and_then(Value::as_array).map_or_else(
-        || {
-            result
-                .as_str()
-                .map_or_else(|| result.to_string(), String::from)
-        },
-        |arr| {
-            arr.iter()
-                .filter_map(|b| {
-                    if b.get("type").and_then(Value::as_str) == Some("text") {
-                        b.get("text").and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        },
-    )
 }
 
 // ============================================================================
@@ -666,8 +639,7 @@ fn guard_conformance_report() {
                 let exp_cmds = expected_commands
                     .iter()
                     .find(|(id, _)| *id == *ext_id)
-                    .map(|(_, c)| *c)
-                    .unwrap_or(&[]);
+                    .map_or(&[] as &[&str], |(_, c)| *c);
                 let cmds_pass = exp_cmds.iter().all(|c| cmd_names.contains(&c.to_string()));
                 results.push(GuardTestResult {
                     extension_id: ext_id.to_string(),

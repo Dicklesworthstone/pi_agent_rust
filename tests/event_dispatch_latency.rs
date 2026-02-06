@@ -100,9 +100,9 @@ fn synth_noop_extension(ext_index: usize, events: &[&str]) -> String {
         );
     }
     format!(
-        r#"export default function synthExt{ext_index}(pi) {{
+        r"export default function synthExt{ext_index}(pi) {{
 {hooks}}}
-"#
+"
     )
 }
 
@@ -193,7 +193,7 @@ struct LatencyResult {
 fn measure_event_latency(
     manager: &ExtensionManager,
     event: ExtensionEventName,
-    payload: Option<Value>,
+    payload: &Option<Value>,
     iterations: u64,
     warmup: u64,
 ) -> LatencyResult {
@@ -280,7 +280,7 @@ fn event_type_latency_single_extension() {
     for (i, event) in event_enums.iter().enumerate() {
         let payload = json!({ "systemPrompt": "test", "index": i });
         let mut result =
-            measure_event_latency(&loaded.manager, *event, Some(payload), ITERATIONS, WARMUP);
+            measure_event_latency(&loaded.manager, *event, &Some(payload), ITERATIONS, WARMUP);
         result.extensions = 1;
 
         let summary = summarize_us(&result.latencies_us);
@@ -338,8 +338,8 @@ fn event_dispatch_scaling() {
     let mut all_results = Vec::new();
     eprintln!("\n  Extension count scaling (event: AgentStart):");
     eprintln!(
-        "  {:<12} {:<10} {:<10} {:<10} {:<10} {}",
-        "Extensions", "p50 (us)", "p95 (us)", "p99 (us)", "max (us)", "Status"
+        "  {:<12} {:<10} {:<10} {:<10} {:<10} Status",
+        "Extensions", "p50 (us)", "p95 (us)", "p99 (us)", "max (us)"
     );
 
     for &count in &scale_levels {
@@ -357,7 +357,7 @@ fn event_dispatch_scaling() {
 
         let payload = json!({ "systemPrompt": "test" });
         let mut result =
-            measure_event_latency(&loaded.manager, event, Some(payload), ITERATIONS, WARMUP);
+            measure_event_latency(&loaded.manager, event, &Some(payload), ITERATIONS, WARMUP);
         result.extensions = count;
 
         let summary = summarize_us(&result.latencies_us);
@@ -418,7 +418,7 @@ fn hostcall_roundtrip_latency() {
     let payload = json!({ "systemPrompt": "test" });
 
     let mut result =
-        measure_event_latency(&loaded.manager, event, Some(payload), ITERATIONS, WARMUP);
+        measure_event_latency(&loaded.manager, event, &Some(payload), ITERATIONS, WARMUP);
     result.extensions = 1;
 
     let summary = summarize_us(&result.latencies_us);
@@ -471,7 +471,7 @@ fn no_handler_dispatch_overhead() {
     let payload = json!({ "turnIndex": 1 });
 
     let mut result =
-        measure_event_latency(&loaded.manager, event, Some(payload), ITERATIONS, WARMUP);
+        measure_event_latency(&loaded.manager, event, &Some(payload), ITERATIONS, WARMUP);
     result.extensions = 1;
 
     let summary = summarize_us(&result.latencies_us);
@@ -503,14 +503,12 @@ fn no_handler_dispatch_overhead() {
 
 /// Measure latency with real extensions from the conformance corpus.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn real_extension_dispatch_latency() {
     let manifest_path = project_root().join("tests/ext_conformance/VALIDATED_MANIFEST.json");
-    let data = match std::fs::read_to_string(&manifest_path) {
-        Ok(d) => d,
-        Err(_) => {
-            eprintln!("  Skipping: VALIDATED_MANIFEST.json not found");
-            return;
-        }
+    let Ok(data) = std::fs::read_to_string(&manifest_path) else {
+        eprintln!("  Skipping: VALIDATED_MANIFEST.json not found");
+        return;
     };
     let manifest: Value = serde_json::from_str(&data).expect("parse manifest");
     let extensions = manifest["extensions"].as_array().expect("extensions array");
@@ -595,7 +593,7 @@ fn real_extension_dispatch_latency() {
 
     for (event, label) in &events_to_test {
         let payload = json!({ "systemPrompt": "test" });
-        let mut result = measure_event_latency(&manager, *event, Some(payload), ITERATIONS, WARMUP);
+        let mut result = measure_event_latency(&manager, *event, &Some(payload), ITERATIONS, WARMUP);
         result.extensions = ext_count;
 
         let summary = summarize_us(&result.latencies_us);
@@ -637,7 +635,7 @@ fn real_extension_dispatch_latency() {
 
 /// Generate consolidated JSON report with all latency data.
 #[test]
-#[ignore]
+#[ignore = "report generator: run manually after other tests"]
 fn generate_latency_report() {
     let report_dir = report_dir();
     let _ = std::fs::create_dir_all(&report_dir);
