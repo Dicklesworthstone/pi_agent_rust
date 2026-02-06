@@ -2900,9 +2900,7 @@ mod tests {
         let entry = session.get_entry(&bash_id).unwrap();
         if let SessionEntry::Message(msg) = entry {
             if let SessionMessage::BashExecution {
-                command,
-                exit_code,
-                ..
+                command, exit_code, ..
             } = &msg.message
             {
                 assert_eq!(command, "echo hello");
@@ -2926,10 +2924,7 @@ mod tests {
         let id = session.next_entry_id();
         let base = EntryBase::new(session.leaf_id.clone(), id.clone());
         let mut extra = HashMap::new();
-        extra.insert(
-            "excludeFromContext".to_string(),
-            serde_json::json!(true),
-        );
+        extra.insert("excludeFromContext".to_string(), serde_json::json!(true));
         let entry = SessionEntry::Message(MessageEntry {
             base,
             message: SessionMessage::BashExecution {
@@ -2992,10 +2987,7 @@ mod tests {
         if let SessionEntry::Custom(custom) = entry {
             assert_eq!(custom.custom_type, "my_type");
             assert_eq!(custom.data, Some(serde_json::json!(42)));
-            assert_eq!(
-                custom.base.parent_id.as_deref(),
-                Some(root_id.as_str())
-            );
+            assert_eq!(custom.base.parent_id.as_deref(), Some(root_id.as_str()));
         } else {
             panic!("expected Custom entry");
         }
@@ -3031,8 +3023,7 @@ mod tests {
         let mut session = Session::in_memory();
 
         let msg_id = session.append_message(make_test_message("Hello"));
-        let change_id =
-            session.append_model_change("openai".to_string(), "gpt-4".to_string());
+        let change_id = session.append_model_change("openai".to_string(), "gpt-4".to_string());
 
         assert_eq!(session.leaf_id.as_deref(), Some(change_id.as_str()));
 
@@ -3150,14 +3141,7 @@ mod tests {
             timestamp: Some(100),
         });
 
-        session.append_bash_execution(
-            "ls".to_string(),
-            "files".to_string(),
-            0,
-            false,
-            false,
-            None,
-        );
+        session.append_bash_execution("ls".to_string(), "files".to_string(), 0, false, false, None);
 
         session.append_custom_entry(
             "ext_data".to_string(),
@@ -3345,7 +3329,10 @@ mod tests {
         let result = run_async(async {
             Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
         });
-        assert!(result.is_err(), "corrupted header should cause open failure");
+        assert!(
+            result.is_err(),
+            "corrupted header should cause open failure"
+        );
     }
 
     // ======================================================================
@@ -3433,7 +3420,7 @@ mod tests {
     fn test_plan_fork_from_user_message() {
         let mut session = Session::in_memory();
 
-        let id_a = session.append_message(make_test_message("First question"));
+        let _id_a = session.append_message(make_test_message("First question"));
         let assistant = AssistantMessage {
             content: vec![ContentBlock::Text(TextContent::new("Answer"))],
             api: "anthropic".to_string(),
@@ -3498,8 +3485,8 @@ mod tests {
     fn test_compaction_truncates_model_context() {
         let mut session = Session::in_memory();
 
-        let id_a = session.append_message(make_test_message("old message A"));
-        let id_b = session.append_message(make_test_message("old message B"));
+        let _id_a = session.append_message(make_test_message("old message A"));
+        let _id_b = session.append_message(make_test_message("old message B"));
         let id_c = session.append_message(make_test_message("kept message C"));
 
         // Compact: keep from id_c onwards
@@ -3803,9 +3790,8 @@ mod tests {
 
     #[test]
     fn test_open_nonexistent_file_returns_error() {
-        let result = run_async(async {
-            Session::open("/tmp/nonexistent_session_12345.jsonl").await
-        });
+        let result =
+            run_async(async { Session::open("/tmp/nonexistent_session_12345.jsonl").await });
         assert!(result.is_err());
     }
 
@@ -3815,8 +3801,7 @@ mod tests {
         let path = temp.path().join("empty.jsonl");
         std::fs::write(&path, "").unwrap();
 
-        let result =
-            run_async(async { Session::open(path.to_string_lossy().as_ref()).await });
+        let result = run_async(async { Session::open(path.to_string_lossy().as_ref()).await });
         assert!(result.is_err());
     }
 
@@ -3851,7 +3836,10 @@ mod tests {
         let entry = session.get_entry(&id).unwrap();
         if let SessionEntry::Message(msg) = entry {
             if let SessionMessage::User { content, .. } = &msg.message {
-                assert_eq!(content, &UserContent::Text("Modified".to_string()));
+                match content {
+                    UserContent::Text(t) => assert_eq!(t, "Modified"),
+                    _ => panic!("expected Text content"),
+                }
             } else {
                 panic!("expected user message");
             }
