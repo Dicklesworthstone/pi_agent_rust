@@ -540,4 +540,178 @@ mod tests {
         store.record("", "exec", true).unwrap();
         assert_eq!(store.lookup("", "exec"), Some(true));
     }
+
+    // ── days_to_ymd ─────────────────────────────────────────────────
+
+    #[test]
+    fn days_to_ymd_epoch_start() {
+        let (y, m, d) = days_to_ymd(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+    }
+
+    #[test]
+    fn days_to_ymd_known_date() {
+        // 2026-02-06 is day 20490 since epoch
+        let days: u64 = 20490;
+        let (y, m, d) = days_to_ymd(days);
+        assert_eq!((y, m, d), (2026, 2, 6));
+    }
+
+    #[test]
+    fn days_to_ymd_leap_year() {
+        // 2024-02-29 is a leap day
+        // 2024-01-01 is day 19723
+        // 2024-02-29 is day 19723 + 31 (Jan) + 28 = 19782
+        let (y, m, d) = days_to_ymd(19782);
+        assert_eq!((y, m, d), (2024, 2, 29));
+    }
+
+    #[test]
+    fn days_to_ymd_end_of_year() {
+        // 2023-12-31
+        let (y, m, d) = days_to_ymd(19722);
+        assert_eq!((y, m, d), (2023, 12, 31));
+    }
+
+    // ── lookup with expired decision ─────────────────────────────────
+
+    #[test]
+    fn lookup_expired_decision_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+
+        store
+            .decisions
+            .entry("ext1".to_string())
+            .or_default()
+            .insert(
+                "exec".to_string(),
+                PersistedDecision {
+                    capability: "exec".to_string(),
+                    allow: true,
+                    decided_at: "2020-01-01T00:00:00Z".to_string(),
+                    expires_at: Some("2020-06-01T00:00:00Z".to_string()),
+                    version_range: None,
+                },
+            );
+
+        assert_eq!(store.lookup("ext1", "exec"), None);
+    }
+
+    #[test]
+    fn lookup_non_expired_decision_returns_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+
+        store
+            .decisions
+            .entry("ext1".to_string())
+            .or_default()
+            .insert(
+                "exec".to_string(),
+                PersistedDecision {
+                    capability: "exec".to_string(),
+                    allow: false,
+                    decided_at: "2020-01-01T00:00:00Z".to_string(),
+                    expires_at: Some("2099-12-31T23:59:59Z".to_string()),
+                    version_range: None,
+                },
+            );
+
+        assert_eq!(store.lookup("ext1", "exec"), Some(false));
+    }
+
+    // ── to_cache_map ────────────────────────────────────────────────
+
+    #[test]
+    fn to_cache_map_includes_no_expiry_decisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+
+        store.record("ext", "exec", true).unwrap();
+        let cache = store.to_cache_map();
+        assert_eq!(cache.get("ext").and_then(|m| m.get("exec")), Some(&true));
+    }
+
+    #[test]
+    fn to_cache_map_omits_extension_when_all_expired() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+
+        store
+            .decisions
+            .entry("ext-dead".to_string())
+            .or_default()
+            .insert(
+                "exec".to_string(),
+                PersistedDecision {
+                    capability: "exec".to_string(),
+                    allow: true,
+                    decided_at: "2020-01-01T00:00:00Z".to_string(),
+                    expires_at: Some("2020-06-01T00:00:00Z".to_string()),
+                    version_range: None,
+                },
+            );
+
+        let cache = store.to_cache_map();
+        assert!(!cache.contains_key("ext-dead"));
+    }
+
+    // ── revoke on nonexistent extension ──────────────────────────────
+
+    #[test]
+    fn revoke_nonexistent_extension_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.json");
+        let mut store = PermissionStore::open(&path).unwrap();
+        store.record("ext-a", "exec", true).unwrap();
+
+        // Revoking nonexistent extension should succeed
+        store.revoke_extension("nonexistent").unwrap();
+        // Original should remain
+        assert_eq!(store.lookup("ext-a", "exec"), Some(true));
+    }
+
+    // ── PermissionsFile default ─────────────────────────────────────
+
+    #[test]
+    fn permissions_file_default_version() {
+        let file = PermissionsFile::default();
+        assert_eq!(file.version, CURRENT_VERSION);
+        assert!(file.decisions.is_empty());
+    }
+
+    // ── PersistedDecision serde roundtrip ────────────────────────────
+
+    #[test]
+    fn persisted_decision_serde_roundtrip() {
+        let dec = PersistedDecision {
+            capability: "exec".to_string(),
+            allow: true,
+            decided_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: Some("2027-01-01T00:00:00Z".to_string()),
+            version_range: Some(">=1.0.0".to_string()),
+        };
+        let json = serde_json::to_string(&dec).unwrap();
+        let dec2: PersistedDecision = serde_json::from_str(&json).unwrap();
+        assert_eq!(dec, dec2);
+    }
+
+    #[test]
+    fn persisted_decision_optional_fields_omitted() {
+        let dec = PersistedDecision {
+            capability: "http".to_string(),
+            allow: false,
+            decided_at: "2026-01-01T00:00:00Z".to_string(),
+            expires_at: None,
+            version_range: None,
+        };
+        let json = serde_json::to_string(&dec).unwrap();
+        assert!(!json.contains("expires_at"));
+        assert!(!json.contains("version_range"));
+    }
 }

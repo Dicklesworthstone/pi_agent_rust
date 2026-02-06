@@ -346,4 +346,167 @@ mod tests {
         assert_eq!(selector.selected_index(), 0);
         assert_eq!(selector.scroll_offset(), 0);
     }
+
+    #[test]
+    fn empty_selector_stays_stable_for_navigation_and_queries() {
+        let mut selector = selector(&[]);
+        assert_eq!(selector.filtered_len(), 0);
+        assert!(selector.selected_item().is_none());
+
+        selector.select_next();
+        selector.select_prev();
+        selector.select_page_down();
+        selector.select_page_up();
+        selector.push_chars("abc".chars());
+        selector.pop_char();
+        selector.clear_query();
+
+        assert_eq!(selector.filtered_len(), 0);
+        assert_eq!(selector.selected_index(), 0);
+        assert_eq!(selector.scroll_offset(), 0);
+        assert_eq!(selector.query(), "");
+    }
+
+    #[test]
+    fn whitespace_only_query_keeps_all_models_visible() {
+        let mut selector = selector(&[
+            ("openai", "gpt-4o"),
+            ("openai", "gpt-4o-mini"),
+            ("anthropic", "claude-sonnet-4"),
+        ]);
+        selector.push_chars("   ".chars());
+
+        assert_eq!(selector.query(), "   ");
+        assert_eq!(selector.filtered_len(), 3);
+        assert_eq!(
+            selector.selected_item().unwrap().full_id(),
+            "anthropic/claude-sonnet-4"
+        );
+    }
+
+    #[test]
+    fn query_refresh_resets_selection_to_first_match() {
+        let mut selector = selector(&[("openai", "gpt-4o"), ("openai", "gpt-4o-mini")]);
+        selector.select_next();
+        assert_eq!(selector.selected_index(), 1);
+
+        selector.push_chars("mini".chars());
+        assert_eq!(selector.filtered_len(), 1);
+        assert_eq!(selector.selected_index(), 0);
+        assert_eq!(
+            selector.selected_item().unwrap().full_id(),
+            "openai/gpt-4o-mini"
+        );
+    }
+
+    // ── ModelKey::full_id ────────────────────────────────────────────
+
+    #[test]
+    fn model_key_full_id() {
+        let key = ModelKey {
+            provider: "anthropic".to_string(),
+            id: "claude-sonnet-4".to_string(),
+        };
+        assert_eq!(key.full_id(), "anthropic/claude-sonnet-4");
+    }
+
+    // ── fuzzy_match function ─────────────────────────────────────────
+
+    #[test]
+    fn fuzzy_match_exact() {
+        assert!(fuzzy_match("hello", "hello"));
+    }
+
+    #[test]
+    fn fuzzy_match_subsequence() {
+        assert!(fuzzy_match("gpt", "gpt-4o-mini"));
+    }
+
+    #[test]
+    fn fuzzy_match_no_match() {
+        assert!(!fuzzy_match("xyz", "abc"));
+    }
+
+    #[test]
+    fn fuzzy_match_case_insensitive() {
+        assert!(fuzzy_match("GPT", "gpt-4o"));
+    }
+
+    #[test]
+    fn fuzzy_match_empty_pattern() {
+        assert!(fuzzy_match("", "anything"));
+    }
+
+    // ── matches_query function ───────────────────────────────────────
+
+    #[test]
+    fn matches_query_by_provider() {
+        let key = ModelKey {
+            provider: "anthropic".to_string(),
+            id: "claude".to_string(),
+        };
+        assert!(matches_query("anth", &key));
+    }
+
+    #[test]
+    fn matches_query_by_id() {
+        let key = ModelKey {
+            provider: "openai".to_string(),
+            id: "gpt-4o".to_string(),
+        };
+        assert!(matches_query("gpt", &key));
+    }
+
+    #[test]
+    fn matches_query_by_full_id() {
+        let key = ModelKey {
+            provider: "openai".to_string(),
+            id: "gpt-4o".to_string(),
+        };
+        assert!(matches_query("oi/g", &key));
+    }
+
+    // ── pop_char on empty query ──────────────────────────────────────
+
+    #[test]
+    fn pop_char_on_empty_is_noop() {
+        let mut s = selector(&[("a", "b")]);
+        s.pop_char();
+        assert_eq!(s.query(), "");
+        assert_eq!(s.filtered_len(), 1);
+    }
+
+    // ── item_at out of bounds ────────────────────────────────────────
+
+    #[test]
+    fn item_at_out_of_bounds_returns_none() {
+        let s = selector(&[("a", "b")]);
+        assert!(s.item_at(100).is_none());
+    }
+
+    // ── duplicate keys ──────────────────────────────────────────────
+
+    #[test]
+    fn duplicate_keys_are_preserved() {
+        let s = selector(&[("a", "m1"), ("a", "m1")]);
+        assert_eq!(s.filtered_len(), 2);
+    }
+
+    // ── scroll_offset edge cases ─────────────────────────────────────
+
+    #[test]
+    fn scroll_offset_zero_when_within_window() {
+        let s = selector(&[("a", "1"), ("a", "2"), ("a", "3")]);
+        assert_eq!(s.scroll_offset(), 0);
+    }
+
+    #[test]
+    fn scroll_offset_tracks_selection_beyond_window() {
+        let mut s = selector(&[("a", "1"), ("a", "2"), ("a", "3"), ("a", "4"), ("a", "5")]);
+        s.set_max_visible(2);
+        // Select past the visible window
+        s.select_next(); // index 1
+        s.select_next(); // index 2 → scroll_offset should be 1
+        assert_eq!(s.scroll_offset(), 1);
+    }
 }

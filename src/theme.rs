@@ -676,4 +676,295 @@ mod tests {
             "expected config error, got {err:?}"
         );
     }
+
+    #[test]
+    fn looks_like_theme_path_detects_names_and_paths() {
+        assert!(!looks_like_theme_path("dark"));
+        assert!(!looks_like_theme_path("custom-theme"));
+        assert!(looks_like_theme_path("dark.json"));
+        assert!(looks_like_theme_path("themes/dark"));
+        assert!(looks_like_theme_path(r"themes\dark"));
+        assert!(looks_like_theme_path("~/themes/dark.json"));
+    }
+
+    #[test]
+    fn resolve_theme_path_handles_home_relative_and_absolute() {
+        let cwd = Path::new("/work/cwd");
+        let home = dirs::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+
+        assert_eq!(
+            resolve_theme_path("themes/dark.json", cwd),
+            cwd.join("themes/dark.json")
+        );
+        assert_eq!(
+            resolve_theme_path("/tmp/theme.json", cwd),
+            PathBuf::from("/tmp/theme.json")
+        );
+        assert_eq!(resolve_theme_path("~", cwd), home);
+        assert_eq!(
+            resolve_theme_path("~/themes/dark.json", cwd),
+            home.join("themes/dark.json")
+        );
+        assert_eq!(resolve_theme_path("~custom", cwd), home.join("custom"));
+    }
+
+    #[test]
+    fn parse_hex_color_trims_and_rejects_invalid_inputs() {
+        assert_eq!(parse_hex_color("  #A0b1C2 "), Some((160, 177, 194)));
+        assert_eq!(parse_hex_color("A0b1C2"), None);
+        assert_eq!(parse_hex_color("#123"), None);
+        assert_eq!(parse_hex_color("#12345G"), None);
+    }
+
+    #[test]
+    fn is_light_uses_background_luminance_threshold() {
+        let mut theme = Theme::dark();
+        theme.colors.background = "#808080".to_string();
+        assert!(theme.is_light(), "mid-gray should be treated as light");
+
+        theme.colors.background = "#7f7f7f".to_string();
+        assert!(!theme.is_light(), "just below threshold should be dark");
+
+        theme.colors.background = "not-a-color".to_string();
+        assert!(!theme.is_light(), "invalid colors should default to dark");
+    }
+
+    #[test]
+    fn resolve_falls_back_to_dark_for_invalid_spec() {
+        let cfg = Config {
+            theme: Some("does-not-exist".to_string()),
+            ..Default::default()
+        };
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let resolved = Theme::resolve(&cfg, cwd.path());
+        assert_eq!(resolved.name, "dark");
+    }
+
+    // ── resolve with empty/None config ───────────────────────────────
+
+    #[test]
+    fn resolve_defaults_to_dark_when_no_theme_set() {
+        let cfg = Config {
+            theme: None,
+            ..Default::default()
+        };
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let resolved = Theme::resolve(&cfg, cwd.path());
+        assert_eq!(resolved.name, "dark");
+    }
+
+    #[test]
+    fn resolve_defaults_to_dark_when_theme_is_empty() {
+        let cfg = Config {
+            theme: Some("".to_string()),
+            ..Default::default()
+        };
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let resolved = Theme::resolve(&cfg, cwd.path());
+        assert_eq!(resolved.name, "dark");
+    }
+
+    #[test]
+    fn resolve_defaults_to_dark_when_theme_is_whitespace() {
+        let cfg = Config {
+            theme: Some("   ".to_string()),
+            ..Default::default()
+        };
+        let cwd = tempfile::tempdir().expect("tempdir");
+        let resolved = Theme::resolve(&cfg, cwd.path());
+        assert_eq!(resolved.name, "dark");
+    }
+
+    // ── resolve_spec case insensitivity ──────────────────────────────
+
+    #[test]
+    fn resolve_spec_case_insensitive() {
+        let cwd = Path::new(".");
+        assert_eq!(Theme::resolve_spec("DARK", cwd).unwrap().name, "dark");
+        assert_eq!(Theme::resolve_spec("Light", cwd).unwrap().name, "light");
+        assert_eq!(
+            Theme::resolve_spec("SOLARIZED", cwd).unwrap().name,
+            "solarized"
+        );
+    }
+
+    #[test]
+    fn resolve_spec_empty_returns_error() {
+        let err = Theme::resolve_spec("", Path::new(".")).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    // ── validate_color edge cases ────────────────────────────────────
+
+    #[test]
+    fn validate_color_valid() {
+        assert!(Theme::validate_color("test", "#000000").is_ok());
+        assert!(Theme::validate_color("test", "#ffffff").is_ok());
+        assert!(Theme::validate_color("test", "#AbCdEf").is_ok());
+    }
+
+    #[test]
+    fn validate_color_invalid_no_hash() {
+        assert!(Theme::validate_color("test", "000000").is_err());
+    }
+
+    #[test]
+    fn validate_color_invalid_too_short() {
+        assert!(Theme::validate_color("test", "#123").is_err());
+    }
+
+    #[test]
+    fn validate_color_invalid_chars() {
+        assert!(Theme::validate_color("test", "#ZZZZZZ").is_err());
+    }
+
+    // ── validate ─────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_rejects_empty_name() {
+        let mut theme = Theme::dark();
+        theme.name = "".to_string();
+        assert!(theme.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_empty_version() {
+        let mut theme = Theme::dark();
+        theme.version = "  ".to_string();
+        assert!(theme.validate().is_err());
+    }
+
+    // ── is_light ─────────────────────────────────────────────────────
+
+    #[test]
+    fn dark_theme_is_not_light() {
+        assert!(!Theme::dark().is_light());
+    }
+
+    #[test]
+    fn light_theme_is_light() {
+        assert!(Theme::light().is_light());
+    }
+
+    // ── parse_hex_color ──────────────────────────────────────────────
+
+    #[test]
+    fn parse_hex_color_black_and_white() {
+        assert_eq!(parse_hex_color("#000000"), Some((0, 0, 0)));
+        assert_eq!(parse_hex_color("#ffffff"), Some((255, 255, 255)));
+    }
+
+    #[test]
+    fn parse_hex_color_empty_returns_none() {
+        assert_eq!(parse_hex_color(""), None);
+    }
+
+    // ── glob_json ────────────────────────────────────────────────────
+
+    #[test]
+    fn glob_json_nonexistent_dir() {
+        let result = glob_json(Path::new("/nonexistent/dir"));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn glob_json_dir_with_non_json_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::write(dir.path().join("readme.txt"), "hi").unwrap();
+        fs::write(dir.path().join("theme.json"), "{}").unwrap();
+        fs::write(dir.path().join("other.toml"), "").unwrap();
+
+        let result = glob_json(dir.path());
+        assert_eq!(result.len(), 1);
+        assert!(result[0].to_string_lossy().ends_with("theme.json"));
+    }
+
+    // ── discover_themes_with_roots ──────────────────────────────────
+
+    #[test]
+    fn discover_themes_empty_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = ThemeRoots {
+            global_dir: dir.path().join("global"),
+            project_dir: dir.path().join("project"),
+        };
+        let themes = Theme::discover_themes_with_roots(&roots);
+        assert!(themes.is_empty());
+    }
+
+    // ── Theme serialization roundtrip ────────────────────────────────
+
+    #[test]
+    fn theme_serde_roundtrip() {
+        let theme = Theme::dark();
+        let json = serde_json::to_string(&theme).unwrap();
+        let theme2: Theme = serde_json::from_str(&json).unwrap();
+        assert_eq!(theme.name, theme2.name);
+        assert_eq!(theme.colors.foreground, theme2.colors.foreground);
+    }
+
+    // ── load_by_name_with_roots ─────────────────────────────────────
+
+    #[test]
+    fn load_by_name_empty_name_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = ThemeRoots {
+            global_dir: dir.path().join("global"),
+            project_dir: dir.path().join("project"),
+        };
+        let err = Theme::load_by_name_with_roots("", &roots).unwrap_err();
+        assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn load_by_name_not_found_returns_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let roots = ThemeRoots {
+            global_dir: dir.path().join("global"),
+            project_dir: dir.path().join("project"),
+        };
+        let err = Theme::load_by_name_with_roots("nonexistent", &roots).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn load_by_name_finds_theme_in_global_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let global_themes = dir.path().join("global/themes");
+        fs::create_dir_all(&global_themes).unwrap();
+
+        let theme = Theme::dark();
+        let mut custom = theme;
+        custom.name = "mycustom".to_string();
+        let json = serde_json::to_string_pretty(&custom).unwrap();
+        fs::write(global_themes.join("mycustom.json"), json).unwrap();
+
+        let roots = ThemeRoots {
+            global_dir: dir.path().join("global"),
+            project_dir: dir.path().join("project"),
+        };
+        let loaded = Theme::load_by_name_with_roots("mycustom", &roots).unwrap();
+        assert_eq!(loaded.name, "mycustom");
+    }
+
+    // ── tui_styles and glamour_style_config smoke tests ─────────────
+
+    #[test]
+    fn tui_styles_returns_valid_struct() {
+        let styles = Theme::dark().tui_styles();
+        // Just verify all fields are accessible without panic
+        let _ = format!("{:?}", styles.title);
+        let _ = format!("{:?}", styles.muted);
+        let _ = format!("{:?}", styles.accent);
+        let _ = format!("{:?}", styles.error_bold);
+    }
+
+    #[test]
+    fn glamour_style_config_smoke() {
+        let dark_config = Theme::dark().glamour_style_config();
+        let light_config = Theme::light().glamour_style_config();
+        // Verify the configs are created without panic
+        assert!(dark_config.document.style.color.is_some());
+        assert!(light_config.document.style.color.is_some());
+    }
 }
