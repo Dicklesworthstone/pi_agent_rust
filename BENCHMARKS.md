@@ -354,6 +354,36 @@ Target metrics for Rust vs TypeScript:
 | Binary size | N/A (Node) | <20MB | 7.6MB ✅ |
 | Memory (idle) | ~80MB | <50MB | TBD |
 
+### Extension Load Time: Rust vs Legacy TS (bd-uah)
+
+Per-extension load time comparison across all 60 official extensions.
+Both runtimes load the same unmodified `.ts` files. TS uses Bun/jiti (native V8-based eval).
+Rust uses QuickJS with SWC transpilation.
+
+| Metric | Rust (QuickJS) | TS (Bun/jiti) |
+|--------|---------------|---------------|
+| Mean load time | 103ms | 2ms |
+| Min load time | 96ms | 1ms |
+| Max load time | 131ms | 51ms |
+
+**Known regression:** Extension loading in Rust is ~50-100x slower due to:
+1. SWC TypeScript-to-JavaScript transpilation per-load
+2. QuickJS bytecode compilation (no JIT)
+3. Virtual module system resolution overhead
+
+**Why this is acceptable:** The loading cost is a one-time cold-start per session.
+Steady-state operations are orders of magnitude faster in Rust:
+- Tool call roundtrip: 44μs (Rust) vs ~5ms (TS)
+- Policy evaluation: 20ns (Rust)
+- Event hook dispatch: sub-50μs (Rust)
+
+**Planned mitigation:** Compiled bytecode caching (see Opportunity Matrix above)
+to amortize cold-start across sessions.
+
+Full per-extension data: `tests/ext_conformance/reports/performance_comparison.json`
+
+Regenerate: `cargo test --test performance_comparison generate_performance_comparison -- --nocapture`
+
 ## Notes
 
 - Benchmarks run in release mode with LTO enabled
