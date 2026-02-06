@@ -4457,6 +4457,12 @@ fn parse_extension_tool_defs(tools: &[Value]) -> Vec<ExtensionToolDef> {
     defs
 }
 
+/// Trait allowing tests to intercept hostcalls before they reach real dispatch.
+/// Return `Some(outcome)` to short-circuit, or `None` to fall through to real dispatch.
+pub trait HostcallInterceptor: Send + Sync {
+    fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome>;
+}
+
 #[derive(Clone)]
 struct JsRuntimeHost {
     tools: Arc<ToolRegistry>,
@@ -4466,6 +4472,7 @@ struct JsRuntimeHost {
     manager_ref: Weak<Mutex<ExtensionManagerInner>>,
     http: Arc<HttpConnector>,
     policy: ExtensionPolicy,
+    interceptor: Option<Arc<dyn HostcallInterceptor>>,
 }
 
 impl JsRuntimeHost {
@@ -4576,6 +4583,28 @@ impl JsExtensionRuntimeHandle {
         tools: Arc<ToolRegistry>,
         manager: ExtensionManager,
     ) -> Result<Self> {
+        Self::start_inner(config, tools, manager, None).await
+    }
+
+    /// Like [`start`](Self::start) but installs a [`HostcallInterceptor`] that
+    /// can short-circuit hostcalls before they reach real dispatch handlers.
+    /// Used by conformance tests to provide deterministic exec/http/ui stubs.
+    pub async fn start_with_interceptor(
+        config: PiJsRuntimeConfig,
+        tools: Arc<ToolRegistry>,
+        manager: ExtensionManager,
+        interceptor: Arc<dyn HostcallInterceptor>,
+    ) -> Result<Self> {
+        Self::start_inner(config, tools, manager, Some(interceptor)).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    async fn start_inner(
+        config: PiJsRuntimeConfig,
+        tools: Arc<ToolRegistry>,
+        manager: ExtensionManager,
+        interceptor: Option<Arc<dyn HostcallInterceptor>>,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(32);
         let (init_tx, init_rx) = oneshot::channel();
         let (exit_tx, exit_rx) = oneshot::channel();
@@ -4584,6 +4613,7 @@ impl JsExtensionRuntimeHandle {
             manager_ref: Arc::downgrade(&manager.inner),
             http: Arc::new(HttpConnector::with_defaults()),
             policy: ExtensionPolicy::default(),
+            interceptor,
         };
 
         thread::spawn(move || {
@@ -5813,6 +5843,13 @@ async fn dispatch_hostcall_allowed(
     host: &JsRuntimeHost,
     request: HostcallRequest,
 ) -> HostcallOutcome {
+    // Allow test interceptors to short-circuit before real dispatch.
+    if let Some(ref interceptor) = host.interceptor {
+        if let Some(outcome) = interceptor.intercept(&request) {
+            return outcome;
+        }
+    }
+
     let HostcallRequest {
         call_id,
         kind,
@@ -8650,6 +8687,7 @@ mod tests {
                     default_caps: Vec::new(),
                     deny_caps: Vec::new(),
                 },
+                interceptor: None,
             };
 
             let request = HostcallRequest {
@@ -9388,6 +9426,7 @@ mod tests {
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
             },
+            interceptor: None,
         };
 
         let request = crate::extensions_js::HostcallRequest {
@@ -9493,6 +9532,7 @@ mod tests {
                 default_caps: vec!["read".to_string()],
                 deny_caps: Vec::new(),
             },
+            interceptor: None,
         };
 
         let request = crate::extensions_js::HostcallRequest {
@@ -9555,6 +9595,7 @@ mod tests {
                 default_caps: vec!["read".to_string(), "write".to_string()],
                 deny_caps: Vec::new(),
             },
+            interceptor: None,
         };
 
         let write_request = crate::extensions_js::HostcallRequest {
