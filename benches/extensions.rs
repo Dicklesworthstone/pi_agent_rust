@@ -5,12 +5,18 @@
 //! - `cargo bench ext_policy`
 
 use std::hint::black_box;
-use std::sync::OnceLock;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use futures::executor::block_on;
-use pi::extensions_js::PiJsRuntime;
+use pi::extensions::{
+    ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+};
+use pi::extensions_js::{PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::HostcallOutcome;
+use pi::tools::ToolRegistry;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sysinfo::System;
@@ -80,6 +86,13 @@ fn print_bench_banner_once() {
 fn criterion_config() -> Criterion {
     print_bench_banner_once();
     Criterion::default()
+}
+
+fn artifact_single_file_entry(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/ext_conformance/artifacts")
+        .join(name)
+        .join(format!("{name}.ts"))
 }
 
 fn bench_extension_policy(c: &mut Criterion) {
@@ -289,6 +302,198 @@ fn bench_protocol_parse_and_validate(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_extension_load_init(c: &mut Criterion) {
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let js_cwd = cwd.display().to_string();
+
+    let mut group = c.benchmark_group("ext_load_init");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+
+    let cases = [
+        ("hello", artifact_single_file_entry("hello")),
+        ("pirate", artifact_single_file_entry("pirate")),
+    ];
+
+    for (ext_name, entry_path) in cases {
+        let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).unwrap_or_else(|_| {
+            panic!(
+                "expected extension artifact entry at {}",
+                entry_path.display()
+            )
+        });
+        let cwd = cwd.clone();
+        let js_cwd = js_cwd.clone();
+
+        group.bench_function(BenchmarkId::new("load_init_cold", ext_name), move |b| {
+            let spec = spec.clone();
+            let cwd = cwd.clone();
+            let js_cwd = js_cwd.clone();
+
+            b.iter_batched(
+                || {
+                    let manager = ExtensionManager::new();
+                    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+                    let runtime = block_on({
+                        let manager = manager.clone();
+                        let tools = Arc::clone(&tools);
+                        let js_config = PiJsRuntimeConfig {
+                            cwd: js_cwd.clone(),
+                            ..Default::default()
+                        };
+                        async move {
+                            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                                .await
+                                .expect("start js runtime")
+                        }
+                    });
+                    manager.set_js_runtime(runtime);
+                    manager
+                },
+                |manager| {
+                    block_on({
+                        let spec = spec.clone();
+                        async move {
+                            manager
+                                .load_js_extensions(vec![spec])
+                                .await
+                                .expect("load extension");
+                            // Avoid leaking runtime threads during benchmark runs.
+                            let _ok = manager.shutdown(Duration::from_millis(250)).await;
+                        }
+                    });
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+fn bench_extension_tool_call_roundtrip(c: &mut Criterion) {
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let js_cwd = cwd.display().to_string();
+    let entry_path = artifact_single_file_entry("hello");
+    let spec = JsExtensionLoadSpec::from_entry_path(&entry_path)
+        .unwrap_or_else(|_| panic!("expected hello artifact at {}", entry_path.display()));
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: js_cwd.clone(),
+        ..Default::default()
+    };
+
+    let runtime = block_on({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+
+    block_on({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load hello extension");
+        }
+    });
+
+    let runtime = manager.js_runtime().expect("runtime should exist");
+    let tool_name = "hello".to_string();
+    let call_id = "bench-call-1".to_string();
+    let input = json!({"name": "World"});
+    let ctx_payload = json!({ "hasUI": false, "cwd": js_cwd });
+
+    {
+        let mut group = c.benchmark_group("ext_tool_call");
+        group.throughput(Throughput::Elements(1));
+        group.bench_function("hello", |b| {
+            b.iter(|| {
+                let result = block_on(runtime.execute_tool(
+                    black_box(tool_name.clone()),
+                    black_box(call_id.clone()),
+                    black_box(input.clone()),
+                    black_box(ctx_payload.clone()),
+                    5_000,
+                ))
+                .expect("execute hello tool");
+                black_box(result);
+            });
+        });
+        group.finish();
+    }
+
+    let _ = block_on(manager.shutdown(Duration::from_millis(250)));
+}
+
+fn bench_extension_event_hook_dispatch(c: &mut Criterion) {
+    let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let js_cwd = cwd.display().to_string();
+    let entry_path = artifact_single_file_entry("pirate");
+    let spec = JsExtensionLoadSpec::from_entry_path(&entry_path)
+        .unwrap_or_else(|_| panic!("expected pirate artifact at {}", entry_path.display()));
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: js_cwd,
+        ..Default::default()
+    };
+
+    let runtime = block_on({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    manager.set_js_runtime(runtime);
+
+    block_on({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load pirate extension");
+        }
+    });
+
+    let event_payload = json!({"systemPrompt": "You are Pi."});
+    let manager_for_bench = manager.clone();
+
+    {
+        let mut group = c.benchmark_group("ext_event_hook");
+        group.throughput(Throughput::Elements(1));
+        group.bench_function("before_agent_start", move |b| {
+            let manager = manager_for_bench.clone();
+            let event_payload = event_payload.clone();
+
+            b.iter(|| {
+                block_on(manager.dispatch_event_with_response(
+                    ExtensionEventName::BeforeAgentStart,
+                    Some(black_box(event_payload.clone())),
+                    5_000,
+                ))
+                .expect("dispatch before_agent_start");
+            });
+        });
+        group.finish();
+    }
+
+    let _ = block_on(manager.shutdown(Duration::from_millis(250)));
+}
+
 fn bench_js_runtime(c: &mut Criterion) {
     let mut group = c.benchmark_group("ext_js_runtime");
     group.bench_function("cold_start", |b| {
@@ -359,6 +564,9 @@ criterion_group!(
         bench_required_capability_for_host_call,
         bench_dispatch_decision,
         bench_protocol_parse_and_validate,
+        bench_extension_load_init,
+        bench_extension_tool_call_roundtrip,
+        bench_extension_event_hook_dispatch,
         bench_js_runtime
 );
 criterion_main!(benches);
