@@ -149,10 +149,7 @@ impl Provider for GeminiProvider {
         let url = self.streaming_url(&auth_value);
 
         // Build request (Content-Type set by .json() below)
-        let mut request = self
-            .client
-            .post(&url)
-            .header("Accept", "text/event-stream");
+        let mut request = self.client.post(&url).header("Accept", "text/event-stream");
 
         for (key, value) in &options.headers {
             request = request.header(key, value);

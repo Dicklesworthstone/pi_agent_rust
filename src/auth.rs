@@ -1495,7 +1495,7 @@ mod tests {
         assert!(auth.entries.contains_key("anthropic"));
         match auth.get("anthropic").expect("credential") {
             AuthCredential::ApiKey { key } => assert_eq!(key, "sk-test-abc"),
-            other => panic!("expected ApiKey, got: {other:?}"),
+            other @ AuthCredential::OAuth { .. } => panic!("expected ApiKey, got: {other:?}"),
         }
     }
 

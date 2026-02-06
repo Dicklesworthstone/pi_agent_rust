@@ -1547,7 +1547,9 @@ mod tests {
         let out = collect_events(&events);
 
         // Should have ToolCallEnd with properly assembled arguments.
-        let tool_end = out.iter().find(|e| matches!(e, StreamEvent::ToolCallEnd { .. }));
+        let tool_end = out
+            .iter()
+            .find(|e| matches!(e, StreamEvent::ToolCallEnd { .. }));
         assert!(tool_end.is_some(), "Expected ToolCallEnd event");
         if let Some(StreamEvent::ToolCallEnd { tool_call, .. }) = tool_end {
             assert_eq!(tool_call.name, "bash");
@@ -1581,7 +1583,10 @@ mod tests {
         assert!(out.iter().any(|e| matches!(e, StreamEvent::Done { .. })));
         assert!(out.iter().any(|e| matches!(
             e,
-            StreamEvent::TextStart { content_index: 0, .. }
+            StreamEvent::TextStart {
+                content_index: 0,
+                ..
+            }
         )));
     }
 }

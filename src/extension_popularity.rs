@@ -119,7 +119,7 @@ impl GitHubRepoRef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubRepoMetrics {
     pub full_name: String,
     pub stars: u64,
@@ -129,13 +129,13 @@ pub struct GitHubRepoMetrics {
     pub pushed_at: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpmDownloads {
     pub weekly: Option<u64>,
     pub monthly: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NpmRegistryMeta {
     pub latest_version: Option<String>,
     pub last_publish: Option<String>,
@@ -188,10 +188,10 @@ pub fn github_repo_candidate_from_url(input: &str) -> Option<GitHubRepoCandidate
 
     let mut segments = url.path_segments()?.filter(|seg| !seg.is_empty());
     let ownerish = segments.next()?.to_string();
-    let repo = segments.next().map(|s| s.to_string());
+    let repo = segments.next().map(ToString::to_string);
 
     match repo {
-        Some(repo) => parse_owner_repo(ownerish, repo).map(GitHubRepoCandidate::Repo),
+        Some(ref repo) => parse_owner_repo(&ownerish, repo).map(GitHubRepoCandidate::Repo),
         None => Some(GitHubRepoCandidate::Slug(ownerish)),
     }
 }
@@ -208,9 +208,8 @@ pub fn github_repo_guesses_from_slug(slug: &str) -> Vec<GitHubRepoRef> {
 
     // Common case for our third-party imports: `owner-pi-foo` should be `owner/pi-foo`.
     if let Some((owner, suffix)) = slug.split_once("-pi-") {
-        let owner = owner.to_string();
         let repo = format!("pi-{suffix}");
-        if let Some(r) = parse_owner_repo(owner, repo) {
+        if let Some(r) = parse_owner_repo(owner, &repo) {
             if seen.insert(r.clone()) {
                 out.push(r);
             }
@@ -219,7 +218,7 @@ pub fn github_repo_guesses_from_slug(slug: &str) -> Vec<GitHubRepoRef> {
 
     // Try first hyphen split: `owner-rest...` -> `owner/rest...`
     if let Some((owner, repo)) = slug.split_once('-') {
-        if let Some(r) = parse_owner_repo(owner.to_string(), repo.to_string()) {
+        if let Some(r) = parse_owner_repo(owner, repo) {
             if seen.insert(r.clone()) {
                 out.push(r);
             }
@@ -228,7 +227,7 @@ pub fn github_repo_guesses_from_slug(slug: &str) -> Vec<GitHubRepoRef> {
 
     // Try last hyphen split: `owner...-repo` -> `owner.../repo`
     if let Some((owner, repo)) = slug.rsplit_once('-') {
-        if let Some(r) = parse_owner_repo(owner.to_string(), repo.to_string()) {
+        if let Some(r) = parse_owner_repo(owner, repo) {
             if seen.insert(r.clone()) {
                 out.push(r);
             }
@@ -269,10 +268,7 @@ pub async fn fetch_github_repo_metrics_optional(
     token: &str,
     repo: &GitHubRepoRef,
 ) -> Result<Option<GitHubRepoMetrics>> {
-    let url = format!(
-        "https://api.github.com/repos/{}/{}",
-        repo.owner, repo.repo
-    );
+    let url = format!("https://api.github.com/repos/{}/{}", repo.owner, repo.repo);
     let response = client
         .get(&url)
         .header("Accept", "application/vnd.github+json")
@@ -357,7 +353,10 @@ pub fn parse_npm_registry_response(text: &str) -> Result<NpmRegistryMeta> {
     })
 }
 
-pub async fn fetch_npm_registry_meta(client: &Client, package: &str) -> Result<Option<NpmRegistryMeta>> {
+pub async fn fetch_npm_registry_meta(
+    client: &Client,
+    package: &str,
+) -> Result<Option<NpmRegistryMeta>> {
     let encoded = url::form_urlencoded::byte_serialize(package.as_bytes()).collect::<String>();
     let url = format!("https://registry.npmjs.org/{encoded}");
     let response = client.get(&url).send().await?;
@@ -371,9 +370,13 @@ pub async fn fetch_npm_registry_meta(client: &Client, package: &str) -> Result<O
     }
 }
 
-fn parse_owner_repo(owner: String, repo: String) -> Option<GitHubRepoRef> {
+fn parse_owner_repo(owner: &str, repo: &str) -> Option<GitHubRepoRef> {
     let owner = owner.trim().trim_matches('/').to_string();
-    let repo = repo.trim().trim_matches('/').trim_end_matches(".git").to_string();
+    let repo = repo
+        .trim()
+        .trim_matches('/')
+        .trim_end_matches(".git")
+        .to_string();
     if owner.is_empty() || repo.is_empty() {
         return None;
     }
@@ -383,8 +386,8 @@ fn parse_owner_repo(owner: String, repo: String) -> Option<GitHubRepoRef> {
 fn parse_owner_repo_from_path(path: &str) -> Option<GitHubRepoRef> {
     let path = path.trim().trim_matches('/');
     let mut parts = path.split('/');
-    let owner = parts.next()?.to_string();
-    let repo = parts.next()?.to_string();
+    let owner = parts.next()?;
+    let repo = parts.next()?;
     parse_owner_repo(owner, repo)
 }
 
@@ -401,4 +404,457 @@ pub async fn snapshot_github_repos(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ====================================================================
+    // GitHubRepoRef
+    // ====================================================================
+
+    #[test]
+    fn github_repo_ref_full_name() {
+        let r = GitHubRepoRef {
+            owner: "anthropics".to_string(),
+            repo: "claude-code".to_string(),
+        };
+        assert_eq!(r.full_name(), "anthropics/claude-code");
+    }
+
+    // ====================================================================
+    // github_repo_candidate_from_url
+    // ====================================================================
+
+    #[test]
+    fn url_https_standard() {
+        let c = github_repo_candidate_from_url("https://github.com/owner/repo").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn url_https_with_dot_git() {
+        let c = github_repo_candidate_from_url("https://github.com/owner/repo.git").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn url_git_plus_https() {
+        let c = github_repo_candidate_from_url("git+https://github.com/owner/repo.git").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn url_git_at_scp() {
+        let c = github_repo_candidate_from_url("git@github.com:owner/repo.git").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn url_bare_domain() {
+        let c = github_repo_candidate_from_url("github.com/owner/repo").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn url_single_segment_returns_slug() {
+        let c = github_repo_candidate_from_url("https://github.com/foo-bar").unwrap();
+        assert_eq!(c, GitHubRepoCandidate::Slug("foo-bar".to_string()));
+    }
+
+    #[test]
+    fn url_empty_string_returns_none() {
+        assert!(github_repo_candidate_from_url("").is_none());
+    }
+
+    #[test]
+    fn url_whitespace_only_returns_none() {
+        assert!(github_repo_candidate_from_url("   ").is_none());
+    }
+
+    #[test]
+    fn url_non_github_returns_none() {
+        assert!(github_repo_candidate_from_url("https://gitlab.com/owner/repo").is_none());
+    }
+
+    #[test]
+    fn url_with_trailing_path() {
+        let c = github_repo_candidate_from_url("https://github.com/owner/repo/tree/main").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn url_with_leading_trailing_whitespace() {
+        let c = github_repo_candidate_from_url("  https://github.com/owner/repo  ").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    // ====================================================================
+    // github_repo_guesses_from_slug
+    // ====================================================================
+
+    #[test]
+    fn slug_guess_pi_pattern() {
+        let guesses = github_repo_guesses_from_slug("owner-pi-foo");
+        assert!(
+            guesses
+                .iter()
+                .any(|r| r.owner == "owner" && r.repo == "pi-foo")
+        );
+    }
+
+    #[test]
+    fn slug_guess_simple_hyphen() {
+        let guesses = github_repo_guesses_from_slug("alice-myrepo");
+        assert!(
+            guesses
+                .iter()
+                .any(|r| r.owner == "alice" && r.repo == "myrepo")
+        );
+    }
+
+    #[test]
+    fn slug_guess_empty_returns_empty() {
+        assert!(github_repo_guesses_from_slug("").is_empty());
+    }
+
+    #[test]
+    fn slug_guess_whitespace_returns_empty() {
+        assert!(github_repo_guesses_from_slug("   ").is_empty());
+    }
+
+    #[test]
+    fn slug_guess_no_hyphen_returns_empty() {
+        assert!(github_repo_guesses_from_slug("nohyphen").is_empty());
+    }
+
+    #[test]
+    fn slug_guess_multiple_hyphens_gives_multiple_guesses() {
+        let guesses = github_repo_guesses_from_slug("a-b-c");
+        assert!(!guesses.is_empty());
+        // Should contain at least first-split ("a"/"b-c") and last-split ("a-b"/"c").
+        assert!(guesses.iter().any(|r| r.owner == "a" && r.repo == "b-c"));
+        assert!(guesses.iter().any(|r| r.owner == "a-b" && r.repo == "c"));
+    }
+
+    // ====================================================================
+    // parse_github_repo_response
+    // ====================================================================
+
+    #[test]
+    fn parse_github_repo_response_full() {
+        let json = r#"{
+            "full_name": "anthropics/claude-code",
+            "stargazers_count": 42000,
+            "forks_count": 1500,
+            "subscribers_count": 800,
+            "open_issues_count": 123,
+            "pushed_at": "2026-02-01T12:00:00Z"
+        }"#;
+        let metrics = parse_github_repo_response(json).unwrap();
+        assert_eq!(metrics.full_name, "anthropics/claude-code");
+        assert_eq!(metrics.stars, 42000);
+        assert_eq!(metrics.forks, 1500);
+        assert_eq!(metrics.watchers, Some(800));
+        assert_eq!(metrics.open_issues, 123);
+        assert_eq!(metrics.pushed_at, Some("2026-02-01T12:00:00Z".to_string()));
+    }
+
+    #[test]
+    fn parse_github_repo_response_missing_optional_fields() {
+        let json = r#"{
+            "full_name": "owner/repo",
+            "stargazers_count": 10,
+            "forks_count": 2,
+            "open_issues_count": 0
+        }"#;
+        let metrics = parse_github_repo_response(json).unwrap();
+        assert_eq!(metrics.stars, 10);
+        assert_eq!(metrics.watchers, None);
+        assert_eq!(metrics.pushed_at, None);
+    }
+
+    #[test]
+    fn parse_github_repo_response_invalid_json() {
+        assert!(parse_github_repo_response("{broken}").is_err());
+    }
+
+    // ====================================================================
+    // parse_npm_downloads_response
+    // ====================================================================
+
+    #[test]
+    fn parse_npm_downloads_response_with_count() {
+        let json = r#"{"downloads": 50000}"#;
+        assert_eq!(parse_npm_downloads_response(json).unwrap(), Some(50000));
+    }
+
+    #[test]
+    fn parse_npm_downloads_response_with_error() {
+        let json = r#"{"error": "package not found"}"#;
+        assert_eq!(parse_npm_downloads_response(json).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_npm_downloads_response_null_downloads() {
+        let json = r#"{"downloads": null}"#;
+        assert_eq!(parse_npm_downloads_response(json).unwrap(), None);
+    }
+
+    #[test]
+    fn parse_npm_downloads_response_zero() {
+        let json = r#"{"downloads": 0}"#;
+        assert_eq!(parse_npm_downloads_response(json).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn parse_npm_downloads_response_invalid_json() {
+        assert!(parse_npm_downloads_response("{bad").is_err());
+    }
+
+    // ====================================================================
+    // parse_npm_registry_response
+    // ====================================================================
+
+    #[test]
+    fn parse_npm_registry_response_full() {
+        let json = r#"{
+            "dist-tags": {"latest": "3.2.1"},
+            "time": {"3.2.1": "2026-01-15T10:00:00Z"},
+            "repository": {"type": "git", "url": "https://github.com/owner/repo.git"}
+        }"#;
+        let meta = parse_npm_registry_response(json).unwrap();
+        assert_eq!(meta.latest_version, Some("3.2.1".to_string()));
+        assert_eq!(meta.last_publish, Some("2026-01-15T10:00:00Z".to_string()));
+        assert_eq!(
+            meta.repository_url,
+            Some("https://github.com/owner/repo.git".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_npm_registry_response_string_repository() {
+        let json = r#"{
+            "dist-tags": {"latest": "1.0.0"},
+            "time": {"1.0.0": "2026-01-01T00:00:00Z"},
+            "repository": "https://github.com/owner/repo"
+        }"#;
+        let meta = parse_npm_registry_response(json).unwrap();
+        assert_eq!(
+            meta.repository_url,
+            Some("https://github.com/owner/repo".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_npm_registry_response_no_dist_tags() {
+        let json = r#"{}"#;
+        let meta = parse_npm_registry_response(json).unwrap();
+        assert_eq!(meta.latest_version, None);
+        assert_eq!(meta.last_publish, None);
+        assert_eq!(meta.repository_url, None);
+    }
+
+    #[test]
+    fn parse_npm_registry_response_invalid_json() {
+        assert!(parse_npm_registry_response("{broken").is_err());
+    }
+
+    // ====================================================================
+    // PopularityEvidence serde round-trip
+    // ====================================================================
+
+    #[test]
+    fn popularity_evidence_default_serializes_all_none() {
+        let pe = PopularityEvidence::default();
+        let json = serde_json::to_value(&pe).unwrap();
+        assert!(json["github_stars"].is_null());
+        assert!(json["npm_downloads_weekly"].is_null());
+        assert!(json["marketplace_rank"].is_null());
+    }
+
+    #[test]
+    fn popularity_evidence_round_trip() {
+        let pe = PopularityEvidence {
+            snapshot_at: Some("2026-02-06T12:00:00Z".to_string()),
+            github_stars: Some(42000),
+            github_forks: Some(1500),
+            npm_downloads_weekly: Some(100_000),
+            npm_downloads_monthly: Some(400_000),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&pe).unwrap();
+        let pe2: PopularityEvidence = serde_json::from_str(&json).unwrap();
+        assert_eq!(pe2.github_stars, Some(42000));
+        assert_eq!(pe2.npm_downloads_weekly, Some(100_000));
+        assert_eq!(pe2.github_watchers, None);
+    }
+
+    // ====================================================================
+    // CandidateSource serde (tagged enum variants)
+    // ====================================================================
+
+    #[test]
+    fn candidate_source_git_round_trip() {
+        let src = CandidateSource::Git {
+            repo: "https://github.com/owner/repo.git".to_string(),
+            path: Some("packages/core".to_string()),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains(r#""type":"git"#));
+        let deserialized: CandidateSource = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            CandidateSource::Git { repo, path } => {
+                assert_eq!(repo, "https://github.com/owner/repo.git");
+                assert_eq!(path, Some("packages/core".to_string()));
+            }
+            _ => panic!("expected Git variant"),
+        }
+    }
+
+    #[test]
+    fn candidate_source_npm_round_trip() {
+        let src = CandidateSource::Npm {
+            package: "@scope/pkg".to_string(),
+            version: "1.2.3".to_string(),
+            url: "https://registry.npmjs.org/@scope/pkg/-/pkg-1.2.3.tgz".to_string(),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains(r#""type":"npm"#));
+        let deserialized: CandidateSource = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            CandidateSource::Npm {
+                package,
+                version,
+                url,
+            } => {
+                assert_eq!(package, "@scope/pkg");
+                assert_eq!(version, "1.2.3");
+                assert!(url.contains("registry.npmjs.org"));
+            }
+            _ => panic!("expected Npm variant"),
+        }
+    }
+
+    #[test]
+    fn candidate_source_url_round_trip() {
+        let src = CandidateSource::Url {
+            url: "https://example.com/ext.tgz".to_string(),
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        assert!(json.contains(r#""type":"url"#));
+        let deserialized: CandidateSource = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            CandidateSource::Url { url } => {
+                assert_eq!(url, "https://example.com/ext.tgz");
+            }
+            _ => panic!("expected Url variant"),
+        }
+    }
+
+    #[test]
+    fn candidate_source_git_no_path() {
+        let src = CandidateSource::Git {
+            repo: "https://github.com/owner/repo".to_string(),
+            path: None,
+        };
+        let json = serde_json::to_string(&src).unwrap();
+        let deserialized: CandidateSource = serde_json::from_str(&json).unwrap();
+        match deserialized {
+            CandidateSource::Git { path, .. } => {
+                assert_eq!(path, None);
+            }
+            _ => panic!("expected Git variant"),
+        }
+    }
+
+    // ====================================================================
+    // parse_owner_repo edge cases (via public API)
+    // ====================================================================
+
+    #[test]
+    fn url_with_trailing_slash() {
+        let c = github_repo_candidate_from_url("https://github.com/owner/repo/").unwrap();
+        assert_eq!(
+            c,
+            GitHubRepoCandidate::Repo(GitHubRepoRef {
+                owner: "owner".to_string(),
+                repo: "repo".to_string()
+            })
+        );
+    }
+
+    // ====================================================================
+    // NpmDownloads / NpmRegistryMeta / GitHubRepoMetrics equality
+    // ====================================================================
+
+    #[test]
+    fn npm_downloads_equality() {
+        let a = NpmDownloads {
+            weekly: Some(100),
+            monthly: Some(400),
+        };
+        let b = NpmDownloads {
+            weekly: Some(100),
+            monthly: Some(400),
+        };
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn github_repo_metrics_equality() {
+        let a = GitHubRepoMetrics {
+            full_name: "o/r".to_string(),
+            stars: 10,
+            forks: 5,
+            watchers: None,
+            open_issues: 0,
+            pushed_at: None,
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
+    }
 }
