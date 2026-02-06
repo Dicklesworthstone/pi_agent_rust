@@ -12,6 +12,7 @@
 //! 4. If tool calls: execute tools, append results, goto 3
 //! 5. If done: return final message
 
+use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::error::{Error, Result};
 use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
@@ -1457,6 +1458,7 @@ pub struct AgentSession {
     /// down when the session ends.
     pub extensions: Option<ExtensionRegion>,
     extensions_is_streaming: Arc<AtomicBool>,
+    compaction_settings: ResolvedCompactionSettings,
 }
 
 #[derive(Debug, Default)]
@@ -1849,7 +1851,8 @@ mod extensions_integration_tests {
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -1923,7 +1926,12 @@ mod extensions_integration_tests {
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, Arc::clone(&session), false);
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2002,7 +2010,12 @@ mod extensions_integration_tests {
             let tools = ToolRegistry::new(&[], Path::new("."), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, Arc::clone(&session), false);
+            let mut agent_session = AgentSession::new(
+                agent,
+                Arc::clone(&session),
+                false,
+                ResolvedCompactionSettings::default(),
+            );
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2080,7 +2093,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2133,7 +2147,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2180,7 +2195,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2244,7 +2260,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2294,7 +2311,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2346,7 +2364,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2399,7 +2418,8 @@ mod extensions_integration_tests {
             let tools = ToolRegistry::new(&["bash"], temp_dir.path(), None);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&["bash"], temp_dir.path(), None, &[entry_path])
@@ -2471,7 +2491,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2538,7 +2559,8 @@ mod extensions_integration_tests {
             let tools = ToolRegistry::from_tools(Vec::new());
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2601,7 +2623,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2675,7 +2698,8 @@ mod extensions_integration_tests {
             })]);
             let agent = Agent::new(provider, tools, AgentConfig::default());
             let session = Arc::new(Mutex::new(Session::in_memory()));
-            let mut agent_session = AgentSession::new(agent, session, false);
+            let mut agent_session =
+                AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
             agent_session
                 .enable_extensions(&[], temp_dir.path(), None, &[entry_path])
@@ -2799,7 +2823,8 @@ mod abort_tests {
         let tools = ToolRegistry::new(&[], Path::new("."), None);
         let agent = Agent::new(provider, tools, AgentConfig::default());
         let session = Arc::new(Mutex::new(Session::in_memory()));
-        let mut agent_session = AgentSession::new(agent, session, false);
+        let mut agent_session =
+            AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
         let started_tx = Arc::clone(&started);
         let join = handle.spawn(async move {
@@ -2902,7 +2927,8 @@ mod turn_event_tests {
         let tools = ToolRegistry::new(&[], Path::new("."), None);
         let agent = Agent::new(provider, tools, AgentConfig::default());
         let session = Arc::new(Mutex::new(Session::in_memory()));
-        let mut agent_session = AgentSession::new(agent, session, false);
+        let mut agent_session =
+            AgentSession::new(agent, session, false, ResolvedCompactionSettings::default());
 
         let events: Arc<std::sync::Mutex<Vec<AgentEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2980,18 +3006,80 @@ mod turn_event_tests {
 }
 
 impl AgentSession {
-    pub fn new(agent: Agent, session: Arc<Mutex<Session>>, save_enabled: bool) -> Self {
+    pub fn new(
+        agent: Agent,
+        session: Arc<Mutex<Session>>,
+        save_enabled: bool,
+        compaction_settings: ResolvedCompactionSettings,
+    ) -> Self {
         Self {
             agent,
             session,
             save_enabled,
             extensions: None,
             extensions_is_streaming: Arc::new(AtomicBool::new(false)),
+            compaction_settings,
         }
     }
 
     pub const fn save_enabled(&self) -> bool {
         self.save_enabled
+    }
+
+    async fn maybe_compact(&self) -> Result<()> {
+        if !self.compaction_settings.enabled {
+            return Ok(());
+        }
+
+        let preparation = {
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+            let entries = session
+                .entries_for_current_path()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
+        };
+
+        if let Some(prep) = preparation {
+            let provider = self.agent.provider();
+            let api_key = self
+                .agent
+                .stream_options()
+                .api_key
+                .clone()
+                .unwrap_or_default();
+
+            // Note: We might want custom instructions from config, but for now None is fine.
+            let result = compaction::compact(prep, provider, &api_key, None).await?;
+
+            let cx = crate::agent_cx::AgentCx::for_request();
+            let mut session = self
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|e| Error::session(e.to_string()))?;
+
+            let details = compaction::compaction_details_to_value(&result.details).ok();
+
+            session.append_compaction(
+                result.summary,
+                result.first_kept_entry_id,
+                result.tokens_before,
+                details,
+                None, // from_hook
+            );
+
+            if self.save_enabled {
+                session.save().await?;
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3278,6 +3366,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.maybe_compact().await?;
         let history = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = self
@@ -3303,6 +3392,7 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
+        self.maybe_compact().await?;
         let history = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let session = self

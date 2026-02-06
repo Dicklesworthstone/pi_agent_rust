@@ -391,7 +391,7 @@ impl ThinkingLevel {
             Self::Low => 2048,
             Self::Medium => 8192,
             Self::High => 16384,
-            Self::XHigh => u32::MAX, // Model max
+            Self::XHigh => 32768, // High reasonable limit
         }
     }
 }

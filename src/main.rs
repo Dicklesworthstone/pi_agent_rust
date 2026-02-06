@@ -23,6 +23,7 @@ use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
+use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::extensions::extension_event_from_agent;
 use pi::model::{AssistantMessage, ContentBlock, StopReason};
@@ -327,10 +328,16 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
 
     let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
     let session_arc = Arc::new(Mutex::new(session));
+    let compaction_settings = ResolvedCompactionSettings {
+        enabled: config.compaction_enabled(),
+        reserve_tokens: config.compaction_reserve_tokens(),
+        keep_recent_tokens: config.compaction_keep_recent_tokens(),
+    };
     let mut agent_session = AgentSession::new(
         Agent::new(provider, tools, agent_config),
         session_arc,
         !cli.no_session,
+        compaction_settings,
     );
 
     let history = {

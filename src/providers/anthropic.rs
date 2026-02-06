@@ -103,11 +103,18 @@ impl AnthropicProvider {
             }
         });
 
+        let mut max_tokens = options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+        if let Some(t) = &thinking {
+            if max_tokens <= t.budget_tokens {
+                max_tokens = t.budget_tokens + 4096;
+            }
+        }
+
         AnthropicRequest {
             model: self.model.clone(),
             messages,
             system: context.system_prompt.clone(),
-            max_tokens: options.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS),
+            max_tokens,
             temperature: options.temperature,
             tools,
             stream: true,
