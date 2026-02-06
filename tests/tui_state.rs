@@ -1439,6 +1439,54 @@ fn tui_state_tool_end_appends_tool_output_message() {
 }
 
 #[test]
+fn tui_state_tool_update_with_diff_details_appends_diff_block() {
+    let harness = TestHarness::new("tui_state_tool_update_with_diff_details_appends_diff_block");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(edit)",
+        PiMsg::ToolStart {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(edit+diff)",
+        PiMsg::ToolUpdate {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "Successfully replaced text in foo.txt.",
+            ))],
+            details: Some(json!({
+                "diff": "+1 added line\n-1 removed line\n 1 context",
+            })),
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(edit)",
+        PiMsg::ToolEnd {
+            name: "edit".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Tool edit output:");
+    assert_after_contains(&harness, &step, "Successfully replaced text in foo.txt.");
+    assert_after_contains(&harness, &step, "Diff:");
+    assert_after_contains(&harness, &step, "+1 added line");
+    assert_after_contains(&harness, &step, "-1 removed line");
+}
+
+#[test]
 fn tui_state_expand_tools_toggles_tool_output_visibility() {
     let harness = TestHarness::new("tui_state_expand_tools_toggles_tool_output_visibility");
     let mut app = build_app(&harness, Vec::new());

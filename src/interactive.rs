@@ -687,6 +687,49 @@ impl PiApp {
             .saturating_sub(chrome + self.input.height())
     }
 
+    /// Compute the effective conversation viewport height for the current
+    /// render frame, accounting for conditional chrome (scroll indicator,
+    /// tool status, status message) that reduce available space.
+    ///
+    /// Used in [`view()`] for conversation line slicing so the total output
+    /// never exceeds `term_height` rows.  The stored
+    /// `conversation_viewport.height` still drives scroll-position management.
+    fn view_effective_conversation_height(&self) -> usize {
+        // Fixed chrome: header(2) + footer(2).
+        let mut chrome: usize = 2 + 2;
+
+        // Budget 1 row for the scroll indicator.  Slightly conservative
+        // when content is short, but prevents the off-by-one that triggers
+        // terminal scrolling.
+        chrome += 1;
+
+        // Tool status: "\n  spinner Running {tool} ...\n" = 2 rows.
+        if self.current_tool.is_some() {
+            chrome += 2;
+        }
+
+        // Status message: "\n  {status}\n" = 2 rows.
+        if self.status_message.is_some() {
+            chrome += 2;
+        }
+
+        // Input area vs processing spinner.
+        let show_input = self.agent_state == AgentState::Idle
+            && self.session_picker.is_none()
+            && self.settings_ui.is_none()
+            && self.theme_picker.is_none();
+
+        if show_input {
+            // render_input: "\n  header\n" (2 rows) + input.height() rows.
+            chrome += 2 + self.input.height();
+        } else if self.agent_state != AgentState::Idle {
+            // Processing spinner: "\n  spinner Processing...\n" = 2 rows.
+            chrome += 2;
+        }
+
+        self.term_height.saturating_sub(chrome)
+    }
+
     /// Set the input area height and recalculate the conversation viewport
     /// so the total layout fits the terminal.
     fn set_input_height(&mut self, h: usize) {
@@ -5063,22 +5106,26 @@ impl PiApp {
             conversation_content
         };
 
-        // Render conversation area (scrollable)
+        // Render conversation area (scrollable).
+        // Use the per-frame effective height so that conditional chrome
+        // (scroll indicator, tool status, status message, …) is accounted
+        // for and the total output never exceeds term_height rows.
+        let effective_vp = self.view_effective_conversation_height();
         let conversation_lines: Vec<&str> = viewport_content.lines().collect();
         let start = self
             .conversation_viewport
             .y_offset()
             .min(conversation_lines.len().saturating_sub(1));
-        let end = (start + self.conversation_viewport.height).min(conversation_lines.len());
+        let end = (start + effective_vp).min(conversation_lines.len());
         let visible_lines = conversation_lines.get(start..end).unwrap_or(&[]);
         output.push_str(&visible_lines.join("\n"));
         output.push('\n');
 
         // Scroll indicator
-        if conversation_lines.len() > self.conversation_viewport.height {
+        if conversation_lines.len() > effective_vp {
             let total = conversation_lines
                 .len()
-                .saturating_sub(self.conversation_viewport.height);
+                .saturating_sub(effective_vp);
             let percent = (start * 100).checked_div(total).map_or(100, |p| p.min(100));
             let indicator = format!("  [{percent}%] ↑/↓ PgUp/PgDn to scroll");
             output.push_str(&self.styles.muted.render(&indicator));
@@ -5145,6 +5192,9 @@ impl PiApp {
         // Footer with usage stats
         output.push_str(&self.render_footer());
 
+        // Clamp the output to `term_height` rows so the terminal never
+        // scrolls in the alternate-screen buffer.
+        let output = clamp_to_terminal_height(output, self.term_height);
         normalize_raw_terminal_newlines(output)
     }
 
@@ -9239,6 +9289,41 @@ impl PiApp {
     }
 }
 
+/// Ensure the view output fits within `term_height` terminal rows.
+///
+/// The output must contain at most `term_height - 1` newline characters so
+/// that the cursor never advances past the last visible row, which would
+/// trigger terminal scrolling in the alternate-screen buffer.
+fn clamp_to_terminal_height(mut output: String, term_height: usize) -> String {
+    if term_height == 0 {
+        output.clear();
+        return output;
+    }
+    let max_newlines = term_height.saturating_sub(1);
+
+    // Fast path: count newlines and bail if we fit.
+    let newline_count = output.as_bytes().iter().filter(|&&b| b == b'\n').count();
+    if newline_count <= max_newlines {
+        return output;
+    }
+
+    // Truncate: keep only the first `max_newlines` newlines.
+    let mut seen = 0usize;
+    let cut = output
+        .bytes()
+        .position(|b| {
+            if b == b'\n' {
+                seen += 1;
+                seen > max_newlines
+            } else {
+                false
+            }
+        })
+        .unwrap_or(output.len());
+    output.truncate(cut);
+    output
+}
+
 fn normalize_raw_terminal_newlines(input: String) -> String {
     if !input.contains('\n') {
         return input;
@@ -9282,6 +9367,48 @@ mod tests {
     fn normalize_raw_terminal_newlines_handles_mixed_newlines() {
         let normalized = normalize_raw_terminal_newlines("a\r\nb\nc\r\nd\n".to_string());
         assert_eq!(normalized, "a\r\nb\r\nc\r\nd\r\n");
+    }
+
+    #[test]
+    fn clamp_to_terminal_height_noop_when_fits() {
+        let input = "line1\nline2\nline3".to_string();
+        // 2 newlines → 3 rows; term_height=4 allows 3 newlines → fits.
+        assert_eq!(
+            clamp_to_terminal_height(input.clone(), 4),
+            input
+        );
+    }
+
+    #[test]
+    fn clamp_to_terminal_height_truncates_excess() {
+        let input = "a\nb\nc\nd\ne\n".to_string(); // 5 newlines = 6 rows
+        // term_height=4 → max 3 newlines → keeps "a\nb\nc\nd"
+        let clamped = clamp_to_terminal_height(input, 4);
+        assert_eq!(clamped, "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn clamp_to_terminal_height_zero_height() {
+        let clamped = clamp_to_terminal_height("hello\nworld".to_string(), 0);
+        assert_eq!(clamped, "");
+    }
+
+    #[test]
+    fn clamp_to_terminal_height_exact_fit() {
+        // term_height=3 → max 2 newlines.  Input has exactly 2 → fits.
+        let input = "a\nb\nc".to_string();
+        assert_eq!(
+            clamp_to_terminal_height(input.clone(), 3),
+            input
+        );
+    }
+
+    #[test]
+    fn clamp_to_terminal_height_trailing_newline() {
+        // "a\nb\n" = 2 newlines, 3 rows (last row empty).
+        // term_height=2 → max 1 newline → "a\nb"
+        let clamped = clamp_to_terminal_height("a\nb\n".to_string(), 2);
+        assert_eq!(clamped, "a\nb");
     }
 
     #[test]
