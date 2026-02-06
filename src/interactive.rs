@@ -679,6 +679,32 @@ impl PiApp {
         self.maybe_trigger_autocomplete();
     }
 
+    /// Compute the conversation viewport height based on the current input area height.
+    /// Layout budget: header (2 rows) + input decoration (2 rows) + input lines + footer (2 rows).
+    fn conversation_viewport_height(&self) -> usize {
+        let chrome = 2 + 2 + 2; // header + input_decoration + footer
+        self.term_height
+            .saturating_sub(chrome + self.input.height())
+    }
+
+    /// Set the input area height and recalculate the conversation viewport
+    /// so the total layout fits the terminal.
+    fn set_input_height(&mut self, h: usize) {
+        self.input.set_height(h);
+        self.resize_conversation_viewport();
+    }
+
+    /// Rebuild the conversation viewport after a height change (terminal resize or
+    /// input area growth). Preserves mouse-wheel settings and scroll position.
+    fn resize_conversation_viewport(&mut self) {
+        let viewport_height = self.conversation_viewport_height();
+        let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
+        viewport.mouse_wheel_enabled = true;
+        viewport.mouse_wheel_delta = 3;
+        self.conversation_viewport = viewport;
+        self.scroll_to_bottom();
+    }
+
     pub fn set_terminal_size(&mut self, width: usize, height: usize) {
         let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
         let previous_height = self.term_height;
@@ -697,13 +723,7 @@ impl PiApp {
             );
         }
 
-        let viewport_height = self.term_height.saturating_sub(9);
-        let mut viewport = Viewport::new(self.term_width.saturating_sub(2), viewport_height);
-        viewport.mouse_wheel_enabled = true;
-        viewport.mouse_wheel_delta = 3;
-        self.conversation_viewport = viewport;
-
-        self.scroll_to_bottom();
+        self.resize_conversation_viewport();
     }
 
     fn accept_autocomplete(&mut self, item: &AutocompleteItem) {
@@ -2002,15 +2022,79 @@ fn format_tool_output(
     show_images: bool,
 ) -> Option<String> {
     let mut output = tool_content_blocks_to_text(content, show_images);
-    if output.trim().is_empty() {
-        if let Some(details) = details {
+    if let Some(details) = details {
+        // `edit` includes a unified diff-like view in `details.diff`. Surface it in the TUI
+        // even when the primary content is a short "success" message.
+        if let Some(diff) = details.get("diff").and_then(Value::as_str) {
+            let diff = diff.trim();
+            if !diff.is_empty() {
+                if !output.trim().is_empty() {
+                    output.push_str("\n\n");
+                }
+                output.push_str("Diff:\n");
+                output.push_str(diff);
+            }
+        } else if output.trim().is_empty() {
             output = pretty_json(details);
         }
+    } else if output.trim().is_empty() {
+        // No primary content and no details payload.
     }
     if output.trim().is_empty() {
         None
     } else {
         Some(output)
+    }
+}
+
+fn render_tool_message(text: &str, styles: &TuiStyles) -> String {
+    let mut out = String::new();
+    let mut in_diff = false;
+
+    for (idx, line) in text.lines().enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+
+        if line.trim() == "Diff:" {
+            in_diff = true;
+            out.push_str(&styles.muted_bold.render(line));
+            continue;
+        }
+
+        if in_diff {
+            if line.starts_with('+') {
+                out.push_str(&styles.success_bold.render(line));
+                continue;
+            }
+            if line.starts_with('-') {
+                out.push_str(&styles.error_bold.render(line));
+                continue;
+            }
+        }
+
+        out.push_str(&styles.muted.render(line));
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod render_tool_message_tests {
+    use super::render_tool_message;
+    use crate::theme::Theme;
+
+    #[test]
+    fn colors_diff_only_after_header() {
+        let styles = Theme::dark().tui_styles();
+        let input = "+notdiff\nDiff:\n+added\n-removed\n 1 ctx";
+        let rendered = render_tool_message(input, &styles);
+
+        assert!(rendered.contains(&styles.muted.render("+notdiff")));
+        assert!(rendered.contains(&styles.muted_bold.render("Diff:")));
+        assert!(rendered.contains(&styles.success_bold.render("+added")));
+        assert!(rendered.contains(&styles.error_bold.render("-removed")));
+        assert!(rendered.contains(&styles.muted.render(" 1 ctx")));
     }
 }
 
@@ -2385,10 +2469,25 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
             SessionMessage::ToolResult {
                 tool_name,
                 content,
+                details,
                 is_error,
                 ..
             } => {
-                let (text, _) = assistant_content_to_text(content);
+                let (mut text, _) = assistant_content_to_text(content);
+                if let Some(diff) = details
+                    .as_ref()
+                    .and_then(|details| details.get("diff"))
+                    .and_then(Value::as_str)
+                {
+                    let diff = diff.trim();
+                    if !diff.is_empty() {
+                        if !text.trim().is_empty() {
+                            text.push_str("\n\n");
+                        }
+                        text.push_str("Diff:\n");
+                        text.push_str(diff);
+                    }
+                }
                 let prefix = if *is_error {
                     "Tool error"
                 } else {
@@ -4398,9 +4497,10 @@ impl PiApp {
 
         let spinner = SpinnerModel::with_spinner(spinners::dot()).style(styles.accent.clone());
 
-        // Configure viewport for conversation history
-        // Reserve space for header (2), input (5), footer (2)
-        let viewport_height = term_height.saturating_sub(9);
+        // Configure viewport for conversation history.
+        // Height budget: header(2) + input_decoration(2) + input_lines + footer(2).
+        let chrome = 2 + 2 + 2; // header + input_decoration + footer
+        let viewport_height = term_height.saturating_sub(chrome + input.height());
         let mut conversation_viewport =
             Viewport::new(term_width.saturating_sub(2), viewport_height);
         conversation_viewport.mouse_wheel_enabled = true;
@@ -5608,7 +5708,7 @@ impl PiApp {
                 }
                 MessageRole::Tool => {
                     if self.tools_expanded {
-                        let rendered = self.styles.muted.render(&msg.content);
+                        let rendered = render_tool_message(&msg.content, &self.styles);
                         let _ = write!(output, "\n  {rendered}\n");
                     } else {
                         let header = msg.content.lines().next().unwrap_or("Tool output");
@@ -6241,7 +6341,7 @@ impl PiApp {
         // Clear input and reset to single-line mode
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
-        self.input.set_height(3);
+        self.set_input_height(3);
 
         let label = match kind {
             QueuedMessageKind::Steering => "steering",
@@ -6274,7 +6374,7 @@ impl PiApp {
         self.input.set_value(&combined);
         if combined.contains('\n') {
             self.input_mode = InputMode::MultiLine;
-            self.input.set_height(6);
+            self.set_input_height(6);
         }
         self.input.focus();
 
@@ -6319,7 +6419,7 @@ impl PiApp {
         // Clear input and reset to single-line mode
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
-        self.input.set_height(3);
+        self.set_input_height(3);
 
         // Start processing
         self.agent_state = AgentState::Processing;
@@ -6527,7 +6627,7 @@ impl PiApp {
 
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
-        self.input.set_height(3);
+        self.set_input_height(3);
 
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
@@ -6712,7 +6812,7 @@ impl PiApp {
         // Clear input and reset to single-line mode
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
-        self.input.set_height(3);
+        self.set_input_height(3);
 
         // Start processing
         self.agent_state = AgentState::Processing;
@@ -6995,7 +7095,7 @@ impl PiApp {
         // Do not store OAuth codes in history or session.
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
-        self.input.set_height(3);
+        self.set_input_height(3);
 
         self.agent_state = AgentState::Processing;
         self.scroll_to_bottom();
@@ -7378,7 +7478,7 @@ impl PiApp {
                 // When idle, Escape exits multi-line mode (but does NOT quit)
                 if key.key_type == KeyType::Esc && self.input_mode == InputMode::MultiLine {
                     self.input_mode = InputMode::SingleLine;
-                    self.input.set_height(3);
+                    self.set_input_height(3);
                     self.status_message = Some("Single-line mode".to_string());
                 }
                 // Legacy behavior: Escape when idle does nothing (no quit)
@@ -7512,7 +7612,7 @@ impl PiApp {
                 let value = self.input.value();
                 if self.input_mode == InputMode::SingleLine && value.trim().is_empty() {
                     self.input_mode = InputMode::MultiLine;
-                    self.input.set_height(6);
+                    self.set_input_height(6);
                     self.status_message = Some("Multi-line mode".to_string());
                     return None;
                 }
@@ -7524,7 +7624,7 @@ impl PiApp {
             AppAction::NewLine => {
                 self.input.insert_rune('\n');
                 self.input_mode = InputMode::MultiLine;
-                self.input.set_height(6);
+                self.set_input_height(6);
                 None
             }
 
@@ -7774,7 +7874,7 @@ impl PiApp {
                             oauth_config: ext_config,
                         });
                         self.input_mode = InputMode::SingleLine;
-                        self.input.set_height(3);
+                        self.set_input_height(3);
                         self.input.focus();
                         None
                     }
