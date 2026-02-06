@@ -2789,4 +2789,1078 @@ mod tests {
         assert!(encoded.ends_with("--"));
         assert!(encoded.contains("home-user-project"));
     }
+
+    // ======================================================================
+    // Session creation and header validation
+    // ======================================================================
+
+    #[test]
+    fn test_session_header_defaults() {
+        let header = SessionHeader::new();
+        assert_eq!(header.r#type, "session");
+        assert_eq!(header.version, Some(SESSION_VERSION));
+        assert!(!header.id.is_empty());
+        assert!(!header.timestamp.is_empty());
+        assert!(header.provider.is_none());
+        assert!(header.model_id.is_none());
+        assert!(header.thinking_level.is_none());
+        assert!(header.parent_session.is_none());
+    }
+
+    #[test]
+    fn test_session_create_produces_unique_ids() {
+        let s1 = Session::create();
+        let s2 = Session::create();
+        assert_ne!(s1.header.id, s2.header.id);
+    }
+
+    #[test]
+    fn test_in_memory_session_has_no_path() {
+        let session = Session::in_memory();
+        assert!(session.path.is_none());
+        assert!(session.leaf_id.is_none());
+        assert!(session.entries.is_empty());
+    }
+
+    #[test]
+    fn test_create_with_dir_stores_session_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        assert_eq!(session.session_dir, Some(temp.path().to_path_buf()));
+    }
+
+    // ======================================================================
+    // Message types: tool result, bash execution, custom
+    // ======================================================================
+
+    #[test]
+    fn test_append_tool_result_message() {
+        let mut session = Session::in_memory();
+        let user_id = session.append_message(make_test_message("Hello"));
+
+        let tool_msg = SessionMessage::ToolResult {
+            tool_call_id: "call_123".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("file contents"))],
+            details: None,
+            is_error: false,
+            timestamp: Some(1000),
+        };
+        let tool_id = session.append_message(tool_msg);
+
+        // Verify parent linking
+        let entry = session.get_entry(&tool_id).unwrap();
+        assert_eq!(entry.base().parent_id.as_deref(), Some(user_id.as_str()));
+
+        // Verify it converts to model message
+        let messages = session.to_messages();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[1], Message::ToolResult(tr) if tr.tool_call_id == "call_123"));
+    }
+
+    #[test]
+    fn test_append_tool_result_error() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Hello"));
+
+        let tool_msg = SessionMessage::ToolResult {
+            tool_call_id: "call_err".to_string(),
+            tool_name: "bash".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("command not found"))],
+            details: None,
+            is_error: true,
+            timestamp: Some(2000),
+        };
+        let tool_id = session.append_message(tool_msg);
+
+        let entry = session.get_entry(&tool_id).unwrap();
+        if let SessionEntry::Message(msg) = entry {
+            if let SessionMessage::ToolResult { is_error, .. } = &msg.message {
+                assert!(is_error);
+            } else {
+                panic!("expected ToolResult");
+            }
+        }
+    }
+
+    #[test]
+    fn test_append_bash_execution() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("run something"));
+
+        let bash_id = session.append_bash_execution(
+            "echo hello".to_string(),
+            "hello\n".to_string(),
+            0,
+            false,
+            false,
+            None,
+        );
+
+        let entry = session.get_entry(&bash_id).unwrap();
+        if let SessionEntry::Message(msg) = entry {
+            if let SessionMessage::BashExecution {
+                command,
+                exit_code,
+                ..
+            } = &msg.message
+            {
+                assert_eq!(command, "echo hello");
+                assert_eq!(*exit_code, 0);
+            } else {
+                panic!("expected BashExecution");
+            }
+        }
+
+        // BashExecution converts to User message for model context
+        let messages = session.to_messages();
+        assert_eq!(messages.len(), 2);
+        assert!(matches!(&messages[1], Message::User(_)));
+    }
+
+    #[test]
+    fn test_bash_execution_exclude_from_context() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("run something"));
+
+        let id = session.next_entry_id();
+        let base = EntryBase::new(session.leaf_id.clone(), id.clone());
+        let mut extra = HashMap::new();
+        extra.insert(
+            "excludeFromContext".to_string(),
+            serde_json::json!(true),
+        );
+        let entry = SessionEntry::Message(MessageEntry {
+            base,
+            message: SessionMessage::BashExecution {
+                command: "secret".to_string(),
+                output: "hidden".to_string(),
+                exit_code: 0,
+                cancelled: None,
+                truncated: None,
+                full_output_path: None,
+                timestamp: Some(0),
+                extra,
+            },
+        });
+        session.leaf_id = Some(id);
+        session.entries.push(entry);
+
+        // The excluded bash execution should not appear in model messages
+        let messages = session.to_messages();
+        assert_eq!(messages.len(), 1); // only the user message
+    }
+
+    #[test]
+    fn test_append_custom_message() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Hello"));
+
+        let custom_msg = SessionMessage::Custom {
+            custom_type: "extension_state".to_string(),
+            content: "some state".to_string(),
+            display: false,
+            details: Some(serde_json::json!({"key": "value"})),
+        };
+        let custom_id = session.append_message(custom_msg);
+
+        let entry = session.get_entry(&custom_id).unwrap();
+        if let SessionEntry::Message(msg) = entry {
+            if let SessionMessage::Custom {
+                custom_type,
+                display,
+                ..
+            } = &msg.message
+            {
+                assert_eq!(custom_type, "extension_state");
+                assert!(!display);
+            } else {
+                panic!("expected Custom");
+            }
+        }
+    }
+
+    #[test]
+    fn test_append_custom_entry() {
+        let mut session = Session::in_memory();
+        let root_id = session.append_message(make_test_message("Hello"));
+
+        let custom_id =
+            session.append_custom_entry("my_type".to_string(), Some(serde_json::json!(42)));
+
+        let entry = session.get_entry(&custom_id).unwrap();
+        if let SessionEntry::Custom(custom) = entry {
+            assert_eq!(custom.custom_type, "my_type");
+            assert_eq!(custom.data, Some(serde_json::json!(42)));
+            assert_eq!(
+                custom.base.parent_id.as_deref(),
+                Some(root_id.as_str())
+            );
+        } else {
+            panic!("expected Custom entry");
+        }
+    }
+
+    // ======================================================================
+    // Parent linking / tree structure
+    // ======================================================================
+
+    #[test]
+    fn test_parent_linking_chain() {
+        let mut session = Session::in_memory();
+
+        let id1 = session.append_message(make_test_message("A"));
+        let id2 = session.append_message(make_test_message("B"));
+        let id3 = session.append_message(make_test_message("C"));
+
+        // First entry has no parent
+        let e1 = session.get_entry(&id1).unwrap();
+        assert!(e1.base().parent_id.is_none());
+
+        // Second entry's parent is first
+        let e2 = session.get_entry(&id2).unwrap();
+        assert_eq!(e2.base().parent_id.as_deref(), Some(id1.as_str()));
+
+        // Third entry's parent is second
+        let e3 = session.get_entry(&id3).unwrap();
+        assert_eq!(e3.base().parent_id.as_deref(), Some(id2.as_str()));
+    }
+
+    #[test]
+    fn test_model_change_updates_leaf() {
+        let mut session = Session::in_memory();
+
+        let msg_id = session.append_message(make_test_message("Hello"));
+        let change_id =
+            session.append_model_change("openai".to_string(), "gpt-4".to_string());
+
+        assert_eq!(session.leaf_id.as_deref(), Some(change_id.as_str()));
+
+        let entry = session.get_entry(&change_id).unwrap();
+        assert_eq!(entry.base().parent_id.as_deref(), Some(msg_id.as_str()));
+
+        if let SessionEntry::ModelChange(mc) = entry {
+            assert_eq!(mc.provider, "openai");
+            assert_eq!(mc.model_id, "gpt-4");
+        } else {
+            panic!("expected ModelChange");
+        }
+    }
+
+    #[test]
+    fn test_thinking_level_change_updates_leaf() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Hello"));
+
+        let change_id = session.append_thinking_level_change("high".to_string());
+        assert_eq!(session.leaf_id.as_deref(), Some(change_id.as_str()));
+
+        let entry = session.get_entry(&change_id).unwrap();
+        if let SessionEntry::ThinkingLevelChange(tlc) = entry {
+            assert_eq!(tlc.thinking_level, "high");
+        } else {
+            panic!("expected ThinkingLevelChange");
+        }
+    }
+
+    // ======================================================================
+    // Session name get/set
+    // ======================================================================
+
+    #[test]
+    fn test_get_name_returns_latest() {
+        let mut session = Session::in_memory();
+
+        assert!(session.get_name().is_none());
+
+        session.set_name("first");
+        assert_eq!(session.get_name().as_deref(), Some("first"));
+
+        session.set_name("second");
+        assert_eq!(session.get_name().as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn test_set_name_returns_entry_id() {
+        let mut session = Session::in_memory();
+        let id = session.set_name("test-name");
+        assert!(!id.is_empty());
+        let entry = session.get_entry(&id).unwrap();
+        assert!(matches!(entry, SessionEntry::SessionInfo(_)));
+    }
+
+    // ======================================================================
+    // Label
+    // ======================================================================
+
+    #[test]
+    fn test_add_label_to_existing_entry() {
+        let mut session = Session::in_memory();
+        let msg_id = session.append_message(make_test_message("Hello"));
+
+        let label_id = session.add_label(&msg_id, Some("important".to_string()));
+        assert!(label_id.is_some());
+
+        let entry = session.get_entry(&label_id.unwrap()).unwrap();
+        if let SessionEntry::Label(label) = entry {
+            assert_eq!(label.target_id, msg_id);
+            assert_eq!(label.label.as_deref(), Some("important"));
+        } else {
+            panic!("expected Label entry");
+        }
+    }
+
+    #[test]
+    fn test_add_label_to_nonexistent_entry_returns_none() {
+        let mut session = Session::in_memory();
+        let result = session.add_label("nonexistent", Some("label".to_string()));
+        assert!(result.is_none());
+    }
+
+    // ======================================================================
+    // JSONL round-trip (save + reload)
+    // ======================================================================
+
+    #[test]
+    fn test_round_trip_preserves_all_message_types() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        // Append diverse message types
+        session.append_message(make_test_message("user text"));
+
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("response"))],
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            model: "claude-test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        session.append_message(SessionMessage::Assistant { message: assistant });
+
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "call_1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("result"))],
+            details: None,
+            is_error: false,
+            timestamp: Some(100),
+        });
+
+        session.append_bash_execution(
+            "ls".to_string(),
+            "files".to_string(),
+            0,
+            false,
+            false,
+            None,
+        );
+
+        session.append_custom_entry(
+            "ext_data".to_string(),
+            Some(serde_json::json!({"foo": "bar"})),
+        );
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.entries.len(), session.entries.len());
+        assert_eq!(loaded.header.id, session.header.id);
+        assert_eq!(loaded.header.version, Some(SESSION_VERSION));
+
+        // Verify specific entry types survived the round-trip
+        let has_tool_result = loaded.entries.iter().any(|e| {
+            matches!(
+                e,
+                SessionEntry::Message(m) if matches!(
+                    &m.message,
+                    SessionMessage::ToolResult { tool_name, .. } if tool_name == "read"
+                )
+            )
+        });
+        assert!(has_tool_result, "tool result should survive round-trip");
+
+        let has_bash = loaded.entries.iter().any(|e| {
+            matches!(
+                e,
+                SessionEntry::Message(m) if matches!(
+                    &m.message,
+                    SessionMessage::BashExecution { command, .. } if command == "ls"
+                )
+            )
+        });
+        assert!(has_bash, "bash execution should survive round-trip");
+
+        let has_custom = loaded.entries.iter().any(|e| {
+            matches!(
+                e,
+                SessionEntry::Custom(c) if c.custom_type == "ext_data"
+            )
+        });
+        assert!(has_custom, "custom entry should survive round-trip");
+    }
+
+    #[test]
+    fn test_round_trip_preserves_leaf_id() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        let _id1 = session.append_message(make_test_message("A"));
+        let id2 = session.append_message(make_test_message("B"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.leaf_id.as_deref(), Some(id2.as_str()));
+    }
+
+    #[test]
+    fn test_round_trip_preserves_header_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.header.provider = Some("anthropic".to_string());
+        session.header.model_id = Some("claude-opus".to_string());
+        session.header.thinking_level = Some("high".to_string());
+        session.header.parent_session = Some("/old/session.jsonl".to_string());
+
+        session.append_message(make_test_message("Hello"));
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.header.provider.as_deref(), Some("anthropic"));
+        assert_eq!(loaded.header.model_id.as_deref(), Some("claude-opus"));
+        assert_eq!(loaded.header.thinking_level.as_deref(), Some("high"));
+        assert_eq!(
+            loaded.header.parent_session.as_deref(),
+            Some("/old/session.jsonl")
+        );
+    }
+
+    #[test]
+    fn test_empty_session_save_and_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert!(loaded.entries.is_empty());
+        assert!(loaded.leaf_id.is_none());
+        assert_eq!(loaded.header.id, session.header.id);
+    }
+
+    // ======================================================================
+    // Corrupted JSONL recovery
+    // ======================================================================
+
+    #[test]
+    fn test_corrupted_middle_entry_preserves_surrounding_entries() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        let id1 = session.append_message(make_test_message("First"));
+        let _id2 = session.append_message(make_test_message("Second"));
+        let id3 = session.append_message(make_test_message("Third"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        // Corrupt the middle entry (line 3, 1-indexed: header=1, first=2, second=3)
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(lines.len() >= 4);
+        lines[2] = "GARBAGE JSON".to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let (loaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert_eq!(diagnostics.skipped_entries.len(), 1);
+        assert_eq!(diagnostics.skipped_entries[0].line_number, 3);
+
+        // First and third entries should survive
+        assert_eq!(loaded.entries.len(), 2);
+        assert!(loaded.get_entry(&id1).is_some());
+        assert!(loaded.get_entry(&id3).is_some());
+    }
+
+    #[test]
+    fn test_multiple_corrupted_entries_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        session.append_message(make_test_message("A"));
+        session.append_message(make_test_message("B"));
+        session.append_message(make_test_message("C"));
+        session.append_message(make_test_message("D"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let mut lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        // Corrupt entries B (line 3) and D (line 5)
+        lines[2] = "BAD".to_string();
+        lines[4] = "ALSO BAD".to_string();
+        std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let (loaded, diagnostics) = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        })
+        .unwrap();
+
+        assert_eq!(diagnostics.skipped_entries.len(), 2);
+        assert_eq!(loaded.entries.len(), 2); // A and C survive
+    }
+
+    #[test]
+    fn test_corrupted_header_fails_to_open() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("bad_header.jsonl");
+        std::fs::write(&path, "NOT A VALID HEADER\n{\"type\":\"message\"}\n").unwrap();
+
+        let result = run_async(async {
+            Session::open_with_diagnostics(path.to_string_lossy().as_ref()).await
+        });
+        assert!(result.is_err(), "corrupted header should cause open failure");
+    }
+
+    // ======================================================================
+    // Branching and navigation
+    // ======================================================================
+
+    #[test]
+    fn test_create_branch_from_nonexistent_returns_false() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("A"));
+        assert!(!session.create_branch_from("nonexistent"));
+    }
+
+    #[test]
+    fn test_deep_branching() {
+        let mut session = Session::in_memory();
+
+        // Create A -> B -> C
+        let id_a = session.append_message(make_test_message("A"));
+        let id_b = session.append_message(make_test_message("B"));
+        let _id_c = session.append_message(make_test_message("C"));
+
+        // Branch from A: A -> D
+        session.create_branch_from(&id_a);
+        let _id_d = session.append_message(make_test_message("D"));
+
+        // Branch from B: A -> B -> E
+        session.create_branch_from(&id_b);
+        let id_e = session.append_message(make_test_message("E"));
+
+        // Should have 3 leaves: C, D, E
+        let leaves = session.list_leaves();
+        assert_eq!(leaves.len(), 3);
+
+        // Path to E is A -> B -> E
+        let path = session.get_path_to_entry(&id_e);
+        assert_eq!(path.len(), 3);
+        assert_eq!(path[0], id_a);
+        assert_eq!(path[1], id_b);
+        assert_eq!(path[2], id_e);
+    }
+
+    #[test]
+    fn test_sibling_branches_at_fork() {
+        let mut session = Session::in_memory();
+
+        // Create A -> B -> C
+        let id_a = session.append_message(make_test_message("A"));
+        let _id_b = session.append_message(make_test_message("B"));
+        let _id_c = session.append_message(make_test_message("C"));
+
+        // Branch from A: A -> D
+        session.create_branch_from(&id_a);
+        let id_d = session.append_message(make_test_message("D"));
+
+        // Navigate to D to make it current
+        session.navigate_to(&id_d);
+
+        let siblings = session.sibling_branches();
+        assert!(siblings.is_some());
+        let (fork_point, branches) = siblings.unwrap();
+        assert!(fork_point.is_none() || fork_point.as_deref() == Some(id_a.as_str()));
+        assert_eq!(branches.len(), 2);
+
+        // One should be current, one not
+        let current_count = branches.iter().filter(|b| b.is_current).count();
+        assert_eq!(current_count, 1);
+    }
+
+    #[test]
+    fn test_sibling_branches_no_fork() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("A"));
+        session.append_message(make_test_message("B"));
+
+        // No fork points, so sibling_branches returns None
+        assert!(session.sibling_branches().is_none());
+    }
+
+    // ======================================================================
+    // Plan fork
+    // ======================================================================
+
+    #[test]
+    fn test_plan_fork_from_user_message() {
+        let mut session = Session::in_memory();
+
+        let id_a = session.append_message(make_test_message("First question"));
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("Answer"))],
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        let _id_b = session.append_message(SessionMessage::Assistant { message: assistant });
+        let id_c = session.append_message(make_test_message("Second question"));
+
+        // Fork from the second user message
+        let plan = session.plan_fork_from_user_message(&id_c).unwrap();
+        assert_eq!(plan.selected_text, "Second question");
+        // Entries should be the path up to (but not including) the forked message
+        assert_eq!(plan.entries.len(), 2); // A and B
+    }
+
+    #[test]
+    fn test_plan_fork_from_root_message() {
+        let mut session = Session::in_memory();
+        let id_a = session.append_message(make_test_message("Root question"));
+
+        let plan = session.plan_fork_from_user_message(&id_a).unwrap();
+        assert_eq!(plan.selected_text, "Root question");
+        assert!(plan.entries.is_empty()); // No entries before root
+        assert!(plan.leaf_id.is_none());
+    }
+
+    #[test]
+    fn test_plan_fork_from_nonexistent_fails() {
+        let session = Session::in_memory();
+        assert!(session.plan_fork_from_user_message("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_plan_fork_from_assistant_message_fails() {
+        let mut session = Session::in_memory();
+        session.append_message(make_test_message("Q"));
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("A"))],
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        let asst_id = session.append_message(SessionMessage::Assistant { message: assistant });
+
+        assert!(session.plan_fork_from_user_message(&asst_id).is_err());
+    }
+
+    // ======================================================================
+    // Compaction in message context
+    // ======================================================================
+
+    #[test]
+    fn test_compaction_truncates_model_context() {
+        let mut session = Session::in_memory();
+
+        let id_a = session.append_message(make_test_message("old message A"));
+        let id_b = session.append_message(make_test_message("old message B"));
+        let id_c = session.append_message(make_test_message("kept message C"));
+
+        // Compact: keep from id_c onwards
+        session.append_compaction(
+            "Summary of old messages".to_string(),
+            id_c.clone(),
+            5000,
+            None,
+            None,
+        );
+
+        let id_d = session.append_message(make_test_message("new message D"));
+
+        // Ensure we're at the right leaf
+        session.navigate_to(&id_d);
+
+        let messages = session.to_messages_for_current_path();
+        // Should have: compaction summary + kept message C + new message D
+        // (old messages A and B should be omitted)
+        assert!(messages.len() <= 4); // compaction summary + C + compaction entry + D
+
+        // Verify old messages are not in context
+        let all_text: String = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::User(u) => match &u.content {
+                    UserContent::Text(t) => Some(t.clone()),
+                    UserContent::Blocks(blocks) => {
+                        let texts: Vec<String> = blocks
+                            .iter()
+                            .filter_map(|b| {
+                                if let ContentBlock::Text(t) = b {
+                                    Some(t.text.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+                        Some(texts.join(" "))
+                    }
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        assert!(
+            !all_text.contains("old message A"),
+            "compacted message A should not appear in context"
+        );
+        assert!(
+            !all_text.contains("old message B"),
+            "compacted message B should not appear in context"
+        );
+        assert!(
+            all_text.contains("kept message C") || all_text.contains("new message D"),
+            "kept messages should appear in context"
+        );
+    }
+
+    // ======================================================================
+    // Large session handling
+    // ======================================================================
+
+    #[test]
+    fn test_large_session_append_and_path() {
+        let mut session = Session::in_memory();
+
+        let mut last_id = String::new();
+        for i in 0..500 {
+            last_id = session.append_message(make_test_message(&format!("msg-{i}")));
+        }
+
+        assert_eq!(session.entries.len(), 500);
+        assert_eq!(session.leaf_id.as_deref(), Some(last_id.as_str()));
+
+        // Path from root to leaf should include all 500 entries
+        let path = session.get_path_to_entry(&last_id);
+        assert_eq!(path.len(), 500);
+
+        // Entries for current path should also be 500
+        let current = session.entries_for_current_path();
+        assert_eq!(current.len(), 500);
+    }
+
+    #[test]
+    fn test_large_session_save_and_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        for i in 0..200 {
+            session.append_message(make_test_message(&format!("message {i}")));
+        }
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let loaded =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await }).unwrap();
+
+        assert_eq!(loaded.entries.len(), 200);
+        assert_eq!(loaded.header.id, session.header.id);
+    }
+
+    // ======================================================================
+    // Entry ID generation
+    // ======================================================================
+
+    #[test]
+    fn test_ensure_entry_ids_fills_missing() {
+        let mut entries = vec![
+            SessionEntry::Message(MessageEntry {
+                base: EntryBase {
+                    id: None,
+                    parent_id: None,
+                    timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+                },
+                message: SessionMessage::User {
+                    content: UserContent::Text("test".to_string()),
+                    timestamp: Some(0),
+                },
+            }),
+            SessionEntry::Message(MessageEntry {
+                base: EntryBase {
+                    id: Some("existing".to_string()),
+                    parent_id: None,
+                    timestamp: "2025-01-01T00:00:00.000Z".to_string(),
+                },
+                message: SessionMessage::User {
+                    content: UserContent::Text("test2".to_string()),
+                    timestamp: Some(0),
+                },
+            }),
+        ];
+
+        ensure_entry_ids(&mut entries);
+
+        // First entry should now have an ID
+        assert!(entries[0].base().id.is_some());
+        // Second entry should keep its existing ID
+        assert_eq!(entries[1].base().id.as_deref(), Some("existing"));
+        // IDs should be unique
+        assert_ne!(entries[0].base().id, entries[1].base().id);
+    }
+
+    #[test]
+    fn test_generate_entry_id_produces_8_char_hex() {
+        let existing = HashSet::new();
+        let id = generate_entry_id(&existing);
+        assert_eq!(id.len(), 8);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // ======================================================================
+    // set_model_header / set_branched_from
+    // ======================================================================
+
+    #[test]
+    fn test_set_model_header() {
+        let mut session = Session::in_memory();
+        session.set_model_header(
+            Some("anthropic".to_string()),
+            Some("claude-opus".to_string()),
+            Some("high".to_string()),
+        );
+        assert_eq!(session.header.provider.as_deref(), Some("anthropic"));
+        assert_eq!(session.header.model_id.as_deref(), Some("claude-opus"));
+        assert_eq!(session.header.thinking_level.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn test_set_branched_from() {
+        let mut session = Session::in_memory();
+        assert!(session.header.parent_session.is_none());
+
+        session.set_branched_from(Some("/path/to/parent.jsonl".to_string()));
+        assert_eq!(
+            session.header.parent_session.as_deref(),
+            Some("/path/to/parent.jsonl")
+        );
+    }
+
+    // ======================================================================
+    // to_html rendering
+    // ======================================================================
+
+    #[test]
+    fn test_to_html_contains_all_message_types() {
+        let mut session = Session::in_memory();
+
+        session.append_message(make_test_message("user question"));
+
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("assistant answer"))],
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        session.append_message(SessionMessage::Assistant { message: assistant });
+        session.append_model_change("anthropic".to_string(), "claude-test".to_string());
+        session.set_name("test-session-html");
+
+        let html = session.to_html();
+        assert!(html.contains("<!doctype html>"));
+        assert!(html.contains("user question"));
+        assert!(html.contains("assistant answer"));
+        assert!(html.contains("anthropic"));
+        assert!(html.contains("test-session-html"));
+    }
+
+    // ======================================================================
+    // to_messages conversion
+    // ======================================================================
+
+    #[test]
+    fn test_to_messages_includes_all_message_entries() {
+        let mut session = Session::in_memory();
+
+        session.append_message(make_test_message("Q1"));
+        let assistant = AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("A1"))],
+            api: "anthropic".to_string(),
+            provider: "anthropic".to_string(),
+            model: "test".to_string(),
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 0,
+        };
+        session.append_message(SessionMessage::Assistant { message: assistant });
+        session.append_message(SessionMessage::ToolResult {
+            tool_call_id: "c1".to_string(),
+            tool_name: "edit".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("edited"))],
+            details: None,
+            is_error: false,
+            timestamp: Some(0),
+        });
+
+        // Non-message entries should NOT appear in to_messages()
+        session.append_model_change("openai".to_string(), "gpt-4".to_string());
+        session.append_session_info(Some("name".to_string()));
+
+        let messages = session.to_messages();
+        assert_eq!(messages.len(), 3); // user + assistant + tool_result
+    }
+
+    // ======================================================================
+    // JSONL format validation
+    // ======================================================================
+
+    #[test]
+    fn test_jsonl_header_is_first_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        session.append_message(make_test_message("test"));
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let contents = std::fs::read_to_string(path).unwrap();
+        let first_line = contents.lines().next().unwrap();
+        let header: serde_json::Value = serde_json::from_str(first_line).unwrap();
+
+        assert_eq!(header["type"], "session");
+        assert_eq!(header["version"], SESSION_VERSION);
+        assert!(!header["id"].as_str().unwrap().is_empty());
+        assert!(!header["timestamp"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_jsonl_entries_have_camelcase_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+
+        session.append_message(make_test_message("test"));
+        session.append_model_change("provider".to_string(), "model".to_string());
+
+        run_async(async { session.save().await }).unwrap();
+        let path = session.path.clone().unwrap();
+
+        let contents = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<&str> = contents.lines().collect();
+
+        // Check message entry (line 2)
+        let msg_value: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert!(msg_value.get("parentId").is_some() || msg_value.get("id").is_some());
+
+        // Check model change entry (line 3)
+        let mc_value: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+        assert!(mc_value.get("modelId").is_some());
+    }
+
+    // ======================================================================
+    // Session open errors
+    // ======================================================================
+
+    #[test]
+    fn test_open_nonexistent_file_returns_error() {
+        let result = run_async(async {
+            Session::open("/tmp/nonexistent_session_12345.jsonl").await
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_empty_file_returns_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("empty.jsonl");
+        std::fs::write(&path, "").unwrap();
+
+        let result =
+            run_async(async { Session::open(path.to_string_lossy().as_ref()).await });
+        assert!(result.is_err());
+    }
+
+    // ======================================================================
+    // get_entry / get_entry_mut
+    // ======================================================================
+
+    #[test]
+    fn test_get_entry_returns_correct_entry() {
+        let mut session = Session::in_memory();
+        let id = session.append_message(make_test_message("Hello"));
+
+        let entry = session.get_entry(&id);
+        assert!(entry.is_some());
+        assert_eq!(entry.unwrap().base().id.as_deref(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn test_get_entry_mut_allows_modification() {
+        let mut session = Session::in_memory();
+        let id = session.append_message(make_test_message("Original"));
+
+        let entry = session.get_entry_mut(&id).unwrap();
+        if let SessionEntry::Message(msg) = entry {
+            msg.message = SessionMessage::User {
+                content: UserContent::Text("Modified".to_string()),
+                timestamp: Some(0),
+            };
+        }
+
+        // Verify modification persisted
+        let entry = session.get_entry(&id).unwrap();
+        if let SessionEntry::Message(msg) = entry {
+            if let SessionMessage::User { content, .. } = &msg.message {
+                assert_eq!(content, &UserContent::Text("Modified".to_string()));
+            } else {
+                panic!("expected user message");
+            }
+        }
+    }
+
+    #[test]
+    fn test_get_entry_nonexistent_returns_none() {
+        let session = Session::in_memory();
+        assert!(session.get_entry("nonexistent").is_none());
+    }
 }
