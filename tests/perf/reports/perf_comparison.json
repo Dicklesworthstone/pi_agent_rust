@@ -1,6 +1,6 @@
 {
   "schema": "pi.ext.perf_comparison.v1",
-  "generated_at": "2026-02-01T01:09:56Z",
+  "generated_at": "2026-02-01T01:12:42Z",
   "summary": {
     "faster_count": 0,
     "slower_count": 6,
@@ -101,7 +101,7 @@
     {
       "category": "Stress",
       "metric": "30s sustained load (15 exts, 50 evt/s)",
-      "rust_value": "1313 events, 0 errors",
+      "rust_value": "1378 events, 0 errors",
       "legacy_value": "N/A",
       "delta": "-",
       "delta_pct": "-",
@@ -110,7 +110,7 @@
     {
       "category": "Stress",
       "metric": "RSS growth under load",
-      "rust_value": "0.00%",
+      "rust_value": "0.65%",
       "legacy_value": "N/A",
       "delta": "-",
       "delta_pct": "-",
@@ -119,7 +119,7 @@
     {
       "category": "Stress",
       "metric": "Dispatch p50 latency",
-      "rust_value": "16689us",
+      "rust_value": "16362us",
       "legacy_value": "N/A",
       "delta": "-",
       "delta_pct": "-",
@@ -128,7 +128,7 @@
     {
       "category": "Stress",
       "metric": "Dispatch p99 latency",
-      "rust_value": "31272us",
+      "rust_value": "24161us",
       "legacy_value": "N/A",
       "delta": "-",
       "delta_pct": "-",

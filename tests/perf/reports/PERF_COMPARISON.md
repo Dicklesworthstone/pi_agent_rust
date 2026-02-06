@@ -1,6 +1,6 @@
 # Extension Performance Comparison: Rust vs Legacy
 
-> Generated: 2026-02-01T01:09:56Z
+> Generated: 2026-02-01T01:12:42Z
 
 ## Executive Summary
 
@@ -25,10 +25,10 @@
 | Event Hook | legacy event calls/sec | N/A (see tool call) | 582092 | - | - | INFO |
 | E2E Process | 200 iters x 1 tool (hyperfine median) | 16.8ms | N/A | - | - | INFO |
 | E2E Process | 200 iters x 10 tools (hyperfine median) | 94.8ms | N/A | - | - | INFO |
-| Stress | 30s sustained load (15 exts, 50 evt/s) | 1313 events, 0 errors | N/A | - | - | PASS |
-| Stress | RSS growth under load | 0.00% | N/A | - | - | PASS |
-| Stress | Dispatch p50 latency | 16689us | N/A | - | - | INFO |
-| Stress | Dispatch p99 latency | 31272us | N/A | - | - | PASS |
+| Stress | 30s sustained load (15 exts, 50 evt/s) | 1378 events, 0 errors | N/A | - | - | PASS |
+| Stress | RSS growth under load | 0.65% | N/A | - | - | PASS |
+| Stress | Dispatch p50 latency | 16362us | N/A | - | - | INFO |
+| Stress | Dispatch p99 latency | 24161us | N/A | - | - | PASS |
 
 ## Regression Analysis
 
