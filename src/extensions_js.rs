@@ -167,6 +167,74 @@ impl QuickJsRuntime {
 }
 
 // ============================================================================
+// Environment variable filtering (bd-1av0.9)
+// ============================================================================
+
+/// Determine whether an environment variable is safe to expose to extensions.
+///
+/// Uses a blocklist approach: most vars are allowed, but known sensitive
+/// patterns (API keys, secrets, tokens, passwords, credentials) are blocked.
+pub fn is_env_var_allowed(key: &str) -> bool {
+    const BLOCKED_EXACT: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "GOOGLE_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+        "COHERE_API_KEY",
+        "GROQ_API_KEY",
+        "DEEPINFRA_API_KEY",
+        "CEREBRAS_API_KEY",
+        "OPENROUTER_API_KEY",
+        "MISTRAL_API_KEY",
+        "MOONSHOT_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "DEEPSEEK_API_KEY",
+        "FIREWORKS_API_KEY",
+        "TOGETHER_API_KEY",
+        "PERPLEXITY_API_KEY",
+        "XAI_API_KEY",
+        "DATABASE_URL",
+        "REDIS_URL",
+        "MONGODB_URI",
+        "PRIVATE_KEY",
+        "CARGO_REGISTRY_TOKEN",
+        "NPM_TOKEN",
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+    ];
+    const BLOCKED_SUFFIXES: &[&str] = &[
+        "_SECRET",
+        "_SECRET_KEY",
+        "_ACCESS_KEY",
+        "_PRIVATE_KEY",
+        "_PASSWORD",
+        "_PASSWD",
+        "_CREDENTIAL",
+        "_CREDENTIALS",
+    ];
+    const BLOCKED_PREFIXES: &[&str] = &["AWS_SECRET_", "AWS_SESSION_"];
+
+    if key.starts_with("PI_") {
+        return true;
+    }
+    if BLOCKED_EXACT.contains(&key) {
+        return false;
+    }
+    let upper = key.to_ascii_uppercase();
+    for suffix in BLOCKED_SUFFIXES {
+        if upper.ends_with(suffix) {
+            return false;
+        }
+    }
+    for prefix in BLOCKED_PREFIXES {
+        if upper.starts_with(prefix) {
+            return false;
+        }
+    }
+    true
+}
+
+// ============================================================================
 // Promise Bridge Types (bd-2ke)
 // ============================================================================
 
@@ -3764,43 +3832,7 @@ export default { inspect, promisify };
 
     modules.insert(
         "node:crypto".to_string(),
-        r#"
-export function randomUUID() {
-  // Not cryptographically secure; sufficient for deterministic tests.
-  const r = Math.random().toString(16).slice(2);
-  return `00000000-0000-4000-8000-${r.padEnd(12, "0").slice(0, 12)}`;
-}
-
-// Simple hash implementation (NOT cryptographically secure - for testing only)
-export function createHash(algorithm) {
-  let data = '';
-  return {
-    update(input) {
-      data += String(input ?? '');
-      return this;
-    },
-    digest(encoding) {
-      // Simple non-crypto hash using djb2 algorithm
-      let hash = 5381;
-      for (let i = 0; i < data.length; i++) {
-        hash = ((hash << 5) + hash) + data.charCodeAt(i);
-        hash = hash >>> 0; // Convert to unsigned 32-bit
-      }
-      // Convert to hex string
-      const hex = hash.toString(16).padStart(8, '0');
-      // Repeat to approximate SHA-1/SHA-256 length
-      if (encoding === 'hex') {
-        return (hex + hex + hex + hex + hex).slice(0, algorithm === 'sha256' ? 64 : 40);
-      }
-      return hex;
-    },
-  };
-}
-
-export default { randomUUID, createHash };
-"#
-        .trim()
-        .to_string(),
+        crate::crypto_shim::NODE_CRYPTO_JS.trim().to_string(),
     );
 
     modules.insert(
@@ -4196,12 +4228,16 @@ const p = globalThis.process || {};
 export const env = p.env || {};
 export const argv = p.argv || [];
 export const cwd = typeof p.cwd === 'function' ? p.cwd : () => '/';
+export const chdir = typeof p.chdir === 'function' ? p.chdir : () => { throw new Error('ENOSYS'); };
 export const platform = p.platform || 'linux';
 export const arch = p.arch || 'x64';
 export const version = p.version || 'v20.0.0';
 export const versions = p.versions || {};
 export const pid = p.pid || 1;
 export const ppid = p.ppid || 0;
+export const title = p.title || 'pi';
+export const execPath = p.execPath || '/usr/bin/pi';
+export const execArgv = p.execArgv || [];
 export const stdout = p.stdout || { write() {} };
 export const stderr = p.stderr || { write() {} };
 export const stdin = p.stdin || {};
@@ -4209,8 +4245,19 @@ export const nextTick = p.nextTick || ((fn, ...a) => Promise.resolve().then(() =
 export const hrtime = p.hrtime || Object.assign(() => [0, 0], { bigint: () => BigInt(0) });
 export const exit = p.exit || (() => {});
 export const kill = p.kill || (() => {});
-export const on = p.on || (() => {});
-export const off = p.off || (() => {});
+export const on = p.on || (() => p);
+export const off = p.off || (() => p);
+export const once = p.once || (() => p);
+export const addListener = p.addListener || (() => p);
+export const removeListener = p.removeListener || (() => p);
+export const removeAllListeners = p.removeAllListeners || (() => p);
+export const listeners = p.listeners || (() => []);
+export const emit = p.emit || (() => false);
+export const emitWarning = p.emitWarning || (() => {});
+export const uptime = p.uptime || (() => 0);
+export const memoryUsage = p.memoryUsage || (() => ({ rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0 }));
+export const cpuUsage = p.cpuUsage || (() => ({ user: 0, system: 0 }));
+export const release = p.release || { name: 'node' };
 export default p;
 "
         .trim()
@@ -4287,7 +4334,24 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
     /// Create a new PiJS runtime with a custom clock and runtime config.
     #[allow(clippy::future_not_send)]
-    pub async fn with_clock_and_config(clock: C, config: PiJsRuntimeConfig) -> Result<Self> {
+    pub async fn with_clock_and_config(clock: C, mut config: PiJsRuntimeConfig) -> Result<Self> {
+        // Inject target architecture so JS process.arch can read it
+        #[cfg(target_arch = "x86_64")]
+        config
+            .env
+            .entry("PI_TARGET_ARCH".to_string())
+            .or_insert_with(|| "x64".to_string());
+        #[cfg(target_arch = "aarch64")]
+        config
+            .env
+            .entry("PI_TARGET_ARCH".to_string())
+            .or_insert_with(|| "arm64".to_string());
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        config
+            .env
+            .entry("PI_TARGET_ARCH".to_string())
+            .or_insert_with(|| "x64".to_string());
+
         let runtime = AsyncRuntime::new().map_err(|err| map_js_error(&err))?;
         if let Some(limit) = config.limits.memory_limit_bytes {
             runtime.set_memory_limit(limit).await;
@@ -5131,16 +5195,53 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     }),
                 )?;
 
+                // __pi_process_exit_native(code) -> enqueues exit hostcall
+                global.set(
+                    "__pi_process_exit_native",
+                    Func::from({
+                        let queue = hostcall_queue.clone();
+                        let tracker = hostcall_tracker.clone();
+                        move |_ctx: Ctx<'_>, code: i32| -> rquickjs::Result<()> {
+                            tracing::info!(
+                                event = "pijs.process.exit",
+                                code,
+                                "process.exit requested"
+                            );
+                            let call_id = format!("call-{}", generate_call_id());
+                            tracker.borrow_mut().register(call_id.clone(), None);
+                            let request = HostcallRequest {
+                                call_id,
+                                kind: HostcallKind::Events {
+                                    op: "exit".to_string(),
+                                },
+                                payload: serde_json::json!({ "code": code }),
+                                trace_id: 0,
+                                extension_id: None,
+                            };
+                            queue.borrow_mut().push_back(request);
+                            Ok(())
+                        }
+                    }),
+                )?;
+
+                // __pi_process_execpath_native() -> string
+                global.set(
+                    "__pi_process_execpath_native",
+                    Func::from(move |_ctx: Ctx<'_>| -> rquickjs::Result<String> {
+                        Ok(std::env::current_exe().map_or_else(
+                            |_| "/usr/bin/pi".to_string(),
+                            |p| p.to_string_lossy().into_owned(),
+                        ))
+                    }),
+                )?;
+
                 // __pi_env_get_native(key) -> string | null
                 global.set(
                     "__pi_env_get_native",
                     Func::from({
                         let env = env.clone();
                         move |_ctx: Ctx<'_>, key: String| -> rquickjs::Result<Option<String>> {
-                            let allowed = key == "HOME"
-                                || key == "OSTYPE"
-                                || key == "OS"
-                                || key.starts_with("PI_");
+                            let allowed = is_env_var_allowed(&key);
                             tracing::debug!(
                                 event = "pijs.env.get",
                                 key = %key,
@@ -5394,6 +5495,9 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         }
                     }),
                 )?;
+
+                // Register crypto hostcalls for node:crypto module
+                crate::crypto_shim::register_crypto_hostcalls(&global)?;
 
                 // Install the JS bridge that creates Promises and wraps the native functions
                 match ctx.eval::<(), _>(PI_BRIDGE_JS) {
@@ -7648,8 +7752,12 @@ if (typeof globalThis.process === 'undefined') {
                 const value = __pi_env_get_native(prop);
                 return value === null || value === undefined ? undefined : value;
             },
-            set(_target, prop, value) {
-                // Read-only in PiJS
+            set(_target, prop, _value) {
+                // Read-only in PiJS — silently ignore writes
+                return typeof prop === 'string';
+            },
+            deleteProperty(_target, prop) {
+                // Read-only — silently ignore deletes
                 return typeof prop === 'string';
             },
             has(_target, prop) {
@@ -7658,27 +7766,88 @@ if (typeof globalThis.process === 'undefined') {
                 const value = __pi_env_get_native(prop);
                 return value !== null && value !== undefined;
             },
+            ownKeys() {
+                // Cannot enumerate real env — return empty
+                return [];
+            },
+            getOwnPropertyDescriptor(_target, prop) {
+                if (typeof prop !== 'string') return undefined;
+                const value = __pi_env_get_native(prop);
+                if (value === null || value === undefined) return undefined;
+                return { value, writable: false, enumerable: true, configurable: true };
+            },
         },
     );
 
-    const noop = () => {};
-    const noopWrite = { write: noop, end: noop, on: noop, once: noop, pipe: noop };
+    // stdout/stderr that route through console output
+    function makeWritable(level) {
+        return {
+            write(chunk) {
+                if (typeof __pi_console_output_native === 'function') {
+                    __pi_console_output_native(level, String(chunk));
+                }
+                return true;
+            },
+            end() { return this; },
+            on() { return this; },
+            once() { return this; },
+            pipe() { return this; },
+            isTTY: false,
+        };
+    }
+
+    // Event listener registry
+    const __evtMap = Object.create(null);
+    function __on(event, fn) {
+        if (!__evtMap[event]) __evtMap[event] = [];
+        __evtMap[event].push(fn);
+        return globalThis.process;
+    }
+    function __off(event, fn) {
+        const arr = __evtMap[event];
+        if (!arr) return globalThis.process;
+        const idx = arr.indexOf(fn);
+        if (idx >= 0) arr.splice(idx, 1);
+        return globalThis.process;
+    }
+
+    const startMs = (typeof __pi_now_ms_native === 'function') ? __pi_now_ms_native() : 0;
+
     globalThis.process = {
         env: envProxy,
         argv: __pi_process_args_native(),
         cwd: () => detCwd || __pi_process_cwd_native(),
         platform: String(platform).split('-')[0],
-        arch: 'x64',
+        arch: __pi_env_get_native('PI_TARGET_ARCH') || 'x64',
         version: 'v20.0.0',
         versions: { node: '20.0.0', v8: '0.0.0', modules: '0' },
         pid: 1,
         ppid: 0,
-        stdout: noopWrite,
-        stderr: noopWrite,
-        stdin: { on: noop, once: noop, read: noop, resume: noop, pause: noop },
+        title: 'pi',
+        execPath: (typeof __pi_process_execpath_native === 'function')
+            ? __pi_process_execpath_native()
+            : '/usr/bin/pi',
+        execArgv: [],
+        stdout: makeWritable('log'),
+        stderr: makeWritable('error'),
+        stdin: { on() { return this; }, once() { return this; }, read() {}, resume() { return this; }, pause() { return this; } },
         nextTick: (fn, ...args) => { Promise.resolve().then(() => fn(...args)); },
-        hrtime: Object.assign((_prev) => [0, 0], {
-            bigint: () => BigInt(0),
+        hrtime: Object.assign((prev) => {
+            const nowMs = (typeof __pi_now_ms_native === 'function') ? __pi_now_ms_native() : 0;
+            const secs = Math.floor(nowMs / 1000);
+            const nanos = Math.floor((nowMs % 1000) * 1e6);
+            if (Array.isArray(prev) && prev.length >= 2) {
+                let ds = secs - prev[0];
+                let dn = nanos - prev[1];
+                if (dn < 0) { ds -= 1; dn += 1e9; }
+                return [ds, dn];
+            }
+            return [secs, nanos];
+        }, {
+            bigint: () => {
+                const nowMs = (typeof __pi_now_ms_native === 'function') ? __pi_now_ms_native() : 0;
+                return BigInt(Math.floor(nowMs * 1e6));
+            },
         }),
         kill: (pid, sig) => {
             const impl = globalThis.__pi_process_kill_impl;
@@ -7689,18 +7858,79 @@ if (typeof globalThis.process === 'undefined') {
             err.code = 'ENOSYS';
             throw err;
         },
-        exit: (_code) => {
-            throw new Error('process.exit is not available in PiJS');
+        exit: (code) => {
+            const exitCode = code === undefined ? 0 : Number(code);
+            // Fire exit listeners
+            const listeners = __evtMap['exit'];
+            if (listeners) {
+                for (const fn of listeners.slice()) {
+                    try { fn(exitCode); } catch (_) {}
+                }
+            }
+            // Signal native side
+            if (typeof __pi_process_exit_native === 'function') {
+                __pi_process_exit_native(exitCode);
+            }
+            const err = new Error('process.exit(' + exitCode + ')');
+            err.code = 'ERR_PROCESS_EXIT';
+            err.exitCode = exitCode;
+            throw err;
         },
-        on: noop,
-        off: noop,
-        once: noop,
-        removeListener: noop,
+        chdir: (_dir) => {
+            const err = new Error('process.chdir is not supported in PiJS');
+            err.code = 'ENOSYS';
+            throw err;
+        },
+        uptime: () => {
+            const nowMs = (typeof __pi_now_ms_native === 'function') ? __pi_now_ms_native() : 0;
+            return Math.floor((nowMs - startMs) / 1000);
+        },
+        memoryUsage: () => ({
+            rss: 0, heapTotal: 0, heapUsed: 0, external: 0, arrayBuffers: 0,
+        }),
+        cpuUsage: (_prev) => ({ user: 0, system: 0 }),
+        emitWarning: (msg) => {
+            if (typeof __pi_console_output_native === 'function') {
+                __pi_console_output_native('warn', 'Warning: ' + msg);
+            }
+        },
+        release: { name: 'node', lts: 'PiJS' },
+        config: { variables: {} },
+        features: {},
+        on: __on,
+        addListener: __on,
+        off: __off,
+        removeListener: __off,
+        once(event, fn) {
+            const wrapped = (...args) => {
+                __off(event, wrapped);
+                fn(...args);
+            };
+            wrapped._original = fn;
+            __on(event, wrapped);
+            return globalThis.process;
+        },
+        removeAllListeners(event) {
+            if (event) { delete __evtMap[event]; }
+            else { for (const k in __evtMap) delete __evtMap[k]; }
+            return globalThis.process;
+        },
+        listeners(event) {
+            return (__evtMap[event] || []).slice();
+        },
+        emit(event, ...args) {
+            const listeners = __evtMap[event];
+            if (!listeners || listeners.length === 0) return false;
+            for (const fn of listeners.slice()) {
+                try { fn(...args); } catch (_) {}
+            }
+            return true;
+        },
     };
 
     try { Object.freeze(envProxy); } catch (_) {}
     try { Object.freeze(globalThis.process.argv); } catch (_) {}
-    try { Object.freeze(globalThis.process); } catch (_) {}
+    // Do NOT freeze globalThis.process — extensions may need to monkey-patch it
 }
 
 if (typeof globalThis.setTimeout !== 'function') {
