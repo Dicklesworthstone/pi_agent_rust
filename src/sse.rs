@@ -88,7 +88,7 @@ impl SseParser {
         let mut buffer = std::mem::take(&mut self.buffer);
         let mut start = 0usize;
         // Use memchr for ~4x faster newline scanning vs str::find.
-        while let Some(rel_newline) = memchr::memchr(b'\n', buffer[start..].as_bytes()) {
+        while let Some(rel_newline) = memchr::memchr(b'\n', &buffer.as_bytes()[start..]) {
             let newline_pos = start + rel_newline;
             let mut line = &buffer[start..newline_pos];
             if let Some(stripped) = line.strip_suffix('\r') {
@@ -207,10 +207,9 @@ where
                     // Feed valid portion to the parser.
                     if valid_len > 0 {
                         // Convert to owned String to avoid borrow conflict with self.parser.
-                        let valid_str =
-                            std::str::from_utf8(&self.utf8_buffer[..valid_len])
-                                .unwrap()
-                                .to_string();
+                        let valid_str = std::str::from_utf8(&self.utf8_buffer[..valid_len])
+                            .unwrap()
+                            .to_string();
                         let events = self.parser.feed(&valid_str);
                         if !events.is_empty() {
                             self.pending_events = events.into_iter().collect();

@@ -802,13 +802,13 @@ fn conformance_full_report() {
 
 /// Generate a conformance test for a single extension.
 macro_rules! conformance_test {
-    ($name:ident, $ext_id:literal) => {
+    ($name:ident, $ext_id:literal $(,)?) => {
         #[test]
         fn $name() {
             run_conformance_test($ext_id);
         }
     };
-    ($name:ident, $ext_id:literal, ignore) => {
+    ($name:ident, $ext_id:literal, ignore $(,)?) => {
         #[test]
         #[ignore = "TODO: enable once full extension conformance runner is supported"]
         fn $name() {
