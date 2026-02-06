@@ -1,6 +1,6 @@
 ## Stratified Extension Sampling Matrix
 
-This matrix uses **deterministic sampling criteria** from `docs/EXTENSION_CANDIDATES.md` (popularity rubric + compatibility status), plus the raw candidate pool and coverage tags, to select a target sample size of **16** (min **12**, max **20**). It defines **axes + quotas** and maps **every candidate** to the axes so selection can be mechanical and reproducible.
+This matrix uses **deterministic sampling criteria** from `docs/EXTENSION_CANDIDATES.md` (popularity rubric + compatibility status), plus the raw candidate pool (`docs/extension-candidate-pool.json`) and coverage tags, to select a target sample size of **16** (min **12**, max **20**). It defines **axes + quotas** and maps **every candidate** to the axes so selection can be mechanical and reproducible.
 
 > **Note:** Tags below are **inferred** from README/descriptions. A static scan should validate and adjust before final selection.
 

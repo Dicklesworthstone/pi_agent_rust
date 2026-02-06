@@ -1,0 +1,5019 @@
+{
+  "$schema": "pi.ext.candidate_pool.v1",
+  "generated_at": "2026-02-06T12:12:26.732773Z",
+  "source_inputs": {
+    "artifact_provenance": "docs/extension-artifact-provenance.json",
+    "artifact_root": "tests/ext_conformance/artifacts",
+    "extra_npm_packages": [
+      "pi-mcp-adapter",
+      "pi-interactive-shell",
+      "pi-powerline-footer",
+      "pi-acp",
+      "pi-package-test",
+      "shitty-extensions",
+      "pi-extensions",
+      "@verioussmith/pi-openrouter",
+      "agentsbox",
+      "mitsupi"
+    ]
+  },
+  "total_candidates": 215,
+  "items": [
+    {
+      "id": "agents-mikeastock/extensions",
+      "name": "extensions",
+      "source_tier": "agents-mikeastock",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/agents-mikeastock/extensions",
+      "checksum": {
+        "sha256": "95d149ee9ac44275829f5390d30821ae1cbfc81221b89a49eb3566d6b36328ce"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/mikeastock/agents"
+      },
+      "repository_url": "https://github.com/mikeastock/agents",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "antigravity-image-gen",
+      "name": "antigravity-image-gen",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/antigravity-image-gen",
+      "checksum": {
+        "sha256": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/antigravity-image-gen.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "name": "auto-commit-on-exit",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/auto-commit-on-exit",
+      "checksum": {
+        "sha256": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/auto-commit-on-exit.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "bash-spawn-hook",
+      "name": "bash-spawn-hook",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/bash-spawn-hook",
+      "checksum": {
+        "sha256": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/bash-spawn-hook.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "bookmark",
+      "name": "bookmark",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/bookmark",
+      "checksum": {
+        "sha256": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/bookmark.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "claude-rules",
+      "name": "claude-rules",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/claude-rules",
+      "checksum": {
+        "sha256": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/claude-rules.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/ferologics-notify",
+      "name": "ferologics-notify",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/ferologics-notify",
+      "checksum": {
+        "sha256": "65f6df19c08c3eb5b144d9cba749c6651e3a20019d84353beb23094acfce4ae8"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/ferologics/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-clipboard",
+      "name": "hjanuschka-clipboard",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-clipboard",
+      "checksum": {
+        "sha256": "0e7cf92783f5eca3c711f74ff1bdbf2634c1b7d4ea0ceaea7370cdaa7cf14b40"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/clipboard.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-cost-tracker",
+      "name": "hjanuschka-cost-tracker",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-cost-tracker",
+      "checksum": {
+        "sha256": "0b61091eb8d2a499e416dcd06af57cf77c455e920a4731ed0440fbf31db69844"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/cost-tracker.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-flicker-corp",
+      "name": "hjanuschka-flicker-corp",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-flicker-corp",
+      "checksum": {
+        "sha256": "256cd4ccd0ee07d81033391b1be01fcf6a34bbfbd0f53a27e34ea4ffca1932c9"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/flicker-corp.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-funny-working-message",
+      "name": "hjanuschka-funny-working-message",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-funny-working-message",
+      "checksum": {
+        "sha256": "2970513c5001c51b85dfbb8474603af0e32a749363a0f70d65e9afacb517987f"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/funny-working-message.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-handoff",
+      "name": "hjanuschka-handoff",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-handoff",
+      "checksum": {
+        "sha256": "33b6c44b1dc54f96f1010db7883ce5fa0a479e2daab4cb656cceb1eb4cefa49d"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/handoff.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-loop",
+      "name": "hjanuschka-loop",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-loop",
+      "checksum": {
+        "sha256": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/loop.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-memory-mode",
+      "name": "hjanuschka-memory-mode",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-memory-mode",
+      "checksum": {
+        "sha256": "7629747c2b9ba487e87557a1590ecbf723ce7b6875e7bdd42d35b3e7c412c627"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/memory-mode.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-oracle",
+      "name": "hjanuschka-oracle",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-oracle",
+      "checksum": {
+        "sha256": "de236872074c912361fef6c818c75b361e46ff06662fb368a66cb4c1b9efb462"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/oracle.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-plan-mode",
+      "name": "hjanuschka-plan-mode",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-plan-mode",
+      "checksum": {
+        "sha256": "c4752e61346eb26d3cb040e276c4cc74e33e44e6b947f5195d6cf3a89bd3ffe5"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/plan-mode.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-resistance",
+      "name": "hjanuschka-resistance",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-resistance",
+      "checksum": {
+        "sha256": "0c1c12390befdb887dfb01a90a48c67a6370f59910952f71ddda6a2c4bb645bf"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/resistance.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-speedreading",
+      "name": "hjanuschka-speedreading",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-speedreading",
+      "checksum": {
+        "sha256": "82069bb9932d9f1615d1c2e05b55730bcfe70f2598d69db1fd894045cc0928d8"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/speedreading.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-status-widget",
+      "name": "hjanuschka-status-widget",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-status-widget",
+      "checksum": {
+        "sha256": "7b84c6ed07403380fcd7121b58886fc6998730a93e419a6597cd3834d4a1826f"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/status-widget.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-ultrathink",
+      "name": "hjanuschka-ultrathink",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-ultrathink",
+      "checksum": {
+        "sha256": "1d053f8505eb2742f8e4f5cf7c3770183c7712f5a4a674fa0031f7a042cbbe0f"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/ultrathink.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/hjanuschka-usage-bar",
+      "name": "hjanuschka-usage-bar",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/hjanuschka-usage-bar",
+      "checksum": {
+        "sha256": "27df810602025a27dbe024c31a17c68075267d992d5cf346cc62df8550a65d33"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/hjanuschka/usage-bar.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/jyaunches-canvas",
+      "name": "jyaunches-canvas",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/jyaunches-canvas",
+      "checksum": {
+        "sha256": "c3f5cabe2c97a8b27d36f3ff7c0b41f7fd5131aa18dc1ac158a1c2ac63779f99"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/jyaunches/canvas-src/api/canvas-api.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-answer",
+      "name": "mitsuhiko-answer",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-answer",
+      "checksum": {
+        "sha256": "bb88cf88385a69ecffa4457b3313ca5892acc792b789b3194647ae73cd6534bd"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/answer.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-control",
+      "name": "mitsuhiko-control",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-control",
+      "checksum": {
+        "sha256": "d62efac581309d30add9dd031bcdb70d053673fa14b5c097e6d807f6e3989515"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/control.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-cwd-history",
+      "name": "mitsuhiko-cwd-history",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-cwd-history",
+      "checksum": {
+        "sha256": "e8203f37d45976de19bbc57e859bc5b3ad36df7d2f7915d2740554192e32e977"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/cwd-history.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-files",
+      "name": "mitsuhiko-files",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-files",
+      "checksum": {
+        "sha256": "3893617b45ab5ba20a9d6c96b3c00f794679d04c456fdff2f76aa75839d034ea"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/files.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-loop",
+      "name": "mitsuhiko-loop",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-loop",
+      "checksum": {
+        "sha256": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/loop.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-notify",
+      "name": "mitsuhiko-notify",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-notify",
+      "checksum": {
+        "sha256": "f89cc98c595e61914571f97ad3201529fe2edeff87ce58630573c2d796fdb81a"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/notify.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-review",
+      "name": "mitsuhiko-review",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-review",
+      "checksum": {
+        "sha256": "5dadea5b28c0ec1ec315603ebfc09227c9911b7d5e59d1e359066b793eb68c51"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/review.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-todos",
+      "name": "mitsuhiko-todos",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-todos",
+      "checksum": {
+        "sha256": "530b690fd6f6e7d8a8db52bca6624f9fb14150b3a415a633e536b3d7c48badd5"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/todos.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-uv",
+      "name": "mitsuhiko-uv",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-uv",
+      "checksum": {
+        "sha256": "aa2baf20eddb875e8b923063384b3d86a8856cba835395f63eccc4c01db7c30a"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/uv.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/mitsuhiko-whimsical",
+      "name": "mitsuhiko-whimsical",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/mitsuhiko-whimsical",
+      "checksum": {
+        "sha256": "4004c97adeab517b59b7bbca27b0514238431d8235bba558018958c5e8dd8446"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/mitsuhiko/whimsical.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/nicobailon-interactive-shell",
+      "name": "nicobailon-interactive-shell",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/nicobailon-interactive-shell",
+      "checksum": {
+        "sha256": "d25b11404f70137e0dd662f146499c875ae3f15691e803d7993678723f134a31"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/nicobailon/config.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/nicobailon-interview-tool",
+      "name": "nicobailon-interview-tool",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/nicobailon-interview-tool",
+      "checksum": {
+        "sha256": "c3589f0daacbf63f54da18e4483efc8d93d98e5ed65fd9f5fd1c6a27db5a53cc"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/nicobailon/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/nicobailon-mcp-adapter",
+      "name": "nicobailon-mcp-adapter",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/nicobailon-mcp-adapter",
+      "checksum": {
+        "sha256": "8f627dce605f88e84ee1d3b254a8942be358d1ef64f9f0724e7ef42f59313fac"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/nicobailon/config.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/nicobailon-powerline-footer",
+      "name": "nicobailon-powerline-footer",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/nicobailon-powerline-footer",
+      "checksum": {
+        "sha256": "1063f154b4ea058036bae14b60691354482b1787d8884bb91a55db9e4532ae3d"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/nicobailon/colors.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/nicobailon-rewind-hook",
+      "name": "nicobailon-rewind-hook",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/nicobailon-rewind-hook",
+      "checksum": {
+        "sha256": "b80c0f602fdfd7bcc3e9bb4ed126d8acc32a7fc87b523ecb582cfa178edbfd4d"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/nicobailon/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/nicobailon-subagents",
+      "name": "nicobailon-subagents",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/nicobailon-subagents",
+      "checksum": {
+        "sha256": "c8f3d576d60ceaf872244112551e83850f9170a52b90f96a9e3d315deb342ef1"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/nicobailon/agents.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/ogulcancelik-ghostty-theme-sync",
+      "name": "ogulcancelik-ghostty-theme-sync",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/ogulcancelik-ghostty-theme-sync",
+      "checksum": {
+        "sha256": "5d245d0f5513497527dfcbeefd77e37010ce7ffa286014a587380cc34e766aa1"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/ogulcancelik/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/prateekmedia-checkpoint",
+      "name": "prateekmedia-checkpoint",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/prateekmedia-checkpoint",
+      "checksum": {
+        "sha256": "52280b9cc462f877840223fcb2618432bfd7f11d9a37c77f4ac0f9283c8a27e9"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/prateekmedia/checkpoint-core.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/prateekmedia-lsp",
+      "name": "prateekmedia-lsp",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/prateekmedia-lsp",
+      "checksum": {
+        "sha256": "83d77cd7c3d502d3d473485537b5745716ae70a18907e97d9847896bd165433f"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/prateekmedia/lsp-core.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/prateekmedia-permission",
+      "name": "prateekmedia-permission",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/prateekmedia-permission",
+      "checksum": {
+        "sha256": "04018afed8ed0a1537ed508d49ab393480bc2f431d1d6d24a60d2929e602743b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/prateekmedia/permission-core.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/prateekmedia-ralph-loop",
+      "name": "prateekmedia-ralph-loop",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/prateekmedia-ralph-loop",
+      "checksum": {
+        "sha256": "f1bc511949b4a67978159b52d23cd875501d03fd1c6990d5f3077f5557656a22"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/prateekmedia/agents.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/prateekmedia-repeat",
+      "name": "prateekmedia-repeat",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/prateekmedia-repeat",
+      "checksum": {
+        "sha256": "3552f0c03d6ebd33ab1fbb30e60603fae643e91638c9d485a694fc39a59ceeb4"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/prateekmedia/repeat.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/prateekmedia-token-rate",
+      "name": "prateekmedia-token-rate",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/prateekmedia-token-rate",
+      "checksum": {
+        "sha256": "bb6b105f0a596d89901d438b0cdcf37c5a4cb64b29a7fa36daf28131f71bcdce"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/prateekmedia/token-rate.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/qualisero-background-notify",
+      "name": "qualisero-background-notify",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/qualisero-background-notify",
+      "checksum": {
+        "sha256": "c9ad30c099446cd31a5ae46ef1b96e12ff0cec1739af0c49cc0cb5ce990bb84b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/qualisero/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/qualisero-compact-config",
+      "name": "qualisero-compact-config",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/qualisero-compact-config",
+      "checksum": {
+        "sha256": "401cc25921bb2a2b093b12835c58db33faf2f47f0ba71290de1f230d373216af"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/qualisero/compact-config.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/qualisero-pi-agent-scip",
+      "name": "qualisero-pi-agent-scip",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/qualisero-pi-agent-scip",
+      "checksum": {
+        "sha256": "0320a754323cc480229a4ed5b931542d0c5095c3033e52f67ec0cc0be78e6d8b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/qualisero/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/qualisero-safe-git",
+      "name": "qualisero-safe-git",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/qualisero-safe-git",
+      "checksum": {
+        "sha256": "011a8bcaa77ccddcccc8dfba59cf9593242e5718401fc88592677d6623b64f26"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/qualisero/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/qualisero-safe-rm",
+      "name": "qualisero-safe-rm",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/qualisero-safe-rm",
+      "checksum": {
+        "sha256": "837283f8a309065e566e48f6eef6469a0e7792ce4f39a7cc9282a8dad080b55b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/qualisero/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/qualisero-session-color",
+      "name": "qualisero-session-color",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/qualisero-session-color",
+      "checksum": {
+        "sha256": "170ca637cfc48b380361b8a52822df80562795a040075d2dae1886b12650c903"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/qualisero/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/qualisero-session-emoji",
+      "name": "qualisero-session-emoji",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/qualisero-session-emoji",
+      "checksum": {
+        "sha256": "efbff21a7d33ee75241bb53a8e09c3f24eba6e0e8bd61cdf6090e86e4290fa9e"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/qualisero/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-agent-guidance",
+      "name": "tmustier-agent-guidance",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-agent-guidance",
+      "checksum": {
+        "sha256": "97f5c7e76e0ac94c6ca9372feb5d67e0388d3983bb2be47ba71eb35558692b6e"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/agent-guidance.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-arcade-mario-not",
+      "name": "tmustier-arcade-mario-not",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-arcade-mario-not",
+      "checksum": {
+        "sha256": "d48d9d4ea3f64f4a7e4e9a6e212de9bc8169883729017fdb59dd742bf0198081"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/mario-not.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-arcade-picman",
+      "name": "tmustier-arcade-picman",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-arcade-picman",
+      "checksum": {
+        "sha256": "d73d5f0df08b64cce2c604e0a28c2ecd19f54c98b33f1352b9a735f8eb8de888"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/picman.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-arcade-ping",
+      "name": "tmustier-arcade-ping",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-arcade-ping",
+      "checksum": {
+        "sha256": "eeb5418914342f17aac7cfdad9fd689d8923e338b670d5df2dbcdf6d2f12dd22"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/ping.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-arcade-spice-invaders",
+      "name": "tmustier-arcade-spice-invaders",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-arcade-spice-invaders",
+      "checksum": {
+        "sha256": "ea95d81378b212678560194ab1d1d1f9a646146a47faa9d8b7609eaf8410d32e"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/spice-invaders.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-arcade-tetris",
+      "name": "tmustier-arcade-tetris",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-arcade-tetris",
+      "checksum": {
+        "sha256": "27e847c070078d640d77de07911267eba54afda1157c8a990086a9bfc53caa6e"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/tetris.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-code-actions",
+      "name": "tmustier-code-actions",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-code-actions",
+      "checksum": {
+        "sha256": "d118c915f5c25ada408ce21a5ed312006a5bb5e0a198d09d2c09701833df9434"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-files-widget",
+      "name": "tmustier-files-widget",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-files-widget",
+      "checksum": {
+        "sha256": "a8c2bb0799f0e34c982312f50ca51fff3f21811fa36d42f782284481f8d7bc91"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/browser.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-ralph-wiggum",
+      "name": "tmustier-ralph-wiggum",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-ralph-wiggum",
+      "checksum": {
+        "sha256": "673fabce1f11ee1580719794b29bca3c268da876d806c8e80113fd92d849263d"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-raw-paste",
+      "name": "tmustier-raw-paste",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-raw-paste",
+      "checksum": {
+        "sha256": "a06cb9a8e4acd814816fdb1074c41ff61e5da9731c48c1071dfcaf9735e9919b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-tab-status",
+      "name": "tmustier-tab-status",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-tab-status",
+      "checksum": {
+        "sha256": "4666e65023cb9287160667a0d9b4f12c68834ed5aa3946993c6c49645c7cb2d9"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/tab-status.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "community/tmustier-usage-extension",
+      "name": "tmustier-usage-extension",
+      "source_tier": "community",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/community/tmustier-usage-extension",
+      "checksum": {
+        "sha256": "e0e3878852b677f89d3c6a477321c76d2f8955b0988d6024f905098b61d9f9ce"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/tmustier/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "confirm-destructive",
+      "name": "confirm-destructive",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/confirm-destructive",
+      "checksum": {
+        "sha256": "1ea07be2d3287b2ca19faa21bef82e578c7872255838d4257d1b86d4876135d2"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/confirm-destructive.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "custom-compaction",
+      "name": "custom-compaction",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-compaction",
+      "checksum": {
+        "sha256": "f530739cb3e6e36ea2df1e93e1da1fdaad71acc41acf042ac0877dcbfab5ded5"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-compaction.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "custom-footer",
+      "name": "custom-footer",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-footer",
+      "checksum": {
+        "sha256": "3ea51342bd093054762695a878e5c309e1491309e25f1290c09c19231c161965"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-footer.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "custom-header",
+      "name": "custom-header",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-header",
+      "checksum": {
+        "sha256": "996f53a6a6dd531c9e3ca2585f5f57fd559ec8b0b6a8c802702205bd26fe2472"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-header.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "name": "pi-extension-custom-provider-anthropic",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-provider-anthropic",
+      "checksum": {
+        "sha256": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "custom-provider-gitlab-duo",
+      "name": "pi-extension-custom-provider-gitlab-duo",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-provider-gitlab-duo",
+      "checksum": {
+        "sha256": "f4b4c1f5063b56a24ffb9f3746fc2107769ba3b4a0b1a65f7ee3e18e15684d77"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "name": "pi-extension-custom-provider-qwen-cli",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-provider-qwen-cli",
+      "checksum": {
+        "sha256": "29278eca3a44361d59e04256e57db294a0cd2fe6c612307b7b5c3139e1dc7286"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "dirty-repo-guard",
+      "name": "dirty-repo-guard",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/dirty-repo-guard",
+      "checksum": {
+        "sha256": "86b312a1ccde2a74973e340b5fa8377a7926c0232afe4ea0eb239ce93b8b6cfd"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/dirty-repo-guard.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "doom-overlay",
+      "name": "doom-overlay",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/doom-overlay",
+      "checksum": {
+        "sha256": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/doom-component.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "dynamic-resources",
+      "name": "dynamic-resources",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/dynamic-resources",
+      "checksum": {
+        "sha256": "7d9bc974bd48ecf0cd39e326b0d53815d1c17228ec14e14da63710ba79540788"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "event-bus",
+      "name": "event-bus",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/event-bus",
+      "checksum": {
+        "sha256": "869e3d574d574e68d713f9eb947b26643e800981919f1cf1f1e8097eeafa255a"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/event-bus.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "file-trigger",
+      "name": "file-trigger",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/file-trigger",
+      "checksum": {
+        "sha256": "d9623f289add349102a78ebf6a04df61a1b19cdcca9e6a8f4728138cc32a34fe"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/file-trigger.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "git-checkpoint",
+      "name": "git-checkpoint",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/git-checkpoint",
+      "checksum": {
+        "sha256": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/git-checkpoint.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "handoff",
+      "name": "handoff",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/handoff",
+      "checksum": {
+        "sha256": "c84672af255b3889d99c99fb76382520bc686a18fb26c1c04d341de0865e7fe9"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/handoff.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "hello",
+      "name": "hello",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/hello",
+      "checksum": {
+        "sha256": "6d4d5a97ada168817b9cb3808e51013969c2ce7c2c4d1536b4d630ad3f8b78f1"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/hello.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "inline-bash",
+      "name": "inline-bash",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/inline-bash",
+      "checksum": {
+        "sha256": "41caf5a75b33eface492ba382a98db3745768563da10e35c55d4ef733e5a9287"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/inline-bash.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "input-transform",
+      "name": "input-transform",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/input-transform",
+      "checksum": {
+        "sha256": "21c653ea09ff9467de4095770ba27709f41fd3540cc8087bfd7af618ce2b8050"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/input-transform.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "interactive-shell",
+      "name": "interactive-shell",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/interactive-shell",
+      "checksum": {
+        "sha256": "bb511be03dc47da3e31ae2011d3a932d3d0cdc74f8b7c535657d5cd7f699cd33"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/interactive-shell.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "mac-system-theme",
+      "name": "mac-system-theme",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/mac-system-theme",
+      "checksum": {
+        "sha256": "a9ac7ae1d161963f4c21cf8116a6ffd561f76aa7c858d9a73288745f2db99eb7"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/mac-system-theme.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "message-renderer",
+      "name": "message-renderer",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/message-renderer",
+      "checksum": {
+        "sha256": "6eda7eaade9a07ff140bbdc88e5c8b8ad414fbbb738fea13dac620c194c4ba50"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/message-renderer.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "modal-editor",
+      "name": "modal-editor",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/modal-editor",
+      "checksum": {
+        "sha256": "f875e8d3af9eb78ea88a2e274f798e7c8eae10b543e2728dde8e8fd2c7912da9"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/modal-editor.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "model-status",
+      "name": "model-status",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/model-status",
+      "checksum": {
+        "sha256": "b43a7e8bc67c988f230fc730e12f92401870b04ebb1dba7a26667baa63daec0b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/model-status.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "notify",
+      "name": "notify",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/notify",
+      "checksum": {
+        "sha256": "8979cdf28c59201375cdec7c7c704bad425918fda771ec46736e1b627f586960"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/notify.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "npm/@verioussmith/pi-openrouter",
+      "name": "@verioussmith/pi-openrouter",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "@verioussmith/pi-openrouter",
+        "version": "1.1.0",
+        "url": "https://www.npmjs.com/package/@verioussmith/pi-openrouter"
+      },
+      "repository_url": "git+https://github.com/verioussmith/pi-openrouter-extension.git",
+      "published_at": "2026-01-30T08:02:46.045Z",
+      "version": "1.1.0",
+      "description": "OpenRouter provider extension for Pi Coding Agent - access 20+ LLM models through unified API",
+      "popularity": {
+        "npm_downloads_weekly": 462,
+        "npm_downloads_monthly": 462
+      },
+      "aliases": [],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/agentsbox",
+      "name": "agentsbox",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "agentsbox",
+        "version": "0.1.3",
+        "url": "https://www.npmjs.com/package/agentsbox"
+      },
+      "repository_url": "git+https://github.com/assagman/agentsbox.git",
+      "published_at": "2026-01-25T17:22:37.860Z",
+      "version": "0.1.3",
+      "description": "Tool-search facade for MCP servers (OpenCode + pi integrations)",
+      "popularity": {
+        "npm_downloads_weekly": 34,
+        "npm_downloads_monthly": 805
+      },
+      "aliases": [],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/aliou-pi-extension-dev",
+      "name": "@aliou/pi-extension-dev",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/aliou-pi-extension-dev",
+      "checksum": {
+        "sha256": "c8324f78f8aa70ef574c753d0335f77cfa806506844507064370dc9926c345a6"
+      },
+      "source": {
+        "type": "npm",
+        "package": "aliou-pi-extension-dev",
+        "version": "0.2.0",
+        "url": "https://www.npmjs.com/package/aliou-pi-extension-dev"
+      },
+      "repository_url": "git+https://github.com/aliou/pi-extensions.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T10:07:48.729Z",
+      "version": "0.2.0",
+      "description": "Tools and commands for developing and updating Pi extensions."
+    },
+    {
+      "id": "npm/aliou-pi-guardrails",
+      "name": "@aliou/pi-guardrails",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/aliou-pi-guardrails",
+      "checksum": {
+        "sha256": "4855fd0c2ba13dc96ff7e4721b4940283ed0091119b93f91aa7b3480b24f6aef"
+      },
+      "source": {
+        "type": "npm",
+        "package": "aliou-pi-guardrails",
+        "version": "0.6.1",
+        "url": "https://www.npmjs.com/package/aliou-pi-guardrails"
+      },
+      "repository_url": "git+https://github.com/aliou/pi-extensions.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T19:45:24.744Z",
+      "version": "0.7.0",
+      "description": "Security hooks to prevent potentially dangerous operations."
+    },
+    {
+      "id": "npm/aliou-pi-linkup",
+      "name": "@aliou/pi-linkup",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/aliou-pi-linkup",
+      "checksum": {
+        "sha256": "50bedf464319de47acf952d2d3bbb6cb835bf892c511626f57526303baad7b29"
+      },
+      "source": {
+        "type": "npm",
+        "package": "aliou-pi-linkup",
+        "version": "0.3.1",
+        "url": "https://www.npmjs.com/package/aliou-pi-linkup"
+      },
+      "repository_url": "git+https://github.com/aliou/pi-linkup.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T10:08:04.756Z",
+      "version": "0.3.1",
+      "description": "Web search and content fetching extension for [Pi](https://buildwithpi.ai/) using the [Linkup API](https://linkup.so)."
+    },
+    {
+      "id": "npm/aliou-pi-processes",
+      "name": "@aliou/pi-processes",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/aliou-pi-processes",
+      "checksum": {
+        "sha256": "b4099b9e789b25e572cbb7ccf478ec4c704b22f633257d5f9a705cf2168e9e6b"
+      },
+      "source": {
+        "type": "npm",
+        "package": "aliou-pi-processes",
+        "version": "0.3.3",
+        "url": "https://www.npmjs.com/package/aliou-pi-processes"
+      },
+      "repository_url": "git+https://github.com/aliou/pi-extensions.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T10:07:48.851Z",
+      "version": "0.3.3",
+      "description": "Manage background processes from Pi. Start long-running commands (dev servers, build watchers, log tailers) without blocking the conversation."
+    },
+    {
+      "id": "npm/aliou-pi-synthetic",
+      "name": "@aliou/pi-synthetic",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/aliou-pi-synthetic",
+      "checksum": {
+        "sha256": "9bbf34e97f50ea4cb841f717dd77913a2ef77206bdcef93f32b05a27a0542781"
+      },
+      "source": {
+        "type": "npm",
+        "package": "aliou-pi-synthetic",
+        "version": "0.4.2",
+        "url": "https://www.npmjs.com/package/aliou-pi-synthetic"
+      },
+      "repository_url": "git+https://github.com/aliou/pi-synthetic.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T10:08:09.993Z",
+      "version": "0.4.2",
+      "description": "A Pi extension that adds [Synthetic](https://synthetic.new) as a model provider, giving you access to open-source models through an OpenAI-compatible API."
+    },
+    {
+      "id": "npm/aliou-pi-toolchain",
+      "name": "@aliou/pi-toolchain",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/aliou-pi-toolchain",
+      "checksum": {
+        "sha256": "f559a9fc862659b808b5a58ae8dc91be444407d4b3e75a0e7d790564cfd14293"
+      },
+      "source": {
+        "type": "npm",
+        "package": "aliou-pi-toolchain",
+        "version": "0.1.1",
+        "url": "https://www.npmjs.com/package/aliou-pi-toolchain"
+      },
+      "repository_url": "git+https://github.com/aliou/pi-extensions.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T19:45:24.743Z",
+      "version": "0.2.0",
+      "description": "Opinionated toolchain enforcement for pi. Transparently rewrites commands to use preferred tools instead of blocking and forcing retries."
+    },
+    {
+      "id": "npm/benvargas-pi-ancestor-discovery",
+      "name": "@benvargas/pi-ancestor-discovery",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/benvargas-pi-ancestor-discovery",
+      "checksum": {
+        "sha256": "320f8eceae4a7d834851310b4270f3a34a9139313d5abffc9602e2b827b0bd6e"
+      },
+      "source": {
+        "type": "npm",
+        "package": "benvargas-pi-ancestor-discovery",
+        "version": "1.1.1",
+        "url": "https://www.npmjs.com/package/benvargas-pi-ancestor-discovery"
+      },
+      "repository_url": "git+https://github.com/ben-vargas/pi-packages.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-04T04:59:46.223Z",
+      "version": "1.1.1",
+      "description": "Recursive ancestor discovery for pi resources (skills, prompts, themes)"
+    },
+    {
+      "id": "npm/benvargas-pi-antigravity-image-gen",
+      "name": "@benvargas/pi-antigravity-image-gen",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/benvargas-pi-antigravity-image-gen",
+      "checksum": {
+        "sha256": "2e6b008e4f64167724288d468e2afcf649f7e836afb7fc6a11d4e9738c951b71"
+      },
+      "source": {
+        "type": "npm",
+        "package": "benvargas-pi-antigravity-image-gen",
+        "version": "1.1.1",
+        "url": "https://www.npmjs.com/package/benvargas-pi-antigravity-image-gen"
+      },
+      "repository_url": "git+https://github.com/ben-vargas/pi-packages.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-02T05:27:09.112Z",
+      "version": "1.1.1",
+      "description": "Google Antigravity image generation tool for pi - Generate images via Gemini and Imagen models with inline terminal rendering"
+    },
+    {
+      "id": "npm/benvargas-pi-synthetic-provider",
+      "name": "@benvargas/pi-synthetic-provider",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/benvargas-pi-synthetic-provider",
+      "checksum": {
+        "sha256": "2f8cf9b635a26f6e8bdf208fdcedc919c171c2ffe45dcce825e954208607aee1"
+      },
+      "source": {
+        "type": "npm",
+        "package": "benvargas-pi-synthetic-provider",
+        "version": "1.1.0",
+        "url": "https://www.npmjs.com/package/benvargas-pi-synthetic-provider"
+      },
+      "repository_url": "git+https://github.com/ben-vargas/pi-packages.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-02T04:21:55.107Z",
+      "version": "1.1.0",
+      "description": "Synthetic (synthetic.new) model provider for pi - Dynamic model fetching with reasoning, vision, and tools support"
+    },
+    {
+      "id": "npm/checkpoint-pi",
+      "name": "checkpoint-pi",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/checkpoint-pi",
+      "checksum": {
+        "sha256": "defbcc7d4a4e3d60f48cf19de2ae8e67e91b7126093bbc6ff2c78d954f773236"
+      },
+      "source": {
+        "type": "npm",
+        "package": "checkpoint-pi",
+        "version": "1.0.1",
+        "url": "https://www.npmjs.com/package/checkpoint-pi"
+      },
+      "repository_url": "git@github.com:langchain-ai/langgraphjs.git",
+      "popularity": {
+        "npm_downloads_weekly": 151,
+        "npm_downloads_monthly": 151
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2025-10-18T00:00:08.009Z",
+      "version": "1.0.0",
+      "description": "Library with base interfaces for LangGraph checkpoint savers."
+    },
+    {
+      "id": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "name": "@imsus/pi-extension-minimax-coding-plan-mcp",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "checksum": {
+        "sha256": "d01fc2206c107b24fee01f8e18ce04665072dbd9628788bac4f150e55b3dbb91"
+      },
+      "source": {
+        "type": "npm",
+        "package": "imsus-pi-extension-minimax-coding-plan-mcp",
+        "version": "1.0.1",
+        "url": "https://www.npmjs.com/package/imsus-pi-extension-minimax-coding-plan-mcp"
+      },
+      "repository_url": "git+https://github.com/imsus/pi-extension-minimax-coding-plan-mcp.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-29T14:54:54.087Z",
+      "version": "1.0.1",
+      "description": "MiniMax Coding Plan extension for pi coding agent - provides web_search and understand_image tools"
+    },
+    {
+      "id": "npm/juanibiapina-pi-extension-settings",
+      "name": "@juanibiapina/pi-extension-settings",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/juanibiapina-pi-extension-settings",
+      "checksum": {
+        "sha256": "63990a9a3055005ea9a15e363eb7c69c4193e7422a1f8577d97dd44715fca376"
+      },
+      "source": {
+        "type": "npm",
+        "package": "juanibiapina-pi-extension-settings",
+        "version": "0.4.0",
+        "url": "https://www.npmjs.com/package/juanibiapina-pi-extension-settings"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/juanibiapina-pi-files",
+      "name": "@juanibiapina/pi-files",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/juanibiapina-pi-files",
+      "checksum": {
+        "sha256": "c9ea095426bbaf6998d8af0ddf2d3f5e03b7affc599af5657063e59a2331a98f"
+      },
+      "source": {
+        "type": "npm",
+        "package": "juanibiapina-pi-files",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/juanibiapina-pi-files"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/juanibiapina-pi-gob",
+      "name": "@juanibiapina/pi-gob",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/juanibiapina-pi-gob",
+      "checksum": {
+        "sha256": "ff7d0bc4fdef19c3c22bacb3d903c1c5063fd4db03fb2d3e4634290716ee20f4"
+      },
+      "source": {
+        "type": "npm",
+        "package": "juanibiapina-pi-gob",
+        "version": "0.2.0",
+        "url": "https://www.npmjs.com/package/juanibiapina-pi-gob"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/lsp-pi",
+      "name": "lsp-pi",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/lsp-pi",
+      "checksum": {
+        "sha256": "d0919dccd283992ed4c4f9589609785f2c737a29978b52bf9a050868c799a30c"
+      },
+      "source": {
+        "type": "npm",
+        "package": "lsp-pi",
+        "version": "1.0.1",
+        "url": "https://www.npmjs.com/package/lsp-pi"
+      },
+      "repository_url": "git+https://github.com/Microsoft/vscode-languageserver-node.git",
+      "popularity": {
+        "npm_downloads_weekly": 101,
+        "npm_downloads_monthly": 101
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2024-07-31T15:43:55.080Z",
+      "version": "1.0.12",
+      "description": "A simple text document implementation for Node LSP servers"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-bar",
+      "name": "@marckrenn/pi-sub-bar",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/marckrenn-pi-sub-bar",
+      "checksum": {
+        "sha256": "4c8d489332cd87e504ce064a2cfe32dfe3e9dec4cca1e8b1452a3533b4aeab6c"
+      },
+      "source": {
+        "type": "npm",
+        "package": "marckrenn-pi-sub-bar",
+        "version": "1.0.4",
+        "url": "https://www.npmjs.com/package/marckrenn-pi-sub-bar"
+      },
+      "repository_url": "https://www.npmjs.com/package/marckrenn-pi-sub-bar",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T16:14:37.177Z",
+      "version": "1.0.5",
+      "description": "Usage widget extension for pi-coding-agent - shows current provider usage above the editor"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-core",
+      "name": "@marckrenn/pi-sub-core",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/marckrenn-pi-sub-core",
+      "checksum": {
+        "sha256": "77dcc7f7f2d506a34e1b19f684c72976bb2c304420a98e39acd9ee4b1d234f0b"
+      },
+      "source": {
+        "type": "npm",
+        "package": "marckrenn-pi-sub-core",
+        "version": "1.0.4",
+        "url": "https://www.npmjs.com/package/marckrenn-pi-sub-core"
+      },
+      "repository_url": "https://www.npmjs.com/package/marckrenn-pi-sub-core",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T16:13:14.421Z",
+      "version": "1.0.5",
+      "description": "Shared usage data core for pi extensions"
+    },
+    {
+      "id": "npm/mitsupi",
+      "name": "mitsupi",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "UNKNOWN",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "mitsupi",
+        "version": "1.1.1",
+        "url": "https://www.npmjs.com/package/mitsupi"
+      },
+      "repository_url": "git+https://github.com/mitsuhiko/agent-stuff.git",
+      "published_at": "2026-01-30T23:19:52.758Z",
+      "version": "1.1.1",
+      "description": "Armin's pi coding agent commands, skills, extensions, and themes",
+      "popularity": {
+        "npm_downloads_weekly": 305,
+        "npm_downloads_monthly": 825
+      },
+      "aliases": [],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/ogulcancelik-pi-sketch",
+      "name": "@ogulcancelik/pi-sketch",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/ogulcancelik-pi-sketch",
+      "checksum": {
+        "sha256": "a4e95b67e0cc2dd1a0147dd9efcf09d775bb1550c3aee8358329dac16442d399"
+      },
+      "source": {
+        "type": "npm",
+        "package": "ogulcancelik-pi-sketch",
+        "version": "0.1.1",
+        "url": "https://www.npmjs.com/package/ogulcancelik-pi-sketch"
+      },
+      "repository_url": "https://github.com/DataDog/sketches-js",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2024-04-23T08:27:52.864Z",
+      "version": "2.1.1",
+      "description": "TypeScript implementation of DDSketch, a distributed quantile sketch algorithm "
+    },
+    {
+      "id": "npm/permission-pi",
+      "name": "permission-pi",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/permission-pi",
+      "checksum": {
+        "sha256": "b3b9d427784198407ca84f9c82bbcf35841c36af5a750473222648a756f94a60"
+      },
+      "source": {
+        "type": "npm",
+        "package": "permission-pi",
+        "version": "1.0.1",
+        "url": "https://www.npmjs.com/package/permission-pi"
+      },
+      "repository_url": "git+https://github.com/cookiegraves/rarerteatsh.git",
+      "popularity": {
+        "npm_downloads_weekly": 88,
+        "npm_downloads_monthly": 88
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2024-07-27T03:19:34.054Z",
+      "version": "1.2.4",
+      "description": "A utility package for JavaScript applications."
+    },
+    {
+      "id": "npm/pi-acp",
+      "name": "pi-acp",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "pi-acp",
+        "version": "0.0.14",
+        "url": "https://www.npmjs.com/package/pi-acp"
+      },
+      "repository_url": "git+https://github.com/svkozak/pi-acp.git",
+      "published_at": "2026-01-14T08:02:07.981Z",
+      "version": "0.0.14",
+      "description": "ACP adapter for pi coding agent",
+      "popularity": {
+        "npm_downloads_weekly": 56,
+        "npm_downloads_monthly": 228
+      },
+      "aliases": [],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/pi-agentic-compaction",
+      "name": "pi-agentic-compaction",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-agentic-compaction",
+      "checksum": {
+        "sha256": "5c1a2880ced5377656d12585a7966ddd62e9c1b68d06106cc128b197c25b2305"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-agentic-compaction",
+        "version": "0.2.1",
+        "url": "https://www.npmjs.com/package/pi-agentic-compaction"
+      },
+      "repository_url": "git+https://github.com/laulauland/dotfiles.git",
+      "popularity": {
+        "npm_downloads_weekly": 113,
+        "npm_downloads_monthly": 390
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T12:23:34.583Z",
+      "version": "0.3.0",
+      "description": "Pi extension for intelligent conversation compaction using a virtual filesystem and LLM exploration"
+    },
+    {
+      "id": "npm/pi-amplike",
+      "name": "pi-amplike",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-amplike",
+      "checksum": {
+        "sha256": "d105f1bfd68bc6f73dbaf7eb1fdada4a07b09772925393ba05c222f376146c65"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-amplike",
+        "version": "0.1.2",
+        "url": "https://www.npmjs.com/package/pi-amplike"
+      },
+      "repository_url": "git+https://github.com/pasky/pi-amplike.git",
+      "popularity": {
+        "npm_downloads_weekly": 430,
+        "npm_downloads_monthly": 430
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:08:14.499Z",
+      "version": "0.2.0",
+      "description": "Pi skills and extensions that provide Amp Code-like workflows (handoff, session query, web search, visit webpage)."
+    },
+    {
+      "id": "npm/pi-annotate",
+      "name": "pi-annotate",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-annotate",
+      "checksum": {
+        "sha256": "cf98e955a19bb579e4117a0878abcce650cc539d563ef8987da1107536ba8b6b"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-annotate",
+        "version": "0.3.6",
+        "url": "https://www.npmjs.com/package/pi-annotate"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-annotate.git",
+      "popularity": {
+        "npm_downloads_weekly": 659,
+        "npm_downloads_monthly": 659
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-02T00:39:41.318Z",
+      "version": "0.3.6",
+      "description": "Visual annotation tool for Pi coding agent with inline note cards"
+    },
+    {
+      "id": "npm/pi-bash-confirm",
+      "name": "pi-bash-confirm",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-bash-confirm",
+      "checksum": {
+        "sha256": "705b3c6c504252bfd3d7f3c09c9f22fadcc46a2aeda6e117778b258e1c934ece"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-bash-confirm",
+        "version": "1.0.1",
+        "url": "https://www.npmjs.com/package/pi-bash-confirm"
+      },
+      "repository_url": "git+https://github.com/SBoudrias/Inquirer.js.git",
+      "popularity": {
+        "npm_downloads_weekly": 205,
+        "npm_downloads_monthly": 205
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-11T18:34:15.790Z",
+      "version": "6.0.4",
+      "description": "Inquirer confirm prompt"
+    },
+    {
+      "id": "npm/pi-brave-search",
+      "name": "pi-brave-search",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-brave-search",
+      "checksum": {
+        "sha256": "246fdf04e8877b43a6a27f080b7514815edf719e0719638597a584bc76b28263"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-brave-search",
+        "version": "0.2.0",
+        "url": "https://www.npmjs.com/package/pi-brave-search"
+      },
+      "repository_url": "git+https://github.com/w-winter/dot314.git",
+      "popularity": {
+        "npm_downloads_weekly": 304,
+        "npm_downloads_monthly": 304
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-02T17:07:43.042Z",
+      "version": "0.2.0",
+      "description": "Token-efficient Brave web search + AI grounding extension for Pi, with optional full-page Markdown content extraction"
+    },
+    {
+      "id": "npm/pi-command-center",
+      "name": "pi-command-center",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-command-center",
+      "checksum": {
+        "sha256": "d794ecb901fbf888c52f0b622140c3e8d8d72dd1719ee93f01cabb92e43a8990"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-command-center",
+        "version": "0.1.1",
+        "url": "https://www.npmjs.com/package/pi-command-center"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": 175,
+        "npm_downloads_monthly": 175
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/pi-ephemeral",
+      "name": "pi-ephemeral",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-ephemeral",
+      "checksum": {
+        "sha256": "d8460a3d3febe46009d4c9c258b51046a5556d3b79a32ded2294ea67b18d9a79"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-ephemeral",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/pi-ephemeral"
+      },
+      "repository_url": "git+https://github.com/w-winter/dot314.git",
+      "popularity": {
+        "npm_downloads_weekly": 9,
+        "npm_downloads_monthly": 86
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-28T01:32:45.350Z",
+      "version": "0.1.0",
+      "description": "Toggle Pi session persistence mid-session (delete session file on exit)"
+    },
+    {
+      "id": "npm/pi-extensions",
+      "name": "pi-extensions",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "pi-extensions",
+        "version": "0.1.21",
+        "url": "https://www.npmjs.com/package/pi-extensions"
+      },
+      "repository_url": null,
+      "published_at": "2026-02-05T13:30:45.463Z",
+      "version": "0.1.21",
+      "description": "Personal extensions for the [Pi coding agent](https://github.com/badlogic/pi-mono).",
+      "popularity": {
+        "npm_downloads_weekly": 426,
+        "npm_downloads_monthly": 1213
+      },
+      "aliases": [],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/pi-ghostty-theme-sync",
+      "name": "pi-ghostty-theme-sync",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-ghostty-theme-sync",
+      "checksum": {
+        "sha256": "b86806b563696a42309c866176201b2d4512b73ae27f10865784b90564aff93c"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-ghostty-theme-sync",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/pi-ghostty-theme-sync"
+      },
+      "repository_url": "git+https://github.com/coder/ghostty-web.git",
+      "popularity": {
+        "npm_downloads_weekly": 133,
+        "npm_downloads_monthly": 133
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2025-12-09T03:11:18.721Z",
+      "version": "0.4.0",
+      "description": "Web-based terminal emulator using Ghostty's VT100 parser via WebAssembly"
+    },
+    {
+      "id": "npm/pi-interactive-shell",
+      "name": "pi-interactive-shell",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "pi-interactive-shell",
+        "version": "0.7.1",
+        "url": "https://www.npmjs.com/package/pi-interactive-shell"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-interactive-shell.git",
+      "published_at": "2026-02-03T19:24:48.562Z",
+      "version": "0.7.1",
+      "description": "Run AI coding agents as foreground subagents in pi TUI overlays with hands-free monitoring",
+      "popularity": {
+        "npm_downloads_weekly": 650,
+        "npm_downloads_monthly": 2638
+      },
+      "aliases": [
+        "community/nicobailon-interactive-shell"
+      ],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/pi-mcp-adapter",
+      "name": "pi-mcp-adapter",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "pi-mcp-adapter",
+        "version": "2.1.2",
+        "url": "https://www.npmjs.com/package/pi-mcp-adapter"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-mcp-adapter.git",
+      "published_at": "2026-02-03T19:27:06.199Z",
+      "version": "2.1.2",
+      "description": "MCP (Model Context Protocol) adapter extension for Pi coding agent",
+      "popularity": {
+        "npm_downloads_weekly": 754,
+        "npm_downloads_monthly": 1638
+      },
+      "aliases": [
+        "community/nicobailon-mcp-adapter"
+      ],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/pi-md-export",
+      "name": "pi-md-export",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-md-export",
+      "checksum": {
+        "sha256": "3f9dd50972e67bdf68ab8e9894de8c54b149d3ea38a79438b79cc034dc4da2a7"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-md-export",
+        "version": "0.2.0",
+        "url": "https://www.npmjs.com/package/pi-md-export"
+      },
+      "repository_url": "git+https://github.com/w-winter/dot314.git",
+      "popularity": {
+        "npm_downloads_weekly": 142,
+        "npm_downloads_monthly": 241
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-30T18:35:28.605Z",
+      "version": "0.2.0",
+      "description": "Export Pi sessions (last N turns, full branch, or full session) to readable Markdown on clipboard or local file"
+    },
+    {
+      "id": "npm/pi-mermaid",
+      "name": "pi-mermaid",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-mermaid",
+      "checksum": {
+        "sha256": "611796b35af8b8b6d4589e7133d4dec918f7ae81331b4c6c321aab24e30c03ed"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-mermaid",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/pi-mermaid"
+      },
+      "repository_url": "git+https://github.com/mermaid-js/mermaid.git",
+      "popularity": {
+        "npm_downloads_weekly": 171,
+        "npm_downloads_monthly": 171
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2025-12-02T16:28:33.665Z",
+      "version": "11.12.2",
+      "description": "Markdown-ish syntax for generating flowcharts, mindmaps, sequence diagrams, class diagrams, gantt charts, git graphs and more."
+    },
+    {
+      "id": "npm/pi-messenger",
+      "name": "pi-messenger",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-messenger",
+      "checksum": {
+        "sha256": "648ac76846fab38495eff900e8459f4446bb921bb063308ab76e8075f74040c8"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-messenger",
+        "version": "0.8.2",
+        "url": "https://www.npmjs.com/package/pi-messenger"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-messenger.git",
+      "popularity": {
+        "npm_downloads_weekly": 425,
+        "npm_downloads_monthly": 502
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-06T05:51:11.566Z",
+      "version": "0.10.0",
+      "description": "Inter-agent messaging and file reservation system for pi coding agent"
+    },
+    {
+      "id": "npm/pi-model-switch",
+      "name": "pi-model-switch",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-model-switch",
+      "checksum": {
+        "sha256": "c4afaeed5d2cd4349f8e752b52796e52088e672882e839bbee258a9af1356e32"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-model-switch",
+        "version": "0.1.2",
+        "url": "https://www.npmjs.com/package/pi-model-switch"
+      },
+      "repository_url": "https://www.npmjs.com/package/pi-model-switch",
+      "popularity": {
+        "npm_downloads_weekly": 217,
+        "npm_downloads_monthly": 295
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-02T00:39:35.807Z",
+      "version": "0.1.1",
+      "description": "Model switching extension for pi coding agent"
+    },
+    {
+      "id": "npm/pi-moonshot",
+      "name": "pi-moonshot",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-moonshot",
+      "checksum": {
+        "sha256": "2cfb6ca621d022e84d3535a0c2367bc9eac55262bf8ba3a5b4b60578b9fbc5a5"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-moonshot",
+        "version": "1.0.0",
+        "url": "https://www.npmjs.com/package/pi-moonshot"
+      },
+      "repository_url": "git+https://github.com/default-anton/pi-moonshot.git",
+      "popularity": {
+        "npm_downloads_weekly": 14,
+        "npm_downloads_monthly": 116
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-27T19:18:13.954Z",
+      "version": "1.0.0",
+      "description": "Pi extension adding Moonshot AI provider with Kimi K2.5 and other models"
+    },
+    {
+      "id": "npm/pi-multicodex",
+      "name": "pi-multicodex",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-multicodex",
+      "checksum": {
+        "sha256": "5062226f7706474d7fa67a1835cd0428bf86d4e9087f0a4804608ad151048152"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-multicodex",
+        "version": "1.0.2",
+        "url": "https://www.npmjs.com/package/pi-multicodex"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": 251,
+        "npm_downloads_monthly": 251
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/pi-notify",
+      "name": "pi-notify",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-notify",
+      "checksum": {
+        "sha256": "76957c026ee81629146b914d34dd32892ee2db62125d846af5470b516246cbf1"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-notify",
+        "version": "1.0.3",
+        "url": "https://www.npmjs.com/package/pi-notify"
+      },
+      "repository_url": "git+https://github.com/ferologics/pi-notify.git",
+      "popularity": {
+        "npm_downloads_weekly": 525,
+        "npm_downloads_monthly": 629
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T19:21:13.214Z",
+      "version": "1.0.3",
+      "description": "Desktop notifications for Pi agent via OSC 777/99 and Windows toast"
+    },
+    {
+      "id": "npm/pi-package-test",
+      "name": "pi-package-test",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "pi-package-test",
+        "version": "0.1.6",
+        "url": "https://www.npmjs.com/package/pi-package-test"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-package-test.git",
+      "published_at": "2026-01-25T00:33:32.915Z",
+      "version": "0.1.6",
+      "description": "Test package for pi coding agent with extensions, skills, themes, and prompts",
+      "popularity": {
+        "npm_downloads_weekly": 44,
+        "npm_downloads_monthly": 682
+      },
+      "aliases": [],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/pi-poly-notify",
+      "name": "pi-poly-notify",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-poly-notify",
+      "checksum": {
+        "sha256": "a1b120324b7178392f3f153ab277dde6c62033818a641efc9cae47e1f48be5bc"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-poly-notify",
+        "version": "0.1.2",
+        "url": "https://www.npmjs.com/package/pi-poly-notify"
+      },
+      "repository_url": "git+https://github.com/alphagov/notifications-node-client.git",
+      "popularity": {
+        "npm_downloads_weekly": 124,
+        "npm_downloads_monthly": 124
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2024-08-07T15:15:42.541Z",
+      "version": "8.2.1",
+      "description": "GOV.UK Notify Node.js client "
+    },
+    {
+      "id": "npm/pi-powerline-footer",
+      "name": "pi-powerline-footer",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "pi-powerline-footer",
+        "version": "0.2.22",
+        "url": "https://www.npmjs.com/package/pi-powerline-footer"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-powerline-footer.git",
+      "published_at": "2026-02-01T03:00:04.522Z",
+      "version": "0.2.22",
+      "description": "Powerline-style status bar extension for pi coding agent",
+      "popularity": {
+        "npm_downloads_weekly": 609,
+        "npm_downloads_monthly": 2130
+      },
+      "aliases": [
+        "community/nicobailon-powerline-footer"
+      ],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/pi-prompt-template-model",
+      "name": "pi-prompt-template-model",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-prompt-template-model",
+      "checksum": {
+        "sha256": "faaee501cfc8824e12fc2003885f8b45975159fa90b6cec8ae4618290746a1fe"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-prompt-template-model",
+        "version": "0.2.1",
+        "url": "https://www.npmjs.com/package/pi-prompt-template-model"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-prompt-template-model.git",
+      "popularity": {
+        "npm_downloads_weekly": 392,
+        "npm_downloads_monthly": 475
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-01T02:43:06.229Z",
+      "version": "0.2.1",
+      "description": "Prompt template model selector extension for pi coding agent"
+    },
+    {
+      "id": "npm/pi-repoprompt-mcp",
+      "name": "pi-repoprompt-mcp",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-repoprompt-mcp",
+      "checksum": {
+        "sha256": "3e42769cfa41f0ebadfd68972fd1a944222684b45cd5683cfcb8e9d4f6594421"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-repoprompt-mcp",
+        "version": "0.2.0",
+        "url": "https://www.npmjs.com/package/pi-repoprompt-mcp"
+      },
+      "repository_url": "git+https://github.com/w-winter/dot314.git",
+      "popularity": {
+        "npm_downloads_weekly": 245,
+        "npm_downloads_monthly": 325
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T01:03:46.857Z",
+      "version": "0.2.0",
+      "description": "A token-efficient RepoPrompt MCP integration for Pi"
+    },
+    {
+      "id": "npm/pi-review-loop",
+      "name": "pi-review-loop",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-review-loop",
+      "checksum": {
+        "sha256": "702b84a720521184955491fd2ca72b6b0e15d86a9b1636f87d03fbddcf6bff69"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-review-loop",
+        "version": "0.4.2",
+        "url": "https://www.npmjs.com/package/pi-review-loop"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-review-loop.git",
+      "popularity": {
+        "npm_downloads_weekly": 402,
+        "npm_downloads_monthly": 887
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-02T19:01:23.526Z",
+      "version": "0.4.2",
+      "description": "Automated code review loop extension for pi coding agent"
+    },
+    {
+      "id": "npm/pi-screenshots-picker",
+      "name": "pi-screenshots-picker",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-screenshots-picker",
+      "checksum": {
+        "sha256": "cd5ac0eea7259bba6cf02dc7c0793336aa15ffe25bc7b0cfee8226d2172d22d5"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-screenshots-picker",
+        "version": "1.1.10",
+        "url": "https://www.npmjs.com/package/pi-screenshots-picker"
+      },
+      "repository_url": "git+https://github.com/Graffioh/pi-screenshots-picker.git",
+      "popularity": {
+        "npm_downloads_weekly": 2455,
+        "npm_downloads_monthly": 2455
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-04T06:43:39.560Z",
+      "version": "1.1.9",
+      "description": "Screenshot picker extension for pi coding agent - quickly select and attach screenshots to your prompts"
+    },
+    {
+      "id": "npm/pi-search-agent",
+      "name": "pi-search-agent",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-search-agent",
+      "checksum": {
+        "sha256": "05ca34ce4cc62058d3ea1e032ffb0d837f33f174b347732689b54a26e96729f6"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-search-agent",
+        "version": "1.0.0",
+        "url": "https://www.npmjs.com/package/pi-search-agent"
+      },
+      "repository_url": "https://www.npmjs.com/package/pi-search-agent",
+      "popularity": {
+        "npm_downloads_weekly": 15,
+        "npm_downloads_monthly": 34
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-26T20:43:56.439Z",
+      "version": "1.0.0",
+      "description": "Semantic codebase search with sub-agent processing"
+    },
+    {
+      "id": "npm/pi-session-ask",
+      "name": "pi-session-ask",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-session-ask",
+      "checksum": {
+        "sha256": "ec08e99817b26d8440e0d3cbfbe64c2d562c8aa0918123b16c5979813633d1bc"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-session-ask",
+        "version": "0.1.1",
+        "url": "https://www.npmjs.com/package/pi-session-ask"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": 190,
+        "npm_downloads_monthly": 190
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/pi-shadow-git",
+      "name": "pi-shadow-git",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-shadow-git",
+      "checksum": {
+        "sha256": "55eb623f2c2389218d0a6cd8c536df22fc2f54fb955fc0ce89dd70aca52be46c"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-shadow-git",
+        "version": "2.1.0",
+        "url": "https://www.npmjs.com/package/pi-shadow-git"
+      },
+      "repository_url": "git+https://github.com/EmZod/pi-subagent-with-logging.git",
+      "popularity": {
+        "npm_downloads_weekly": 151,
+        "npm_downloads_monthly": 151
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T10:50:38.954Z",
+      "version": "2.1.1",
+      "description": "Git-based orchestration logging for pi subagents with Mission Control dashboard"
+    },
+    {
+      "id": "npm/pi-shell-completions",
+      "name": "pi-shell-completions",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-shell-completions",
+      "checksum": {
+        "sha256": "5ed1e066f294d283beda50e5d94ca846af0d438ffac27b12c91092375958bf1b"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-shell-completions",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/pi-shell-completions"
+      },
+      "repository_url": "https://github.com/laulauland/dotfiles",
+      "popularity": {
+        "npm_downloads_weekly": 14,
+        "npm_downloads_monthly": 105
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-28T10:17:29.440Z",
+      "version": "0.1.0",
+      "description": "Pi extension that adds native shell completions (fish/zsh/bash) to ! and !! bash mode commands"
+    },
+    {
+      "id": "npm/pi-skill-palette",
+      "name": "pi-skill-palette",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-skill-palette",
+      "checksum": {
+        "sha256": "3766ee3bf3613d52d3cbc8ed651ce181c4485e95c2567891e6f28924164176dc"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-skill-palette",
+        "version": "1.1.0",
+        "url": "https://www.npmjs.com/package/pi-skill-palette"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-skill-palette.git",
+      "popularity": {
+        "npm_downloads_weekly": 43,
+        "npm_downloads_monthly": 205
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-28T05:13:13.107Z",
+      "version": "1.1.0",
+      "description": "VS Code-style command palette for selecting and applying skills in pi"
+    },
+    {
+      "id": "npm/pi-subdir-context",
+      "name": "pi-subdir-context",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-subdir-context",
+      "checksum": {
+        "sha256": "d70ce15a7585b9f585c466499527f02a6bad90edc0a4f63bd6ab1e83a6a6c6cb"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-subdir-context",
+        "version": "1.0.1",
+        "url": "https://www.npmjs.com/package/pi-subdir-context"
+      },
+      "repository_url": "git+https://github.com/default-anton/pi-subdir-context.git",
+      "popularity": {
+        "npm_downloads_weekly": 31,
+        "npm_downloads_monthly": 181
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-29T20:13:49.680Z",
+      "version": "1.0.1",
+      "description": "Automatically load AGENTS.md context from subdirectories in pi coding agent"
+    },
+    {
+      "id": "npm/pi-super-curl",
+      "name": "pi-super-curl",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-super-curl",
+      "checksum": {
+        "sha256": "790bb671335973eac552dcb6cdd6efcd6e4f9d13625c09f231d697ff25d763b5"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-super-curl",
+        "version": "1.1.1",
+        "url": "https://www.npmjs.com/package/pi-super-curl"
+      },
+      "repository_url": "git+https://github.com/Graffioh/pi-super-curl.git",
+      "popularity": {
+        "npm_downloads_weekly": 1262,
+        "npm_downloads_monthly": 1318
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T09:32:05.726Z",
+      "version": "1.1.2",
+      "description": "HTTP request extension for pi shitty coding agent with auto-config, JWT generation, and named endpoints"
+    },
+    {
+      "id": "npm/pi-telemetry-otel",
+      "name": "pi-telemetry-otel",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-telemetry-otel",
+      "checksum": {
+        "sha256": "eaf69b8eb80e8729f654f444497eeb42a1f0aa394dceb2d52a123204e339060b"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-telemetry-otel",
+        "version": "0.1.1",
+        "url": "https://www.npmjs.com/package/pi-telemetry-otel"
+      },
+      "repository_url": "git+https://github.com/open-telemetry/opentelemetry-js-contrib.git",
+      "popularity": {
+        "npm_downloads_weekly": 160,
+        "npm_downloads_monthly": 160
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-22T10:01:56.000Z",
+      "version": "0.55.0",
+      "description": "OpenTelemetry instrumentation for `fastify` http web application framework"
+    },
+    {
+      "id": "npm/pi-threads",
+      "name": "pi-threads",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-threads",
+      "checksum": {
+        "sha256": "05f2df644ac2bc5d43326ac5afb6517bb2f5de62391b6df027a59d6d1e0ee252"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-threads",
+        "version": "0.2.1",
+        "url": "https://www.npmjs.com/package/pi-threads"
+      },
+      "repository_url": "https://github.com/laulauland/dotfiles",
+      "popularity": {
+        "npm_downloads_weekly": 39,
+        "npm_downloads_monthly": 317
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-28T09:03:09.258Z",
+      "version": "0.2.1",
+      "description": "Pi extension for searching and reading past conversation threads with ripgrep-powered search"
+    },
+    {
+      "id": "npm/pi-voice-of-god",
+      "name": "pi-voice-of-god",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-voice-of-god",
+      "checksum": {
+        "sha256": "1ab8d9785881562bef5d417bb6a60e6de42c2e41152c370206ddccdf61bd6096"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-voice-of-god",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/pi-voice-of-god"
+      },
+      "repository_url": "git+https://github.com/w-winter/dot314.git",
+      "popularity": {
+        "npm_downloads_weekly": 10,
+        "npm_downloads_monthly": 109
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-28T01:45:38.994Z",
+      "version": "0.1.0",
+      "description": "For within-session insertion/editing/disablement of a user-controlled message into Pi's system prompt, right before the `# Project Context` section."
+    },
+    {
+      "id": "npm/pi-wakatime",
+      "name": "pi-wakatime",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-wakatime",
+      "checksum": {
+        "sha256": "179d05266f2bc580d0c3a2f12856501815d1c308003e80ef22c8c8a1e84a1fa8"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-wakatime",
+        "version": "1.0.0",
+        "url": "https://www.npmjs.com/package/pi-wakatime"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": 71,
+        "npm_downloads_monthly": 71
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/pi-watch",
+      "name": "pi-watch",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-watch",
+      "checksum": {
+        "sha256": "6d99882ffa560dc01a0418438b7ec664a28c7ec204d50e66862fdfd23d46e5dd"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-watch",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/pi-watch"
+      },
+      "repository_url": "git+https://github.com/kaofelix/pi-watch.git",
+      "popularity": {
+        "npm_downloads_weekly": 21,
+        "npm_downloads_monthly": 84
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-29T09:17:43.553Z",
+      "version": "0.1.0",
+      "description": "Pi extension that watches for AI comments in your code and sends them to the agent"
+    },
+    {
+      "id": "npm/pi-web-access",
+      "name": "pi-web-access",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-web-access",
+      "checksum": {
+        "sha256": "62427a5f9452041963b260175572780d760599534dc0749ae66ed5154a71011b"
+      },
+      "source": {
+        "type": "npm",
+        "package": "pi-web-access",
+        "version": "0.7.2",
+        "url": "https://www.npmjs.com/package/pi-web-access"
+      },
+      "repository_url": "git+https://github.com/nicobailon/pi-web-access.git",
+      "popularity": {
+        "npm_downloads_weekly": 761,
+        "npm_downloads_monthly": 908
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-06T06:48:32.035Z",
+      "version": "0.7.3",
+      "description": "Web search, URL fetching, GitHub repo cloning, PDF extraction, YouTube video understanding, and local video analysis for Pi coding agent"
+    },
+    {
+      "id": "npm/ralph-loop-pi",
+      "name": "ralph-loop-pi",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/ralph-loop-pi",
+      "checksum": {
+        "sha256": "e61f0d3c32b2f4f8cb6e93a313e423c58380e61505d01107a4d9592138506e36"
+      },
+      "source": {
+        "type": "npm",
+        "package": "ralph-loop-pi",
+        "version": "1.0.1",
+        "url": "https://www.npmjs.com/package/ralph-loop-pi"
+      },
+      "repository_url": "git+https://github.com/subsy/ralph-tui.git",
+      "popularity": {
+        "npm_downloads_weekly": 87,
+        "npm_downloads_monthly": 87
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T10:47:50.932Z",
+      "version": "0.7.1",
+      "description": "Ralph TUI - AI Agent Loop Orchestrator"
+    },
+    {
+      "id": "npm/repeat-pi",
+      "name": "repeat-pi",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/repeat-pi",
+      "checksum": {
+        "sha256": "6e5aaba4109d587d60add0cce8f2c42b434efac9018887ebd5dfa04c18febed7"
+      },
+      "source": {
+        "type": "npm",
+        "package": "repeat-pi",
+        "version": "0.50.0",
+        "url": "https://www.npmjs.com/package/repeat-pi"
+      },
+      "repository_url": "git+https://github.com/jonschlinkert/repeat-string.git",
+      "popularity": {
+        "npm_downloads_weekly": 83,
+        "npm_downloads_monthly": 83
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2016-10-23T16:54:00.613Z",
+      "version": "1.6.1",
+      "description": "Repeat the given string n times. Fastest implementation for repeating a string."
+    },
+    {
+      "id": "npm/shitty-extensions",
+      "name": "shitty-extensions",
+      "source_tier": "npm-registry",
+      "status": "unvendored",
+      "license": "MIT",
+      "retrieved": null,
+      "artifact_path": null,
+      "checksum": null,
+      "source": {
+        "type": "npm",
+        "package": "shitty-extensions",
+        "version": "1.0.9",
+        "url": "https://www.npmjs.com/package/shitty-extensions"
+      },
+      "repository_url": "git+https://github.com/hjanuschka/shitty-extensions.git",
+      "published_at": "2026-02-02T19:44:00.006Z",
+      "version": "1.0.9",
+      "description": "Custom extensions and skills for pi coding agent",
+      "popularity": {
+        "npm_downloads_weekly": 318,
+        "npm_downloads_monthly": 1094
+      },
+      "aliases": [],
+      "notes": "Discovered via bd-kcj6 npm sweep; not yet vendored into artifacts."
+    },
+    {
+      "id": "npm/token-rate-pi",
+      "name": "token-rate-pi",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/token-rate-pi",
+      "checksum": {
+        "sha256": "867ddbea5924723a135dca1d06846f5fd4b7a90b5f79f057ff01c9357833ec6b"
+      },
+      "source": {
+        "type": "npm",
+        "package": "token-rate-pi",
+        "version": "1.0.2",
+        "url": "https://www.npmjs.com/package/token-rate-pi"
+      },
+      "repository_url": "git://github.com/jhurliman/node-rate-limiter.git",
+      "popularity": {
+        "npm_downloads_weekly": 89,
+        "npm_downloads_monthly": 89
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2025-01-24T23:31:05.212Z",
+      "version": "3.0.0",
+      "description": "A generic rate limiter for the web and node.js. Useful for API clients, web crawling, or other tasks that need to be throttled"
+    },
+    {
+      "id": "npm/vaayne-agent-kit",
+      "name": "@vaayne/agent-kit",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/vaayne-agent-kit",
+      "checksum": {
+        "sha256": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a"
+      },
+      "source": {
+        "type": "npm",
+        "package": "vaayne-agent-kit",
+        "version": "1.0.0",
+        "url": "https://www.npmjs.com/package/vaayne-agent-kit"
+      },
+      "repository_url": "git+https://github.com/vaayne/agent-kit.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-01-27T08:28:18.692Z",
+      "version": "1.0.0",
+      "description": "Reusable skills and extensions for Pi coding agent"
+    },
+    {
+      "id": "npm/vaayne-pi-mcp",
+      "name": "@vaayne/pi-mcp",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/vaayne-pi-mcp",
+      "checksum": {
+        "sha256": "3d4e7d11ed0d4e145bbb1d48e2a0073197eade13079cad7ceacae3317435412e"
+      },
+      "source": {
+        "type": "npm",
+        "package": "vaayne-pi-mcp",
+        "version": "0.2.0",
+        "url": "https://www.npmjs.com/package/vaayne-pi-mcp"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/vaayne-pi-subagent",
+      "name": "@vaayne/pi-subagent",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/vaayne-pi-subagent",
+      "checksum": {
+        "sha256": "46686ae22598dfae424b80fcbe00dd5a7332e7db5eedc3048c490b46aacc70e0"
+      },
+      "source": {
+        "type": "npm",
+        "package": "vaayne-pi-subagent",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/vaayne-pi-subagent"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/vaayne-pi-web-tools",
+      "name": "@vaayne/pi-web-tools",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/vaayne-pi-web-tools",
+      "checksum": {
+        "sha256": "462a1bedf75121c15ead23426a8b86de2b73c2ea95a3da6c38456d9293b7fe50"
+      },
+      "source": {
+        "type": "npm",
+        "package": "vaayne-pi-web-tools",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/vaayne-pi-web-tools"
+      },
+      "repository_url": "git+https://github.com/googlechrome/workbox.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2025-11-19T17:46:27.913Z",
+      "version": "7.4.0",
+      "description": "A service worker helper library implementing common caching strategies."
+    },
+    {
+      "id": "npm/vpellegrino-pi-skills",
+      "name": "@vpellegrino/pi-skills",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/vpellegrino-pi-skills",
+      "checksum": {
+        "sha256": "8f6034974269cb16a2afd43af934ed82cc7f8c69a2c37ef7b4048aa39b531994"
+      },
+      "source": {
+        "type": "npm",
+        "package": "vpellegrino-pi-skills",
+        "version": "1.0.5",
+        "url": "https://www.npmjs.com/package/vpellegrino-pi-skills"
+      },
+      "repository_url": "git+https://github.com/badlogic/pi-mono.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-05T23:26:24.715Z",
+      "version": "0.52.6",
+      "description": "Coding agent CLI with read, bash, edit, write tools and session management"
+    },
+    {
+      "id": "npm/walterra-pi-charts",
+      "name": "@walterra/pi-charts",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/walterra-pi-charts",
+      "checksum": {
+        "sha256": "fdc7f399ad65241a2dce435ff95066d9726dd094dab63e0ba00fca2b44f3e438"
+      },
+      "source": {
+        "type": "npm",
+        "package": "walterra-pi-charts",
+        "version": "0.0.4",
+        "url": "https://www.npmjs.com/package/walterra-pi-charts"
+      },
+      "repository_url": "git+https://github.com/walterra/agent-tools.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T07:34:05.527Z",
+      "version": "0.0.4",
+      "description": "Vega-Lite chart extension for pi coding agent - render data visualizations as inline images"
+    },
+    {
+      "id": "npm/walterra-pi-graphviz",
+      "name": "@walterra/pi-graphviz",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/walterra-pi-graphviz",
+      "checksum": {
+        "sha256": "39ddfa33a2431d8078ae2c49e1e1d4fdd1ccc5d398e191a316053df0726cb101"
+      },
+      "source": {
+        "type": "npm",
+        "package": "walterra-pi-graphviz",
+        "version": "0.0.4",
+        "url": "https://www.npmjs.com/package/walterra-pi-graphviz"
+      },
+      "repository_url": "git+https://github.com/walterra/agent-tools.git",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T07:34:05.645Z",
+      "version": "0.0.4",
+      "description": "Graphviz chart extension for pi coding agent - render DOT diagrams as inline images"
+    },
+    {
+      "id": "npm/zenobius-pi-dcp",
+      "name": "@zenobius/pi-dcp",
+      "source_tier": "npm-registry",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/zenobius-pi-dcp",
+      "checksum": {
+        "sha256": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2"
+      },
+      "source": {
+        "type": "npm",
+        "package": "zenobius-pi-dcp",
+        "version": "0.1.0",
+        "url": "https://www.npmjs.com/package/zenobius-pi-dcp"
+      },
+      "repository_url": "https://www.npmjs.com/package/zenobius-pi-dcp",
+      "popularity": {
+        "npm_downloads_weekly": null,
+        "npm_downloads_monthly": null
+      },
+      "aliases": [],
+      "notes": null,
+      "published_at": "2026-02-03T06:36:56.045Z",
+      "version": "0.1.0",
+      "description": "Dynamic Context Pruning extension for pi - intelligently removes obsolete messages to optimize token usage"
+    },
+    {
+      "id": "overlay-qa-tests",
+      "name": "overlay-qa-tests",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/overlay-qa-tests",
+      "checksum": {
+        "sha256": "bf9f1a3be8ce1d0d8d4d96d9ef411defab10d06756e7a12ce58febddc9ba3c4b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/overlay-qa-tests.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "overlay-test",
+      "name": "overlay-test",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/overlay-test",
+      "checksum": {
+        "sha256": "a7ccdad170e3f68673e415144b2b995f63d116a3b966d351508c8b6e7cedbbc0"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/overlay-test.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "permission-gate",
+      "name": "permission-gate",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/permission-gate",
+      "checksum": {
+        "sha256": "d3d73f1d4b2dcea877564979ab797e46a79192e1613121f647da839afbe0bea1"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/permission-gate.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "pirate",
+      "name": "pirate",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/pirate",
+      "checksum": {
+        "sha256": "60b73aa9150a1e1e441310691ceeb1fc02c08e119975a9a151fcaa7e334de055"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/pirate.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "plan-mode",
+      "name": "plan-mode",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/plan-mode",
+      "checksum": {
+        "sha256": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "preset",
+      "name": "preset",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/preset",
+      "checksum": {
+        "sha256": "5b6675a52c54e0567ad4fb203f7b70adad4994e2e4e2d436b44f3f0f483d7c30"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/preset.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "protected-paths",
+      "name": "protected-paths",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/protected-paths",
+      "checksum": {
+        "sha256": "4a1d3f6628da9b93f28124085d58a864ceb57852d2df016603b897c3df7ba92b"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/protected-paths.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "qna",
+      "name": "qna",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/qna",
+      "checksum": {
+        "sha256": "ae359438f308bc86ecc4dbab766a9665853ccf78824c4b1c2192933e27843d66"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/qna.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "question",
+      "name": "question",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/question",
+      "checksum": {
+        "sha256": "bc55457385e5c4d4ccc6a1583a69e68cf2ba196b8052ab0abdc1848cd1d65bec"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/question.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "questionnaire",
+      "name": "questionnaire",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/questionnaire",
+      "checksum": {
+        "sha256": "99cbd301a86000e8a50e861396f7523b2a3c6a4dd10463b2c9e5c8e773f6f1ed"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/questionnaire.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "rainbow-editor",
+      "name": "rainbow-editor",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/rainbow-editor",
+      "checksum": {
+        "sha256": "db6b53ced476a4746c77c38c8ae1cf9a74f835899b0a0dcd8795e02fdbac4e15"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/rainbow-editor.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "rpc-demo",
+      "name": "rpc-demo",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/rpc-demo",
+      "checksum": {
+        "sha256": "ce2c285f6b4900da766fa143dab7ad58d3779cd39b537437807e7458d21a6f83"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/rpc-demo.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "sandbox",
+      "name": "pi-extension-sandbox",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/sandbox",
+      "checksum": {
+        "sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "send-user-message",
+      "name": "send-user-message",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/send-user-message",
+      "checksum": {
+        "sha256": "82fa2ff47441f8c1d21118ffd3c31c5fd6be4a70959c8c8bae5af2d378907f95"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/send-user-message.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "session-name",
+      "name": "session-name",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/session-name",
+      "checksum": {
+        "sha256": "5df0ce9bc28cabed038684803f48d77f786849aa03720f25ef1ca73d77a754ef"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/session-name.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "shutdown-command",
+      "name": "shutdown-command",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/shutdown-command",
+      "checksum": {
+        "sha256": "cc0e2521d0649a1f452daea39bdfdf01335fdefcf35d6fc33556b1a3c30a3a78"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/shutdown-command.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "snake",
+      "name": "snake",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/snake",
+      "checksum": {
+        "sha256": "bbc517362fc270018de83528867dcba5657f2abf246994e5ce3798457ef08f97"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/snake.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "space-invaders",
+      "name": "space-invaders",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/space-invaders",
+      "checksum": {
+        "sha256": "4503a565b6a6e76e0641322dc81e4ec28c974ca79d1b35a6cbad6a3fd317d7e5"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/space-invaders.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "ssh",
+      "name": "ssh",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/ssh",
+      "checksum": {
+        "sha256": "215182f7f2cbec3253676800a1634087dec1893938f50e304f859736ef06bc77"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/ssh.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "status-line",
+      "name": "status-line",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/status-line",
+      "checksum": {
+        "sha256": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/status-line.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "subagent",
+      "name": "subagent",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/subagent",
+      "checksum": {
+        "sha256": "f96041857c53f67acb940c4838fe9a48e032e03b147b3313850f23d4e77185fe"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/agents.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "summarize",
+      "name": "summarize",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/summarize",
+      "checksum": {
+        "sha256": "00c714ef20680fa7561a2bf9fbb6ef38984b8806a9e35ca31bea0d15bd2a4c31"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/summarize.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "system-prompt-header",
+      "name": "system-prompt-header",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/system-prompt-header",
+      "checksum": {
+        "sha256": "ad1a4f20208d1909359fc3e7a9973511984be6c17c8834131001f603f78744c9"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/system-prompt-header.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/aliou-pi-extensions",
+      "name": "aliou-pi-extensions",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/aliou-pi-extensions",
+      "checksum": {
+        "sha256": "60a1caf25626d1442662f3d1f7fbdc570727e26b049868798d49ec9c023f3863"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/aliou-pi-extensions"
+      },
+      "repository_url": "https://github.com/aliou-pi-extensions",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/ben-vargas-pi-packages",
+      "name": "ben-vargas-pi-packages",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/ben-vargas-pi-packages",
+      "checksum": {
+        "sha256": "cfcde6f2e0ad8e86c94a3235ddcfee996a19b690b3d3293e42d46a1e3ea5ceda"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/ben-vargas-pi-packages"
+      },
+      "repository_url": "https://github.com/ben-vargas-pi-packages",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/charles-cooper-pi-extensions",
+      "name": "charles-cooper-pi-extensions",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/charles-cooper-pi-extensions",
+      "checksum": {
+        "sha256": "3cac3471b6c4bcb5b4d9782aad3acb7bcd73c2a56812754a35c1e8e0501e932d"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/charles-cooper-pi-extensions"
+      },
+      "repository_url": "https://github.com/charles-cooper-pi-extensions",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/cv-pi-ssh-remote",
+      "name": "cv-pi-ssh-remote",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/cv-pi-ssh-remote",
+      "checksum": {
+        "sha256": "0bd8627f38acdff48bd1ac65507275b8e31d521d82881f0a4faa4780f842d9dd"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/cv-pi-ssh-remote"
+      },
+      "repository_url": "https://github.com/cv-pi-ssh-remote",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/graffioh-pi-screenshots-picker",
+      "name": "graffioh-pi-screenshots-picker",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/graffioh-pi-screenshots-picker",
+      "checksum": {
+        "sha256": "5181a60a6713abfcdd6c160d0ec25eb195ef44c2bb6692545dd1b8e4a52d2729"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/graffioh-pi-screenshots-picker"
+      },
+      "repository_url": "https://github.com/graffioh-pi-screenshots-picker",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/graffioh-pi-super-curl",
+      "name": "graffioh-pi-super-curl",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/graffioh-pi-super-curl",
+      "checksum": {
+        "sha256": "37e872926c3497b53ac9ae1b212a8fde43469fa489077b68b019117a4a12bc40"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/graffioh-pi-super-curl"
+      },
+      "repository_url": "https://github.com/graffioh-pi-super-curl",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/jyaunches-pi-canvas",
+      "name": "pi-canvas",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/jyaunches-pi-canvas",
+      "checksum": {
+        "sha256": "d4618898cb6343e1c0f92bd4c57aa12e58d67a75f301c0ef934a6f0503d02856"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/jyaunches/pi-canvas"
+      },
+      "repository_url": "https://github.com/jyaunches/pi-canvas",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions",
+      "name": "kcosr-pi-extensions",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/kcosr-pi-extensions",
+      "checksum": {
+        "sha256": "f6b3ff290505757043ea983c7dd25450fb9c72de3fac14a38a2bcbe6f97ddb93"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/kcosr-pi-extensions"
+      },
+      "repository_url": "https://github.com/kcosr-pi-extensions",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/limouren-agent-things",
+      "name": "limouren-agent-things",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/limouren-agent-things",
+      "checksum": {
+        "sha256": "21eee9be6d91393d856e1db08abadf41b691c0f704ff68c4e00f37d5af510b7d"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/limouren-agent-things"
+      },
+      "repository_url": "https://github.com/limouren-agent-things",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/lsj5031-pi-notification-extension",
+      "name": "lsj5031-pi-notification-extension",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/lsj5031-pi-notification-extension",
+      "checksum": {
+        "sha256": "e21fe411676c1cdabefe6cc2453f143fd3ad3f3db698074c5e0c1d400a679815"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/lsj5031-pi-notification-extension"
+      },
+      "repository_url": "https://github.com/lsj5031-pi-notification-extension",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/marckrenn-pi-sub",
+      "name": "marckrenn-pi-sub",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/marckrenn-pi-sub",
+      "checksum": {
+        "sha256": "33ba799ac71a1086058ad47fec013f18d08fcf5021cfa5f4729538a3ab90fe36"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/marckrenn-pi-sub"
+      },
+      "repository_url": "https://github.com/marckrenn-pi-sub",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/michalvavra-agents",
+      "name": "michalvavra-agents",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/michalvavra-agents",
+      "checksum": {
+        "sha256": "0dcfa4b6a577b6cea9c328b19f0d42d6df4fec2dfa1d0eb7d8251d26c6a94637"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/michalvavra-agents"
+      },
+      "repository_url": "https://github.com/michalvavra-agents",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/ogulcancelik-pi-sketch",
+      "name": "ogulcancelik-pi-sketch",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/ogulcancelik-pi-sketch",
+      "checksum": {
+        "sha256": "893ecf1c25c7c23b5b2a65c1b9812144fbd4b42a87a838b11b93f538c8e98568"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/ogulcancelik-pi-sketch"
+      },
+      "repository_url": "https://github.com/ogulcancelik-pi-sketch",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/openclaw-openclaw",
+      "name": "openclaw-openclaw",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/openclaw-openclaw",
+      "checksum": {
+        "sha256": "12eb25733887d8915edff35621a62e7f23d938a1a39cdeacb18c0a7add061d23"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/openclaw-openclaw"
+      },
+      "repository_url": "https://github.com/openclaw-openclaw",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/pasky-pi-amplike",
+      "name": "pasky-pi-amplike",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/pasky-pi-amplike",
+      "checksum": {
+        "sha256": "659340b537fa7e1fd67a970f5f7f562a6b3fe0fdac3d24c29941a38f7db6e6a3"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/pasky-pi-amplike"
+      },
+      "repository_url": "https://github.com/pasky-pi-amplike",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/qualisero-pi-agent-scip",
+      "name": "qualisero-pi-agent-scip",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/qualisero-pi-agent-scip",
+      "checksum": {
+        "sha256": "7144f23e52b21cff9cbd631f405309bbd3e3003a6b6c0a6b0814d14dd61e9ecd"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/qualisero-pi-agent-scip"
+      },
+      "repository_url": "https://github.com/qualisero-pi-agent-scip",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/raunovillberg-pi-stuffed",
+      "name": "raunovillberg-pi-stuffed",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/raunovillberg-pi-stuffed",
+      "checksum": {
+        "sha256": "e7202fee521d6e42ee4ff59fe17deebcca3f59de01b1d675bbd819d25f451a90"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/raunovillberg-pi-stuffed"
+      },
+      "repository_url": "https://github.com/raunovillberg-pi-stuffed",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/rytswd-direnv",
+      "name": "rytswd-direnv",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/rytswd-direnv",
+      "checksum": {
+        "sha256": "d6d18409b31c3b471c83f7b6b2c3d22538ecc526ad608af40a04f9a8b512161c"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/rytswd-direnv"
+      },
+      "repository_url": "https://github.com/rytswd-direnv",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/rytswd-questionnaire",
+      "name": "rytswd-questionnaire",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/rytswd-questionnaire",
+      "checksum": {
+        "sha256": "a96794e0f579c28b7277e3e0a937cdf43fc5b1e8b636bb567312bf13ff359e86"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/rytswd-questionnaire"
+      },
+      "repository_url": "https://github.com/rytswd-questionnaire",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/rytswd-slow-mode",
+      "name": "rytswd-slow-mode",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/rytswd-slow-mode",
+      "checksum": {
+        "sha256": "d29e116e17bcac2ca9d14509b9ab3b522c75f77b7d30d3c62cd7b2296510842b"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/rytswd-slow-mode"
+      },
+      "repository_url": "https://github.com/rytswd-slow-mode",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/vtemian-pi-config",
+      "name": "vtemian-pi-config",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/vtemian-pi-config",
+      "checksum": {
+        "sha256": "369c6db4b029cd0b7c5e5a09792130b908af87d01b1d1a818991a74c2dbc54fc"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/vtemian-pi-config"
+      },
+      "repository_url": "https://github.com/vtemian-pi-config",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/w-winter-dot314",
+      "name": "w-winter-dot314",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/w-winter-dot314",
+      "checksum": {
+        "sha256": "f91b288aab011778eb0cbac75849731c3d36ac2e2369cf23a28ccb990461b6a1"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/w-winter-dot314"
+      },
+      "repository_url": "https://github.com/w-winter-dot314",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "third-party/zenobi-us-pi-dcp",
+      "name": "zenobi-us-pi-dcp",
+      "source_tier": "third-party-github",
+      "status": "vendored",
+      "license": "UNKNOWN",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/third-party/zenobi-us-pi-dcp",
+      "checksum": {
+        "sha256": "0d1ae83f96d31489bbb01bc8cf27969a560fbe1510e5594b41a62126da5b9932"
+      },
+      "source": {
+        "type": "url",
+        "url": "https://github.com/zenobi-us-pi-dcp"
+      },
+      "repository_url": "https://github.com/zenobi-us-pi-dcp",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "timed-confirm",
+      "name": "timed-confirm",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/timed-confirm",
+      "checksum": {
+        "sha256": "1a263aeed2429cd08647d48432bf4aca42806bf801aca1dae7dc5cb40ed17b50"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/timed-confirm.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "titlebar-spinner",
+      "name": "titlebar-spinner",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/titlebar-spinner",
+      "checksum": {
+        "sha256": "80c0590aab9851dea93d5ece66c5c0f1a1192abdbd41225216375467350ffb47"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/titlebar-spinner.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "todo",
+      "name": "todo",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/todo",
+      "checksum": {
+        "sha256": "31a2be2d4f47ea22b054f6bb8732c491e9ee08f9b3decf6307495534c4df6dec"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/todo.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "tool-override",
+      "name": "tool-override",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/tool-override",
+      "checksum": {
+        "sha256": "b4d1e4d1aab08c2410958fa690f5dfab120667d0e04f53b8bc9248fbdb3f1fbb"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/tool-override.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "tools",
+      "name": "tools",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/tools",
+      "checksum": {
+        "sha256": "a2d13c338790648a1fea4ce01642765725708d7e88d51e3adef1517153c7b046"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/tools.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "trigger-compact",
+      "name": "trigger-compact",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/trigger-compact",
+      "checksum": {
+        "sha256": "95c4b7b4a624b0998746a53c79a9de84ee56a8a8c015b2af04fb8890b2b8de8d"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/trigger-compact.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "truncated-tool",
+      "name": "truncated-tool",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/truncated-tool",
+      "checksum": {
+        "sha256": "3751f5db4845438111c8346f4d0c975de07c65d2ee2445b1a6cca3b570a0f077"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/truncated-tool.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "widget-placement",
+      "name": "widget-placement",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/widget-placement",
+      "checksum": {
+        "sha256": "9dc59e893eebd95e7a30aaeae140b9dad721ecbe388ac24afb0f034a13be507f"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/widget-placement.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    },
+    {
+      "id": "with-deps",
+      "name": "pi-extension-with-deps",
+      "source_tier": "official-pi-mono",
+      "status": "vendored",
+      "license": "MIT",
+      "retrieved": "2026-02-05",
+      "artifact_path": "tests/ext_conformance/artifacts/with-deps",
+      "checksum": {
+        "sha256": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293"
+      },
+      "source": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts"
+      },
+      "repository_url": "https://github.com/badlogic/pi-mono",
+      "popularity": {},
+      "aliases": [],
+      "notes": null
+    }
+  ],
+  "alias_notes": [
+    {
+      "note": "Alias relationships are intentionally kept manual/curated. Many vendored candidates are mirrored inside badlogic/pi-mono, so repository_url-based grouping is too noisy."
+    },
+    {
+      "note": "Current manual aliases focus on high-signal npm packages that appear vendored as community mirrors under pi-mono."
+    }
+  ]
+}
