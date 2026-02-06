@@ -37,6 +37,7 @@ pub struct OpenAIProvider {
     client: Client,
     model: String,
     base_url: String,
+    provider: String,
 }
 
 impl OpenAIProvider {
@@ -46,7 +47,18 @@ impl OpenAIProvider {
             client: Client::new(),
             model: model.into(),
             base_url: OPENAI_API_URL.to_string(),
+            provider: "openai".to_string(),
         }
+    }
+
+    /// Override the provider name reported in streamed events.
+    ///
+    /// This is useful for OpenAI-compatible backends (Groq, Together, etc.) that use this
+    /// implementation but should still surface their own provider identifier in session logs.
+    #[must_use]
+    pub fn with_provider_name(mut self, provider: impl Into<String>) -> Self {
+        self.provider = provider.into();
+        self
     }
 
     /// Create with a custom base URL (for Azure, Groq, etc.).
@@ -111,8 +123,8 @@ impl OpenAIProvider {
 
 #[async_trait]
 impl Provider for OpenAIProvider {
-    fn name(&self) -> &'static str {
-        "openai"
+    fn name(&self) -> &str {
+        &self.provider
     }
 
     fn api(&self) -> &'static str {

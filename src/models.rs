@@ -258,6 +258,7 @@ fn built_in_models(auth: &AuthStorage) -> Vec<ModelEntry> {
     models
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config: &ModelsConfig) {
     for (provider_id, provider_cfg) in &config.providers {
         let provider_api = provider_cfg.api.as_deref().unwrap_or("openai-completions");
@@ -287,8 +288,14 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 .iter_mut()
                 .filter(|m| m.model.provider == *provider_id)
             {
-                entry.model.base_url.clone_from(&provider_base);
-                entry.model.api.clone_from(&provider_api_string);
+                // Only override base_url and api if explicitly set in models.json.
+                // Otherwise keep the built-in defaults (e.g. anthropic's /v1/messages URL).
+                if provider_cfg.base_url.is_some() {
+                    entry.model.base_url.clone_from(&provider_base);
+                }
+                if provider_cfg.api.is_some() {
+                    entry.model.api.clone_from(&provider_api_string);
+                }
                 entry.headers.clone_from(&provider_headers);
                 if provider_key.is_some() {
                     entry.api_key.clone_from(&provider_key);
@@ -296,7 +303,9 @@ fn apply_custom_models(auth: &AuthStorage, models: &mut Vec<ModelEntry>, config:
                 if provider_cfg.compat.is_some() {
                     entry.compat.clone_from(&provider_cfg.compat);
                 }
-                entry.auth_header = auth_header;
+                if provider_cfg.auth_header.is_some() {
+                    entry.auth_header = auth_header;
+                }
             }
             continue;
         }
@@ -482,12 +491,28 @@ fn ad_hoc_provider_defaults(provider: &str) -> Option<AdHocProviderDefaults> {
             context_window: 128_000,
             max_tokens: 8192,
         }),
+        "cohere" => Some(AdHocProviderDefaults {
+            api: "cohere-chat",
+            base_url: "https://api.cohere.com/v2",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 8192,
+        }),
 
         // OpenAI-compatible providers (chat/completions).
         // Sources: Vercel AI SDK + opencode fixture.
         "groq" => Some(AdHocProviderDefaults {
             api: "openai-completions",
             base_url: "https://api.groq.com/openai/v1",
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        "deepinfra" => Some(AdHocProviderDefaults {
+            api: "openai-completions",
+            base_url: "https://api.deepinfra.com/v1/openai",
             reasoning: true,
             input: &INPUT_TEXT,
             context_window: 128_000,

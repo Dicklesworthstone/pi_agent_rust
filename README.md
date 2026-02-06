@@ -325,7 +325,9 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
 | `OPENAI_API_KEY` | OpenAI API key |
 | `GOOGLE_API_KEY` | Google Gemini API key |
 | `AZURE_OPENAI_API_KEY` | Azure OpenAI API key |
+| `COHERE_API_KEY` | Cohere API key |
 | `GROQ_API_KEY` | Groq API key (OpenAI-compatible) |
+| `DEEPINFRA_API_KEY` | DeepInfra API key (OpenAI-compatible) |
 | `CEREBRAS_API_KEY` | Cerebras API key (OpenAI-compatible) |
 | `OPENROUTER_API_KEY` | OpenRouter API key (OpenAI-compatible) |
 | `MISTRAL_API_KEY` | Mistral API key (OpenAI-compatible) |

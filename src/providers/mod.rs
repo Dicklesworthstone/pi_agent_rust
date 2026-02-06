@@ -22,8 +22,10 @@ use std::sync::Arc;
 
 pub mod anthropic;
 pub mod azure;
+pub mod cohere;
 pub mod gemini;
 pub mod openai;
+pub mod openai_responses;
 
 fn vcr_client_if_enabled() -> Result<Option<Client>> {
     if env::var(VCR_ENV_MODE).is_err() {
@@ -453,9 +455,30 @@ pub fn create_provider(
             ));
         }
         "openai" => {
+            // Built-in OpenAI provider can speak either chat completions or responses,
+            // based on the configured `api` field.
+            if entry.model.api == "openai-completions" {
+                return Ok(Arc::new(
+                    openai::OpenAIProvider::new(entry.model.id.clone())
+                        .with_provider_name(entry.model.provider.clone())
+                        .with_base_url(normalize_openai_base(&entry.model.base_url))
+                        .with_client(client),
+                ));
+            }
+
+            // Default to the newer Responses API.
             return Ok(Arc::new(
-                openai::OpenAIProvider::new(entry.model.id.clone())
-                    .with_base_url(normalize_openai_base(&entry.model.base_url))
+                openai_responses::OpenAIResponsesProvider::new(entry.model.id.clone())
+                    .with_provider_name(entry.model.provider.clone())
+                    .with_base_url(normalize_openai_responses_base(&entry.model.base_url))
+                    .with_client(client),
+            ));
+        }
+        "cohere" => {
+            return Ok(Arc::new(
+                cohere::CohereProvider::new(entry.model.id.clone())
+                    .with_provider_name(entry.model.provider.clone())
+                    .with_base_url(normalize_cohere_base(&entry.model.base_url))
                     .with_client(client),
             ));
         }
@@ -482,9 +505,22 @@ pub fn create_provider(
                 .with_base_url(entry.model.base_url.clone())
                 .with_client(client),
         )),
-        "openai-completions" | "openai-responses" => Ok(Arc::new(
+        "openai-completions" => Ok(Arc::new(
             openai::OpenAIProvider::new(entry.model.id.clone())
+                .with_provider_name(entry.model.provider.clone())
                 .with_base_url(normalize_openai_base(&entry.model.base_url))
+                .with_client(client),
+        )),
+        "openai-responses" => Ok(Arc::new(
+            openai_responses::OpenAIResponsesProvider::new(entry.model.id.clone())
+                .with_provider_name(entry.model.provider.clone())
+                .with_base_url(normalize_openai_responses_base(&entry.model.base_url))
+                .with_client(client),
+        )),
+        "cohere-chat" => Ok(Arc::new(
+            cohere::CohereProvider::new(entry.model.id.clone())
+                .with_provider_name(entry.model.provider.clone())
+                .with_base_url(normalize_cohere_base(&entry.model.base_url))
                 .with_client(client),
         )),
         "google-generative-ai" => Ok(Arc::new(
@@ -501,13 +537,39 @@ pub fn create_provider(
 
 pub fn normalize_openai_base(base_url: &str) -> String {
     let base_url = base_url.trim_end_matches('/');
-    if base_url.ends_with("/chat/completions") || base_url.ends_with("/responses") {
+    if base_url.ends_with("/chat/completions") {
         return base_url.to_string();
     }
+    let base_url = base_url.strip_suffix("/responses").unwrap_or(base_url);
     if base_url.ends_with("/v1") {
         return format!("{base_url}/chat/completions");
     }
     format!("{base_url}/chat/completions")
+}
+
+pub fn normalize_openai_responses_base(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/responses") {
+        return base_url.to_string();
+    }
+    let base_url = base_url
+        .strip_suffix("/chat/completions")
+        .unwrap_or(base_url);
+    if base_url.ends_with("/v1") {
+        return format!("{base_url}/responses");
+    }
+    format!("{base_url}/responses")
+}
+
+pub fn normalize_cohere_base(base_url: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    if base_url.ends_with("/chat") {
+        return base_url.to_string();
+    }
+    if base_url.ends_with("/v2") {
+        return format!("{base_url}/chat");
+    }
+    format!("{base_url}/chat")
 }
 
 #[cfg(test)]
