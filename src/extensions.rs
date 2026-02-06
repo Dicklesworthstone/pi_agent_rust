@@ -9574,6 +9574,298 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn js_hostcall_capability_denial_matrix_emits_deterministic_errors_and_logs() {
+        use std::sync::Arc;
+
+        #[derive(Clone)]
+        struct DenyCase {
+            call_id: &'static str,
+            kind: crate::extensions_js::HostcallKind,
+            payload: serde_json::Value,
+            capability: &'static str,
+            reason: &'static str,
+        }
+
+        fn to_request(case: &DenyCase) -> crate::extensions_js::HostcallRequest {
+            crate::extensions_js::HostcallRequest {
+                call_id: case.call_id.to_string(),
+                kind: case.kind.clone(),
+                payload: case.payload.clone(),
+                trace_id: 0,
+                extension_id: Some("ext.test".to_string()),
+            }
+        }
+
+        fn assert_denied(outcome: &HostcallOutcome, capability: &str, reason: &str) {
+            match outcome {
+                HostcallOutcome::Error { code, message } => {
+                    assert_eq!(code, "denied");
+                    assert!(
+                        message.contains(&format!(
+                            "Capability '{capability}' denied by policy ({reason})"
+                        )),
+                        "unexpected denial message: {message}"
+                    );
+                }
+                other @ HostcallOutcome::Success(_) => {
+                    panic!("expected denied outcome for capability={capability}, got {other:?}");
+                }
+            }
+        }
+
+        fn assert_policy_decision_logged(
+            events: &[CapturedEvent],
+            call_id: &str,
+            capability: &str,
+            reason: &str,
+        ) {
+            let matching = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .fields
+                        .get("event")
+                        .is_some_and(|value| value.contains("policy.decision"))
+                        && event
+                            .fields
+                            .get("call_id")
+                            .is_some_and(|value| value.contains(call_id))
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                !matching.is_empty(),
+                "expected policy.decision log for call_id={call_id}; got events: {events:#?}"
+            );
+
+            assert!(
+                matching.iter().any(|event| {
+                    event.level == tracing::Level::WARN
+                        && event
+                            .fields
+                            .get("capability")
+                            .is_some_and(|value| value.contains(capability))
+                        && event
+                            .fields
+                            .get("reason")
+                            .is_some_and(|value| value.contains(reason))
+                }),
+                "expected WARN policy.decision with capability={capability} reason={reason} for call_id={call_id}; got: {matching:#?}"
+            );
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let tools = Arc::new(crate::tools::ToolRegistry::new(
+            &["read", "write", "bash"],
+            &cwd,
+            None,
+        ));
+
+        // Strict: deny anything not in default_caps.
+        let mgr_strict = ExtensionManager::new();
+        let host_strict = JsRuntimeHost {
+            tools: Arc::clone(&tools),
+            manager_ref: Arc::downgrade(&mgr_strict.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: vec!["read".to_string()],
+                deny_caps: Vec::new(),
+            },
+            interceptor: None,
+        };
+
+        let strict_cases = vec![
+            DenyCase {
+                call_id: "deny-strict-exec",
+                kind: crate::extensions_js::HostcallKind::Exec {
+                    cmd: "does-not-run".to_string(),
+                },
+                payload: serde_json::json!({}),
+                capability: "exec",
+                reason: "not_in_default_caps",
+            },
+            DenyCase {
+                call_id: "deny-strict-http",
+                kind: crate::extensions_js::HostcallKind::Http,
+                payload: serde_json::json!({ "url": "https://example.com", "method": "GET" }),
+                capability: "http",
+                reason: "not_in_default_caps",
+            },
+            DenyCase {
+                call_id: "deny-strict-session",
+                kind: crate::extensions_js::HostcallKind::Session {
+                    op: "get_name".to_string(),
+                },
+                payload: serde_json::json!({}),
+                capability: "session",
+                reason: "not_in_default_caps",
+            },
+            DenyCase {
+                call_id: "deny-strict-ui",
+                kind: crate::extensions_js::HostcallKind::Ui {
+                    op: "confirm".to_string(),
+                },
+                payload: serde_json::json!({ "title": "t", "message": "m" }),
+                capability: "ui",
+                reason: "not_in_default_caps",
+            },
+            DenyCase {
+                call_id: "deny-strict-events",
+                kind: crate::extensions_js::HostcallKind::Events {
+                    op: "getTools".to_string(),
+                },
+                payload: serde_json::json!({}),
+                capability: "events",
+                reason: "not_in_default_caps",
+            },
+            // Use a tool hostcall to cover filesystem-ish access (write capability).
+            DenyCase {
+                call_id: "deny-strict-write",
+                kind: crate::extensions_js::HostcallKind::Tool {
+                    name: "write".to_string(),
+                },
+                payload: serde_json::json!({ "path": "note.txt", "content": "hi" }),
+                capability: "write",
+                reason: "not_in_default_caps",
+            },
+        ];
+
+        let (strict_outcomes, strict_events) = capture_tracing_events(|| {
+            run_async(async {
+                let mut out = Vec::new();
+                for case in &strict_cases {
+                    let outcome = super::dispatch_hostcall(&host_strict, to_request(case)).await;
+                    out.push((case.call_id, case.capability, case.reason, outcome));
+                }
+                out
+            })
+        });
+
+        for (call_id, capability, reason, outcome) in &strict_outcomes {
+            assert_denied(outcome, capability, reason);
+            assert_policy_decision_logged(&strict_events, call_id, capability, reason);
+        }
+
+        // Prompt: non-default capabilities trigger UI, simulate user deny for each capability.
+        let manager_prompt = ExtensionManager::new();
+        let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(16);
+        manager_prompt.set_ui_sender(ui_tx);
+
+        let manager_for_ui = manager_prompt.clone();
+        let prompt_count = strict_cases.len();
+        let ui_join = std::thread::spawn(move || {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build asupersync runtime");
+            runtime.block_on(async move {
+                let cx = asupersync::Cx::for_request();
+                for _ in 0..prompt_count {
+                    let request = ui_rx.recv(&cx).await.expect("ui request");
+                    assert_eq!(request.method, "confirm");
+
+                    assert!(
+                        manager_for_ui.respond_ui(ExtensionUiResponse {
+                            id: request.id,
+                            value: Some(serde_json::Value::Bool(false)),
+                            cancelled: false,
+                        }),
+                        "respond_ui"
+                    );
+                }
+            });
+        });
+
+        let host_prompt = JsRuntimeHost {
+            tools: Arc::clone(&tools),
+            manager_ref: Arc::downgrade(&manager_prompt.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Prompt,
+                max_memory_mb: 256,
+                default_caps: vec!["read".to_string()],
+                deny_caps: Vec::new(),
+            },
+            interceptor: None,
+        };
+
+        let prompt_cases = strict_cases
+            .iter()
+            .map(|case| DenyCase {
+                call_id: match case.call_id {
+                    "deny-strict-exec" => "deny-prompt-exec",
+                    "deny-strict-http" => "deny-prompt-http",
+                    "deny-strict-session" => "deny-prompt-session",
+                    "deny-strict-ui" => "deny-prompt-ui",
+                    "deny-strict-events" => "deny-prompt-events",
+                    "deny-strict-write" => "deny-prompt-write",
+                    _ => "deny-prompt-unknown",
+                },
+                kind: case.kind.clone(),
+                payload: case.payload.clone(),
+                capability: case.capability,
+                reason: "prompt_user_deny",
+            })
+            .collect::<Vec<_>>();
+
+        let (prompt_outcomes, prompt_events) = capture_tracing_events(|| {
+            run_async(async {
+                let mut out = Vec::new();
+                for case in &prompt_cases {
+                    let outcome = super::dispatch_hostcall(&host_prompt, to_request(case)).await;
+                    out.push((case.call_id, case.capability, case.reason, outcome));
+                }
+                out
+            })
+        });
+
+        ui_join.join().expect("ui thread join");
+
+        for (call_id, capability, reason, outcome) in &prompt_outcomes {
+            assert_denied(outcome, capability, reason);
+            assert_policy_decision_logged(&prompt_events, call_id, capability, reason);
+        }
+
+        // Permissive: deny_caps still takes precedence and must produce deterministic denial.
+        let mgr_perm = ExtensionManager::new();
+        let host_perm = JsRuntimeHost {
+            tools,
+            manager_ref: Arc::downgrade(&mgr_perm.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: vec!["http".to_string()],
+            },
+            interceptor: None,
+        };
+
+        let perm_case = DenyCase {
+            call_id: "deny-permissive-http",
+            kind: crate::extensions_js::HostcallKind::Http,
+            payload: serde_json::json!({ "url": "https://example.com" }),
+            capability: "http",
+            reason: "deny_caps",
+        };
+
+        let (perm_outcome, perm_events) = capture_tracing_events(|| {
+            run_async(async { super::dispatch_hostcall(&host_perm, to_request(&perm_case)).await })
+        });
+
+        assert_denied(&perm_outcome, perm_case.capability, perm_case.reason);
+        assert_policy_decision_logged(
+            &perm_events,
+            perm_case.call_id,
+            perm_case.capability,
+            perm_case.reason,
+        );
+    }
+
+    #[test]
     fn js_hostcall_routes_write_and_read_tools_when_allowed() {
         use std::sync::Arc;
 
