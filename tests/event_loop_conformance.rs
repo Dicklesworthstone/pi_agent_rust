@@ -98,7 +98,7 @@ fn run_case(case: &Case) {
             Op::ClearTimeout { timer } => {
                 let id = *timers
                     .get(timer.as_str())
-                    .unwrap_or_else(|| panic!("{}: step {idx}: unknown timer {timer}", case.name));
+                    .unwrap_or_else(|| unreachable!("{}: step {idx}: unknown timer {timer}", case.name));
                 loop_state.clear_timeout(id);
             }
             Op::EnqueueHostcallCompletion { call_id } => {
@@ -139,7 +139,7 @@ fn run_case(case: &Case) {
                     },
                     ExpectedTask::TimerFired { timer } => {
                         let timer_id = *timers.get(timer.as_str()).unwrap_or_else(|| {
-                            panic!("{}: step {idx}: unknown timer {timer}", case.name)
+                            unreachable!("{}: step {idx}: unknown timer {timer}", case.name)
                         });
                         ObservedTask::TimerFired { timer_id }
                     }
@@ -600,7 +600,7 @@ fn lab_virtual_time_timer_ordering() {
             assert_eq!(*id1, 2, "first 100ms timer");
             assert_eq!(*id2, 4, "second 100ms timer (same deadline, later seq)");
         }
-        _ => panic!("expected two TimerFired, got {t1:?} and {t2:?}"),
+        _ => unreachable!("expected two TimerFired, got {t1:?} and {t2:?}"),
     }
 
     // Step 2: advance to 250ms — the 200ms timer fires.
@@ -611,7 +611,7 @@ fn lab_virtual_time_timer_ordering() {
         scheduler::MacrotaskKind::TimerFired { timer_id } => {
             assert_eq!(*timer_id, 3, "200ms timer");
         }
-        _ => panic!("expected TimerFired, got {t3:?}"),
+        _ => unreachable!("expected TimerFired, got {t3:?}"),
     }
 
     // Step 3: advance to 400ms — the 300ms timer fires.
@@ -622,7 +622,7 @@ fn lab_virtual_time_timer_ordering() {
         scheduler::MacrotaskKind::TimerFired { timer_id } => {
             assert_eq!(*timer_id, 1, "300ms timer");
         }
-        _ => panic!("expected TimerFired, got {t4:?}"),
+        _ => unreachable!("expected TimerFired, got {t4:?}"),
     }
     drop(s);
 }
