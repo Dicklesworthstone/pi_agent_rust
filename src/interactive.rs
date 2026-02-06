@@ -5339,6 +5339,16 @@ impl PiApp {
         Arc::clone(&self.session)
     }
 
+    /// Get the current status message (for testing).
+    pub fn status_message(&self) -> Option<&str> {
+        self.status_message.as_deref()
+    }
+
+    /// Check if the branch picker is currently open (for testing).
+    pub const fn has_branch_picker(&self) -> bool {
+        self.branch_picker.is_some()
+    }
+
     /// Initialize the application.
     fn init(&self) -> Option<Cmd> {
         // Start text input cursor blink and spinner
@@ -5913,7 +5923,7 @@ impl PiApp {
     }
 
     /// Handle keyboard input when the branch picker overlay is active.
-    fn handle_branch_picker_key(&mut self, key: &KeyMsg) -> Option<Cmd> {
+    pub fn handle_branch_picker_key(&mut self, key: &KeyMsg) -> Option<Cmd> {
         let picker = self.branch_picker.as_mut()?;
 
         match key.key_type {
@@ -6029,7 +6039,7 @@ impl PiApp {
     }
 
     /// Open the branch picker if the session has sibling branches.
-    fn open_branch_picker(&mut self) {
+    pub fn open_branch_picker(&mut self) {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot switch branches while processing".to_string());
             return;
@@ -6053,7 +6063,7 @@ impl PiApp {
     }
 
     /// Cycle to the next or previous sibling branch (Ctrl+Right / Ctrl+Left).
-    fn cycle_sibling_branch(&mut self, forward: bool) {
+    pub fn cycle_sibling_branch(&mut self, forward: bool) {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot switch branches while processing".to_string());
             return;
@@ -6076,7 +6086,7 @@ impl PiApp {
         if let Some(leaf_id) = target {
             self.switch_to_branch_leaf(&leaf_id);
         } else {
-            self.status_message = Some("No sibling branches to cycle through".to_string());
+            self.status_message = Some("No sibling branches (use /fork to create one)".to_string());
         }
     }
 

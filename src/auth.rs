@@ -279,12 +279,38 @@ impl AuthStorage {
             }
         }
 
-        for (provider, refresh_token, config) in refreshes {
-            let refreshed = refresh_extension_oauth_token(client, &config, &refresh_token).await?;
-            self.entries.insert(provider, refreshed);
-            self.save_async().await?;
+        if !refreshes.is_empty() {
+            tracing::info!(
+                event = "pi.auth.extension_oauth_refresh.start",
+                count = refreshes.len(),
+                "Refreshing expired extension OAuth tokens"
+            );
         }
-
+        for (provider, refresh_token, config) in refreshes {
+            let start = std::time::Instant::now();
+            match refresh_extension_oauth_token(client, &config, &refresh_token).await {
+                Ok(refreshed) => {
+                    tracing::info!(
+                        event = "pi.auth.extension_oauth_refresh.ok",
+                        provider = %provider,
+                        elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "Extension OAuth token refreshed"
+                    );
+                    self.entries.insert(provider, refreshed);
+                    self.save_async().await?;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        event = "pi.auth.extension_oauth_refresh.error",
+                        provider = %provider,
+                        error = %e,
+                        elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "Failed to refresh extension OAuth token"
+                    );
+                    return Err(e);
+                }
+            }
+        }
         Ok(())
     }
 }

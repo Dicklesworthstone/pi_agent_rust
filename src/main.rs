@@ -370,7 +370,34 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         if let Some(region) = &agent_session.extensions {
             let ext_entries = region.manager().extension_model_entries();
             if !ext_entries.is_empty() {
+                // Build OAuth configs map from model entries before merging.
+                let ext_oauth_configs: std::collections::HashMap<String, pi::models::OAuthConfig> =
+                    ext_entries
+                        .iter()
+                        .filter_map(|entry| {
+                            entry
+                                .oauth_config
+                                .as_ref()
+                                .map(|cfg| (entry.model.provider.clone(), cfg.clone()))
+                        })
+                        .collect();
+
                 model_registry.merge_entries(ext_entries);
+
+                // Refresh expired OAuth tokens for extension-registered providers.
+                if !ext_oauth_configs.is_empty() {
+                    let client = pi::http::client::Client::new();
+                    if let Err(e) = auth
+                        .refresh_expired_extension_oauth_tokens(&client, &ext_oauth_configs)
+                        .await
+                    {
+                        tracing::warn!(
+                            event = "pi.auth.extension_oauth_refresh.failed",
+                            error = %e,
+                            "Failed to refresh extension OAuth tokens, continuing with existing credentials"
+                        );
+                    }
+                }
             }
         }
     }

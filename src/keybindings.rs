@@ -1391,12 +1391,15 @@ impl KeyBindings {
         m.insert(AppAction::NewSession, vec![]);
         m.insert(AppAction::Tree, vec![]);
         m.insert(AppAction::Fork, vec![]);
-        m.insert(AppAction::BranchPicker, vec![KeyBinding::ctrl("b")]);
+        m.insert(AppAction::BranchPicker, vec![]);
         m.insert(
             AppAction::BranchNextSibling,
-            vec![KeyBinding::ctrl("right")],
+            vec![KeyBinding::ctrl_shift("right")],
         );
-        m.insert(AppAction::BranchPrevSibling, vec![KeyBinding::ctrl("left")]);
+        m.insert(
+            AppAction::BranchPrevSibling,
+            vec![KeyBinding::ctrl_shift("left")],
+        );
 
         // Models & Thinking
         m.insert(AppAction::SelectModel, vec![KeyBinding::ctrl("l")]);

@@ -221,47 +221,80 @@ where
         loop {
             match Pin::new(&mut self.inner).poll_next(cx) {
                 Poll::Ready(Some(Ok(bytes))) => {
-                    self.utf8_buffer.extend_from_slice(&bytes);
-
-                    // Determine how much of the buffer is valid UTF-8.
-                    // Take the bytes out so we can borrow self.parser mutably without fighting
-                    // the borrow checker over self.utf8_buffer.
-                    let mut utf8_buffer = std::mem::take(&mut self.utf8_buffer);
-
-                    let parsed = match std::str::from_utf8(&utf8_buffer) {
-                        Ok(s) => Some((utf8_buffer.len(), self.parser.feed(s))),
-                        Err(e) => {
-                            if e.error_len().is_some() {
-                                // Restore buffer so callers can inspect state if they want.
-                                self.utf8_buffer = utf8_buffer;
-                                return Poll::Ready(Some(Err(std::io::Error::new(
-                                    std::io::ErrorKind::InvalidData,
-                                    e,
-                                ))));
+                    if self.utf8_buffer.is_empty() {
+                        // Fast path: when we don't have a pending UTF-8 tail, avoid copying the
+                        // entire chunk into `utf8_buffer`. Most provider streams are UTF-8 aligned.
+                        match std::str::from_utf8(&bytes) {
+                            Ok(s) => {
+                                let events = self.parser.feed(s);
+                                self.pending_events.extend(events);
                             }
-                            let valid_len = e.valid_up_to();
-                            if valid_len == 0 {
-                                None
+                            Err(e) => {
+                                if e.error_len().is_some() {
+                                    // Preserve the offending bytes for diagnostics.
+                                    self.utf8_buffer = bytes;
+                                    return Poll::Ready(Some(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        e,
+                                    ))));
+                                }
+
+                                let valid_len = e.valid_up_to();
+                                if valid_len > 0 {
+                                    let s = std::str::from_utf8(&bytes[..valid_len]).unwrap();
+                                    let events = self.parser.feed(s);
+                                    self.pending_events.extend(events);
+                                }
+
+                                // Keep only the trailing incomplete UTF-8 bytes (no allocation).
+                                let mut remainder = bytes;
+                                remainder.drain(..valid_len);
+                                self.utf8_buffer = remainder;
+                            }
+                        }
+                    } else {
+                        self.utf8_buffer.extend_from_slice(&bytes);
+
+                        // Determine how much of the buffer is valid UTF-8.
+                        // Take the bytes out so we can borrow self.parser mutably without fighting
+                        // the borrow checker over self.utf8_buffer.
+                        let mut utf8_buffer = std::mem::take(&mut self.utf8_buffer);
+
+                        let parsed = match std::str::from_utf8(&utf8_buffer) {
+                            Ok(s) => Some((utf8_buffer.len(), self.parser.feed(s))),
+                            Err(e) => {
+                                if e.error_len().is_some() {
+                                    // Restore buffer so callers can inspect state if they want.
+                                    self.utf8_buffer = utf8_buffer;
+                                    return Poll::Ready(Some(Err(std::io::Error::new(
+                                        std::io::ErrorKind::InvalidData,
+                                        e,
+                                    ))));
+                                }
+                                let valid_len = e.valid_up_to();
+                                if valid_len == 0 {
+                                    None
+                                } else {
+                                    let s = std::str::from_utf8(&utf8_buffer[..valid_len]).unwrap();
+                                    Some((valid_len, self.parser.feed(s)))
+                                }
+                            }
+                        };
+
+                        if let Some((valid_len, events)) = parsed {
+                            self.pending_events.extend(events);
+
+                            // Remove the consumed bytes efficiently.
+                            if valid_len == utf8_buffer.len() {
+                                utf8_buffer.clear();
                             } else {
-                                let s = std::str::from_utf8(&utf8_buffer[..valid_len]).unwrap();
-                                Some((valid_len, self.parser.feed(s)))
+                                // Keep only the trailing incomplete UTF-8 bytes (no allocation).
+                                utf8_buffer.drain(..valid_len);
                             }
                         }
-                    };
 
-                    if let Some((valid_len, events)) = parsed {
-                        self.pending_events.extend(events);
-
-                        // Remove the consumed bytes efficiently.
-                        if valid_len == utf8_buffer.len() {
-                            utf8_buffer.clear();
-                        } else {
-                            // Keep only the trailing incomplete UTF-8 bytes (no allocation).
-                            utf8_buffer.drain(..valid_len);
-                        }
+                        self.utf8_buffer = utf8_buffer;
                     }
-
-                    self.utf8_buffer = utf8_buffer;
 
                     // If we have pending events, return the first one
                     if let Some(event) = self.pending_events.pop_front() {

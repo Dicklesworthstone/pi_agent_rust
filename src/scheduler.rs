@@ -122,6 +122,15 @@ pub enum HostcallOutcome {
     Success(serde_json::Value),
     /// Error result.
     Error { code: String, message: String },
+    /// Incremental stream chunk.
+    StreamChunk {
+        /// Monotonically increasing sequence number per call.
+        sequence: u64,
+        /// Arbitrary JSON payload for this chunk.
+        chunk: serde_json::Value,
+        /// `true` on the final chunk.
+        is_final: bool,
+    },
 }
 
 /// A macrotask in the queue.
@@ -359,6 +368,24 @@ impl<C: Clock> Scheduler<C> {
         self.macrotask_queue.push_back(task);
     }
 
+    /// Convenience: enqueue a stream chunk for a hostcall.
+    pub fn enqueue_stream_chunk(
+        &mut self,
+        call_id: String,
+        sequence: u64,
+        chunk: serde_json::Value,
+        is_final: bool,
+    ) {
+        self.enqueue_hostcall_complete(
+            call_id,
+            HostcallOutcome::StreamChunk {
+                sequence,
+                chunk,
+                is_final,
+            },
+        );
+    }
+
     /// Enqueue an inbound event from the host.
     pub fn enqueue_event(&mut self, event_id: String, payload: serde_json::Value) {
         let seq = self.next_seq();
@@ -540,7 +567,7 @@ mod tests {
         assert!(task.is_some());
         match task.unwrap().kind {
             MacrotaskKind::TimerFired { timer_id: id } => assert_eq!(id, timer_id),
-            other => panic!("Expected TimerFired, got {other:?}"),
+            other => unreachable!("Expected TimerFired, got {other:?}"),
         }
     }
 
@@ -564,15 +591,15 @@ mod tests {
 
         match task1.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t1),
-            other => panic!("Expected t1, got {other:?}"),
+            other => unreachable!("Expected t1, got {other:?}"),
         }
         match task2.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t2),
-            other => panic!("Expected t2, got {other:?}"),
+            other => unreachable!("Expected t2, got {other:?}"),
         }
         match task3.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t3),
-            other => panic!("Expected t3, got {other:?}"),
+            other => unreachable!("Expected t3, got {other:?}"),
         }
     }
 
@@ -595,15 +622,15 @@ mod tests {
         // Must fire in order they were created (by seq)
         match task1.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t1),
-            other => panic!("Expected t1, got {other:?}"),
+            other => unreachable!("Expected t1, got {other:?}"),
         }
         match task2.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t2),
-            other => panic!("Expected t2, got {other:?}"),
+            other => unreachable!("Expected t2, got {other:?}"),
         }
         match task3.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t3),
-            other => panic!("Expected t3, got {other:?}"),
+            other => unreachable!("Expected t3, got {other:?}"),
         }
     }
 
@@ -625,7 +652,7 @@ mod tests {
         let task = sched.tick().unwrap();
         match task.kind {
             MacrotaskKind::TimerFired { timer_id } => assert_eq!(timer_id, t2),
-            other => panic!("Expected t2, got {other:?}"),
+            other => unreachable!("Expected t2, got {other:?}"),
         }
 
         // No more tasks
@@ -648,10 +675,10 @@ mod tests {
                 assert_eq!(call_id, "call-1");
                 match outcome {
                     HostcallOutcome::Success(v) => assert_eq!(v["result"], 42),
-                    HostcallOutcome::Error { .. } => panic!("Expected success"),
+                    other => unreachable!("Expected success, got {other:?}"),
                 }
             }
-            other => panic!("Expected HostcallComplete, got {other:?}"),
+            other => unreachable!("Expected HostcallComplete, got {other:?}"),
         }
     }
 
@@ -670,11 +697,11 @@ mod tests {
 
         match task1.kind {
             MacrotaskKind::InboundEvent { event_id, .. } => assert_eq!(event_id, "evt-1"),
-            other => panic!("Expected evt-1, got {other:?}"),
+            other => unreachable!("Expected evt-1, got {other:?}"),
         }
         match task2.kind {
             MacrotaskKind::InboundEvent { event_id, .. } => assert_eq!(event_id, "evt-2"),
-            other => panic!("Expected evt-2, got {other:?}"),
+            other => unreachable!("Expected evt-2, got {other:?}"),
         }
     }
 
@@ -696,14 +723,14 @@ mod tests {
         let task1 = sched.tick().unwrap();
         match task1.kind {
             MacrotaskKind::InboundEvent { event_id, .. } => assert_eq!(event_id, "evt-1"),
-            other => panic!("Expected event first, got {other:?}"),
+            other => unreachable!("Expected event first, got {other:?}"),
         }
 
         // Then timer
         let task2 = sched.tick().unwrap();
         match task2.kind {
             MacrotaskKind::TimerFired { .. } => {}
-            other => panic!("Expected timer second, got {other:?}"),
+            other => unreachable!("Expected timer second, got {other:?}"),
         }
     }
 
@@ -814,6 +841,13 @@ mod tests {
                 let outcome_tag = match outcome {
                     HostcallOutcome::Success(_) => "ok",
                     HostcallOutcome::Error { .. } => "err",
+                    HostcallOutcome::StreamChunk { is_final, .. } => {
+                        if *is_final {
+                            "stream_final"
+                        } else {
+                            "chunk"
+                        }
+                    }
                 };
                 format!("seq={}:hostcall:{call_id}:{outcome_tag}", task.seq.value())
             }

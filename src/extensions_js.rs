@@ -276,6 +276,13 @@ impl HostcallRequest {
         }
     }
 
+    /// Build the canonical params shape for hashing.
+    ///
+    /// **Canonical shapes** (must match `hostcall_request_to_payload()` in `extensions.rs`):
+    /// - `tool`:  `{ "name": <tool_name>, "input": <payload> }`
+    /// - `exec`:  `{ "cmd": <string>, ...payload_fields }`
+    /// - `http`:  payload passthrough
+    /// - `session/ui/events`:  `{ "op": <string>, ...payload_fields }` (flattened)
     #[must_use]
     pub fn params_for_hash(&self) -> serde_json::Value {
         match &self.kind {
@@ -283,28 +290,28 @@ impl HostcallRequest {
                 serde_json::json!({ "name": name, "input": self.payload.clone() })
             }
             HostcallKind::Exec { cmd } => {
-                let mut map = serde_json::Map::new();
-                map.insert("cmd".to_string(), serde_json::Value::String(cmd.clone()));
-                match &self.payload {
-                    serde_json::Value::Object(obj) => {
-                        for (key, value) in obj {
-                            if key == "cmd" {
-                                continue;
-                            }
-                            map.insert(key.clone(), value.clone());
-                        }
+                let mut obj = match &self.payload {
+                    serde_json::Value::Object(map) => {
+                        let mut m = map.clone();
+                        m.remove("command"); // normalize legacy alias
+                        m
                     }
-                    other => {
-                        map.insert("payload".to_string(), other.clone());
-                    }
-                }
-                serde_json::Value::Object(map)
+                    _ => serde_json::Map::new(),
+                };
+                obj.insert("cmd".to_string(), serde_json::Value::String(cmd.clone()));
+                serde_json::Value::Object(obj)
             }
             HostcallKind::Http => self.payload.clone(),
             HostcallKind::Session { op }
             | HostcallKind::Ui { op }
             | HostcallKind::Events { op } => {
-                serde_json::json!({ "op": op, "args": self.payload.clone() })
+                // Flattened: { "op": "op_name", ...payload_fields }
+                let mut obj = match &self.payload {
+                    serde_json::Value::Object(map) => map.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                obj.insert("op".to_string(), serde_json::Value::String(op.clone()));
+                serde_json::Value::Object(obj)
             }
         }
     }
@@ -399,6 +406,13 @@ impl<'js> PendingHostcalls<'js> {
                 error.set("code", code.clone())?;
                 error.set("message", message.clone())?;
                 reject.call::<_, ()>((error,))?;
+            }
+            HostcallOutcome::StreamChunk { .. } => {
+                tracing::trace!(
+                    event = "promise_bridge.stream_chunk",
+                    call_id = %call_id,
+                    "Ignoring stream chunk in promise bridge"
+                );
             }
         }
 
@@ -970,6 +984,10 @@ impl HostcallTracker {
 
     fn pending_count(&self) -> usize {
         self.pending.len()
+    }
+
+    fn is_pending(&self, call_id: &str) -> bool {
+        self.pending.contains(call_id)
     }
 
     fn on_complete(&mut self, call_id: &str) -> HostcallCompletion {
@@ -4130,6 +4148,27 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
     }
 
+    /// Read a global variable from the JS context and convert it to JSON.
+    ///
+    /// This is primarily intended for integration tests and diagnostics; it intentionally
+    /// does not expose raw `rquickjs` types as part of the public API.
+    pub async fn read_global_json(&self, name: &str) -> Result<serde_json::Value> {
+        self.interrupt_budget.reset();
+        let value = match self
+            .context
+            .with(|ctx| {
+                let global = ctx.globals();
+                let value: Value<'_> = global.get(name)?;
+                js_to_json(&value)
+            })
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => return Err(self.map_quickjs_error(&err)),
+        };
+        Ok(value)
+    }
+
     /// Drain pending hostcall requests from the queue.
     ///
     /// Returns the requests that need to be processed by the host.
@@ -4171,6 +4210,26 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         };
 
         serde_json::from_value(value).map_err(|err| Error::Json(Box::new(err)))
+    }
+
+    /// Read a global value by name and convert it to JSON.
+    ///
+    /// This is intentionally a narrow helper that avoids exposing raw `rquickjs`
+    /// types in the public API (useful for integration tests and debugging).
+    pub async fn get_global_json(&self, name: &str) -> Result<serde_json::Value> {
+        self.interrupt_budget.reset();
+        match self
+            .context
+            .with(|ctx| {
+                let global = ctx.globals();
+                let value: Value<'_> = global.get(name)?;
+                js_to_json(&value)
+            })
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(err) => Err(self.map_quickjs_error(&err)),
+        }
     }
 
     /// Enqueue a hostcall completion to be delivered on next tick.
@@ -4302,21 +4361,42 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
         match &task.kind {
             SMK::HostcallComplete { call_id, outcome } => {
-                let completion = self.hostcall_tracker.borrow_mut().on_complete(call_id);
-                let timer_id = match completion {
-                    HostcallCompletion::Delivered { timer_id } => timer_id,
-                    HostcallCompletion::Unknown => {
+                let is_nonfinal_stream = matches!(
+                    outcome,
+                    HostcallOutcome::StreamChunk {
+                        is_final: false,
+                        ..
+                    }
+                );
+
+                if is_nonfinal_stream {
+                    // Non-final stream chunk: keep the call pending, just deliver the chunk.
+                    if !self.hostcall_tracker.borrow().is_pending(call_id) {
                         tracing::debug!(
-                            event = "pijs.macrotask.hostcall_complete.ignored",
+                            event = "pijs.macrotask.stream_chunk.ignored",
                             call_id = %call_id,
-                            "Ignoring hostcall completion (not pending)"
+                            "Ignoring stream chunk (not pending)"
                         );
                         return Ok(());
                     }
-                };
+                } else {
+                    // Final chunk or non-stream outcome: complete the hostcall.
+                    let completion = self.hostcall_tracker.borrow_mut().on_complete(call_id);
+                    let timer_id = match completion {
+                        HostcallCompletion::Delivered { timer_id } => timer_id,
+                        HostcallCompletion::Unknown => {
+                            tracing::debug!(
+                                event = "pijs.macrotask.hostcall_complete.ignored",
+                                call_id = %call_id,
+                                "Ignoring hostcall completion (not pending)"
+                            );
+                            return Ok(());
+                        }
+                    };
 
-                if let Some(timer_id) = timer_id {
-                    let _ = self.scheduler.borrow_mut().clear_timeout(timer_id);
+                    if let Some(timer_id) = timer_id {
+                        let _ = self.scheduler.borrow_mut().clear_timeout(timer_id);
+                    }
                 }
 
                 tracing::debug!(
@@ -4325,8 +4405,6 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                     seq = task.seq.value(),
                     "Delivering hostcall completion"
                 );
-                // The actual Promise resolution is handled by the global
-                // __pi_complete_hostcall function installed in JS
                 Self::deliver_hostcall_completion(ctx, call_id, outcome)?;
             }
             SMK::TimerFired { timer_id } => {
@@ -4394,6 +4472,19 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 obj.set("ok", false)?;
                 obj.set("code", code.clone())?;
                 obj.set("message", message.clone())?;
+                obj
+            }
+            HostcallOutcome::StreamChunk {
+                chunk,
+                sequence,
+                is_final,
+            } => {
+                let obj = Object::new(ctx.clone())?;
+                obj.set("ok", true)?;
+                obj.set("stream", true)?;
+                obj.set("sequence", *sequence)?;
+                obj.set("isFinal", *is_final)?;
+                obj.set("chunk", json_to_js(ctx, chunk)?)?;
                 obj
             }
         };
@@ -6183,15 +6274,125 @@ async function __pi_execute_shortcut(key_id, ctx_payload) {
     return await __pi_with_extension_async(record.extensionId, () => record.handler(ctx));
 }
 
+// Hostcall stream class (async iterator for streaming hostcall results)
+class __pi_HostcallStream {
+    constructor(callId) {
+        this.callId = callId;
+        this.buffer = [];
+        this.waitResolve = null;
+        this.done = false;
+    }
+    pushChunk(chunk, isFinal) {
+        if (isFinal) this.done = true;
+        if (this.waitResolve) {
+            const resolve = this.waitResolve;
+            this.waitResolve = null;
+            if (isFinal && chunk === null) {
+                resolve({ value: undefined, done: true });
+            } else {
+                resolve({ value: chunk, done: false });
+            }
+        } else {
+            this.buffer.push({ chunk, isFinal });
+        }
+    }
+    pushError(error) {
+        this.done = true;
+        if (this.waitResolve) {
+            const rej = this.waitResolve;
+            this.waitResolve = null;
+            rej({ __error: error });
+        } else {
+            this.buffer.push({ __error: error });
+        }
+    }
+    next() {
+        if (this.buffer.length > 0) {
+            const entry = this.buffer.shift();
+            if (entry.__error) return Promise.reject(entry.__error);
+            if (entry.isFinal && entry.chunk === null) return Promise.resolve({ value: undefined, done: true });
+            return Promise.resolve({ value: entry.chunk, done: false });
+        }
+        if (this.done) return Promise.resolve({ value: undefined, done: true });
+        return new Promise((resolve, reject) => {
+            this.waitResolve = (result) => {
+                if (result && result.__error) reject(result.__error);
+                else resolve(result);
+            };
+        });
+    }
+    return() {
+        this.done = true;
+        this.buffer = [];
+        this.waitResolve = null;
+        return Promise.resolve({ value: undefined, done: true });
+    }
+    [Symbol.asyncIterator]() { return this; }
+}
+
 // Complete a hostcall (called from Rust)
 function __pi_complete_hostcall(call_id, outcome) {
     const pending = __pi_pending_hostcalls.get(call_id);
-    if (!pending) {
-        console.warn('Unknown hostcall completion:', call_id);
+    if (!pending) return;
+
+    if (outcome.stream) {
+        const seq = Number(outcome.sequence);
+        if (!Number.isFinite(seq)) {
+            const error = new Error('Invalid stream sequence');
+            error.code = 'STREAM_SEQUENCE';
+            if (pending.stream) pending.stream.pushError(error);
+            else if (pending.reject) pending.reject(error);
+            __pi_pending_hostcalls.delete(call_id);
+            return;
+        }
+        if (pending.lastSeq === undefined) {
+            if (seq !== 0) {
+                const error = new Error('Stream sequence must start at 0');
+                error.code = 'STREAM_SEQUENCE';
+                if (pending.stream) pending.stream.pushError(error);
+                else if (pending.reject) pending.reject(error);
+                __pi_pending_hostcalls.delete(call_id);
+                return;
+            }
+        } else if (seq <= pending.lastSeq) {
+            const error = new Error('Stream sequence out of order');
+            error.code = 'STREAM_SEQUENCE';
+            if (pending.stream) pending.stream.pushError(error);
+            else if (pending.reject) pending.reject(error);
+            __pi_pending_hostcalls.delete(call_id);
+            return;
+        }
+        pending.lastSeq = seq;
+
+        if (pending.stream) {
+            pending.stream.pushChunk(outcome.chunk, outcome.isFinal);
+        } else if (pending.onChunk) {
+            const chunk = outcome.chunk;
+            const isFinal = outcome.isFinal;
+            Promise.resolve().then(() => {
+                try {
+                    pending.onChunk(chunk, isFinal);
+                } catch (e) {
+                    console.error('Hostcall onChunk error:', e);
+                }
+            });
+        }
+        if (outcome.isFinal) {
+            __pi_pending_hostcalls.delete(call_id);
+            if (pending.resolve) pending.resolve(outcome.chunk);
+        }
         return;
     }
-    __pi_pending_hostcalls.delete(call_id);
 
+    if (!outcome.ok && pending.stream) {
+        const error = new Error(outcome.message);
+        error.code = outcome.code;
+        pending.stream.pushError(error);
+        __pi_pending_hostcalls.delete(call_id);
+        return;
+    }
+
+    __pi_pending_hostcalls.delete(call_id);
     if (outcome.ok) {
         pending.resolve(outcome.value);
     } else {
@@ -6267,6 +6468,13 @@ function __pi_make_hostcall(nativeFn) {
     };
 }
 
+function __pi_make_streaming_hostcall(nativeFn, ...args) {
+    const call_id = nativeFn(...args);
+    const stream = new __pi_HostcallStream(call_id);
+    __pi_pending_hostcalls.set(call_id, { stream, resolve: () => {}, reject: () => {} });
+    return stream;
+}
+
 function __pi_env_get(key) {
     const value = __pi_env_get_native(key);
     if (value === null || value === undefined) {
@@ -6337,11 +6545,47 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
     // pi.tool(name, input) - invoke a tool
     tool: __pi_make_hostcall(__pi_tool_native),
 
-    // pi.exec(cmd, args) - execute a shell command
-    exec: (cmd, args, options = {}) => __pi_exec_hostcall(cmd, args, options),
+    // pi.exec(cmd, args, options) - execute a shell command
+    exec: (cmd, args, options = {}) => {
+        if (options && options.stream) {
+            const onChunk =
+                options && typeof options === 'object'
+                    ? (options.onChunk || options.on_chunk)
+                    : undefined;
+            if (typeof onChunk === 'function') {
+                const opts = Object.assign({}, options);
+                delete opts.onChunk;
+                delete opts.on_chunk;
+                const call_id = __pi_exec_native(cmd, args, opts);
+                return new Promise((resolve, reject) => {
+                    __pi_pending_hostcalls.set(call_id, { onChunk, resolve, reject });
+                });
+            }
+            return __pi_make_streaming_hostcall(__pi_exec_native, cmd, args, options);
+        }
+        return __pi_exec_hostcall(cmd, args, options);
+    },
 
     // pi.http(request) - make an HTTP request
-    http: __pi_make_hostcall(__pi_http_native),
+    http: (request) => {
+        if (request && request.stream) {
+            const onChunk =
+                request && typeof request === 'object'
+                    ? (request.onChunk || request.on_chunk)
+                    : undefined;
+            if (typeof onChunk === 'function') {
+                const req = Object.assign({}, request);
+                delete req.onChunk;
+                delete req.on_chunk;
+                const call_id = __pi_http_native(req);
+                return new Promise((resolve, reject) => {
+                    __pi_pending_hostcalls.set(call_id, { onChunk, resolve, reject });
+                });
+            }
+            return __pi_make_streaming_hostcall(__pi_http_native, request);
+        }
+        return __pi_make_hostcall(__pi_http_native)(request);
+    },
 
     // pi.session(op, args) - session operations
     session: __pi_make_hostcall(__pi_session_native),
@@ -9870,6 +10114,268 @@ mod tests {
             let r = get_global_json(&runtime, "rlResult").await;
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["hasCreateInterface"], serde_json::json!(true));
+        });
+    }
+
+    // ── Streaming hostcall tests ────────────────────────────────────────
+
+    #[test]
+    fn pijs_stream_chunks_delivered_via_async_iterator() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            // Start a streaming exec call
+            runtime
+                .eval(
+                    r#"
+            globalThis.chunks = [];
+            globalThis.done = false;
+            (async () => {
+                const stream = pi.exec("cat", ["big.txt"], { stream: true });
+                for await (const chunk of stream) {
+                    globalThis.chunks.push(chunk);
+                }
+                globalThis.done = true;
+            })();
+            "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = requests[0].call_id.clone();
+
+            // Send three non-final chunks then a final one
+            for seq in 0..3 {
+                runtime.complete_hostcall(
+                    call_id.clone(),
+                    HostcallOutcome::StreamChunk {
+                        sequence: seq,
+                        chunk: serde_json::json!({ "line": seq }),
+                        is_final: false,
+                    },
+                );
+                let stats = runtime.tick().await.expect("tick chunk");
+                assert!(stats.ran_macrotask);
+            }
+
+            // Hostcall should still be pending (tracker not yet completed)
+            assert!(
+                runtime.hostcall_tracker.borrow().is_pending(&call_id),
+                "hostcall should still be pending after non-final chunks"
+            );
+
+            // Send final chunk
+            runtime.complete_hostcall(
+                call_id.clone(),
+                HostcallOutcome::StreamChunk {
+                    sequence: 3,
+                    chunk: serde_json::json!({ "line": 3 }),
+                    is_final: true,
+                },
+            );
+            let stats = runtime.tick().await.expect("tick final");
+            assert!(stats.ran_macrotask);
+
+            // Hostcall is now completed
+            assert!(
+                !runtime.hostcall_tracker.borrow().is_pending(&call_id),
+                "hostcall should be completed after final chunk"
+            );
+
+            // Run microtasks to let the async iterator resolve
+            runtime.tick().await.expect("tick settle");
+
+            let chunks = get_global_json(&runtime, "chunks").await;
+            let arr = chunks.as_array().expect("chunks is array");
+            assert_eq!(arr.len(), 4, "expected 4 chunks, got {arr:?}");
+            for (i, c) in arr.iter().enumerate() {
+                assert_eq!(c["line"], serde_json::json!(i), "chunk {i}");
+            }
+
+            let done = get_global_json(&runtime, "done").await;
+            assert_eq!(
+                done,
+                serde_json::json!(true),
+                "async loop should have completed"
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_stream_error_rejects_async_iterator() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+            globalThis.chunks = [];
+            globalThis.errMsg = null;
+            (async () => {
+                try {
+                    const stream = pi.exec("fail", [], { stream: true });
+                    for await (const chunk of stream) {
+                        globalThis.chunks.push(chunk);
+                    }
+                } catch (e) {
+                    globalThis.errMsg = e.message;
+                }
+            })();
+            "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            let call_id = requests[0].call_id.clone();
+
+            // Send one good chunk
+            runtime.complete_hostcall(
+                call_id.clone(),
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: serde_json::json!("first"),
+                    is_final: false,
+                },
+            );
+            runtime.tick().await.expect("tick chunk 0");
+
+            // Now error the hostcall
+            runtime.complete_hostcall(
+                call_id,
+                HostcallOutcome::Error {
+                    code: "STREAM_ERR".into(),
+                    message: "broken pipe".into(),
+                },
+            );
+            runtime.tick().await.expect("tick error");
+            runtime.tick().await.expect("tick settle");
+
+            let chunks = get_global_json(&runtime, "chunks").await;
+            assert_eq!(
+                chunks.as_array().expect("array").len(),
+                1,
+                "should have received 1 chunk before error"
+            );
+
+            let err = get_global_json(&runtime, "errMsg").await;
+            assert_eq!(err, serde_json::json!("broken pipe"));
+        });
+    }
+
+    #[test]
+    fn pijs_stream_http_returns_async_iterator() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+            globalThis.chunks = [];
+            globalThis.done = false;
+            (async () => {
+                const stream = pi.http({ url: "http://example.com", stream: true });
+                for await (const chunk of stream) {
+                    globalThis.chunks.push(chunk);
+                }
+                globalThis.done = true;
+            })();
+            "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let call_id = requests[0].call_id.clone();
+
+            // Two chunks: non-final then final
+            runtime.complete_hostcall(
+                call_id.clone(),
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: serde_json::json!("chunk-a"),
+                    is_final: false,
+                },
+            );
+            runtime.tick().await.expect("tick a");
+
+            runtime.complete_hostcall(
+                call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 1,
+                    chunk: serde_json::json!("chunk-b"),
+                    is_final: true,
+                },
+            );
+            runtime.tick().await.expect("tick b");
+            runtime.tick().await.expect("tick settle");
+
+            let chunks = get_global_json(&runtime, "chunks").await;
+            let arr = chunks.as_array().expect("array");
+            assert_eq!(arr.len(), 2);
+            assert_eq!(arr[0], serde_json::json!("chunk-a"));
+            assert_eq!(arr[1], serde_json::json!("chunk-b"));
+
+            assert_eq!(
+                get_global_json(&runtime, "done").await,
+                serde_json::json!(true)
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_stream_chunk_ignored_after_hostcall_completed() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+            globalThis.result = null;
+            pi.tool("read", { path: "test.txt" }).then(r => {
+                globalThis.result = r;
+            });
+            "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            let call_id = requests[0].call_id.clone();
+
+            // Complete normally first
+            runtime.complete_hostcall(
+                call_id.clone(),
+                HostcallOutcome::Success(serde_json::json!({ "content": "done" })),
+            );
+            runtime.tick().await.expect("tick success");
+
+            // Now try to deliver a stream chunk to the same call_id — should be ignored
+            runtime.complete_hostcall(
+                call_id,
+                HostcallOutcome::StreamChunk {
+                    sequence: 0,
+                    chunk: serde_json::json!("stale"),
+                    is_final: false,
+                },
+            );
+            // This should not panic
+            let stats = runtime.tick().await.expect("tick stale chunk");
+            assert!(stats.ran_macrotask, "macrotask should run (and be ignored)");
+
+            let result = get_global_json(&runtime, "result").await;
+            assert_eq!(result["content"], serde_json::json!("done"));
         });
     }
 }

@@ -163,6 +163,55 @@ export default function init(pi) {
 }
 "#;
 
+/// Extension that cancels `session_before_switch` via `{cancelled: true}`.
+#[allow(dead_code)]
+const SESSION_CANCEL_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("session_before_switch", (event, ctx) => {
+        return { cancelled: true, reason: "Extension vetoed switch" };
+    });
+
+    pi.on("session_before_fork", (event, ctx) => {
+        return { cancel: true };
+    });
+
+    pi.on("session_before_compact", (event, ctx) => {
+        return false;
+    });
+
+    pi.on("session_switch", (event, ctx) => {
+        // After-event: just record, no cancellation possible.
+        return null;
+    });
+
+    pi.on("session_fork", (event, ctx) => {
+        return null;
+    });
+
+    pi.on("session_compact", (event, ctx) => {
+        return null;
+    });
+}
+"#;
+
+/// Extension that does NOT cancel `session_before_switch`.
+#[allow(dead_code)]
+const SESSION_ALLOW_EXT: &str = r#"
+export default function init(pi) {
+    pi.on("session_before_switch", (event, ctx) => {
+        return { cancelled: false };
+    });
+
+    pi.on("session_before_fork", (event, ctx) => {
+        return null;
+    });
+
+    pi.on("session_before_compact", (event, ctx) => {
+        return true;
+    });
+}
+"#;
+
 /// Extension that registers a tool.
 const TOOL_EXT: &str = r#"
 export default function init(pi) {

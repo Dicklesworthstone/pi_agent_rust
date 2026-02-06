@@ -741,6 +741,208 @@ fn resolve_api_key_override_takes_precedence_over_oauth() {
 }
 
 // ---------------------------------------------------------------------------
+// Startup wiring: build OAuth configs from ModelEntry, then refresh (bd-1uy.2)
+// ---------------------------------------------------------------------------
+
+/// Mirrors the config-extraction logic in main.rs.
+fn oauth_configs_from_entries(entries: &[pi::models::ModelEntry]) -> HashMap<String, OAuthConfig> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .oauth_config
+                .as_ref()
+                .map(|cfg| (entry.model.provider.clone(), cfg.clone()))
+        })
+        .collect()
+}
+
+fn make_model_entry(provider: &str, oauth: Option<OAuthConfig>) -> pi::models::ModelEntry {
+    pi::models::ModelEntry {
+        model: pi::provider::Model {
+            id: format!("{provider}-model-1"),
+            name: format!("{provider} Model"),
+            api: "anthropic".to_string(),
+            provider: provider.to_string(),
+            base_url: String::new(),
+            reasoning: false,
+            input: vec![pi::provider::InputType::Text],
+            cost: pi::provider::ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 8192,
+            headers: HashMap::new(),
+        },
+        api_key: None,
+        headers: HashMap::new(),
+        auth_header: false,
+        compat: None,
+        oauth_config: oauth,
+    }
+}
+
+#[test]
+fn oauth_configs_from_entries_empty_when_no_oauth() {
+    let entries = vec![make_model_entry("my-prov", None)];
+    let configs = oauth_configs_from_entries(&entries);
+    assert!(configs.is_empty());
+}
+
+#[test]
+fn oauth_configs_from_entries_extracts_providers_with_oauth() {
+    let cfg = sample_config("https://tok.example.com/token");
+    let entries = vec![
+        make_model_entry("ext-prov-a", Some(cfg)),
+        make_model_entry("ext-prov-b", None),
+        make_model_entry(
+            "ext-prov-c",
+            Some(OAuthConfig {
+                auth_url: "https://other.example.com/auth".to_string(),
+                token_url: "https://other.example.com/token".to_string(),
+                client_id: "other-client".to_string(),
+                scopes: vec![],
+                redirect_uri: None,
+            }),
+        ),
+    ];
+    let configs = oauth_configs_from_entries(&entries);
+    assert_eq!(configs.len(), 2);
+    assert!(configs.contains_key("ext-prov-a"));
+    assert!(configs.contains_key("ext-prov-c"));
+    assert!(!configs.contains_key("ext-prov-b"));
+}
+
+#[test]
+fn full_wiring_refresh_expired_token_via_mock_server() {
+    let harness = TestHarness::new("full_wiring_refresh_expired_token_via_mock_server");
+    run_async(async move {
+        let server = harness.start_mock_http_server();
+        server.add_route(
+            "POST",
+            "/token",
+            MockHttpResponse::json(
+                200,
+                &json!({
+                    "access_token": "fresh-access",
+                    "refresh_token": "fresh-refresh",
+                    "expires_in": 3600,
+                    "token_type": "Bearer"
+                }),
+            ),
+        );
+
+        let auth_path = harness.temp_path("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("load");
+
+        // Set an expired OAuth credential.
+        auth.set(
+            "ext-prov-a",
+            AuthCredential::OAuth {
+                access_token: "old-access".to_string(),
+                refresh_token: "old-refresh".to_string(),
+                expires: 0, // expired
+            },
+        );
+
+        // Build configs map with the mock server's token URL.
+        let mut configs = HashMap::new();
+        configs.insert(
+            "ext-prov-a".to_string(),
+            OAuthConfig {
+                auth_url: "https://auth.example.com/authorize".to_string(),
+                token_url: format!("{}/token", server.base_url()),
+                client_id: "test-client".to_string(),
+                scopes: vec!["read".to_string()],
+                redirect_uri: None,
+            },
+        );
+
+        let client = Client::new();
+        auth.refresh_expired_extension_oauth_tokens(&client, &configs)
+            .await
+            .expect("refresh should succeed");
+
+        // Verify the token was refreshed.
+        let key = auth.resolve_api_key("ext-prov-a", None);
+        assert_eq!(key.as_deref(), Some("fresh-access"));
+    });
+}
+
+#[test]
+fn full_wiring_no_refresh_when_token_valid() {
+    let harness = TestHarness::new("full_wiring_no_refresh_when_token_valid");
+    run_async(async move {
+        let auth_path = harness.temp_path("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("load");
+
+        let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
+        auth.set(
+            "ext-prov-a",
+            AuthCredential::OAuth {
+                access_token: "still-valid".to_string(),
+                refresh_token: "ref".to_string(),
+                expires: far_future,
+            },
+        );
+
+        // Even with a config provided, no refresh happens because token is not expired.
+        let mut configs = HashMap::new();
+        configs.insert(
+            "ext-prov-a".to_string(),
+            sample_config("https://should-not-be-called.example.com/token"),
+        );
+
+        let client = Client::new();
+        auth.refresh_expired_extension_oauth_tokens(&client, &configs)
+            .await
+            .expect("should succeed without making any requests");
+
+        // Token unchanged.
+        let key = auth.resolve_api_key("ext-prov-a", None);
+        assert_eq!(key.as_deref(), Some("still-valid"));
+    });
+}
+
+#[test]
+fn full_wiring_refresh_skips_providers_without_config() {
+    let harness = TestHarness::new("full_wiring_refresh_skips_providers_without_config");
+    run_async(async move {
+        let auth_path = harness.temp_path("auth.json");
+        let mut auth = AuthStorage::load(auth_path).expect("load");
+
+        // Set expired tokens for a provider with no matching config.
+        auth.set(
+            "ext-prov-no-config",
+            AuthCredential::OAuth {
+                access_token: "old".to_string(),
+                refresh_token: "old-ref".to_string(),
+                expires: 0,
+            },
+        );
+
+        // No config provided for this provider — it should be silently skipped.
+        let configs: HashMap<String, OAuthConfig> = HashMap::new();
+
+        let client = Client::new();
+        auth.refresh_expired_extension_oauth_tokens(&client, &configs)
+            .await
+            .expect("should succeed — no providers to refresh");
+
+        // Token not changed (still expired, still "old").
+        match auth.get("ext-prov-no-config") {
+            Some(AuthCredential::OAuth { access_token, .. }) => {
+                assert_eq!(access_token, "old");
+            }
+            other => panic!("expected OAuth credential, got {other:?}"),
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

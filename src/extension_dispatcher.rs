@@ -44,6 +44,17 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     cwd: PathBuf,
 }
 
+fn ui_response_value_for_op(op: &str, response: &ExtensionUiResponse) -> Value {
+    if response.cancelled {
+        return match op {
+            // Deterministic defaults (bd-2hz.1): confirm cancellation/timeout resolves false.
+            "confirm" => Value::Bool(false),
+            _ => Value::Null,
+        };
+    }
+    response.value.clone().unwrap_or(Value::Null)
+}
+
 impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -124,7 +135,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 },
             },
             Err(err) => HostcallOutcome::Error {
-                code: "tool_error".to_string(),
+                code: "io".to_string(),
                 message: err.to_string(),
             },
         }
@@ -473,7 +484,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         };
 
         match self.ui_handler.request_ui(request).await {
-            Ok(Some(response)) => HostcallOutcome::Success(response.value.unwrap_or(Value::Null)),
+            Ok(Some(response)) => HostcallOutcome::Success(ui_response_value_for_op(op, &response)),
             Ok(None) => HostcallOutcome::Success(Value::Null),
             Err(err) => HostcallOutcome::Error {
                 code: "io".to_string(),
@@ -804,6 +815,20 @@ mod tests {
     use std::net::TcpListener;
     use std::path::Path;
     use std::sync::Mutex;
+
+    #[test]
+    fn ui_confirm_cancel_defaults_to_false() {
+        let response = ExtensionUiResponse {
+            id: "req-1".to_string(),
+            value: None,
+            cancelled: true,
+        };
+        assert_eq!(
+            ui_response_value_for_op("confirm", &response),
+            Value::Bool(false)
+        );
+        assert_eq!(ui_response_value_for_op("select", &response), Value::Null);
+    }
 
     struct NullSession;
 

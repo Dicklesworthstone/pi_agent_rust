@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-06T06:21:55Z
+> Generated: 2026-02-06T11:04:12Z
 
 ## Summary
 
@@ -8,9 +8,9 @@
 |---|---|
 | Total budgets | 13 |
 | CI-enforced | 8 |
-| PASS | 5 |
+| PASS | 3 |
 | FAIL | 0 |
-| No data | 8 |
+| No data | 10 |
 
 ## Startup
 
@@ -31,8 +31,8 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `tool_call_latency_p99` | p99 per-call latency | 200 us | 44 | PASS | Yes |
-| `tool_call_throughput_min` | minimum calls/sec | 5000 calls/sec | 22883 | PASS | Yes |
+| `tool_call_latency_p99` | p99 per-call latency | 200 us | - | NO_DATA | Yes |
+| `tool_call_throughput_min` | minimum calls/sec | 5000 calls/sec | - | NO_DATA | Yes |
 
 ## Event_dispatch
 

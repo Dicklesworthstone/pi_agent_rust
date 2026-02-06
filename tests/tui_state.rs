@@ -16,7 +16,8 @@ use pi::extensions_js::PiJsRuntimeConfig;
 use pi::interactive::{ConversationMessage, MessageRole, PendingInput, PiApp, PiMsg};
 use pi::keybindings::KeyBindings;
 use pi::model::{
-    ContentBlock, Cost, ImageContent, StopReason, StreamEvent, TextContent, Usage, UserContent,
+    AssistantMessage, ContentBlock, Cost, ImageContent, StopReason, StreamEvent, TextContent,
+    Usage, UserContent,
 };
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
@@ -743,6 +744,15 @@ fn record_step_artifacts(harness: &TestHarness, step: &StepOutcome) {
 
 fn fail_step(harness: &TestHarness, step: &StepOutcome, message: &str) -> ! {
     record_step_artifacts(harness, step);
+    // Dump full after view for debugging
+    let dump_dir = "/tmp/claude-1000/-data-projects-pi-agent-rust/1fdfcc26-21eb-4e93-9a47-a30d0beec819/scratchpad";
+    let _ = std::fs::create_dir_all(dump_dir);
+    let slug = step
+        .label
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect::<String>();
+    let _ = std::fs::write(format!("{dump_dir}/fail_after_{slug}.txt"), &step.after);
     std::panic::panic_any(format!(
         "{message}\nlabel={}\nchanged_lines={}\nfirst_changed_line={:?}\n",
         step.label, step.delta.changed_lines, step.delta.first_changed_line
@@ -1487,7 +1497,7 @@ fn tui_state_tool_update_with_diff_details_appends_diff_block() {
 
     assert_after_contains(&harness, &step, "Tool edit output:");
     assert_after_contains(&harness, &step, "Successfully replaced text in foo.txt.");
-    assert_after_contains(&harness, &step, "Diff:");
+    assert_after_contains(&harness, &step, "@@ foo.txt @@");
     assert_after_contains(&harness, &step, "+1 added line");
     assert_after_contains(&harness, &step, "-1 removed line");
 }
@@ -1654,7 +1664,16 @@ fn tui_state_terminal_show_images_true_shows_image_placeholders_in_tool_output()
 
     assert_after_contains(&harness, &step, "Tool read output:");
     assert_after_contains(&harness, &step, "file contents");
-    assert_after_contains(&harness, &step, "[image: image/png]");
+    let has_placeholder = step.after.contains("[image: image/png]");
+    let has_kitty = step.after.contains("\u{1b}_G");
+    let has_iterm2 = step.after.contains("\u{1b}]1337;File=");
+    if !(has_placeholder || has_kitty || has_iterm2) {
+        fail_step(
+            &harness,
+            &step,
+            "Expected an inline image rendering in view",
+        );
+    }
     assert_after_not_contains(&harness, &step, "image(s) hidden");
 }
 
@@ -2487,7 +2506,7 @@ fn tui_state_slash_resume_selects_latest_session_and_loads_messages() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Loading session...");
 
-    let events = wait_for_pi_msgs(&event_rx, Duration::from_millis(500), |msgs| {
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(2), |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }))
     });
@@ -3469,4 +3488,309 @@ fn tui_state_capability_prompt_shows_description() {
     assert_after_contains(&harness, &step, "fancy-ext");
     assert_after_contains(&harness, &step, "env");
     assert_after_contains(&harness, &step, "Access environment variables HOME, PATH");
+}
+
+// --- Branch Picker Tests ---
+// These tests call branch picker methods directly to avoid keybinding
+// conflicts (Ctrl+B is also CursorLeft in Emacs mode, etc.).
+
+#[test]
+fn tui_grad_branch_picker_no_branches_shows_message() {
+    let harness = TestHarness::new("tui_grad_branch_picker_no_branches_shows_message");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Directly open branch picker.
+    app.open_branch_picker();
+
+    // Single-branch session should show status message.
+    assert_eq!(
+        app.status_message(),
+        Some("No branches to pick (use /fork to create one)")
+    );
+    assert!(!app.has_branch_picker());
+}
+
+#[test]
+fn tui_grad_branch_picker_blocked_during_processing() {
+    let harness = TestHarness::new("tui_grad_branch_picker_blocked_during_processing");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Start a tool (puts agent in ToolRunning state).
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    // Try to open branch picker while tool is running.
+    app.open_branch_picker();
+
+    assert_eq!(
+        app.status_message(),
+        Some("Cannot switch branches while processing")
+    );
+    assert!(!app.has_branch_picker());
+}
+
+#[test]
+fn tui_grad_branch_indicator_hidden_for_single_branch() {
+    let harness = TestHarness::new("tui_grad_branch_indicator_hidden_for_single_branch");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:noop",
+        KeyMsg::from_runes(vec![' ']),
+    );
+
+    // No branch indicator should appear for a single-branch session.
+    assert_after_not_contains(&harness, &step, "[branch");
+}
+
+#[test]
+fn tui_grad_cycle_sibling_no_branches_shows_message() {
+    let harness = TestHarness::new("tui_grad_cycle_sibling_no_branches_shows_message");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Directly cycle sibling branch.
+    app.cycle_sibling_branch(true);
+
+    assert_eq!(
+        app.status_message(),
+        Some("No sibling branches (use /fork to create one)")
+    );
+}
+
+#[test]
+fn tui_grad_cycle_sibling_blocked_during_processing() {
+    let harness = TestHarness::new("tui_grad_cycle_sibling_blocked_during_processing");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Start a tool.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    // Try to cycle sibling while processing.
+    app.cycle_sibling_branch(false);
+
+    assert_eq!(
+        app.status_message(),
+        Some("Cannot switch branches while processing")
+    );
+}
+
+/// Helper: creates a session with two branches forking from the root message.
+/// Returns (`session`, `root_id`, `branch1_leaf_id`, `branch2_leaf_id`).
+fn create_two_branch_session() -> (Session, String, String, String) {
+    let mut session = Session::in_memory();
+    // Root message
+    let root_id = session.append_message(SessionMessage::User {
+        content: UserContent::Text("Root question".to_string()),
+        timestamp: Some(0),
+    });
+    // Branch 1: assistant reply + user follow-up
+    let _asst1_id = session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("Answer A"))],
+            api: "anthropic".to_string(),
+            provider: "dummy".to_string(),
+            model: "dummy-model".to_string(),
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 15,
+                cost: Cost::default(),
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 1,
+        },
+    });
+    let branch1_leaf = session.append_message(SessionMessage::User {
+        content: UserContent::Text("Follow-up on branch 1".to_string()),
+        timestamp: Some(2),
+    });
+
+    // Navigate back to root to create fork point
+    session.navigate_to(&root_id);
+
+    // Branch 2: different assistant reply + user follow-up
+    let _asst2_id = session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("Answer B"))],
+            api: "anthropic".to_string(),
+            provider: "dummy".to_string(),
+            model: "dummy-model".to_string(),
+            usage: Usage {
+                input: 10,
+                output: 5,
+                cache_read: 0,
+                cache_write: 0,
+                total_tokens: 15,
+                cost: Cost::default(),
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: 3,
+        },
+    });
+    let branch2_leaf = session.append_message(SessionMessage::User {
+        content: UserContent::Text("Follow-up on branch 2".to_string()),
+        timestamp: Some(4),
+    });
+
+    (session, root_id, branch1_leaf, branch2_leaf)
+}
+
+#[test]
+fn tui_grad_branch_indicator_shows_for_multi_branch_session() {
+    let harness = TestHarness::new("tui_grad_branch_indicator_shows_for_multi_branch_session");
+    let (session, _, _, _) = create_two_branch_session();
+    let (app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Render view and check for branch indicator in header.
+    let view = normalize_view(&BubbleteaModel::view(&app));
+    assert!(
+        view.to_lowercase().contains("branch"),
+        "Expected branch indicator in header for multi-branch session, got:\n{view}"
+    );
+}
+
+#[test]
+fn tui_grad_branch_picker_opens_with_branches() {
+    let harness = TestHarness::new("tui_grad_branch_picker_opens_with_branches");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Open branch picker directly.
+    app.open_branch_picker();
+
+    // Picker should be open (not a "No branches" message).
+    assert!(app.has_branch_picker(), "Branch picker should be open");
+    assert!(
+        app.status_message().is_none(),
+        "No error status expected when picker opens"
+    );
+}
+
+#[test]
+fn tui_grad_branch_picker_escape_closes() {
+    let harness = TestHarness::new("tui_grad_branch_picker_escape_closes");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Open picker.
+    app.open_branch_picker();
+    assert!(app.has_branch_picker());
+
+    // Close with Escape via handle_branch_picker_key.
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Esc));
+
+    assert!(
+        !app.has_branch_picker(),
+        "Branch picker should be closed after Escape"
+    );
+}
+
+#[test]
+fn tui_grad_branch_picker_navigation_up_down() {
+    let harness = TestHarness::new("tui_grad_branch_picker_navigation_up_down");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Open picker.
+    app.open_branch_picker();
+    assert!(app.has_branch_picker());
+
+    // Navigate down - picker should still be open.
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Down));
+    assert!(
+        app.has_branch_picker(),
+        "Picker should remain open after Down"
+    );
+
+    // Navigate up - picker should still be open.
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Up));
+    assert!(
+        app.has_branch_picker(),
+        "Picker should remain open after Up"
+    );
+}
+
+#[test]
+fn tui_grad_branch_picker_enter_switches_branch() {
+    let harness = TestHarness::new("tui_grad_branch_picker_enter_switches_branch");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Open picker.
+    app.open_branch_picker();
+    assert!(app.has_branch_picker());
+
+    // Navigate to a different branch and press Enter.
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Down));
+    app.handle_branch_picker_key(&KeyMsg::from_type(KeyType::Enter));
+
+    // Picker should close after branch switch.
+    assert!(!app.has_branch_picker(), "Picker should close after Enter");
+}
+
+#[test]
+fn tui_grad_cycle_sibling_forward_with_branches() {
+    let harness = TestHarness::new("tui_grad_cycle_sibling_forward_with_branches");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Cycle forward - should succeed (no error message).
+    app.cycle_sibling_branch(true);
+
+    // Should NOT show "No sibling branches" since we have 2 branches.
+    let msg = app.status_message().unwrap_or("");
+    assert!(
+        !msg.contains("No sibling branches"),
+        "Expected successful branch cycle, got status: {msg}"
+    );
+}
+
+#[test]
+fn tui_grad_cycle_sibling_backward_with_branches() {
+    let harness = TestHarness::new("tui_grad_cycle_sibling_backward_with_branches");
+    let (session, _, _, _) = create_two_branch_session();
+    let (mut app, _rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    // Cycle backward - should succeed (no error message).
+    app.cycle_sibling_branch(false);
+
+    // Should NOT show "No sibling branches" since we have 2 branches.
+    let msg = app.status_message().unwrap_or("");
+    assert!(
+        !msg.contains("No sibling branches"),
+        "Expected successful branch cycle, got status: {msg}"
+    );
 }

@@ -516,10 +516,7 @@ mod extension_ui_channel {
             // With no sender, request_ui returns an error about sender not configured.
             let request = ExtensionUiRequest::new("noop", "notify", json!({"title": "Hi"}));
             let response = manager.request_ui(request).await;
-            assert!(
-                response.is_err(),
-                "Should error when UI sender is cleared"
-            );
+            assert!(response.is_err(), "Should error when UI sender is cleared");
             let err = format!("{}", response.unwrap_err());
             assert!(
                 err.contains("sender") || err.contains("configured"),

@@ -2284,7 +2284,77 @@ mod wasm_host {
                     None,
                     None,
                 )),
+                HostcallOutcome::StreamChunk {
+                    sequence,
+                    chunk,
+                    is_final,
+                } => {
+                    let value = json!({
+                        "stream": true,
+                        "sequence": sequence,
+                        "chunk": chunk,
+                        "isFinal": is_final,
+                    });
+
+                    serde_json::to_string(&value).map_err(|err| {
+                        Self::host_error_json(
+                            HostCallErrorCode::Internal,
+                            format!("Failed to serialize hostcall stream chunk: {err}"),
+                            None,
+                            None,
+                        )
+                    })
+                }
             }
+        }
+
+        fn host_result_payload_to_result(
+            result: HostResultPayload,
+        ) -> std::result::Result<String, String> {
+            if result.is_error {
+                let err = result.error.unwrap_or_else(|| HostCallError {
+                    code: HostCallErrorCode::Internal,
+                    message: "Hostcall failed with missing error payload".to_string(),
+                    details: None,
+                    retryable: None,
+                });
+
+                return Err(serde_json::to_string(&err).unwrap_or_else(|_| {
+                    Self::host_error_json(
+                        HostCallErrorCode::Internal,
+                        "Failed to serialize hostcall error payload",
+                        None,
+                        None,
+                    )
+                }));
+            }
+
+            if let Some(chunk) = result.chunk {
+                let value = json!({
+                    "stream": true,
+                    "sequence": chunk.index,
+                    "chunk": result.output,
+                    "isFinal": chunk.is_last,
+                });
+
+                return serde_json::to_string(&value).map_err(|err| {
+                    Self::host_error_json(
+                        HostCallErrorCode::Internal,
+                        format!("Failed to serialize hostcall stream chunk: {err}"),
+                        None,
+                        None,
+                    )
+                });
+            }
+
+            serde_json::to_string(&result.output).map_err(|err| {
+                Self::host_error_json(
+                    HostCallErrorCode::Internal,
+                    format!("Failed to serialize hostcall output: {err}"),
+                    None,
+                    None,
+                )
+            })
         }
 
         async fn resolve_policy_decision(
@@ -2742,211 +2812,20 @@ mod wasm_host {
                 ));
             }
 
-            let Some(required) = required_capability_for_host_call(&payload) else {
-                return Err(Self::host_error_json(
-                    HostCallErrorCode::InvalidRequest,
-                    format!("Unknown host_call method: {}", payload.method),
-                    Some(json!({ "method": payload.method })),
-                    None,
-                ));
+            let manager = self.manager();
+            let ctx = HostCallContext {
+                runtime: "wasm",
+                extension_id: self.extension_id.as_deref(),
+                policy: &self.policy,
+                tools: self.tools.as_ref(),
+                http: &self.http,
+                fs: Some(&self.fs),
+                env_allowlist: Some(&self.env_allowlist),
+                manager: manager.as_ref(),
             };
 
-            if !payload.capability.trim().eq_ignore_ascii_case(&required) {
-                return Err(Self::host_error_json(
-                    HostCallErrorCode::InvalidRequest,
-                    "Capability mismatch: declared capability does not match derived capability",
-                    Some(json!({
-                        "declared": payload.capability,
-                        "required": required,
-                        "method": payload.method,
-                    })),
-                    None,
-                ));
-            }
-
-            let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
-            let params_hash = Self::hostcall_params_hash(&payload.method, &payload.params);
-            let started_at = Instant::now();
-
-            tracing::info!(
-                event = "host_call.start",
-                runtime = "wasm",
-                call_id = %payload.call_id,
-                extension_id = ?self.extension_id.as_deref(),
-                capability = %required,
-                method = %payload.method,
-                params_hash = %params_hash,
-                timeout_ms = call_timeout_ms,
-                "Hostcall start"
-            );
-
-            let (decision, reason, capability) = self.resolve_policy_decision(&required).await;
-            if decision == PolicyDecision::Allow {
-                tracing::info!(
-                    event = "policy.decision",
-                    runtime = "wasm",
-                    call_id = %payload.call_id,
-                    extension_id = ?self.extension_id.as_deref(),
-                    capability = %capability,
-                    decision = ?decision,
-                    reason = %reason,
-                    params_hash = %params_hash,
-                    "Hostcall allowed by policy"
-                );
-            } else {
-                tracing::warn!(
-                    event = "policy.decision",
-                    runtime = "wasm",
-                    call_id = %payload.call_id,
-                    extension_id = ?self.extension_id.as_deref(),
-                    capability = %capability,
-                    decision = ?decision,
-                    reason = %reason,
-                    params_hash = %params_hash,
-                    "Hostcall denied by policy"
-                );
-            }
-
-            let method = payload.method.trim().to_ascii_lowercase();
-            let outcome = if decision == PolicyDecision::Allow {
-                let dispatch = async {
-                    match method.as_str() {
-                        "tool" => self.dispatch_tool(&payload).await,
-                        "http" => self.dispatch_http(&payload).await,
-                        "exec" => self.dispatch_exec(&payload).await,
-                        "fs" => self.dispatch_fs(&payload).await,
-                        "env" => self.dispatch_env(&payload).await,
-                        "session" | "ui" | "events" => {
-                            let op = Self::hostcall_op(&payload.params).ok_or_else(|| {
-                                Self::host_error_json(
-                                    HostCallErrorCode::InvalidRequest,
-                                    format!("Missing host_call op for {method}"),
-                                    Some(json!({ "method": method })),
-                                    None,
-                                )
-                            })?;
-                            let manager = self.manager().ok_or_else(|| {
-                                Self::host_error_json(
-                                    HostCallErrorCode::Denied,
-                                    "No extension manager configured for host_call",
-                                    Some(json!({ "method": method })),
-                                    None,
-                                )
-                            })?;
-                            let outcome = match method.as_str() {
-                                "session" => {
-                                    dispatch_hostcall_session(
-                                        &payload.call_id,
-                                        &manager,
-                                        &op,
-                                        payload.params.clone(),
-                                    )
-                                    .await
-                                }
-                                "ui" => {
-                                    dispatch_hostcall_ui(
-                                        &payload.call_id,
-                                        &manager,
-                                        &op,
-                                        payload.params.clone(),
-                                    )
-                                    .await
-                                }
-                                "events" => {
-                                    dispatch_hostcall_events(
-                                        &payload.call_id,
-                                        &manager,
-                                        self.tools.as_ref(),
-                                        &op,
-                                        payload.params.clone(),
-                                    )
-                                    .await
-                                }
-                                _ => HostcallOutcome::Error {
-                                    code: "invalid_request".to_string(),
-                                    message: format!("Unsupported host_call method: {method}"),
-                                },
-                            };
-                            Self::hostcall_outcome_to_result(outcome)
-                        }
-                        _ => Err(Self::host_error_json(
-                            HostCallErrorCode::InvalidRequest,
-                            format!("Unsupported host_call method: {method}"),
-                            Some(json!({ "method": method })),
-                            None,
-                        )),
-                    }
-                };
-
-                match call_timeout_ms {
-                    Some(timeout_ms) => timeout(
-                        wall_now(),
-                        Duration::from_millis(timeout_ms),
-                        Box::pin(dispatch),
-                    )
-                    .await
-                    .unwrap_or_else(|_| {
-                        Err(Self::host_error_json(
-                            HostCallErrorCode::Timeout,
-                            format!("Hostcall timed out after {timeout_ms}ms"),
-                            Some(json!({ "capability": required, "method": method })),
-                            Some(true),
-                        ))
-                    }),
-                    None => dispatch.await,
-                }
-            } else {
-                Err(Self::host_error_json(
-                    HostCallErrorCode::Denied,
-                    format!("Capability '{capability}' denied by policy ({reason})"),
-                    Some(json!({
-                        "capability": capability,
-                        "decision": format!("{:?}", decision),
-                        "reason": reason,
-                    })),
-                    None,
-                ))
-            };
-
-            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-            let (is_error, error_code) = match &outcome {
-                Ok(_) => (false, None),
-                Err(err_json) => (
-                    true,
-                    serde_json::from_str::<HostCallError>(err_json)
-                        .ok()
-                        .map(|err| err.code),
-                ),
-            };
-
-            if is_error {
-                tracing::warn!(
-                    event = "host_call.end",
-                    runtime = "wasm",
-                    call_id = %payload.call_id,
-                    extension_id = ?self.extension_id.as_deref(),
-                    capability = %required,
-                    method = %payload.method,
-                    params_hash = %params_hash,
-                    duration_ms,
-                    error_code = ?error_code,
-                    "Hostcall end (error)"
-                );
-            } else {
-                tracing::info!(
-                    event = "host_call.end",
-                    runtime = "wasm",
-                    call_id = %payload.call_id,
-                    extension_id = ?self.extension_id.as_deref(),
-                    capability = %required,
-                    method = %payload.method,
-                    params_hash = %params_hash,
-                    duration_ms,
-                    "Hostcall end (success)"
-                );
-            }
-
-            outcome
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            Self::host_result_payload_to_result(result)
         }
     }
 
@@ -3530,6 +3409,7 @@ mod wasm_host {
             let err_json = outcome.expect_err("tool hostcall timeout");
             let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
             assert_eq!(err.code, HostCallErrorCode::Timeout);
+            assert_eq!(err.retryable, Some(true));
             assert_policy_decision_logged(&events, &call.call_id, "tool", "Allow");
         }
 
@@ -3655,6 +3535,91 @@ mod wasm_host {
             assert_eq!(out.get("body").and_then(Value::as_str), Some("ok"));
 
             join.join().expect("server thread join");
+        }
+
+        #[test]
+        fn wasm_host_session_denied_without_manager_is_taxonomy_correct() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-session-no-manager".to_string(),
+                capability: "session".to_string(),
+                method: "session".to_string(),
+                params: json!({}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let json = serde_json::to_string(&call).expect("serialize hostcall");
+            let err_json = run_async(async {
+                host::Host::call(&mut state, "session".to_string(), json).await
+            })
+            .expect_err("session denied");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+        }
+
+        #[test]
+        fn wasm_host_ui_denied_without_manager_is_taxonomy_correct() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-ui-no-manager".to_string(),
+                capability: "ui".to_string(),
+                method: "ui".to_string(),
+                params: json!({}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let json = serde_json::to_string(&call).expect("serialize hostcall");
+            let err_json =
+                run_async(async { host::Host::call(&mut state, "ui".to_string(), json).await })
+                    .expect_err("ui denied");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+        }
+
+        #[test]
+        fn wasm_host_events_denied_without_manager_is_taxonomy_correct() {
+            let dir = tempdir().expect("tempdir");
+            let cwd = dir.path().to_path_buf();
+
+            let mut state = HostState::new(permissive_policy(), cwd).expect("host state");
+            state
+                .apply_registration(&registration_payload())
+                .expect("apply registration");
+
+            let call = HostCallPayload {
+                call_id: "call-events-no-manager".to_string(),
+                capability: "events".to_string(),
+                method: "events".to_string(),
+                params: json!({}),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            let json = serde_json::to_string(&call).expect("serialize hostcall");
+            let err_json =
+                run_async(async { host::Host::call(&mut state, "events".to_string(), json).await })
+                    .expect_err("events denied");
+            let err: HostCallError = serde_json::from_str(&err_json).expect("parse error json");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
         }
     }
 }
@@ -5671,7 +5636,8 @@ async fn prompt_capability_once(
     });
     let request = ExtensionUiRequest::new("", "confirm", payload);
 
-    match manager.request_ui(request).await {
+    let result = manager.request_ui(request).await;
+    match result {
         Ok(Some(response)) => {
             response
                 .value
@@ -5685,270 +5651,116 @@ async fn prompt_capability_once(
 }
 
 #[allow(clippy::future_not_send)]
-async fn resolve_js_hostcall_policy_decision(
-    host: &JsRuntimeHost,
-    extension_id: Option<&str>,
-    required: &str,
-) -> (PolicyDecision, String, String) {
-    const UNKNOWN_EXTENSION_ID: &str = "<unknown>";
-    let PolicyCheck {
-        mut decision,
-        capability,
-        mut reason,
-    } = host.policy.evaluate(required);
+/// Convert a [`HostcallRequest`] (JS tier) into a canonical [`HostCallPayload`]
+/// suitable for the shared dispatcher.
+fn hostcall_request_to_payload(request: &HostcallRequest) -> HostCallPayload {
+    let method = request.method().to_string();
+    let capability = request.required_capability();
+    let timeout_ms = js_hostcall_timeout_ms(request);
 
-    if decision != PolicyDecision::Prompt {
-        return (decision, reason, capability);
-    }
-
-    if let Some(extension_id) = extension_id {
-        if let Some(allow) = host
-            .manager()
-            .and_then(|m| m.cached_policy_prompt_decision(extension_id, &capability))
-        {
-            decision = if allow {
-                PolicyDecision::Allow
-            } else {
-                PolicyDecision::Deny
-            };
-            reason = if allow {
-                "prompt_cache_allow".to_string()
-            } else {
-                "prompt_cache_deny".to_string()
-            };
-            return (decision, reason, capability);
+    // Build canonical params from the JS-tier kind + payload.
+    let params = match &request.kind {
+        HostcallKind::Tool { name } => {
+            // Canonical: { "name": "tool_name", "input": <payload> }
+            json!({ "name": name, "input": request.payload.clone() })
         }
-    }
-
-    let prompt_extension_id = extension_id.unwrap_or(UNKNOWN_EXTENSION_ID);
-    let Some(manager) = host.manager() else {
-        return (PolicyDecision::Deny, "shutdown".to_string(), capability);
+        HostcallKind::Exec { cmd } => {
+            // Canonical: { "cmd": "<command>", ...payload_fields }
+            // Normalize legacy "command" alias to "cmd".
+            let mut obj = match &request.payload {
+                Value::Object(map) => {
+                    let mut m = map.clone();
+                    m.remove("command"); // drop legacy alias if present
+                    m
+                }
+                _ => serde_json::Map::new(),
+            };
+            obj.insert("cmd".to_string(), Value::String(cmd.clone()));
+            Value::Object(obj)
+        }
+        HostcallKind::Http => {
+            // Params is the request object as-is.
+            request.payload.clone()
+        }
+        HostcallKind::Session { op } | HostcallKind::Ui { op } | HostcallKind::Events { op } => {
+            // Canonical: { "op": "op_name", ...payload_fields }
+            let mut obj = match &request.payload {
+                Value::Object(map) => map.clone(),
+                _ => serde_json::Map::new(),
+            };
+            obj.insert("op".to_string(), Value::String(op.clone()));
+            Value::Object(obj)
+        }
     };
-    let allow = prompt_capability_once(&manager, prompt_extension_id, &capability).await;
-    if let Some(extension_id) = extension_id {
-        manager.cache_policy_prompt_decision(extension_id, &capability, allow);
-    }
-    decision = if allow {
-        PolicyDecision::Allow
-    } else {
-        PolicyDecision::Deny
-    };
-    reason = if allow {
-        "prompt_user_allow".to_string()
-    } else {
-        "prompt_user_deny".to_string()
-    };
-    (decision, reason, capability)
-}
 
-fn log_js_hostcall_start(
-    call_id: &str,
-    extension_id: Option<&str>,
-    required: &str,
-    method: &str,
-    params_hash: &str,
-    call_timeout_ms: Option<u64>,
-) {
-    tracing::info!(
-        event = "host_call.start",
-        runtime = "js",
-        call_id = %call_id,
-        extension_id = ?extension_id,
-        capability = %required,
-        method = %method,
-        params_hash = %params_hash,
-        timeout_ms = call_timeout_ms,
-        "Hostcall start"
-    );
-}
-
-fn log_js_policy_decision(
-    call_id: &str,
-    extension_id: Option<&str>,
-    capability: &str,
-    decision: &PolicyDecision,
-    reason: &str,
-    params_hash: &str,
-) {
-    if *decision == PolicyDecision::Allow {
-        tracing::info!(
-            event = "policy.decision",
-            runtime = "js",
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %capability,
-            decision = ?decision,
-            reason = %reason,
-            params_hash = %params_hash,
-            "Hostcall allowed by policy"
-        );
-    } else {
-        tracing::warn!(
-            event = "policy.decision",
-            runtime = "js",
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %capability,
-            decision = ?decision,
-            reason = %reason,
-            params_hash = %params_hash,
-            "Hostcall denied by policy"
-        );
+    HostCallPayload {
+        call_id: request.call_id.clone(),
+        capability,
+        method,
+        params,
+        timeout_ms,
+        cancel_token: None,
+        context: None,
     }
 }
 
-fn log_js_hostcall_end(
-    call_id: &str,
-    extension_id: Option<&str>,
-    required: &str,
-    method: &str,
-    params_hash: &str,
-    duration_ms: u64,
-    outcome: &HostcallOutcome,
-) {
-    let (is_error, error_code) = match outcome {
-        HostcallOutcome::Success(_) => (false, None),
-        HostcallOutcome::Error { code, .. } => (true, Some(code.as_str())),
-    };
-
-    if is_error {
-        tracing::warn!(
-            event = "host_call.end",
-            runtime = "js",
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %required,
-            method = %method,
-            params_hash = %params_hash,
-            duration_ms,
-            error_code = error_code,
-            "Hostcall end (error)"
+/// Convert a [`HostResultPayload`] from the shared dispatcher back to
+/// [`HostcallOutcome`] for JS Promise completion.
+fn host_result_to_outcome(result: &HostResultPayload) -> HostcallOutcome {
+    if result.is_error {
+        let (code, message) = result.error.as_ref().map_or_else(
+            || ("internal".to_string(), "Unknown error".to_string()),
+            |e| {
+                // Use serde to get the snake_case code string (e.g. "invalid_request").
+                let code_str = serde_json::to_value(e.code)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_else(|| "internal".to_string());
+                (code_str, e.message.clone())
+            },
         );
+        HostcallOutcome::Error { code, message }
     } else {
-        tracing::info!(
-            event = "host_call.end",
-            runtime = "js",
-            call_id = %call_id,
-            extension_id = ?extension_id,
-            capability = %required,
-            method = %method,
-            params_hash = %params_hash,
-            duration_ms,
-            "Hostcall end (success)"
-        );
+        HostcallOutcome::Success(result.output.clone())
     }
 }
 
+/// Dispatch a JS hostcall through the shared dispatcher.
+///
+/// Preserves test interceptors as a hook *around* the shared dispatcher.
+/// All policy, logging, timeout, and taxonomy enforcement is handled by
+/// [`dispatch_host_call_shared`].
 #[allow(clippy::future_not_send)]
-async fn dispatch_hostcall_allowed(
-    host: &JsRuntimeHost,
-    request: HostcallRequest,
-) -> HostcallOutcome {
-    // Allow test interceptors to short-circuit before real dispatch.
+async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
+    // Test interceptor: short-circuit before shared dispatch.
     if let Some(ref interceptor) = host.interceptor {
         if let Some(outcome) = interceptor.intercept(&request) {
             return outcome;
         }
     }
 
-    let HostcallRequest {
-        call_id,
-        kind,
-        payload,
-        ..
-    } = request;
+    // Convert JS request to canonical payload.
+    let payload = hostcall_request_to_payload(&request);
 
-    match (kind, payload) {
-        (HostcallKind::Tool { name }, payload) => {
-            dispatch_hostcall_tool(&host.tools, &call_id, &name, payload).await
-        }
-        (HostcallKind::Exec { cmd }, payload) => {
-            dispatch_hostcall_exec(&call_id, &cmd, payload).await
-        }
-        (HostcallKind::Http, payload) => {
-            dispatch_hostcall_http(&call_id, &host.http, payload).await
-        }
-        (HostcallKind::Session { op }, payload) => {
-            let Some(manager) = host.manager() else {
-                return HostcallOutcome::Error {
-                    code: "SHUTDOWN".to_string(),
-                    message: "Extension manager is shutting down".to_string(),
-                };
-            };
-            dispatch_hostcall_session(&call_id, &manager, &op, payload).await
-        }
-        (HostcallKind::Ui { op }, payload) => {
-            let Some(manager) = host.manager() else {
-                return HostcallOutcome::Error {
-                    code: "SHUTDOWN".to_string(),
-                    message: "Extension manager is shutting down".to_string(),
-                };
-            };
-            dispatch_hostcall_ui(&call_id, &manager, &op, payload).await
-        }
-        (HostcallKind::Events { op }, payload) => {
-            let Some(manager) = host.manager() else {
-                return HostcallOutcome::Error {
-                    code: "SHUTDOWN".to_string(),
-                    message: "Extension manager is shutting down".to_string(),
-                };
-            };
-            dispatch_hostcall_events(&call_id, &manager, &host.tools, &op, payload).await
-        }
-    }
-}
-
-#[allow(clippy::future_not_send)]
-async fn dispatch_hostcall(host: &JsRuntimeHost, request: HostcallRequest) -> HostcallOutcome {
-    let call_id = request.call_id.clone();
-    let extension_id = request.extension_id.clone();
-    let method = request.method();
-    let required = request.required_capability();
-    let params_hash = request.params_hash();
-    let call_timeout_ms = js_hostcall_timeout_ms(&request);
-    let started_at = Instant::now();
-
-    log_js_hostcall_start(
-        &call_id,
-        extension_id.as_deref(),
-        &required,
-        method,
-        &params_hash,
-        call_timeout_ms,
-    );
-
-    let (decision, reason, capability) =
-        resolve_js_hostcall_policy_decision(host, extension_id.as_deref(), &required).await;
-    log_js_policy_decision(
-        &call_id,
-        extension_id.as_deref(),
-        &capability,
-        &decision,
-        &reason,
-        &params_hash,
-    );
-
-    let outcome = if decision == PolicyDecision::Allow {
-        dispatch_hostcall_allowed(host, request).await
-    } else {
-        HostcallOutcome::Error {
-            code: "denied".to_string(),
-            message: format!("Capability '{capability}' denied by policy ({reason})"),
-        }
+    // Build execution context from JsRuntimeHost.
+    let manager = host.manager();
+    let ctx = HostCallContext {
+        runtime: "js",
+        extension_id: request.extension_id.as_deref(),
+        policy: &host.policy,
+        tools: &host.tools,
+        http: &host.http,
+        fs: None,
+        env_allowlist: None,
+        manager: manager.as_ref(),
     };
 
-    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-    log_js_hostcall_end(
-        &call_id,
-        extension_id.as_deref(),
-        &required,
-        method,
-        &params_hash,
-        duration_ms,
-        &outcome,
-    );
+    // Dispatch through the shared dispatcher (handles validation, policy,
+    // timeout, logging, and taxonomy enforcement).
+    let result = dispatch_host_call_shared(&ctx, &payload).await;
 
-    outcome
+    // Convert back to HostcallOutcome for Promise completion.
+    host_result_to_outcome(&result)
 }
 
 #[allow(clippy::future_not_send)]
@@ -5974,7 +5786,7 @@ async fn dispatch_hostcall_tool(
             },
         },
         Err(err) => HostcallOutcome::Error {
-            code: "tool_error".to_string(),
+            code: "io".to_string(),
             message: err.to_string(),
         },
     }
@@ -6976,6 +6788,7 @@ impl ExtensionManager {
     }
 
     /// Load persisted permission decisions into the inner state.
+    #[cfg(not(test))]
     fn load_persisted_permissions(inner: &mut ExtensionManagerInner) {
         match PermissionStore::open_default() {
             Ok(store) => {
@@ -6988,6 +6801,13 @@ impl ExtensionManager {
             }
         }
     }
+
+    /// Unit tests must not read/write the real user permissions file.
+    ///
+    /// Tests that need persisted-permission behavior should open a `PermissionStore`
+    /// at an explicit temp path and wire it into the manager.
+    #[cfg(test)]
+    const fn load_persisted_permissions(_inner: &mut ExtensionManagerInner) {}
 
     /// Set the budget for extension operations.
     pub fn set_budget(&self, budget: Budget) {
@@ -8412,7 +8232,7 @@ fn shared_result_err(
 ) -> HostResultPayload {
     HostResultPayload {
         call_id: call_id.to_string(),
-        output: Value::Null,
+        output: json!({}),
         is_error: true,
         error: Some(HostCallError {
             code,
@@ -8434,7 +8254,7 @@ fn shared_result_err_with_details(
 ) -> HostResultPayload {
     HostResultPayload {
         call_id: call_id.to_string(),
-        output: Value::Null,
+        output: json!({}),
         is_error: true,
         error: Some(HostCallError {
             code,
@@ -8453,14 +8273,30 @@ fn outcome_to_host_result(call_id: &str, outcome: HostcallOutcome) -> HostResult
         HostcallOutcome::Success(value) => shared_result_ok(call_id, value),
         HostcallOutcome::Error { code, message } => {
             let error_code = match code.to_ascii_lowercase().as_str() {
-                "timeout" => HostCallErrorCode::Timeout,
-                "denied" | "shutdown" => HostCallErrorCode::Denied,
-                "io" => HostCallErrorCode::Io,
+                "timeout" | "cancelled" => HostCallErrorCode::Timeout,
+                "denied" => HostCallErrorCode::Denied,
+                "io" | "tool_error" => HostCallErrorCode::Io,
                 "invalid_request" => HostCallErrorCode::InvalidRequest,
+                // shutdown/internal/unknown codes map to Internal (not user-facing denial)
                 _ => HostCallErrorCode::Internal,
             };
             shared_result_err(call_id, error_code, message)
         }
+        HostcallOutcome::StreamChunk {
+            chunk,
+            sequence,
+            is_final,
+        } => HostResultPayload {
+            call_id: call_id.to_string(),
+            output: chunk,
+            is_error: false,
+            error: None,
+            chunk: Some(HostStreamChunk {
+                index: sequence,
+                is_last: is_final,
+                backpressure: None,
+            }),
+        },
     }
 }
 
@@ -8781,7 +8617,11 @@ async fn dispatch_shared_allowed(
                     "Empty tool name",
                 );
             }
-            let outcome = dispatch_hostcall_tool(ctx.tools, call_id, name, params.clone()).await;
+            let input = params
+                .get("input")
+                .cloned()
+                .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+            let outcome = dispatch_hostcall_tool(ctx.tools, call_id, name, input).await;
             outcome_to_host_result(call_id, outcome)
         }
         "exec" => {
@@ -10311,8 +10151,10 @@ mod tests {
                         "unexpected denial message: {message}"
                     );
                 }
-                other @ HostcallOutcome::Success(_) => {
-                    panic!("expected denied outcome for capability={capability}, got {other:?}");
+                other => {
+                    unreachable!(
+                        "expected denied outcome for capability={capability}, got {other:?}"
+                    );
                 }
             }
         }
@@ -10636,6 +10478,7 @@ mod tests {
                 );
                 return;
             }
+            HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
         };
 
         let encoded = serde_json::to_string(&value).expect("serialize read output");
@@ -10678,6 +10521,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -10709,6 +10553,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -10737,6 +10582,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
             assert_eq!(tool_list.len(), 2);
@@ -10789,6 +10635,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_list = value.get("tools").and_then(Value::as_array).unwrap();
             assert_eq!(tool_list.len(), 2); // 1 built-in + 1 extension
@@ -10830,6 +10677,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let tool_names: Vec<String> = value
                 .get("tools")
@@ -11586,6 +11434,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert!(value.get("provider").unwrap().is_null());
             assert!(value.get("modelId").unwrap().is_null());
@@ -11631,6 +11480,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert!(value.get("thinkingLevel").unwrap().is_null());
         });
@@ -11666,6 +11516,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(
                 value.get("thinkingLevel").and_then(Value::as_str),
@@ -11823,6 +11674,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(value.as_str(), Some("My Feature Work"));
         });
@@ -11941,6 +11793,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(
                 value.get("provider").and_then(Value::as_str),
@@ -11984,6 +11837,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(
                 value.get("thinkingLevel").and_then(Value::as_str),
@@ -12383,6 +12237,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert_eq!(val.get("name").and_then(Value::as_str), Some("output-dir"));
             assert_eq!(val.get("type").and_then(Value::as_str), Some("string"));
@@ -12422,6 +12277,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success with null, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             assert!(val.is_null());
         });
@@ -12452,6 +12308,7 @@ mod tests {
                 HostcallOutcome::Error { code, message } => {
                     unreachable!("expected success, got error {code}: {message}");
                 }
+                HostcallOutcome::StreamChunk { .. } => unreachable!("unexpected stream chunk"),
             };
             let arr = val.as_array().expect("expected array");
             assert_eq!(arr.len(), 3);
@@ -14219,8 +14076,12 @@ mod tests {
         let cases = vec![
             ("timeout", HostCallErrorCode::Timeout),
             ("denied", HostCallErrorCode::Denied),
-            ("SHUTDOWN", HostCallErrorCode::Denied),
+            ("SHUTDOWN", HostCallErrorCode::Internal),
+            ("shutdown", HostCallErrorCode::Internal),
+            ("CANCELLED", HostCallErrorCode::Timeout),
+            ("cancelled", HostCallErrorCode::Timeout),
             ("io", HostCallErrorCode::Io),
+            ("tool_error", HostCallErrorCode::Io),
             ("invalid_request", HostCallErrorCode::InvalidRequest),
             ("something_else", HostCallErrorCode::Internal),
         ];
@@ -14232,6 +14093,11 @@ mod tests {
             let result = outcome_to_host_result("call-err", outcome);
             assert!(result.is_error);
             assert_eq!(result.error.as_ref().unwrap().code, expected, "code={code}");
+            // Verify output is always an object (spec requirement)
+            assert!(
+                result.output.is_object(),
+                "error result output must be object for code={code}"
+            );
         }
     }
 
@@ -14249,6 +14115,299 @@ mod tests {
             shared_params_hash("http", &first),
             shared_params_hash("tool", &first)
         );
+    }
+
+    // --- Canonical params shapes (bd-1uy.1.1.2) ---
+
+    #[test]
+    fn canonical_params_tool_shape() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c1".into(),
+            kind: HostcallKind::Tool {
+                name: "read".into(),
+            },
+            payload: json!({"path": "/tmp/foo"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.method, "tool");
+        assert_eq!(payload.params["name"], "read");
+        assert_eq!(payload.params["input"]["path"], "/tmp/foo");
+        let hp = request.params_for_hash();
+        assert_eq!(hp["name"], "read");
+        assert_eq!(hp["input"]["path"], "/tmp/foo");
+    }
+
+    #[test]
+    fn canonical_params_exec_shape() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c2".into(),
+            kind: HostcallKind::Exec { cmd: "ls".into() },
+            payload: json!({"args": ["-la"], "cwd": "/home"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.params["cmd"], "ls");
+        assert_eq!(payload.params["args"][0], "-la");
+        assert_eq!(payload.params["cwd"], "/home");
+        let hp = request.params_for_hash();
+        assert_eq!(hp["cmd"], "ls");
+        assert_eq!(hp["args"][0], "-la");
+    }
+
+    #[test]
+    fn canonical_params_exec_command_alias_normalized() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c2b".into(),
+            kind: HostcallKind::Exec { cmd: "git".into() },
+            payload: json!({"command": "git", "args": ["status"]}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.params["cmd"], "git");
+        assert!(
+            payload.params.get("command").is_none(),
+            "legacy 'command' must be normalized"
+        );
+        let hp = request.params_for_hash();
+        assert!(hp.get("command").is_none());
+        assert_eq!(hp["cmd"], "git");
+    }
+
+    #[test]
+    fn canonical_params_exec_non_object_payload() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c2c".into(),
+            kind: HostcallKind::Exec { cmd: "echo".into() },
+            payload: json!("hello"),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.params["cmd"], "echo");
+        assert!(payload.params.is_object());
+    }
+
+    #[test]
+    fn canonical_params_http_shape() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c3".into(),
+            kind: HostcallKind::Http,
+            payload: json!({"url": "https://example.com", "method": "GET"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.params["url"], "https://example.com");
+        let hp = request.params_for_hash();
+        assert_eq!(hp, request.payload);
+    }
+
+    #[test]
+    fn canonical_params_session_flattened() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c4".into(),
+            kind: HostcallKind::Session {
+                op: "set_model".into(),
+            },
+            payload: json!({"provider": "anthropic", "modelId": "claude-sonnet-4-5"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.params["op"], "set_model");
+        assert_eq!(payload.params["provider"], "anthropic");
+        assert!(payload.params.get("args").is_none(), "must be flattened");
+        let hp = request.params_for_hash();
+        assert_eq!(hp["op"], "set_model");
+        assert_eq!(hp["provider"], "anthropic");
+    }
+
+    #[test]
+    fn canonical_params_ui_flattened() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c5".into(),
+            kind: HostcallKind::Ui { op: "toast".into() },
+            payload: json!({"message": "Done!", "level": "info"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.params["op"], "toast");
+        assert_eq!(payload.params["message"], "Done!");
+        let hp = request.params_for_hash();
+        assert_eq!(hp["op"], "toast");
+        assert_eq!(hp["message"], "Done!");
+    }
+
+    #[test]
+    fn canonical_params_events_flattened() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let request = HostcallRequest {
+            call_id: "c6".into(),
+            kind: HostcallKind::Events {
+                op: "subscribe".into(),
+            },
+            payload: json!({"event": "tool_start"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let payload = hostcall_request_to_payload(&request);
+        assert_eq!(payload.params["op"], "subscribe");
+        assert_eq!(payload.params["event"], "tool_start");
+        let hp = request.params_for_hash();
+        assert_eq!(hp["op"], "subscribe");
+        assert_eq!(hp["event"], "tool_start");
+    }
+
+    // --- Params hash parity: JS-tier vs shared dispatcher ---
+
+    #[test]
+    fn params_hash_parity_tool() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let r = HostcallRequest {
+            call_id: "p1".into(),
+            kind: HostcallKind::Tool {
+                name: "bash".into(),
+            },
+            payload: json!({"command": "ls -la"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let p = hostcall_request_to_payload(&r);
+        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
+    }
+
+    #[test]
+    fn params_hash_parity_exec() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let r = HostcallRequest {
+            call_id: "p2".into(),
+            kind: HostcallKind::Exec { cmd: "git".into() },
+            payload: json!({"args": ["status", "--short"]}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let p = hostcall_request_to_payload(&r);
+        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
+    }
+
+    #[test]
+    fn params_hash_parity_http() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let r = HostcallRequest {
+            call_id: "p3".into(),
+            kind: HostcallKind::Http,
+            payload: json!({"url": "https://api.example.com", "method": "POST", "body": "data"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let p = hostcall_request_to_payload(&r);
+        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
+    }
+
+    #[test]
+    fn params_hash_parity_session() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let r = HostcallRequest {
+            call_id: "p4".into(),
+            kind: HostcallKind::Session {
+                op: "set_model".into(),
+            },
+            payload: json!({"provider": "anthropic", "modelId": "claude-sonnet-4-5"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let p = hostcall_request_to_payload(&r);
+        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
+    }
+
+    #[test]
+    fn params_hash_parity_ui() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let r = HostcallRequest {
+            call_id: "p5".into(),
+            kind: HostcallKind::Ui { op: "toast".into() },
+            payload: json!({"message": "hello"}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let p = hostcall_request_to_payload(&r);
+        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
+    }
+
+    #[test]
+    fn params_hash_parity_events() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let r = HostcallRequest {
+            call_id: "p6".into(),
+            kind: HostcallKind::Events {
+                op: "subscribe".into(),
+            },
+            payload: json!({"event": "tool_end", "filter": {"name": "bash"}}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let p = hostcall_request_to_payload(&r);
+        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
+    }
+
+    #[test]
+    fn params_hash_parity_exec_command_alias() {
+        use crate::extensions_js::{HostcallKind, HostcallRequest};
+        let r = HostcallRequest {
+            call_id: "p7".into(),
+            kind: HostcallKind::Exec { cmd: "npm".into() },
+            payload: json!({"command": "npm", "args": ["install"]}),
+            trace_id: 0,
+            extension_id: None,
+        };
+        let p = hostcall_request_to_payload(&r);
+        assert_eq!(r.params_hash(), shared_params_hash(&p.method, &p.params));
+    }
+
+    #[test]
+    fn params_hash_different_methods_differ() {
+        let params = json!({"op": "get_state"});
+        let h1 = shared_params_hash("session", &params);
+        let h2 = shared_params_hash("ui", &params);
+        let h3 = shared_params_hash("events", &params);
+        assert_ne!(h1, h2);
+        assert_ne!(h2, h3);
+        assert_ne!(h1, h3);
+    }
+
+    #[test]
+    fn params_hash_nested_key_order_independent() {
+        let a = json!({"op": "test", "config": {"z": 1, "a": 2}, "list": [3, 2, 1]});
+        let b = json!({"config": {"a": 2, "z": 1}, "op": "test", "list": [3, 2, 1]});
+        assert_eq!(
+            shared_params_hash("session", &a),
+            shared_params_hash("session", &b)
+        );
+        let c = json!({"op": "test", "config": {"z": 1, "a": 2}, "list": [1, 2, 3]});
+        assert_ne!(
+            shared_params_hash("session", &a),
+            shared_params_hash("session", &c)
+        );
+    }
+
+    #[test]
+    fn canonicalize_json_for_hash_idempotent() {
+        let input = json!({"z": {"b": 2, "a": 1}, "a": [3, {"x": 1, "a": 0}]});
+        let once = canonicalize_json_for_hash(&input);
+        let twice = canonicalize_json_for_hash(&once);
+        assert_eq!(once, twice);
     }
 
     // --- Timeout ---
@@ -14339,5 +14498,980 @@ mod tests {
                 HostCallErrorCode::InvalidRequest
             );
         });
+    }
+
+    // ================================================================
+    // Log ledger helpers + tests (bd-1uy.1.1.4)
+    // ================================================================
+
+    const TAXONOMY: &[HostCallErrorCode] = &[
+        HostCallErrorCode::Timeout,
+        HostCallErrorCode::Denied,
+        HostCallErrorCode::Io,
+        HostCallErrorCode::InvalidRequest,
+        HostCallErrorCode::Internal,
+    ];
+
+    fn assert_taxonomy(result: &HostResultPayload) {
+        if let Some(ref err) = result.error {
+            assert!(
+                TAXONOMY
+                    .iter()
+                    .any(|c| std::mem::discriminant(c) == std::mem::discriminant(&err.code)),
+                "error code {:?} is not in the taxonomy",
+                err.code
+            );
+        }
+    }
+
+    fn events_named<'a>(events: &'a [CapturedEvent], name: &'a str) -> Vec<&'a CapturedEvent> {
+        events
+            .iter()
+            .filter(|e| e.fields.get("event").is_some_and(|v| v == name))
+            .collect()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn assert_log_ledger(events: &[CapturedEvent], expected_call_id: &str, expected_method: &str) {
+        let starts = events_named(events, "host_call.start");
+        assert_eq!(
+            starts.len(),
+            1,
+            "expected 1 host_call.start, got {}",
+            starts.len()
+        );
+        let start = starts[0];
+        assert_eq!(
+            start.fields.get("call_id").map(String::as_str),
+            Some(expected_call_id)
+        );
+        assert_eq!(
+            start.fields.get("method").map(String::as_str),
+            Some(expected_method)
+        );
+        assert!(
+            start.fields.contains_key("runtime"),
+            "start missing runtime"
+        );
+        assert!(
+            start.fields.contains_key("capability"),
+            "start missing capability"
+        );
+        assert!(
+            start.fields.contains_key("params_hash"),
+            "start missing params_hash"
+        );
+        let decisions = events_named(events, "policy.decision");
+        assert_eq!(
+            decisions.len(),
+            1,
+            "expected 1 policy.decision, got {}",
+            decisions.len()
+        );
+        let dec = decisions[0];
+        assert_eq!(
+            dec.fields.get("call_id").map(String::as_str),
+            Some(expected_call_id)
+        );
+        assert!(
+            dec.fields.contains_key("capability"),
+            "decision missing capability"
+        );
+        assert!(
+            dec.fields.contains_key("decision"),
+            "decision missing decision"
+        );
+        assert!(
+            dec.fields.contains_key("params_hash"),
+            "decision missing params_hash"
+        );
+        let ends = events_named(events, "host_call.end");
+        assert_eq!(
+            ends.len(),
+            1,
+            "expected 1 host_call.end, got {}",
+            ends.len()
+        );
+        let end = ends[0];
+        assert_eq!(
+            end.fields.get("call_id").map(String::as_str),
+            Some(expected_call_id)
+        );
+        assert_eq!(
+            end.fields.get("method").map(String::as_str),
+            Some(expected_method)
+        );
+        assert!(end.fields.contains_key("runtime"), "end missing runtime");
+        assert!(
+            end.fields.contains_key("capability"),
+            "end missing capability"
+        );
+        assert!(
+            end.fields.contains_key("params_hash"),
+            "end missing params_hash"
+        );
+        assert!(
+            end.fields.contains_key("duration_ms"),
+            "end missing duration_ms"
+        );
+    }
+
+    fn assert_no_raw_params(events: &[CapturedEvent], raw_values: &[&str]) {
+        for event in events {
+            for (key, val) in &event.fields {
+                if key == "params_hash" || key == "message" {
+                    continue;
+                }
+                for raw in raw_values {
+                    assert!(
+                        !val.contains(raw),
+                        "raw param value {raw:?} leaked into log field {key}={val}"
+                    );
+                }
+            }
+        }
+    }
+
+    // --- Spec-valid host_result payloads (bd-1uy.1.1.1) ---
+
+    #[test]
+    fn shared_result_err_constructors_produce_valid_payloads() {
+        let err1 = shared_result_err("err-test-1", HostCallErrorCode::Internal, "test error");
+        assert!(validate_host_result(&err1).is_ok());
+        let err2 = shared_result_err_with_details(
+            "err-test-2",
+            HostCallErrorCode::Io,
+            "io error",
+            json!({ "detail": "x" }),
+            Some(true),
+        );
+        assert!(validate_host_result(&err2).is_ok());
+    }
+
+    #[test]
+    fn shared_result_ok_produces_valid_payload() {
+        let ok = shared_result_ok("ok-test-1", json!({ "data": 42 }));
+        assert!(validate_host_result(&ok).is_ok());
+        assert!(!ok.is_error);
+    }
+
+    #[test]
+    fn validate_host_result_rejects_null_output() {
+        let bad = HostResultPayload {
+            call_id: "null-output".to_string(),
+            output: Value::Null,
+            is_error: false,
+            error: None,
+            chunk: None,
+        };
+        assert!(
+            validate_host_result(&bad).is_err(),
+            "null output must be rejected"
+        );
+    }
+
+    // --- Ledger tests (bd-1uy.1.1.4) ---
+
+    #[test]
+    fn ledger_log_success() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-log-1",
+                    "log",
+                    "log",
+                    json!({ "level": "info", "message": "test-msg-secret" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(!result.is_error);
+        assert_log_ledger(&events, "ledger-log-1", "log");
+        assert_no_raw_params(&events, &["test-msg-secret"]);
+    }
+
+    #[test]
+    fn ledger_log_denied_by_strict_policy() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Strict,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-log-denied",
+                    "log",
+                    "log",
+                    json!({ "level": "warn", "message": "deny-me" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-log-denied", "log");
+    }
+
+    #[test]
+    fn ledger_env_success() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    deny_caps: vec![],
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let allowlist: BTreeSet<String> = std::iter::once("HOME".to_string()).collect();
+                let mut ctx = make_ctx(&policy, &tools, &http);
+                ctx.env_allowlist = Some(&allowlist);
+                let payload = make_payload("ledger-env-1", "env", "env", json!({ "name": "HOME" }));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(!result.is_error);
+        assert_log_ledger(&events, "ledger-env-1", "env");
+    }
+
+    #[test]
+    fn ledger_env_denied_not_in_allowlist() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    deny_caps: vec![],
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let allowlist: BTreeSet<String> = std::iter::once("HOME".to_string()).collect();
+                let mut ctx = make_ctx(&policy, &tools, &http);
+                ctx.env_allowlist = Some(&allowlist);
+                let payload = make_payload(
+                    "ledger-env-denied",
+                    "env",
+                    "env",
+                    json!({ "name": "SECRET_KEY_12345" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_log_ledger(&events, "ledger-env-denied", "env");
+        assert_no_raw_params(&events, &["SECRET_KEY_12345"]);
+    }
+
+    #[test]
+    fn ledger_env_no_connector() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    deny_caps: vec![],
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload =
+                    make_payload("ledger-env-noconn", "env", "env", json!({ "name": "PATH" }));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-env-noconn", "env");
+    }
+
+    #[test]
+    fn ledger_tool_missing_name() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload("ledger-tool-noname", "tool", "tool", json!({}));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::InvalidRequest
+        );
+        let starts = events_named(&events, "host_call.start");
+        assert!(starts.is_empty(), "validation error should produce no log");
+    }
+
+    #[test]
+    fn ledger_tool_unknown_tool() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-tool-unk",
+                    "tool",
+                    "tool",
+                    json!({ "name": "nonexistent_tool_xyz" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_log_ledger(&events, "ledger-tool-unk", "tool");
+        assert_no_raw_params(&events, &["nonexistent_tool_xyz"]);
+    }
+
+    #[test]
+    fn ledger_tool_denied_by_policy() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    deny_caps: vec!["read".to_string()],
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload =
+                    make_payload("ledger-tool-pol", "read", "tool", json!({ "name": "read" }));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-tool-pol", "tool");
+    }
+
+    #[test]
+    fn ledger_exec_missing_cmd() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    deny_caps: vec![],
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload("ledger-exec-nocmd", "exec", "exec", json!({}));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::InvalidRequest
+        );
+        assert_log_ledger(&events, "ledger-exec-nocmd", "exec");
+    }
+
+    #[test]
+    fn ledger_exec_denied_by_strict_policy() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Strict,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-exec-denied",
+                    "exec",
+                    "exec",
+                    json!({ "cmd": "echo secret_password_42" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-exec-denied", "exec");
+        assert_no_raw_params(&events, &["secret_password_42"]);
+    }
+
+    #[test]
+    fn ledger_http_denied_by_policy() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    deny_caps: vec!["http".to_string()],
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-http-denied",
+                    "http",
+                    "http",
+                    json!({ "url": "https://secret.example.com/api" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-http-denied", "http");
+        assert_no_raw_params(&events, &["secret.example.com"]);
+    }
+
+    #[test]
+    fn ledger_session_no_manager() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-sess-nomgr",
+                    "session",
+                    "session",
+                    json!({ "op": "getState" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-sess-nomgr", "session");
+    }
+
+    #[test]
+    fn ledger_session_missing_op() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let manager = ExtensionManager::new();
+                let mut ctx = make_ctx(&policy, &tools, &http);
+                ctx.manager = Some(&manager);
+                let payload = make_payload("ledger-sess-noop", "session", "session", json!({}));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::InvalidRequest
+        );
+        assert_log_ledger(&events, "ledger-sess-noop", "session");
+    }
+
+    #[test]
+    fn ledger_ui_no_manager() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-ui-nomgr",
+                    "ui",
+                    "ui",
+                    json!({ "op": "showToast", "message": "hello" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-ui-nomgr", "ui");
+        assert_no_raw_params(&events, &["showToast", "hello"]);
+    }
+
+    #[test]
+    fn ledger_events_no_manager() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-ev-nomgr",
+                    "events",
+                    "events",
+                    json!({ "op": "getModel" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-ev-nomgr", "events");
+    }
+
+    #[test]
+    fn ledger_fs_no_connector() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-fs-noconn",
+                    "read",
+                    "fs",
+                    json!({ "op": "read", "path": "/tmp/secret_file.txt" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::Denied
+        );
+        assert_log_ledger(&events, "ledger-fs-noconn", "fs");
+        assert_no_raw_params(&events, &["secret_file.txt"]);
+    }
+
+    #[test]
+    fn ledger_unsupported_method() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload("ledger-unsup", "banana", "banana", json!({}));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::InvalidRequest
+        );
+        let starts = events_named(&events, "host_call.start");
+        assert!(starts.is_empty(), "validation error should produce no log");
+    }
+
+    #[test]
+    fn ledger_empty_call_id() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload("", "log", "log", json!({}));
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::InvalidRequest
+        );
+        let starts = events_named(&events, "host_call.start");
+        assert!(starts.is_empty());
+    }
+
+    #[test]
+    fn ledger_capability_mismatch() {
+        let (result, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-cap-mismatch",
+                    "exec",
+                    "log",
+                    json!({ "level": "info", "message": "mismatch" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        assert!(validate_host_result(&result).is_ok());
+        assert!(result.is_error);
+        assert_taxonomy(&result);
+        assert_eq!(
+            result.error.as_ref().unwrap().code,
+            HostCallErrorCode::InvalidRequest
+        );
+        let starts = events_named(&events, "host_call.start");
+        assert!(starts.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ledger_full_cycle_all_methods() {
+        struct Case {
+            call_id: &'static str,
+            capability: &'static str,
+            method: &'static str,
+            params: Value,
+        }
+        let cases = vec![
+            Case {
+                call_id: "fc-log",
+                capability: "log",
+                method: "log",
+                params: json!({ "level": "debug", "message": "test" }),
+            },
+            Case {
+                call_id: "fc-env",
+                capability: "env",
+                method: "env",
+                params: json!({ "name": "SHELL" }),
+            },
+            Case {
+                call_id: "fc-tool",
+                capability: "tool",
+                method: "tool",
+                params: json!({ "name": "unknown_for_test" }),
+            },
+            Case {
+                call_id: "fc-exec",
+                capability: "exec",
+                method: "exec",
+                params: json!({ "cmd": "true" }),
+            },
+            Case {
+                call_id: "fc-http",
+                capability: "http",
+                method: "http",
+                params: json!({ "url": "https://invalid.test" }),
+            },
+            Case {
+                call_id: "fc-session",
+                capability: "session",
+                method: "session",
+                params: json!({ "op": "getState" }),
+            },
+            Case {
+                call_id: "fc-ui",
+                capability: "ui",
+                method: "ui",
+                params: json!({ "op": "showToast" }),
+            },
+            Case {
+                call_id: "fc-events",
+                capability: "events",
+                method: "events",
+                params: json!({ "op": "getModel" }),
+            },
+            Case {
+                call_id: "fc-fs",
+                capability: "read",
+                method: "fs",
+                params: json!({ "op": "read", "path": "/nonexistent" }),
+            },
+        ];
+        for case in &cases {
+            let (result, events) = capture_tracing_events(|| {
+                run_async(async {
+                    let policy = ExtensionPolicy {
+                        mode: ExtensionPolicyMode::Permissive,
+                        deny_caps: vec![],
+                        ..ExtensionPolicy::default()
+                    };
+                    let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                    let http = HttpConnector::with_defaults();
+                    let allowlist: BTreeSet<String> =
+                        std::iter::once("SHELL".to_string()).collect();
+                    let manager = ExtensionManager::new();
+                    let mut ctx = make_ctx(&policy, &tools, &http);
+                    ctx.env_allowlist = Some(&allowlist);
+                    ctx.manager = Some(&manager);
+                    let payload = make_payload(
+                        case.call_id,
+                        case.capability,
+                        case.method,
+                        case.params.clone(),
+                    );
+                    dispatch_host_call_shared(&ctx, &payload).await
+                })
+            });
+            assert!(
+                validate_host_result(&result).is_ok(),
+                "validate failed for {}",
+                case.call_id
+            );
+            assert_taxonomy(&result);
+            assert_log_ledger(&events, case.call_id, case.method);
+        }
+    }
+
+    #[test]
+    fn ledger_params_hash_is_opaque() {
+        let secret_value = "absolutely_secret_value_98765";
+        let (_, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    deny_caps: vec![],
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let allowlist: BTreeSet<String> =
+                    std::iter::once(secret_value.to_string()).collect();
+                let mut ctx = make_ctx(&policy, &tools, &http);
+                ctx.env_allowlist = Some(&allowlist);
+                let payload = make_payload(
+                    "ledger-hash-opaque",
+                    "env",
+                    "env",
+                    json!({ "name": secret_value }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        let starts = events_named(&events, "host_call.start");
+        assert_eq!(starts.len(), 1);
+        let hash = starts[0]
+            .fields
+            .get("params_hash")
+            .expect("params_hash field");
+        assert_eq!(hash.len(), 64, "params_hash should be 64 hex chars");
+        assert!(
+            hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "params_hash should be hex only"
+        );
+        assert!(
+            !hash.contains(secret_value),
+            "params_hash must not contain raw param"
+        );
+        assert_no_raw_params(&events, &[secret_value]);
+    }
+
+    #[test]
+    fn ledger_duration_ms_is_numeric() {
+        let (_, events) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-dur-num",
+                    "log",
+                    "log",
+                    json!({ "level": "info", "message": "timing" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        let ends = events_named(&events, "host_call.end");
+        assert_eq!(ends.len(), 1);
+        let dur = ends[0]
+            .fields
+            .get("duration_ms")
+            .expect("duration_ms field");
+        assert!(
+            dur.parse::<u64>().is_ok(),
+            "duration_ms should parse as u64, got: {dur}"
+        );
+    }
+
+    #[test]
+    fn ledger_policy_decision_level_varies() {
+        let (_, events_allow) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-lvl-allow",
+                    "log",
+                    "log",
+                    json!({ "level": "info", "message": "x" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        let allow_decs = events_named(&events_allow, "policy.decision");
+        assert_eq!(allow_decs.len(), 1);
+        assert_eq!(allow_decs[0].level, tracing::Level::INFO);
+        let (_, events_deny) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Strict,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-lvl-deny",
+                    "log",
+                    "log",
+                    json!({ "level": "info", "message": "x" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        let deny_decs = events_named(&events_deny, "policy.decision");
+        assert_eq!(deny_decs.len(), 1);
+        assert_eq!(deny_decs[0].level, tracing::Level::WARN);
+    }
+
+    #[test]
+    fn ledger_end_level_varies_by_outcome() {
+        let (_, events_ok) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-end-ok",
+                    "log",
+                    "log",
+                    json!({ "level": "info", "message": "x" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        let ends_ok = events_named(&events_ok, "host_call.end");
+        assert_eq!(ends_ok.len(), 1);
+        assert_eq!(ends_ok[0].level, tracing::Level::INFO);
+        let (_, events_err) = capture_tracing_events(|| {
+            run_async(async {
+                let policy = ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Strict,
+                    ..ExtensionPolicy::default()
+                };
+                let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+                let http = HttpConnector::with_defaults();
+                let ctx = make_ctx(&policy, &tools, &http);
+                let payload = make_payload(
+                    "ledger-end-err",
+                    "log",
+                    "log",
+                    json!({ "level": "info", "message": "x" }),
+                );
+                dispatch_host_call_shared(&ctx, &payload).await
+            })
+        });
+        let ends_err = events_named(&events_err, "host_call.end");
+        assert_eq!(ends_err.len(), 1);
+        assert_eq!(ends_err[0].level, tracing::Level::WARN);
     }
 }

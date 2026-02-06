@@ -375,6 +375,7 @@ fn trace_scheduler_task(task: &scheduler::Macrotask) -> String {
             let tag = match outcome {
                 HostcallOutcome::Success(_) => "ok",
                 HostcallOutcome::Error { .. } => "err",
+                HostcallOutcome::StreamChunk { .. } => "chunk",
             };
             format!("seq={}:hostcall:{call_id}:{tag}", task.seq.value())
         }

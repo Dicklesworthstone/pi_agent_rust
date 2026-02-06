@@ -593,7 +593,7 @@ fn test_thinking_level_default_budget() {
         (ThinkingLevel::Low, 2048),
         (ThinkingLevel::Medium, 8192),
         (ThinkingLevel::High, 16384),
-        (ThinkingLevel::XHigh, u32::MAX),
+        (ThinkingLevel::XHigh, 32768),
     ];
 
     for (level, expected) in test_cases {

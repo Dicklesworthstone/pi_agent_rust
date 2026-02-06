@@ -10,7 +10,7 @@ pub mod http;
 use crate::error::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 // ============================================================================
 // Hostcall protocol types (defined locally to avoid coupling with extensions)
@@ -104,7 +104,7 @@ pub fn host_result_err(
 ) -> HostResultPayload {
     HostResultPayload {
         call_id: call_id.to_string(),
-        output: Value::Null,
+        output: json!({}),
         is_error: true,
         error: Some(HostCallError {
             code,
@@ -126,7 +126,7 @@ pub fn host_result_err_with_details(
 ) -> HostResultPayload {
     HostResultPayload {
         call_id: call_id.to_string(),
-        output: Value::Null,
+        output: json!({}),
         is_error: true,
         error: Some(HostCallError {
             code,
@@ -135,5 +135,70 @@ pub fn host_result_err_with_details(
             retryable,
         }),
         chunk: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn host_result_err_output_is_object() {
+        let result = host_result_err("c1", HostCallErrorCode::Io, "fail", None);
+        assert!(result.is_error);
+        assert!(
+            result.output.is_object(),
+            "error output must be object, got {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn host_result_err_with_details_output_is_object() {
+        let result = host_result_err_with_details(
+            "c2",
+            HostCallErrorCode::Denied,
+            "nope",
+            json!({"key": "val"}),
+            Some(true),
+        );
+        assert!(result.is_error);
+        assert!(
+            result.output.is_object(),
+            "error output must be object, got {:?}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn host_result_ok_output_is_preserved() {
+        let payload = json!({"data": 42});
+        let result = host_result_ok("c3", payload.clone());
+        assert!(!result.is_error);
+        assert_eq!(result.output, payload);
+    }
+
+    #[test]
+    fn all_error_codes_produce_object_output() {
+        let codes = [
+            HostCallErrorCode::Timeout,
+            HostCallErrorCode::Denied,
+            HostCallErrorCode::Io,
+            HostCallErrorCode::InvalidRequest,
+            HostCallErrorCode::Internal,
+        ];
+        for code in codes {
+            let result = host_result_err("c4", code, "msg", None);
+            assert!(
+                result.output.is_object(),
+                "code={code:?} must produce object output"
+            );
+            let result_d = host_result_err_with_details("c5", code, "msg", json!({}), None);
+            assert!(
+                result_d.output.is_object(),
+                "code={code:?} with details must produce object output"
+            );
+        }
     }
 }

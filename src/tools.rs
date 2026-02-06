@@ -1146,7 +1146,10 @@ impl Tool for ReadTool {
             .collect::<Vec<_>>()
             .join("\n");
 
-        let truncation = truncate_head(&selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        let mut truncation = truncate_head(&selected_content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+        // `selected_content` may be clamped to keep allocations bounded, but truncation details should
+        // still report the full file line count so consumers can reason about "how much is left".
+        truncation.total_lines = total_file_lines;
 
         let mut output_text = truncation.content.clone();
         let mut details: Option<serde_json::Value> = None;

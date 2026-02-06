@@ -8,7 +8,7 @@ use pi::models::ModelEntry;
 use pi::provider::{
     Api, CacheRetention, InputType, KnownProvider, Model, ModelCost, StreamOptions,
 };
-use pi::providers::{create_provider, normalize_openai_base};
+use pi::providers::{create_provider, normalize_openai_base, normalize_openai_responses_base};
 use std::collections::HashMap;
 use std::str::FromStr;
 
@@ -113,8 +113,8 @@ fn normalize_openai_base_preserves_chat_completions() {
 }
 
 #[test]
-fn normalize_openai_base_preserves_responses() {
-    let harness = TestHarness::new("normalize_openai_base_preserves_responses");
+fn normalize_openai_responses_base_preserves_responses() {
+    let harness = TestHarness::new("normalize_openai_responses_base_preserves_responses");
     let input = "https://api.openai.com/v1/responses";
     let expected = "https://api.openai.com/v1/responses";
     harness
@@ -123,7 +123,7 @@ fn normalize_openai_base_preserves_responses() {
             ctx.push(("input".to_string(), input.to_string()));
             ctx.push(("expected".to_string(), expected.to_string()));
         });
-    let normalized = normalize_openai_base(input);
+    let normalized = normalize_openai_responses_base(input);
     assert_eq!(normalized, expected);
 }
 
@@ -144,8 +144,8 @@ fn normalize_openai_base_trims_trailing_slash_for_chat_completions() {
 }
 
 #[test]
-fn normalize_openai_base_trims_trailing_slash_for_responses() {
-    let harness = TestHarness::new("normalize_openai_base_trims_trailing_slash_for_responses");
+fn normalize_openai_responses_base_trims_trailing_slash() {
+    let harness = TestHarness::new("normalize_openai_responses_base_trims_trailing_slash");
     let input = "https://api.openai.com/v1/responses/";
     let expected = "https://api.openai.com/v1/responses";
     harness
@@ -154,7 +154,7 @@ fn normalize_openai_base_trims_trailing_slash_for_responses() {
             ctx.push(("input".to_string(), input.to_string()));
             ctx.push(("expected".to_string(), expected.to_string()));
         });
-    let normalized = normalize_openai_base(input);
+    let normalized = normalize_openai_responses_base(input);
     assert_eq!(normalized, expected);
 }
 
@@ -185,6 +185,26 @@ fn create_provider_for_openai() {
     let harness = TestHarness::new("create_provider_for_openai");
     let entry = make_model_entry("openai", "gpt-test", "https://api.openai.com/v1");
     let provider = create_provider(&entry, None).expect("create openai provider");
+    harness
+        .log()
+        .info_ctx("provider", "created provider", |ctx| {
+            ctx.push(("name".to_string(), provider.name().to_string()));
+            ctx.push(("api".to_string(), provider.api().to_string()));
+            ctx.push(("model".to_string(), provider.model_id().to_string()));
+        });
+
+    assert_eq!(provider.name(), "openai");
+    assert_eq!(provider.api(), "openai-responses");
+    assert_eq!(provider.model_id(), "gpt-test");
+}
+
+#[test]
+fn create_provider_for_openai_completions() {
+    let harness = TestHarness::new("create_provider_for_openai_completions");
+    let mut entry = make_model_entry("openai", "gpt-test", "https://api.openai.com/v1");
+    entry.model.api = "openai-completions".to_string();
+
+    let provider = create_provider(&entry, None).expect("create openai completions provider");
     harness
         .log()
         .info_ctx("provider", "created provider", |ctx| {

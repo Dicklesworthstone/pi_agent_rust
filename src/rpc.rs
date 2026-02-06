@@ -19,7 +19,9 @@ use crate::compaction::{
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
-use crate::extensions::{ExtensionUiRequest, ExtensionUiResponse, extension_event_from_agent};
+use crate::extensions::{
+    ExtensionManager, ExtensionUiRequest, ExtensionUiResponse, extension_event_from_agent,
+};
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
@@ -192,6 +194,12 @@ struct RunningBash {
     abort_tx: oneshot::Sender<()>,
 }
 
+#[derive(Debug, Default)]
+struct RpcUiBridgeState {
+    active: Option<ExtensionUiRequest>,
+    queue: VecDeque<ExtensionUiRequest>,
+}
+
 pub async fn run_stdio(session: AgentSession, options: RpcOptions) -> Result<()> {
     let (in_tx, in_rx) = mpsc::channel::<String>(1024);
     let (out_tx, out_rx) = std::sync::mpsc::channel::<String>();
@@ -305,18 +313,53 @@ pub async fn run(
             .cloned()
     };
 
+    let rpc_ui_state: Option<Arc<Mutex<RpcUiBridgeState>>> = rpc_extension_manager
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(RpcUiBridgeState::default())));
+
     if let Some(ref manager) = rpc_extension_manager {
         let (extension_ui_tx, extension_ui_rx) =
             asupersync::channel::mpsc::channel::<ExtensionUiRequest>(64);
         manager.set_ui_sender(extension_ui_tx);
 
         let out_tx_ui = out_tx.clone();
+        let ui_state = rpc_ui_state
+            .as_ref()
+            .map(Arc::clone)
+            .expect("rpc ui state should exist when extension manager exists");
+        let manager_ui = (*manager).clone();
+        let runtime_handle_ui = options.runtime_handle.clone();
         options.runtime_handle.spawn(async move {
             let cx = Cx::for_request();
             while let Ok(request) = extension_ui_rx.recv(&cx).await {
-                // Emit the UI request as a JSON-RPC notification to the client.
-                let rpc_event = request.to_rpc_event();
-                let _ = out_tx_ui.send(event(&rpc_event));
+                if request.expects_response() {
+                    let emit_now = {
+                        let Ok(mut guard) = ui_state.lock(&cx).await else {
+                            return;
+                        };
+                        if guard.active.is_none() {
+                            guard.active = Some(request.clone());
+                            true
+                        } else {
+                            guard.queue.push_back(request.clone());
+                            false
+                        }
+                    };
+
+                    if emit_now {
+                        rpc_emit_extension_ui_request(
+                            &runtime_handle_ui,
+                            Arc::clone(&ui_state),
+                            manager_ui.clone(),
+                            out_tx_ui.clone(),
+                            request,
+                        );
+                    }
+                } else {
+                    // Fire-and-forget UI updates should not be queued.
+                    let rpc_event = request.to_rpc_event();
+                    let _ = out_tx_ui.send(event(&rpc_event));
+                }
             }
         });
     }
@@ -1348,37 +1391,84 @@ pub async fn run(
             }
 
             "extension_ui_response" => {
-                if let Some(ref manager) = rpc_extension_manager {
-                    let request_id = parsed
-                        .get("requestId")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-
-                    if request_id.is_empty() {
+                if let (Some(manager), Some(ui_state)) =
+                    (rpc_extension_manager.as_ref(), rpc_ui_state.as_ref())
+                {
+                    let Some(request_id) = rpc_parse_extension_ui_response_id(&parsed) else {
                         let _ = out_tx.send(response_error(
                             id,
                             "extension_ui_response",
-                            "Missing requestId field",
+                            "Missing requestId (or id) field",
                         ));
-                    } else {
-                        let value = parsed.get("value").cloned();
-                        let cancelled = parsed
-                            .get("cancelled")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
+                        continue;
+                    };
 
-                        let response = ExtensionUiResponse {
-                            id: request_id,
-                            value,
-                            cancelled,
+                    let (response, next_request) = {
+                        let Ok(mut guard) = ui_state.lock(&cx).await else {
+                            let _ = out_tx.send(response_error(
+                                id,
+                                "extension_ui_response",
+                                "Extension UI bridge unavailable",
+                            ));
+                            continue;
                         };
-                        let resolved = manager.respond_ui(response);
-                        let _ = out_tx.send(response_ok(
-                            id,
-                            "extension_ui_response",
-                            Some(json!({ "resolved": resolved })),
-                        ));
+
+                        let Some(active) = guard.active.clone() else {
+                            let _ = out_tx.send(response_error(
+                                id,
+                                "extension_ui_response",
+                                "No active extension UI request",
+                            ));
+                            continue;
+                        };
+
+                        if active.id != request_id {
+                            let _ = out_tx.send(response_error(
+                                id,
+                                "extension_ui_response",
+                                format!(
+                                    "Unexpected requestId: {request_id} (active: {})",
+                                    active.id
+                                ),
+                            ));
+                            continue;
+                        }
+
+                        let response = match rpc_parse_extension_ui_response(&parsed, &active) {
+                            Ok(response) => response,
+                            Err(message) => {
+                                let _ = out_tx.send(response_error(
+                                    id,
+                                    "extension_ui_response",
+                                    message,
+                                ));
+                                continue;
+                            }
+                        };
+
+                        guard.active = None;
+                        let next = guard.queue.pop_front();
+                        if let Some(ref next) = next {
+                            guard.active = Some(next.clone());
+                        }
+                        (response, next)
+                    };
+
+                    let resolved = manager.respond_ui(response);
+                    let _ = out_tx.send(response_ok(
+                        id,
+                        "extension_ui_response",
+                        Some(json!({ "resolved": resolved })),
+                    ));
+
+                    if let Some(next) = next_request {
+                        rpc_emit_extension_ui_request(
+                            &options.runtime_handle,
+                            Arc::clone(ui_state),
+                            (*manager).clone(),
+                            out_tx.clone(),
+                            next,
+                        );
                     }
                 } else {
                     let _ = out_tx.send(response_ok(id, "extension_ui_response", None));
@@ -1637,6 +1727,263 @@ fn response_error_with_hints(id: Option<String>, command: &str, error: &Error) -
 
 fn event(value: &Value) -> String {
     value.to_string()
+}
+
+fn rpc_emit_extension_ui_request(
+    runtime_handle: &RuntimeHandle,
+    ui_state: Arc<Mutex<RpcUiBridgeState>>,
+    manager: ExtensionManager,
+    out_tx_ui: std::sync::mpsc::Sender<String>,
+    request: ExtensionUiRequest,
+) {
+    // Emit the UI request as a JSON notification to the client.
+    let rpc_event = request.to_rpc_event();
+    let _ = out_tx_ui.send(event(&rpc_event));
+
+    if !request.expects_response() {
+        return;
+    }
+
+    // For dialog methods, enforce deterministic ordering (one active request at a time) by
+    // auto-resolving timeouts as cancellation defaults (per bd-2hz.1).
+    let Some(timeout_ms) = request.effective_timeout_ms() else {
+        return;
+    };
+
+    // Fire a little early so ExtensionManager::request_ui doesn't hit its own timeout first.
+    let fire_ms = timeout_ms.saturating_sub(10).max(1);
+    let request_id = request.id;
+    let ui_state_timeout = Arc::clone(&ui_state);
+    let manager_timeout = manager;
+    let out_tx_timeout = out_tx_ui;
+    let runtime_handle_inner = runtime_handle.clone();
+
+    runtime_handle.spawn(async move {
+        sleep(wall_now(), Duration::from_millis(fire_ms)).await;
+        let cx = Cx::for_request();
+
+        let next = {
+            let Ok(mut guard) = ui_state_timeout.lock(&cx).await else {
+                return;
+            };
+
+            let Some(active) = guard.active.as_ref() else {
+                return;
+            };
+
+            // No-op if the active request has already advanced.
+            if active.id != request_id {
+                return;
+            }
+
+            // Resolve with cancellation defaults (downstream maps method -> default return value).
+            let _ = manager_timeout.respond_ui(ExtensionUiResponse {
+                id: request_id,
+                value: None,
+                cancelled: true,
+            });
+
+            guard.active = None;
+            let next = guard.queue.pop_front();
+            if let Some(ref next) = next {
+                guard.active = Some(next.clone());
+            }
+            next
+        };
+
+        if let Some(next) = next {
+            rpc_emit_extension_ui_request(
+                &runtime_handle_inner,
+                ui_state_timeout,
+                manager_timeout,
+                out_tx_timeout,
+                next,
+            );
+        }
+    });
+}
+
+fn rpc_parse_extension_ui_response_id(parsed: &Value) -> Option<String> {
+    parsed
+        .get("requestId")
+        .and_then(Value::as_str)
+        .or_else(|| parsed.get("id").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(String::from)
+}
+
+fn rpc_parse_extension_ui_response(
+    parsed: &Value,
+    active: &ExtensionUiRequest,
+) -> std::result::Result<ExtensionUiResponse, String> {
+    let cancelled = parsed
+        .get("cancelled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if cancelled {
+        return Ok(ExtensionUiResponse {
+            id: active.id.clone(),
+            value: None,
+            cancelled: true,
+        });
+    }
+
+    match active.method.as_str() {
+        "confirm" => {
+            let value = parsed
+                .get("confirmed")
+                .and_then(Value::as_bool)
+                .or_else(|| parsed.get("value").and_then(Value::as_bool))
+                .ok_or_else(|| "confirm requires boolean `confirmed` (or `value`)".to_string())?;
+            Ok(ExtensionUiResponse {
+                id: active.id.clone(),
+                value: Some(Value::Bool(value)),
+                cancelled: false,
+            })
+        }
+        "select" => {
+            let Some(value) = parsed.get("value") else {
+                return Err("select requires `value` field".to_string());
+            };
+
+            let options = active
+                .payload
+                .get("options")
+                .and_then(Value::as_array)
+                .ok_or_else(|| "select request missing `options` array".to_string())?;
+
+            let mut allowed = Vec::with_capacity(options.len());
+            for opt in options {
+                match opt {
+                    Value::String(s) => allowed.push(Value::String(s.clone())),
+                    Value::Object(map) => {
+                        let label = map
+                            .get("label")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+                        if label.is_empty() {
+                            continue;
+                        }
+                        if let Some(v) = map.get("value") {
+                            allowed.push(v.clone());
+                        } else {
+                            allowed.push(Value::String(label.to_string()));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !allowed.iter().any(|candidate| candidate == value) {
+                return Err("select response value did not match any option".to_string());
+            }
+
+            Ok(ExtensionUiResponse {
+                id: active.id.clone(),
+                value: Some(value.clone()),
+                cancelled: false,
+            })
+        }
+        "input" | "editor" => {
+            let Some(value) = parsed.get("value") else {
+                return Err(format!("{} requires `value` field", active.method));
+            };
+            if !value.is_string() {
+                return Err(format!("{} requires string `value`", active.method));
+            }
+            Ok(ExtensionUiResponse {
+                id: active.id.clone(),
+                value: Some(value.clone()),
+                cancelled: false,
+            })
+        }
+        other => Err(format!("Unsupported extension UI method: {other}")),
+    }
+}
+
+#[cfg(test)]
+mod ui_bridge_tests {
+    use super::*;
+
+    #[test]
+    fn parse_extension_ui_response_id_prefers_request_id() {
+        let value = json!({"type":"extension_ui_response","id":"legacy","requestId":"canonical"});
+        assert_eq!(
+            rpc_parse_extension_ui_response_id(&value),
+            Some("canonical".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_extension_ui_response_id_accepts_id_alias() {
+        let value = json!({"type":"extension_ui_response","id":"legacy"});
+        assert_eq!(
+            rpc_parse_extension_ui_response_id(&value),
+            Some("legacy".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_confirm_response_accepts_confirmed_alias() {
+        let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
+        let value = json!({"type":"extension_ui_response","requestId":"req-1","confirmed":true});
+        let resp = rpc_parse_extension_ui_response(&value, &active).expect("parse confirm");
+        assert!(!resp.cancelled);
+        assert_eq!(resp.value, Some(json!(true)));
+    }
+
+    #[test]
+    fn parse_confirm_response_accepts_value_bool() {
+        let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
+        let value = json!({"type":"extension_ui_response","requestId":"req-1","value":false});
+        let resp = rpc_parse_extension_ui_response(&value, &active).expect("parse confirm");
+        assert!(!resp.cancelled);
+        assert_eq!(resp.value, Some(json!(false)));
+    }
+
+    #[test]
+    fn parse_cancelled_response_wins_over_value() {
+        let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
+        let value = json!({"type":"extension_ui_response","requestId":"req-1","cancelled":true,"value":true});
+        let resp = rpc_parse_extension_ui_response(&value, &active).expect("parse cancel");
+        assert!(resp.cancelled);
+        assert_eq!(resp.value, None);
+    }
+
+    #[test]
+    fn parse_select_response_validates_against_options() {
+        let active = ExtensionUiRequest::new(
+            "req-1",
+            "select",
+            json!({"title":"pick","options":["A","B"]}),
+        );
+        let ok_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"B"});
+        let ok = rpc_parse_extension_ui_response(&ok_value, &active).expect("parse select ok");
+        assert_eq!(ok.value, Some(json!("B")));
+
+        let bad_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"C"});
+        assert!(
+            rpc_parse_extension_ui_response(&bad_value, &active).is_err(),
+            "invalid selection should error"
+        );
+    }
+
+    #[test]
+    fn parse_input_requires_string_value() {
+        let active = ExtensionUiRequest::new("req-1", "input", json!({"title":"t"}));
+        let ok_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"hi"});
+        let ok = rpc_parse_extension_ui_response(&ok_value, &active).expect("parse input ok");
+        assert_eq!(ok.value, Some(json!("hi")));
+
+        let bad_value = json!({"type":"extension_ui_response","requestId":"req-1","value":123});
+        assert!(
+            rpc_parse_extension_ui_response(&bad_value, &active).is_err(),
+            "non-string input should error"
+        );
+    }
 }
 
 fn error_hints_value(error: &Error) -> Value {
