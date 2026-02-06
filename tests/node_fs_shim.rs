@@ -173,11 +173,11 @@ fn stat_sync_directory() {
 #[test]
 fn stat_sync_throws_on_missing() {
     let result = eval_fs(r#"fs.statSync("/no/such/path")"#);
-    assert!(result.starts_with("ERROR:"), "expected error, got: {result}");
     assert!(
-        result.contains("ENOENT"),
-        "expected ENOENT, got: {result}"
+        result.starts_with("ERROR:"),
+        "expected error, got: {result}"
     );
+    assert!(result.contains("ENOENT"), "expected ENOENT, got: {result}");
 }
 
 // ─── mkdirSync ──────────────────────────────────────────────────────────────

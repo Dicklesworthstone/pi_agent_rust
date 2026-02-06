@@ -1285,8 +1285,7 @@ fn e2e_tui_vcr_tool_read() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn e2e_tui_full_interactive_loop() {
-    let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_full_interactive_loop")
-    else {
+    let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_full_interactive_loop") else {
         eprintln!("Skipping: tmux not available");
         return;
     };
@@ -1401,7 +1400,10 @@ fn e2e_tui_full_interactive_loop() {
         .info_ctx("verify", "Tool output + response rendered", |ctx| {
             ctx.push(("expected_line".into(), expected_line.to_string()));
             ctx.push(("tool_name_found".into(), pane.contains("read").to_string()));
-            ctx.push(("final_response_found".into(), pane.contains("Done.").to_string()));
+            ctx.push((
+                "final_response_found".into(),
+                pane.contains("Done.").to_string(),
+            ));
             ctx.push(("tool_output_sha256".into(), tool_output_hash.clone()));
         });
 
@@ -1414,10 +1416,13 @@ fn e2e_tui_full_interactive_loop() {
         "Session did not exit cleanly after full interactive loop"
     );
 
-    session.harness.log().info_ctx("exit", "Session exited", |ctx| {
-        ctx.push(("reason".into(), "graceful".to_string()));
-        ctx.push(("session_alive".into(), session_alive.to_string()));
-    });
+    session
+        .harness
+        .log()
+        .info_ctx("exit", "Session exited", |ctx| {
+            ctx.push(("reason".into(), "graceful".to_string()));
+            ctx.push(("session_alive".into(), session_alive.to_string()));
+        });
 
     // ── Emit artifacts ──
     session.harness.section("artifacts");
@@ -1464,16 +1469,16 @@ fn e2e_tui_full_interactive_loop() {
         .get("id")
         .and_then(Value::as_str)
         .expect("Session header should have id");
-    assert!(
-        !session_id.is_empty(),
-        "Session id should not be empty"
-    );
+    assert!(!session_id.is_empty(), "Session id should not be empty");
 
-    session.harness.log().info_ctx("session_jsonl", "Header verified", |ctx| {
-        ctx.push(("session_id".into(), session_id.to_string()));
-        ctx.push(("version".into(), SESSION_VERSION.to_string()));
-        ctx.push(("total_entries".into(), (lines.len() - 1).to_string()));
-    });
+    session
+        .harness
+        .log()
+        .info_ctx("session_jsonl", "Header verified", |ctx| {
+            ctx.push(("session_id".into(), session_id.to_string()));
+            ctx.push(("version".into(), SESSION_VERSION.to_string()));
+            ctx.push(("total_entries".into(), (lines.len() - 1).to_string()));
+        });
 
     // Parse all entries and verify tree structure
     let mut user_count = 0;
@@ -1498,10 +1503,7 @@ fn e2e_tui_full_interactive_loop() {
             }
 
             // Track IDs for tree verification
-            let entry_id = entry
-                .get("id")
-                .and_then(Value::as_str)
-                .map(String::from);
+            let entry_id = entry.get("id").and_then(Value::as_str).map(String::from);
             let parent_id = entry
                 .get("parentId")
                 .and_then(Value::as_str)
@@ -1514,12 +1516,15 @@ fn e2e_tui_full_interactive_loop() {
         }
     }
 
-    session.harness.log().info_ctx("session_jsonl", "Entry counts", |ctx| {
-        ctx.push(("user_messages".into(), user_count.to_string()));
-        ctx.push(("assistant_messages".into(), assistant_count.to_string()));
-        ctx.push(("tool_results".into(), tool_result_count.to_string()));
-        ctx.push(("entry_ids".into(), entry_ids.len().to_string()));
-    });
+    session
+        .harness
+        .log()
+        .info_ctx("session_jsonl", "Entry counts", |ctx| {
+            ctx.push(("user_messages".into(), user_count.to_string()));
+            ctx.push(("assistant_messages".into(), assistant_count.to_string()));
+            ctx.push(("tool_results".into(), tool_result_count.to_string()));
+            ctx.push(("entry_ids".into(), entry_ids.len().to_string()));
+        });
 
     // We expect at least: 1 user message, 1+ assistant messages (tool_use + final),
     // and 1 tool result.
@@ -1538,9 +1543,10 @@ fn e2e_tui_full_interactive_loop() {
 
     // Verify parent-child chain: at least one entry should have a parentId
     // that references another entry's id (proving tree structure).
-    let has_valid_parent = parent_ids.iter().flatten().any(|pid| {
-        entry_ids.iter().any(|eid| eid == pid)
-    });
+    let has_valid_parent = parent_ids
+        .iter()
+        .flatten()
+        .any(|pid| entry_ids.iter().any(|eid| eid == pid));
     assert!(
         has_valid_parent,
         "Expected at least one entry with a parentId referencing another entry's id.\n\
@@ -1555,11 +1561,14 @@ fn e2e_tui_full_interactive_loop() {
         session.steps().len()
     );
 
-    session.harness.log().info_ctx("summary", "Full interactive loop complete", |ctx| {
-        ctx.push(("total_steps".into(), session.steps().len().to_string()));
-        ctx.push(("user_messages".into(), user_count.to_string()));
-        ctx.push(("assistant_messages".into(), assistant_count.to_string()));
-        ctx.push(("tool_results".into(), tool_result_count.to_string()));
-        ctx.push(("session_tree_valid".into(), has_valid_parent.to_string()));
-    });
+    session
+        .harness
+        .log()
+        .info_ctx("summary", "Full interactive loop complete", |ctx| {
+            ctx.push(("total_steps".into(), session.steps().len().to_string()));
+            ctx.push(("user_messages".into(), user_count.to_string()));
+            ctx.push(("assistant_messages".into(), assistant_count.to_string()));
+            ctx.push(("tool_results".into(), tool_result_count.to_string()));
+            ctx.push(("session_tree_valid".into(), has_valid_parent.to_string()));
+        });
 }

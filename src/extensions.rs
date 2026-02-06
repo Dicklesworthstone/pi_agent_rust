@@ -16581,4 +16581,222 @@ mod tests {
             assert_eq!(protocol_err.code, HostCallErrorCode::InvalidRequest);
         });
     }
+
+    // ========================================================================
+    // bd-2tl1.5: Streaming Hostcall Protocol Invariants
+    // ========================================================================
+
+    #[test]
+    fn stream_chunk_serde_roundtrip() {
+        let chunk = HostStreamChunk {
+            index: 42,
+            is_last: false,
+            backpressure: None,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let back: HostStreamChunk = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.index, 42);
+        assert!(!back.is_last);
+        assert!(back.backpressure.is_none());
+    }
+
+    #[test]
+    fn stream_chunk_serde_with_backpressure() {
+        let chunk = HostStreamChunk {
+            index: 0,
+            is_last: true,
+            backpressure: Some(HostStreamBackpressure {
+                credits: Some(10),
+                delay_ms: Some(500),
+            }),
+        };
+        let json = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(json["index"], 0);
+        assert_eq!(json["is_last"], true);
+        assert_eq!(json["backpressure"]["credits"], 10);
+        assert_eq!(json["backpressure"]["delay_ms"], 500);
+
+        let back: HostStreamChunk = serde_json::from_value(json).unwrap();
+        assert!(back.is_last);
+        let bp = back.backpressure.unwrap();
+        assert_eq!(bp.credits, Some(10));
+        assert_eq!(bp.delay_ms, Some(500));
+    }
+
+    #[test]
+    fn stream_chunk_serde_skips_none_backpressure() {
+        let chunk = HostStreamChunk {
+            index: 5,
+            is_last: false,
+            backpressure: None,
+        };
+        let json = serde_json::to_value(&chunk).unwrap();
+        assert!(
+            json.get("backpressure").is_none(),
+            "None backpressure should be omitted from serialized JSON"
+        );
+    }
+
+    #[test]
+    fn stream_backpressure_serde_roundtrip() {
+        let bp = HostStreamBackpressure {
+            credits: Some(100),
+            delay_ms: None,
+        };
+        let json = serde_json::to_value(&bp).unwrap();
+        assert_eq!(json["credits"], 100);
+        assert!(
+            json.get("delay_ms").is_none(),
+            "None delay_ms should be omitted"
+        );
+
+        let back: HostStreamBackpressure = serde_json::from_value(json).unwrap();
+        assert_eq!(back.credits, Some(100));
+        assert!(back.delay_ms.is_none());
+    }
+
+    #[test]
+    fn stream_backpressure_both_none_serde() {
+        let bp = HostStreamBackpressure {
+            credits: None,
+            delay_ms: None,
+        };
+        let json = serde_json::to_value(&bp).unwrap();
+        assert_eq!(json, json!({}), "both-None backpressure should serialize to empty object");
+
+        let back: HostStreamBackpressure = serde_json::from_value(json).unwrap();
+        assert!(back.credits.is_none());
+        assert!(back.delay_ms.is_none());
+    }
+
+    #[test]
+    fn validate_host_result_accepts_stream_chunk_with_object_output() {
+        let result = HostResultPayload {
+            call_id: "stream-valid".to_string(),
+            output: json!({"data": "chunk"}),
+            is_error: false,
+            error: None,
+            chunk: Some(HostStreamChunk {
+                index: 0,
+                is_last: false,
+                backpressure: None,
+            }),
+        };
+        super::validate_host_result(&result)
+            .expect("valid stream chunk with object output should pass validation");
+    }
+
+    #[test]
+    fn validate_host_result_rejects_stream_chunk_non_object_output() {
+        // Stream chunks in practice may carry string output (e.g., "line 1\n"),
+        // but `validate_host_result` enforces object output uniformly.
+        let result = HostResultPayload {
+            call_id: "stream-bad-output".to_string(),
+            output: json!("string output"),
+            is_error: false,
+            error: None,
+            chunk: Some(HostStreamChunk {
+                index: 0,
+                is_last: false,
+                backpressure: None,
+            }),
+        };
+        assert!(
+            super::validate_host_result(&result).is_err(),
+            "non-object output should be rejected even for stream chunks"
+        );
+    }
+
+    #[test]
+    fn stream_final_chunk_roundtrip_preserves_is_last() {
+        let outcome = HostcallOutcome::StreamChunk {
+            sequence: 99,
+            chunk: json!({"final": true}),
+            is_final: true,
+        };
+        let result = outcome_to_host_result("final-test", &outcome);
+        let chunk_info = result.chunk.as_ref().expect("chunk info");
+        assert!(chunk_info.is_last);
+        assert_eq!(chunk_info.index, 99);
+
+        let back = host_result_to_outcome(result);
+        match back {
+            HostcallOutcome::StreamChunk {
+                sequence, is_final, ..
+            } => {
+                assert_eq!(sequence, 99);
+                assert!(is_final);
+            }
+            other => panic!("expected StreamChunk, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_outcome_roundtrip_backpressure_not_preserved() {
+        // Backpressure is lost in the outcome roundtrip because
+        // `HostcallOutcome::StreamChunk` does not carry backpressure.
+        let result = HostResultPayload {
+            call_id: "bp-test".to_string(),
+            output: json!({"data": "x"}),
+            is_error: false,
+            error: None,
+            chunk: Some(HostStreamChunk {
+                index: 3,
+                is_last: false,
+                backpressure: Some(HostStreamBackpressure {
+                    credits: Some(5),
+                    delay_ms: Some(100),
+                }),
+            }),
+        };
+
+        let outcome = host_result_to_outcome(result);
+        let back = outcome_to_host_result("bp-test", &outcome);
+
+        // Backpressure is lost (`outcome_to_host_result` always sets None).
+        assert!(
+            back.chunk.as_ref().unwrap().backpressure.is_none(),
+            "backpressure should not survive outcome roundtrip"
+        );
+        // But sequence and is_last are preserved.
+        assert_eq!(back.chunk.as_ref().unwrap().index, 3);
+        assert!(!back.chunk.as_ref().unwrap().is_last);
+    }
+
+    #[test]
+    fn stream_chunk_call_id_preserved_through_conversion() {
+        let outcome = HostcallOutcome::StreamChunk {
+            sequence: 0,
+            chunk: json!({}),
+            is_final: false,
+        };
+        let result = outcome_to_host_result("my-call-id-42", &outcome);
+        assert_eq!(result.call_id, "my-call-id-42");
+    }
+
+    #[test]
+    fn stream_chunk_zero_index_roundtrip() {
+        let chunk = HostStreamChunk {
+            index: 0,
+            is_last: false,
+            backpressure: None,
+        };
+        let json = serde_json::to_value(&chunk).unwrap();
+        assert_eq!(json["index"], 0);
+        let back: HostStreamChunk = serde_json::from_value(json).unwrap();
+        assert_eq!(back.index, 0);
+    }
+
+    #[test]
+    fn stream_chunk_max_index_roundtrip() {
+        let chunk = HostStreamChunk {
+            index: u64::MAX,
+            is_last: true,
+            backpressure: None,
+        };
+        let json = serde_json::to_value(&chunk).unwrap();
+        let back: HostStreamChunk = serde_json::from_value(json).unwrap();
+        assert_eq!(back.index, u64::MAX);
+        assert!(back.is_last);
+    }
 }

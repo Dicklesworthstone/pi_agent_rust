@@ -19,7 +19,7 @@ use pi::models::ModelEntry;
 use pi::provider::{InputType, Model, ModelCost, Provider};
 use pi::providers::openai::OpenAIProvider;
 use pi::resources::ResourceLoader;
-use pi::rpc::{run, RpcOptions, RpcScopedModel};
+use pi::rpc::{RpcOptions, RpcScopedModel, run};
 use pi::session::{Session, SessionMessage};
 use pi::tools::ToolRegistry;
 use pi::vcr::{VcrMode, VcrRecorder};
@@ -164,7 +164,10 @@ fn assert_ok(resp: &Value, command: &str) {
 fn assert_err(resp: &Value, command: &str) {
     assert_eq!(resp["type"], "response", "response type for {command}");
     assert_eq!(resp["command"], command);
-    assert_eq!(resp["success"], false, "expected error for {command}: {resp}");
+    assert_eq!(
+        resp["success"], false,
+        "expected error for {command}: {resp}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -559,9 +562,7 @@ fn rpc_set_thinking_level_errors() {
         .await;
         assert_err(&resp, "set_thinking_level");
         assert!(
-            resp["error"]
-                .as_str()
-                .is_some_and(|s| !s.is_empty()),
+            resp["error"].as_str().is_some_and(|s| !s.is_empty()),
             "expected error message"
         );
 
