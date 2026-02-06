@@ -6,8 +6,16 @@
 
 mod common;
 
+#[cfg(unix)]
+use asupersync::runtime::RuntimeBuilder;
 use common::TestHarness;
 use pi::config::Config;
+#[cfg(unix)]
+use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
+#[cfg(unix)]
+use pi::extensions_js::PiJsRuntimeConfig;
+#[cfg(unix)]
+use pi::package_manager::{PackageManager, ResolveRoots};
 use pi::tools::ToolRegistry;
 use serde::Deserialize;
 use serde_json::json;
@@ -18,6 +26,8 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -404,6 +414,46 @@ fn read_invocations(path: &Path) -> Vec<CommandInvocation> {
 fn read_json_value(path: &Path) -> serde_json::Value {
     let content = fs::read_to_string(path).expect("read json file");
     serde_json::from_str(&content).expect("parse json")
+}
+
+#[cfg(unix)]
+fn run_async<T>(future: impl std::future::Future<Output = T>) -> T {
+    let runtime = RuntimeBuilder::current_thread()
+        .build()
+        .expect("build asupersync runtime");
+    runtime.block_on(future)
+}
+
+#[cfg(unix)]
+fn write_jsonl_artifacts(harness: &TestHarness, logs_name: &str, artifacts_name: &str) {
+    let logs_path = harness.temp_path(logs_name);
+    harness
+        .write_jsonl_logs_normalized(&logs_path)
+        .expect("write normalized jsonl logs");
+    harness.record_artifact(logs_name.to_string(), &logs_path);
+
+    let artifact_index = harness.temp_path(artifacts_name);
+    harness
+        .write_artifact_index_jsonl_normalized(&artifact_index)
+        .expect("write normalized artifact index");
+    harness.record_artifact(artifacts_name.to_string(), &artifact_index);
+}
+
+#[cfg(unix)]
+fn resolve_roots_for_cli_harness(harness: &CliTestHarness) -> ResolveRoots {
+    let global_base_dir = PathBuf::from(
+        harness
+            .env
+            .get("PI_CODING_AGENT_DIR")
+            .expect("PI_CODING_AGENT_DIR set by CliTestHarness::new"),
+    );
+
+    ResolveRoots {
+        global_settings_path: harness.global_settings_path(),
+        project_settings_path: harness.project_settings_path(),
+        global_base_dir,
+        project_base_dir: harness.harness.temp_dir().join(".pi"),
+    }
 }
 
 fn write_minimal_session(path: &Path, cwd: &Path) -> (String, String, String, String) {
@@ -1122,6 +1172,292 @@ fn e2e_cli_packages_update_respects_pinning_offline() {
         settings.get("packages"),
         settings_after.get("packages"),
         "update should not rewrite settings.json"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_cli_extensions_install_update_manifest_resolution_offline() {
+    let mut harness =
+        CliTestHarness::new("e2e_cli_extensions_install_update_manifest_resolution_offline");
+    let stubs = harness.enable_offline_package_stubs();
+    harness
+        .harness
+        .record_artifact("npm-invocations.jsonl", &stubs.npm_log);
+    harness
+        .harness
+        .record_artifact("git-invocations.jsonl", &stubs.git_log);
+
+    let write_extension_package = |root: &Path,
+                                   package_name: &str,
+                                   version: &str,
+                                   extension_file: &str,
+                                   command_name: &str,
+                                   display_text: &str| {
+        let extensions_dir = root.join("extensions");
+        fs::create_dir_all(&extensions_dir).expect("create extensions dir");
+        let extension_path = extensions_dir.join(extension_file);
+        let extension_source = format!(
+            "export default function init(pi) {{\n  pi.registerCommand(\"{command_name}\", {{\n    description: \"Command from {package_name}\",\n    handler: async () => ({{ display: \"{display_text}\" }})\n  }});\n}}\n"
+        );
+        fs::write(&extension_path, extension_source).expect("write extension source");
+
+        let package_json = json!({
+            "name": package_name,
+            "version": version,
+            "private": true,
+            "pi": {
+                "extensions": [format!("extensions/{extension_file}")]
+            }
+        });
+        fs::write(
+            root.join("package.json"),
+            serde_json::to_string_pretty(&package_json).expect("serialize package json"),
+        )
+        .expect("write package json");
+    };
+
+    let local_source = "local-ext-pkg";
+    let local_extension_id = "local-ext";
+    let local_version = "0.1.0";
+    let local_scenario_id = "local_install_resolve_execute";
+    let local_pkg_root = harness.harness.create_dir(local_source);
+    write_extension_package(
+        &local_pkg_root,
+        local_extension_id,
+        local_version,
+        "local-ext.js",
+        "local-ext-status",
+        "local-ext ok",
+    );
+
+    harness.harness.log().info_ctx(
+        "extension_workflow",
+        "Install local extension package",
+        |ctx| {
+            ctx.push(("scenario_id".into(), local_scenario_id.to_string()));
+            ctx.push(("extension_id".into(), local_extension_id.to_string()));
+            ctx.push(("install_source".into(), local_source.to_string()));
+            ctx.push(("version".into(), local_version.to_string()));
+        },
+    );
+
+    let result = harness.run(&["install", local_source, "-l"]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Installed {local_source}"),
+    );
+
+    let remote_source = "npm:remote-ext";
+    let remote_extension_id = "remote-ext";
+    let remote_version = "1.2.3";
+    let remote_scenario_id = "remote_install_update_resolve_execute";
+
+    harness.harness.log().info_ctx(
+        "extension_workflow",
+        "Install npm extension package",
+        |ctx| {
+            ctx.push(("scenario_id".into(), remote_scenario_id.to_string()));
+            ctx.push(("extension_id".into(), remote_extension_id.to_string()));
+            ctx.push(("install_source".into(), remote_source.to_string()));
+            ctx.push(("version".into(), remote_version.to_string()));
+        },
+    );
+
+    let result = harness.run(&["install", remote_source, "-l"]);
+    assert_exit_code(&harness.harness, &result, 0);
+    assert_contains(
+        &harness.harness,
+        &result.stdout,
+        &format!("Installed {remote_source}"),
+    );
+
+    let remote_pkg_root = harness
+        .harness
+        .temp_dir()
+        .join(".pi")
+        .join("npm")
+        .join("node_modules")
+        .join(remote_extension_id);
+    assert!(
+        remote_pkg_root.exists(),
+        "expected npm install root to exist for {remote_source}"
+    );
+
+    write_extension_package(
+        &remote_pkg_root,
+        remote_extension_id,
+        remote_version,
+        "remote-ext.js",
+        "remote-ext-status",
+        "remote-ext ok",
+    );
+
+    harness.snapshot_settings("after_extension_package_install");
+
+    fs::write(&stubs.npm_log, "").expect("truncate npm log before update stage");
+    let update_result = harness.run(&["update", remote_source]);
+    assert_exit_code(&harness.harness, &update_result, 0);
+    assert_contains(
+        &harness.harness,
+        &update_result.stdout,
+        &format!("Updated {remote_source}"),
+    );
+    harness.snapshot_settings("after_extension_package_update");
+
+    let npm_invocations = read_invocations(&stubs.npm_log);
+    let updated_specs = npm_invocations
+        .iter()
+        .filter_map(|invocation| {
+            if invocation.argv.first().map(String::as_str) != Some("install") {
+                return None;
+            }
+            if let Some(g_idx) = invocation.argv.iter().position(|arg| arg == "-g") {
+                return invocation.argv.get(g_idx + 1).cloned();
+            }
+
+            invocation
+                .argv
+                .iter()
+                .skip(1)
+                .enumerate()
+                .find_map(|(idx, arg)| {
+                    if arg.starts_with('-') {
+                        return None;
+                    }
+
+                    let prev = invocation
+                        .argv
+                        .get(idx)
+                        .map(String::as_str)
+                        .unwrap_or_default();
+                    if prev == "--prefix" {
+                        return None;
+                    }
+
+                    Some(arg.clone())
+                })
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        updated_specs.iter().any(|spec| spec == "remote-ext"),
+        "expected update to reinstall unpinned npm package; installs={updated_specs:?}"
+    );
+
+    let package_manager = PackageManager::new(harness.harness.temp_dir().to_path_buf());
+    let roots = resolve_roots_for_cli_harness(&harness);
+    let resolved = run_async(package_manager.resolve_with_roots(&roots))
+        .expect("resolve installed package resources");
+
+    let local_extension_path = local_pkg_root.join("extensions").join("local-ext.js");
+    let remote_extension_path = remote_pkg_root.join("extensions").join("remote-ext.js");
+
+    let local_entry = resolved
+        .extensions
+        .iter()
+        .find(|entry| entry.path == local_extension_path)
+        .expect("local extension entry must resolve from package manifest");
+    assert!(local_entry.enabled, "local extension should be enabled");
+    assert_eq!(local_entry.metadata.source, local_source);
+
+    let remote_entry = resolved
+        .extensions
+        .iter()
+        .find(|entry| entry.path == remote_extension_path)
+        .expect("remote extension entry must resolve from package manifest");
+    assert!(remote_entry.enabled, "remote extension should be enabled");
+    assert_eq!(remote_entry.metadata.source, remote_source);
+
+    let extension_manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], harness.harness.temp_dir(), None));
+    let js_config = PiJsRuntimeConfig {
+        cwd: harness.harness.temp_dir().display().to_string(),
+        ..Default::default()
+    };
+
+    let js_runtime = run_async({
+        let extension_manager = extension_manager.clone();
+        let tools = Arc::clone(&tools);
+        async move {
+            JsExtensionRuntimeHandle::start(js_config, tools, extension_manager)
+                .await
+                .expect("start js runtime")
+        }
+    });
+    extension_manager.set_js_runtime(js_runtime);
+
+    let local_spec =
+        JsExtensionLoadSpec::from_entry_path(&local_extension_path).expect("local spec");
+    let remote_spec =
+        JsExtensionLoadSpec::from_entry_path(&remote_extension_path).expect("remote spec");
+    run_async({
+        let extension_manager = extension_manager.clone();
+        async move {
+            extension_manager
+                .load_js_extensions(vec![local_spec, remote_spec])
+                .await
+                .expect("load extension packages");
+        }
+    });
+
+    harness.harness.log().info_ctx(
+        "extension_workflow",
+        "Execute minimal extension scenarios",
+        |ctx| {
+            ctx.push(("scenario_id".into(), local_scenario_id.to_string()));
+            ctx.push(("extension_id".into(), local_extension_id.to_string()));
+            ctx.push(("install_source".into(), local_source.to_string()));
+            ctx.push(("version".into(), local_version.to_string()));
+        },
+    );
+
+    let local_exec_result = run_async({
+        let extension_manager = extension_manager.clone();
+        async move {
+            extension_manager
+                .execute_command("local-ext-status", "", 5000)
+                .await
+        }
+    })
+    .expect("execute local extension command");
+    assert_eq!(
+        local_exec_result
+            .get("display")
+            .and_then(|value| value.as_str()),
+        Some("local-ext ok")
+    );
+
+    harness.harness.log().info_ctx(
+        "extension_workflow",
+        "Execute minimal extension scenarios",
+        |ctx| {
+            ctx.push(("scenario_id".into(), remote_scenario_id.to_string()));
+            ctx.push(("extension_id".into(), remote_extension_id.to_string()));
+            ctx.push(("install_source".into(), remote_source.to_string()));
+            ctx.push(("version".into(), remote_version.to_string()));
+        },
+    );
+
+    let remote_exec_result = run_async(async move {
+        extension_manager
+            .execute_command("remote-ext-status", "", 5000)
+            .await
+    })
+    .expect("execute remote extension command");
+    assert_eq!(
+        remote_exec_result
+            .get("display")
+            .and_then(|value| value.as_str()),
+        Some("remote-ext ok")
+    );
+
+    write_jsonl_artifacts(
+        &harness.harness,
+        "extension-package-workflow.log.jsonl",
+        "extension-package-workflow.artifacts.jsonl",
     );
 }
 
