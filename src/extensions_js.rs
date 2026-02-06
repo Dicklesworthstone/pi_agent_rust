@@ -1505,36 +1505,30 @@ fn build_node_os_module() -> String {
     };
     let tmpdir = std::env::temp_dir().display().to_string();
     let homedir = std::env::var("HOME").unwrap_or_else(|_| "/home/unknown".to_string());
-    let hostname = hostname::get()
+    // Read hostname from /etc/hostname (Linux) or fall back to env/default.
+    let hostname = std::fs::read_to_string("/etc/hostname")
         .ok()
-        .and_then(|h| h.into_string().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
         .unwrap_or_else(|| "localhost".to_string());
-    let num_cpus = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let eol = if cfg!(windows) { "\\r\\n" } else { "\\n" };
     let dev_null = if cfg!(windows) {
         "\\\\\\\\.\\\\NUL"
     } else {
         "/dev/null"
     };
-    #[cfg(unix)]
-    let (uid, gid, username, shell) = {
-        let uid = unsafe { libc::getuid() };
-        let gid = unsafe { libc::getgid() };
-        let username = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        (uid, gid, username, shell)
-    };
-    #[cfg(not(unix))]
-    let (uid, gid, username, shell) = (0u32, 0u32, "unknown".to_string(), "".to_string());
+    let username = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    // Read uid/gid from /proc/self/status on Linux, fall back to defaults.
+    let (uid, gid) = read_proc_uid_gid().unwrap_or((1000, 1000));
 
     // Build CPU array entries. We use generic model names since QuickJS
     // doesn't need real CPU model strings — extensions only care about count.
     let cpu_entry =
         r#"{ model: "cpu", speed: 2400, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }"#;
-    let cpus_array = std::iter::repeat(cpu_entry)
-        .take(num_cpus)
+    let cpus_array = std::iter::repeat_n(cpu_entry, num_cpus)
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -1595,6 +1589,25 @@ export default {{ homedir, tmpdir, hostname, platform, arch, type, release, cpus
     )
     .trim()
     .to_string()
+}
+
+/// Parse uid/gid from `/proc/self/status` (Linux). Returns `None` on other
+/// platforms or if the file is unreadable.
+fn read_proc_uid_gid() -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let mut uid = None;
+    let mut gid = None;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            uid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        } else if let Some(rest) = line.strip_prefix("Gid:") {
+            gid = rest.split_whitespace().next().and_then(|v| v.parse().ok());
+        }
+        if uid.is_some() && gid.is_some() {
+            break;
+        }
+    }
+    Some((uid?, gid?))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2842,7 +2855,86 @@ export default { join, dirname, resolve, basename, relative, isAbsolute, extname
         .to_string(),
     );
 
-    modules.insert("node:os".to_string(), build_node_os_module());
+    modules.insert(
+        "node:os".to_string(),
+        r#"
+export function homedir() {
+  const p = globalThis.process;
+  if (p && p.env && p.env.HOME) return p.env.HOME;
+  const home =
+    globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
+      ? globalThis.pi.env.get("HOME")
+      : undefined;
+  return home || "/home/unknown";
+}
+export function tmpdir() {
+  const p = globalThis.process;
+  if (p && p.env && p.env.TMPDIR) return p.env.TMPDIR;
+  return "/tmp";
+}
+export function hostname() {
+  return "pi-host";
+}
+export function platform() {
+  const p = globalThis.process;
+  return (p && p.platform) || "linux";
+}
+export function arch() {
+  const p = globalThis.process;
+  return (p && p.arch) || "x64";
+}
+export function type() {
+  const plat = platform();
+  if (plat === "darwin") return "Darwin";
+  if (plat === "win32") return "Windows_NT";
+  return "Linux";
+}
+export function release() {
+  return "6.0.0";
+}
+export function cpus() {
+  return [{ model: "PiJS Virtual CPU", speed: 2400, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }];
+}
+export function totalmem() {
+  return 8 * 1024 * 1024 * 1024;
+}
+export function freemem() {
+  return 4 * 1024 * 1024 * 1024;
+}
+export function uptime() {
+  return Math.floor(Date.now() / 1000);
+}
+export function loadavg() {
+  return [0.0, 0.0, 0.0];
+}
+export function networkInterfaces() {
+  return {};
+}
+export function userInfo(_options) {
+  const home = homedir();
+  return {
+    uid: 1000,
+    gid: 1000,
+    username: "pi",
+    homedir: home,
+    shell: "/bin/sh",
+  };
+}
+export function endianness() {
+  return "LE";
+}
+export const EOL = "\n";
+export const devNull = "/dev/null";
+export const constants = {
+  signals: {},
+  errno: {},
+  priority: { PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0, PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 },
+};
+export default { homedir, tmpdir, hostname, platform, arch, type, release, cpus, totalmem, freemem, uptime, loadavg, networkInterfaces, userInfo, endianness, EOL, devNull, constants };
+"#
+        .trim()
+        .to_string(),
+    );
 
     modules.insert(
         "node:child_process".to_string(),
@@ -10457,11 +10549,34 @@ mod tests {
             assert_eq!(r["done"], serde_json::json!(true));
             // homedir returns HOME env or fallback
             assert!(r["homedir"].is_string());
-            assert_eq!(r["tmpdir"], serde_json::json!("/tmp"));
-            assert_eq!(r["hostname"], serde_json::json!("pi-host"));
-            assert_eq!(r["platform"], serde_json::json!("linux"));
-            assert_eq!(r["arch"], serde_json::json!("x64"));
-            assert_eq!(r["type"], serde_json::json!("Linux"));
+            // tmpdir matches std::env::temp_dir()
+            let expected_tmpdir = std::env::temp_dir().display().to_string();
+            assert_eq!(r["tmpdir"].as_str().unwrap(), expected_tmpdir);
+            // hostname is a non-empty string (real system hostname)
+            assert!(
+                r["hostname"].as_str().is_some_and(|s| !s.is_empty()),
+                "hostname should be non-empty string"
+            );
+            // platform/arch/type match current system
+            let expected_platform = match std::env::consts::OS {
+                "macos" => "darwin",
+                "windows" => "win32",
+                other => other,
+            };
+            assert_eq!(r["platform"].as_str().unwrap(), expected_platform);
+            let expected_arch = match std::env::consts::ARCH {
+                "x86_64" => "x64",
+                "aarch64" => "arm64",
+                other => other,
+            };
+            assert_eq!(r["arch"].as_str().unwrap(), expected_arch);
+            let expected_type = match std::env::consts::OS {
+                "linux" => "Linux",
+                "macos" => "Darwin",
+                "windows" => "Windows_NT",
+                other => other,
+            };
+            assert_eq!(r["type"].as_str().unwrap(), expected_type);
             assert_eq!(r["release"], serde_json::json!("6.0.0"));
         });
     }
