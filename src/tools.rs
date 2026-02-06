@@ -2387,6 +2387,40 @@ impl Tool for GrepTool {
             args.push(glob.clone());
         }
 
+        // Mirror find-tool behavior: explicitly pass root/nested .gitignore files
+        // so ignore rules apply consistently even outside a git worktree.
+        let ignore_root = if is_directory {
+            search_path.clone()
+        } else {
+            search_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf()
+        };
+        let mut gitignore_files: Vec<PathBuf> = Vec::new();
+        let root_gitignore = ignore_root.join(".gitignore");
+        if root_gitignore.exists() {
+            gitignore_files.push(root_gitignore);
+        }
+        let nested_pattern = ignore_root.join("**/.gitignore");
+        if let Some(pattern_str) = nested_pattern.to_str() {
+            if let Ok(paths) = glob::glob(pattern_str) {
+                for entry in paths.flatten() {
+                    let entry_str = entry.to_string_lossy();
+                    if entry_str.contains("node_modules") || entry_str.contains("/.git/") {
+                        continue;
+                    }
+                    gitignore_files.push(entry);
+                }
+            }
+        }
+        gitignore_files.sort();
+        gitignore_files.dedup();
+        for gi in gitignore_files {
+            args.push("--ignore-file".to_string());
+            args.push(gi.display().to_string());
+        }
+
         args.push(input.pattern.clone());
         args.push(search_path.display().to_string());
 
@@ -3400,6 +3434,7 @@ fn find_fd_binary() -> Option<&'static str> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::time::Duration;
 
     #[test]
     fn test_truncate_head() {
@@ -3510,6 +3545,1425 @@ mod tests {
         let result = truncate_line(&long, 500);
         assert!(result.was_truncated);
         assert!(result.text.ends_with("... [truncated]"));
+    }
+
+    // ========================================================================
+    // Helper: extract text from ToolOutput content blocks
+    // ========================================================================
+
+    fn get_text(content: &[ContentBlock]) -> String {
+        content
+            .iter()
+            .filter_map(|block| {
+                if let ContentBlock::Text(text) = block {
+                    Some(text.text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<String>()
+    }
+
+    // ========================================================================
+    // Read Tool Tests
+    // ========================================================================
+
+    #[test]
+    fn test_read_valid_file() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("hello.txt"), "alpha\nbeta\ngamma").unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("hello.txt").to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("alpha"));
+            assert!(text.contains("beta"));
+            assert!(text.contains("gamma"));
+            assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_read_nonexistent_file() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = ReadTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("nope.txt").to_string_lossy() }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+        });
+    }
+
+    #[test]
+    fn test_read_empty_file() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("empty.txt"), "").unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("empty.txt").to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert_eq!(text, "");
+            assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_read_offset_and_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("lines.txt"),
+                "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\nL9\nL10",
+            )
+            .unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("lines.txt").to_string_lossy(),
+                        "offset": 3,
+                        "limit": 2
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("L3"));
+            assert!(text.contains("L4"));
+            assert!(!text.contains("L2"));
+            assert!(!text.contains("L5"));
+        });
+    }
+
+    #[test]
+    fn test_read_offset_beyond_eof() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("short.txt"), "a\nb").unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("short.txt").to_string_lossy(),
+                        "offset": 100
+                    }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+            let msg = err.unwrap_err().to_string();
+            assert!(msg.contains("beyond end of file"));
+        });
+    }
+
+    #[test]
+    fn test_read_binary_file_lossy() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let binary_data: Vec<u8> = (0..=255).collect();
+            std::fs::write(tmp.path().join("binary.bin"), &binary_data).unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("binary.bin").to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            // Binary files are read as lossy UTF-8 with replacement characters
+            let text = get_text(&out.content);
+            assert!(!text.is_empty());
+            assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_read_image_detection() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            // Minimal valid PNG header
+            let png_header: Vec<u8> = vec![
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
+                0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1 pixel
+                0x08, 0x02, 0x00, 0x00, 0x00, 0x90, 0x77, 0x53,
+                0xDE, // bit depth, color type, etc
+                0x00, 0x00, 0x00, 0x0C, 0x49, 0x44, 0x41, 0x54, // IDAT chunk
+                0x08, 0xD7, 0x63, 0xF8, 0xCF, 0xC0, 0x00, 0x00, // compressed data
+                0x00, 0x02, 0x00, 0x01, 0xE2, 0x21, 0xBC, 0x33, // CRC
+                0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, // IEND chunk
+                0xAE, 0x42, 0x60, 0x82,
+            ];
+            std::fs::write(tmp.path().join("test.png"), &png_header).unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("test.png").to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            // Should return an image content block
+            let has_image = out
+                .content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image(_)));
+            assert!(has_image, "expected image content block for PNG file");
+        });
+    }
+
+    #[test]
+    fn test_read_blocked_images() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let png_header: Vec<u8> =
+                vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00];
+            std::fs::write(tmp.path().join("test.png"), &png_header).unwrap();
+
+            let tool = ReadTool::with_settings(tmp.path(), false, true);
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("test.png").to_string_lossy() }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+            assert!(err.unwrap_err().to_string().contains("blocked"));
+        });
+    }
+
+    #[test]
+    fn test_read_truncation_at_max_lines() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let content: String = (0..DEFAULT_MAX_LINES + 500)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(tmp.path().join("big.txt"), &content).unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("big.txt").to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            // Should have truncation details
+            assert!(out.details.is_some(), "expected truncation details");
+            let text = get_text(&out.content);
+            assert!(text.contains("offset="));
+        });
+    }
+
+    #[test]
+    fn test_read_first_line_exceeds_max_bytes() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let long_line = "a".repeat(DEFAULT_MAX_BYTES + 128);
+            std::fs::write(tmp.path().join("too_long.txt"), long_line).unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("too_long.txt").to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+
+            let text = get_text(&out.content);
+            assert!(text.contains("exceeds 50.0KB limit"));
+            let details = out.details.expect("expected truncation details");
+            assert_eq!(
+                details
+                    .get("truncation")
+                    .and_then(|v| v.get("firstLineExceedsLimit"))
+                    .and_then(serde_json::Value::as_bool),
+                Some(true)
+            );
+        });
+    }
+
+    #[test]
+    fn test_read_unicode_content() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("uni.txt"), "Hello 你好 🌍\nLine 2 café").unwrap();
+
+            let tool = ReadTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("uni.txt").to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("你好"));
+            assert!(text.contains("🌍"));
+            assert!(text.contains("café"));
+        });
+    }
+
+    // ========================================================================
+    // Write Tool Tests
+    // ========================================================================
+
+    #[test]
+    fn test_write_new_file() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = WriteTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("new.txt").to_string_lossy(),
+                        "content": "hello world"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let contents = std::fs::read_to_string(tmp.path().join("new.txt")).unwrap();
+            assert_eq!(contents, "hello world");
+        });
+    }
+
+    #[test]
+    fn test_write_overwrite_existing() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("exist.txt"), "old content").unwrap();
+
+            let tool = WriteTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("exist.txt").to_string_lossy(),
+                        "content": "new content"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let contents = std::fs::read_to_string(tmp.path().join("exist.txt")).unwrap();
+            assert_eq!(contents, "new content");
+        });
+    }
+
+    #[test]
+    fn test_write_creates_parent_dirs() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = WriteTool::new(tmp.path());
+            let deep_path = tmp.path().join("a/b/c/deep.txt");
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": deep_path.to_string_lossy(),
+                        "content": "deep file"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            assert!(deep_path.exists());
+            assert_eq!(std::fs::read_to_string(&deep_path).unwrap(), "deep file");
+        });
+    }
+
+    #[test]
+    fn test_write_empty_file() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = WriteTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("empty.txt").to_string_lossy(),
+                        "content": ""
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let contents = std::fs::read_to_string(tmp.path().join("empty.txt")).unwrap();
+            assert_eq!(contents, "");
+            let text = get_text(&out.content);
+            assert!(text.contains("Successfully wrote 0 bytes"));
+        });
+    }
+
+    #[test]
+    fn test_write_unicode_content() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = WriteTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("unicode.txt").to_string_lossy(),
+                        "content": "日本語 🎉 Ñoño"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let contents = std::fs::read_to_string(tmp.path().join("unicode.txt")).unwrap();
+            assert_eq!(contents, "日本語 🎉 Ñoño");
+        });
+    }
+
+    // ========================================================================
+    // Edit Tool Tests
+    // ========================================================================
+
+    #[test]
+    fn test_edit_exact_match_replace() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("code.rs"), "fn foo() { bar() }").unwrap();
+
+            let tool = EditTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("code.rs").to_string_lossy(),
+                        "oldText": "bar()",
+                        "newText": "baz()"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let contents = std::fs::read_to_string(tmp.path().join("code.rs")).unwrap();
+            assert_eq!(contents, "fn foo() { baz() }");
+        });
+    }
+
+    #[test]
+    fn test_edit_no_match_error() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("code.rs"), "fn foo() {}").unwrap();
+
+            let tool = EditTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("code.rs").to_string_lossy(),
+                        "oldText": "NONEXISTENT TEXT",
+                        "newText": "replacement"
+                    }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+        });
+    }
+
+    #[test]
+    fn test_edit_ambiguous_match_error() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("dup.txt"), "hello hello hello").unwrap();
+
+            let tool = EditTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("dup.txt").to_string_lossy(),
+                        "oldText": "hello",
+                        "newText": "world"
+                    }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err(), "expected error for ambiguous match");
+        });
+    }
+
+    #[test]
+    fn test_edit_multi_line_replacement() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("multi.txt"),
+                "line 1\nline 2\nline 3\nline 4",
+            )
+            .unwrap();
+
+            let tool = EditTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("multi.txt").to_string_lossy(),
+                        "oldText": "line 2\nline 3",
+                        "newText": "replaced 2\nreplaced 3\nextra line"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let contents = std::fs::read_to_string(tmp.path().join("multi.txt")).unwrap();
+            assert_eq!(
+                contents,
+                "line 1\nreplaced 2\nreplaced 3\nextra line\nline 4"
+            );
+        });
+    }
+
+    #[test]
+    fn test_edit_unicode_content() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("uni.txt"), "Héllo wörld 🌍").unwrap();
+
+            let tool = EditTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("uni.txt").to_string_lossy(),
+                        "oldText": "wörld 🌍",
+                        "newText": "Welt 🌎"
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+            let contents = std::fs::read_to_string(tmp.path().join("uni.txt")).unwrap();
+            assert_eq!(contents, "Héllo Welt 🌎");
+        });
+    }
+
+    #[test]
+    fn test_edit_missing_file() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = EditTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().join("nope.txt").to_string_lossy(),
+                        "oldText": "foo",
+                        "newText": "bar"
+                    }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+        });
+    }
+
+    // ========================================================================
+    // Bash Tool Tests
+    // ========================================================================
+
+    #[test]
+    fn test_bash_simple_command() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "command": "echo hello_from_bash" }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("hello_from_bash"));
+            assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_bash_exit_code_nonzero() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path());
+            let err = tool
+                .execute("t", serde_json::json!({ "command": "exit 42" }), None)
+                .await;
+            // Non-zero exit codes are reported as Err
+            assert!(err.is_err());
+            let msg = err.unwrap_err().to_string();
+            assert!(
+                msg.contains("42"),
+                "expected exit code 42 in error, got: {msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bash_stderr_capture() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "command": "echo stderr_msg >&2" }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(
+                text.contains("stderr_msg"),
+                "expected stderr output in result, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bash_timeout() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "command": "sleep 60", "timeout": 2 }),
+                    None,
+                )
+                .await;
+            // Timeouts are reported as Err
+            assert!(err.is_err());
+            let msg = err.unwrap_err().to_string();
+            assert!(
+                msg.to_lowercase().contains("timeout") || msg.to_lowercase().contains("timed out"),
+                "expected timeout indication, got: {msg}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_timeout_kills_process_tree() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let marker = tmp.path().join("leaked_child.txt");
+            let tool = BashTool::new(tmp.path());
+
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "command": "(sleep 3; echo leaked > leaked_child.txt) & sleep 10",
+                        "timeout": 1
+                    }),
+                    None,
+                )
+                .await
+                .expect_err("expected timeout");
+
+            assert!(err.to_string().contains("Command timed out"));
+
+            // If process tree cleanup fails, this file appears after ~3 seconds.
+            std::thread::sleep(Duration::from_secs(4));
+            assert!(
+                !marker.exists(),
+                "background child was not terminated on timeout"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bash_working_directory() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path());
+            let out = tool
+                .execute("t", serde_json::json!({ "command": "pwd" }), None)
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            let canonical = tmp.path().canonicalize().unwrap();
+            assert!(
+                text.contains(&canonical.to_string_lossy().to_string()),
+                "expected cwd in output, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_bash_multiline_output() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "command": "echo line1; echo line2; echo line3" }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("line1"));
+            assert!(text.contains("line2"));
+            assert!(text.contains("line3"));
+        });
+    }
+
+    // ========================================================================
+    // Grep Tool Tests
+    // ========================================================================
+
+    #[test]
+    fn test_grep_basic_pattern() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("search.txt"),
+                "apple\nbanana\napricot\ncherry",
+            )
+            .unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "ap",
+                        "path": tmp.path().join("search.txt").to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("apple"));
+            assert!(text.contains("apricot"));
+            assert!(!text.contains("banana"));
+            assert!(!text.contains("cherry"));
+        });
+    }
+
+    #[test]
+    fn test_grep_regex_pattern() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("regex.txt"),
+                "foo123\nbar456\nbaz789\nfoo000",
+            )
+            .unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "foo\\d+",
+                        "path": tmp.path().join("regex.txt").to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("foo123"));
+            assert!(text.contains("foo000"));
+            assert!(!text.contains("bar456"));
+        });
+    }
+
+    #[test]
+    fn test_grep_case_insensitive() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("case.txt"), "Hello\nhello\nHELLO").unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "hello",
+                        "path": tmp.path().join("case.txt").to_string_lossy(),
+                        "ignoreCase": true
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("Hello"));
+            assert!(text.contains("hello"));
+            assert!(text.contains("HELLO"));
+        });
+    }
+
+    #[test]
+    fn test_grep_case_sensitive_by_default() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("case_sensitive.txt"), "Hello\nHELLO").unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "hello",
+                        "path": tmp.path().join("case_sensitive.txt").to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(
+                text.contains("No matches found"),
+                "expected case-sensitive search to find no matches, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_grep_no_matches() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("nothing.txt"), "alpha\nbeta\ngamma").unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "ZZZZZ_NOMATCH",
+                        "path": tmp.path().join("nothing.txt").to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(
+                text.to_lowercase().contains("no match")
+                    || text.is_empty()
+                    || text.to_lowercase().contains("no results"),
+                "expected no-match indication, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_grep_context_lines() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(
+                tmp.path().join("ctx.txt"),
+                "aaa\nbbb\nccc\ntarget\nddd\neee\nfff",
+            )
+            .unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "target",
+                        "path": tmp.path().join("ctx.txt").to_string_lossy(),
+                        "context": 1
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("target"));
+            assert!(text.contains("ccc"), "expected context line before match");
+            assert!(text.contains("ddd"), "expected context line after match");
+        });
+    }
+
+    #[test]
+    fn test_grep_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let content: String = (0..200)
+                .map(|i| format!("match_line_{i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            std::fs::write(tmp.path().join("many.txt"), &content).unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "match_line",
+                        "path": tmp.path().join("many.txt").to_string_lossy(),
+                        "limit": 5
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            // With limit=5, we should see at most 5 matches
+            let match_count = text.matches("match_line_").count();
+            assert!(
+                match_count <= 5,
+                "expected at most 5 matches with limit=5, got {match_count}"
+            );
+            let details = out.details.expect("expected limit details");
+            assert_eq!(
+                details
+                    .get("matchLimitReached")
+                    .and_then(serde_json::Value::as_u64),
+                Some(5)
+            );
+        });
+    }
+
+    #[test]
+    fn test_grep_respects_gitignore() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+            std::fs::write(tmp.path().join("ignored.txt"), "needle in ignored file").unwrap();
+            std::fs::write(tmp.path().join("visible.txt"), "nothing here").unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute("t", serde_json::json!({ "pattern": "needle" }), None)
+                .await
+                .unwrap();
+
+            let text = get_text(&out.content);
+            assert!(
+                text.contains("No matches found"),
+                "expected ignored file to be excluded, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_grep_literal_mode() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("literal.txt"), "a+b\na.b\nab\na\\+b").unwrap();
+
+            let tool = GrepTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "a+b",
+                        "path": tmp.path().join("literal.txt").to_string_lossy(),
+                        "literal": true
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("a+b"), "literal match should find 'a+b'");
+        });
+    }
+
+    // ========================================================================
+    // Find Tool Tests
+    // ========================================================================
+
+    #[test]
+    fn test_find_glob_pattern() {
+        asupersync::test_utils::run_test(|| async {
+            if find_fd_binary().is_none() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("file1.rs"), "").unwrap();
+            std::fs::write(tmp.path().join("file2.rs"), "").unwrap();
+            std::fs::write(tmp.path().join("file3.txt"), "").unwrap();
+
+            let tool = FindTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "*.rs",
+                        "path": tmp.path().to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("file1.rs"));
+            assert!(text.contains("file2.rs"));
+            assert!(!text.contains("file3.txt"));
+        });
+    }
+
+    #[test]
+    fn test_find_limit() {
+        asupersync::test_utils::run_test(|| async {
+            if find_fd_binary().is_none() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            for i in 0..20 {
+                std::fs::write(tmp.path().join(format!("f{i}.txt")), "").unwrap();
+            }
+
+            let tool = FindTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "*.txt",
+                        "path": tmp.path().to_string_lossy(),
+                        "limit": 5
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            let file_count = text.lines().filter(|l| l.contains(".txt")).count();
+            assert!(
+                file_count <= 5,
+                "expected at most 5 files with limit=5, got {file_count}"
+            );
+            let details = out.details.expect("expected limit details");
+            assert_eq!(
+                details
+                    .get("resultLimitReached")
+                    .and_then(serde_json::Value::as_u64),
+                Some(5)
+            );
+        });
+    }
+
+    #[test]
+    fn test_find_no_matches() {
+        asupersync::test_utils::run_test(|| async {
+            if find_fd_binary().is_none() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("only.txt"), "").unwrap();
+
+            let tool = FindTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "*.rs",
+                        "path": tmp.path().to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(
+                text.to_lowercase().contains("no files found")
+                    || text.to_lowercase().contains("no matches")
+                    || text.is_empty(),
+                "expected no-match indication, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_find_nonexistent_path() {
+        asupersync::test_utils::run_test(|| async {
+            if find_fd_binary().is_none() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = FindTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "*.rs",
+                        "path": tmp.path().join("nonexistent").to_string_lossy()
+                    }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+        });
+    }
+
+    #[test]
+    fn test_find_nested_directories() {
+        asupersync::test_utils::run_test(|| async {
+            if find_fd_binary().is_none() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(tmp.path().join("a/b/c")).unwrap();
+            std::fs::write(tmp.path().join("top.rs"), "").unwrap();
+            std::fs::write(tmp.path().join("a/mid.rs"), "").unwrap();
+            std::fs::write(tmp.path().join("a/b/c/deep.rs"), "").unwrap();
+
+            let tool = FindTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "*.rs",
+                        "path": tmp.path().to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("top.rs"));
+            assert!(text.contains("mid.rs"));
+            assert!(text.contains("deep.rs"));
+        });
+    }
+
+    #[test]
+    fn test_find_results_are_sorted() {
+        asupersync::test_utils::run_test(|| async {
+            if find_fd_binary().is_none() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("zeta.txt"), "").unwrap();
+            std::fs::write(tmp.path().join("alpha.txt"), "").unwrap();
+            std::fs::write(tmp.path().join("beta.txt"), "").unwrap();
+
+            let tool = FindTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "*.txt",
+                        "path": tmp.path().to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let lines: Vec<String> = get_text(&out.content)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_string)
+                .collect();
+            let mut sorted = lines.clone();
+            sorted.sort_by_key(|line| line.to_lowercase());
+            assert_eq!(lines, sorted, "expected sorted find output");
+        });
+    }
+
+    #[test]
+    fn test_find_respects_gitignore() {
+        asupersync::test_utils::run_test(|| async {
+            if find_fd_binary().is_none() {
+                return;
+            }
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join(".gitignore"), "ignored.txt\n").unwrap();
+            std::fs::write(tmp.path().join("ignored.txt"), "").unwrap();
+
+            let tool = FindTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "pattern": "*.txt",
+                        "path": tmp.path().to_string_lossy()
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(
+                text.contains("No files found matching pattern"),
+                "expected .gitignore'd files to be excluded, got: {text}"
+            );
+        });
+    }
+
+    // ========================================================================
+    // Ls Tool Tests
+    // ========================================================================
+
+    #[test]
+    fn test_ls_directory_listing() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("file_a.txt"), "content").unwrap();
+            std::fs::write(tmp.path().join("file_b.rs"), "fn main() {}").unwrap();
+            std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+
+            let tool = LsTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(text.contains("file_a.txt"));
+            assert!(text.contains("file_b.rs"));
+            assert!(text.contains("subdir"));
+        });
+    }
+
+    #[test]
+    fn test_ls_trailing_slash_for_dirs() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("file.txt"), "").unwrap();
+            std::fs::create_dir(tmp.path().join("mydir")).unwrap();
+
+            let tool = LsTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(
+                text.contains("mydir/"),
+                "expected trailing slash for directory, got: {text}"
+            );
+        });
+    }
+
+    #[test]
+    fn test_ls_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            for i in 0..20 {
+                std::fs::write(tmp.path().join(format!("item_{i:02}.txt")), "").unwrap();
+            }
+
+            let tool = LsTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({
+                        "path": tmp.path().to_string_lossy(),
+                        "limit": 5
+                    }),
+                    None,
+                )
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            let entry_count = text.lines().filter(|l| l.contains("item_")).count();
+            assert!(
+                entry_count <= 5,
+                "expected at most 5 entries, got {entry_count}"
+            );
+            let details = out.details.expect("expected limit details");
+            assert_eq!(
+                details
+                    .get("entryLimitReached")
+                    .and_then(serde_json::Value::as_u64),
+                Some(5)
+            );
+        });
+    }
+
+    #[test]
+    fn test_ls_nonexistent_directory() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = LsTool::new(tmp.path());
+            let err = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": tmp.path().join("nope").to_string_lossy() }),
+                    None,
+                )
+                .await;
+            assert!(err.is_err());
+        });
+    }
+
+    #[test]
+    fn test_ls_empty_directory() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let empty_dir = tmp.path().join("empty");
+            std::fs::create_dir(&empty_dir).unwrap();
+
+            let tool = LsTool::new(tmp.path());
+            let out = tool
+                .execute(
+                    "t",
+                    serde_json::json!({ "path": empty_dir.to_string_lossy() }),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!out.is_error);
+        });
+    }
+
+    #[test]
+    fn test_ls_default_cwd() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            std::fs::write(tmp.path().join("in_cwd.txt"), "").unwrap();
+
+            let tool = LsTool::new(tmp.path());
+            let out = tool
+                .execute("t", serde_json::json!({}), None)
+                .await
+                .unwrap();
+            let text = get_text(&out.content);
+            assert!(
+                text.contains("in_cwd.txt"),
+                "expected cwd listing to include the file, got: {text}"
+            );
+        });
+    }
+
+    // ========================================================================
+    // Additional helper tests
+    // ========================================================================
+
+    #[test]
+    fn test_truncate_head_no_truncation() {
+        let content = "short";
+        let result = truncate_head(content, 100, 1000);
+        assert!(!result.truncated);
+        assert_eq!(result.content, "short");
+        assert_eq!(result.truncated_by, None);
+    }
+
+    #[test]
+    fn test_truncate_tail_no_truncation() {
+        let content = "short";
+        let result = truncate_tail(content, 100, 1000);
+        assert!(!result.truncated);
+        assert_eq!(result.content, "short");
+    }
+
+    #[test]
+    fn test_truncate_head_empty_input() {
+        let result = truncate_head("", 100, 1000);
+        assert!(!result.truncated);
+        assert_eq!(result.content, "");
+    }
+
+    #[test]
+    fn test_truncate_tail_empty_input() {
+        let result = truncate_tail("", 100, 1000);
+        assert!(!result.truncated);
+        assert_eq!(result.content, "");
+    }
+
+    #[test]
+    fn test_detect_line_ending_crlf() {
+        assert_eq!(detect_line_ending("hello\r\nworld"), "\r\n");
+    }
+
+    #[test]
+    fn test_detect_line_ending_lf() {
+        assert_eq!(detect_line_ending("hello\nworld"), "\n");
+    }
+
+    #[test]
+    fn test_detect_line_ending_no_newline() {
+        assert_eq!(detect_line_ending("hello world"), "\n");
+    }
+
+    #[test]
+    fn test_normalize_to_lf() {
+        assert_eq!(normalize_to_lf("a\r\nb\rc\nd"), "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn test_strip_bom_present() {
+        let (result, had_bom) = strip_bom("\u{FEFF}hello");
+        assert_eq!(result, "hello");
+        assert!(had_bom);
+    }
+
+    #[test]
+    fn test_strip_bom_absent() {
+        let (result, had_bom) = strip_bom("hello");
+        assert_eq!(result, "hello");
+        assert!(!had_bom);
+    }
+
+    #[test]
+    fn test_resolve_path_tilde_expansion() {
+        let cwd = PathBuf::from("/home/user/project");
+        let result = resolve_path("~/file.txt", &cwd);
+        // Tilde expansion depends on environment, but should not be literal ~/
+        assert!(!result.to_string_lossy().starts_with("~/"));
     }
 
     fn arbitrary_text() -> impl Strategy<Value = String> {
