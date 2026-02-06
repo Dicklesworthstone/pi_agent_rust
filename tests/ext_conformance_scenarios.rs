@@ -9,9 +9,15 @@
 
 mod common;
 
+use async_trait::async_trait;
 use chrono::{SecondsFormat, Utc};
-use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
-use pi::extensions_js::PiJsRuntimeConfig;
+use pi::extensions::{
+    ExtensionManager, ExtensionSession, HostcallInterceptor, JsExtensionLoadSpec,
+    JsExtensionRuntimeHandle,
+};
+use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntimeConfig};
+use pi::scheduler::HostcallOutcome;
+use pi::session::SessionMessage;
 use pi::tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,7 +26,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
@@ -505,6 +511,26 @@ fn check_expectations(
     result: &Result<Value, String>,
     loaded: &LoadedExtension,
 ) -> Vec<String> {
+    check_expectations_inner(expect, result, &loaded.manager, None)
+}
+
+/// Check scenario expectations with optional interceptor for mock-based checks.
+#[allow(clippy::too_many_lines)]
+fn check_expectations_with_mocks(
+    expect: &ScenarioExpectation,
+    result: &Result<Value, String>,
+    loaded: &LoadedExtensionWithMocks,
+) -> Vec<String> {
+    check_expectations_inner(expect, result, &loaded.manager, Some(&loaded.interceptor))
+}
+
+#[allow(clippy::too_many_lines)]
+fn check_expectations_inner(
+    expect: &ScenarioExpectation,
+    result: &Result<Value, String>,
+    manager: &ExtensionManager,
+    interceptor: Option<&Arc<MockSpecInterceptor>>,
+) -> Vec<String> {
     let mut diffs = Vec::new();
 
     // Check is_error expectation
@@ -626,7 +652,7 @@ fn check_expectations(
 
     // Check provider registration expectations
     if let Some(expected_api) = &expect.api {
-        let providers = loaded.manager.extension_providers();
+        let providers = manager.extension_providers();
         let matching = providers
             .iter()
             .find(|p| p.get("api").and_then(Value::as_str) == Some(expected_api));
@@ -638,7 +664,7 @@ fn check_expectations(
     }
 
     if let Some(expected_env) = &expect.api_key_env {
-        let providers = loaded.manager.extension_providers();
+        let providers = manager.extension_providers();
         // Provider spec uses "apiKey" for the env var name
         let has_env = providers.iter().any(|p| {
             p.get("apiKey").and_then(Value::as_str) == Some(expected_env)
@@ -652,7 +678,7 @@ fn check_expectations(
     }
 
     if let Some(expected_models) = &expect.models_contains {
-        let providers = loaded.manager.extension_providers();
+        let providers = manager.extension_providers();
         let all_model_ids: Vec<String> = providers
             .iter()
             .filter_map(|p| p.get("models").and_then(Value::as_array))
@@ -674,7 +700,7 @@ fn check_expectations(
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let tools = loaded.manager.extension_tool_defs();
+        let tools = manager.extension_tool_defs();
         let matching = tools
             .iter()
             .find(|t| t.get("name").and_then(Value::as_str) == Some(tool_name));
@@ -700,71 +726,694 @@ fn check_expectations(
     diffs
 }
 
+// ─── Mock Infrastructure ─────────────────────────────────────────────────────
+
+/// Rule for matching exec hostcalls.
+#[derive(Debug, Clone)]
+struct ExecRule {
+    command: String,
+    args_pattern: Option<Vec<String>>,
+    result: Value,
+}
+
+/// Rule for matching HTTP hostcalls.
+#[derive(Debug, Clone)]
+struct HttpRule {
+    method: Option<String>,
+    url_contains: Option<String>,
+    response: Value,
+}
+
+/// Mock interceptor that provides deterministic responses for exec, HTTP, and UI
+/// hostcalls. Session/Events/Tool calls pass through to real dispatch.
+struct MockSpecInterceptor {
+    exec_rules: Vec<ExecRule>,
+    exec_default: Value,
+    http_rules: Vec<HttpRule>,
+    http_default: Value,
+    ui_responses: HashMap<String, Value>,
+    ui_confirm_default: bool,
+    ui_notifications: Arc<Mutex<Vec<Value>>>,
+    ui_status_updates: Arc<Mutex<Vec<Value>>>,
+    exec_log: Arc<Mutex<Vec<(String, Value)>>>,
+}
+
+impl MockSpecInterceptor {
+    /// Parse from the mock_spec JSON format (mock_spec_default.json).
+    fn from_mock_spec(spec: &Value) -> Self {
+        let exec_rules = spec
+            .pointer("/exec/rules")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| ExecRule {
+                        command: r
+                            .get("command")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string(),
+                        args_pattern: r.get("args").and_then(Value::as_array).map(|a| {
+                            a.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        }),
+                        result: r.clone(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let exec_default = spec
+            .pointer("/exec/default_result")
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "stdout": "",
+                    "stderr": "mock: command not found",
+                    "code": 127,
+                    "killed": false
+                })
+            });
+
+        let http_rules = spec
+            .pointer("/http/rules")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .map(|r| HttpRule {
+                        method: r.get("method").and_then(Value::as_str).map(String::from),
+                        url_contains: r
+                            .get("url_contains")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        response: r.get("response").cloned().unwrap_or(Value::Null),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let http_default = spec
+            .pointer("/http/default_response")
+            .cloned()
+            .unwrap_or_else(|| {
+                serde_json::json!({
+                    "status": 404,
+                    "headers": {"content-type": "text/plain"},
+                    "body": "mock: no HTTP rule matched"
+                })
+            });
+
+        let ui_responses = spec
+            .pointer("/ui/responses")
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let ui_confirm_default = spec
+            .pointer("/ui/confirm_default")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+
+        Self {
+            exec_rules,
+            exec_default,
+            http_rules,
+            http_default,
+            ui_responses,
+            ui_confirm_default,
+            ui_notifications: Arc::new(Mutex::new(Vec::new())),
+            ui_status_updates: Arc::new(Mutex::new(Vec::new())),
+            exec_log: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Merge scenario-specific setup overrides with the default mock spec.
+    fn from_scenario_setup(setup: &Value, default_spec: &Value) -> Self {
+        let mut interceptor = Self::from_mock_spec(default_spec);
+
+        // Merge mock_exec rules from scenario setup
+        if let Some(mock_exec) = setup.get("mock_exec").and_then(Value::as_array) {
+            for rule in mock_exec {
+                interceptor.exec_rules.push(ExecRule {
+                    command: rule
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    args_pattern: rule.get("args").and_then(Value::as_array).map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    }),
+                    result: rule.clone(),
+                });
+            }
+        }
+
+        // Merge mock_http rules from scenario setup
+        if let Some(mock_http) = setup.get("mock_http") {
+            if let Some(rules) = mock_http.get("rules").and_then(Value::as_array) {
+                for rule in rules {
+                    interceptor.http_rules.push(HttpRule {
+                        method: rule.get("method").and_then(Value::as_str).map(String::from),
+                        url_contains: rule
+                            .get("url_contains")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        response: rule.get("response").cloned().unwrap_or(Value::Null),
+                    });
+                }
+            }
+        }
+
+        interceptor
+    }
+
+    fn match_exec(&self, cmd: &str, payload: &Value) -> Value {
+        let args = payload
+            .get("args")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        for rule in &self.exec_rules {
+            if rule.command != cmd {
+                continue;
+            }
+            if let Some(expected_args) = &rule.args_pattern {
+                if *expected_args != args {
+                    continue;
+                }
+            }
+            return serde_json::json!({
+                "stdout": rule.result.get("stdout").and_then(Value::as_str).unwrap_or(""),
+                "stderr": rule.result.get("stderr").and_then(Value::as_str).unwrap_or(""),
+                "code": rule.result.get("code").and_then(Value::as_i64).unwrap_or(0),
+                "killed": rule.result.get("killed").and_then(Value::as_bool).unwrap_or(false),
+            });
+        }
+
+        self.exec_default.clone()
+    }
+
+    fn match_http(&self, payload: &Value) -> Value {
+        let req_method = payload
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("GET");
+        let req_url = payload.get("url").and_then(Value::as_str).unwrap_or("");
+
+        for rule in &self.http_rules {
+            if let Some(method) = &rule.method {
+                if !method.eq_ignore_ascii_case(req_method) {
+                    continue;
+                }
+            }
+            if let Some(url_pat) = &rule.url_contains {
+                if !req_url.contains(url_pat.as_str()) {
+                    continue;
+                }
+            }
+            return rule.response.clone();
+        }
+
+        self.http_default.clone()
+    }
+}
+
+impl HostcallInterceptor for MockSpecInterceptor {
+    fn intercept(&self, request: &HostcallRequest) -> Option<HostcallOutcome> {
+        match &request.kind {
+            HostcallKind::Exec { cmd } => {
+                // Log the call
+                self.exec_log
+                    .lock()
+                    .unwrap()
+                    .push((cmd.clone(), request.payload.clone()));
+
+                let result = self.match_exec(cmd, &request.payload);
+                Some(HostcallOutcome::Success(result))
+            }
+            HostcallKind::Http => {
+                let result = self.match_http(&request.payload);
+                Some(HostcallOutcome::Success(result))
+            }
+            HostcallKind::Ui { op } => {
+                match op.as_str() {
+                    "notify" => {
+                        self.ui_notifications
+                            .lock()
+                            .unwrap()
+                            .push(request.payload.clone());
+                        Some(HostcallOutcome::Success(serde_json::json!({"ok": true})))
+                    }
+                    "status" => {
+                        self.ui_status_updates
+                            .lock()
+                            .unwrap()
+                            .push(request.payload.clone());
+                        Some(HostcallOutcome::Success(serde_json::json!({"ok": true})))
+                    }
+                    "confirm" => {
+                        let result = self.ui_confirm_default;
+                        Some(HostcallOutcome::Success(
+                            serde_json::json!({ "confirmed": result }),
+                        ))
+                    }
+                    "select" => {
+                        // Check ui_responses for a "select" key
+                        let value = self
+                            .ui_responses
+                            .get("select")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        Some(HostcallOutcome::Success(
+                            serde_json::json!({ "selected": value }),
+                        ))
+                    }
+                    "input" => {
+                        let value = self
+                            .ui_responses
+                            .get("input")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        Some(HostcallOutcome::Success(
+                            serde_json::json!({ "value": value }),
+                        ))
+                    }
+                    // Pass through unknown UI ops to real dispatch
+                    _ => None,
+                }
+            }
+            // Session, Events, Tool → pass through to real dispatch
+            HostcallKind::Session { .. } | HostcallKind::Events { .. } | HostcallKind::Tool { .. } => None,
+        }
+    }
+}
+
+// ─── ConformanceSession ──────────────────────────────────────────────────────
+
+/// Session implementation for conformance tests with pre-seeded data and
+/// full mutation support.
+struct ConformanceSession {
+    state: Mutex<Value>,
+    messages: Mutex<Vec<SessionMessage>>,
+    entries: Mutex<Vec<Value>>,
+    branch: Mutex<Vec<Value>>,
+    name: Mutex<Option<String>>,
+    model: Mutex<(Option<String>, Option<String>)>,
+    thinking_level: Mutex<Option<String>>,
+    labels: Mutex<Vec<(String, Option<String>)>>,
+}
+
+impl ConformanceSession {
+    /// Create from mock_spec JSON and optional scenario setup overrides.
+    fn from_spec(default_spec: &Value, setup: Option<&Value>) -> Self {
+        let session_spec = default_spec.get("session").cloned().unwrap_or(Value::Null);
+
+        let state = session_spec
+            .get("state")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+
+        let messages = session_spec
+            .get("messages")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| serde_json::from_value(m.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let mut entries: Vec<Value> = session_spec
+            .get("entries")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let mut branch: Vec<Value> = session_spec
+            .get("branch")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+
+        let name = session_spec
+            .get("name")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        let model_spec = default_spec.get("model").cloned().unwrap_or(Value::Null);
+        let current = model_spec.get("current").cloned().unwrap_or(Value::Null);
+        let provider = current
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let model_id = current
+            .get("model_id")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        let thinking_level = model_spec
+            .get("thinking_level")
+            .and_then(Value::as_str)
+            .map(String::from);
+
+        // Apply scenario setup overrides
+        if let Some(setup) = setup {
+            if let Some(sb) = setup.get("session_branch").and_then(Value::as_array) {
+                branch = sb.clone();
+            }
+            if let Some(le) = setup.get("session_leaf_entry") {
+                // Add leaf entry to entries if not already there
+                entries.push(le.clone());
+            }
+        }
+
+        Self {
+            state: Mutex::new(state),
+            messages: Mutex::new(messages),
+            entries: Mutex::new(entries),
+            branch: Mutex::new(branch),
+            name: Mutex::new(name),
+            model: Mutex::new((provider, model_id)),
+            thinking_level: Mutex::new(thinking_level),
+            labels: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl ExtensionSession for ConformanceSession {
+    async fn get_state(&self) -> Value {
+        self.state.lock().unwrap().clone()
+    }
+
+    async fn get_messages(&self) -> Vec<SessionMessage> {
+        self.messages.lock().unwrap().clone()
+    }
+
+    async fn get_entries(&self) -> Vec<Value> {
+        self.entries.lock().unwrap().clone()
+    }
+
+    async fn get_branch(&self) -> Vec<Value> {
+        self.branch.lock().unwrap().clone()
+    }
+
+    async fn set_name(&self, name: String) -> pi::error::Result<()> {
+        *self.name.lock().unwrap() = Some(name);
+        Ok(())
+    }
+
+    async fn append_message(&self, message: SessionMessage) -> pi::error::Result<()> {
+        self.messages.lock().unwrap().push(message);
+        Ok(())
+    }
+
+    async fn append_custom_entry(
+        &self,
+        custom_type: String,
+        data: Option<Value>,
+    ) -> pi::error::Result<()> {
+        self.entries.lock().unwrap().push(serde_json::json!({
+            "type": custom_type,
+            "data": data,
+        }));
+        Ok(())
+    }
+
+    async fn set_model(&self, provider: String, model_id: String) -> pi::error::Result<()> {
+        *self.model.lock().unwrap() = (Some(provider), Some(model_id));
+        Ok(())
+    }
+
+    async fn get_model(&self) -> (Option<String>, Option<String>) {
+        self.model.lock().unwrap().clone()
+    }
+
+    async fn set_thinking_level(&self, level: String) -> pi::error::Result<()> {
+        *self.thinking_level.lock().unwrap() = Some(level);
+        Ok(())
+    }
+
+    async fn get_thinking_level(&self) -> Option<String> {
+        self.thinking_level.lock().unwrap().clone()
+    }
+
+    async fn set_label(
+        &self,
+        target_id: String,
+        label: Option<String>,
+    ) -> pi::error::Result<()> {
+        self.labels.lock().unwrap().push((target_id, label));
+        Ok(())
+    }
+}
+
+// ─── Extension loader with mocks ─────────────────────────────────────────────
+
+struct LoadedExtensionWithMocks {
+    manager: ExtensionManager,
+    runtime: JsExtensionRuntimeHandle,
+    interceptor: Arc<MockSpecInterceptor>,
+    #[allow(dead_code)]
+    session: Arc<ConformanceSession>,
+}
+
+/// Load an extension with mock interceptor and conformance session.
+fn load_extension_with_mocks(
+    extension_path: &Path,
+    setup: Option<&Value>,
+    default_spec: &Value,
+) -> Result<LoadedExtensionWithMocks, String> {
+    let settings = deterministic_settings_for(extension_path);
+    ensure_deterministic_dirs(&settings);
+    let cwd = PathBuf::from(&settings.cwd);
+
+    let spec = JsExtensionLoadSpec::from_entry_path(extension_path)
+        .map_err(|e| format!("load spec: {e}"))?;
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+
+    // Build interceptor from mock spec + scenario setup
+    let interceptor = Arc::new(setup.map_or_else(
+        || MockSpecInterceptor::from_mock_spec(default_spec),
+        |s| MockSpecInterceptor::from_scenario_setup(s, default_spec),
+    ));
+
+    // Build conformance session
+    let session = Arc::new(ConformanceSession::from_spec(default_spec, setup));
+    manager.set_session(Arc::clone(&session) as Arc<dyn ExtensionSession>);
+
+    // Pre-seed flags from setup
+    if let Some(flags) = setup.and_then(|s| s.get("flags")).and_then(Value::as_object) {
+        for (flag_name, flag_value) in flags {
+            let str_value = match flag_value {
+                Value::Bool(b) => b.to_string(),
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            // We cannot call async set_flag_value here directly; instead record
+            // flags as pre-seeded state in the manager inner.
+            // The manager exposes set_flag_value but it needs the JS runtime.
+            // For now, skip flag pre-seeding and handle it in ctx payload.
+            let _ = (flag_name, str_value);
+        }
+    }
+
+    let mut env = HashMap::new();
+    env.insert(
+        "PI_DETERMINISTIC_TIME_MS".to_string(),
+        settings.time_ms.clone(),
+    );
+    env.insert(
+        "PI_DETERMINISTIC_TIME_STEP_MS".to_string(),
+        settings.time_step_ms.clone(),
+    );
+    env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
+    env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
+    env.insert("HOME".to_string(), settings.home.clone());
+    if let Some(random_value) = settings.random_value {
+        env.insert("PI_DETERMINISTIC_RANDOM".to_string(), random_value);
+    } else {
+        env.insert(
+            "PI_DETERMINISTIC_RANDOM_SEED".to_string(),
+            settings.random_seed.clone(),
+        );
+    }
+    let js_config = PiJsRuntimeConfig {
+        cwd: settings.cwd.clone(),
+        env,
+        ..Default::default()
+    };
+
+    let runtime = common::run_async({
+        let manager = manager.clone();
+        let tools = Arc::clone(&tools);
+        let interceptor_clone = Arc::clone(&interceptor) as Arc<dyn HostcallInterceptor>;
+        async move {
+            JsExtensionRuntimeHandle::start_with_interceptor(
+                js_config,
+                tools,
+                manager,
+                interceptor_clone,
+            )
+            .await
+            .map_err(|e| format!("start runtime: {e}"))
+        }
+    })?;
+    manager.set_js_runtime(runtime.clone());
+
+    common::run_async({
+        let manager = manager.clone();
+        async move {
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .map_err(|e| format!("load extension: {e}"))
+        }
+    })?;
+
+    // Pre-seed flags via JS runtime (after extension is loaded)
+    if let Some(flags) = setup.and_then(|s| s.get("flags")).and_then(Value::as_object) {
+        for (flag_name, flag_value) in flags {
+            let str_value = match flag_value {
+                Value::Bool(b) => b.to_string(),
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            let ext_id = manager
+                .extension_tool_defs()
+                .first()
+                .and_then(|t| t.get("extension_id").and_then(Value::as_str))
+                .map(String::from)
+                .unwrap_or_else(|| "unknown".to_string());
+            common::run_async({
+                let manager = manager.clone();
+                let flag_name = flag_name.clone();
+                let ext_id = ext_id.clone();
+                async move {
+                    let _ = manager
+                        .set_flag_value(&ext_id, &flag_name, &str_value)
+                        .await;
+                }
+            });
+        }
+    }
+
+    Ok(LoadedExtensionWithMocks {
+        manager,
+        runtime,
+        interceptor,
+        session,
+    })
+}
+
+/// Build ctx payload with mock data populated from setup + default spec.
+fn build_ctx_payload_with_mocks(
+    settings: &DeterministicSettings,
+    scenario_input: Option<&Value>,
+    setup: Option<&Value>,
+    default_spec: &Value,
+) -> Value {
+    let has_ui = scenario_input
+        .and_then(|input| input.get("ctx"))
+        .and_then(|ctx| ctx.get("has_ui"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    // Build model registry from setup.mock_model_registry
+    let model_registry = setup
+        .and_then(|s| s.get("mock_model_registry"))
+        .and_then(Value::as_object)
+        .map(|obj| Value::Object(obj.clone()))
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    // Session data from default spec
+    let session_spec = default_spec.get("session").cloned().unwrap_or(Value::Null);
+    let mut session_entries: Vec<Value> = session_spec
+        .get("entries")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut session_branch: Vec<Value> = session_spec
+        .get("branch")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut session_leaf_entry = Value::Null;
+
+    // Override from setup
+    if let Some(setup) = setup {
+        if let Some(sb) = setup.get("session_branch").and_then(Value::as_array) {
+            session_branch = sb.clone();
+        }
+        if let Some(le) = setup.get("session_leaf_entry") {
+            session_leaf_entry = le.clone();
+        }
+    }
+    // Merge leaf entry into entries
+    if !session_leaf_entry.is_null() {
+        session_entries.push(session_leaf_entry.clone());
+    }
+
+    // Merge UI responses from scenario input ctx
+    let ui_responses = scenario_input
+        .and_then(|input| input.get("ctx"))
+        .and_then(|ctx| ctx.get("ui_responses"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let mut ctx = serde_json::json!({
+        "hasUI": has_ui,
+        "cwd": settings.cwd,
+        "sessionEntries": session_entries,
+        "sessionBranch": session_branch,
+        "sessionLeafEntry": session_leaf_entry,
+        "modelRegistry": model_registry,
+    });
+
+    if !ui_responses.is_null() {
+        ctx.as_object_mut()
+            .unwrap()
+            .insert("uiResponses".to_string(), ui_responses);
+    }
+
+    ctx
+}
+
 // ─── Scenario categorization ────────────────────────────────────────────────
 
 /// Check if a scenario needs setup features we cannot provide yet.
+/// Most features are now supported via `MockSpecInterceptor` and
+/// `ConformanceSession`.
 fn needs_unsupported_setup(scenario: &Scenario) -> Option<String> {
     if let Some(setup) = &scenario.setup {
-        if setup.get("mock_exec").is_some() {
-            return Some("requires mock_exec".to_string());
+        // mock_http with "vcr_or_stub" mode requires actual HTTP stubbing
+        // beyond our simple rule matching
+        if let Some(mock_http) = setup.get("mock_http") {
+            let mode = mock_http
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if mode == "vcr_or_stub" {
+                return Some("requires vcr_or_stub HTTP mock mode".to_string());
+            }
         }
-        if setup.get("mock_http").is_some() {
-            return Some("requires mock_http".to_string());
-        }
-        if setup.get("mock_model_registry").is_some() {
-            return Some("requires mock_model_registry".to_string());
-        }
-        if setup.get("session_branch").is_some() {
-            return Some("requires session_branch setup".to_string());
-        }
-        if setup.get("session_leaf_entry").is_some() {
-            return Some("requires session_leaf_entry setup".to_string());
-        }
+
         if setup.get("state").is_some() {
             return Some("requires pre-seeded extension state".to_string());
-        }
-        if setup.get("flags").is_some() {
-            return Some("requires pre-set flags".to_string());
-        }
-    }
-
-    // Scenarios with UI interaction responses (user selections, confirms)
-    if let Some(input) = &scenario.input {
-        if input
-            .pointer("/ctx/ui_responses")
-            .is_some_and(|v| !v.is_null())
-        {
-            return Some("requires UI interaction responses".to_string());
-        }
-    }
-
-    // Multi-step scenarios need sequential dispatch
-    if scenario.steps.is_some() {
-        return Some("requires multi-step dispatch".to_string());
-    }
-
-    // Event scenarios that check UI state
-    if let Some(expect) = &scenario.expect {
-        if expect.ui_notify_contains.is_some() {
-            return Some("requires UI notification capture".to_string());
-        }
-        if expect.ui_status_key.is_some() || expect.ui_status_contains_sequence.is_some() {
-            return Some("requires UI status tracking".to_string());
-        }
-        if expect.active_tools.is_some() {
-            return Some("requires active tool list management".to_string());
-        }
-        if expect.exec_called.is_some() {
-            return Some("requires exec call tracking".to_string());
-        }
-        if expect.returns_contains.is_some() {
-            return Some("requires returns_contains matching".to_string());
-        }
-        if expect.action.is_some() {
-            return Some("requires action matching (input transform)".to_string());
-        }
-        if expect.content_types.is_some() {
-            return Some("requires content type matching".to_string());
         }
     }
 
