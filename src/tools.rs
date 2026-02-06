@@ -131,10 +131,13 @@ pub enum TruncatedBy {
 }
 
 /// Truncate from the beginning (keep first N lines).
+///
+/// Uses lazy iteration to avoid allocating a Vec of all line slices upfront.
+/// For a 100K-line file this saves ~800KB of pointer-array allocation.
 pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
     let total_bytes = content.len();
-    let lines: Vec<&str> = content.split('\n').collect();
-    let total_lines = lines.len();
+    // Count total lines without collecting into Vec — just count newlines + 1.
+    let total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
 
     // No truncation needed
     if total_lines <= max_lines && total_bytes <= max_bytes {
@@ -153,8 +156,9 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         };
     }
 
-    // If the first line alone exceeds the byte limit, return empty content.
-    let first_line_bytes = lines.first().map_or(0, |l| l.len());
+    // Check first line length without collecting all lines.
+    let first_newline = memchr::memchr(b'\n', content.as_bytes());
+    let first_line_bytes = first_newline.unwrap_or(content.len());
     if first_line_bytes > max_bytes {
         return TruncationResult {
             content: String::new(),
@@ -171,12 +175,13 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         };
     }
 
+    // Iterate lines lazily (no Vec allocation).
     let mut output = String::new();
     let mut line_count = 0;
     let mut byte_count: usize = 0;
     let mut truncated_by = None;
 
-    for (i, line) in lines.iter().enumerate() {
+    for (i, line) in content.split('\n').enumerate() {
         if i >= max_lines {
             truncated_by = Some(TruncatedBy::Lines);
             break;
@@ -215,10 +220,12 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
 }
 
 /// Truncate from the end (keep last N lines).
+///
+/// Uses `rsplit` for lazy reverse iteration and borrows `&str` slices instead
+/// of cloning each line into a `String`. Only the final join allocates.
 pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
     let total_bytes = content.len();
-    let lines: Vec<&str> = content.split('\n').collect();
-    let total_lines = lines.len();
+    let total_lines = memchr::memchr_iter(b'\n', content.as_bytes()).count() + 1;
 
     // No truncation needed
     if total_lines <= max_lines && total_bytes <= max_bytes {
@@ -237,16 +244,22 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         };
     }
 
-    let mut output_lines = Vec::new();
+    // Use an enum to hold either a borrowed slice or an owned partial line.
+    enum TailLine<'a> {
+        Borrowed(&'a str),
+        Owned(String),
+    }
+
+    let mut collected: Vec<TailLine<'_>> = Vec::new();
     let mut byte_count: usize = 0;
     let mut truncated_by = None;
     let mut last_line_partial = false;
 
-    // Iterate from the end
-    for line in lines.iter().rev() {
-        let line_bytes = line.len() + usize::from(!output_lines.is_empty());
+    // rsplit iterates lazily from the end — no Vec<&str> of all lines needed.
+    for line in content.rsplit('\n') {
+        let line_bytes = line.len() + usize::from(!collected.is_empty());
 
-        if output_lines.len() >= max_lines {
+        if collected.len() >= max_lines {
             truncated_by = Some(TruncatedBy::Lines);
             break;
         }
@@ -254,20 +267,32 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         if byte_count + line_bytes > max_bytes {
             // Check if we can include a partial last line
             let remaining = max_bytes.saturating_sub(byte_count);
-            if remaining > 0 && output_lines.is_empty() {
-                output_lines.push(truncate_string_to_bytes_from_end(line, max_bytes));
+            if remaining > 0 && collected.is_empty() {
+                collected.push(TailLine::Owned(truncate_string_to_bytes_from_end(
+                    line, max_bytes,
+                )));
                 last_line_partial = true;
             }
             truncated_by = Some(TruncatedBy::Bytes);
             break;
         }
 
-        output_lines.push((*line).to_string());
+        collected.push(TailLine::Borrowed(line));
         byte_count += line_bytes;
     }
 
-    output_lines.reverse();
-    let output = output_lines.join("\n");
+    collected.reverse();
+    let line_count = collected.len();
+    let mut output = String::with_capacity(byte_count);
+    for (i, tl) in collected.iter().enumerate() {
+        if i > 0 {
+            output.push('\n');
+        }
+        match tl {
+            TailLine::Borrowed(s) => output.push_str(s),
+            TailLine::Owned(s) => output.push_str(s),
+        }
+    }
     let output_bytes = output.len();
 
     TruncationResult {
@@ -276,7 +301,7 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
         truncated_by,
         total_lines,
         total_bytes,
-        output_lines: output_lines.len(),
+        output_lines: line_count,
         output_bytes,
         last_line_partial,
         first_line_exceeds_limit: false,

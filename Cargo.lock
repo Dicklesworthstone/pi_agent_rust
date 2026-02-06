@@ -4020,6 +4020,7 @@ dependencies = [
  "image",
  "insta",
  "jsonschema",
+ "memchr",
  "pretty_assertions",
  "proptest",
  "regex",
