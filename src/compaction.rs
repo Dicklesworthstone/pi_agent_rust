@@ -709,6 +709,10 @@ pub fn prepare_compaction(
     path_entries: &[SessionEntry],
     settings: ResolvedCompactionSettings,
 ) -> Option<CompactionPreparation> {
+    if path_entries.is_empty() {
+        return None;
+    }
+
     if path_entries
         .last()
         .is_some_and(|entry| matches!(entry, SessionEntry::Compaction(_)))
