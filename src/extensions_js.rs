@@ -1217,6 +1217,8 @@ fn resolve_existing_module_candidate(path: PathBuf) -> Option<PathBuf> {
     None
 }
 
+static REQUIRE_CALL_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+
 /// Detect if a JavaScript source uses CommonJS patterns (`require(...)` or
 /// `module.exports`) and transform it into an ESM-compatible wrapper.
 ///
@@ -1243,8 +1245,7 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     // Extract all require() specifiers
     let mut specifiers: Vec<String> = Vec::new();
     let mut seen = HashSet::new();
-    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
-    let re = RE.get_or_init(|| {
+    let re = REQUIRE_CALL_RE.get_or_init(|| {
         regex::Regex::new(r#"require\(\s*["']([^"']+)["']\s*\)"#).expect("require regex")
     });
     for cap in re.captures_iter(source) {
@@ -9014,10 +9015,11 @@ mod tests {
             let mut requests = runtime.drain_hostcall_requests();
             assert_eq!(requests.len(), 1);
             let request = requests.pop_front().expect("exec hostcall");
-            match &request.kind {
-                HostcallKind::Exec { cmd } => assert_eq!(cmd, "pi"),
-                other => panic!("unexpected hostcall kind: {other:?}"),
-            }
+            assert!(
+                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == "pi"),
+                "unexpected hostcall kind: {:?}",
+                request.kind
+            );
 
             runtime.complete_hostcall(
                 request.call_id,

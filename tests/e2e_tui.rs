@@ -432,6 +432,58 @@ fn sha256_hex(input: &str) -> String {
     out
 }
 
+fn sha256_hex_bytes(input: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(input);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+fn collect_files_recursive(path: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let entry_path = entry.path();
+        if entry_path.is_dir() {
+            collect_files_recursive(&entry_path, out);
+        } else if entry_path.is_file() {
+            out.push(entry_path);
+        }
+    }
+}
+
+fn write_dir_snapshot(root: &Path, out_path: &Path) {
+    use std::fmt::Write as _;
+
+    let mut content = String::new();
+    if !root.exists() {
+        content.push_str("missing\n");
+        content.push_str(&root.display().to_string());
+        content.push('\n');
+        std::fs::write(out_path, content).expect("write dir snapshot");
+        return;
+    }
+
+    let mut files = Vec::new();
+    collect_files_recursive(root, &mut files);
+    files.sort();
+
+    for file in files {
+        let rel = file.strip_prefix(root).unwrap_or(&file);
+        let bytes = std::fs::read(&file).unwrap_or_default();
+        let hash = sha256_hex_bytes(&bytes);
+        let _ = writeln!(content, "{hash}\t{}\t{}", bytes.len(), rel.display());
+    }
+
+    std::fs::write(out_path, content).expect("write dir snapshot");
+}
+
 fn collect_jsonl_files(path: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(path) else {
         return;
@@ -557,6 +609,154 @@ fn e2e_tui_model_command() {
     assert!(
         pane.contains("gpt-4o-mini"),
         "Expected model info in output; got:\n{pane}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
+}
+
+/// Test /reload: add a skill on disk, /reload, verify autocomplete refresh; then invalidate skill
+/// to trigger diagnostics, /reload, and verify the autocomplete no longer includes it.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_tui_reload_resources_and_autocomplete_refresh() {
+    let Some(mut session) = TuiSession::new("e2e_tui_reload_resources_and_autocomplete_refresh")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let args = [
+        "--provider",
+        "openai",
+        "--model",
+        "gpt-4o-mini",
+        "--api-key",
+        "test-key-e2e",
+        "--no-tools",
+        // We only need skills for this test; keep other resource categories empty for determinism.
+        "--no-prompt-templates",
+        "--no-extensions",
+        "--no-themes",
+        "--system-prompt",
+        "pi e2e reload resources + autocomplete refresh",
+    ];
+
+    session.launch(&args);
+    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+
+    let skill_rel = ".pi/skills/e2e-reload-skill/SKILL.md";
+    let skill_valid = r"---
+name: e2e-reload-skill
+description: E2E skill used to validate /reload + autocomplete refresh
+---
+
+# e2e-reload-skill
+
+E2E-only skill used by tests.
+";
+    let skill_path = session
+        .harness
+        .create_file(skill_rel, skill_valid.as_bytes());
+    session
+        .harness
+        .record_artifact("skill.valid.SKILL.md", &skill_path);
+
+    let project_pi_dir = session.harness.temp_dir().join(".pi");
+    let global_agent_dir = session.harness.temp_dir().join("env").join("agent");
+
+    let snapshot_pi_after_add = session.harness.temp_path("snapshot.pi.after_add.txt");
+    write_dir_snapshot(&project_pi_dir, &snapshot_pi_after_add);
+    session
+        .harness
+        .record_artifact("snapshot.pi.after_add.txt", &snapshot_pi_after_add);
+
+    let snapshot_agent_after_add = session.harness.temp_path("snapshot.agent.after_add.txt");
+    write_dir_snapshot(&global_agent_dir, &snapshot_agent_after_add);
+    session
+        .harness
+        .record_artifact("snapshot.agent.after_add.txt", &snapshot_agent_after_add);
+
+    // Reload and confirm the skill count changes.
+    let pane = session.send_text_and_wait(
+        "reload_after_add_skill",
+        "/reload",
+        "Reloaded resources:",
+        STARTUP_TIMEOUT,
+    );
+    assert!(
+        pane.contains("1 skills"),
+        "Expected reload status to reflect the added skill; got:\n{pane}"
+    );
+
+    // Autocomplete should now list the skill.
+    session.tmux.send_literal("/skill:e2e");
+    let pane = session.send_key_and_wait(
+        "autocomplete_shows_skill_after_reload",
+        "Tab",
+        "/skill:e2e-reload-skill",
+        COMMAND_TIMEOUT,
+    );
+    assert!(
+        pane.contains("/skill:e2e-reload-skill"),
+        "Expected skill autocomplete entry; got:\n{pane}"
+    );
+
+    // Close autocomplete and clear the editor without relying on Ctrl+C, which can still
+    // deliver SIGINT in some terminal configurations (killing the session).
+    session.send_key_and_wait(
+        "close_autocomplete_after_capture",
+        "Esc",
+        "/skill:e2e",
+        Duration::from_secs(1),
+    );
+    // DEL/backspace enough times to clear regardless of whether autocomplete updated the editor.
+    session.tmux.send_literal(&"\u{7f}".repeat(200));
+
+    // Invalidate the skill on disk (empty description) to trigger diagnostics and removal.
+    let skill_invalid = r"---
+name: e2e-reload-skill
+description:
+---
+
+# e2e-reload-skill
+
+Invalid skill (missing description) to trigger diagnostics.
+";
+    std::fs::write(&skill_path, skill_invalid).expect("write invalid skill");
+    session
+        .harness
+        .record_artifact("skill.invalid.SKILL.md", &skill_path);
+
+    let snapshot_pi_after_invalid = session.harness.temp_path("snapshot.pi.after_invalid.txt");
+    write_dir_snapshot(&project_pi_dir, &snapshot_pi_after_invalid);
+    session
+        .harness
+        .record_artifact("snapshot.pi.after_invalid.txt", &snapshot_pi_after_invalid);
+
+    // Reload again and confirm diagnostics are surfaced.
+    let pane = session.send_text_and_wait(
+        "reload_after_invalid_skill",
+        "/reload",
+        "Reload diagnostics:",
+        STARTUP_TIMEOUT,
+    );
+    assert!(
+        pane.contains("Skills:") && pane.contains("description is required"),
+        "Expected skill diagnostics to mention missing description; got:\n{pane}"
+    );
+
+    // Autocomplete should no longer list the skill after invalidation.
+    session.tmux.send_literal("/skill:e2e");
+    let pane = session.send_key_and_wait(
+        "autocomplete_does_not_show_skill_after_invalid_reload",
+        "Tab",
+        "/skill:e2e",
+        Duration::from_secs(1),
+    );
+    assert!(
+        !pane.contains("/skill:e2e-reload-skill"),
+        "Expected skill autocomplete entry to be removed; got:\n{pane}"
     );
 
     session.exit_gracefully();

@@ -130,6 +130,11 @@ pub enum TruncatedBy {
     Bytes,
 }
 
+enum TailLine<'a> {
+    Borrowed(&'a str),
+    Owned(String),
+}
+
 /// Truncate from the beginning (keep first N lines).
 ///
 /// Uses lazy iteration to avoid allocating a Vec of all line slices upfront.
@@ -242,12 +247,6 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
             max_lines,
             max_bytes,
         };
-    }
-
-    // Use an enum to hold either a borrowed slice or an owned partial line.
-    enum TailLine<'a> {
-        Borrowed(&'a str),
-        Owned(String),
     }
 
     let mut collected: Vec<TailLine<'_>> = Vec::new();
