@@ -3174,12 +3174,30 @@ const __pi_vfs = (() => {
 
 export function existsSync(path) {
   const normalized = __pi_vfs.normalizePath(path);
-  return __pi_vfs.dirs.has(normalized) || __pi_vfs.files.has(normalized);
+  if (__pi_vfs.dirs.has(normalized) || __pi_vfs.files.has(normalized)) return true;
+  if (typeof globalThis.__pi_host_read_file_sync === "function") {
+    try {
+      const content = globalThis.__pi_host_read_file_sync(normalized);
+      const bytes = __pi_vfs.toBytes(content);
+      __pi_vfs.ensureDir(__pi_vfs.dirname(normalized));
+      __pi_vfs.files.set(normalized, bytes);
+      return true;
+    } catch (_e) { /* file not found on real FS */ }
+  }
+  return false;
 }
 
 export function readFileSync(path, encoding) {
   const normalized = __pi_vfs.normalizePath(path);
-  const bytes = __pi_vfs.files.get(normalized);
+  let bytes = __pi_vfs.files.get(normalized);
+  if (!bytes && typeof globalThis.__pi_host_read_file_sync === "function") {
+    try {
+      const content = globalThis.__pi_host_read_file_sync(normalized);
+      bytes = __pi_vfs.toBytes(content);
+      __pi_vfs.ensureDir(__pi_vfs.dirname(normalized));
+      __pi_vfs.files.set(normalized, bytes);
+    } catch (_e) { /* fall through to ENOENT */ }
+  }
   if (!bytes) {
     throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'`);
   }
@@ -4895,6 +4913,17 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             Ok(())
                         },
                     ),
+                )?;
+
+                // __pi_host_read_file_sync(path) -> string (throws on error)
+                // Synchronous real-filesystem read fallback for node:fs readFileSync.
+                global.set(
+                    "__pi_host_read_file_sync",
+                    Func::from(|path: String| -> rquickjs::Result<String> {
+                        std::fs::read_to_string(&path).map_err(|err| {
+                            rquickjs::Error::new_loading_message(&path, format!("host read: {err}"))
+                        })
+                    }),
                 )?;
 
                 // Install the JS bridge that creates Promises and wraps the native functions
