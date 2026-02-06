@@ -627,7 +627,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     fn capture_markdown_segments(markdown: &str) -> Vec<Segment<'static>> {
-        let console = PiConsole::with_color();
+        let mut console = PiConsole::with_color();
         console.console.begin_capture();
         console.render_markdown(markdown);
         console.console.end_capture()
@@ -728,7 +728,7 @@ mod tests {
 
     #[test]
     fn render_markdown_produces_styled_segments() {
-        let console = PiConsole::with_color();
+        let mut console = PiConsole::with_color();
 
         console.console.begin_capture();
         console.render_markdown("# Title\n\nThis is **bold**.\n\n- Item 1\n- Item 2");
@@ -742,7 +742,7 @@ mod tests {
 
     #[test]
     fn render_markdown_code_fence_uses_syntax_highlighting_when_language_present() {
-        let console = PiConsole::with_color();
+        let mut console = PiConsole::with_color();
 
         console.console.begin_capture();
         console.render_markdown("```rust\nfn main() {\n    println!(\"hi\");\n}\n```");
