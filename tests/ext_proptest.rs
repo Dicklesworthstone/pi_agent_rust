@@ -63,6 +63,7 @@ fn hostcall_kind_and_payload() -> impl Strategy<Value = (HostcallKind, Value)> {
             .prop_map(|(op, payload)| (HostcallKind::Ui { op }, payload)),
         (op_name_strategy(), json_value())
             .prop_map(|(op, payload)| { (HostcallKind::Events { op }, payload) }),
+        json_value().prop_map(|payload| (HostcallKind::Log, payload)),
     ]
 }
 
@@ -99,7 +100,7 @@ proptest! {
         prop_assert!(!cap.is_empty());
         prop_assert!(matches!(
             cap.as_str(),
-            "read" | "write" | "exec" | "tool" | "http" | "session" | "ui" | "events"
+            "read" | "write" | "exec" | "tool" | "http" | "session" | "ui" | "events" | "log"
         ));
 
         let normalized = tool_name.trim().to_ascii_lowercase();
@@ -126,6 +127,7 @@ proptest! {
             HostcallKind::Session { .. } => prop_assert_eq!(cap, "session"),
             HostcallKind::Ui { .. } => prop_assert_eq!(cap, "ui"),
             HostcallKind::Events { .. } => prop_assert_eq!(cap, "events"),
+            HostcallKind::Log => prop_assert_eq!(cap, "log"),
         }
     }
 

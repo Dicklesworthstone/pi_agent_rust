@@ -253,6 +253,8 @@ pub enum HostcallKind {
     Ui { op: String },
     /// pi.events(op, args) - event operations
     Events { op: String },
+    /// pi.log(entry) - structured log emission
+    Log,
 }
 
 /// A hostcall request enqueued from JavaScript.
@@ -363,6 +365,7 @@ impl HostcallRequest {
             HostcallKind::Session { .. } => "session",
             HostcallKind::Ui { .. } => "ui",
             HostcallKind::Events { .. } => "events",
+            HostcallKind::Log => "log",
         }
     }
 
@@ -380,6 +383,7 @@ impl HostcallRequest {
             HostcallKind::Session { .. } => "session".to_string(),
             HostcallKind::Ui { .. } => "ui".to_string(),
             HostcallKind::Events { .. } => "events".to_string(),
+            HostcallKind::Log => "log".to_string(),
         }
     }
 
@@ -400,7 +404,7 @@ impl HostcallRequest {
                 serde_json::json!({ "name": name, "input": self.payload.clone() })
             }
             HostcallKind::Exec { cmd } => canonical_exec_params(cmd, &self.payload),
-            HostcallKind::Http => self.payload.clone(),
+            HostcallKind::Http | HostcallKind::Log => self.payload.clone(),
             HostcallKind::Session { op }
             | HostcallKind::Ui { op }
             | HostcallKind::Events { op } => canonical_op_params(op, &self.payload),
@@ -1524,13 +1528,8 @@ fn build_node_os_module() -> String {
     // Read uid/gid from /proc/self/status on Linux, fall back to defaults.
     let (uid, gid) = read_proc_uid_gid().unwrap_or((1000, 1000));
 
-    // Build CPU array entries. We use generic model names since QuickJS
-    // doesn't need real CPU model strings — extensions only care about count.
-    let cpu_entry =
-        r#"{ model: "cpu", speed: 2400, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }"#;
-    let cpus_array = std::iter::repeat_n(cpu_entry, num_cpus)
-        .collect::<Vec<_>>()
-        .join(", ");
+    // Store CPU count; the JS module builds the array at import time.
+    // This avoids emitting potentially thousands of chars of identical entries.
 
     format!(
         r#"
@@ -1546,7 +1545,9 @@ const _uid = {uid};
 const _gid = {gid};
 const _username = "{username}";
 const _shell = "{shell}";
-const _cpus = [{cpus_array}];
+const _numCpus = {num_cpus};
+const _cpuEntry = {{ model: "cpu", speed: 2400, times: {{ user: 0, nice: 0, sys: 0, idle: 0, irq: 0 }} }};
+const _cpus = Array.from({{ length: _numCpus }}, () => ({{ ...(_cpuEntry) }}));
 
 export function homedir() {{
   const env_home =
@@ -2855,86 +2856,7 @@ export default { join, dirname, resolve, basename, relative, isAbsolute, extname
         .to_string(),
     );
 
-    modules.insert(
-        "node:os".to_string(),
-        r#"
-export function homedir() {
-  const p = globalThis.process;
-  if (p && p.env && p.env.HOME) return p.env.HOME;
-  const home =
-    globalThis.pi && globalThis.pi.env && typeof globalThis.pi.env.get === "function"
-      ? globalThis.pi.env.get("HOME")
-      : undefined;
-  return home || "/home/unknown";
-}
-export function tmpdir() {
-  const p = globalThis.process;
-  if (p && p.env && p.env.TMPDIR) return p.env.TMPDIR;
-  return "/tmp";
-}
-export function hostname() {
-  return "pi-host";
-}
-export function platform() {
-  const p = globalThis.process;
-  return (p && p.platform) || "linux";
-}
-export function arch() {
-  const p = globalThis.process;
-  return (p && p.arch) || "x64";
-}
-export function type() {
-  const plat = platform();
-  if (plat === "darwin") return "Darwin";
-  if (plat === "win32") return "Windows_NT";
-  return "Linux";
-}
-export function release() {
-  return "6.0.0";
-}
-export function cpus() {
-  return [{ model: "PiJS Virtual CPU", speed: 2400, times: { user: 0, nice: 0, sys: 0, idle: 0, irq: 0 } }];
-}
-export function totalmem() {
-  return 8 * 1024 * 1024 * 1024;
-}
-export function freemem() {
-  return 4 * 1024 * 1024 * 1024;
-}
-export function uptime() {
-  return Math.floor(Date.now() / 1000);
-}
-export function loadavg() {
-  return [0.0, 0.0, 0.0];
-}
-export function networkInterfaces() {
-  return {};
-}
-export function userInfo(_options) {
-  const home = homedir();
-  return {
-    uid: 1000,
-    gid: 1000,
-    username: "pi",
-    homedir: home,
-    shell: "/bin/sh",
-  };
-}
-export function endianness() {
-  return "LE";
-}
-export const EOL = "\n";
-export const devNull = "/dev/null";
-export const constants = {
-  signals: {},
-  errno: {},
-  priority: { PRIORITY_LOW: 19, PRIORITY_BELOW_NORMAL: 10, PRIORITY_NORMAL: 0, PRIORITY_ABOVE_NORMAL: -7, PRIORITY_HIGH: -14, PRIORITY_HIGHEST: -20 },
-};
-export default { homedir, tmpdir, hostname, platform, arch, type, release, cpus, totalmem, freemem, uptime, loadavg, networkInterfaces, userInfo, endianness, EOL, devNull, constants };
-"#
-        .trim()
-        .to_string(),
-    );
+    // node:os module is registered by build_node_os_module() above.
 
     modules.insert(
         "node:child_process".to_string(),
@@ -4010,31 +3932,151 @@ export default { createInterface, promises };
 export function fileURLToPath(url) {
   const u = String(url ?? '');
   if (u.startsWith('file://')) {
-    return u.slice(7);
+    return decodeURIComponent(u.slice(7));
   }
   return u;
 }
 export function pathToFileURL(path) {
-  return new URL('file://' + String(path ?? ''));
+  return new URL('file://' + encodeURI(String(path ?? '')));
 }
-export class URL {
-  constructor(input, base) {
-    const u = String(input ?? '');
-    this.href = u;
-    this.protocol = u.split(':')[0] + ':';
-    this.pathname = u.replace(/^[^:]+:\/\/[^\/]+/, '') || '/';
-    this.hostname = (u.match(/^[^:]+:\/\/([^\/]+)/) || [])[1] || '';
-    this.host = this.hostname;
-    this.origin = this.protocol + '//' + this.hostname;
+
+// Use built-in URL if available (QuickJS may have it), else provide polyfill
+const _URL = globalThis.URL || (() => {
+  class URLPolyfill {
+    constructor(input, base) {
+      let u = String(input ?? '');
+      if (base !== undefined) {
+        const b = String(base);
+        if (u.startsWith('/')) {
+          const m = b.match(/^([^:]+:\/\/[^\/]+)/);
+          u = m ? m[1] + u : b + u;
+        } else if (!/^[a-z][a-z0-9+.-]*:/i.test(u)) {
+          u = b.replace(/[^\/]*$/, '') + u;
+        }
+      }
+      this.href = u;
+      const protoEnd = u.indexOf(':');
+      this.protocol = protoEnd >= 0 ? u.slice(0, protoEnd + 1) : '';
+      let rest = protoEnd >= 0 ? u.slice(protoEnd + 1) : u;
+      this.username = ''; this.password = '';
+      if (rest.startsWith('//')) {
+        rest = rest.slice(2);
+        const pathStart = rest.indexOf('/');
+        const authority = pathStart >= 0 ? rest.slice(0, pathStart) : rest;
+        rest = pathStart >= 0 ? rest.slice(pathStart) : '/';
+        const atIdx = authority.indexOf('@');
+        let hostPart = authority;
+        if (atIdx >= 0) {
+          const userInfo = authority.slice(0, atIdx);
+          hostPart = authority.slice(atIdx + 1);
+          const colonIdx = userInfo.indexOf(':');
+          if (colonIdx >= 0) {
+            this.username = userInfo.slice(0, colonIdx);
+            this.password = userInfo.slice(colonIdx + 1);
+          } else {
+            this.username = userInfo;
+          }
+        }
+        const portIdx = hostPart.lastIndexOf(':');
+        if (portIdx >= 0 && /^\d+$/.test(hostPart.slice(portIdx + 1))) {
+          this.hostname = hostPart.slice(0, portIdx);
+          this.port = hostPart.slice(portIdx + 1);
+        } else {
+          this.hostname = hostPart;
+          this.port = '';
+        }
+        this.host = this.port ? this.hostname + ':' + this.port : this.hostname;
+        this.origin = this.protocol + '//' + this.host;
+      } else {
+        this.hostname = ''; this.host = ''; this.port = '';
+        this.origin = 'null';
+      }
+      const hashIdx = rest.indexOf('#');
+      if (hashIdx >= 0) {
+        this.hash = rest.slice(hashIdx);
+        rest = rest.slice(0, hashIdx);
+      } else {
+        this.hash = '';
+      }
+      const qIdx = rest.indexOf('?');
+      if (qIdx >= 0) {
+        this.search = rest.slice(qIdx);
+        this.pathname = rest.slice(0, qIdx) || '/';
+      } else {
+        this.search = '';
+        this.pathname = rest || '/';
+      }
+      this.searchParams = new _URLSearchParams(this.search.slice(1));
+    }
+    toString() { return this.href; }
+    toJSON() { return this.href; }
   }
-  toString() { return this.href; }
-}
-export const URLSearchParams = globalThis.URLSearchParams || class URLSearchParams {
-  constructor() { this._params = new Map(); }
-  get(key) { return this._params.get(key); }
-  set(key, val) { this._params.set(key, val); }
+  return URLPolyfill;
+})();
+
+// Always use our polyfill — QuickJS built-in URLSearchParams may not support string init
+const _URLSearchParams = class URLSearchParamsPolyfill {
+  constructor(init) {
+    this._entries = [];
+    if (typeof init === 'string') {
+      const s = init.startsWith('?') ? init.slice(1) : init;
+      if (s) {
+        for (const pair of s.split('&')) {
+          const eqIdx = pair.indexOf('=');
+          if (eqIdx >= 0) {
+            this._entries.push([decodeURIComponent(pair.slice(0, eqIdx)), decodeURIComponent(pair.slice(eqIdx + 1))]);
+          } else {
+            this._entries.push([decodeURIComponent(pair), '']);
+          }
+        }
+      }
+    }
+  }
+  get(key) {
+    for (const [k, v] of this._entries) { if (k === key) return v; }
+    return null;
+  }
+  set(key, val) {
+    let found = false;
+    this._entries = this._entries.filter(([k]) => {
+      if (k === key && !found) { found = true; return true; }
+      return k !== key;
+    });
+    if (found) {
+      for (let i = 0; i < this._entries.length; i++) {
+        if (this._entries[i][0] === key) { this._entries[i][1] = String(val); break; }
+      }
+    } else {
+      this._entries.push([key, String(val)]);
+    }
+  }
+  has(key) { return this._entries.some(([k]) => k === key); }
+  delete(key) { this._entries = this._entries.filter(([k]) => k !== key); }
+  append(key, val) { this._entries.push([key, String(val)]); }
+  getAll(key) { return this._entries.filter(([k]) => k === key).map(([, v]) => v); }
+  keys() { return this._entries.map(([k]) => k)[Symbol.iterator](); }
+  values() { return this._entries.map(([, v]) => v)[Symbol.iterator](); }
+  entries() { return this._entries.slice()[Symbol.iterator](); }
+  forEach(fn, thisArg) { for (const [k, v] of this._entries) fn.call(thisArg, v, k, this); }
+  toString() {
+    return this._entries.map(([k, v]) => encodeURIComponent(k) + '=' + encodeURIComponent(v)).join('&');
+  }
+  [Symbol.iterator]() { return this.entries(); }
+  get size() { return this._entries.length; }
 };
-export default { fileURLToPath, pathToFileURL, URL, URLSearchParams };
+
+export { _URL as URL, _URLSearchParams as URLSearchParams };
+export function format(urlObj) {
+  if (typeof urlObj === 'string') return urlObj;
+  return urlObj && typeof urlObj.href === 'string' ? urlObj.href : String(urlObj);
+}
+export function parse(urlStr) {
+  try { return new _URL(urlStr); } catch (_) { return null; }
+}
+export function resolve(from, to) {
+  try { return new _URL(to, from).href; } catch (_) { return to; }
+}
+export default { URL: _URL, URLSearchParams: _URLSearchParams, fileURLToPath, pathToFileURL, format, parse, resolve };
 "
         .trim()
         .to_string(),
@@ -4183,25 +4225,7 @@ export default EventEmitter;
     // ── node:buffer ──────────────────────────────────────────────────
     modules.insert(
         "node:buffer".to_string(),
-        r"
-// Re-export the globalThis.Buffer if available, otherwise provide a stub.
-const _Buffer = typeof globalThis.Buffer !== 'undefined'
-  ? globalThis.Buffer
-  : class Buffer extends Uint8Array {
-      static from(input) { return new TextEncoder().encode(String(input)); }
-      static alloc(size) { return new Uint8Array(size); }
-      static isBuffer(obj) { return obj instanceof Uint8Array; }
-      toString(encoding) {
-        if (encoding === 'base64') return globalThis.btoa(String.fromCharCode(...this));
-        return new TextDecoder().decode(this);
-      }
-    };
-
-export const Buffer = _Buffer;
-export default { Buffer: _Buffer };
-"
-        .trim()
-        .to_string(),
+        crate::buffer_shim::NODE_BUFFER_JS.trim().to_string(),
     );
 
     // ── node:assert ──────────────────────────────────────────────────
@@ -5271,6 +5295,44 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             let request = HostcallRequest {
                                 call_id: call_id.clone(),
                                 kind: HostcallKind::Events { op },
+                                payload,
+                                trace_id,
+                                extension_id,
+                            };
+                            queue.borrow_mut().push_back(request);
+                            Ok(call_id)
+                        }
+                    }),
+                )?;
+
+                // __pi_log_native(entry) -> call_id
+                global.set(
+                    "__pi_log_native",
+                    Func::from({
+                        let queue = hostcall_queue.clone();
+                        let tracker = hostcall_tracker.clone();
+                        let scheduler = Rc::clone(&scheduler);
+                        let hostcalls_total = Arc::clone(&hostcalls_total);
+                        let trace_seq = Arc::clone(&trace_seq);
+                        move |ctx: Ctx<'_>, entry: Value<'_>| -> rquickjs::Result<String> {
+                            let payload = js_to_json(&entry)?;
+                            let call_id = format!("call-{}", generate_call_id());
+                            hostcalls_total.fetch_add(1, AtomicOrdering::SeqCst);
+                            let trace_id = trace_seq.fetch_add(1, AtomicOrdering::SeqCst);
+                            let timeout_ms = default_hostcall_timeout_ms.filter(|ms| *ms > 0);
+                            let timer_id =
+                                timeout_ms.map(|ms| scheduler.borrow_mut().set_timeout(ms));
+                            tracker.borrow_mut().register(call_id.clone(), timer_id);
+                            let extension_id: Option<String> = ctx
+                                .globals()
+                                .get::<_, Option<String>>("__pi_current_extension_id")
+                                .ok()
+                                .flatten()
+                                .map(|value| value.trim().to_string())
+                                .filter(|value| !value.is_empty());
+                            let request = HostcallRequest {
+                                call_id: call_id.clone(),
+                                kind: HostcallKind::Log,
                                 payload,
                                 trace_id,
                                 extension_id,
@@ -7214,6 +7276,9 @@ const __pi_exec_hostcall = __pi_make_hostcall(__pi_exec_native);
 	    // pi.events(op, args) - event operations
 	    events: __pi_make_hostcall(__pi_events_native),
 
+    // pi.log(entry) - structured log emission
+    log: __pi_make_hostcall(__pi_log_native),
+
     // Extension API (legacy-compatible subset)
     registerTool: __pi_register_tool,
     registerCommand: __pi_register_command,
@@ -8490,6 +8555,37 @@ mod tests {
     }
 
     #[test]
+    fn pijs_runtime_log_hostcall_request_shape() {
+        futures::executor::block_on(async {
+            let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                pi.log({
+                    level: "info",
+                    event: "unit.test",
+                    message: "hello",
+                    correlation: { scenario_id: "scn-1" }
+                });
+            "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let req = &requests[0];
+            assert!(matches!(&req.kind, HostcallKind::Log));
+            assert_eq!(req.payload["level"], "info");
+            assert_eq!(req.payload["event"], "unit.test");
+            assert_eq!(req.payload["message"], "hello");
+        });
+    }
+
+    #[test]
     fn pijs_runtime_get_registered_tools_empty() {
         futures::executor::block_on(async {
             let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
@@ -8679,6 +8775,26 @@ mod tests {
                 },
                 serde_json::json!({ "op": "get_state" }),
             ),
+            (
+                HostcallRequest {
+                    call_id: "log-entry".to_string(),
+                    kind: HostcallKind::Log,
+                    payload: serde_json::json!({
+                        "level": "info",
+                        "event": "unit.test",
+                        "message": "hello",
+                        "correlation": { "scenario_id": "scn-1" }
+                    }),
+                    trace_id: 0,
+                    extension_id: None,
+                },
+                serde_json::json!({
+                    "level": "info",
+                    "event": "unit.test",
+                    "message": "hello",
+                    "correlation": { "scenario_id": "scn-1" }
+                }),
+            ),
         ];
 
         for (request, expected) in cases {
@@ -8712,6 +8828,18 @@ mod tests {
                     op: "set_status".to_string(),
                 },
                 payload: serde_json::json!("thinking"),
+                trace_id: 0,
+                extension_id: Some("ext.test".to_string()),
+            },
+            HostcallRequest {
+                call_id: "hash-log".to_string(),
+                kind: HostcallKind::Log,
+                payload: serde_json::json!({
+                    "level": "warn",
+                    "event": "log.test",
+                    "message": "warn line",
+                    "correlation": { "scenario_id": "scn-2" }
+                }),
                 trace_id: 0,
                 extension_id: Some("ext.test".to_string()),
             },
@@ -10578,6 +10706,59 @@ mod tests {
             };
             assert_eq!(r["type"].as_str().unwrap(), expected_type);
             assert_eq!(r["release"], serde_json::json!("6.0.0"));
+        });
+    }
+
+    #[test]
+    fn pijs_node_os_native_values_cpus_and_userinfo() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.nativeOsResults = {};
+                    import('node:os').then((os) => {
+                        globalThis.nativeOsResults.cpuCount = os.cpus().length;
+                        globalThis.nativeOsResults.totalmem = os.totalmem();
+                        globalThis.nativeOsResults.freemem = os.freemem();
+                        globalThis.nativeOsResults.eol = os.EOL;
+                        globalThis.nativeOsResults.endianness = os.endianness();
+                        globalThis.nativeOsResults.devNull = os.devNull;
+                        const ui = os.userInfo();
+                        globalThis.nativeOsResults.uid = ui.uid;
+                        globalThis.nativeOsResults.username = ui.username;
+                        globalThis.nativeOsResults.hasShell = typeof ui.shell === 'string';
+                        globalThis.nativeOsResults.hasHomedir = typeof ui.homedir === 'string';
+                        globalThis.nativeOsResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:os native");
+
+            let r = get_global_json(&runtime, "nativeOsResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            // cpus() returns array with count matching available parallelism
+            let expected_cpus = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            assert_eq!(r["cpuCount"], serde_json::json!(expected_cpus));
+            // totalmem/freemem are positive numbers
+            assert!(r["totalmem"].as_f64().unwrap() > 0.0);
+            assert!(r["freemem"].as_f64().unwrap() > 0.0);
+            // EOL is correct for platform
+            assert_eq!(r["eol"], serde_json::json!("\n"));
+            assert_eq!(r["endianness"], serde_json::json!("LE"));
+            assert_eq!(r["devNull"], serde_json::json!("/dev/null"));
+            // userInfo has real uid and non-empty username
+            assert!(r["uid"].is_number());
+            assert!(r["username"].as_str().is_some_and(|s| !s.is_empty()));
+            assert_eq!(r["hasShell"], serde_json::json!(true));
+            assert_eq!(r["hasHomedir"], serde_json::json!(true));
         });
     }
 

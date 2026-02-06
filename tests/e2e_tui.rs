@@ -1275,3 +1275,291 @@ fn e2e_tui_vcr_tool_read() {
         "Expected at least one message entry with parentId"
     );
 }
+
+/// E2E interactive: full loop proving TUI input → provider stream → tool execution →
+/// rendered output → clean exit, with comprehensive session JSONL tree verification.
+///
+/// This is the canonical test for bd-dvgl: it asserts tool status rendering, tool output
+/// content, final response text, session JSONL integrity (header + message tree with
+/// parent-child chain), and emits rich per-step artifacts.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn e2e_tui_full_interactive_loop() {
+    let Some((_lock, mut session)) = new_locked_tui_session("e2e_tui_full_interactive_loop")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    // ── Setup: create test file and VCR cassette ──
+    session.harness.section("setup");
+
+    let sample_path = session.harness.temp_path(SAMPLE_FILE_NAME);
+    std::fs::write(&sample_path, SAMPLE_FILE_CONTENT).expect("write sample file");
+    session
+        .harness
+        .record_artifact(SAMPLE_FILE_NAME, &sample_path);
+
+    let tool_output = read_output_for_sample(session.harness.temp_dir(), SAMPLE_FILE_NAME);
+    let tool_output_hash = sha256_hex(&tool_output);
+
+    let cassette_dir = session.harness.temp_path("vcr");
+    let env_root = session.harness.temp_dir().join("env");
+    let system_prompt = build_vcr_system_prompt(session.harness.temp_dir(), &env_root);
+    let system_prompt_hash = sha256_hex(&system_prompt);
+    let cassette_path = write_vcr_cassette(&cassette_dir, &tool_output, &system_prompt);
+    let cassette_name = cassette_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vcr-cassette.json");
+    session
+        .harness
+        .record_artifact(cassette_name, &cassette_path);
+
+    session
+        .harness
+        .log()
+        .info_ctx("vcr", "Prepared full-loop cassette", |ctx| {
+            ctx.push(("cassette_path".into(), cassette_path.display().to_string()));
+            ctx.push(("tool_call_id".into(), TOOL_CALL_ID.to_string()));
+            ctx.push(("tool_name".into(), "read".to_string()));
+            ctx.push(("tool_output_sha256".into(), tool_output_hash.clone()));
+            ctx.push(("system_prompt_sha256".into(), system_prompt_hash));
+        });
+
+    // ── Configure environment for VCR playback ──
+    let cassette_dir_str = cassette_dir.display().to_string();
+    session.set_env(VCR_ENV_MODE, "playback");
+    session.set_env(VCR_ENV_DIR, &cassette_dir_str);
+    session.set_env("PI_VCR_TEST_NAME", VCR_TEST_NAME);
+    session.set_env("PI_TEST_MODE", "1");
+    session.set_env("VCR_DEBUG_BODY", "1");
+
+    let stderr_log = session.harness.temp_path("pi-stderr.log");
+    session.set_env("PI_STDERR_LOG", &stderr_log.display().to_string());
+    session.set_env("RUST_LOG", "debug");
+
+    // ── Step 1: Launch and verify startup ──
+    session.harness.section("launch");
+    session.launch(&vcr_interactive_args());
+
+    let pane = session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+    assert!(
+        pane.contains("Welcome to Pi!"),
+        "Expected welcome message; got:\n{pane}"
+    );
+
+    session
+        .harness
+        .log()
+        .info_ctx("step", "Startup verified", |ctx| {
+            ctx.push(("welcome_found".into(), "true".to_string()));
+        });
+
+    // ── Step 2: Send prompt that triggers tool call ──
+    session.harness.section("prompt → tool call → response");
+
+    // Wait for tool execution and final "Done." response from VCR cassette.
+    // The flow is: user prompt → VCR returns tool_use → pi executes read tool →
+    // sends tool_result → VCR returns "Done." text.
+    let pane = session.send_text_and_wait(
+        "prompt_tool_call",
+        VCR_PROMPT,
+        "Done.",
+        Duration::from_secs(30),
+    );
+
+    // ── Step 3: Assert tool output rendered ──
+    session.harness.section("verify tool output");
+
+    // The read tool output should appear in the pane (the file content).
+    let expected_line = tool_output
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("Hello");
+    assert!(
+        pane.contains(expected_line),
+        "Expected tool output line in pane.\nExpected: {expected_line}\nPane:\n{pane}"
+    );
+
+    // The tool name "read" should appear somewhere in the rendered output
+    // (pi renders tool calls with their name).
+    assert!(
+        pane.contains("read"),
+        "Expected tool name 'read' in rendered pane.\nPane:\n{pane}"
+    );
+
+    // The final response "Done." should appear.
+    assert!(
+        pane.contains("Done."),
+        "Expected final response 'Done.' in pane.\nPane:\n{pane}"
+    );
+
+    session
+        .harness
+        .log()
+        .info_ctx("verify", "Tool output + response rendered", |ctx| {
+            ctx.push(("expected_line".into(), expected_line.to_string()));
+            ctx.push(("tool_name_found".into(), pane.contains("read").to_string()));
+            ctx.push(("final_response_found".into(), pane.contains("Done.").to_string()));
+            ctx.push(("tool_output_sha256".into(), tool_output_hash.clone()));
+        });
+
+    // ── Step 4: Exit gracefully ──
+    session.harness.section("exit");
+    session.exit_gracefully();
+    let session_alive = session.tmux.session_exists();
+    assert!(
+        !session_alive,
+        "Session did not exit cleanly after full interactive loop"
+    );
+
+    session.harness.log().info_ctx("exit", "Session exited", |ctx| {
+        ctx.push(("reason".into(), "graceful".to_string()));
+        ctx.push(("session_alive".into(), session_alive.to_string()));
+    });
+
+    // ── Emit artifacts ──
+    session.harness.section("artifacts");
+    session.write_artifacts();
+
+    // Record stderr log if it exists
+    if stderr_log.exists() {
+        session
+            .harness
+            .record_artifact("pi-stderr.log", &stderr_log);
+    }
+
+    // ── Step 5: Verify session JSONL integrity ──
+    session.harness.section("verify session JSONL");
+
+    let sessions_dir = session.harness.temp_dir().join("env").join("sessions");
+    let session_file = find_session_jsonl(&sessions_dir).expect("Expected session JSONL file");
+    session
+        .harness
+        .record_artifact("session.jsonl", &session_file);
+
+    let content = std::fs::read_to_string(&session_file).expect("read session jsonl");
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+
+    assert!(
+        lines.len() >= 3,
+        "Expected >= 3 lines (header + user + assistant), got {}",
+        lines.len()
+    );
+
+    // Parse header
+    let header: Value = serde_json::from_str(lines[0]).expect("parse session header");
+    assert_eq!(
+        header.get("type").and_then(Value::as_str),
+        Some("session"),
+        "Session header type should be 'session'"
+    );
+    assert_eq!(
+        header.get("version").and_then(Value::as_u64),
+        Some(u64::from(SESSION_VERSION)),
+        "Session version should match SESSION_VERSION"
+    );
+    let session_id = header
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("Session header should have id");
+    assert!(
+        !session_id.is_empty(),
+        "Session id should not be empty"
+    );
+
+    session.harness.log().info_ctx("session_jsonl", "Header verified", |ctx| {
+        ctx.push(("session_id".into(), session_id.to_string()));
+        ctx.push(("version".into(), SESSION_VERSION.to_string()));
+        ctx.push(("total_entries".into(), (lines.len() - 1).to_string()));
+    });
+
+    // Parse all entries and verify tree structure
+    let mut user_count = 0;
+    let mut assistant_count = 0;
+    let mut tool_result_count = 0;
+    let mut entry_ids: Vec<String> = Vec::new();
+    let mut parent_ids: Vec<Option<String>> = Vec::new();
+
+    for line in &lines[1..] {
+        let entry: Value = serde_json::from_str(line).expect("parse session entry");
+        let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
+
+        if entry_type == "message" {
+            let msg = entry.get("message");
+            let role = msg.and_then(|m| m.get("role")).and_then(Value::as_str);
+
+            match role {
+                Some("user") => user_count += 1,
+                Some("assistant") => assistant_count += 1,
+                Some("toolResult") => tool_result_count += 1,
+                _ => {}
+            }
+
+            // Track IDs for tree verification
+            let entry_id = entry
+                .get("id")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let parent_id = entry
+                .get("parentId")
+                .and_then(Value::as_str)
+                .map(String::from);
+
+            if let Some(ref id) = entry_id {
+                entry_ids.push(id.clone());
+            }
+            parent_ids.push(parent_id);
+        }
+    }
+
+    session.harness.log().info_ctx("session_jsonl", "Entry counts", |ctx| {
+        ctx.push(("user_messages".into(), user_count.to_string()));
+        ctx.push(("assistant_messages".into(), assistant_count.to_string()));
+        ctx.push(("tool_results".into(), tool_result_count.to_string()));
+        ctx.push(("entry_ids".into(), entry_ids.len().to_string()));
+    });
+
+    // We expect at least: 1 user message, 1+ assistant messages (tool_use + final),
+    // and 1 tool result.
+    assert!(
+        user_count >= 1,
+        "Expected at least 1 user message, got {user_count}"
+    );
+    assert!(
+        assistant_count >= 1,
+        "Expected at least 1 assistant message, got {assistant_count}"
+    );
+    assert!(
+        tool_result_count >= 1,
+        "Expected at least 1 tool result, got {tool_result_count}"
+    );
+
+    // Verify parent-child chain: at least one entry should have a parentId
+    // that references another entry's id (proving tree structure).
+    let has_valid_parent = parent_ids.iter().flatten().any(|pid| {
+        entry_ids.iter().any(|eid| eid == pid)
+    });
+    assert!(
+        has_valid_parent,
+        "Expected at least one entry with a parentId referencing another entry's id.\n\
+         Entry IDs: {entry_ids:?}\n\
+         Parent IDs: {parent_ids:?}"
+    );
+
+    // ── Verify step count ──
+    assert!(
+        session.steps().len() >= 2,
+        "Expected >= 2 recorded steps (startup + prompt), got {}",
+        session.steps().len()
+    );
+
+    session.harness.log().info_ctx("summary", "Full interactive loop complete", |ctx| {
+        ctx.push(("total_steps".into(), session.steps().len().to_string()));
+        ctx.push(("user_messages".into(), user_count.to_string()));
+        ctx.push(("assistant_messages".into(), assistant_count.to_string()));
+        ctx.push(("tool_results".into(), tool_result_count.to_string()));
+        ctx.push(("session_tree_valid".into(), has_valid_parent.to_string()));
+    });
+}

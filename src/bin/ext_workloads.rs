@@ -256,6 +256,10 @@ async fn run_bench_js(
                         message: "benchmark harness forbids pi.http".to_string(),
                     },
                 ),
+                HostcallKind::Log => (
+                    "log".to_string(),
+                    HostcallOutcome::Success(json!({ "logged": true })),
+                ),
             };
 
             if kind_key != "tool.__bench_report" {

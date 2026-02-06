@@ -6379,6 +6379,7 @@ async fn dispatch_shared_allowed(
             };
             dispatch_hostcall_events(&call.call_id, manager, ctx.tools, op, payload).await
         }
+        "log" => dispatch_hostcall_log(&call.call_id, ctx.extension_id, call.params.clone()).await,
         _ => HostcallOutcome::Error {
             code: "invalid_request".to_string(),
             message: format!("Unsupported hostcall method: {}", call.method),
@@ -7056,6 +7057,120 @@ fn classify_ui_hostcall_error(err: &Error) -> &'static str {
     } else {
         err.hostcall_error_code()
     }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn dispatch_hostcall_log(
+    call_id: &str,
+    extension_id: Option<&str>,
+    payload: Value,
+) -> HostcallOutcome {
+    let Value::Object(mut entry) = payload else {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: "host_call log requires params object".to_string(),
+        };
+    };
+
+    entry
+        .entry("schema".to_string())
+        .or_insert_with(|| Value::String(LOG_SCHEMA_VERSION.to_string()));
+    entry.entry("ts".to_string()).or_insert_with(|| {
+        Value::String(
+            chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        )
+    });
+
+    let mut correlation = match entry.remove("correlation") {
+        Some(Value::Object(map)) => map,
+        Some(_) => {
+            return HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: "host_call log correlation must be an object".to_string(),
+            };
+        }
+        None => serde_json::Map::new(),
+    };
+
+    if !correlation.contains_key("extension_id") {
+        let ext = extension_id.unwrap_or("<unknown>");
+        correlation.insert("extension_id".to_string(), Value::String(ext.to_string()));
+    }
+    correlation
+        .entry("scenario_id".to_string())
+        .or_insert_with(|| Value::String("runtime".to_string()));
+    correlation
+        .entry("host_call_id".to_string())
+        .or_insert_with(|| Value::String(call_id.to_string()));
+    entry.insert("correlation".to_string(), Value::Object(correlation));
+
+    let payload = Value::Object(entry);
+    let log_entry: LogPayload = match serde_json::from_value(payload) {
+        Ok(value) => value,
+        Err(err) => {
+            return HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: format!("host_call log payload is invalid: {err}"),
+            };
+        }
+    };
+
+    if let Err(err) = validate_log(&log_entry) {
+        return HostcallOutcome::Error {
+            code: "invalid_request".to_string(),
+            message: format!("host_call log payload validation failed: {err}"),
+        };
+    }
+
+    let data = log_entry.data.clone().unwrap_or(Value::Null);
+    match log_entry.level {
+        LogLevel::Debug => tracing::debug!(
+            target: "pijs.ext.log",
+            event = %log_entry.event,
+            extension_id = %log_entry.correlation.extension_id,
+            scenario_id = %log_entry.correlation.scenario_id,
+            host_call_id = ?log_entry.correlation.host_call_id,
+            data = ?data,
+            "{message}",
+            message = log_entry.message
+        ),
+        LogLevel::Info => tracing::info!(
+            target: "pijs.ext.log",
+            event = %log_entry.event,
+            extension_id = %log_entry.correlation.extension_id,
+            scenario_id = %log_entry.correlation.scenario_id,
+            host_call_id = ?log_entry.correlation.host_call_id,
+            data = ?data,
+            "{message}",
+            message = log_entry.message
+        ),
+        LogLevel::Warn => tracing::warn!(
+            target: "pijs.ext.log",
+            event = %log_entry.event,
+            extension_id = %log_entry.correlation.extension_id,
+            scenario_id = %log_entry.correlation.scenario_id,
+            host_call_id = ?log_entry.correlation.host_call_id,
+            data = ?data,
+            "{message}",
+            message = log_entry.message
+        ),
+        LogLevel::Error => tracing::error!(
+            target: "pijs.ext.log",
+            event = %log_entry.event,
+            extension_id = %log_entry.correlation.extension_id,
+            scenario_id = %log_entry.correlation.scenario_id,
+            host_call_id = ?log_entry.correlation.host_call_id,
+            data = ?data,
+            "{message}",
+            message = log_entry.message
+        ),
+    }
+
+    HostcallOutcome::Success(json!({
+        "ok": true,
+        "schema": log_entry.schema,
+        "event": log_entry.event,
+    }))
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -14939,7 +15054,12 @@ mod tests {
     // bd-1uy.1.2: Protocol adapter (handle_extension_message) tests
     // ========================================================================
 
-    fn make_host_call_msg(call_id: &str, method: &str, capability: &str, params: Value) -> ExtensionMessage {
+    fn make_host_call_msg(
+        call_id: &str,
+        method: &str,
+        capability: &str,
+        params: Value,
+    ) -> ExtensionMessage {
         ExtensionMessage {
             id: format!("msg-{call_id}"),
             version: PROTOCOL_VERSION.to_string(),
@@ -14985,7 +15105,10 @@ mod tests {
         // The body should be HostResult.
         let result = match &response.body {
             ExtensionBody::HostResult(result) => result,
-            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+            other => panic!(
+                "expected HostResult, got {:?}",
+                extension_body_type_name(other)
+            ),
         };
 
         // call_id must be preserved.
@@ -15018,7 +15141,10 @@ mod tests {
 
         let result = match &responses[0].body {
             ExtensionBody::HostResult(result) => result,
-            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+            other => panic!(
+                "expected HostResult, got {:?}",
+                extension_body_type_name(other)
+            ),
         };
 
         assert!(result.is_error);
@@ -15052,7 +15178,10 @@ mod tests {
 
         let result = match &responses[0].body {
             ExtensionBody::HostResult(result) => result,
-            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+            other => panic!(
+                "expected HostResult, got {:?}",
+                extension_body_type_name(other)
+            ),
         };
 
         assert!(result.is_error);
@@ -15085,7 +15214,10 @@ mod tests {
 
         let result = match &responses[0].body {
             ExtensionBody::HostResult(result) => result,
-            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+            other => panic!(
+                "expected HostResult, got {:?}",
+                extension_body_type_name(other)
+            ),
         };
 
         assert!(result.is_error);
@@ -15136,14 +15268,20 @@ mod tests {
 
         let result = match &response.body {
             ExtensionBody::HostResult(result) => result,
-            other => panic!("expected HostResult, got {:?}", extension_body_type_name(other)),
+            other => panic!(
+                "expected HostResult, got {:?}",
+                extension_body_type_name(other)
+            ),
         };
 
         assert_eq!(result.call_id, "call-read-ok");
         assert!(!result.is_error, "read should succeed: {:?}", result.error);
         // Output should contain the file content.
         let output_str = serde_json::to_string(&result.output).expect("serialize");
-        assert!(output_str.contains("world"), "output should contain file content: {output_str}");
+        assert!(
+            output_str.contains("world"),
+            "output should contain file content: {output_str}"
+        );
     }
 
     #[test]
@@ -15340,6 +15478,95 @@ mod tests {
     // ========================================================================
     // bd-1uy.1.3: JS-origin hostcalls produce taxonomy-only error codes
     // ========================================================================
+
+    #[test]
+    fn js_hostcall_log_defaults_correlation_and_succeeds() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let manager = extension_manager_no_persisted_permissions();
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+            manager_ref: Arc::downgrade(&manager.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+            },
+            interceptor: None,
+        };
+
+        let request = crate::extensions_js::HostcallRequest {
+            call_id: "call-log-ok".to_string(),
+            kind: crate::extensions_js::HostcallKind::Log,
+            payload: serde_json::json!({
+                "level": "info",
+                "event": "unit.log",
+                "message": "hello from extension"
+            }),
+            trace_id: 0,
+            extension_id: Some("ext.test".to_string()),
+        };
+
+        let outcome = run_async(async { super::dispatch_hostcall(&host, request).await });
+        match outcome {
+            HostcallOutcome::Success(value) => {
+                assert_eq!(value["ok"], true);
+                assert_eq!(value["schema"], LOG_SCHEMA_VERSION);
+                assert_eq!(value["event"], "unit.log");
+            }
+            other => panic!("expected Success for log hostcall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn js_hostcall_log_missing_required_fields_is_invalid_request() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path().to_path_buf();
+        let manager = extension_manager_no_persisted_permissions();
+
+        let host = JsRuntimeHost {
+            tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
+            manager_ref: Arc::downgrade(&manager.inner),
+            http: Arc::new(crate::connectors::http::HttpConnector::with_defaults()),
+            policy: ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+            },
+            interceptor: None,
+        };
+
+        let request = crate::extensions_js::HostcallRequest {
+            call_id: "call-log-bad".to_string(),
+            kind: crate::extensions_js::HostcallKind::Log,
+            payload: serde_json::json!({
+                "level": "info",
+                "message": "missing event"
+            }),
+            trace_id: 0,
+            extension_id: Some("ext.test".to_string()),
+        };
+
+        let outcome = run_async(async { super::dispatch_hostcall(&host, request).await });
+        match outcome {
+            HostcallOutcome::Error { code, message } => {
+                assert_eq!(code, "invalid_request");
+                assert!(
+                    message.contains("validation failed") || message.contains("payload is invalid"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => panic!("expected invalid_request for malformed log hostcall, got {other:?}"),
+        }
+    }
 
     /// Unknown tool → `invalid_request` (not `tool_error`).
     #[test]
@@ -15567,5 +15794,819 @@ mod tests {
                 assert_ne!(code, legacy, "emitted legacy code: {code}");
             }
         }
+    }
+
+    // ========================================================================
+    // Cross-Runtime Parity Tests (bd-1uy.1.4)
+    // ========================================================================
+    //
+    // These tests exercise the same canonical `HostCallPayload` through both
+    // the shared dispatcher and the protocol adapter, then assert:
+    // 1. Outputs match (same `is_error`, same error code, same output shape)
+    // 2. Schema validity (`validate_host_result` passes)
+    // 3. Taxonomy-only error codes
+    // 4. Params hash parity between JS-origin and canonical payloads
+
+    const TAXONOMY_CODES: [HostCallErrorCode; 5] = [
+        HostCallErrorCode::Timeout,
+        HostCallErrorCode::Denied,
+        HostCallErrorCode::Io,
+        HostCallErrorCode::InvalidRequest,
+        HostCallErrorCode::Internal,
+    ];
+
+    /// A canonical test case for parity verification.
+    struct ParityCase {
+        name: &'static str,
+        call: HostCallPayload,
+        /// JS-origin request that should produce the same canonical payload.
+        js_request: Option<HostcallRequest>,
+        /// True if this case specifically tests manager-absent behaviour.
+        /// JS dispatch always has a manager via `JsRuntimeHost`, so these
+        /// cases are skipped in JS-vs-protocol parity (tested separately).
+        needs_no_manager: bool,
+    }
+
+    /// Assert structural parity between two `HostResultPayload` values.
+    fn assert_result_parity(
+        label: &str,
+        shared: &HostResultPayload,
+        protocol: &HostResultPayload,
+    ) {
+        assert_eq!(
+            shared.is_error, protocol.is_error,
+            "[{label}] is_error mismatch: shared={}, protocol={}",
+            shared.is_error, protocol.is_error
+        );
+        assert_eq!(
+            shared.call_id, protocol.call_id,
+            "[{label}] call_id mismatch"
+        );
+        match (&shared.error, &protocol.error) {
+            (Some(se), Some(pe)) => {
+                assert_eq!(
+                    se.code, pe.code,
+                    "[{label}] error code mismatch: shared={:?}, protocol={:?}",
+                    se.code, pe.code
+                );
+            }
+            (None, None) => {}
+            _ => panic!(
+                "[{label}] error presence mismatch: shared={:?}, protocol={:?}",
+                shared.error.is_some(),
+                protocol.error.is_some()
+            ),
+        }
+    }
+
+    /// Validate a `HostResultPayload` against schema invariants.
+    fn assert_schema_valid(label: &str, result: &HostResultPayload) {
+        assert!(
+            result.output.is_object(),
+            "[{label}] output must be object, got: {:?}",
+            result.output
+        );
+        if result.is_error {
+            assert!(
+                result.error.is_some(),
+                "[{label}] is_error=true but error is None"
+            );
+        } else {
+            assert!(
+                result.error.is_none(),
+                "[{label}] is_error=false but error is Some: {:?}",
+                result.error
+            );
+        }
+        if let Some(ref err) = result.error {
+            assert!(
+                TAXONOMY_CODES.contains(&err.code),
+                "[{label}] non-taxonomy error code: {:?}",
+                err.code
+            );
+        }
+        super::validate_host_result(result)
+            .unwrap_or_else(|e| panic!("[{label}] validate_host_result failed: {e}"));
+    }
+
+    /// Extract `HostResultPayload` from a protocol adapter response.
+    fn extract_protocol_result(responses: &[ExtensionMessage]) -> &HostResultPayload {
+        assert_eq!(responses.len(), 1, "expected exactly 1 response");
+        match &responses[0].body {
+            ExtensionBody::HostResult(result) => result,
+            other => panic!(
+                "expected HostResult, got {}",
+                extension_body_type_name(other)
+            ),
+        }
+    }
+
+    /// Build canonical test cases for parity verification.
+    #[allow(clippy::too_many_lines)]
+    fn parity_cases(cwd: &std::path::Path) -> Vec<ParityCase> {
+        vec![
+            ParityCase {
+                name: "tool_unknown",
+                call: HostCallPayload {
+                    call_id: "parity-tool-unknown".to_string(),
+                    capability: "tool".to_string(),
+                    method: "tool".to_string(),
+                    params: json!({ "name": "nonexistent_tool_xyz", "input": {} }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: Some(HostcallRequest {
+                    call_id: "parity-tool-unknown".to_string(),
+                    kind: HostcallKind::Tool {
+                        name: "nonexistent_tool_xyz".to_string(),
+                    },
+                    payload: json!({}),
+                    trace_id: 0,
+                    extension_id: Some("ext.parity".to_string()),
+                }),
+                needs_no_manager: false,
+            },
+            ParityCase {
+                name: "tool_read_success",
+                call: HostCallPayload {
+                    call_id: "parity-tool-read".to_string(),
+                    capability: "read".to_string(),
+                    method: "tool".to_string(),
+                    params: json!({
+                        "name": "read",
+                        "input": { "path": cwd.join("parity_test.txt").to_str().unwrap() }
+                    }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: Some(HostcallRequest {
+                    call_id: "parity-tool-read".to_string(),
+                    kind: HostcallKind::Tool {
+                        name: "read".to_string(),
+                    },
+                    payload: json!({
+                        "path": cwd.join("parity_test.txt").to_str().unwrap()
+                    }),
+                    trace_id: 0,
+                    extension_id: Some("ext.parity".to_string()),
+                }),
+                needs_no_manager: false,
+            },
+            ParityCase {
+                name: "exec_empty_cmd",
+                call: HostCallPayload {
+                    call_id: "parity-exec-empty".to_string(),
+                    capability: "exec".to_string(),
+                    method: "exec".to_string(),
+                    params: json!({ "cmd": "" }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: Some(HostcallRequest {
+                    call_id: "parity-exec-empty".to_string(),
+                    kind: HostcallKind::Exec {
+                        cmd: String::new(),
+                    },
+                    payload: json!({}),
+                    trace_id: 0,
+                    extension_id: Some("ext.parity".to_string()),
+                }),
+                needs_no_manager: false,
+            },
+            ParityCase {
+                name: "session_missing_op",
+                call: HostCallPayload {
+                    call_id: "parity-session-noop".to_string(),
+                    capability: "session".to_string(),
+                    method: "session".to_string(),
+                    params: json!({ "key": "value" }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: None,
+                needs_no_manager: false,
+            },
+            ParityCase {
+                name: "session_no_manager",
+                call: HostCallPayload {
+                    call_id: "parity-session-mgr".to_string(),
+                    capability: "session".to_string(),
+                    method: "session".to_string(),
+                    params: json!({ "op": "get_state" }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: Some(HostcallRequest {
+                    call_id: "parity-session-mgr".to_string(),
+                    kind: HostcallKind::Session {
+                        op: "get_state".to_string(),
+                    },
+                    payload: json!({}),
+                    trace_id: 0,
+                    extension_id: Some("ext.parity".to_string()),
+                }),
+                needs_no_manager: true,
+            },
+            ParityCase {
+                name: "ui_no_manager",
+                call: HostCallPayload {
+                    call_id: "parity-ui-mgr".to_string(),
+                    capability: "ui".to_string(),
+                    method: "ui".to_string(),
+                    params: json!({ "op": "confirm", "message": "test?" }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: Some(HostcallRequest {
+                    call_id: "parity-ui-mgr".to_string(),
+                    kind: HostcallKind::Ui {
+                        op: "confirm".to_string(),
+                    },
+                    payload: json!({ "message": "test?" }),
+                    trace_id: 0,
+                    extension_id: Some("ext.parity".to_string()),
+                }),
+                needs_no_manager: true,
+            },
+            ParityCase {
+                name: "ui_empty_op",
+                call: HostCallPayload {
+                    call_id: "parity-ui-noop".to_string(),
+                    capability: "ui".to_string(),
+                    method: "ui".to_string(),
+                    params: json!({ "data": 1 }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: None,
+                needs_no_manager: false,
+            },
+            ParityCase {
+                name: "events_no_manager",
+                call: HostCallPayload {
+                    call_id: "parity-events-mgr".to_string(),
+                    capability: "events".to_string(),
+                    method: "events".to_string(),
+                    params: json!({ "op": "emit", "event": "test" }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: Some(HostcallRequest {
+                    call_id: "parity-events-mgr".to_string(),
+                    kind: HostcallKind::Events {
+                        op: "emit".to_string(),
+                    },
+                    payload: json!({ "event": "test" }),
+                    trace_id: 0,
+                    extension_id: Some("ext.parity".to_string()),
+                }),
+                needs_no_manager: true,
+            },
+            ParityCase {
+                name: "capability_mismatch",
+                call: HostCallPayload {
+                    call_id: "parity-cap-mismatch".to_string(),
+                    capability: "exec".to_string(),
+                    method: "tool".to_string(),
+                    params: json!({ "name": "read", "input": {} }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: None,
+                needs_no_manager: false,
+            },
+            ParityCase {
+                name: "empty_call_id",
+                call: HostCallPayload {
+                    call_id: String::new(),
+                    capability: "tool".to_string(),
+                    method: "tool".to_string(),
+                    params: json!({ "name": "read", "input": {} }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: None,
+                needs_no_manager: false,
+            },
+            ParityCase {
+                name: "unsupported_method",
+                call: HostCallPayload {
+                    call_id: "parity-bad-method".to_string(),
+                    capability: "tool".to_string(),
+                    method: "quantum_compute".to_string(),
+                    params: json!({}),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                },
+                js_request: None,
+                needs_no_manager: false,
+            },
+        ]
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn parity_shared_vs_protocol_all_cases() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::fs::write(cwd.join("parity_test.txt"), "parity_data").expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], cwd, None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let cases = parity_cases(cwd);
+
+        for case in &cases {
+            run_async(async {
+                let shared_result =
+                    dispatch_host_call_shared(&ctx, case.call.clone()).await;
+
+                let msg = make_host_call_msg(
+                    &case.call.call_id,
+                    &case.call.method,
+                    &case.call.capability,
+                    case.call.params.clone(),
+                );
+                let responses = handle_extension_message(&ctx, msg).await;
+                let protocol_result = extract_protocol_result(&responses);
+
+                assert_result_parity(case.name, &shared_result, protocol_result);
+
+                if !case.call.call_id.is_empty() {
+                    assert_schema_valid(
+                        &format!("{}/shared", case.name),
+                        &shared_result,
+                    );
+                    assert_schema_valid(
+                        &format!("{}/protocol", case.name),
+                        protocol_result,
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn parity_params_hash_all_js_cases() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::fs::write(cwd.join("parity_test.txt"), "parity_data").expect("write test file");
+
+        let cases = parity_cases(cwd);
+
+        for case in &cases {
+            let Some(ref js_req) = case.js_request else {
+                continue;
+            };
+            let converted = hostcall_request_to_payload(js_req);
+            let js_hash = js_req.params_hash();
+            let canonical_hash =
+                hostcall_params_hash(&converted.method, &converted.params);
+
+            assert_eq!(
+                js_hash, canonical_hash,
+                "[{}] params_hash mismatch: JS={}, canonical={}",
+                case.name, js_hash, canonical_hash
+            );
+
+            assert_eq!(
+                converted.method, case.call.method,
+                "[{}] method mismatch after JS conversion",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn parity_js_conversion_vs_protocol() {
+        use std::sync::Arc;
+
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::fs::write(cwd.join("parity_test.txt"), "parity_data").expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], cwd, None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let manager = extension_manager_no_persisted_permissions();
+        let host = JsRuntimeHost {
+            tools: Arc::new(ToolRegistry::new(&["read"], cwd, None)),
+            manager_ref: Arc::downgrade(&manager.inner),
+            http: Arc::new(HttpConnector::with_defaults()),
+            policy: permissive_policy(),
+            interceptor: None,
+        };
+
+        let cases = parity_cases(cwd);
+
+        for case in &cases {
+            let Some(ref js_req) = case.js_request else {
+                continue;
+            };
+            // JS dispatch always has a manager via JsRuntimeHost; skip cases
+            // that specifically test manager-absent behaviour (tested separately
+            // in `parity_shared_vs_protocol_all_cases`).
+            if case.needs_no_manager {
+                continue;
+            }
+
+            run_async(async {
+                let js_outcome = super::dispatch_hostcall(&host, js_req.clone()).await;
+
+                let msg = make_host_call_msg(
+                    &case.call.call_id,
+                    &case.call.method,
+                    &case.call.capability,
+                    case.call.params.clone(),
+                );
+                let responses = handle_extension_message(&ctx, msg).await;
+                let protocol_result = extract_protocol_result(&responses);
+
+                let js_result =
+                    outcome_to_host_result(&case.call.call_id, &js_outcome);
+
+                assert_result_parity(
+                    &format!("{}/js_vs_protocol", case.name),
+                    &js_result,
+                    protocol_result,
+                );
+
+                if !case.call.call_id.is_empty() {
+                    assert_schema_valid(
+                        &format!("{}/js_result", case.name),
+                        &js_result,
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn parity_all_errors_are_taxonomy_only() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+
+        let tools = ToolRegistry::new(&["read"], cwd, None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let cases = parity_cases(cwd);
+
+        for case in &cases {
+            run_async(async {
+                let result =
+                    dispatch_host_call_shared(&ctx, case.call.clone()).await;
+                if let Some(ref err) = result.error {
+                    assert!(
+                        TAXONOMY_CODES.contains(&err.code),
+                        "[{}] non-taxonomy error code: {:?} (message: {})",
+                        case.name,
+                        err.code,
+                        err.message
+                    );
+                }
+            });
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn parity_denied_by_policy_shared_vs_protocol() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = deny_all_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let denied_cases = vec![
+            // name=read → required capability "read", not "tool"
+            ("tool_denied", "tool", "read", json!({ "name": "read", "input": {} })),
+            ("exec_denied", "exec", "exec", json!({ "cmd": "ls" })),
+            ("http_denied", "http", "http", json!({ "url": "https://example.com" })),
+            (
+                "session_denied",
+                "session",
+                "session",
+                json!({ "op": "get_state" }),
+            ),
+            (
+                "ui_denied",
+                "ui",
+                "ui",
+                json!({ "op": "confirm", "message": "test" }),
+            ),
+            (
+                "events_denied",
+                "events",
+                "events",
+                json!({ "op": "emit", "event": "test" }),
+            ),
+        ];
+
+        for (name, method, capability, params) in &denied_cases {
+            let call = HostCallPayload {
+                call_id: format!("parity-deny-{name}"),
+                capability: capability.to_string(),
+                method: method.to_string(),
+                params: params.clone(),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+
+            run_async(async {
+                let shared_result =
+                    dispatch_host_call_shared(&ctx, call.clone()).await;
+                let msg = make_host_call_msg(
+                    &call.call_id,
+                    &call.method,
+                    &call.capability,
+                    call.params.clone(),
+                );
+                let responses = handle_extension_message(&ctx, msg).await;
+                let protocol_result = extract_protocol_result(&responses);
+
+                assert!(
+                    shared_result.is_error,
+                    "[{name}] shared: expected error for denied call"
+                );
+                assert!(
+                    protocol_result.is_error,
+                    "[{name}] protocol: expected error for denied call"
+                );
+
+                let shared_code = shared_result
+                    .error
+                    .as_ref()
+                    .expect("shared error")
+                    .code;
+                let protocol_code = protocol_result
+                    .error
+                    .as_ref()
+                    .expect("protocol error")
+                    .code;
+                assert_eq!(
+                    shared_code,
+                    HostCallErrorCode::Denied,
+                    "[{name}] shared: expected Denied, got {shared_code:?}"
+                );
+                assert_eq!(
+                    protocol_code,
+                    HostCallErrorCode::Denied,
+                    "[{name}] protocol: expected Denied, got {protocol_code:?}"
+                );
+
+                assert_result_parity(name, &shared_result, protocol_result);
+                assert_schema_valid(&format!("{name}/shared"), &shared_result);
+                assert_schema_valid(
+                    &format!("{name}/protocol"),
+                    protocol_result,
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn parity_tool_read_success_shared_vs_protocol() {
+        let dir = tempdir().expect("tempdir");
+        let cwd = dir.path();
+        std::fs::write(cwd.join("hello_parity.txt"), "parity_content_42")
+            .expect("write test file");
+
+        let tools = ToolRegistry::new(&["read"], cwd, None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = HostCallContext {
+            runtime_name: "parity_test",
+            extension_id: Some("ext.parity"),
+            tools: &tools,
+            http: &http,
+            manager: None,
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let call = HostCallPayload {
+            call_id: "parity-read-ok".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({
+                "name": "read",
+                "input": { "path": cwd.join("hello_parity.txt").to_str().unwrap() }
+            }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let shared_result =
+                dispatch_host_call_shared(&ctx, call.clone()).await;
+            let msg = make_host_call_msg(
+                &call.call_id,
+                &call.method,
+                &call.capability,
+                call.params.clone(),
+            );
+            let responses = handle_extension_message(&ctx, msg).await;
+            let protocol_result = extract_protocol_result(&responses);
+
+            assert!(
+                !shared_result.is_error,
+                "shared: expected success, got: {:?}",
+                shared_result.error
+            );
+            assert!(
+                !protocol_result.is_error,
+                "protocol: expected success, got: {:?}",
+                protocol_result.error
+            );
+
+            assert_result_parity("read_success", &shared_result, protocol_result);
+            assert_schema_valid("read_success/shared", &shared_result);
+            assert_schema_valid("read_success/protocol", protocol_result);
+
+            let shared_str = serde_json::to_string(&shared_result.output).unwrap();
+            let protocol_str =
+                serde_json::to_string(&protocol_result.output).unwrap();
+            assert!(
+                shared_str.contains("parity_content_42"),
+                "shared output missing file content: {shared_str}"
+            );
+            assert!(
+                protocol_str.contains("parity_content_42"),
+                "protocol output missing file content: {protocol_str}"
+            );
+        });
+    }
+
+    #[test]
+    fn parity_outcome_roundtrip_error_preserves_taxonomy() {
+        for code in &TAXONOMY_CODES {
+            let code_str = host_call_error_code_str(*code);
+            let outcome = HostcallOutcome::Error {
+                code: code_str.to_string(),
+                message: format!("test {code_str}"),
+            };
+
+            let result = outcome_to_host_result("rt-test", &outcome);
+            assert_schema_valid(
+                &format!("roundtrip/{code_str}"),
+                &result,
+            );
+
+            let back = host_result_to_outcome(result);
+            match back {
+                HostcallOutcome::Error {
+                    code: back_code,
+                    message: back_msg,
+                } => {
+                    assert_eq!(
+                        back_code, code_str,
+                        "roundtrip code mismatch: {back_code} != {code_str}"
+                    );
+                    assert!(
+                        back_msg.contains(code_str),
+                        "roundtrip message lost: {back_msg}"
+                    );
+                }
+                other => panic!("expected Error after roundtrip, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parity_outcome_roundtrip_success_preserves_output() {
+        let output = json!({"key": "value", "count": 42});
+        let outcome = HostcallOutcome::Success(output.clone());
+
+        let result = outcome_to_host_result("rt-ok", &outcome);
+        assert_schema_valid("roundtrip/success", &result);
+        assert_eq!(result.output, output);
+
+        let back = host_result_to_outcome(result);
+        match back {
+            HostcallOutcome::Success(v) => assert_eq!(v, output),
+            other => panic!("expected Success after roundtrip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parity_outcome_roundtrip_stream_chunk() {
+        let chunk = json!({"data": "partial"});
+        let outcome = HostcallOutcome::StreamChunk {
+            sequence: 7,
+            chunk: chunk.clone(),
+            is_final: false,
+        };
+
+        let result = outcome_to_host_result("rt-stream", &outcome);
+        assert!(!result.is_error);
+        assert!(result.error.is_none());
+        assert_eq!(result.output, chunk);
+        let stream_info = result.chunk.as_ref().expect("chunk info");
+        assert_eq!(stream_info.index, 7);
+        assert!(!stream_info.is_last);
+
+        let back = host_result_to_outcome(result);
+        match back {
+            HostcallOutcome::StreamChunk {
+                sequence,
+                chunk: c,
+                is_final,
+            } => {
+                assert_eq!(sequence, 7);
+                assert_eq!(c, chunk);
+                assert!(!is_final);
+            }
+            other => panic!("expected StreamChunk after roundtrip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parity_empty_call_id_rejected_both_paths() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let call = HostCallPayload {
+            call_id: String::new(),
+            capability: "tool".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": {} }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let shared = dispatch_host_call_shared(&ctx, call.clone()).await;
+            assert!(shared.is_error, "shared must reject empty call_id");
+            let shared_err = shared.error.as_ref().expect("shared error");
+            assert_eq!(shared_err.code, HostCallErrorCode::InvalidRequest);
+
+            let msg = make_host_call_msg("", "tool", "tool", json!({ "name": "read", "input": {} }));
+            let responses = handle_extension_message(&ctx, msg).await;
+            let protocol = extract_protocol_result(&responses);
+            assert!(protocol.is_error, "protocol must reject empty call_id");
+            let protocol_err = protocol.error.as_ref().expect("protocol error");
+            assert_eq!(protocol_err.code, HostCallErrorCode::InvalidRequest);
+        });
+    }
+
+    #[test]
+    fn parity_non_object_params_rejected() {
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let policy = permissive_policy();
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let call = HostCallPayload {
+            call_id: "parity-badparams".to_string(),
+            capability: "tool".to_string(),
+            method: "tool".to_string(),
+            params: json!("not an object"),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let shared = dispatch_host_call_shared(&ctx, call.clone()).await;
+            assert!(shared.is_error, "shared must reject non-object params");
+            let shared_err = shared.error.as_ref().expect("shared error");
+            assert_eq!(shared_err.code, HostCallErrorCode::InvalidRequest);
+
+            let msg = ExtensionMessage {
+                id: "msg-badparams".to_string(),
+                version: PROTOCOL_VERSION.to_string(),
+                body: ExtensionBody::HostCall(call),
+            };
+            let responses = handle_extension_message(&ctx, msg).await;
+            let protocol = extract_protocol_result(&responses);
+            assert!(protocol.is_error, "protocol must reject non-object params");
+            let protocol_err = protocol.error.as_ref().expect("protocol error");
+            assert_eq!(protocol_err.code, HostCallErrorCode::InvalidRequest);
+        });
     }
 }

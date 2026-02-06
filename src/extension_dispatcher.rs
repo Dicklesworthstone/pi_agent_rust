@@ -199,6 +199,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     self.dispatch_events(&call_id, extension_id.as_deref(), &op, payload)
                         .await
                 }
+                HostcallKind::Log => {
+                    // Log hostcalls are handled by the shared dispatcher path.
+                    // Return success here for the legacy dispatcher fallback.
+                    HostcallOutcome::Success(serde_json::json!({ "logged": true }))
+                }
             };
 
             self.runtime.complete_hostcall(call_id, outcome);
@@ -305,6 +310,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 self.dispatch_events(&payload.call_id, None, &op, params)
                     .await
             }
+            "log" => HostcallOutcome::Success(serde_json::json!({ "logged": true })),
             _ => HostcallOutcome::Error {
                 code: "invalid_request".to_string(),
                 message: format!("Unsupported host_call method: {method}"),

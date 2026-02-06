@@ -1968,7 +1968,10 @@ still frontmatter",
 
     #[test]
     fn test_is_under_path_nonexistent() {
-        assert!(!is_under_path(Path::new("/nonexistent/a"), Path::new("/nonexistent/b")));
+        assert!(!is_under_path(
+            Path::new("/nonexistent/a"),
+            Path::new("/nonexistent/b")
+        ));
     }
 
     // ── dedupe_prompts ─────────────────────────────────────────────────
@@ -2183,9 +2186,7 @@ still frontmatter",
 
     #[test]
     fn test_replace_regex_replaces_all_matches() {
-        let result = replace_regex("a1b2c3", r"\d", |caps| {
-            format!("[{}]", &caps[0])
-        });
+        let result = replace_regex("a1b2c3", r"\d", |caps| format!("[{}]", &caps[0]));
         assert_eq!(result, "a[1]b[2]c[3]");
     }
 

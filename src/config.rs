@@ -1123,10 +1123,7 @@ mod tests {
 
     #[test]
     fn parse_queue_mode_parses_known_values() {
-        assert_eq!(
-            super::parse_queue_mode(Some("all")),
-            Some(QueueMode::All)
-        );
+        assert_eq!(super::parse_queue_mode(Some("all")), Some(QueueMode::All));
         assert_eq!(
             super::parse_queue_mode(Some("one-at-a-time")),
             Some(QueueMode::OneAtATime)
@@ -1235,10 +1232,7 @@ mod tests {
         let json = serde_json::to_string(&config).expect("serialize");
         let deserialized: Config = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(deserialized.theme.as_deref(), Some("dark"));
-        assert_eq!(
-            deserialized.default_provider.as_deref(),
-            Some("anthropic")
-        );
+        assert_eq!(deserialized.default_provider.as_deref(), Some("anthropic"));
         assert!(deserialized.compaction_enabled());
     }
 
