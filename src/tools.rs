@@ -267,9 +267,9 @@ pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
             // Check if we can include a partial last line
             let remaining = max_bytes.saturating_sub(byte_count);
             if remaining > 0 && collected.is_empty() {
-                collected.push(TailLine::Owned(truncate_string_to_bytes_from_end(
-                    line, max_bytes,
-                )));
+                let truncated = truncate_string_to_bytes_from_end(line, max_bytes);
+                byte_count = truncated.len();
+                collected.push(TailLine::Owned(truncated));
                 last_line_partial = true;
             }
             truncated_by = Some(TruncatedBy::Bytes);
