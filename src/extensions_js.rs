@@ -9228,4 +9228,646 @@ mod tests {
             assert_eq!(runtime.drain_hostcall_requests().len(), 0);
         });
     }
+
+    // -----------------------------------------------------------------------
+    // bd-2b9y: Node core shim unit tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pijs_node_os_module_exports() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.osResults = {};
+                    import('node:os').then((os) => {
+                        globalThis.osResults.homedir = os.homedir();
+                        globalThis.osResults.tmpdir = os.tmpdir();
+                        globalThis.osResults.hostname = os.hostname();
+                        globalThis.osResults.platform = os.platform();
+                        globalThis.osResults.arch = os.arch();
+                        globalThis.osResults.type = os.type();
+                        globalThis.osResults.release = os.release();
+                        globalThis.osResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:os");
+
+            let r = get_global_json(&runtime, "osResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            // homedir returns HOME env or fallback
+            assert!(r["homedir"].is_string());
+            assert_eq!(r["tmpdir"], serde_json::json!("/tmp"));
+            assert_eq!(r["hostname"], serde_json::json!("pi-host"));
+            assert_eq!(r["platform"], serde_json::json!("linux"));
+            assert_eq!(r["arch"], serde_json::json!("x64"));
+            assert_eq!(r["type"], serde_json::json!("Linux"));
+            assert_eq!(r["release"], serde_json::json!("6.0.0"));
+        });
+    }
+
+    #[test]
+    fn pijs_node_os_bare_import_alias() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.bare_os_ok = false;
+                    import('os').then((os) => {
+                        globalThis.bare_os_ok = typeof os.homedir === 'function'
+                            && typeof os.platform === 'function';
+                    });
+                    ",
+                )
+                .await
+                .expect("eval bare os import");
+
+            assert_eq!(
+                get_global_json(&runtime, "bare_os_ok").await,
+                serde_json::json!(true)
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_node_url_module_exports() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.urlResults = {};
+                    import('node:url').then((url) => {
+                        globalThis.urlResults.fileToPath = url.fileURLToPath('file:///home/user/test.txt');
+                        globalThis.urlResults.pathToFile = url.pathToFileURL('/home/user/test.txt').href;
+
+                        const u = new url.URL('https://example.com/path?key=val#frag');
+                        globalThis.urlResults.href = u.href;
+                        globalThis.urlResults.protocol = u.protocol;
+                        globalThis.urlResults.hostname = u.hostname;
+                        globalThis.urlResults.pathname = u.pathname;
+                        globalThis.urlResults.toString = u.toString();
+
+                        globalThis.urlResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:url");
+
+            let r = get_global_json(&runtime, "urlResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["fileToPath"], serde_json::json!("/home/user/test.txt"));
+            assert_eq!(
+                r["pathToFile"],
+                serde_json::json!("file:///home/user/test.txt")
+            );
+            // URL parsing
+            assert!(r["href"].as_str().unwrap().starts_with("https://"));
+            assert_eq!(r["protocol"], serde_json::json!("https:"));
+            assert_eq!(r["hostname"], serde_json::json!("example.com"));
+            // Shim URL.pathname includes query+fragment (lightweight parser)
+            assert!(r["pathname"].as_str().unwrap().starts_with("/path"));
+        });
+    }
+
+    #[test]
+    fn pijs_node_crypto_create_hash_and_uuid() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.cryptoResults = {};
+                    import('node:crypto').then((crypto) => {
+                        // createHash
+                        const hash = crypto.createHash('sha256');
+                        hash.update('hello');
+                        globalThis.cryptoResults.hexDigest = hash.digest('hex');
+
+                        // createHash chained
+                        globalThis.cryptoResults.chainedHex = crypto
+                            .createHash('sha256')
+                            .update('world')
+                            .digest('hex');
+
+                        // randomUUID
+                        const uuid = crypto.randomUUID();
+                        globalThis.cryptoResults.uuidLength = uuid.length;
+                        // UUID v4 format: 8-4-4-4-12
+                        globalThis.cryptoResults.uuidHasDashes = uuid.split('-').length === 5;
+
+                        globalThis.cryptoResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:crypto");
+
+            let r = get_global_json(&runtime, "cryptoResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            // createHash returns a hex string
+            assert!(r["hexDigest"].is_string());
+            let hex = r["hexDigest"].as_str().unwrap();
+            // djb2-simulated hash, not real SHA-256 — verify it's a non-empty hex string
+            assert!(!hex.is_empty());
+            assert!(hex.chars().all(|c| c.is_ascii_hexdigit()));
+            // chained usage also works
+            assert!(r["chainedHex"].is_string());
+            let chained = r["chainedHex"].as_str().unwrap();
+            assert!(!chained.is_empty());
+            assert!(chained.chars().all(|c| c.is_ascii_hexdigit()));
+            // Two different inputs produce different hashes
+            assert_ne!(r["hexDigest"], r["chainedHex"]);
+            // randomUUID format
+            assert_eq!(r["uuidLength"], serde_json::json!(36));
+            assert_eq!(r["uuidHasDashes"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_buffer_global_operations() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.bufResults = {};
+                    import('node:buffer').then(({ Buffer }) => {
+                        // Buffer.from
+                        const buf = Buffer.from('hello');
+                        globalThis.bufResults.fromLength = buf.length;
+                        globalThis.bufResults.isBufferTrue = Buffer.isBuffer(buf);
+
+                        // Buffer.alloc
+                        const zeroed = Buffer.alloc(16);
+                        globalThis.bufResults.allocLength = zeroed.length;
+
+                        // isBuffer with non-buffer
+                        globalThis.bufResults.isBufferFalse = Buffer.isBuffer('not a buffer');
+
+                        globalThis.bufResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval Buffer");
+
+            let r = get_global_json(&runtime, "bufResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["fromLength"], serde_json::json!(5)); // "hello" = 5 bytes UTF-8
+            assert_eq!(r["isBufferTrue"], serde_json::json!(true));
+            assert_eq!(r["allocLength"], serde_json::json!(16));
+            assert_eq!(r["isBufferFalse"], serde_json::json!(false));
+        });
+    }
+
+    #[test]
+    fn pijs_node_fs_promises_async_roundtrip() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.fspResults = {};
+                    import('node:fs/promises').then(async (fsp) => {
+                        // Write then read back
+                        await fsp.writeFile('/test/hello.txt', 'async content');
+                        const data = await fsp.readFile('/test/hello.txt', 'utf8');
+                        globalThis.fspResults.readBack = data;
+
+                        // stat
+                        const st = await fsp.stat('/test/hello.txt');
+                        globalThis.fspResults.statIsFile = st.isFile();
+                        globalThis.fspResults.statSize = st.size;
+
+                        // mkdir + readdir
+                        await fsp.mkdir('/test/subdir');
+                        await fsp.writeFile('/test/subdir/a.txt', 'aaa');
+                        const entries = await fsp.readdir('/test/subdir');
+                        globalThis.fspResults.dirEntries = entries;
+
+                        // unlink
+                        await fsp.unlink('/test/subdir/a.txt');
+                        const exists = await fsp.access('/test/subdir/a.txt').then(() => true).catch(() => false);
+                        globalThis.fspResults.deletedFileExists = exists;
+
+                        globalThis.fspResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval fs/promises");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let r = get_global_json(&runtime, "fspResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["readBack"], serde_json::json!("async content"));
+            assert_eq!(r["statIsFile"], serde_json::json!(true));
+            assert!(r["statSize"].as_u64().unwrap() > 0);
+            assert_eq!(r["dirEntries"], serde_json::json!(["a.txt"]));
+            assert_eq!(r["deletedFileExists"], serde_json::json!(false));
+        });
+    }
+
+    #[test]
+    fn pijs_node_process_module_exports() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let config = PiJsRuntimeConfig {
+                cwd: "/test/project".to_string(),
+                args: vec!["arg1".to_string(), "arg2".to_string()],
+                env: HashMap::new(),
+                limits: PiJsRuntimeLimits::default(),
+            };
+            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.procResults = {};
+                    import('node:process').then((proc) => {
+                        globalThis.procResults.platform = proc.platform;
+                        globalThis.procResults.arch = proc.arch;
+                        globalThis.procResults.version = proc.version;
+                        globalThis.procResults.pid = proc.pid;
+                        globalThis.procResults.cwdType = typeof proc.cwd;
+                        globalThis.procResults.cwdValue = typeof proc.cwd === 'function'
+                            ? proc.cwd() : proc.cwd;
+                        globalThis.procResults.hasEnv = typeof proc.env === 'object';
+                        globalThis.procResults.hasStdout = typeof proc.stdout === 'object';
+                        globalThis.procResults.hasStderr = typeof proc.stderr === 'object';
+                        globalThis.procResults.hasNextTick = typeof proc.nextTick === 'function';
+
+                        // nextTick should schedule microtask
+                        globalThis.procResults.nextTickRan = false;
+                        proc.nextTick(() => { globalThis.procResults.nextTickRan = true; });
+
+                        // hrtime should return array
+                        const hr = proc.hrtime();
+                        globalThis.procResults.hrtimeIsArray = Array.isArray(hr);
+                        globalThis.procResults.hrtimeLength = hr.length;
+
+                        globalThis.procResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:process");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let r = get_global_json(&runtime, "procResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["platform"], serde_json::json!("linux"));
+            assert_eq!(r["arch"], serde_json::json!("x64"));
+            assert!(r["version"].is_string());
+            assert_eq!(r["pid"], serde_json::json!(1));
+            assert!(r["hasEnv"] == serde_json::json!(true));
+            assert!(r["hasStdout"] == serde_json::json!(true));
+            assert!(r["hasStderr"] == serde_json::json!(true));
+            assert!(r["hasNextTick"] == serde_json::json!(true));
+            // nextTick is scheduled as microtask — should have run
+            assert_eq!(r["nextTickRan"], serde_json::json!(true));
+            assert_eq!(r["hrtimeIsArray"], serde_json::json!(true));
+            assert_eq!(r["hrtimeLength"], serde_json::json!(2));
+        });
+    }
+
+    #[test]
+    fn pijs_node_path_relative_resolve_format() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let config = PiJsRuntimeConfig {
+                cwd: "/home/user/project".to_string(),
+                args: Vec::new(),
+                env: HashMap::new(),
+                limits: PiJsRuntimeLimits::default(),
+            };
+            let runtime = PiJsRuntime::with_clock_and_config(Arc::clone(&clock), config)
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.pathResults2 = {};
+                    import('node:path').then((path) => {
+                        // relative
+                        globalThis.pathResults2.relSameDir = path.relative('/a/b/c', '/a/b/c/d');
+                        globalThis.pathResults2.relUp = path.relative('/a/b/c', '/a/b');
+                        globalThis.pathResults2.relSame = path.relative('/a/b', '/a/b');
+
+                        // resolve uses cwd as base
+                        globalThis.pathResults2.resolveAbs = path.resolve('/absolute/path');
+                        globalThis.pathResults2.resolveRel = path.resolve('relative');
+
+                        // format
+                        globalThis.pathResults2.formatFull = path.format({
+                            dir: '/home/user',
+                            base: 'file.txt'
+                        });
+
+                        // sep and delimiter constants
+                        globalThis.pathResults2.sep = path.sep;
+                        globalThis.pathResults2.delimiter = path.delimiter;
+
+                        // dirname edge cases
+                        globalThis.pathResults2.dirnameRoot = path.dirname('/');
+                        globalThis.pathResults2.dirnameNested = path.dirname('/a/b/c');
+
+                        // join edge cases
+                        globalThis.pathResults2.joinEmpty = path.join();
+                        globalThis.pathResults2.joinDots = path.join('a', '..', 'b');
+
+                        globalThis.pathResults2.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval path extended 2");
+
+            let r = get_global_json(&runtime, "pathResults2").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["relSameDir"], serde_json::json!("d"));
+            assert_eq!(r["relUp"], serde_json::json!(".."));
+            assert_eq!(r["relSame"], serde_json::json!("."));
+            assert_eq!(r["resolveAbs"], serde_json::json!("/absolute/path"));
+            // resolve('relative') should resolve against cwd
+            assert!(r["resolveRel"].as_str().unwrap().ends_with("/relative"));
+            assert_eq!(r["formatFull"], serde_json::json!("/home/user/file.txt"));
+            assert_eq!(r["sep"], serde_json::json!("/"));
+            assert_eq!(r["delimiter"], serde_json::json!(":"));
+            assert_eq!(r["dirnameRoot"], serde_json::json!("/"));
+            assert_eq!(r["dirnameNested"], serde_json::json!("/a/b"));
+            // join doesn't normalize; normalize is separate
+            let join_dots = r["joinDots"].as_str().unwrap();
+            assert!(join_dots == "b" || join_dots == "a/../b");
+        });
+    }
+
+    #[test]
+    fn pijs_node_util_module_exports() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.utilResults = {};
+                    import('node:util').then((util) => {
+                        globalThis.utilResults.hasInspect = typeof util.inspect === 'function';
+                        globalThis.utilResults.hasPromisify = typeof util.promisify === 'function';
+                        globalThis.utilResults.inspectResult = util.inspect({ a: 1, b: [2, 3] });
+                        globalThis.utilResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:util");
+
+            let r = get_global_json(&runtime, "utilResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["hasInspect"], serde_json::json!(true));
+            assert_eq!(r["hasPromisify"], serde_json::json!(true));
+            // inspect should return some string representation
+            assert!(r["inspectResult"].is_string());
+        });
+    }
+
+    #[test]
+    fn pijs_node_assert_module_pass_and_fail() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.assertResults = {};
+                    import('node:assert').then((mod) => {
+                        const assert = mod.default;
+
+                        // Passing assertions should not throw
+                        assert.ok(true);
+                        assert.strictEqual(1, 1);
+                        assert.deepStrictEqual({ a: 1 }, { a: 1 });
+                        assert.notStrictEqual(1, 2);
+
+                        // Failing assertion should throw
+                        try {
+                            assert.strictEqual(1, 2);
+                            globalThis.assertResults.failDidNotThrow = true;
+                        } catch (e) {
+                            globalThis.assertResults.failThrew = true;
+                            globalThis.assertResults.failMessage = e.message || String(e);
+                        }
+
+                        globalThis.assertResults.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval node:assert");
+
+            let r = get_global_json(&runtime, "assertResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["failThrew"], serde_json::json!(true));
+            assert!(r["failMessage"].is_string());
+        });
+    }
+
+    #[test]
+    fn pijs_node_fs_sync_edge_cases() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.fsEdge = {};
+                    import('node:fs').then((fs) => {
+                        // Write, overwrite, read back
+                        fs.writeFileSync('/edge/file.txt', 'first');
+                        fs.writeFileSync('/edge/file.txt', 'second');
+                        globalThis.fsEdge.overwrite = fs.readFileSync('/edge/file.txt', 'utf8');
+
+                        // existsSync for existing vs non-existing
+                        globalThis.fsEdge.existsTrue = fs.existsSync('/edge/file.txt');
+                        globalThis.fsEdge.existsFalse = fs.existsSync('/nonexistent/file.txt');
+
+                        // mkdirSync + readdirSync with withFileTypes
+                        fs.mkdirSync('/edge/dir');
+                        fs.writeFileSync('/edge/dir/a.txt', 'aaa');
+                        fs.mkdirSync('/edge/dir/sub');
+                        const dirents = fs.readdirSync('/edge/dir', { withFileTypes: true });
+                        globalThis.fsEdge.direntCount = dirents.length;
+                        const fileDirent = dirents.find(d => d.name === 'a.txt');
+                        const dirDirent = dirents.find(d => d.name === 'sub');
+                        globalThis.fsEdge.fileIsFile = fileDirent ? fileDirent.isFile() : null;
+                        globalThis.fsEdge.dirIsDir = dirDirent ? dirDirent.isDirectory() : null;
+
+                        // rmSync recursive
+                        fs.writeFileSync('/edge/dir/sub/deep.txt', 'deep');
+                        fs.rmSync('/edge/dir', { recursive: true });
+                        globalThis.fsEdge.rmRecursiveGone = !fs.existsSync('/edge/dir');
+
+                        // accessSync on non-existing file should throw
+                        try {
+                            fs.accessSync('/nope');
+                            globalThis.fsEdge.accessThrew = false;
+                        } catch (e) {
+                            globalThis.fsEdge.accessThrew = true;
+                        }
+
+                        // statSync on directory
+                        fs.mkdirSync('/edge/statdir');
+                        const dStat = fs.statSync('/edge/statdir');
+                        globalThis.fsEdge.dirStatIsDir = dStat.isDirectory();
+                        globalThis.fsEdge.dirStatIsFile = dStat.isFile();
+
+                        globalThis.fsEdge.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval fs edge cases");
+
+            let r = get_global_json(&runtime, "fsEdge").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["overwrite"], serde_json::json!("second"));
+            assert_eq!(r["existsTrue"], serde_json::json!(true));
+            assert_eq!(r["existsFalse"], serde_json::json!(false));
+            assert_eq!(r["direntCount"], serde_json::json!(2));
+            assert_eq!(r["fileIsFile"], serde_json::json!(true));
+            assert_eq!(r["dirIsDir"], serde_json::json!(true));
+            assert_eq!(r["rmRecursiveGone"], serde_json::json!(true));
+            assert_eq!(r["accessThrew"], serde_json::json!(true));
+            assert_eq!(r["dirStatIsDir"], serde_json::json!(true));
+            assert_eq!(r["dirStatIsFile"], serde_json::json!(false));
+        });
+    }
+
+    #[test]
+    fn pijs_node_net_and_http_stubs_throw() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.stubResults = {};
+                    (async () => {
+                        // node:net createServer should throw
+                        const net = await import('node:net');
+                        try {
+                            net.createServer();
+                            globalThis.stubResults.netThrew = false;
+                        } catch (e) {
+                            globalThis.stubResults.netThrew = true;
+                        }
+
+                        // node:http createServer should throw
+                        const http = await import('node:http');
+                        try {
+                            http.createServer();
+                            globalThis.stubResults.httpThrew = false;
+                        } catch (e) {
+                            globalThis.stubResults.httpThrew = true;
+                        }
+
+                        // node:https request should throw
+                        const https = await import('node:https');
+                        try {
+                            https.request('https://example.com');
+                            globalThis.stubResults.httpsThrew = false;
+                        } catch (e) {
+                            globalThis.stubResults.httpsThrew = true;
+                        }
+
+                        globalThis.stubResults.done = true;
+                    })();
+                    ",
+                )
+                .await
+                .expect("eval stub throws");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let r = get_global_json(&runtime, "stubResults").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["netThrew"], serde_json::json!(true));
+            assert_eq!(r["httpThrew"], serde_json::json!(true));
+            assert_eq!(r["httpsThrew"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_node_readline_stub_exports() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.rlResult = {};
+                    import('node:readline').then((rl) => {
+                        globalThis.rlResult.hasCreateInterface = typeof rl.createInterface === 'function';
+                        globalThis.rlResult.done = true;
+                    });
+                    ",
+                )
+                .await
+                .expect("eval readline");
+
+            let r = get_global_json(&runtime, "rlResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["hasCreateInterface"], serde_json::json!(true));
+        });
+    }
 }
