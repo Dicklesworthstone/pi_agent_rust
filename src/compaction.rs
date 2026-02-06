@@ -1414,7 +1414,9 @@ mod tests {
 
     #[test]
     fn compaction_boundary_true_for_compaction() {
-        assert!(entry_is_compaction_boundary(&compact_entry("1", "sum", 100)));
+        assert!(entry_is_compaction_boundary(&compact_entry(
+            "1", "sum", 100
+        )));
     }
 
     #[test]
@@ -1531,10 +1533,7 @@ mod tests {
 
     #[test]
     fn find_valid_cut_points_includes_branch_summary() {
-        let entries = vec![
-            branch_entry("1", "summary"),
-            user_entry("2", "hello"),
-        ];
+        let entries = vec![branch_entry("1", "summary"), user_entry("2", "hello")];
         let cuts = find_valid_cut_points(&entries, 0, entries.len());
         assert!(cuts.contains(&0));
         assert!(cuts.contains(&1));
@@ -1757,10 +1756,7 @@ mod tests {
 
     #[test]
     fn prepare_compaction_last_is_compaction_returns_none() {
-        let entries = vec![
-            user_entry("1", "hello"),
-            compact_entry("2", "summary", 100),
-        ];
+        let entries = vec![user_entry("1", "hello"), compact_entry("2", "summary", 100)];
         assert!(prepare_compaction(&entries, ResolvedCompactionSettings::default()).is_none());
     }
 
