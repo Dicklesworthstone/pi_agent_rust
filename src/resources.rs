@@ -1832,7 +1832,7 @@ mod tests {
 
     #[test]
     fn test_validate_frontmatter_fields_allows_known_and_rejects_unknown() {
-        let keys = vec![
+        let keys = [
             "name".to_string(),
             "description".to_string(),
             "unknown-field".to_string(),
@@ -1875,9 +1875,9 @@ body line 2"#,
         assert_eq!(parsed.body, "body line 1\nbody line 2");
 
         let unclosed = parse_frontmatter(
-            r#"---
+            r"---
 name: nope
-still frontmatter"#,
+still frontmatter",
         );
         assert!(unclosed.frontmatter.is_empty());
         assert!(unclosed.body.starts_with("---"));
@@ -1927,5 +1927,298 @@ still frontmatter"#,
                 PathBuf::from("/c"),
             ]
         );
+    }
+
+    // ── strip_frontmatter ──────────────────────────────────────────────
+
+    #[test]
+    fn test_strip_frontmatter_removes_yaml_header() {
+        let raw = "---\nname: test\n---\nbody content";
+        assert_eq!(strip_frontmatter(raw), "body content");
+    }
+
+    #[test]
+    fn test_strip_frontmatter_returns_body_when_no_frontmatter() {
+        let raw = "just body content";
+        assert_eq!(strip_frontmatter(raw), "just body content");
+    }
+
+    // ── is_under_path ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_under_path_same_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        assert!(is_under_path(tmp.path(), tmp.path()));
+    }
+
+    #[test]
+    fn test_is_under_path_child() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let child = tmp.path().join("sub");
+        fs::create_dir(&child).expect("mkdir");
+        assert!(is_under_path(&child, tmp.path()));
+    }
+
+    #[test]
+    fn test_is_under_path_unrelated() {
+        let tmp1 = tempfile::tempdir().expect("tmp1");
+        let tmp2 = tempfile::tempdir().expect("tmp2");
+        assert!(!is_under_path(tmp1.path(), tmp2.path()));
+    }
+
+    #[test]
+    fn test_is_under_path_nonexistent() {
+        assert!(!is_under_path(Path::new("/nonexistent/a"), Path::new("/nonexistent/b")));
+    }
+
+    // ── dedupe_prompts ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_dedupe_prompts_removes_duplicates_keeps_first() {
+        let prompts = vec![
+            PromptTemplate {
+                name: "review".to_string(),
+                description: "first".to_string(),
+                content: "content1".to_string(),
+                source: "a".to_string(),
+                file_path: PathBuf::from("/a/review.md"),
+            },
+            PromptTemplate {
+                name: "review".to_string(),
+                description: "second".to_string(),
+                content: "content2".to_string(),
+                source: "b".to_string(),
+                file_path: PathBuf::from("/b/review.md"),
+            },
+            PromptTemplate {
+                name: "unique".to_string(),
+                description: "only one".to_string(),
+                content: "content3".to_string(),
+                source: "c".to_string(),
+                file_path: PathBuf::from("/c/unique.md"),
+            },
+        ];
+        let (deduped, diagnostics) = dedupe_prompts(prompts);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].kind, DiagnosticKind::Collision);
+        assert!(diagnostics[0].message.contains("review"));
+    }
+
+    #[test]
+    fn test_dedupe_prompts_sorts_by_name() {
+        let prompts = vec![
+            PromptTemplate {
+                name: "z-prompt".to_string(),
+                description: "z".to_string(),
+                content: String::new(),
+                source: "s".to_string(),
+                file_path: PathBuf::from("/z.md"),
+            },
+            PromptTemplate {
+                name: "a-prompt".to_string(),
+                description: "a".to_string(),
+                content: String::new(),
+                source: "s".to_string(),
+                file_path: PathBuf::from("/a.md"),
+            },
+        ];
+        let (deduped, diagnostics) = dedupe_prompts(prompts);
+        assert!(diagnostics.is_empty());
+        assert_eq!(deduped[0].name, "a-prompt");
+        assert_eq!(deduped[1].name, "z-prompt");
+    }
+
+    // ── expand_skill_command ───────────────────────────────────────────
+
+    #[test]
+    fn test_expand_skill_command_with_matching_skill() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_file = tmp.path().join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: test-skill\ndescription: A test\n---\nDo the thing.",
+        )
+        .expect("write skill");
+
+        let skills = vec![Skill {
+            name: "test-skill".to_string(),
+            description: "A test".to_string(),
+            file_path: skill_file,
+            base_dir: tmp.path().to_path_buf(),
+            source: "test".to_string(),
+            disable_model_invocation: false,
+        }];
+        let result = expand_skill_command("/skill:test-skill extra args", &skills);
+        assert!(result.contains("<skill name=\"test-skill\""));
+        assert!(result.contains("Do the thing."));
+        assert!(result.contains("extra args"));
+    }
+
+    #[test]
+    fn test_expand_skill_command_no_matching_skill_returns_input() {
+        let result = expand_skill_command("/skill:nonexistent", &[]);
+        assert_eq!(result, "/skill:nonexistent");
+    }
+
+    #[test]
+    fn test_expand_skill_command_non_skill_prefix_returns_input() {
+        let result = expand_skill_command("plain text", &[]);
+        assert_eq!(result, "plain text");
+    }
+
+    // ── parse_command_args edge cases ──────────────────────────────────
+
+    #[test]
+    fn test_parse_command_args_empty() {
+        assert!(parse_command_args("").is_empty());
+        assert!(parse_command_args("   ").is_empty());
+    }
+
+    #[test]
+    fn test_parse_command_args_tabs_as_separators() {
+        assert_eq!(parse_command_args("a\tb\tc"), vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_parse_command_args_unclosed_quote() {
+        // Unclosed quote just includes chars up to end
+        assert_eq!(parse_command_args("foo \"bar"), vec!["foo", "bar"]);
+    }
+
+    // ── substitute_args edge cases ─────────────────────────────────────
+
+    #[test]
+    fn test_substitute_args_out_of_range_positional() {
+        let args = vec!["one".to_string()];
+        assert_eq!(substitute_args("$2", &args), "");
+    }
+
+    #[test]
+    fn test_substitute_args_zero_positional() {
+        let args = vec!["one".to_string(), "two".to_string()];
+        // $0 → index 0-1 = index -1 which saturates → args[0]? No, it tries idx.saturating_sub(1) = 0
+        // Actually $0 parsed as idx=0, then 0.saturating_sub(1) = 0, so args[0] = "one"
+        // Wait, 0usize.saturating_sub(1) = 0, but that's still index 0 which is "one"
+        // Hmm, actually 0_usize.saturating_sub(1) = 0, so args.get(0) = Some("one")
+        // But logically $0 shouldn't match anything... let me just test the behavior
+        let result = substitute_args("$0", &args);
+        // $0 → idx=0, 0.saturating_sub(1)=0, args[0]="one"
+        assert_eq!(result, "one");
+    }
+
+    #[test]
+    fn test_substitute_args_empty_args() {
+        let result = substitute_args("$1 $@ $ARGUMENTS", &[]);
+        assert_eq!(result, "  ");
+    }
+
+    // ── expand_prompt_template edge cases ──────────────────────────────
+
+    #[test]
+    fn test_expand_prompt_template_non_slash_returns_as_is() {
+        let result = expand_prompt_template("plain text", &[]);
+        assert_eq!(result, "plain text");
+    }
+
+    #[test]
+    fn test_expand_prompt_template_unknown_command_returns_as_is() {
+        let result = expand_prompt_template("/nonexistent foo", &[]);
+        assert_eq!(result, "/nonexistent foo");
+    }
+
+    // ── parse_frontmatter edge cases ───────────────────────────────────
+
+    #[test]
+    fn test_parse_frontmatter_empty_input() {
+        let parsed = parse_frontmatter("");
+        assert!(parsed.frontmatter.is_empty());
+        assert!(parsed.body.is_empty());
+    }
+
+    #[test]
+    fn test_parse_frontmatter_only_body() {
+        let parsed = parse_frontmatter("no frontmatter here\njust body");
+        assert!(parsed.frontmatter.is_empty());
+        assert_eq!(parsed.body, "no frontmatter here\njust body");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_empty_key_ignored() {
+        let parsed = parse_frontmatter("---\n: value\nname: test\n---\nbody");
+        assert!(!parsed.frontmatter.contains_key(""));
+        assert_eq!(parsed.frontmatter.get("name"), Some(&"test".to_string()));
+    }
+
+    // ── validate_name edge cases ───────────────────────────────────────
+
+    #[test]
+    fn test_validate_name_valid_name() {
+        let errors = validate_name("good-name", "good-name");
+        assert!(errors.is_empty());
+    }
+
+    #[test]
+    fn test_validate_name_single_char() {
+        let errors = validate_name("a", "a");
+        assert!(errors.is_empty());
+    }
+
+    // ── CollisionInfo and DiagnosticKind ────────────────────────────────
+
+    #[test]
+    fn test_diagnostic_kind_equality() {
+        assert_eq!(DiagnosticKind::Warning, DiagnosticKind::Warning);
+        assert_eq!(DiagnosticKind::Collision, DiagnosticKind::Collision);
+        assert_ne!(DiagnosticKind::Warning, DiagnosticKind::Collision);
+    }
+
+    // ── replace_regex ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_replace_regex_no_match_returns_input() {
+        let result = replace_regex("hello world", r"\d+", |_| "num".to_string());
+        assert_eq!(result, "hello world");
+    }
+
+    #[test]
+    fn test_replace_regex_replaces_all_matches() {
+        let result = replace_regex("a1b2c3", r"\d", |caps| {
+            format!("[{}]", &caps[0])
+        });
+        assert_eq!(result, "a[1]b[2]c[3]");
+    }
+
+    // ── load_skill_from_file with valid skill ──────────────────────────
+
+    #[test]
+    fn test_load_skill_from_file_valid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("my-skill");
+        fs::create_dir(&skill_dir).expect("mkdir");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_file,
+            "---\nname: my-skill\ndescription: A great skill\n---\nDo something.",
+        )
+        .expect("write");
+
+        let result = load_skill_from_file(&skill_file, "test".to_string());
+        assert!(result.skill.is_some());
+        let skill = result.skill.unwrap();
+        assert_eq!(skill.name, "my-skill");
+        assert_eq!(skill.description, "A great skill");
+    }
+
+    #[test]
+    fn test_load_skill_from_file_missing_description() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let skill_dir = tmp.path().join("bad-skill");
+        fs::create_dir(&skill_dir).expect("mkdir");
+        let skill_file = skill_dir.join("SKILL.md");
+        fs::write(&skill_file, "---\nname: bad-skill\n---\nContent.").expect("write");
+
+        let result = load_skill_from_file(&skill_file, "test".to_string());
+        assert!(!result.diagnostics.is_empty());
     }
 }

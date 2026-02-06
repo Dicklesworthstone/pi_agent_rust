@@ -796,4 +796,202 @@ mod tests {
         assert!(view.contains("Session ID"));
         assert!(view.contains("Delete session? Press y/n to confirm."));
     }
+
+    // ── selected_path when nothing chosen ──────────────────────────────
+
+    #[test]
+    fn selected_path_returns_none_when_no_selection() {
+        let picker = SessionPicker::new(vec![make_meta(Path::new("/tmp/a.jsonl"))]);
+        assert!(picker.selected_path().is_none());
+        assert!(!picker.was_cancelled());
+    }
+
+    // ── with_theme constructor ─────────────────────────────────────────
+
+    #[test]
+    fn with_theme_constructor_sets_initial_state() {
+        let theme = Theme::dark();
+        let sessions = vec![make_meta(Path::new("/tmp/a.jsonl"))];
+        let picker = SessionPicker::with_theme(sessions, &theme);
+        assert_eq!(picker.selected, 0);
+        assert!(!picker.was_cancelled());
+        assert!(picker.selected_path().is_none());
+    }
+
+    // ── delete last session causes quit ────────────────────────────────
+
+    #[test]
+    fn delete_last_session_sets_cancelled_true() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("only.jsonl");
+        fs::write(&session_path, "test").expect("write");
+
+        let mut picker = SessionPicker::new(vec![make_meta(&session_path)]);
+
+        picker.update(key_msg(KeyType::CtrlD, vec![]));
+        let cmd = picker.update(key_msg(KeyType::Runes, vec!['y']));
+        assert!(picker.was_cancelled());
+        assert!(cmd.is_some()); // quit command issued
+    }
+
+    // ── Esc during delete prompt cancels prompt ────────────────────────
+
+    #[test]
+    fn esc_cancels_delete_prompt() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("sess.jsonl");
+        fs::write(&session_path, "test").expect("write");
+
+        let mut picker = SessionPicker::new(vec![make_meta(&session_path)]);
+        picker.update(key_msg(KeyType::CtrlD, vec![]));
+        assert!(picker.confirm_delete.is_some());
+
+        picker.update(key_msg(KeyType::Esc, vec![]));
+        assert!(picker.confirm_delete.is_none());
+        assert!(picker.status_message.is_none());
+    }
+
+    // ── enter on empty list still returns quit ─────────────────────────
+
+    #[test]
+    fn enter_on_empty_list_returns_quit() {
+        let mut picker = SessionPicker::new(Vec::new());
+        let cmd = picker.update(key_msg(KeyType::Enter, vec![]));
+        assert!(cmd.is_some()); // quit
+        assert!(picker.selected_path().is_none());
+    }
+
+    // ── ctrl-d on empty list is a noop ─────────────────────────────────
+
+    #[test]
+    fn ctrl_d_on_empty_list_is_noop() {
+        let mut picker = SessionPicker::new(Vec::new());
+        picker.update(key_msg(KeyType::CtrlD, vec![]));
+        assert!(picker.confirm_delete.is_none());
+    }
+
+    // ── build_meta_from_jsonl ──────────────────────────────────────────
+
+    #[test]
+    fn build_meta_from_jsonl_parses_session_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("test.jsonl");
+        let header = serde_json::json!({
+            "type": "header",
+            "id": "abc123",
+            "cwd": "/work",
+            "timestamp": "2025-06-01T12:00:00.000Z"
+        });
+        let msg1 = serde_json::json!({
+            "type": "message",
+            "timestamp": "2025-06-01T12:00:01.000Z",
+            "message": {"role": "user", "content": "hi"}
+        });
+        let msg2 = serde_json::json!({
+            "type": "message",
+            "timestamp": "2025-06-01T12:00:02.000Z",
+            "message": {"role": "user", "content": "hello again"}
+        });
+        let info = serde_json::json!({
+            "type": "session_info",
+            "timestamp": "2025-06-01T12:00:03.000Z",
+            "name": "My Session"
+        });
+        let content = format!(
+            "{}\n{}\n{}\n{}",
+            serde_json::to_string(&header).unwrap(),
+            serde_json::to_string(&msg1).unwrap(),
+            serde_json::to_string(&msg2).unwrap(),
+            serde_json::to_string(&info).unwrap(),
+        );
+        fs::write(&session_path, content).expect("write");
+
+        let meta = build_meta_from_jsonl(&session_path).expect("parse meta");
+        assert_eq!(meta.id, "abc123");
+        assert_eq!(meta.cwd, "/work");
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(meta.name.as_deref(), Some("My Session"));
+        assert!(meta.size_bytes > 0);
+    }
+
+    #[test]
+    fn build_meta_from_jsonl_empty_file_returns_error() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("empty.jsonl");
+        fs::write(&session_path, "").expect("write");
+
+        assert!(build_meta_from_jsonl(&session_path).is_err());
+    }
+
+    // ── is_session_file_path additional cases ──────────────────────────
+
+    #[test]
+    fn is_session_file_path_rejects_common_non_session_extensions() {
+        assert!(!is_session_file_path(Path::new("/tmp/file.json")));
+        assert!(!is_session_file_path(Path::new("/tmp/file.md")));
+        assert!(!is_session_file_path(Path::new("/tmp/file.rs")));
+    }
+
+    // ── scan_sessions_on_disk ──────────────────────────────────────────
+
+    #[test]
+    fn scan_sessions_on_disk_finds_valid_session_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("session.jsonl");
+        let header = serde_json::json!({
+            "type": "header",
+            "id": "scan-test",
+            "cwd": "/work",
+            "timestamp": "2025-06-01T12:00:00.000Z"
+        });
+        fs::write(&session_path, serde_json::to_string(&header).unwrap()).expect("write");
+
+        // Also create a non-session file that should be ignored
+        fs::write(tmp.path().join("notes.txt"), "not a session").expect("write");
+
+        let found = scan_sessions_on_disk(tmp.path());
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, "scan-test");
+    }
+
+    #[test]
+    fn scan_sessions_on_disk_nonexistent_dir_returns_empty() {
+        let found = scan_sessions_on_disk(Path::new("/nonexistent/dir"));
+        assert!(found.is_empty());
+    }
+
+    // ── with_theme_and_root constructor ────────────────────────────────
+
+    #[test]
+    fn with_theme_and_root_stores_sessions_root() {
+        let theme = Theme::dark();
+        let root = PathBuf::from("/sessions");
+        let picker = SessionPicker::with_theme_and_root(Vec::new(), &theme, root);
+        assert!(picker.sessions_root.is_some());
+    }
+
+    // ── delete adjusts selection when at end ───────────────────────────
+
+    #[test]
+    fn delete_adjusts_selection_when_at_end() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path_a = tmp.path().join("a.jsonl");
+        let path_b = tmp.path().join("b.jsonl");
+        fs::write(&path_a, "test").expect("write a");
+        fs::write(&path_b, "test").expect("write b");
+
+        let mut picker = SessionPicker::new(vec![make_meta(&path_a), make_meta(&path_b)]);
+
+        // Navigate to second item
+        picker.update(key_msg(KeyType::Down, vec![]));
+        assert_eq!(picker.selected, 1);
+
+        // Delete it
+        picker.update(key_msg(KeyType::CtrlD, vec![]));
+        picker.update(key_msg(KeyType::Runes, vec!['y']));
+
+        // Selection should clamp back to 0
+        assert_eq!(picker.selected, 0);
+        assert_eq!(picker.sessions.len(), 1);
+    }
 }

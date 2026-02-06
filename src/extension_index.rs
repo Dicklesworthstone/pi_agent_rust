@@ -782,9 +782,13 @@ pub fn seed_index() -> Result<ExtensionIndex> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExtensionIndex, ExtensionIndexEntry, ExtensionIndexSource, ExtensionIndexStore,
-        merge_entries, parse_github_search_entries, parse_npm_search_entries, seed_index,
+        EXTENSION_INDEX_SCHEMA, EXTENSION_INDEX_VERSION, ExtensionIndex, ExtensionIndexEntry,
+        ExtensionIndexSource, ExtensionIndexStore, merge_entries, merge_tags, non_empty,
+        normalize_license, parse_github_search_entries, parse_npm_search_entries, score_entry,
+        seed_index,
     };
+    use chrono::{Duration as ChronoDuration, Utc};
+    use std::time::Duration;
 
     #[test]
     fn seed_index_parses_and_has_entries() {
@@ -925,5 +929,481 @@ mod tests {
         );
         assert!(entry.tags.iter().any(|tag| tag == "npm"));
         assert!(entry.tags.iter().any(|tag| tag == "extension"));
+    }
+
+    // ── new_empty ──────────────────────────────────────────────────────
+
+    #[test]
+    fn new_empty_has_correct_schema_and_version() {
+        let index = ExtensionIndex::new_empty();
+        assert_eq!(index.schema, EXTENSION_INDEX_SCHEMA);
+        assert_eq!(index.version, EXTENSION_INDEX_VERSION);
+        assert!(index.generated_at.is_some());
+        assert!(index.last_refreshed_at.is_none());
+        assert!(index.entries.is_empty());
+    }
+
+    // ── validate ───────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_accepts_correct_schema_and_version() {
+        let index = ExtensionIndex::new_empty();
+        assert!(index.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_wrong_schema() {
+        let mut index = ExtensionIndex::new_empty();
+        index.schema = "wrong.schema".to_string();
+        let err = index.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported extension index schema")
+        );
+    }
+
+    #[test]
+    fn validate_rejects_wrong_version() {
+        let mut index = ExtensionIndex::new_empty();
+        index.version = 999;
+        let err = index.validate().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Unsupported extension index version")
+        );
+    }
+
+    // ── is_stale ───────────────────────────────────────────────────────
+
+    #[test]
+    fn is_stale_true_when_no_timestamp() {
+        let index = ExtensionIndex::new_empty();
+        assert!(index.is_stale(Utc::now(), Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn is_stale_true_when_invalid_timestamp() {
+        let mut index = ExtensionIndex::new_empty();
+        index.last_refreshed_at = Some("not-a-date".to_string());
+        assert!(index.is_stale(Utc::now(), Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn is_stale_false_when_fresh() {
+        let mut index = ExtensionIndex::new_empty();
+        index.last_refreshed_at = Some(Utc::now().to_rfc3339());
+        assert!(!index.is_stale(Utc::now(), Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn is_stale_true_when_expired() {
+        let mut index = ExtensionIndex::new_empty();
+        let old = Utc::now() - ChronoDuration::hours(2);
+        index.last_refreshed_at = Some(old.to_rfc3339());
+        assert!(index.is_stale(Utc::now(), Duration::from_secs(3600)));
+    }
+
+    // ── search ─────────────────────────────────────────────────────────
+
+    fn test_entry(id: &str, name: &str, desc: Option<&str>, tags: &[&str]) -> ExtensionIndexEntry {
+        ExtensionIndexEntry {
+            id: id.to_string(),
+            name: name.to_string(),
+            description: desc.map(std::string::ToString::to_string),
+            tags: tags.iter().map(std::string::ToString::to_string).collect(),
+            license: None,
+            source: None,
+            install_source: Some(format!("npm:{name}")),
+        }
+    }
+
+    fn test_index(entries: Vec<ExtensionIndexEntry>) -> ExtensionIndex {
+        ExtensionIndex {
+            schema: EXTENSION_INDEX_SCHEMA.to_string(),
+            version: EXTENSION_INDEX_VERSION,
+            generated_at: None,
+            last_refreshed_at: None,
+            entries,
+        }
+    }
+
+    #[test]
+    fn search_empty_query_returns_nothing() {
+        let index = test_index(vec![test_entry("npm/foo", "foo", None, &[])]);
+        assert!(index.search("", 10).is_empty());
+        assert!(index.search("   ", 10).is_empty());
+    }
+
+    #[test]
+    fn search_zero_limit_returns_nothing() {
+        let index = test_index(vec![test_entry("npm/foo", "foo", None, &[])]);
+        assert!(index.search("foo", 0).is_empty());
+    }
+
+    #[test]
+    fn search_matches_by_name() {
+        let index = test_index(vec![
+            test_entry("npm/alpha", "alpha", None, &[]),
+            test_entry("npm/beta", "beta", None, &[]),
+        ]);
+        let hits = index.search("alpha", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.name, "alpha");
+    }
+
+    #[test]
+    fn search_matches_by_description() {
+        let index = test_index(vec![test_entry(
+            "npm/foo",
+            "foo",
+            Some("checkpoint helper"),
+            &[],
+        )]);
+        let hits = index.search("checkpoint", 10);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_matches_by_tag() {
+        let index = test_index(vec![test_entry("npm/foo", "foo", None, &["automation"])]);
+        let hits = index.search("automation", 10);
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_respects_limit() {
+        let index = test_index(vec![
+            test_entry("npm/foo-a", "foo-a", None, &[]),
+            test_entry("npm/foo-b", "foo-b", None, &[]),
+            test_entry("npm/foo-c", "foo-c", None, &[]),
+        ]);
+        let hits = index.search("foo", 2);
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn search_ranks_name_higher_than_description() {
+        let index = test_index(vec![
+            test_entry("npm/other", "other", Some("checkpoint tool"), &[]),
+            test_entry("npm/checkpoint", "checkpoint", None, &[]),
+        ]);
+        let hits = index.search("checkpoint", 10);
+        assert_eq!(hits.len(), 2);
+        // Name match (300) beats description match (60)
+        assert_eq!(hits[0].entry.name, "checkpoint");
+    }
+
+    // ── score_entry ────────────────────────────────────────────────────
+
+    #[test]
+    fn score_entry_name_match_highest() {
+        let entry = test_entry("npm/foo", "foo", Some("bar"), &["baz"]);
+        assert_eq!(score_entry(&entry, &["foo".to_string()]), 300 + 120);
+        // name(300) + id contains "foo" too (120)
+    }
+
+    #[test]
+    fn score_entry_no_match_returns_zero() {
+        let entry = test_entry("npm/foo", "foo", None, &[]);
+        assert_eq!(score_entry(&entry, &["zzz".to_string()]), 0);
+    }
+
+    #[test]
+    fn score_entry_tag_match() {
+        let entry = test_entry("npm/bar", "bar", None, &["automation"]);
+        let score = score_entry(&entry, &["automation".to_string()]);
+        assert_eq!(score, 180);
+    }
+
+    #[test]
+    fn score_entry_multiple_tokens_accumulate() {
+        let entry = test_entry("npm/foo", "foo", Some("great tool"), &["utility"]);
+        let score = score_entry(&entry, &["foo".to_string(), "great".to_string()]);
+        // "foo": name(300) + id(120) = 420
+        // "great": description(60) = 60
+        assert_eq!(score, 480);
+    }
+
+    // ── merge_tags ─────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_tags_deduplicates() {
+        let result = merge_tags(
+            vec!["a".to_string(), "b".to_string()],
+            vec!["b".to_string(), "c".to_string()],
+        );
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_tags_trims_and_skips_empty() {
+        let result = merge_tags(
+            vec!["  a  ".to_string(), String::new()],
+            vec!["  ".to_string(), "b".to_string()],
+        );
+        assert_eq!(result, vec!["a", "b"]);
+    }
+
+    // ── normalize_license ──────────────────────────────────────────────
+
+    #[test]
+    fn normalize_license_returns_none_for_none() {
+        assert_eq!(normalize_license(None), None);
+    }
+
+    #[test]
+    fn normalize_license_returns_none_for_empty() {
+        assert_eq!(normalize_license(Some("")), None);
+        assert_eq!(normalize_license(Some("  ")), None);
+    }
+
+    #[test]
+    fn normalize_license_returns_none_for_unknown() {
+        assert_eq!(normalize_license(Some("unknown")), None);
+        assert_eq!(normalize_license(Some("UNKNOWN")), None);
+    }
+
+    #[test]
+    fn normalize_license_returns_value_for_valid() {
+        assert_eq!(normalize_license(Some("MIT")), Some("MIT".to_string()));
+        assert_eq!(
+            normalize_license(Some("Apache-2.0")),
+            Some("Apache-2.0".to_string())
+        );
+    }
+
+    // ── non_empty ──────────────────────────────────────────────────────
+
+    #[test]
+    fn non_empty_returns_none_for_empty_and_whitespace() {
+        assert_eq!(non_empty(""), None);
+        assert_eq!(non_empty("   "), None);
+    }
+
+    #[test]
+    fn non_empty_trims_and_returns() {
+        assert_eq!(non_empty("  hello  "), Some("hello".to_string()));
+    }
+
+    // ── resolve_install_source edge cases ──────────────────────────────
+
+    #[test]
+    fn resolve_install_source_empty_query_returns_none() {
+        let index = test_index(vec![test_entry("npm/foo", "foo", None, &[])]);
+        assert_eq!(index.resolve_install_source(""), None);
+        assert_eq!(index.resolve_install_source("   "), None);
+    }
+
+    #[test]
+    fn resolve_install_source_case_insensitive() {
+        let index = test_index(vec![ExtensionIndexEntry {
+            id: "npm/Foo".to_string(),
+            name: "Foo".to_string(),
+            description: None,
+            tags: Vec::new(),
+            license: None,
+            source: None,
+            install_source: Some("npm:Foo".to_string()),
+        }]);
+        assert_eq!(
+            index.resolve_install_source("foo"),
+            Some("npm:Foo".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_install_source_npm_package_name() {
+        let index = test_index(vec![ExtensionIndexEntry {
+            id: "npm/my-ext".to_string(),
+            name: "my-ext".to_string(),
+            description: None,
+            tags: Vec::new(),
+            license: None,
+            source: Some(ExtensionIndexSource::Npm {
+                package: "my-ext".to_string(),
+                version: Some("1.0.0".to_string()),
+                url: None,
+            }),
+            install_source: Some("npm:my-ext@1.0.0".to_string()),
+        }]);
+        assert_eq!(
+            index.resolve_install_source("my-ext"),
+            Some("npm:my-ext@1.0.0".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_install_source_no_install_source_returns_none() {
+        let index = test_index(vec![ExtensionIndexEntry {
+            id: "npm/foo".to_string(),
+            name: "foo".to_string(),
+            description: None,
+            tags: Vec::new(),
+            license: None,
+            source: None,
+            install_source: None,
+        }]);
+        assert_eq!(index.resolve_install_source("foo"), None);
+    }
+
+    // ── ExtensionIndexStore save/load roundtrip ────────────────────────
+
+    #[test]
+    fn store_save_load_roundtrip() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let path = temp_dir.path().join("index.json");
+        let store = ExtensionIndexStore::new(path);
+
+        let mut index = ExtensionIndex::new_empty();
+        index
+            .entries
+            .push(test_entry("npm/rt", "rt", Some("roundtrip"), &["test"]));
+        store.save(&index).expect("save");
+
+        let loaded = store.load().expect("load").expect("some");
+        assert_eq!(loaded.entries.len(), 1);
+        assert_eq!(loaded.entries[0].name, "rt");
+        assert_eq!(loaded.entries[0].description.as_deref(), Some("roundtrip"));
+    }
+
+    #[test]
+    fn store_load_nonexistent_returns_none() {
+        let store = ExtensionIndexStore::new(std::path::PathBuf::from("/nonexistent/path.json"));
+        assert!(store.load().expect("load").is_none());
+    }
+
+    #[test]
+    fn store_load_or_seed_falls_back_on_missing() {
+        let store = ExtensionIndexStore::new(std::path::PathBuf::from("/nonexistent/path.json"));
+        let index = store.load_or_seed().expect("load_or_seed");
+        assert!(!index.entries.is_empty());
+    }
+
+    // ── parse edge cases ───────────────────────────────────────────────
+
+    #[test]
+    fn parse_npm_no_version_omits_at_in_install_source() {
+        let body = r#"{
+          "objects": [{
+            "package": {
+              "name": "bare-ext",
+              "keywords": [],
+              "links": {}
+            }
+          }]
+        }"#;
+        let entries = parse_npm_search_entries(body).expect("parse");
+        assert_eq!(entries[0].install_source.as_deref(), Some("npm:bare-ext"));
+    }
+
+    #[test]
+    fn parse_npm_empty_objects_returns_empty() {
+        let body = r#"{ "objects": [] }"#;
+        let entries = parse_npm_search_entries(body).expect("parse");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn parse_github_noassertion_license_filtered_out() {
+        let body = r#"{
+          "items": [{
+            "full_name": "org/ext",
+            "name": "ext",
+            "topics": [],
+            "license": { "spdx_id": "NOASSERTION" }
+          }]
+        }"#;
+        let entries = parse_github_search_entries(body).expect("parse");
+        assert!(entries[0].license.is_none());
+    }
+
+    #[test]
+    fn parse_github_null_license_ok() {
+        let body = r#"{
+          "items": [{
+            "full_name": "org/ext2",
+            "name": "ext2",
+            "topics": []
+          }]
+        }"#;
+        let entries = parse_github_search_entries(body).expect("parse");
+        assert!(entries[0].license.is_none());
+    }
+
+    // ── merge_entries adds new entries ──────────────────────────────────
+
+    #[test]
+    fn merge_entries_adds_new_and_deduplicates() {
+        let existing = vec![test_entry("npm/a", "a", None, &[])];
+        let npm = vec![test_entry("npm/b", "b", None, &[])];
+        let git = vec![test_entry("git/c", "c", None, &[])];
+        let merged = merge_entries(existing, npm, git);
+        assert_eq!(merged.len(), 3);
+        // Sorted by id
+        assert_eq!(merged[0].id, "git/c");
+        assert_eq!(merged[1].id, "npm/a");
+        assert_eq!(merged[2].id, "npm/b");
+    }
+
+    #[test]
+    fn merge_entries_case_insensitive_dedup() {
+        let existing = vec![test_entry("npm/Foo", "Foo", Some("old"), &[])];
+        let npm = vec![test_entry("npm/foo", "foo", Some("new"), &[])];
+        let merged = merge_entries(existing, npm, Vec::new());
+        assert_eq!(merged.len(), 1);
+        // Incoming overwrites description
+        assert_eq!(merged[0].description.as_deref(), Some("new"));
+    }
+
+    // ── serde roundtrip ────────────────────────────────────────────────
+
+    #[test]
+    fn extension_index_serde_roundtrip() {
+        let index = test_index(vec![test_entry("npm/x", "x", Some("desc"), &["tag1"])]);
+        let json = serde_json::to_string(&index).expect("serialize");
+        let deserialized: ExtensionIndex = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(deserialized.entries.len(), 1);
+        assert_eq!(deserialized.entries[0].name, "x");
+    }
+
+    #[test]
+    fn extension_index_entry_source_variants_serialize() {
+        let npm = ExtensionIndexSource::Npm {
+            package: "p".to_string(),
+            version: Some("1.0".to_string()),
+            url: None,
+        };
+        let git = ExtensionIndexSource::Git {
+            repo: "org/r".to_string(),
+            path: None,
+            r#ref: None,
+        };
+        let url = ExtensionIndexSource::Url {
+            url: "https://example.com".to_string(),
+        };
+
+        for source in [npm, git, url] {
+            let json = serde_json::to_string(&source).expect("serialize");
+            let _: ExtensionIndexSource = serde_json::from_str(&json).expect("deserialize");
+        }
+    }
+
+    // ── ExtensionIndexRefreshStats default ─────────────────────────────
+
+    #[test]
+    fn refresh_stats_default_all_zero() {
+        let stats = super::ExtensionIndexRefreshStats::default();
+        assert_eq!(stats.npm_entries, 0);
+        assert_eq!(stats.github_entries, 0);
+        assert_eq!(stats.merged_entries, 0);
+        assert!(!stats.refreshed);
+    }
+
+    // ── store path accessor ────────────────────────────────────────────
+
+    #[test]
+    fn store_path_returns_configured_path() {
+        let store = ExtensionIndexStore::new(std::path::PathBuf::from("/custom/path.json"));
+        assert_eq!(store.path().to_str().unwrap(), "/custom/path.json");
     }
 }
