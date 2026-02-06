@@ -6,6 +6,7 @@
 //! - Timing utilities for performance analysis
 
 use std::future::Future;
+use std::sync::OnceLock;
 
 pub mod harness;
 pub mod logging;
@@ -26,11 +27,17 @@ where
     Fut: Future<Output = T> + Send + 'static,
     T: Send + 'static,
 {
-    let runtime = asupersync::runtime::RuntimeBuilder::new()
-        .blocking_threads(1, 8)
-        .build()
-        .expect("build asupersync runtime");
+    // Reuse a single runtime across tests. Spinning up a fresh runtime per call is
+    // extremely expensive and can distort perf/stress test measurements.
+    static RT: OnceLock<asupersync::runtime::Runtime> = OnceLock::new();
+    let runtime = RT.get_or_init(|| {
+        asupersync::runtime::RuntimeBuilder::new()
+            .blocking_threads(1, 8)
+            .build()
+            .expect("build asupersync runtime")
+    });
 
     let join = runtime.handle().spawn(future);
-    runtime.block_on(join)
+    // Await the JoinHandle on a minimal executor; the task itself runs on `runtime`.
+    futures::executor::block_on(join)
 }
