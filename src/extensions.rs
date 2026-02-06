@@ -8,11 +8,11 @@ use crate::connectors::Connector;
 use crate::connectors::http::HttpConnector;
 use crate::error::{Error, Result};
 use crate::extension_events::{ToolCallEventResult, ToolResultEventResult};
-use crate::permissions::PermissionStore;
 use crate::extensions_js::{
     ExtensionToolDef, HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig, js_to_json,
     json_to_js,
 };
+use crate::permissions::PermissionStore;
 use crate::scheduler::HostcallOutcome;
 use crate::session::SessionMessage;
 use crate::tools::ToolRegistry;
@@ -28,7 +28,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::Digest as _;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -8324,6 +8324,648 @@ fn normalize_command(name: &str) -> String {
     name.trim_start_matches('/').trim().to_ascii_lowercase()
 }
 
+// ============================================================================
+// Shared Hostcall Dispatcher (bd-1uy.1.1)
+// ============================================================================
+//
+// Single source of truth for hostcall execution across all runtimes (JS, WASM,
+// protocol). Takes `HostCallPayload` + execution context, performs validation,
+// capability derivation, policy check, timeout-wrapped dispatch, and structured
+// logging. Returns `HostResultPayload` with strict error taxonomy.
+
+/// Canonicalize a JSON value for stable hashing (sort object keys recursively).
+fn canonicalize_json_for_hash(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            let mut out = serde_json::Map::new();
+            for key in keys {
+                if let Some(v) = map.get(&key) {
+                    out.insert(key, canonicalize_json_for_hash(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonicalize_json_for_hash).collect()),
+        other => other.clone(),
+    }
+}
+
+/// SHA-256 hex digest of an input string.
+fn sha256_hex_str(input: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(input.as_bytes());
+    let digest = hasher.finalize();
+    format!("{digest:x}")
+}
+
+/// Compute a stable hash of hostcall method + params for logging.
+///
+/// Never logs raw params; only this hash is emitted.
+pub(crate) fn shared_params_hash(method: &str, params: &Value) -> String {
+    let canonical = canonicalize_json_for_hash(&json!({ "method": method, "params": params }));
+    let encoded = serde_json::to_string(&canonical)
+        .unwrap_or_else(|_| r#"{"error":"canonical_failed"}"#.to_string());
+    sha256_hex_str(&encoded)
+}
+
+/// Execution context for the shared hostcall dispatcher.
+///
+/// Bundles all runtime resources needed to dispatch a hostcall. Callers
+/// from JS, WASM, or protocol tiers construct this from their own state.
+pub struct HostCallContext<'a> {
+    /// Runtime identifier for logging: `"js"`, `"wasm"`, `"protocol"`.
+    pub runtime: &'a str,
+    /// Extension that issued the hostcall (for logging and policy cache).
+    pub extension_id: Option<&'a str>,
+    /// Policy to evaluate capabilities against.
+    pub policy: &'a ExtensionPolicy,
+    /// Tool registry for `"tool"` method dispatch.
+    pub tools: &'a ToolRegistry,
+    /// HTTP connector for `"http"` method dispatch.
+    pub http: &'a HttpConnector,
+    /// FS connector for `"fs"` method dispatch.
+    pub fs: Option<&'a FsConnector>,
+    /// Environment variable allowlist for `"env"` method dispatch.
+    pub env_allowlist: Option<&'a BTreeSet<String>>,
+    /// Extension manager for session/ui/events dispatch + policy prompt cache.
+    pub manager: Option<&'a ExtensionManager>,
+}
+
+/// Create a successful [`HostResultPayload`].
+fn shared_result_ok(call_id: &str, output: Value) -> HostResultPayload {
+    HostResultPayload {
+        call_id: call_id.to_string(),
+        output,
+        is_error: false,
+        error: None,
+        chunk: None,
+    }
+}
+
+/// Create an error [`HostResultPayload`] with the given taxonomy code.
+fn shared_result_err(
+    call_id: &str,
+    code: HostCallErrorCode,
+    message: impl Into<String>,
+) -> HostResultPayload {
+    HostResultPayload {
+        call_id: call_id.to_string(),
+        output: Value::Null,
+        is_error: true,
+        error: Some(HostCallError {
+            code,
+            message: message.into(),
+            details: None,
+            retryable: None,
+        }),
+        chunk: None,
+    }
+}
+
+/// Create an error [`HostResultPayload`] with details and optional retryable flag.
+fn shared_result_err_with_details(
+    call_id: &str,
+    code: HostCallErrorCode,
+    message: impl Into<String>,
+    details: Value,
+    retryable: Option<bool>,
+) -> HostResultPayload {
+    HostResultPayload {
+        call_id: call_id.to_string(),
+        output: Value::Null,
+        is_error: true,
+        error: Some(HostCallError {
+            code,
+            message: message.into(),
+            details: Some(details),
+            retryable,
+        }),
+        chunk: None,
+    }
+}
+
+/// Convert [`HostcallOutcome`] (used by individual dispatchers) to
+/// [`HostResultPayload`] with strict error taxonomy.
+fn outcome_to_host_result(call_id: &str, outcome: HostcallOutcome) -> HostResultPayload {
+    match outcome {
+        HostcallOutcome::Success(value) => shared_result_ok(call_id, value),
+        HostcallOutcome::Error { code, message } => {
+            let error_code = match code.to_ascii_lowercase().as_str() {
+                "timeout" => HostCallErrorCode::Timeout,
+                "denied" | "shutdown" => HostCallErrorCode::Denied,
+                "io" => HostCallErrorCode::Io,
+                "invalid_request" => HostCallErrorCode::InvalidRequest,
+                _ => HostCallErrorCode::Internal,
+            };
+            shared_result_err(call_id, error_code, message)
+        }
+    }
+}
+
+/// Resolve policy decision, including prompt-cache lookup and user prompting.
+#[allow(clippy::future_not_send)]
+async fn resolve_shared_policy_decision(
+    ctx: &HostCallContext<'_>,
+    required: &str,
+) -> (PolicyDecision, String, String) {
+    let PolicyCheck {
+        mut decision,
+        capability,
+        mut reason,
+    } = ctx.policy.evaluate(required);
+
+    if decision != PolicyDecision::Prompt {
+        return (decision, reason, capability);
+    }
+
+    // Check prompt cache if we have a manager and extension_id.
+    if let (Some(extension_id), Some(manager)) = (ctx.extension_id, ctx.manager) {
+        if let Some(allow) = manager.cached_policy_prompt_decision(extension_id, &capability) {
+            decision = if allow {
+                PolicyDecision::Allow
+            } else {
+                PolicyDecision::Deny
+            };
+            reason = if allow {
+                "prompt_cache_allow".to_string()
+            } else {
+                "prompt_cache_deny".to_string()
+            };
+            return (decision, reason, capability);
+        }
+    }
+
+    // Prompt the user if we have a manager.
+    if let Some(manager) = ctx.manager {
+        let prompt_ext_id = ctx.extension_id.unwrap_or("<unknown>");
+        let allow = prompt_capability_once(manager, prompt_ext_id, &capability).await;
+        if let Some(extension_id) = ctx.extension_id {
+            manager.cache_policy_prompt_decision(extension_id, &capability, allow);
+        }
+        decision = if allow {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny
+        };
+        reason = if allow {
+            "prompt_user_allow".to_string()
+        } else {
+            "prompt_user_deny".to_string()
+        };
+    } else {
+        decision = PolicyDecision::Deny;
+        reason = "no_manager_for_prompt".to_string();
+    }
+
+    (decision, reason, capability)
+}
+
+fn log_shared_hostcall_start(
+    runtime: &str,
+    call_id: &str,
+    extension_id: Option<&str>,
+    capability: &str,
+    method: &str,
+    params_hash: &str,
+    timeout_ms: Option<u64>,
+) {
+    tracing::info!(
+        event = "host_call.start",
+        runtime = %runtime,
+        call_id = %call_id,
+        extension_id = ?extension_id,
+        capability = %capability,
+        method = %method,
+        params_hash = %params_hash,
+        timeout_ms = timeout_ms,
+        "Hostcall start"
+    );
+}
+
+fn log_shared_policy_decision(
+    runtime: &str,
+    call_id: &str,
+    extension_id: Option<&str>,
+    capability: &str,
+    decision: &PolicyDecision,
+    reason: &str,
+    params_hash: &str,
+) {
+    if *decision == PolicyDecision::Allow {
+        tracing::info!(
+            event = "policy.decision",
+            runtime = %runtime,
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %capability,
+            decision = ?decision,
+            reason = %reason,
+            params_hash = %params_hash,
+            "Hostcall allowed by policy"
+        );
+    } else {
+        tracing::warn!(
+            event = "policy.decision",
+            runtime = %runtime,
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %capability,
+            decision = ?decision,
+            reason = %reason,
+            params_hash = %params_hash,
+            "Hostcall denied by policy"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn log_shared_hostcall_end(
+    runtime: &str,
+    call_id: &str,
+    extension_id: Option<&str>,
+    capability: &str,
+    method: &str,
+    params_hash: &str,
+    duration_ms: u64,
+    result: &HostResultPayload,
+) {
+    let error_code = result.error.as_ref().map(|e| format!("{:?}", e.code));
+
+    if result.is_error {
+        tracing::warn!(
+            event = "host_call.end",
+            runtime = %runtime,
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %capability,
+            method = %method,
+            params_hash = %params_hash,
+            duration_ms,
+            error_code = error_code.as_deref(),
+            "Hostcall end (error)"
+        );
+    } else {
+        tracing::info!(
+            event = "host_call.end",
+            runtime = %runtime,
+            call_id = %call_id,
+            extension_id = ?extension_id,
+            capability = %capability,
+            method = %method,
+            params_hash = %params_hash,
+            duration_ms,
+            "Hostcall end (success)"
+        );
+    }
+}
+
+/// Dispatch an `"env"` hostcall (reads environment variables within allowlist).
+fn dispatch_hostcall_env_shared(
+    call_id: &str,
+    env_allowlist: &BTreeSet<String>,
+    params: &Value,
+) -> HostResultPayload {
+    let mut names = Vec::new();
+    if let Some(name) = params.get("name").and_then(Value::as_str) {
+        let name = name.trim();
+        if !name.is_empty() {
+            names.push(name.to_string());
+        }
+    } else if let Some(items) = params.get("names").and_then(Value::as_array) {
+        for item in items {
+            if let Some(name) = item.as_str() {
+                let name = name.trim();
+                if !name.is_empty() {
+                    names.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    if names.is_empty() {
+        return shared_result_err(
+            call_id,
+            HostCallErrorCode::InvalidRequest,
+            "Missing env var name(s)",
+        );
+    }
+
+    if env_allowlist.is_empty() {
+        return shared_result_err(
+            call_id,
+            HostCallErrorCode::Denied,
+            "Env access not configured (no allowlist)",
+        );
+    }
+
+    let mut denied_hashes = Vec::new();
+    for name in &names {
+        if !env_allowlist.contains(name) {
+            denied_hashes.push(sha256_hex_str(name));
+        }
+    }
+
+    if !denied_hashes.is_empty() {
+        return shared_result_err_with_details(
+            call_id,
+            HostCallErrorCode::Denied,
+            "Env var not allowed by scope",
+            json!({ "denied_hashes": denied_hashes }),
+            None,
+        );
+    }
+
+    let mut values = serde_json::Map::new();
+    for name in names {
+        match std::env::var_os(&name) {
+            None => {
+                values.insert(name, Value::Null);
+            }
+            Some(value) => match value.into_string() {
+                Ok(v) => {
+                    values.insert(name, Value::String(v));
+                }
+                Err(_) => {
+                    return shared_result_err_with_details(
+                        call_id,
+                        HostCallErrorCode::Io,
+                        "Env var value is not valid UTF-8",
+                        json!({ "name_hash": sha256_hex_str(&name) }),
+                        None,
+                    );
+                }
+            },
+        }
+    }
+
+    shared_result_ok(call_id, json!({ "values": Value::Object(values) }))
+}
+
+/// Dispatch a `"log"` hostcall — structured extension log emission.
+fn dispatch_hostcall_log_shared(
+    call_id: &str,
+    extension_id: Option<&str>,
+    params: &Value,
+) -> HostResultPayload {
+    let level = params
+        .get("level")
+        .and_then(Value::as_str)
+        .unwrap_or("info")
+        .trim()
+        .to_ascii_lowercase();
+
+    let message = params.get("message").and_then(Value::as_str).unwrap_or("");
+
+    let data = params.get("data");
+
+    match level.as_str() {
+        "error" => tracing::error!(
+            event = "extension.log",
+            extension_id = ?extension_id,
+            level = "error",
+            data = ?data,
+            "{message}"
+        ),
+        "warn" | "warning" => tracing::warn!(
+            event = "extension.log",
+            extension_id = ?extension_id,
+            level = "warn",
+            data = ?data,
+            "{message}"
+        ),
+        "debug" => tracing::debug!(
+            event = "extension.log",
+            extension_id = ?extension_id,
+            level = "debug",
+            data = ?data,
+            "{message}"
+        ),
+        _ => tracing::info!(
+            event = "extension.log",
+            extension_id = ?extension_id,
+            level = "info",
+            data = ?data,
+            "{message}"
+        ),
+    }
+
+    shared_result_ok(call_id, json!({ "logged": true }))
+}
+
+/// Route an allowed hostcall to the appropriate method handler.
+#[allow(clippy::too_many_lines, clippy::future_not_send)]
+async fn dispatch_shared_allowed(
+    ctx: &HostCallContext<'_>,
+    payload: &HostCallPayload,
+) -> HostResultPayload {
+    let call_id = &payload.call_id;
+    let method = payload.method.trim().to_ascii_lowercase();
+    let params = &payload.params;
+
+    match method.as_str() {
+        "tool" => {
+            let Some(name) = params.get("name").and_then(Value::as_str) else {
+                return shared_result_err(
+                    call_id,
+                    HostCallErrorCode::InvalidRequest,
+                    "Missing tool name in params",
+                );
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return shared_result_err(
+                    call_id,
+                    HostCallErrorCode::InvalidRequest,
+                    "Empty tool name",
+                );
+            }
+            let outcome = dispatch_hostcall_tool(ctx.tools, call_id, name, params.clone()).await;
+            outcome_to_host_result(call_id, outcome)
+        }
+        "exec" => {
+            let cmd = params
+                .get("cmd")
+                .and_then(Value::as_str)
+                .or_else(|| params.get("command").and_then(Value::as_str))
+                .unwrap_or_default()
+                .trim();
+            if cmd.is_empty() {
+                return shared_result_err(
+                    call_id,
+                    HostCallErrorCode::InvalidRequest,
+                    "Missing exec command",
+                );
+            }
+            let outcome = dispatch_hostcall_exec(call_id, cmd, params.clone()).await;
+            outcome_to_host_result(call_id, outcome)
+        }
+        "http" => {
+            let outcome = dispatch_hostcall_http(call_id, ctx.http, params.clone()).await;
+            outcome_to_host_result(call_id, outcome)
+        }
+        "fs" => {
+            let Some(fs) = ctx.fs else {
+                return shared_result_err(
+                    call_id,
+                    HostCallErrorCode::Denied,
+                    "FS connector not configured",
+                );
+            };
+            fs.handle_host_call(payload)
+        }
+        "env" => {
+            let Some(env_allowlist) = ctx.env_allowlist else {
+                return shared_result_err(
+                    call_id,
+                    HostCallErrorCode::Denied,
+                    "Env access not configured",
+                );
+            };
+            dispatch_hostcall_env_shared(call_id, env_allowlist, params)
+        }
+        "session" | "ui" | "events" => {
+            let Some(manager) = ctx.manager else {
+                return shared_result_err(
+                    call_id,
+                    HostCallErrorCode::Denied,
+                    "No extension manager configured",
+                );
+            };
+            let op = params
+                .get("op")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
+            if op.is_empty() {
+                return shared_result_err(
+                    call_id,
+                    HostCallErrorCode::InvalidRequest,
+                    format!("Missing op for {method}"),
+                );
+            }
+            let outcome = match method.as_str() {
+                "session" => dispatch_hostcall_session(call_id, manager, &op, params.clone()).await,
+                "ui" => dispatch_hostcall_ui(call_id, manager, &op, params.clone()).await,
+                "events" => {
+                    dispatch_hostcall_events(call_id, manager, ctx.tools, &op, params.clone()).await
+                }
+                _ => unreachable!(),
+            };
+            outcome_to_host_result(call_id, outcome)
+        }
+        "log" => dispatch_hostcall_log_shared(call_id, ctx.extension_id, params),
+        _ => shared_result_err(
+            call_id,
+            HostCallErrorCode::InvalidRequest,
+            format!("Unsupported hostcall method: {method}"),
+        ),
+    }
+}
+
+/// Shared hostcall dispatcher — single source of truth for all runtimes.
+///
+/// Takes a [`HostCallPayload`] plus execution context, performs validation,
+/// capability derivation, policy check, timeout-wrapped dispatch, and
+/// structured logging. Returns [`HostResultPayload`] with strict error
+/// taxonomy codes: `timeout | denied | io | invalid_request | internal`.
+#[allow(clippy::future_not_send)]
+pub async fn dispatch_host_call_shared(
+    ctx: &HostCallContext<'_>,
+    payload: &HostCallPayload,
+) -> HostResultPayload {
+    let call_id = &payload.call_id;
+
+    // 1. Validate payload (call_id, method, params, capability match).
+    if let Err(e) = validate_host_call(payload) {
+        return shared_result_err(call_id, HostCallErrorCode::InvalidRequest, e.to_string());
+    }
+
+    // 2. Derive capability and compute params hash for logging.
+    // Safe to unwrap: validate_host_call ensures method is valid.
+    let required = required_capability_for_host_call(payload)
+        .expect("validate_host_call ensures method is valid");
+    let method = payload.method.trim().to_ascii_lowercase();
+    let params_hash = shared_params_hash(&method, &payload.params);
+    let call_timeout_ms = payload.timeout_ms.filter(|ms| *ms > 0);
+
+    // 3. Log start.
+    log_shared_hostcall_start(
+        ctx.runtime,
+        call_id,
+        ctx.extension_id,
+        &required,
+        &method,
+        &params_hash,
+        call_timeout_ms,
+    );
+
+    // 4. Policy check.
+    let (decision, reason, capability) = resolve_shared_policy_decision(ctx, &required).await;
+    log_shared_policy_decision(
+        ctx.runtime,
+        call_id,
+        ctx.extension_id,
+        &capability,
+        &decision,
+        &reason,
+        &params_hash,
+    );
+
+    let started_at = Instant::now();
+
+    // 5. Dispatch or deny.
+    let result = if decision == PolicyDecision::Allow {
+        let dispatch = dispatch_shared_allowed(ctx, payload);
+        match call_timeout_ms {
+            Some(ms) => timeout(wall_now(), Duration::from_millis(ms), Box::pin(dispatch))
+                .await
+                .unwrap_or_else(|_| {
+                    shared_result_err_with_details(
+                        call_id,
+                        HostCallErrorCode::Timeout,
+                        format!("Hostcall timed out after {ms}ms"),
+                        json!({
+                            "capability": required,
+                            "method": method,
+                        }),
+                        Some(true),
+                    )
+                }),
+            None => dispatch.await,
+        }
+    } else {
+        shared_result_err_with_details(
+            call_id,
+            HostCallErrorCode::Denied,
+            format!("Capability '{capability}' denied by policy ({reason})"),
+            json!({
+                "capability": capability,
+                "decision": format!("{decision:?}"),
+                "reason": reason,
+            }),
+            None,
+        )
+    };
+
+    // 6. Log end.
+    let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+    log_shared_hostcall_end(
+        ctx.runtime,
+        call_id,
+        ctx.extension_id,
+        &required,
+        &method,
+        &params_hash,
+        duration_ms,
+        &result,
+    );
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9451,29 +10093,6 @@ mod tests {
         let cwd = dir.path().to_path_buf();
 
         let manager = ExtensionManager::new();
-        let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(8);
-        manager.set_ui_sender(ui_tx);
-
-        let manager_for_ui = manager.clone();
-        let ui_join = std::thread::spawn(move || {
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build asupersync runtime");
-            runtime.block_on(async move {
-                let cx = asupersync::Cx::for_request();
-                let request = ui_rx.recv(&cx).await.expect("ui request");
-                assert_eq!(request.method, "confirm");
-
-                assert!(
-                    manager_for_ui.respond_ui(ExtensionUiResponse {
-                        id: request.id,
-                        value: Some(serde_json::Value::Bool(true)),
-                        cancelled: false,
-                    }),
-                    "respond_ui"
-                );
-            });
-        });
 
         let host = JsRuntimeHost {
             tools: Arc::new(crate::tools::ToolRegistry::new(&[], &cwd, None)),
@@ -9512,14 +10131,39 @@ mod tests {
         };
 
         let ((first, second), events) = capture_tracing_events(|| {
-            run_async(async {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build asupersync runtime");
+            let handle = runtime.handle();
+
+            runtime.block_on(async {
+                let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(8);
+                manager.set_ui_sender(ui_tx);
+
+                // Respond to any capability prompt(s). We expect 1 prompt here; if caching is broken
+                // and we see >1, respond anyway so the test fails via assertions instead of hanging.
+                let responder = manager.clone();
+                handle.spawn(async move {
+                    let cx = asupersync::Cx::for_request();
+                    while let Ok(request) = ui_rx.recv(&cx).await {
+                        assert_eq!(request.method, "confirm");
+                        assert!(
+                            responder.respond_ui(ExtensionUiResponse {
+                                id: request.id,
+                                value: Some(serde_json::Value::Bool(true)),
+                                cancelled: false,
+                            }),
+                            "respond_ui"
+                        );
+                    }
+                });
+
                 let first = super::dispatch_hostcall(&host, request).await;
                 let second = super::dispatch_hostcall(&host, request_cached).await;
+                manager.clear_ui_sender();
                 (first, second)
             })
         });
-
-        ui_join.join().expect("ui thread join");
 
         assert!(matches!(first, HostcallOutcome::Error { code, .. } if code == "invalid_request"));
         assert!(matches!(second, HostcallOutcome::Error { code, .. } if code == "invalid_request"));
@@ -9811,32 +10455,6 @@ mod tests {
 
         // Prompt: non-default capabilities trigger UI, simulate user deny for each capability.
         let manager_prompt = ExtensionManager::new();
-        let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(16);
-        manager_prompt.set_ui_sender(ui_tx);
-
-        let manager_for_ui = manager_prompt.clone();
-        let prompt_count = strict_cases.len();
-        let ui_join = std::thread::spawn(move || {
-            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-                .build()
-                .expect("build asupersync runtime");
-            runtime.block_on(async move {
-                let cx = asupersync::Cx::for_request();
-                for _ in 0..prompt_count {
-                    let request = ui_rx.recv(&cx).await.expect("ui request");
-                    assert_eq!(request.method, "confirm");
-
-                    assert!(
-                        manager_for_ui.respond_ui(ExtensionUiResponse {
-                            id: request.id,
-                            value: Some(serde_json::Value::Bool(false)),
-                            cancelled: false,
-                        }),
-                        "respond_ui"
-                    );
-                }
-            });
-        });
 
         let host_prompt = JsRuntimeHost {
             tools: Arc::clone(&tools),
@@ -9871,17 +10489,40 @@ mod tests {
             .collect::<Vec<_>>();
 
         let (prompt_outcomes, prompt_events) = capture_tracing_events(|| {
-            run_async(async {
+            let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+                .build()
+                .expect("build asupersync runtime");
+            let handle = runtime.handle();
+
+            runtime.block_on(async {
+                let (ui_tx, ui_rx) = asupersync::channel::mpsc::channel(16);
+                manager_prompt.set_ui_sender(ui_tx);
+
+                let responder = manager_prompt.clone();
+                handle.spawn(async move {
+                    let cx = asupersync::Cx::for_request();
+                    while let Ok(request) = ui_rx.recv(&cx).await {
+                        assert_eq!(request.method, "confirm");
+                        assert!(
+                            responder.respond_ui(ExtensionUiResponse {
+                                id: request.id,
+                                value: Some(serde_json::Value::Bool(false)),
+                                cancelled: false,
+                            }),
+                            "respond_ui"
+                        );
+                    }
+                });
+
                 let mut out = Vec::new();
                 for case in &prompt_cases {
                     let outcome = super::dispatch_hostcall(&host_prompt, to_request(case)).await;
                     out.push((case.call_id, case.capability, case.reason, outcome));
                 }
+                manager_prompt.clear_ui_sender();
                 out
             })
         });
-
-        ui_join.join().expect("ui thread join");
 
         for (call_id, capability, reason, outcome) in &prompt_outcomes {
             assert_denied(outcome, capability, reason);
@@ -13074,5 +13715,629 @@ mod tests {
                 });
             }
         }
+    }
+
+    // ====================================================================
+    // Shared Hostcall Dispatcher Tests (bd-1uy.1.1)
+    // ====================================================================
+
+    fn make_payload(
+        call_id: &str,
+        capability: &str,
+        method: &str,
+        params: Value,
+    ) -> HostCallPayload {
+        HostCallPayload {
+            call_id: call_id.to_string(),
+            capability: capability.to_string(),
+            method: method.to_string(),
+            params,
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        }
+    }
+
+    fn make_ctx<'a>(
+        policy: &'a ExtensionPolicy,
+        tools: &'a ToolRegistry,
+        http: &'a HttpConnector,
+    ) -> HostCallContext<'a> {
+        HostCallContext {
+            runtime: "test",
+            extension_id: Some("test-ext"),
+            policy,
+            tools,
+            http,
+            fs: None,
+            env_allowlist: None,
+            manager: None,
+        }
+    }
+
+    // --- Validation ---
+
+    #[test]
+    fn shared_dispatcher_rejects_empty_call_id() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload("", "read", "tool", json!({ "name": "read" }));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::InvalidRequest
+            );
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_rejects_capability_mismatch() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            // Declare "exec" but method is "tool" which requires "read"/"write"/etc.
+            let payload = make_payload("cap-mismatch", "exec", "tool", json!({ "name": "read" }));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::InvalidRequest
+            );
+            assert!(result.error.as_ref().unwrap().message.contains("mismatch"));
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_rejects_unknown_method() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload("unknown-method", "read", "unknown_method_xyz", json!({}));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::InvalidRequest
+            );
+        });
+    }
+
+    // --- Policy: Denied ---
+
+    #[test]
+    fn shared_dispatcher_denies_by_strict_policy() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: vec!["read".to_string()],
+                deny_caps: Vec::new(),
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            // "exec" not in default_caps → denied
+            let payload = make_payload(
+                "denied-exec",
+                "exec",
+                "exec",
+                json!({ "cmd": "echo hello" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_denies_by_deny_caps() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: vec!["http".to_string()],
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload(
+                "denied-http",
+                "http",
+                "http",
+                json!({ "url": "https://example.com" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+            let details = result.error.as_ref().unwrap().details.as_ref().unwrap();
+            assert_eq!(details["capability"], "http");
+        });
+    }
+
+    // --- Log method ---
+
+    #[test]
+    fn shared_dispatcher_log_success() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload(
+                "log-1",
+                "log",
+                "log",
+                json!({ "level": "info", "message": "test log" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(!result.is_error);
+            assert_eq!(result.output["logged"], true);
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_log_denied_by_policy() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: vec!["log".to_string()],
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload(
+                "log-denied",
+                "log",
+                "log",
+                json!({ "level": "info", "message": "should not log" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    // --- Env method ---
+
+    #[test]
+    fn shared_dispatcher_env_success() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                deny_caps: Vec::new(),
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let mut allowlist = BTreeSet::new();
+            allowlist.insert("HOME".to_string());
+            let mut ctx = make_ctx(&policy, &tools, &http);
+            ctx.env_allowlist = Some(&allowlist);
+
+            let payload = make_payload("env-1", "env", "env", json!({ "name": "HOME" }));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(!result.is_error);
+            assert!(result.output["values"]["HOME"].is_string());
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_env_denied_not_in_allowlist() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let mut allowlist = BTreeSet::new();
+            allowlist.insert("HOME".to_string());
+            let mut ctx = make_ctx(&policy, &tools, &http);
+            ctx.env_allowlist = Some(&allowlist);
+
+            let payload = make_payload("env-denied", "env", "env", json!({ "name": "SECRET_KEY" }));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_env_no_connector() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+            // env_allowlist is None
+
+            let payload = make_payload("env-no-conn", "env", "env", json!({ "name": "HOME" }));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    // --- FS method ---
+
+    #[test]
+    fn shared_dispatcher_fs_no_connector() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload(
+                "fs-no-conn",
+                "read",
+                "fs",
+                json!({ "op": "read", "path": "/tmp/test.txt" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_fs_read_write_roundtrip() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempdir().expect("tempdir");
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let scopes = FsScopes::for_cwd(dir.path()).expect("scopes");
+            let fs_connector =
+                FsConnector::new(dir.path(), policy.clone(), scopes).expect("fs connector");
+            let tools = ToolRegistry::new(&[], dir.path(), None);
+            let http = HttpConnector::with_defaults();
+            let mut ctx = make_ctx(&policy, &tools, &http);
+            ctx.fs = Some(&fs_connector);
+
+            // Write a file
+            let write_payload = make_payload(
+                "fs-write",
+                "write",
+                "fs",
+                json!({ "op": "write", "path": dir.path().join("hello.txt").to_str().unwrap(), "data": "hello world" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &write_payload).await;
+            assert!(!result.is_error, "fs write failed: {result:?}");
+
+            // Read it back
+            let read_payload = make_payload(
+                "fs-read",
+                "read",
+                "fs",
+                json!({ "op": "read", "path": dir.path().join("hello.txt").to_str().unwrap() }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &read_payload).await;
+            assert!(!result.is_error, "fs read failed: {result:?}");
+            assert!(result.output.to_string().contains("hello world"));
+        });
+    }
+
+    // --- Session/UI/Events: no manager ---
+
+    #[test]
+    fn shared_dispatcher_session_no_manager() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload(
+                "session-no-mgr",
+                "session",
+                "session",
+                json!({ "op": "get_name" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_events_no_manager() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload(
+                "events-no-mgr",
+                "events",
+                "events",
+                json!({ "op": "list_tools" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    // --- Tool method ---
+
+    #[test]
+    fn shared_dispatcher_tool_missing_name() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&["read"], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            // tool method but no "name" in params
+            let payload = make_payload("tool-no-name", "read", "tool", json!({ "input": {} }));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::InvalidRequest
+            );
+        });
+    }
+
+    // --- Exec method ---
+
+    #[test]
+    fn shared_dispatcher_exec_missing_cmd() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                deny_caps: Vec::new(),
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload("exec-no-cmd", "exec", "exec", json!({ "args": ["hello"] }));
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::InvalidRequest
+            );
+        });
+    }
+
+    #[test]
+    fn shared_dispatcher_exec_denied_by_policy() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: vec!["read".to_string()],
+                deny_caps: vec!["exec".to_string()],
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            let payload = make_payload(
+                "exec-denied",
+                "exec",
+                "exec",
+                json!({ "cmd": "echo hello" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Denied
+            );
+        });
+    }
+
+    // --- Outcome conversion ---
+
+    #[test]
+    fn outcome_to_host_result_success() {
+        let outcome = HostcallOutcome::Success(json!({ "data": 42 }));
+        let result = outcome_to_host_result("call-ok", outcome);
+        assert!(!result.is_error);
+        assert_eq!(result.output["data"], 42);
+        assert_eq!(result.call_id, "call-ok");
+    }
+
+    #[test]
+    fn outcome_to_host_result_error_taxonomy() {
+        let cases = vec![
+            ("timeout", HostCallErrorCode::Timeout),
+            ("denied", HostCallErrorCode::Denied),
+            ("SHUTDOWN", HostCallErrorCode::Denied),
+            ("io", HostCallErrorCode::Io),
+            ("invalid_request", HostCallErrorCode::InvalidRequest),
+            ("something_else", HostCallErrorCode::Internal),
+        ];
+        for (code, expected) in cases {
+            let outcome = HostcallOutcome::Error {
+                code: code.to_string(),
+                message: "test".to_string(),
+            };
+            let result = outcome_to_host_result("call-err", outcome);
+            assert!(result.is_error);
+            assert_eq!(result.error.as_ref().unwrap().code, expected, "code={code}");
+        }
+    }
+
+    // --- Params hash ---
+
+    #[test]
+    fn shared_params_hash_stable_for_key_ordering() {
+        let first = json!({ "b": 2, "a": 1 });
+        let second = json!({ "a": 1, "b": 2 });
+        assert_eq!(
+            shared_params_hash("http", &first),
+            shared_params_hash("http", &second)
+        );
+        assert_ne!(
+            shared_params_hash("http", &first),
+            shared_params_hash("tool", &first)
+        );
+    }
+
+    // --- Timeout ---
+
+    #[test]
+    fn shared_dispatcher_timeout_fires() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                deny_caps: Vec::new(),
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            // exec with a sleep that exceeds timeout
+            let mut payload = make_payload(
+                "timeout-test",
+                "exec",
+                "exec",
+                json!({ "cmd": "sleep", "args": ["10"] }),
+            );
+            payload.timeout_ms = Some(50); // 50ms timeout
+
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::Timeout
+            );
+            assert_eq!(result.error.as_ref().unwrap().retryable, Some(true));
+        });
+    }
+
+    // --- Unsupported method through dispatch ---
+
+    #[test]
+    fn shared_dispatcher_unsupported_method_through_allowed() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+            let ctx = make_ctx(&policy, &tools, &http);
+
+            // "log" method with "log" capability — validation passes, should succeed
+            let payload = make_payload(
+                "log-through",
+                "log",
+                "log",
+                json!({ "level": "debug", "message": "hi" }),
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(!result.is_error);
+        });
+    }
+
+    // --- Session missing op ---
+
+    #[test]
+    fn shared_dispatcher_session_missing_op() {
+        asupersync::test_utils::run_test(|| async {
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                ..ExtensionPolicy::default()
+            };
+            let tools = ToolRegistry::new(&[], std::path::Path::new("."), None);
+            let http = HttpConnector::with_defaults();
+
+            // We need a manager for session, but with a missing op
+            let mgr = ExtensionManager::new();
+            let mut ctx = make_ctx(&policy, &tools, &http);
+            ctx.manager = Some(&mgr);
+
+            let payload = make_payload(
+                "session-no-op",
+                "session",
+                "session",
+                json!({}), // no "op" field
+            );
+            let result = dispatch_host_call_shared(&ctx, &payload).await;
+            assert!(result.is_error);
+            assert_eq!(
+                result.error.as_ref().unwrap().code,
+                HostCallErrorCode::InvalidRequest
+            );
+        });
     }
 }
