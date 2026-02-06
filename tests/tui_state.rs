@@ -397,6 +397,7 @@ fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Us
                     role: MessageRole::User,
                     content: user_content_to_text(content),
                     thinking: None,
+                    collapsed: false,
                 });
             }
             SessionMessage::Assistant { message } => {
@@ -406,6 +407,7 @@ fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Us
                     role: MessageRole::Assistant,
                     content: text,
                     thinking,
+                    collapsed: false,
                 });
             }
             SessionMessage::ToolResult {
@@ -424,6 +426,7 @@ fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Us
                     role: MessageRole::Tool,
                     content: format!("{prefix} ({tool_name}): {text}"),
                     thinking: None,
+                    collapsed: false,
                 });
             }
             SessionMessage::Custom {
@@ -434,6 +437,7 @@ fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>, Us
                         role: MessageRole::System,
                         content: content.clone(),
                         thinking: None,
+                        collapsed: false,
                     });
                 }
             }
@@ -873,6 +877,7 @@ fn user_msg(text: &str) -> ConversationMessage {
         role: MessageRole::User,
         content: text.to_string(),
         thinking: None,
+        collapsed: false,
     }
 }
 
@@ -881,6 +886,7 @@ fn assistant_msg(text: &str) -> ConversationMessage {
         role: MessageRole::Assistant,
         content: text.to_string(),
         thinking: None,
+        collapsed: false,
     }
 }
 
@@ -1524,17 +1530,17 @@ fn tui_state_expand_tools_toggles_tool_output_visibility() {
     );
     assert_after_contains(&harness, &step, "Tool read output:");
     assert_after_contains(&harness, &step, "file contents");
-    assert_after_not_contains(&harness, &step, "(collapsed)");
+    assert_after_not_contains(&harness, &step, "collapsed");
 
     let step = press_ctrlo(&harness, &mut app);
     assert_after_contains(&harness, &step, "Tool read output:");
-    assert_after_contains(&harness, &step, "(collapsed)");
+    assert_after_contains(&harness, &step, "collapsed");
     assert_after_not_contains(&harness, &step, "file contents");
 
     let step = press_ctrlo(&harness, &mut app);
     assert_after_contains(&harness, &step, "Tool read output:");
     assert_after_contains(&harness, &step, "file contents");
-    assert_after_not_contains(&harness, &step, "(collapsed)");
+    assert_after_not_contains(&harness, &step, "collapsed");
 }
 
 #[test]
@@ -3010,4 +3016,457 @@ fn tui_state_status_message_clears_on_any_keypress() {
 
     let step = type_text(&harness, &mut app, "x");
     assert_after_not_contains(&harness, &step, "Current model: dummy/dummy-model");
+}
+
+#[test]
+fn tui_state_tool_update_with_progress_shows_elapsed_and_lines() {
+    let harness = TestHarness::new("tui_state_tool_update_with_progress_shows_elapsed_and_lines");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Start a tool.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    // Send a ToolUpdate with progress metrics (elapsed >= 1s triggers display).
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) with progress",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("some output"))],
+            details: Some(json!({
+                "progress": {
+                    "elapsedMs": 5000,
+                    "lineCount": 42,
+                    "byteCount": 1024
+                }
+            })),
+        },
+    );
+
+    // The spinner should show "Running bash" with progress "(5s * 42 lines)".
+    assert_after_contains(&harness, &step, "Running bash");
+    assert_after_contains(&harness, &step, "5s");
+    assert_after_contains(&harness, &step, "42 lines");
+}
+
+#[test]
+fn tui_state_tool_progress_hidden_under_one_second() {
+    let harness = TestHarness::new("tui_state_tool_progress_hidden_under_one_second");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+
+    // Send progress with < 1s elapsed — should NOT show the elapsed time.
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) sub-second",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("quick"))],
+            details: Some(json!({
+                "progress": {
+                    "elapsedMs": 500,
+                    "lineCount": 3,
+                    "byteCount": 100
+                }
+            })),
+        },
+    );
+
+    assert_after_contains(&harness, &step, "Running bash");
+    // Sub-second progress should not appear.
+    assert_after_not_contains(&harness, &step, "0s");
+    assert_after_not_contains(&harness, &step, "3 lines");
+}
+
+#[test]
+fn tui_state_tool_progress_reset_on_new_tool_start() {
+    let harness = TestHarness::new("tui_state_tool_progress_reset_on_new_tool_start");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // First tool with progress.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) progress",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("out"))],
+            details: Some(json!({
+                "progress": {
+                    "elapsedMs": 10000,
+                    "lineCount": 999,
+                    "byteCount": 50000
+                }
+            })),
+        },
+    );
+
+    // End first tool, start second with no progress yet.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(bash)",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-2".to_string(),
+        },
+    );
+
+    // The old progress from bash should NOT leak into the read tool spinner.
+    assert_after_contains(&harness, &step, "Running read");
+    assert_after_not_contains(&harness, &step, "999 lines");
+    assert_after_not_contains(&harness, &step, "10s");
+}
+
+// ============================================================================
+// Capability prompt overlay tests
+// ============================================================================
+
+#[test]
+fn tui_state_capability_prompt_shows_overlay() {
+    let harness = TestHarness::new("tui_state_capability_prompt_shows_overlay");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let request = ExtensionUiRequest::new(
+        "cap-1",
+        "confirm",
+        json!({
+            "title": "Allow extension capability: exec",
+            "message": "Extension my-ext requests capability 'exec'. Allow?",
+            "extension_id": "my-ext",
+            "capability": "exec",
+        }),
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Modal should render with key elements.
+    assert_after_contains(&harness, &step, "Extension Permission Request");
+    assert_after_contains(&harness, &step, "my-ext");
+    assert_after_contains(&harness, &step, "exec");
+    assert_after_contains(&harness, &step, "Allow Once");
+    assert_after_contains(&harness, &step, "Deny");
+}
+
+#[test]
+fn tui_state_capability_prompt_navigate_buttons() {
+    let harness = TestHarness::new("tui_state_capability_prompt_navigate_buttons");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let request = ExtensionUiRequest::new(
+        "cap-2",
+        "confirm",
+        json!({
+            "extension_id": "test-ext",
+            "capability": "http",
+            "message": "test prompt",
+        }),
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Default focus on first button (Allow Once).  Press Right to move to Allow Always.
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:Right",
+        KeyMsg::from_type(KeyType::Right),
+    );
+    assert_after_contains(&harness, &step, "Allow Always");
+
+    // Press Right again to move to Deny.
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:Right",
+        KeyMsg::from_type(KeyType::Right),
+    );
+    assert_after_contains(&harness, &step, "Deny");
+}
+
+#[test]
+fn tui_state_capability_prompt_escape_denies() {
+    let harness = TestHarness::new("tui_state_capability_prompt_escape_denies");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let request = ExtensionUiRequest::new(
+        "cap-3",
+        "confirm",
+        json!({
+            "extension_id": "test-ext",
+            "capability": "exec",
+            "message": "test",
+        }),
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Press Escape to deny.
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:Esc",
+        KeyMsg::from_type(KeyType::Esc),
+    );
+
+    // Overlay should be dismissed (no more "Extension Permission Request").
+    assert_after_not_contains(&harness, &step, "Extension Permission Request");
+}
+
+#[test]
+fn tui_state_capability_prompt_enter_confirms() {
+    let harness = TestHarness::new("tui_state_capability_prompt_enter_confirms");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let request = ExtensionUiRequest::new(
+        "cap-4",
+        "confirm",
+        json!({
+            "extension_id": "test-ext",
+            "capability": "exec",
+            "message": "test",
+        }),
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Press Enter to confirm the default (Allow Once).
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:Enter",
+        KeyMsg::from_type(KeyType::Enter),
+    );
+
+    // Overlay should be dismissed.
+    assert_after_not_contains(&harness, &step, "Extension Permission Request");
+}
+
+#[test]
+fn tui_state_generic_confirm_not_intercepted_as_capability() {
+    let harness = TestHarness::new("tui_state_generic_confirm_not_intercepted_as_capability");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // A generic confirm (no extension_id/capability fields) should NOT trigger the overlay.
+    let request = ExtensionUiRequest::new(
+        "gen-1",
+        "confirm",
+        json!({
+            "title": "Are you sure?",
+            "message": "Please confirm.",
+        }),
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(generic confirm)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Should NOT show the capability overlay — should fall through to the text-based flow.
+    assert_after_not_contains(&harness, &step, "Extension Permission Request");
+}
+
+#[test]
+fn tui_state_capability_prompt_blocks_regular_input() {
+    let harness = TestHarness::new("tui_state_capability_prompt_blocks_regular_input");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Show capability prompt.
+    let request = ExtensionUiRequest::new(
+        "cap-block",
+        "confirm",
+        json!({
+            "extension_id": "test-ext",
+            "capability": "exec",
+            "message": "test",
+        }),
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Try typing regular text — should NOT appear in input area because modal is active.
+    let step = apply_key(&harness, &mut app, "key:a", KeyMsg::from_runes(vec!['a']));
+    // The prompt should still be visible, and normal text input should not be processed.
+    assert_after_contains(&harness, &step, "Extension Permission Request");
+    // Input area should NOT be shown while prompt is open.
+    assert_after_not_contains(&harness, &step, "> ");
+}
+
+#[test]
+fn tui_state_capability_prompt_tab_cycles_buttons() {
+    let harness = TestHarness::new("tui_state_capability_prompt_tab_cycles_buttons");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let request = ExtensionUiRequest::new(
+        "cap-tab",
+        "confirm",
+        json!({
+            "extension_id": "test-ext",
+            "capability": "http",
+            "message": "test",
+        }),
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Tab cycles forward through buttons.
+    apply_key(
+        &harness,
+        &mut app,
+        "key:Tab",
+        KeyMsg::from_type(KeyType::Tab),
+    );
+    apply_key(
+        &harness,
+        &mut app,
+        "key:Tab",
+        KeyMsg::from_type(KeyType::Tab),
+    );
+    apply_key(
+        &harness,
+        &mut app,
+        "key:Tab",
+        KeyMsg::from_type(KeyType::Tab),
+    );
+
+    // After 3 tabs we should be on "Deny Always" (index 3).
+    // Press Enter to confirm.
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:Enter",
+        KeyMsg::from_type(KeyType::Enter),
+    );
+
+    // Overlay should be dismissed.
+    assert_after_not_contains(&harness, &step, "Extension Permission Request");
+}
+
+#[test]
+fn tui_state_capability_prompt_shows_auto_deny_timer() {
+    let harness = TestHarness::new("tui_state_capability_prompt_shows_auto_deny_timer");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let request = ExtensionUiRequest::new(
+        "cap-timer",
+        "confirm",
+        json!({
+            "extension_id": "timer-ext",
+            "capability": "fs",
+            "message": "File system access",
+        }),
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    // Auto-deny timer should be visible (default 30s).
+    assert_after_contains(&harness, &step, "Auto-deny in 30s");
+}
+
+#[test]
+fn tui_state_capability_prompt_shows_description() {
+    let harness = TestHarness::new("tui_state_capability_prompt_shows_description");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    let request = ExtensionUiRequest::new(
+        "cap-desc",
+        "confirm",
+        json!({
+            "extension_id": "fancy-ext",
+            "capability": "env",
+            "message": "Access environment variables HOME, PATH",
+        }),
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ExtensionUiRequest(capability)",
+        PiMsg::ExtensionUiRequest(request),
+    );
+
+    assert_after_contains(&harness, &step, "fancy-ext");
+    assert_after_contains(&harness, &step, "env");
+    assert_after_contains(&harness, &step, "Access environment variables HOME, PATH");
 }
