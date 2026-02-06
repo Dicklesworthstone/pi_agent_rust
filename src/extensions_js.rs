@@ -7346,25 +7346,173 @@ if (typeof globalThis.Buffer === 'undefined') {
                 const enc = String(encoding || '').toLowerCase();
                 if (enc === 'base64') {
                     const bin = __pi_base64_decode_native(input);
-                    const out = new Uint8Array(bin.length);
+                    const out = new Buffer(bin.length);
                     for (let i = 0; i < bin.length; i++) {
                         out[i] = bin.charCodeAt(i) & 0xff;
                     }
                     return out;
                 }
-                return new TextEncoder().encode(input);
+                if (enc === 'hex') {
+                    const hex = input.replace(/[^0-9a-fA-F]/g, '');
+                    const out = new Buffer(hex.length >> 1);
+                    for (let i = 0; i < out.length; i++) {
+                        out[i] = parseInt(hex.substr(i * 2, 2), 16);
+                    }
+                    return out;
+                }
+                const encoded = new TextEncoder().encode(input);
+                const out = new Buffer(encoded.length);
+                out.set(encoded);
+                return out;
             }
             if (input instanceof ArrayBuffer) {
-                return new Uint8Array(input);
+                const out = new Buffer(input.byteLength);
+                out.set(new Uint8Array(input));
+                return out;
             }
             if (ArrayBuffer.isView && ArrayBuffer.isView(input)) {
-                return new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+                const out = new Buffer(input.byteLength);
+                out.set(new Uint8Array(input.buffer, input.byteOffset, input.byteLength));
+                return out;
             }
             if (Array.isArray(input)) {
-                return new Uint8Array(input);
+                const out = new Buffer(input.length);
+                for (let i = 0; i < input.length; i++) out[i] = input[i] & 0xff;
+                return out;
             }
             throw new Error('Buffer.from: unsupported input');
         }
+        static alloc(size, fill) {
+            const buf = new Buffer(size);
+            if (fill !== undefined) buf.fill(typeof fill === 'number' ? fill : 0);
+            return buf;
+        }
+        static allocUnsafe(size) { return new Buffer(size); }
+        static isBuffer(obj) { return obj instanceof Buffer; }
+        static isEncoding(enc) {
+            return ['utf8','utf-8','ascii','latin1','binary','base64','hex','ucs2','ucs-2','utf16le','utf-16le'].includes(String(enc).toLowerCase());
+        }
+        static byteLength(str, encoding) {
+            if (typeof str !== 'string') return str.length || 0;
+            const enc = String(encoding || 'utf8').toLowerCase();
+            if (enc === 'base64') return Math.ceil(str.length * 3 / 4);
+            if (enc === 'hex') return str.length >> 1;
+            return new TextEncoder().encode(str).length;
+        }
+        static concat(list, totalLength) {
+            if (!Array.isArray(list) || list.length === 0) return Buffer.alloc(0);
+            const total = totalLength !== undefined ? totalLength : list.reduce((s, b) => s + b.length, 0);
+            const out = Buffer.alloc(total);
+            let offset = 0;
+            for (const buf of list) {
+                if (offset >= total) break;
+                const src = buf instanceof Uint8Array ? buf : Buffer.from(buf);
+                const copyLen = Math.min(src.length, total - offset);
+                out.set(src.subarray(0, copyLen), offset);
+                offset += copyLen;
+            }
+            return out;
+        }
+        static compare(a, b) {
+            const len = Math.min(a.length, b.length);
+            for (let i = 0; i < len; i++) {
+                if (a[i] < b[i]) return -1;
+                if (a[i] > b[i]) return 1;
+            }
+            if (a.length < b.length) return -1;
+            if (a.length > b.length) return 1;
+            return 0;
+        }
+        toString(encoding, start, end) {
+            const s = start || 0;
+            const e = end !== undefined ? end : this.length;
+            const view = this.subarray(s, e);
+            const enc = String(encoding || 'utf8').toLowerCase();
+            if (enc === 'base64') {
+                let binary = '';
+                for (let i = 0; i < view.length; i++) binary += String.fromCharCode(view[i]);
+                return __pi_base64_encode_native(binary);
+            }
+            if (enc === 'hex') {
+                let hex = '';
+                for (let i = 0; i < view.length; i++) hex += (view[i] < 16 ? '0' : '') + view[i].toString(16);
+                return hex;
+            }
+            return new TextDecoder().decode(view);
+        }
+        toJSON() {
+            return { type: 'Buffer', data: Array.from(this) };
+        }
+        equals(other) {
+            if (this.length !== other.length) return false;
+            for (let i = 0; i < this.length; i++) {
+                if (this[i] !== other[i]) return false;
+            }
+            return true;
+        }
+        compare(other) { return Buffer.compare(this, other); }
+        copy(target, targetStart, sourceStart, sourceEnd) {
+            const ts = targetStart || 0;
+            const ss = sourceStart || 0;
+            const se = sourceEnd !== undefined ? sourceEnd : this.length;
+            const src = this.subarray(ss, se);
+            const copyLen = Math.min(src.length, target.length - ts);
+            target.set(src.subarray(0, copyLen), ts);
+            return copyLen;
+        }
+        slice(start, end) {
+            const sliced = super.slice(start, end);
+            const buf = new Buffer(sliced.length);
+            buf.set(sliced);
+            return buf;
+        }
+        indexOf(value, byteOffset, encoding) {
+            const offset = byteOffset || 0;
+            if (typeof value === 'number') {
+                for (let i = offset; i < this.length; i++) {
+                    if (this[i] === (value & 0xff)) return i;
+                }
+                return -1;
+            }
+            const needle = typeof value === 'string' ? Buffer.from(value, encoding) : value;
+            outer: for (let i = offset; i <= this.length - needle.length; i++) {
+                for (let j = 0; j < needle.length; j++) {
+                    if (this[i + j] !== needle[j]) continue outer;
+                }
+                return i;
+            }
+            return -1;
+        }
+        includes(value, byteOffset, encoding) {
+            return this.indexOf(value, byteOffset, encoding) !== -1;
+        }
+        write(string, offset, length, encoding) {
+            const o = offset || 0;
+            const enc = encoding || 'utf8';
+            const bytes = Buffer.from(string, enc);
+            const len = length !== undefined ? Math.min(length, bytes.length) : bytes.length;
+            const copyLen = Math.min(len, this.length - o);
+            this.set(bytes.subarray(0, copyLen), o);
+            return copyLen;
+        }
+        fill(value, offset, end, encoding) {
+            const s = offset || 0;
+            const e = end !== undefined ? end : this.length;
+            const v = typeof value === 'number' ? (value & 0xff) : 0;
+            for (let i = s; i < e; i++) this[i] = v;
+            return this;
+        }
+        readUInt8(offset) { return this[offset || 0]; }
+        readUInt16BE(offset) { const o = offset || 0; return (this[o] << 8) | this[o + 1]; }
+        readUInt16LE(offset) { const o = offset || 0; return this[o] | (this[o + 1] << 8); }
+        readUInt32BE(offset) { const o = offset || 0; return ((this[o] << 24) | (this[o+1] << 16) | (this[o+2] << 8) | this[o+3]) >>> 0; }
+        readUInt32LE(offset) { const o = offset || 0; return (this[o] | (this[o+1] << 8) | (this[o+2] << 16) | (this[o+3] << 24)) >>> 0; }
+        readInt8(offset) { const v = this[offset || 0]; return v > 127 ? v - 256 : v; }
+        writeUInt8(value, offset) { this[offset || 0] = value & 0xff; return (offset || 0) + 1; }
+        writeUInt16BE(value, offset) { const o = offset || 0; this[o] = (value >> 8) & 0xff; this[o+1] = value & 0xff; return o + 2; }
+        writeUInt16LE(value, offset) { const o = offset || 0; this[o] = value & 0xff; this[o+1] = (value >> 8) & 0xff; return o + 2; }
+        writeUInt32BE(value, offset) { const o = offset || 0; this[o]=(value>>>24)&0xff; this[o+1]=(value>>>16)&0xff; this[o+2]=(value>>>8)&0xff; this[o+3]=value&0xff; return o+4; }
+        writeUInt32LE(value, offset) { const o = offset || 0; this[o]=value&0xff; this[o+1]=(value>>>8)&0xff; this[o+2]=(value>>>16)&0xff; this[o+3]=(value>>>24)&0xff; return o+4; }
     }
     globalThis.Buffer = Buffer;
 }
@@ -11489,6 +11637,148 @@ mod tests {
             assert_eq!(r["eol"], serde_json::json!("\n"));
             assert_eq!(r["devNull"], serde_json::json!("/dev/null"));
             assert_eq!(r["hasConstants"], serde_json::json!(true));
+        });
+    }
+
+    // ── Buffer expanded API tests ──────────────────────────────────────
+
+    #[test]
+    fn pijs_buffer_expanded_apis() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.bufResult = {};
+                    (() => {
+                        const B = globalThis.Buffer;
+
+                        // alloc
+                        const a = B.alloc(4, 0xAB);
+                        globalThis.bufResult.allocFill = Array.from(a);
+
+                        // from string + hex encoding
+                        const hex = B.from('48656c6c6f', 'hex');
+                        globalThis.bufResult.hexDecode = hex.toString('utf8');
+
+                        // concat
+                        const c = B.concat([B.from('Hello'), B.from(' World')]);
+                        globalThis.bufResult.concat = c.toString();
+
+                        // byteLength
+                        globalThis.bufResult.byteLength = B.byteLength('Hello');
+
+                        // compare
+                        globalThis.bufResult.compareEqual = B.compare(B.from('abc'), B.from('abc'));
+                        globalThis.bufResult.compareLess = B.compare(B.from('abc'), B.from('abd'));
+                        globalThis.bufResult.compareGreater = B.compare(B.from('abd'), B.from('abc'));
+
+                        // isEncoding
+                        globalThis.bufResult.isEncodingUtf8 = B.isEncoding('utf8');
+                        globalThis.bufResult.isEncodingFake = B.isEncoding('fake');
+
+                        // isBuffer
+                        globalThis.bufResult.isBufferTrue = B.isBuffer(B.from('x'));
+                        globalThis.bufResult.isBufferFalse = B.isBuffer('x');
+
+                        // instance methods
+                        const b = B.from('Hello World');
+                        globalThis.bufResult.indexOf = b.indexOf('World');
+                        globalThis.bufResult.includes = b.includes('World');
+                        globalThis.bufResult.notIncludes = b.includes('xyz');
+
+                        const sliced = b.slice(0, 5);
+                        globalThis.bufResult.slice = sliced.toString();
+
+                        globalThis.bufResult.toJSON = b.toJSON().type;
+
+                        const eq1 = B.from('abc');
+                        const eq2 = B.from('abc');
+                        const eq3 = B.from('xyz');
+                        globalThis.bufResult.equalsTrue = eq1.equals(eq2);
+                        globalThis.bufResult.equalsFalse = eq1.equals(eq3);
+
+                        // copy
+                        const src = B.from('Hello');
+                        const dst = B.alloc(5);
+                        src.copy(dst);
+                        globalThis.bufResult.copy = dst.toString();
+
+                        // write
+                        const wb = B.alloc(10);
+                        wb.write('Hi');
+                        globalThis.bufResult.write = wb.toString('utf8', 0, 2);
+
+                        // readUInt / writeUInt
+                        const nb = B.alloc(4);
+                        nb.writeUInt16BE(0x1234, 0);
+                        globalThis.bufResult.readUInt16BE = nb.readUInt16BE(0);
+                        nb.writeUInt32LE(0xDEADBEEF, 0);
+                        globalThis.bufResult.readUInt32LE = nb.readUInt32LE(0);
+
+                        // hex encoding
+                        const hb = B.from([0xDE, 0xAD]);
+                        globalThis.bufResult.toHex = hb.toString('hex');
+
+                        // base64 round-trip
+                        const b64 = B.from('Hello').toString('base64');
+                        const roundTrip = B.from(b64, 'base64').toString();
+                        globalThis.bufResult.base64Round = roundTrip;
+
+                        globalThis.bufResult.done = true;
+                    })();
+                    ",
+                )
+                .await
+                .expect("eval Buffer expanded");
+
+            let r = get_global_json(&runtime, "bufResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            // alloc with fill
+            assert_eq!(r["allocFill"], serde_json::json!([0xAB, 0xAB, 0xAB, 0xAB]));
+            // hex decode
+            assert_eq!(r["hexDecode"], serde_json::json!("Hello"));
+            // concat
+            assert_eq!(r["concat"], serde_json::json!("Hello World"));
+            // byteLength
+            assert_eq!(r["byteLength"].as_f64(), Some(5.0));
+            // compare
+            assert_eq!(r["compareEqual"].as_f64(), Some(0.0));
+            assert!(r["compareLess"].as_f64().unwrap_or(0.0) < 0.0);
+            assert!(r["compareGreater"].as_f64().unwrap_or(0.0) > 0.0);
+            // isEncoding
+            assert_eq!(r["isEncodingUtf8"], serde_json::json!(true));
+            assert_eq!(r["isEncodingFake"], serde_json::json!(false));
+            // isBuffer
+            assert_eq!(r["isBufferTrue"], serde_json::json!(true));
+            assert_eq!(r["isBufferFalse"], serde_json::json!(false));
+            // indexOf / includes
+            assert_eq!(r["indexOf"].as_f64(), Some(6.0));
+            assert_eq!(r["includes"], serde_json::json!(true));
+            assert_eq!(r["notIncludes"], serde_json::json!(false));
+            // slice
+            assert_eq!(r["slice"], serde_json::json!("Hello"));
+            // toJSON
+            assert_eq!(r["toJSON"], serde_json::json!("Buffer"));
+            // equals
+            assert_eq!(r["equalsTrue"], serde_json::json!(true));
+            assert_eq!(r["equalsFalse"], serde_json::json!(false));
+            // copy
+            assert_eq!(r["copy"], serde_json::json!("Hello"));
+            // write
+            assert_eq!(r["write"], serde_json::json!("Hi"));
+            // readUInt16BE
+            assert_eq!(r["readUInt16BE"].as_f64(), Some(f64::from(0x1234)));
+            // readUInt32LE
+            assert_eq!(r["readUInt32LE"].as_f64(), Some(f64::from(0xDEAD_BEEF_u32)));
+            // hex
+            assert_eq!(r["toHex"], serde_json::json!("dead"));
+            // base64 round-trip
+            assert_eq!(r["base64Round"], serde_json::json!("Hello"));
         });
     }
 }

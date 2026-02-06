@@ -540,12 +540,36 @@ mod tests {
         }
     }
 
+    fn key_msg(key_type: KeyType, runes: Vec<char>) -> Message {
+        Message::new(KeyMsg {
+            key_type,
+            runes,
+            alt: false,
+            paste: false,
+        })
+    }
+
     #[test]
     fn test_format_time() {
         let ts = "2025-01-15T10:30:00.000Z";
         let formatted = format_time(ts);
         assert!(formatted.contains("2025-01-15"));
         assert!(formatted.contains("10:30"));
+    }
+
+    #[test]
+    fn test_format_time_invalid_returns_input() {
+        let ts = "not-a-timestamp";
+        assert_eq!(format_time(ts), ts);
+    }
+
+    #[test]
+    fn test_is_session_file_path() {
+        assert!(is_session_file_path(Path::new("/tmp/sess.jsonl")));
+        assert!(!is_session_file_path(Path::new("/tmp/sess.txt")));
+        assert!(!is_session_file_path(Path::new("/tmp/noext")));
+        #[cfg(feature = "sqlite-sessions")]
+        assert!(is_session_file_path(Path::new("/tmp/sess.sqlite")));
     }
 
     #[test]
@@ -577,23 +601,11 @@ mod tests {
         assert_eq!(picker.selected, 0);
 
         // Navigate down
-        let down_msg = Message::new(KeyMsg {
-            key_type: KeyType::Down,
-            runes: vec![],
-            alt: false,
-            paste: false,
-        });
-        picker.update(down_msg);
+        picker.update(key_msg(KeyType::Down, vec![]));
         assert_eq!(picker.selected, 1);
 
         // Navigate up
-        let up_msg = Message::new(KeyMsg {
-            key_type: KeyType::Up,
-            runes: vec![],
-            alt: false,
-            paste: false,
-        });
-        picker.update(up_msg);
+        picker.update(key_msg(KeyType::Up, vec![]));
         assert_eq!(picker.selected, 0);
     }
 
@@ -626,23 +638,11 @@ mod tests {
         assert_eq!(picker.selected, 0);
 
         // Navigate down with 'j'
-        let j_msg = Message::new(KeyMsg {
-            key_type: KeyType::Runes,
-            runes: vec!['j'],
-            alt: false,
-            paste: false,
-        });
-        picker.update(j_msg);
+        picker.update(key_msg(KeyType::Runes, vec!['j']));
         assert_eq!(picker.selected, 1);
 
         // Navigate up with 'k'
-        let k_msg = Message::new(KeyMsg {
-            key_type: KeyType::Runes,
-            runes: vec!['k'],
-            alt: false,
-            paste: false,
-        });
-        picker.update(k_msg);
+        picker.update(key_msg(KeyType::Runes, vec!['k']));
         assert_eq!(picker.selected, 0);
     }
 
@@ -655,22 +655,10 @@ mod tests {
         let sessions = vec![make_meta(&session_path)];
         let mut picker = SessionPicker::new(sessions);
 
-        let ctrl_d_msg = Message::new(KeyMsg {
-            key_type: KeyType::CtrlD,
-            runes: vec![],
-            alt: false,
-            paste: false,
-        });
-        picker.update(ctrl_d_msg);
+        picker.update(key_msg(KeyType::CtrlD, vec![]));
         assert!(picker.confirm_delete.is_some());
 
-        let n_msg = Message::new(KeyMsg {
-            key_type: KeyType::Runes,
-            runes: vec!['n'],
-            alt: false,
-            paste: false,
-        });
-        picker.update(n_msg);
+        picker.update(key_msg(KeyType::Runes, vec!['n']));
         assert!(picker.confirm_delete.is_none());
         assert!(session_path.exists());
     }
@@ -684,23 +672,128 @@ mod tests {
         let sessions = vec![make_meta(&session_path)];
         let mut picker = SessionPicker::new(sessions);
 
-        let ctrl_d_msg = Message::new(KeyMsg {
-            key_type: KeyType::CtrlD,
-            runes: vec![],
-            alt: false,
-            paste: false,
-        });
-        picker.update(ctrl_d_msg);
+        picker.update(key_msg(KeyType::CtrlD, vec![]));
 
-        let y_msg = Message::new(KeyMsg {
-            key_type: KeyType::Runes,
-            runes: vec!['y'],
-            alt: false,
-            paste: false,
-        });
-        picker.update(y_msg);
+        picker.update(key_msg(KeyType::Runes, vec!['y']));
 
         assert!(!session_path.exists());
         assert!(picker.sessions.is_empty());
+    }
+
+    #[test]
+    fn session_picker_navigation_bounds() {
+        let sessions = vec![
+            SessionMeta {
+                path: "/test/a.jsonl".to_string(),
+                id: "aaaaaaaa".to_string(),
+                cwd: "/test".to_string(),
+                timestamp: "2025-01-15T10:00:00.000Z".to_string(),
+                message_count: 1,
+                last_modified_ms: 1000,
+                size_bytes: 100,
+                name: None,
+            },
+            SessionMeta {
+                path: "/test/b.jsonl".to_string(),
+                id: "bbbbbbbb".to_string(),
+                cwd: "/test".to_string(),
+                timestamp: "2025-01-15T11:00:00.000Z".to_string(),
+                message_count: 2,
+                last_modified_ms: 2000,
+                size_bytes: 200,
+                name: None,
+            },
+        ];
+
+        let mut picker = SessionPicker::new(sessions);
+        picker.update(key_msg(KeyType::Up, vec![]));
+        assert_eq!(picker.selected, 0);
+
+        picker.update(key_msg(KeyType::Down, vec![]));
+        picker.update(key_msg(KeyType::Down, vec![]));
+        assert_eq!(picker.selected, 1);
+    }
+
+    #[test]
+    fn session_picker_enter_selects_current_session() {
+        let sessions = vec![
+            SessionMeta {
+                path: "/test/a.jsonl".to_string(),
+                id: "aaaaaaaa".to_string(),
+                cwd: "/test".to_string(),
+                timestamp: "2025-01-15T10:00:00.000Z".to_string(),
+                message_count: 1,
+                last_modified_ms: 1000,
+                size_bytes: 100,
+                name: None,
+            },
+            SessionMeta {
+                path: "/test/b.jsonl".to_string(),
+                id: "bbbbbbbb".to_string(),
+                cwd: "/test".to_string(),
+                timestamp: "2025-01-15T11:00:00.000Z".to_string(),
+                message_count: 2,
+                last_modified_ms: 2000,
+                size_bytes: 200,
+                name: Some("chosen".to_string()),
+            },
+        ];
+
+        let mut picker = SessionPicker::new(sessions);
+        picker.update(key_msg(KeyType::Down, vec![]));
+        picker.update(key_msg(KeyType::Enter, vec![]));
+        assert_eq!(picker.selected_path(), Some("/test/b.jsonl"));
+        assert!(!picker.was_cancelled());
+    }
+
+    #[test]
+    fn session_picker_cancel_keys_mark_cancelled() {
+        let sessions = vec![SessionMeta {
+            path: "/test/a.jsonl".to_string(),
+            id: "aaaaaaaa".to_string(),
+            cwd: "/test".to_string(),
+            timestamp: "2025-01-15T10:00:00.000Z".to_string(),
+            message_count: 1,
+            last_modified_ms: 1000,
+            size_bytes: 100,
+            name: None,
+        }];
+
+        let mut esc_picker = SessionPicker::new(sessions.clone());
+        esc_picker.update(key_msg(KeyType::Esc, vec![]));
+        assert!(esc_picker.was_cancelled());
+
+        let mut q_picker = SessionPicker::new(sessions.clone());
+        q_picker.update(key_msg(KeyType::Runes, vec!['q']));
+        assert!(q_picker.was_cancelled());
+
+        let mut ctrl_c_picker = SessionPicker::new(sessions);
+        ctrl_c_picker.update(key_msg(KeyType::CtrlC, vec![]));
+        assert!(ctrl_c_picker.was_cancelled());
+    }
+
+    #[test]
+    fn session_picker_view_empty_and_populated_states() {
+        let empty_picker = SessionPicker::new(Vec::new());
+        let empty_view = empty_picker.view();
+        assert!(empty_view.contains("Select a session to resume"));
+        assert!(empty_view.contains("No sessions found for this project."));
+
+        let sessions = vec![SessionMeta {
+            path: "/test/a.jsonl".to_string(),
+            id: "aaaaaaaa-bbbb".to_string(),
+            cwd: "/test".to_string(),
+            timestamp: "2025-01-15T10:00:00.000Z".to_string(),
+            message_count: 3,
+            last_modified_ms: 1000,
+            size_bytes: 100,
+            name: Some("demo".to_string()),
+        }];
+        let mut populated = SessionPicker::new(sessions);
+        populated.update(key_msg(KeyType::CtrlD, vec![]));
+        let view = populated.view();
+        assert!(view.contains("Messages"));
+        assert!(view.contains("Session ID"));
+        assert!(view.contains("Delete session? Press y/n to confirm."));
     }
 }

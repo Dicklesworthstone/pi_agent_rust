@@ -2369,7 +2369,7 @@
       "directory": "npm/zenobius-pi-dcp",
       "retrieved": "2026-02-05",
       "checksum": {
-        "sha256": "54a746244d1f83cba01652c3e1e0eff731398fb511433124a14679caa651ca93"
+        "sha256": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2"
       },
       "name": "@zenobius/pi-dcp",
       "version": "0.1.0",

@@ -1773,4 +1773,159 @@ mod tests {
             diagnostics[0]
         );
     }
+
+    #[test]
+    fn test_extract_string_list_variants() {
+        assert_eq!(
+            extract_string_list(&Value::String("one".to_string())),
+            vec!["one".to_string()]
+        );
+        assert_eq!(
+            extract_string_list(&json!(["one", 2, "three", true, null])),
+            vec!["one".to_string(), "three".to_string()]
+        );
+        assert!(extract_string_list(&json!({"a": 1})).is_empty());
+    }
+
+    #[test]
+    fn test_validate_name_catches_all_error_categories() {
+        let errors = validate_name("Bad--Name-", "parent");
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("does not match parent directory"))
+        );
+        assert!(errors.iter().any(|e| e.contains("invalid characters")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must not start or end with a hyphen"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must not contain consecutive hyphens"))
+        );
+
+        let too_long = "a".repeat(MAX_SKILL_NAME_LEN + 1);
+        let too_long_errors = validate_name(&too_long, &too_long);
+        assert!(
+            too_long_errors
+                .iter()
+                .any(|e| e.contains(&format!("name exceeds {MAX_SKILL_NAME_LEN} characters")))
+        );
+    }
+
+    #[test]
+    fn test_validate_description_rules() {
+        let empty_errors = validate_description("   ");
+        assert!(empty_errors.iter().any(|e| e == "description is required"));
+
+        let long = "x".repeat(MAX_SKILL_DESC_LEN + 1);
+        let long_errors = validate_description(&long);
+        assert!(long_errors.iter().any(|e| e.contains(&format!(
+            "description exceeds {MAX_SKILL_DESC_LEN} characters"
+        ))));
+
+        assert!(validate_description("ok").is_empty());
+    }
+
+    #[test]
+    fn test_validate_frontmatter_fields_allows_known_and_rejects_unknown() {
+        let keys = vec![
+            "name".to_string(),
+            "description".to_string(),
+            "unknown-field".to_string(),
+        ];
+        let errors = validate_frontmatter_fields(keys.iter());
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0], "unknown frontmatter field \"unknown-field\"");
+    }
+
+    #[test]
+    fn test_escape_xml_replaces_all_special_chars() {
+        let escaped = escape_xml("& < > \" '");
+        assert_eq!(escaped, "&amp; &lt; &gt; &quot; &apos;");
+    }
+
+    #[test]
+    fn test_parse_frontmatter_valid_and_unclosed() {
+        let parsed = parse_frontmatter(
+            r#"---
+name: "skill-name"
+description: 'demo'
+# comment
+metadata: keep
+---
+body line 1
+body line 2"#,
+        );
+        assert_eq!(
+            parsed.frontmatter.get("name"),
+            Some(&"skill-name".to_string())
+        );
+        assert_eq!(
+            parsed.frontmatter.get("description"),
+            Some(&"demo".to_string())
+        );
+        assert_eq!(
+            parsed.frontmatter.get("metadata"),
+            Some(&"keep".to_string())
+        );
+        assert_eq!(parsed.body, "body line 1\nbody line 2");
+
+        let unclosed = parse_frontmatter(
+            r#"---
+name: nope
+still frontmatter"#,
+        );
+        assert!(unclosed.frontmatter.is_empty());
+        assert!(unclosed.body.starts_with("---"));
+    }
+
+    #[test]
+    fn test_resolve_path_tilde_relative_absolute_and_trim() {
+        let cwd = Path::new("/work/cwd");
+        let home = dirs::home_dir().unwrap_or_else(|| cwd.to_path_buf());
+
+        assert_eq!(resolve_path("  rel/file  ", cwd), cwd.join("rel/file"));
+        assert_eq!(resolve_path("/abs/file", cwd), PathBuf::from("/abs/file"));
+        assert_eq!(resolve_path("~", cwd), home);
+        assert_eq!(resolve_path("~/cfg", cwd), home.join("cfg"));
+        assert_eq!(resolve_path("~custom", cwd), home.join("custom"));
+    }
+
+    #[test]
+    fn test_theme_path_helpers() {
+        assert!(is_theme_file(Path::new("/tmp/theme.json")));
+        assert!(is_theme_file(Path::new("/tmp/theme.ini")));
+        assert!(is_theme_file(Path::new("/tmp/theme.theme")));
+        assert!(!is_theme_file(Path::new("/tmp/theme.txt")));
+
+        assert_eq!(
+            build_path_source_label(Path::new("/tmp/ocean.theme")),
+            "(path:ocean)"
+        );
+        assert_eq!(build_path_source_label(Path::new("/")), "(path:path)");
+    }
+
+    #[test]
+    fn test_dedupe_paths_preserves_order_of_first_occurrence() {
+        let paths = vec![
+            PathBuf::from("/a"),
+            PathBuf::from("/b"),
+            PathBuf::from("/a"),
+            PathBuf::from("/c"),
+            PathBuf::from("/b"),
+        ];
+        let deduped = dedupe_paths(paths);
+        assert_eq!(
+            deduped,
+            vec![
+                PathBuf::from("/a"),
+                PathBuf::from("/b"),
+                PathBuf::from("/c"),
+            ]
+        );
+    }
 }

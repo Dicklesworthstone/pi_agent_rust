@@ -20,10 +20,13 @@ use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::connectors::{Connector, HostCallPayload, http::HttpConnector};
+use crate::connectors::{Connector, http::HttpConnector};
 use crate::error::Result;
 use crate::extensions::EXTENSION_EVENT_TIMEOUT_MS;
-use crate::extensions::{ExtensionSession, ExtensionUiRequest, ExtensionUiResponse};
+use crate::extensions::{
+    ExtensionBody, ExtensionMessage, ExtensionSession, ExtensionUiRequest, ExtensionUiResponse,
+    HostCallError, HostCallErrorCode, HostCallPayload, HostResultPayload, HostStreamChunk,
+};
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, js_to_json, json_to_js};
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
 use crate::tools::ToolRegistry;
@@ -53,6 +56,81 @@ fn ui_response_value_for_op(op: &str, response: &ExtensionUiResponse) -> Value {
         };
     }
     response.value.clone().unwrap_or(Value::Null)
+}
+
+fn protocol_hostcall_op(params: &Value) -> Option<String> {
+    params
+        .get("op")
+        .or_else(|| params.get("method"))
+        .or_else(|| params.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn protocol_normalize_output(value: Value) -> Value {
+    if value.is_object() {
+        value
+    } else {
+        serde_json::json!({ "value": value })
+    }
+}
+
+fn protocol_error_code(code: &str) -> HostCallErrorCode {
+    match code {
+        "timeout" => HostCallErrorCode::Timeout,
+        "denied" => HostCallErrorCode::Denied,
+        "io" | "tool_error" => HostCallErrorCode::Io,
+        "invalid_request" => HostCallErrorCode::InvalidRequest,
+        _ => HostCallErrorCode::Internal,
+    }
+}
+
+fn hostcall_outcome_to_protocol_result(
+    call_id: &str,
+    outcome: HostcallOutcome,
+) -> HostResultPayload {
+    match outcome {
+        HostcallOutcome::Success(output) => HostResultPayload {
+            call_id: call_id.to_string(),
+            output: protocol_normalize_output(output),
+            is_error: false,
+            error: None,
+            chunk: None,
+        },
+        HostcallOutcome::StreamChunk {
+            sequence,
+            chunk,
+            is_final,
+        } => HostResultPayload {
+            call_id: call_id.to_string(),
+            output: serde_json::json!({
+                "sequence": sequence,
+                "chunk": chunk,
+                "isFinal": is_final,
+            }),
+            is_error: false,
+            error: None,
+            chunk: Some(HostStreamChunk {
+                index: sequence,
+                is_last: is_final,
+                backpressure: None,
+            }),
+        },
+        HostcallOutcome::Error { code, message } => HostResultPayload {
+            call_id: call_id.to_string(),
+            output: serde_json::json!({}),
+            is_error: true,
+            error: Some(HostCallError {
+                code: protocol_error_code(&code),
+                message,
+                details: None,
+                retryable: None,
+            }),
+            chunk: None,
+        },
+    }
 }
 
 impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
@@ -112,6 +190,113 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         })
     }
 
+    /// Protocol adapter: convert `ExtensionMessage(type=host_call)` into
+    /// `ExtensionMessage(type=host_result)` using the same dispatch paths used
+    /// by runtime hostcalls.
+    #[allow(clippy::future_not_send)]
+    pub fn dispatch_protocol_message(
+        &self,
+        message: ExtensionMessage,
+    ) -> Pin<Box<dyn Future<Output = Result<ExtensionMessage>> + '_>> {
+        Box::pin(async move {
+            message.validate()?;
+            let ExtensionMessage { id, version, body } = message;
+            let ExtensionBody::HostCall(payload) = body else {
+                return Err(crate::error::Error::validation(
+                    "dispatch_protocol_message expects host_call message",
+                ));
+            };
+
+            let outcome = self.dispatch_protocol_host_call(&payload).await;
+            let response = ExtensionMessage {
+                id,
+                version,
+                body: ExtensionBody::HostResult(hostcall_outcome_to_protocol_result(
+                    &payload.call_id,
+                    outcome,
+                )),
+            };
+            response.validate()?;
+            Ok(response)
+        })
+    }
+
+    #[allow(clippy::future_not_send)]
+    async fn dispatch_protocol_host_call(&self, payload: &HostCallPayload) -> HostcallOutcome {
+        let method = payload.method.trim().to_ascii_lowercase();
+        let params = payload.params.clone();
+
+        match method.as_str() {
+            "tool" => {
+                let Some(name) = params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                else {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "host_call tool requires params.name".to_string(),
+                    };
+                };
+                let input = params
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| Value::Object(serde_json::Map::new()));
+                self.dispatch_tool(&payload.call_id, name, input).await
+            }
+            "exec" => {
+                let Some(cmd) = params
+                    .get("cmd")
+                    .or_else(|| params.get("command"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|cmd| !cmd.is_empty())
+                    .map(ToString::to_string)
+                else {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "host_call exec requires params.cmd or params.command".to_string(),
+                    };
+                };
+                self.dispatch_exec(&payload.call_id, &cmd, params).await
+            }
+            "http" => self.dispatch_http(&payload.call_id, params).await,
+            "session" => {
+                let Some(op) = protocol_hostcall_op(&params) else {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "host_call session requires params.op".to_string(),
+                    };
+                };
+                self.dispatch_session(&payload.call_id, &op, params).await
+            }
+            "ui" => {
+                let Some(op) = protocol_hostcall_op(&params) else {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "host_call ui requires params.op".to_string(),
+                    };
+                };
+                self.dispatch_ui(&payload.call_id, &op, params).await
+            }
+            "events" => {
+                let Some(op) = protocol_hostcall_op(&params) else {
+                    return HostcallOutcome::Error {
+                        code: "invalid_request".to_string(),
+                        message: "host_call events requires params.op".to_string(),
+                    };
+                };
+                self.dispatch_events(&payload.call_id, None, &op, params)
+                    .await
+            }
+            _ => HostcallOutcome::Error {
+                code: "invalid_request".to_string(),
+                message: format!("Unsupported host_call method: {method}"),
+            },
+        }
+    }
+
     #[allow(clippy::future_not_send)]
     async fn dispatch_tool(
         &self,
@@ -148,8 +333,44 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         cmd: &str,
         payload: serde_json::Value,
     ) -> HostcallOutcome {
-        use std::io::Read as _;
+        use std::io::{BufRead as _, Read as _};
         use std::process::{Command, Stdio};
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+        use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+
+        enum ExecStreamFrame {
+            Stdout(String),
+            Stderr(String),
+            Final { code: i32, killed: bool },
+            Error(String),
+        }
+
+        fn pump_stream<R: std::io::Read>(
+            reader: R,
+            tx: &SyncSender<ExecStreamFrame>,
+            stdout: bool,
+        ) -> std::result::Result<(), String> {
+            let mut reader = std::io::BufReader::new(reader);
+            loop {
+                let mut buf = Vec::new();
+                let read = reader
+                    .read_until(b'\n', &mut buf)
+                    .map_err(|err| err.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&buf).to_string();
+                let frame = if stdout {
+                    ExecStreamFrame::Stdout(text)
+                } else {
+                    ExecStreamFrame::Stderr(text)
+                };
+                if tx.send(frame).is_err() {
+                    break;
+                }
+            }
+            Ok(())
+        }
 
         let args_value = payload
             .get("args")
@@ -193,6 +414,156 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     .and_then(serde_json::Value::as_u64)
             })
             .filter(|ms| *ms > 0);
+        let stream = options
+            .get("stream")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+
+        if stream {
+            let cmd = cmd.to_string();
+            let args = args.clone();
+            let (tx, rx) = mpsc::sync_channel::<ExecStreamFrame>(256);
+            let cancel = Arc::new(AtomicBool::new(false));
+            let cancel_worker = Arc::clone(&cancel);
+            let call_id_for_error = call_id.to_string();
+
+            thread::spawn(move || {
+                let result = (|| -> std::result::Result<(), String> {
+                    let mut command = Command::new(&cmd);
+                    command
+                        .args(&args)
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped())
+                        .current_dir(&cwd);
+
+                    let mut child = command.spawn().map_err(|err| err.to_string())?;
+                    let pid = child.id();
+
+                    let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
+                    let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
+
+                    let stdout_tx = tx.clone();
+                    let stderr_tx = tx.clone();
+                    let stdout_handle =
+                        thread::spawn(move || pump_stream(stdout, &stdout_tx, true));
+                    let stderr_handle =
+                        thread::spawn(move || pump_stream(stderr, &stderr_tx, false));
+
+                    let start = Instant::now();
+                    let mut killed = false;
+                    let status = loop {
+                        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                            break status;
+                        }
+
+                        if cancel_worker.load(AtomicOrdering::SeqCst) {
+                            killed = true;
+                            crate::tools::kill_process_tree(Some(pid));
+                            let _ = child.kill();
+                            break child.wait().map_err(|err| err.to_string())?;
+                        }
+
+                        if let Some(timeout_ms) = timeout_ms {
+                            if start.elapsed() >= Duration::from_millis(timeout_ms) {
+                                killed = true;
+                                crate::tools::kill_process_tree(Some(pid));
+                                let _ = child.kill();
+                                break child.wait().map_err(|err| err.to_string())?;
+                            }
+                        }
+
+                        thread::sleep(Duration::from_millis(10));
+                    };
+
+                    let stdout_result = stdout_handle
+                        .join()
+                        .map_err(|_| "stdout reader thread panicked".to_string())?;
+                    if let Err(err) = stdout_result {
+                        return Err(format!("Read stdout: {err}"));
+                    }
+
+                    let stderr_result = stderr_handle
+                        .join()
+                        .map_err(|_| "stderr reader thread panicked".to_string())?;
+                    if let Err(err) = stderr_result {
+                        return Err(format!("Read stderr: {err}"));
+                    }
+
+                    let code = status.code().unwrap_or(0);
+                    let _ = tx.send(ExecStreamFrame::Final { code, killed });
+                    Ok(())
+                })();
+
+                if let Err(err) = result {
+                    if tx.send(ExecStreamFrame::Error(err)).is_err() {
+                        tracing::trace!(
+                            call_id = %call_id_for_error,
+                            "Exec hostcall stream result dropped before completion"
+                        );
+                    }
+                }
+            });
+
+            let mut sequence = 0_u64;
+            loop {
+                if !self.runtime.is_hostcall_pending(call_id) {
+                    cancel.store(true, AtomicOrdering::SeqCst);
+                    return HostcallOutcome::Error {
+                        code: "cancelled".to_string(),
+                        message: "exec stream cancelled".to_string(),
+                    };
+                }
+
+                match rx.recv_timeout(Duration::from_millis(25)) {
+                    Ok(ExecStreamFrame::Stdout(chunk)) => {
+                        self.runtime.complete_hostcall(
+                            call_id.to_string(),
+                            HostcallOutcome::StreamChunk {
+                                sequence,
+                                chunk: serde_json::json!({ "stdout": chunk }),
+                                is_final: false,
+                            },
+                        );
+                        sequence = sequence.saturating_add(1);
+                    }
+                    Ok(ExecStreamFrame::Stderr(chunk)) => {
+                        self.runtime.complete_hostcall(
+                            call_id.to_string(),
+                            HostcallOutcome::StreamChunk {
+                                sequence,
+                                chunk: serde_json::json!({ "stderr": chunk }),
+                                is_final: false,
+                            },
+                        );
+                        sequence = sequence.saturating_add(1);
+                    }
+                    Ok(ExecStreamFrame::Final { code, killed }) => {
+                        return HostcallOutcome::StreamChunk {
+                            sequence,
+                            chunk: serde_json::json!({
+                                "code": code,
+                                "killed": killed,
+                            }),
+                            is_final: true,
+                        };
+                    }
+                    Ok(ExecStreamFrame::Error(message)) => {
+                        return HostcallOutcome::Error {
+                            code: "io".to_string(),
+                            message,
+                        };
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        return HostcallOutcome::Error {
+                            code: "internal".to_string(),
+                            message: "exec stream channel closed".to_string(),
+                        };
+                    }
+                }
+            }
+        }
 
         let cmd = cmd.to_string();
         let args = args.clone();
@@ -853,6 +1224,7 @@ mod tests {
     use super::*;
 
     use crate::connectors::http::HttpConnectorConfig;
+    use crate::extensions::{ExtensionBody, ExtensionMessage, HostCallPayload, PROTOCOL_VERSION};
     use crate::scheduler::DeterministicClock;
     use crate::session::SessionMessage;
     use serde_json::Value;
@@ -1736,6 +2108,145 @@ mod tests {
                 )
                 .await
                 .expect("verify error");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatcher_exec_hostcall_streaming_callback_delivers_chunks_and_final_result() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.chunks = [];
+                    globalThis.finalResult = null;
+                    pi.exec("sh", ["-c", "printf 'out-1\n'; printf 'err-1\n' 1>&2; printf 'out-2\n'"], {
+                        stream: true,
+                        onChunk: (chunk, isFinal) => {
+                            globalThis.chunks.push({ chunk, isFinal });
+                        },
+                    }).then((r) => { globalThis.finalResult = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!Array.isArray(globalThis.chunks) || globalThis.chunks.length < 3) {
+                        throw new Error("Expected stream chunks, got: " + JSON.stringify(globalThis.chunks));
+                    }
+                    const sawStdout = globalThis.chunks.some((entry) => entry.chunk && entry.chunk.stdout && entry.chunk.stdout.includes("out-1"));
+                    if (!sawStdout) {
+                        throw new Error("Missing stdout chunk: " + JSON.stringify(globalThis.chunks));
+                    }
+                    const sawStderr = globalThis.chunks.some((entry) => entry.chunk && entry.chunk.stderr && entry.chunk.stderr.includes("err-1"));
+                    if (!sawStderr) {
+                        throw new Error("Missing stderr chunk: " + JSON.stringify(globalThis.chunks));
+                    }
+                    const finalEntry = globalThis.chunks[globalThis.chunks.length - 1];
+                    if (!finalEntry || finalEntry.isFinal !== true) {
+                        throw new Error("Missing final chunk marker: " + JSON.stringify(globalThis.chunks));
+                    }
+                    if (globalThis.finalResult === null) {
+                        throw new Error("Promise not resolved");
+                    }
+                    if (globalThis.finalResult.code !== 0) {
+                        throw new Error("Wrong exit code: " + JSON.stringify(globalThis.finalResult));
+                    }
+                    if (globalThis.finalResult.killed !== false) {
+                        throw new Error("Unexpected killed flag: " + JSON.stringify(globalThis.finalResult));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify stream callback result");
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dispatcher_exec_hostcall_streaming_async_iterator_delivers_chunks_in_order() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.iterChunks = [];
+                    globalThis.iterDone = false;
+                    (async () => {
+                        const stream = pi.exec("sh", ["-c", "printf 'a\n'; printf 'b\n'"], { stream: true });
+                        for await (const chunk of stream) {
+                            globalThis.iterChunks.push(chunk);
+                        }
+                        globalThis.iterDone = true;
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.iterDone !== true) {
+                        throw new Error("Async iterator did not finish");
+                    }
+                    if (!Array.isArray(globalThis.iterChunks) || globalThis.iterChunks.length < 3) {
+                        throw new Error("Missing stream chunks: " + JSON.stringify(globalThis.iterChunks));
+                    }
+                    if (!globalThis.iterChunks[0] || globalThis.iterChunks[0].stdout !== "a\n") {
+                        throw new Error("Unexpected first chunk: " + JSON.stringify(globalThis.iterChunks));
+                    }
+                    if (!globalThis.iterChunks[1] || globalThis.iterChunks[1].stdout !== "b\n") {
+                        throw new Error("Unexpected second chunk: " + JSON.stringify(globalThis.iterChunks));
+                    }
+                    const finalChunk = globalThis.iterChunks[globalThis.iterChunks.length - 1];
+                    if (!finalChunk || finalChunk.code !== 0 || finalChunk.killed !== false) {
+                        throw new Error("Unexpected final chunk: " + JSON.stringify(finalChunk));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify async iterator result");
         });
     }
 
@@ -6693,6 +7204,123 @@ mod tests {
                     _ => panic!("alias pair ({snake}, {camel}) should both succeed"),
                 }
             }
+        });
+    }
+
+    #[test]
+    fn protocol_adapter_host_call_to_host_result_success() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            let message = ExtensionMessage {
+                id: "msg-hostcall-1".to_string(),
+                version: PROTOCOL_VERSION.to_string(),
+                body: ExtensionBody::HostCall(HostCallPayload {
+                    call_id: "call-hostcall-1".to_string(),
+                    capability: "session".to_string(),
+                    method: "session".to_string(),
+                    params: serde_json::json!({ "op": "get_state" }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                }),
+            };
+
+            let response = dispatcher
+                .dispatch_protocol_message(message)
+                .await
+                .expect("protocol dispatch");
+
+            match response.body {
+                ExtensionBody::HostResult(result) => {
+                    assert_eq!(result.call_id, "call-hostcall-1");
+                    assert!(!result.is_error, "expected success host_result");
+                    assert!(
+                        result.output.is_object(),
+                        "host_result output must remain object"
+                    );
+                    assert!(result.error.is_none(), "success should not include error");
+                }
+                other => panic!("expected host_result body, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn protocol_adapter_missing_op_returns_invalid_request_taxonomy() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            let message = ExtensionMessage {
+                id: "msg-hostcall-2".to_string(),
+                version: PROTOCOL_VERSION.to_string(),
+                body: ExtensionBody::HostCall(HostCallPayload {
+                    call_id: "call-hostcall-2".to_string(),
+                    capability: "session".to_string(),
+                    method: "session".to_string(),
+                    params: serde_json::json!({}),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                }),
+            };
+
+            let response = dispatcher
+                .dispatch_protocol_message(message)
+                .await
+                .expect("protocol dispatch");
+
+            match response.body {
+                ExtensionBody::HostResult(result) => {
+                    assert!(result.is_error, "expected error host_result");
+                    assert!(result.output.is_object(), "error output must be object");
+                    let error = result.error.expect("error payload");
+                    assert_eq!(
+                        error.code,
+                        crate::extensions::HostCallErrorCode::InvalidRequest
+                    );
+                }
+                other => panic!("expected host_result body, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn protocol_adapter_rejects_non_host_call_messages() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            let message = ExtensionMessage {
+                id: "msg-hostcall-3".to_string(),
+                version: PROTOCOL_VERSION.to_string(),
+                body: ExtensionBody::ToolResult(crate::extensions::ToolResultPayload {
+                    call_id: "tool-1".to_string(),
+                    output: serde_json::json!({}),
+                    is_error: false,
+                }),
+            };
+
+            let err = dispatcher
+                .dispatch_protocol_message(message)
+                .await
+                .expect_err("non-host-call should fail");
+            assert!(
+                err.to_string()
+                    .contains("dispatch_protocol_message expects host_call"),
+                "unexpected error: {err}"
+            );
         });
     }
 }
