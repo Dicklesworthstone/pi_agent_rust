@@ -3713,6 +3713,72 @@
       }
     },
     {
+      "id": "npm/mitsupi",
+      "entry_path": "npm/mitsupi/pi-extensions/answer.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": true,
+        "registers_providers": false,
+        "subscribes_events": [
+          "agent_end",
+          "connect",
+          "data",
+          "error",
+          "session_before_compact",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "session_tree",
+          "turn_end",
+          "turn_start"
+        ],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 5,
+      "mock_requirements": [
+        "exec"
+      ],
+      "registrations": {
+        "tools": [
+          "list_sessions",
+          "send_to_session",
+          "signal_loop_success",
+          "todo"
+        ],
+        "commands": [
+          "answer",
+          "control-sessions",
+          "diff",
+          "end-review",
+          "files",
+          "loop",
+          "review",
+          "todos"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "agent_end",
+          "connect",
+          "data",
+          "error",
+          "session_before_compact",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "session_tree",
+          "turn_end",
+          "turn_start"
+        ]
+      }
+    },
+    {
       "id": "npm/ogulcancelik-pi-sketch",
       "entry_path": "npm/ogulcancelik-pi-sketch/extensions/index.ts",
       "source_tier": "npm-registry",
@@ -4040,6 +4106,65 @@
       }
     },
     {
+      "id": "npm/pi-extensions",
+      "entry_path": "npm/pi-extensions/agent-guidance/agent-guidance.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [
+          "agent_end",
+          "before_agent_start",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_result"
+        ],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [
+        "exec"
+      ],
+      "registrations": {
+        "tools": [
+          "ralph_done",
+          "ralph_start"
+        ],
+        "commands": [
+          "code",
+          "diff",
+          "mario-not",
+          "paste",
+          "picman",
+          "ping",
+          "ralph",
+          "ralph-stop",
+          "readfiles",
+          "review",
+          "spice-invaders",
+          "tetris",
+          "usage"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "agent_end",
+          "before_agent_start",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_result"
+        ]
+      }
+    },
+    {
       "id": "npm/pi-ghostty-theme-sync",
       "entry_path": "npm/pi-ghostty-theme-sync/extensions/index.ts",
       "source_tier": "npm-registry",
@@ -4067,6 +4192,88 @@
         "commands": [],
         "flags": [],
         "event_handlers": [
+          "session_start"
+        ]
+      }
+    },
+    {
+      "id": "npm/pi-interactive-shell",
+      "entry_path": "npm/pi-interactive-shell/index.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [
+          "session_shutdown",
+          "session_start",
+          "session_switch"
+        ],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": true
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [
+        "exec"
+      ],
+      "registrations": {
+        "tools": [],
+        "commands": [
+          "attach",
+          "dismiss"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "session_shutdown",
+          "session_start",
+          "session_switch"
+        ]
+      }
+    },
+    {
+      "id": "npm/pi-mcp-adapter",
+      "entry_path": "npm/pi-mcp-adapter/index.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": true,
+        "registers_providers": false,
+        "subscribes_events": [
+          "close",
+          "error",
+          "session_shutdown",
+          "session_start"
+        ],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": true
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [
+        "exec"
+      ],
+      "registrations": {
+        "tools": [
+          "mcp"
+        ],
+        "commands": [
+          "mcp",
+          "mcp-auth"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "close",
+          "error",
+          "session_shutdown",
           "session_start"
         ]
       }
@@ -4318,6 +4525,82 @@
       }
     },
     {
+      "id": "npm/pi-package-test",
+      "entry_path": "npm/pi-package-test/extensions/confirm-destructive.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": true,
+        "registers_providers": false,
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "context",
+          "session_before_compact",
+          "session_before_fork",
+          "session_before_switch",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start"
+        ],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": true
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [
+          "signal_loop_success"
+        ],
+        "commands": [
+          "cost",
+          "flicker-corp",
+          "footer",
+          "fun-working",
+          "handoff",
+          "loop",
+          "mem",
+          "oracle",
+          "plan",
+          "remember",
+          "signature-flicker",
+          "speedread",
+          "status",
+          "status-refresh",
+          "todos",
+          "ultrathink",
+          "usage"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "context",
+          "session_before_compact",
+          "session_before_fork",
+          "session_before_switch",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call",
+          "tool_result",
+          "turn_end",
+          "turn_start"
+        ]
+      }
+    },
+    {
       "id": "npm/pi-poly-notify",
       "entry_path": "npm/pi-poly-notify/extensions/poly-notify/index.ts",
       "source_tier": "npm-registry",
@@ -4352,6 +4635,61 @@
           "agent_end",
           "agent_start",
           "session_start"
+        ]
+      }
+    },
+    {
+      "id": "npm/pi-powerline-footer",
+      "entry_path": "npm/pi-powerline-footer/index.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": true,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "close",
+          "data",
+          "error",
+          "session_start",
+          "tool_call",
+          "tool_result",
+          "user_bash",
+          "user_message"
+        ],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [
+        "exec"
+      ],
+      "registrations": {
+        "tools": [],
+        "commands": [
+          "powerline",
+          "vibe"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "close",
+          "data",
+          "error",
+          "session_start",
+          "tool_call",
+          "tool_result",
+          "user_bash",
+          "user_message"
         ]
       }
     },
@@ -5108,6 +5446,73 @@
       }
     },
     {
+      "id": "npm/shitty-extensions",
+      "entry_path": "npm/shitty-extensions/extensions/clipboard.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": true,
+        "registers_providers": false,
+        "subscribes_events": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "session_before_compact",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ],
+        "uses_exec": true,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [
+        "exec"
+      ],
+      "registrations": {
+        "tools": [
+          "copy_to_clipboard",
+          "plan",
+          "signal_loop_success"
+        ],
+        "commands": [
+          "cost",
+          "flicker-corp",
+          "fun-working",
+          "handoff",
+          "loop",
+          "mem",
+          "oracle",
+          "plan",
+          "remember",
+          "resistance",
+          "signature-flicker",
+          "speedread",
+          "status",
+          "status-refresh",
+          "ultrathink",
+          "usage"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "agent_end",
+          "agent_start",
+          "before_agent_start",
+          "session_before_compact",
+          "session_shutdown",
+          "session_start",
+          "session_switch",
+          "tool_call"
+        ]
+      }
+    },
+    {
       "id": "npm/token-rate-pi",
       "entry_path": "npm/token-rate-pi/token-rate.ts",
       "source_tier": "npm-registry",
@@ -5312,6 +5717,32 @@
           "web-fetch",
           "web-search"
         ],
+        "commands": [],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
+      "id": "npm/verioussmith-pi-openrouter",
+      "entry_path": "npm/verioussmith-pi-openrouter/openrouter.ts",
+      "source_tier": "npm-registry",
+      "capabilities": {
+        "registers_tools": false,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": true,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": false,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [],
         "commands": [],
         "flags": [],
         "event_handlers": []

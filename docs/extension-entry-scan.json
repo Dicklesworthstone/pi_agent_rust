@@ -3,15 +3,15 @@
   "generated": "2026-02-05",
   "description": "Static scan of extension corpus entry points (bd-2u2s)",
   "summary": {
-    "total_files": 1198,
-    "entry_points": 310,
-    "sub_modules": 765,
-    "non_extensions": 117,
+    "total_files": 1295,
+    "entry_points": 363,
+    "sub_modules": 808,
+    "non_extensions": 118,
     "unknown": 6,
     "by_confidence": {
-      "high": 1097,
+      "high": 1192,
       "low": 14,
-      "medium": 87
+      "medium": 89
     },
     "by_tier": {
       "agents-mikeastock": {
@@ -30,9 +30,9 @@
         "sub_modules": 57
       },
       "npm-registry": {
-        "total_files": 364,
-        "entry_points": 68,
-        "sub_modules": 264
+        "total_files": 461,
+        "entry_points": 121,
+        "sub_modules": 307
       },
       "official-pi-mono": {
         "total_files": 72,
@@ -3847,6 +3847,127 @@
       "patterns_found": []
     },
     {
+      "path": "npm/mitsupi/pi-extensions/answer.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "registerShortcut",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/control.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "registerFlag",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/cwd-history.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/files.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "registerShortcut",
+        "exec_api",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/loop.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/review.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "exec_api",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/todos.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/uv.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/mitsupi/pi-extensions/whimsical.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
       "path": "npm/ogulcancelik-pi-sketch/extensions/index.ts",
       "classification": "entry_point",
       "confidence": "high",
@@ -4023,6 +4144,279 @@
       ]
     },
     {
+      "path": "npm/pi-extensions/agent-guidance/agent-guidance.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "event_hook"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/arcade/mario-not/mario-not.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/arcade/picman.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/arcade/ping.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/arcade/spice-invaders.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/arcade/tetris.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/code-actions/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/code-actions/src/actions.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "exec_api",
+        "ui_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/code-actions/src/index.ts",
+      "classification": "non_extension",
+      "confidence": "high",
+      "patterns_found": []
+    },
+    {
+      "path": "npm/pi-extensions/code-actions/src/search.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/code-actions/src/snippets.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "exec_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/code-actions/src/ui.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "ui_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/browser.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/comment.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/constants.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/file-tree.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/file-viewer.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/git.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/input-utils.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/types.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/utils.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/files-widget/viewer.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/ralph-wiggum/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/raw-paste/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/tab-status/tab-status.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-extensions/usage-extension/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
       "path": "npm/pi-ghostty-theme-sync/extensions/index.ts",
       "classification": "entry_point",
       "confidence": "high",
@@ -4032,6 +4426,197 @@
         "ExtensionAPI_type",
         "event_hook",
         "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/config.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/headless-monitor.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "session_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "event_hook",
+        "events_api",
+        "session_api",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/key-encoding.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/overlay-component.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "session_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/pty-session.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "exec_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/reattach-overlay.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "session_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/session-manager.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "session_api",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/tool-schema.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-interactive-shell/types.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/config.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "registerFlag",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/lifecycle.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/mcp-panel.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/metadata-cache.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/npx-resolver.ts",
+      "classification": "sub_module",
+      "confidence": "medium",
+      "patterns_found": [
+        "event_hook",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/oauth-handler.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/resource-tools.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/server-manager.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/tool-registrar.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-mcp-adapter/types.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
       ]
     },
     {
@@ -4376,6 +4961,184 @@
       ]
     },
     {
+      "path": "npm/pi-package-test/extensions/confirm-destructive.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/extensions/custom-footer.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/cost-tracker.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/flicker-corp.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/funny-working-message.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/handoff.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/loop.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/memory-mode.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/oracle.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/plan-mode.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "registerShortcut",
+        "registerFlag",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/speedreading.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "registerShortcut",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/status-widget.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/ultrathink.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "registerShortcut",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-package-test/node_modules/shitty-extensions/extensions/usage-bar.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
       "path": "npm/pi-poly-notify/extensions/poly-notify/index.ts",
       "classification": "entry_point",
       "confidence": "high",
@@ -4387,6 +5150,103 @@
         "registerShortcut",
         "event_hook",
         "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/colors.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/git-status.ts",
+      "classification": "sub_module",
+      "confidence": "medium",
+      "patterns_found": [
+        "event_hook",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/icons.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/presets.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/segments.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/separators.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/theme.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/types.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/welcome.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "named_exports"
+      ]
+    },
+    {
+      "path": "npm/pi-powerline-footer/working-vibes.ts",
+      "classification": "sub_module",
+      "confidence": "high",
+      "patterns_found": [
+        "ExtensionAPI_import",
+        "named_exports"
       ]
     },
     {
@@ -5037,6 +5897,186 @@
       ]
     },
     {
+      "path": "npm/shitty-extensions/extensions/clipboard.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/cost-tracker.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/flicker-corp.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/funny-working-message.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/handoff.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/loop.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/memory-mode.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/oracle.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/plan-mode.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "registerCommand",
+        "registerShortcut",
+        "registerFlag",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/resistance.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/speedreading.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "registerShortcut",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/status-widget.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/ultrathink.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "registerShortcut",
+        "event_hook",
+        "ui_api"
+      ]
+    },
+    {
+      "path": "npm/shitty-extensions/extensions/usage-bar.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand",
+        "ui_api"
+      ]
+    },
+    {
       "path": "npm/token-rate-pi/token-rate.ts",
       "classification": "entry_point",
       "confidence": "high",
@@ -5187,6 +6227,17 @@
       "confidence": "high",
       "patterns_found": [
         "named_exports"
+      ]
+    },
+    {
+      "path": "npm/verioussmith-pi-openrouter/openrouter.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerProvider"
       ]
     },
     {
