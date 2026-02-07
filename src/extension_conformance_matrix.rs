@@ -205,8 +205,11 @@ fn build_behaviors(
             HostCapability::Read => behaviors.push(ExpectedBehavior {
                 description: "Tool reads files via pi.tool(read/grep/find/ls)".into(),
                 protocol_surface: "host_call(method=tool, name∈{read,grep,find,ls})".into(),
-                pass_criteria: "Hostcall completes with correct file content; capability derived as read".into(),
-                fail_criteria: "Hostcall denied, wrong capability derivation, or incorrect content".into(),
+                pass_criteria:
+                    "Hostcall completes with correct file content; capability derived as read"
+                        .into(),
+                fail_criteria: "Hostcall denied, wrong capability derivation, or incorrect content"
+                    .into(),
             }),
             HostCapability::Write => behaviors.push(ExpectedBehavior {
                 description: "Tool writes/edits files via pi.tool(write/edit)".into(),
@@ -216,7 +219,8 @@ fn build_behaviors(
             }),
             HostCapability::Exec => behaviors.push(ExpectedBehavior {
                 description: "Tool executes commands via pi.exec() or pi.tool(bash)".into(),
-                protocol_surface: "host_call(method=exec) or host_call(method=tool, name=bash)".into(),
+                protocol_surface: "host_call(method=exec) or host_call(method=tool, name=bash)"
+                    .into(),
                 pass_criteria: "Command runs, stdout/stderr/exitCode returned".into(),
                 fail_criteria: "Execution denied, timeout without error, or wrong exit code".into(),
             }),
@@ -253,7 +257,8 @@ fn build_behaviors(
             HostCapability::Http => behaviors.push(ExpectedBehavior {
                 description: "Provider streams LLM responses via pi.http()".into(),
                 protocol_surface: "host_call(method=http) + streamSimple streaming".into(),
-                pass_criteria: "HTTP request to LLM API succeeds; streaming chunks delivered".into(),
+                pass_criteria: "HTTP request to LLM API succeeds; streaming chunks delivered"
+                    .into(),
                 fail_criteria: "HTTP denied, stream broken, or chunks lost".into(),
             }),
             HostCapability::Read => behaviors.push(ExpectedBehavior {
@@ -326,16 +331,23 @@ fn build_behaviors(
             // Multi-category extensions: behaviors are the union of their constituent types.
             // We add a cross-cutting behavior.
             behaviors.push(ExpectedBehavior {
-                description: format!("Multi-type extension uses {capability:?} across registrations"),
-                protocol_surface: format!("Multiple register types + host_call using {capability:?}"),
-                pass_criteria: "All registration types load; capability dispatched correctly".into(),
+                description: format!(
+                    "Multi-type extension uses {capability:?} across registrations"
+                ),
+                protocol_surface: format!(
+                    "Multiple register types + host_call using {capability:?}"
+                ),
+                pass_criteria: "All registration types load; capability dispatched correctly"
+                    .into(),
                 fail_criteria: "Any registration type fails or capability mismatch".into(),
             });
         }
         ExtensionCategory::General => {
             if matches!(capability, HostCapability::Session | HostCapability::Ui) {
                 behaviors.push(ExpectedBehavior {
-                    description: format!("General extension uses {capability:?} via export default"),
+                    description: format!(
+                        "General extension uses {capability:?} via export default"
+                    ),
                     protocol_surface: format!("export default + host_call(method={capability:?})"),
                     pass_criteria: "Extension loads; hostcall dispatched and returns".into(),
                     fail_criteria: "Load failure or hostcall error".into(),
@@ -401,7 +413,8 @@ fn build_category_criteria() -> Vec<CategoryCriteria> {
                 "registerTool present in registration snapshot".into(),
                 "Tool definition includes name, description, and JSON Schema parameters".into(),
                 "tool_call dispatch reaches handler and returns tool_result".into(),
-                "Hostcalls use correct capability derivation (read/write/exec per tool name)".into(),
+                "Hostcalls use correct capability derivation (read/write/exec per tool name)"
+                    .into(),
             ],
             failure_conditions: vec![
                 "registerTool missing from snapshot".into(),
@@ -427,9 +440,7 @@ fn build_category_criteria() -> Vec<CategoryCriteria> {
                 "slash_command dispatch fails".into(),
                 "UI hostcall denied in interactive mode".into(),
             ],
-            out_of_scope: vec![
-                "Command business logic correctness".into(),
-            ],
+            out_of_scope: vec!["Command business logic correctness".into()],
         },
         CategoryCriteria {
             category: ExtensionCategory::Provider,
@@ -464,9 +475,7 @@ fn build_category_criteria() -> Vec<CategoryCriteria> {
                 "Hostcall denied when capability is granted".into(),
                 "Hook error propagates as host crash".into(),
             ],
-            out_of_scope: vec![
-                "Hook side-effect correctness".into(),
-            ],
+            out_of_scope: vec!["Hook side-effect correctness".into()],
         },
         CategoryCriteria {
             category: ExtensionCategory::UiComponent,
@@ -479,9 +488,7 @@ fn build_category_criteria() -> Vec<CategoryCriteria> {
                 "Renderer missing from snapshot".into(),
                 "Renderer throws on valid input".into(),
             ],
-            out_of_scope: vec![
-                "Visual rendering correctness (requires UI testing)".into(),
-            ],
+            out_of_scope: vec!["Visual rendering correctness (requires UI testing)".into()],
         },
         CategoryCriteria {
             category: ExtensionCategory::Configuration,
@@ -495,9 +502,7 @@ fn build_category_criteria() -> Vec<CategoryCriteria> {
                 "Flag value not persisted".into(),
                 "Shortcut activation does not trigger handler".into(),
             ],
-            out_of_scope: vec![
-                "Configuration persistence across sessions".into(),
-            ],
+            out_of_scope: vec!["Configuration persistence across sessions".into()],
         },
         CategoryCriteria {
             category: ExtensionCategory::Multi,
@@ -510,9 +515,7 @@ fn build_category_criteria() -> Vec<CategoryCriteria> {
                 "Any declared registration type missing".into(),
                 "Cross-type interaction causes error".into(),
             ],
-            out_of_scope: vec![
-                "Interaction semantics between registration types".into(),
-            ],
+            out_of_scope: vec!["Interaction semantics between registration types".into()],
         },
         CategoryCriteria {
             category: ExtensionCategory::General,
@@ -695,15 +698,20 @@ pub fn build_test_plan(
         .count();
     let uncovered_required_cells = fixture_assignments
         .iter()
-        .filter(|a| !a.coverage_met && matrix.iter().any(|c| format!("{:?}:{:?}", c.category, c.capability) == a.cell_key && c.required))
+        .filter(|a| {
+            !a.coverage_met
+                && matrix.iter().any(|c| {
+                    format!("{:?}:{:?}", c.category, c.capability) == a.cell_key && c.required
+                })
+        })
         .count();
     let total_exemplars: BTreeSet<&str> = ext_map.keys().map(String::as_str).collect();
-    let categories_covered: std::collections::HashSet<String> =
-        ext_map.values().map(|(cat, _)| format!("{cat:?}")).collect();
-    let capabilities_covered: BTreeSet<&HostCapability> = ext_map
+    let categories_covered: std::collections::HashSet<String> = ext_map
         .values()
-        .flat_map(|(_, caps)| caps.iter())
+        .map(|(cat, _)| format!("{cat:?}"))
         .collect();
+    let capabilities_covered: BTreeSet<&HostCapability> =
+        ext_map.values().flat_map(|(_, caps)| caps.iter()).collect();
 
     let coverage = CoverageSummary {
         total_cells,

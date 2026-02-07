@@ -885,6 +885,242 @@ Nested: **bold and *italic*** and ~~**strike bold**~~.
         );
     }
 
+    // ── strip_markup edge cases ──────────────────────────────────────
+    #[test]
+    fn strip_markup_nested_tags() {
+        assert_eq!(strip_markup("[bold][red]text[/][/]"), "text");
+    }
+
+    #[test]
+    fn strip_markup_empty_tag() {
+        // `[]` has empty buffer → not treated as tag, preserved
+        assert_eq!(strip_markup("before[]after"), "before[]after");
+    }
+
+    #[test]
+    fn strip_markup_adjacent_tags() {
+        assert_eq!(strip_markup("[bold]A[/][red]B[/]"), "AB");
+    }
+
+    #[test]
+    fn strip_markup_only_closing_tag() {
+        assert_eq!(strip_markup("[/]"), "");
+    }
+
+    #[test]
+    fn strip_markup_unclosed_bracket_at_end() {
+        assert_eq!(strip_markup("text[unclosed"), "text[unclosed");
+    }
+
+    #[test]
+    fn strip_markup_bracket_with_special_chars() {
+        // Characters like ! or @ are not in the tag heuristic set → not a tag
+        assert_eq!(strip_markup("[hello!]world"), "[hello!]world");
+        assert_eq!(strip_markup("[hello@world]text"), "[hello@world]text");
+    }
+
+    #[test]
+    fn strip_markup_pure_digits_preserved() {
+        assert_eq!(strip_markup("array[0]"), "array[0]");
+        assert_eq!(strip_markup("arr[123]"), "arr[123]");
+        assert_eq!(strip_markup("x[0][1][2]"), "x[0][1][2]");
+    }
+
+    #[test]
+    fn strip_markup_mixed_digit_alpha_is_tag() {
+        // "dim" is not pure digits → treated as tag
+        assert_eq!(strip_markup("[dim]faded[/]"), "faded");
+    }
+
+    #[test]
+    fn strip_markup_empty_input() {
+        assert_eq!(strip_markup(""), "");
+    }
+
+    #[test]
+    fn strip_markup_no_brackets() {
+        assert_eq!(
+            strip_markup("plain text without brackets"),
+            "plain text without brackets"
+        );
+    }
+
+    #[test]
+    fn strip_markup_hash_color_tag() {
+        assert_eq!(strip_markup("[#aabbcc]colored[/]"), "colored");
+    }
+
+    #[test]
+    fn strip_markup_tag_with_equals() {
+        assert_eq!(strip_markup("[link=https://example.com]click[/]"), "click");
+    }
+
+    #[test]
+    fn strip_markup_multiple_lines() {
+        let input = "[bold]line1[/]\n[red]line2[/]\n";
+        assert_eq!(strip_markup(input), "line1\nline2\n");
+    }
+
+    // ── split_markdown_fenced_code_blocks edge cases ───────────────────
+    #[test]
+    fn split_markdown_multiple_code_blocks() {
+        let input = "text1\n```rust\ncode1\n```\ntext2\n```python\ncode2\n```\ntext3\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 5, "expected 5 chunks: {chunks:?}");
+        assert!(matches!(&chunks[0], MarkdownChunk::Text(_)));
+        assert!(
+            matches!(&chunks[1], MarkdownChunk::CodeBlock { language, .. } if language.as_deref() == Some("rust"))
+        );
+        assert!(matches!(&chunks[2], MarkdownChunk::Text(_)));
+        assert!(
+            matches!(&chunks[3], MarkdownChunk::CodeBlock { language, .. } if language.as_deref() == Some("python"))
+        );
+        assert!(matches!(&chunks[4], MarkdownChunk::Text(_)));
+    }
+
+    #[test]
+    fn split_markdown_code_block_no_language() {
+        let input = "```\nplain code\n```\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            &chunks[0],
+            MarkdownChunk::CodeBlock { language, code }
+                if language.is_none() && code.contains("plain code")
+        ));
+    }
+
+    #[test]
+    fn split_markdown_empty_code_block() {
+        let input = "```rust\n```\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            &chunks[0],
+            MarkdownChunk::CodeBlock { language, code }
+                if language.as_deref() == Some("rust") && code.is_empty()
+        ));
+    }
+
+    #[test]
+    fn split_markdown_four_backtick_fence() {
+        // 4-backtick fence should work (>= 3 backticks)
+        let input = "````rust\ncode\n````\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(&chunks[0], MarkdownChunk::CodeBlock { .. }));
+    }
+
+    #[test]
+    fn split_markdown_nested_fence_shorter_doesnt_close() {
+        // Inner 3-backtick fence shouldn't close a 4-backtick fence
+        let input = "````\nsome ```inner``` text\n````\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(
+            &chunks[0],
+            MarkdownChunk::CodeBlock { code, .. }
+                if code.contains("```inner```")
+        ));
+    }
+
+    #[test]
+    fn split_markdown_no_code_blocks() {
+        let input = "Just plain markdown\n\n# Heading\n";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 1);
+        assert!(matches!(&chunks[0], MarkdownChunk::Text(t) if t.contains("plain markdown")));
+    }
+
+    #[test]
+    fn split_markdown_code_block_at_start() {
+        let input = "```js\nconsole.log('hi')\n```\ntext after";
+        let chunks = split_markdown_fenced_code_blocks(input);
+        assert_eq!(chunks.len(), 2);
+        assert!(matches!(&chunks[0], MarkdownChunk::CodeBlock { .. }));
+        assert!(matches!(&chunks[1], MarkdownChunk::Text(t) if t.contains("text after")));
+    }
+
+    // ── has_multiple_non_none_styles ────────────────────────────────────
+    #[test]
+    fn has_multiple_styles_empty() {
+        assert!(!has_multiple_non_none_styles(&[]));
+    }
+
+    #[test]
+    fn has_multiple_styles_all_none() {
+        let segments = vec![Segment::plain("text1"), Segment::plain("text2")];
+        assert!(!has_multiple_non_none_styles(&segments));
+    }
+
+    #[test]
+    fn has_multiple_styles_single_style() {
+        let style = Style::parse("bold").unwrap();
+        let segments = vec![
+            Segment::styled("text1", style.clone()),
+            Segment::styled("text2", style),
+        ];
+        assert!(!has_multiple_non_none_styles(&segments));
+    }
+
+    #[test]
+    fn has_multiple_styles_two_different() {
+        let bold = Style::parse("bold").unwrap();
+        let red = Style::parse("red").unwrap();
+        let segments = vec![
+            Segment::styled("text1", bold),
+            Segment::styled("text2", red),
+        ];
+        assert!(has_multiple_non_none_styles(&segments));
+    }
+
+    #[test]
+    fn has_multiple_styles_ignores_whitespace_only() {
+        let bold = Style::parse("bold").unwrap();
+        let red = Style::parse("red").unwrap();
+        let segments = vec![
+            Segment::styled("text1", bold),
+            Segment::styled("   ", red), // whitespace-only, should be ignored
+        ];
+        assert!(!has_multiple_non_none_styles(&segments));
+    }
+
+    // ── SpinnerStyle ───────────────────────────────────────────────────
+    #[test]
+    fn spinner_line_frames_and_interval() {
+        let line = SpinnerStyle::Line;
+        assert_eq!(line.frames().len(), 6);
+        assert_eq!(line.interval_ms(), 100);
+    }
+
+    #[test]
+    fn spinner_all_frames_non_empty() {
+        for style in [SpinnerStyle::Dots, SpinnerStyle::Line, SpinnerStyle::Simple] {
+            for frame in style.frames() {
+                assert!(!frame.is_empty(), "empty frame in {:?}", style.frames());
+            }
+        }
+    }
+
+    // ── parse_fenced_code_language additional ───────────────────────────
+    #[test]
+    fn parse_fenced_code_language_with_info_string() {
+        // Info string like "rust,no_run" → language is "rust"
+        assert_eq!(
+            parse_fenced_code_language("rust,no_run"),
+            Some("rust".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_fenced_code_language_with_space_and_attr() {
+        // "python attrs" → language is "python"
+        assert_eq!(
+            parse_fenced_code_language("python {.highlight}"),
+            Some("python".to_string())
+        );
+    }
+
     #[test]
     fn render_markdown_code_fences_highlight_multiple_languages_and_fallback_unknown() {
         let segments = capture_markdown_segments(

@@ -71,9 +71,7 @@ fn conformance_plan_has_required_cells() {
     let tool_required: BTreeSet<_> = plan
         .matrix
         .iter()
-        .filter(|c| {
-            format!("{:?}", c.category) == "Tool" && c.required
-        })
+        .filter(|c| format!("{:?}", c.category) == "Tool" && c.required)
         .map(|c| c.capability)
         .collect();
     assert!(
@@ -136,10 +134,7 @@ fn conformance_plan_category_criteria() {
 #[test]
 fn conformance_plan_coverage_summary() {
     let (plan, _, _) = load_test_plan();
-    assert!(
-        plan.coverage.total_cells > 0,
-        "Should have total cells"
-    );
+    assert!(plan.coverage.total_cells > 0, "Should have total cells");
     assert!(
         plan.coverage.required_cells > 0,
         "Should have required cells"
@@ -216,10 +211,7 @@ fn conformance_plan_no_duplicate_cells() {
     let mut seen = BTreeSet::new();
     for cell in &plan.matrix {
         let key = format!("{:?}:{:?}", cell.category, cell.capability);
-        assert!(
-            seen.insert(key.clone()),
-            "Duplicate matrix cell: {key}"
-        );
+        assert!(seen.insert(key.clone()), "Duplicate matrix cell: {key}");
     }
 }
 
@@ -314,12 +306,10 @@ fn generate_conformance_test_plan() {
     // ── Assertions ──
 
     // The plan must be valid JSON round-trip
-    let _: ConformanceTestPlan =
-        serde_json::from_str(&json).expect("plan should be valid JSON");
+    let _: ConformanceTestPlan = serde_json::from_str(&json).expect("plan should be valid JSON");
 
     // Total included extensions should match inclusion list
-    let total_included =
-        inclusion.tier0.len() + inclusion.tier1.len() + inclusion.tier2.len();
+    let total_included = inclusion.tier0.len() + inclusion.tier1.len() + inclusion.tier2.len();
     eprintln!(
         "\nInclusion list: {} extensions ({} tier-0, {} tier-1, {} tier-2)",
         total_included,
