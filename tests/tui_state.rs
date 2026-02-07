@@ -6170,3 +6170,155 @@ fn tui_state_collapse_changelog_toggle_off_then_on() {
     let settings = read_project_settings_json(&harness);
     assert_eq!(settings["collapse_changelog"], json!(true));
 }
+
+// ===========================================================================
+// bd-4ma1: Model selector + scoped cycling additional tests
+// ===========================================================================
+
+#[test]
+fn tui_state_model_selector_blocked_during_processing() {
+    let harness = TestHarness::new("tui_state_model_selector_blocked_during_processing");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+    log_initial_state(&harness, &app);
+
+    // Simulate agent processing state.
+    apply_pi(&harness, &mut app, "PiMsg::AgentStart", PiMsg::AgentStart);
+
+    // Ctrl+L while processing should be blocked.
+    let step = press_ctrll(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Cannot switch models while processing");
+    assert_after_not_contains(&harness, &step, "Select a model");
+}
+
+#[test]
+fn tui_state_model_selector_jk_navigation() {
+    let harness = TestHarness::new("tui_state_model_selector_jk_navigation");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let available_models = vec![anthropic.clone(), openai, google];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+    log_initial_state(&harness, &app);
+
+    press_ctrll(&harness, &mut app);
+    // Navigate down with j twice → should land on third model (index 2)
+    type_text(&harness, &mut app, "j");
+    type_text(&harness, &mut app, "j");
+    // Select it with Enter
+    let step = press_enter(&harness, &mut app);
+    // Third model in sorted order: anthropic/claude-a, google/gemini-a, openai/gpt-a
+    // Start at idx 0 → j → idx 1 → j → idx 2 → Enter selects openai/gpt-a
+    assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
+}
+
+#[test]
+fn tui_state_model_selector_filter_then_select() {
+    let harness = TestHarness::new("tui_state_model_selector_filter_then_select");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let available_models = vec![anthropic.clone(), openai, google];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+    log_initial_state(&harness, &app);
+
+    press_ctrll(&harness, &mut app);
+    // Type filter text that matches only gemini
+    type_text(&harness, &mut app, "gemini");
+    // First filtered result should be auto-selected, press Enter to confirm
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched model: google/gemini-a");
+    assert_after_not_contains(&harness, &step, "Select a model");
+}
+
+#[test]
+fn tui_state_model_selector_no_match_enter_shows_no_model() {
+    let harness = TestHarness::new("tui_state_model_selector_no_match_enter_shows_no_model");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+    log_initial_state(&harness, &app);
+
+    press_ctrll(&harness, &mut app);
+    // Type filter text that matches nothing
+    type_text(&harness, &mut app, "zzzzz");
+    // Press Enter with no matches → should show "No model selected"
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "No model selected");
+    assert_after_not_contains(&harness, &step, "Select a model");
+}
