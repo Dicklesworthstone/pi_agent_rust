@@ -1,0 +1,391 @@
+{
+  "generated": "2026-02-07",
+  "task": "bd-kgmr",
+  "queries_executed": 12,
+  "query_list": [
+    {
+      "num": 1,
+      "query": "buildwithpi extension language:TypeScript",
+      "results": 0
+    },
+    {
+      "num": 2,
+      "query": "pi-mono extension language:TypeScript",
+      "results": 5
+    },
+    {
+      "num": 3,
+      "query": "pi agent extension registerTool language:TypeScript",
+      "results": 0
+    },
+    {
+      "num": 4,
+      "query": "pi coding agent extension language:TypeScript",
+      "results": 49
+    },
+    {
+      "num": 5,
+      "query": "pi extension registerCommand language:TypeScript",
+      "results": 0
+    },
+    {
+      "num": 6,
+      "query": "pi extension registerProvider",
+      "results": 0
+    },
+    {
+      "num": 7,
+      "query": "topic:pi-extension",
+      "results": 9
+    },
+    {
+      "num": 8,
+      "query": "topic:pi-agent extension",
+      "results": 3
+    },
+    {
+      "num": 9,
+      "query": "mariozechner pi extension",
+      "results": 1
+    },
+    {
+      "num": 10,
+      "query": "pi-coding-agent",
+      "results": 124
+    },
+    {
+      "num": 11,
+      "query": ".pi extensions registerTool language:TypeScript",
+      "results": 0
+    },
+    {
+      "num": 12,
+      "query": "pi extension tool command language:TypeScript",
+      "results": 0
+    }
+  ],
+  "total_repos_found": 136,
+  "repos_inspected": 325,
+  "overlap_with_code_search": 35,
+  "new_validated": 7,
+  "repos": [
+    {
+      "repo": "ditfetzt/pi-cline-free-models",
+      "entrypoint": "index.ts",
+      "stars": 2,
+      "description": null,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "default-anton/pi-subdir-context",
+      "entrypoint": "src/index.ts",
+      "stars": 1,
+      "description": "Automatically load AGENTS.md context from subdirectories in pi coding agent",
+      "registrations": []
+    },
+    {
+      "repo": "igor-makarov/pi-extension-sandbox",
+      "entrypoint": "src/index.ts",
+      "stars": 0,
+      "description": "A proper sandbox extension for pi (https://github.com/badlogic/pi-mono)",
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "Istar-Eldritch/pi-wakatime",
+      "entrypoint": "index.ts",
+      "stars": 0,
+      "description": "A pi-coding-agent extension to log usage on wakatime.",
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "annapurna-himal/pi-memory-search",
+      "entrypoint": "index.ts",
+      "stars": 0,
+      "description": "Semantic memory search extension for Pi coding agent",
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "annapurna-himal/pi-vim-editor",
+      "entrypoint": "index.ts",
+      "stars": 0,
+      "description": "A vim-like modal editor extension for Pi coding agent",
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "isaacraja/pi-vertex-claude",
+      "entrypoint": "index.ts",
+      "stars": 0,
+      "description": "Google Vertex AI Claude provider for Pi coding agent",
+      "registrations": [
+        "registerProvider"
+      ]
+    }
+  ],
+  "high_star_repos": [
+    {
+      "repo": "badlogic/pi-skills",
+      "stars": 355,
+      "description": "Skills for pi coding agent (compatible with Claude Code and Codex CLI)",
+      "topics": []
+    },
+    {
+      "repo": "galz10/pickle-rick-extension",
+      "stars": 350,
+      "description": "This extension transforms the Gemini CLI into \"Pickle Rick,\" a hyper-intelligent, arrogant, yet extr",
+      "topics": [
+        "ai",
+        "gemini",
+        "gemini-cli",
+        "gemini-cli-extensions"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-interactive-shell",
+      "stars": 149,
+      "description": "Pi coding agent extension that allows Pi to autonomously control interactive CLIs in an observable o",
+      "topics": []
+    },
+    {
+      "repo": "Piebald-AI/splitrail",
+      "stars": 102,
+      "description": "Fast, cross-platform, real-time token usage tracker and cost monitor for Gemini CLI / Claude Code / ",
+      "topics": [
+        "agentic",
+        "analyzer",
+        "blazing-fast",
+        "ccusage",
+        "claude-code",
+        "cline",
+        "codex",
+        "gcusage",
+        "gemini-cli",
+        "kilo-code",
+        "opencode",
+        "pi-agent",
+        "piebald",
+        "qwen",
+        "qwen-code",
+        "ravishing",
+        "roo-code",
+        "rust",
+        "splitrail",
+        "usage"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-messenger",
+      "stars": 100,
+      "description": "Multi-agent communication extension for pi coding agent",
+      "topics": []
+    },
+    {
+      "repo": "qualisero/awesome-pi-agent",
+      "stars": 55,
+      "description": "Awesome list of add-ons, hooks, tools, skills, and resources for the pi coding agent (pi-mono).",
+      "topics": [
+        "agentic-ai",
+        "llm",
+        "pi",
+        "pi-agent"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-mcp-adapter",
+      "stars": 48,
+      "description": "Token-efficient MCP adapter for Pi coding agent",
+      "topics": [
+        "ai",
+        "claude",
+        "coding-agent",
+        "extension",
+        "llm",
+        "mcp",
+        "model-context-protocol",
+        "pi"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-web-access",
+      "stars": 45,
+      "description": "Web search and content extraction extension for Pi coding agent",
+      "topics": [
+        "perplexity",
+        "pi-coding-agent",
+        "typescript",
+        "web-search"
+      ]
+    },
+    {
+      "repo": "google-research/pisac",
+      "stars": 45,
+      "description": "Tensorflow 2 source code for the PI-SAC agent from \"Predictive Information Accelerates Learning in R",
+      "topics": [
+        "deep-learning",
+        "deep-reinforcement-learning",
+        "information-theory",
+        "machine-learning",
+        "reinforcement-learning",
+        "robotics",
+        "vision"
+      ]
+    },
+    {
+      "repo": "hjanuschka/shitty-extensions",
+      "stars": 41,
+      "description": "Custom hooks for pi coding agent",
+      "topics": []
+    },
+    {
+      "repo": "nicobailon/pi-rewind-hook",
+      "stars": 39,
+      "description": "Pi agent hook for rewinding file changes during coding sessions",
+      "topics": []
+    },
+    {
+      "repo": "tmustier/pi-extensions",
+      "stars": 39,
+      "description": "A set of delightful extensions for Pi",
+      "topics": [
+        "extension",
+        "npm",
+        "pi",
+        "pi-coding-agent"
+      ]
+    },
+    {
+      "repo": "vohidjon123/google",
+      "stars": 32,
+      "description": "(function(sttc){/*     Copyright The Closure Library Authors.   SPDX-License-Identifier: Apache-2.0 ",
+      "topics": []
+    },
+    {
+      "repo": "dnouri/pi-coding-agent",
+      "stars": 31,
+      "description": "Emacs frontend for the pi coding agent",
+      "topics": []
+    },
+    {
+      "repo": "nicobailon/pi-review-loop",
+      "stars": 21,
+      "description": "Automated code review loop extension for Pi coding agent",
+      "topics": []
+    },
+    {
+      "repo": "DickDumBR1/Aim",
+      "stars": 20,
+      "description": "Skip to content Sign up Sign in This repository   Search Explore Features Enterprise Pricing  Watch ",
+      "topics": []
+    },
+    {
+      "repo": "zsith/launcher.user.js",
+      "stars": 18,
+      "description": "// ==UserScript== // @name        AposLauncher // @namespace   AposLauncher // @include     http://a",
+      "topics": []
+    },
+    {
+      "repo": "Lifestylerr/DAWD",
+      "stars": 17,
+      "description": "/*The MIT License (MIT) Copyright (c) 2015 Apostolique Permission is hereby granted, free of charge,",
+      "topics": []
+    },
+    {
+      "repo": "jwintz/pi-island",
+      "stars": 16,
+      "description": "A native macOS dynamic island interface for the Pi coding agent. Real-time session monitoring, ambie",
+      "topics": [
+        "agent",
+        "coding",
+        "dynamic",
+        "island",
+        "notch",
+        "pi"
+      ]
+    },
+    {
+      "repo": "kcosr/assistant",
+      "stars": 16,
+      "description": "Panel-based personal assistant with a plugin architecture for productivity workflows. AI agents shar",
+      "topics": []
+    },
+    {
+      "repo": "nicobailon/pi-powerline-footer",
+      "stars": 14,
+      "description": "Powerline-style status bar extension for pi coding agent",
+      "topics": []
+    },
+    {
+      "repo": "jchidley/helix-pi",
+      "stars": 14,
+      "description": "Pi coding agent integration for [Helix](https://helix-editor.com/) via [Steel](https://github.com/ma",
+      "topics": []
+    },
+    {
+      "repo": "tmustier/pi-nes",
+      "stars": 13,
+      "description": "An NES emulator for Pi. Play classic Nintendo games while your agent works. ROMs not included",
+      "topics": [
+        "extension",
+        "nes",
+        "nintendo-nes",
+        "npm",
+        "pi",
+        "pi-coding-agent"
+      ]
+    },
+    {
+      "repo": "PacktPublishing/Raspberry-Pi-for-Secret-Agents-Third-Edition",
+      "stars": 12,
+      "description": "Code repository for Raspberry Pi for Secret Agents Third Edition, published by Packt",
+      "topics": []
+    },
+    {
+      "repo": "Rogerio111/Rogerio",
+      "stars": 12,
+      "description": "<!DOCTYPE html> <html> <head> <meta charset=\"utf-8\"> <meta http-equiv=\"X-UA-Compatible\" content=\"IE=",
+      "topics": []
+    },
+    {
+      "repo": "nicobailon/pi-model-switch",
+      "stars": 11,
+      "description": "Pi coding agent extension that gives the agent the ability to switch models on its own",
+      "topics": []
+    },
+    {
+      "repo": "mochtamvan/launcher.user.js",
+      "stars": 11,
+      "description": "/*The MIT License (MIT) Copyright (c) 2015 Apostolique Permission is hereby granted, free of charge,",
+      "topics": []
+    },
+    {
+      "repo": "dannote/dot-pi",
+      "stars": 10,
+      "description": "Extensions, skills, and rules for Pi coding agent",
+      "topics": []
+    },
+    {
+      "repo": "hjanuschka/pi-qmd",
+      "stars": 10,
+      "description": "QMD (Quick Markdown Search) extension for pi coding agent - on-device knowledge base search with BM2",
+      "topics": []
+    },
+    {
+      "repo": "cv/pi-action",
+      "stars": 10,
+      "description": "GitHub Action to invoke the PI coding agent on issues and PRs via comment triggers",
+      "topics": []
+    }
+  ]
+}

@@ -1,0 +1,1547 @@
+{
+  "generated": "2026-02-07",
+  "task": "bd-3l39",
+  "queries_executed": 10,
+  "query_signatures": [
+    "@mariozechner/pi-coding-agent \"export default\"",
+    "@mariozechner/pi-coding-agent \"ExtensionAPI\"",
+    "@mariozechner/pi-coding-agent \"registerTool(\"",
+    "@mariozechner/pi-coding-agent \"registerProvider(\"",
+    "@mariozechner/pi-coding-agent \"registerCommand(\"",
+    "@mariozechner/pi-ai \"registerTool(\"",
+    "\"ExtensionAPI\" \"registerTool(\"",
+    "\"ExtensionAPI\" \"registerCommand(\"",
+    "@mariozechner/pi-coding-agent \"registerShortcut(\"",
+    "@mariozechner/pi-coding-agent \"registerFlag(\""
+  ],
+  "total_repos_searched": 479,
+  "repos_inspected": 290,
+  "validated_extensions": 189,
+  "registration_api_breakdown": {
+    "registerCommand": 98,
+    "registerTool": 81,
+    "registerShortcut": 21,
+    "registerProvider": 15,
+    "registerFlag": 13,
+    "registerMessageRenderer": 3
+  },
+  "repos": [
+    {
+      "repo": "Deskaunedsei1983/loc_clawdbot_01",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "Dwsy/agent",
+      "entrypoint": "checkpoint-v2/index.ts",
+      "file_count": 26,
+      "registrations": []
+    },
+    {
+      "repo": "ElementsAI-Dev/Cognia",
+      "entrypoint": "plugin-sdk/typescript/src/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "ElwinLiu/pi-config",
+      "entrypoint": "agent/extensions/droid-style/index.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "EthanAlgoX/MarketBot",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 5,
+      "registrations": []
+    },
+    {
+      "repo": "ForwardInfinity/pi-extensions",
+      "entrypoint": "antigravity-rotator/antigravity-account-rotator.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "Iranb/clawdbot",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "Itsnotaka/dot-pi",
+      "entrypoint": "agent/extensions/context7/index.ts",
+      "file_count": 15,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "Lukeus/ai-shell",
+      "entrypoint": "apps/extension-host/src/extension-runtime.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "Mic92/dotfiles",
+      "entrypoint": "home/.pi/agent/extensions/custom-footer.ts",
+      "file_count": 5,
+      "registrations": []
+    },
+    {
+      "repo": "PSPDFKit-labs/pi-skills",
+      "entrypoint": "extensions/buildkite-failures.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "Volantk/pi-agent-skills-extensions",
+      "entrypoint": "extensions/copy-tool.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "Whamp/pi-brain",
+      "entrypoint": "extensions/brain-query/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "Whamp/pi-rlm",
+      "entrypoint": "devdocs/claude_code_RLM/extensions/subagent/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "Willyfrog/pi-agent-extensions",
+      "entrypoint": "extensions/variable-store.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "aadishv/dotfiles",
+      "entrypoint": "manifests/files/common/.pi/agent/extensions/clean-startup.ts",
+      "file_count": 5,
+      "registrations": []
+    },
+    {
+      "repo": "adragomir/dotfiles",
+      "entrypoint": ".config/pi/agent/extensions/lsp/index.ts",
+      "file_count": 10,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "aldoborrero/agent-kit",
+      "entrypoint": "pi/extensions/questionnaire/index.ts",
+      "file_count": 10,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "anntnzrb/agents",
+      "entrypoint": "tools/pi/agent/extensions/answer/index.ts",
+      "file_count": 4,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "assagman/pi-extensions",
+      "entrypoint": "extensions/gamma/src/index.ts",
+      "file_count": 6,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "az9713/clawdbot",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "bout3fiddy/agents",
+      "entrypoint": "extensions/pi-eval/index.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "bytes032/agentkit",
+      "entrypoint": "pi-extensions/handoff.ts",
+      "file_count": 7,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "cameronmaske/agent-stuff",
+      "entrypoint": "extensions/pi-annotate/index.ts",
+      "file_count": 8,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "can1357/oh-my-pi",
+      "entrypoint": "packages/coding-agent/examples/extensions/with-deps/index.ts",
+      "file_count": 7,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "charlie-818/CLAWD",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 3,
+      "registrations": []
+    },
+    {
+      "repo": "christroutner/pi-extensions",
+      "entrypoint": "extensions/brave-search.ts",
+      "file_count": 5,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "coltonbatts/Loubot",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "continua-ai/pi-lab",
+      "entrypoint": "extensions/live-commentary/index.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "davekilleen/Dex",
+      "entrypoint": "pi-extensions/dex/index.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "dctrwatson/pi-squared",
+      "entrypoint": "extensions/gh-todo/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "default-anton/dotfiles",
+      "entrypoint": "pi/agent/extensions/finder/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "dejanr/dotfiles",
+      "entrypoint": "modules/home/cli/pi-mono/extensions/codex-tuning/index.ts",
+      "file_count": 15,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "deybhayden/bendows",
+      "entrypoint": ".pi/agent/extensions/answer.ts",
+      "file_count": 4,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "deybhayden/dotfiles",
+      "entrypoint": ".pi/agent/extensions/answer.ts",
+      "file_count": 7,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "dungle-scrubs/agent-config",
+      "entrypoint": "stow/pi/extensions/lsp/index.ts",
+      "file_count": 15,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "ehtbanton/controlocal",
+      "entrypoint": "packages/openclaw/.pi/extensions/prompt-url-widget.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "ex3ndr/daycare",
+      "entrypoint": "packages/daycare/sources/plugins/anthropic-fetch/plugin.ts",
+      "file_count": 10,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "garymjr/dotfiles",
+      "entrypoint": "dot_pi/agent/extensions/review/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "goncalossilva/.agents",
+      "entrypoint": "pi/extensions/loop.ts",
+      "file_count": 4,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "goofansu/agent-stuff",
+      "entrypoint": "pi-extensions/answer.ts",
+      "file_count": 4,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "graycarl/dotshell",
+      "entrypoint": "apps/pi/agent/extensions/subagent/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "haider-patanwala/clawdbot",
+      "entrypoint": ".pi/extensions/diff.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "hjanuschka/shitty-extensions",
+      "entrypoint": "extensions/clipboard.ts",
+      "file_count": 7,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "jamwil/dotfiles",
+      "entrypoint": "dot_pi/agent/extensions/context7/index.ts",
+      "file_count": 5,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "jbuckmccready/dotfiles",
+      "entrypoint": "pi/.pi/agent/extensions/sandbox/index.ts",
+      "file_count": 7,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "jcolano/openclaw",
+      "entrypoint": ".pi/extensions/diff.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "joelazar/dotfiles",
+      "entrypoint": "dot_pi/agent/extensions/sandbox/index.ts",
+      "file_count": 13,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "jorgeavaldez/pi-config",
+      "entrypoint": "extensions/subagent/index.ts",
+      "file_count": 7,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "joshuadavidthomas/agentkit",
+      "entrypoint": "runtimes/pi/extensions/pi-subagents/index.ts",
+      "file_count": 7,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "kaofelix/dotfiles",
+      "entrypoint": "pi/.pi/agent/extensions/auto-exit.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "kavia-common/moltbot-311196",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "knoopx/pi",
+      "entrypoint": "agent/extensions/bookmarks/index.ts",
+      "file_count": 18,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "l-lin/dotfiles",
+      "entrypoint": "home-manager/modules/share/ai/pi/.pi/agent/extensions/ask-user-question.ts",
+      "file_count": 5,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "laulauland/dotfiles",
+      "entrypoint": "shared/.pi/agent/extensions/mcp/index.ts",
+      "file_count": 9,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "leiserfg/nix-config",
+      "entrypoint": "home/leiserfg/pi-extensions/loop.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "leopechnicki/AI-Assistant",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 5,
+      "registrations": []
+    },
+    {
+      "repo": "lllooollpp/clawdbot-cn",
+      "entrypoint": "apps/desktop/src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "markus1189/nixos-config",
+      "entrypoint": "nixos-shared/home-manager/pi-agent/extensions/block-dangerous.ts",
+      "file_count": 6,
+      "registrations": []
+    },
+    {
+      "repo": "masonjames/dockhand-sre-agent",
+      "entrypoint": "packages/coding-agent/src/core/extensions/loader.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerProvider",
+        "registerFlag",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "megalithic/dotfiles",
+      "entrypoint": "home/programs/ai/pi-coding-agent/extensions/answer.ts",
+      "file_count": 6,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "meteyou/pi-stuff",
+      "entrypoint": "extensions/loop-workflow/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "mikeastock/dotagents",
+      "entrypoint": "extensions/pi/AskUserQuestion/index.ts",
+      "file_count": 5,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "mikeyobrien/pi-agent",
+      "entrypoint": "extensions/brave-search.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "mikeyobrien/rho",
+      "entrypoint": "extensions/brain.ts",
+      "file_count": 10,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "mitsuhiko/agent-stuff",
+      "entrypoint": "pi-extensions/answer.ts",
+      "file_count": 10,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "mrndstvndv/nixdots",
+      "entrypoint": "modules/pi/package/extensions/kimi/kimi.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "neonspectra/dotfiles",
+      "entrypoint": ".pi/agent/extensions/commands.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nexxeln/dots",
+      "entrypoint": "config/pi/agent/extensions/handoff.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-coordination",
+      "entrypoint": "coordinate/coordinator-tools/index.ts",
+      "file_count": 10,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-subagents",
+      "entrypoint": "index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "nof0xgiven/pi-coding-agent-eureka",
+      "entrypoint": "extensions/chrome-devtools/index.ts",
+      "file_count": 16,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "openclaw/openclaw",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "otahontas/nix",
+      "entrypoint": "home/configs/pi-coding-agent/extensions/piception/index.ts",
+      "file_count": 6,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "prateekmedia/pi-hooks",
+      "entrypoint": "lsp/lsp-tool.ts",
+      "file_count": 6,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "richard-devbot/Computer-Agent",
+      "entrypoint": ".pi/extensions/diff.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "richardgill/nix",
+      "entrypoint": "out-of-store-config/ai-agents/pi/extensions/handoff.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "safzanpirani/pi-config",
+      "entrypoint": "extensions/antigravity-multi-account/index.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand",
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "sbattywolf/GAIA",
+      "entrypoint": "external/openclaw/.pi/extensions/files.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "seriousben/serious-nixos-config",
+      "entrypoint": "home-manager/files/pi/extensions/answer.ts",
+      "file_count": 4,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "sids/pi-extensions",
+      "entrypoint": "answer/index.ts",
+      "file_count": 4,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "skyfallsin/pi-agent-config",
+      "entrypoint": "extensions/plan-mode/index.ts",
+      "file_count": 5,
+      "registrations": [
+        "registerCommand",
+        "registerFlag",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "stefan2904/dockerized-pi",
+      "entrypoint": "pi/agent/extensions/antigravity-quota.ts",
+      "file_count": 5,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "thrashr888/agentkernel",
+      "entrypoint": "packages/pi-agentkernel/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "towry/agent-share",
+      "entrypoint": "nix/hm/ai/pi/extensions/chrome-dev/index.ts",
+      "file_count": 19,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "tudoroancea/dotfiles",
+      "entrypoint": ".pi/agent/extensions/claude-style.ts",
+      "file_count": 9,
+      "registrations": []
+    },
+    {
+      "repo": "verioussmith/pi-openrouter-extension",
+      "entrypoint": "openrouter.ts",
+      "file_count": 5,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "vrslev/dotfiles",
+      "entrypoint": "home/.pi/agent/extensions/mac-system-theme.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "w-winter/dot314",
+      "entrypoint": "extensions/brave-search/index.ts",
+      "file_count": 26,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "weolopez/aardvark",
+      "entrypoint": "coding-agent/core/extensions/loader.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerProvider",
+        "registerFlag",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "whodaniel/fuse",
+      "entrypoint": "apps/openclaw/.pi/extensions/prompt-url-widget.ts",
+      "file_count": 3,
+      "registrations": []
+    },
+    {
+      "repo": "willem4130/Android",
+      "entrypoint": "Kotlin/android/01-openclaw-production-app/.pi/extensions/prompt-url-widget.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "zanieb/pi-plugins",
+      "entrypoint": "extensions/clear-alias.ts",
+      "file_count": 4,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "ATONCAP/monorepo",
+      "entrypoint": "packages/self/.pi/extensions/files.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "ArchieCrawford/OpenClaw",
+      "entrypoint": "openclaw-main/src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "FlufyBot/openclaw",
+      "entrypoint": "prompt-url-widget.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "Leechael/pi-provider-kimi-code",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "M-Dev-Lab/ultimate-agent",
+      "entrypoint": "Sampling- Resources/openclaw-main/.pi/extensions/prompt-url-widget.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "Max-Leopold/dotfiles",
+      "entrypoint": "dot_pi/agent/extensions/answer.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "NeoTavern/NeoTavern-Frontend",
+      "entrypoint": "src/utils/extensions.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "RobExtremeVoice/openclaw-1",
+      "entrypoint": "src/agents/pi-extensions/compaction-safeguard.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "Tiberriver256/mcp-server-azure-devops",
+      "entrypoint": ".pi/extensions/test-watch.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "TimoFreiberg/dotfiles",
+      "entrypoint": "agents/extensions/timestamps.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "Whamp/glm-vision",
+      "entrypoint": "src/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "Whamp/pi-agentic-compaction",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "Whamp/pi-automem",
+      "entrypoint": "extensions/automem.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "Willyfrog/agents-warning",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "YeSongYun/openclaw-cn",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "anthnykr/agent-setups",
+      "entrypoint": "pi-extensions/study-commits.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "asoules/pi-recall",
+      "entrypoint": "src/extension.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "assagman/agentsbox",
+      "entrypoint": "src/pi.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "az9713/openclaw",
+      "entrypoint": "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "badlogic/pi-dosbox",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "balaraj74/F.R.I.D.A.Y",
+      "entrypoint": "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "blwsk/pi-test-scope",
+      "entrypoint": "extensions/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "brianwan19801015/labopenclaw",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "carmandale/ralph-loop",
+      "entrypoint": "pi-integration/tool/index.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "coctostan/pi-superteam",
+      "entrypoint": "src/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "coctostan/pi-web-tools",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "0xSero/pi-readiness-report",
+      "entrypoint": "readiness-report.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "9cog/pi-cogno",
+      "entrypoint": "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+      "file_count": 48,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "assagman/phi",
+      "entrypoint": "packages/coding-agent/examples/extensions/best/delta/src/index.ts",
+      "file_count": 24,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "ayagmar/pi-extmgr",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "badlogic/pi-doom",
+      "entrypoint": "src/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "badlogic/pi-gitlab-duo",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "bout3fiddy/pi-langlearn",
+      "entrypoint": "src/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "continua-ai/tinny-pi",
+      "entrypoint": "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+      "file_count": 49,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "davidgasquez/dotfiles",
+      "entrypoint": "agents/pi/extensions/branch-term.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "dinhtungdu/orange",
+      "entrypoint": "extensions/pi/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "ditfetzt/pi-antigravity-imagen",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "ditfetzt/pi-antigravity-quota",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "dotemacs/pi-multi-prompt",
+      "entrypoint": "multi-prompt.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "drshailesh88/Krypto",
+      "entrypoint": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "edmundmiller/dotfiles",
+      "entrypoint": "packages/pi-dcp/index.ts",
+      "file_count": 3,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "fink-andreas/pi-web-reader",
+      "entrypoint": "extensions/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "forbidden-game/kimicodeprovider",
+      "entrypoint": "extensions/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "hdresearch/pi-v",
+      "entrypoint": "extensions/plan-mode/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerFlag",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "hjanuschka/pi-qmd",
+      "entrypoint": "extensions/qmd.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerMessageRenderer"
+      ]
+    },
+    {
+      "repo": "isaacraja/agents-config",
+      "entrypoint": "agents/pi/extensions/vertex-claude/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "jasonish/pi-sandbox",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "joshleblanc/pi-ext",
+      "entrypoint": "custom-provider-venice/index.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "joshleblanc/pi-minimax",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "joshp123/ai-stack",
+      "entrypoint": "extensions/todowrite.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "jwrunge/agent",
+      "entrypoint": "src/run-workflow.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "k1000/pi-reflect",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "kanatti/pipi",
+      "entrypoint": "extensions/permission-gate.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "lenstr/pi-fetch-url",
+      "entrypoint": "extensions/fetch-url.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "lepinkainen/dotfiles",
+      "entrypoint": "dot_pi/agent/extensions/files.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "maxsumrall/homeycli",
+      "entrypoint": ".github/actions/pi-pr-review/ci-sandbox.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "mcasper/dotfiles",
+      "entrypoint": "agents/extensions/handoff.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "mcollina/pi-bash-confirm",
+      "entrypoint": "extensions/bash-confirm.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "messense/pi-parallel-agents",
+      "entrypoint": "src/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "mrexodia/agent-viewer",
+      "entrypoint": ".pi/hooks/devdocs-commands.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "mrexodia/devdocs-cli",
+      "entrypoint": "embed/devdocs-commands.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "neohope/NeoPimonoSrc",
+      "entrypoint": "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+      "file_count": 26,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-annotate",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-interactive-shell",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-interview-tool",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-mcp-adapter",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-messenger",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-model-switch",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-powerline-footer",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-review-loop",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-skill-palette",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerMessageRenderer"
+      ]
+    },
+    {
+      "repo": "nicobailon/pi-web-access",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "ninlds/pi-ding",
+      "entrypoint": "extensions/ding.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "nrupatunga/pi-extensions",
+      "entrypoint": "quick-model-picker/quick-model-picker.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "opus-workshop/rush",
+      "entrypoint": "pi-rush/extensions/rush.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "pauldthomson/dotfiles",
+      "entrypoint": ".pi/extensions/web-fetch.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "prateekmedia/claude-agent-sdk-pi",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "pratos/clanker-setup",
+      "entrypoint": "extensions/humanlayer.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "rhnvrm/pi-mesh",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "richardgill/pi-extensions",
+      "entrypoint": "extensions/files/src/extension.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "rkunnamp/pi-apply-patch",
+      "entrypoint": "extensions/apply-patch/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "rytswd/pi-agent-extensions",
+      "entrypoint": "questionnaire/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "samuelstevens/dotfiles",
+      "entrypoint": "pi/.pi/agent/extensions/questions.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "scooter-lacroix/LeIndex",
+      "entrypoint": "pi/src/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "screenpipe/screenpipe",
+      "entrypoint": "apps/screenpipe-app-tauri/src-tauri/assets/extensions/web-search.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "sgtest/megarepo",
+      "entrypoint": "sourcegraph/client/shared/src/api/extension/extensionApi.ts",
+      "file_count": 2,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "sibyllinesoft/scribe",
+      "entrypoint": "scribe-rs/npm/scribe/scripts/extensions/scribe.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "sigtom/wow-ocp",
+      "entrypoint": ".pi/extensions/homelab-tools.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "skyfallsin/pi-vertex-anthropic",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerProvider"
+      ]
+    },
+    {
+      "repo": "surma/nixenv",
+      "entrypoint": "modules/programs/pi/extensions/plan-mode/claude-plan-mode.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ]
+    },
+    {
+      "repo": "thurstonsand/ansiblonomicon",
+      "entrypoint": "chezmoi/private_dot_pi/agent/extensions/mac-system-theme.ts",
+      "file_count": 1,
+      "registrations": []
+    },
+    {
+      "repo": "toorusr/ai-extensions",
+      "entrypoint": "semantic-search/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut",
+        "registerMessageRenderer"
+      ]
+    },
+    {
+      "repo": "ttttmr/pi-search-tool",
+      "entrypoint": "src/index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "wayanjimmy/agent-stuff",
+      "entrypoint": "pi-extensions/stash.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "xxrenzhe/autobb",
+      "entrypoint": "openclaw/.pi/extensions/prompt-url-widget.ts",
+      "file_count": 2,
+      "registrations": []
+    },
+    {
+      "repo": "yulqen/conductor-pi",
+      "entrypoint": "index.ts",
+      "file_count": 1,
+      "registrations": [
+        "registerCommand"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,655 @@
+{
+  "histogram": [
+    {
+      "range": "0-9",
+      "count": 0
+    },
+    {
+      "range": "10-19",
+      "count": 95
+    },
+    {
+      "range": "20-29",
+      "count": 97
+    },
+    {
+      "range": "30-39",
+      "count": 26
+    },
+    {
+      "range": "40-49",
+      "count": 43
+    },
+    {
+      "range": "50-59",
+      "count": 10
+    },
+    {
+      "range": "60-69",
+      "count": 60
+    },
+    {
+      "range": "70-79",
+      "count": 0
+    },
+    {
+      "range": "80-89",
+      "count": 0
+    },
+    {
+      "range": "90-99",
+      "count": 0
+    },
+    {
+      "range": "100-100",
+      "count": 0
+    }
+  ],
+  "topOverall": [
+    {
+      "id": "with-deps",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 1
+    },
+    {
+      "id": "widget-placement",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 2
+    },
+    {
+      "id": "truncated-tool",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 3
+    },
+    {
+      "id": "trigger-compact",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 4
+    },
+    {
+      "id": "tools",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 5
+    },
+    {
+      "id": "tool-override",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 6
+    },
+    {
+      "id": "todo",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 7
+    },
+    {
+      "id": "titlebar-spinner",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 8
+    },
+    {
+      "id": "timed-confirm",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 9
+    },
+    {
+      "id": "system-prompt-header",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 10
+    },
+    {
+      "id": "summarize",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 11
+    },
+    {
+      "id": "subagent",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 12
+    },
+    {
+      "id": "status-line",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 13
+    },
+    {
+      "id": "ssh",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 14
+    },
+    {
+      "id": "space-invaders",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 15
+    },
+    {
+      "id": "snake",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 16
+    },
+    {
+      "id": "shutdown-command",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 17
+    },
+    {
+      "id": "session-name",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 18
+    },
+    {
+      "id": "send-user-message",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 19
+    },
+    {
+      "id": "sandbox",
+      "score": 60,
+      "tier": "tier-0",
+      "rank": 20
+    }
+  ],
+  "topBySourceTier": {
+    "agents-mikeastock": [
+      {
+        "id": "mikeastock/agents",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 133
+      }
+    ],
+    "community": [
+      {
+        "id": "badlogic/pi-mono",
+        "score": 54,
+        "tier": "tier-2",
+        "rank": 63
+      }
+    ],
+    "extensions": [
+      {
+        "id": "graffioh/pi-super-curl",
+        "score": 44,
+        "tier": "excluded",
+        "rank": 83
+      },
+      {
+        "id": "ferologics/pi-notify",
+        "score": 44,
+        "tier": "excluded",
+        "rank": 84
+      },
+      {
+        "id": "kcosr/pi-extensions",
+        "score": 40,
+        "tier": "excluded",
+        "rank": 113
+      },
+      {
+        "id": "ogulcancelik/pi-ghostty-theme-sync",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 132
+      },
+      {
+        "id": "jyaunches/pi-canvas",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 134
+      },
+      {
+        "id": "ben-vargas/pi-packages",
+        "score": 22,
+        "tier": "excluded",
+        "rank": 198
+      },
+      {
+        "id": "zenobi-us/pi-dcp",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 286
+      },
+      {
+        "id": "qualisero/rhubarb-pi",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 296
+      },
+      {
+        "id": "ogulcancelik/pi-sketch",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 298
+      },
+      {
+        "id": "michalvavra/agents",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 299
+      },
+      {
+        "id": "lsj5031/pi-notification-extension",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 303
+      },
+      {
+        "id": "jwintz/pi-island",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 309
+      },
+      {
+        "id": "galz10/pickle-rick-extension",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 311
+      },
+      {
+        "id": "cv/pi-ssh-remote",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 319
+      }
+    ],
+    "npm-registry": [
+      {
+        "id": "googlechrome/workbox",
+        "score": 54,
+        "tier": "tier-2",
+        "rank": 62
+      },
+      {
+        "id": "nicobailon/pi-interactive-shell",
+        "score": 52,
+        "tier": "tier-2",
+        "rank": 64
+      },
+      {
+        "id": "langchain-ai/langgraphjs",
+        "score": 52,
+        "tier": "tier-2",
+        "rank": 65
+      },
+      {
+        "id": "subsy/ralph-tui",
+        "score": 51,
+        "tier": "tier-2",
+        "rank": 66
+      },
+      {
+        "id": "microsoft/vscode-languageserver-node",
+        "score": 51,
+        "tier": "tier-2",
+        "rank": 67
+      },
+      {
+        "id": "nicobailon/pi-messenger",
+        "score": 50,
+        "tier": "tier-2",
+        "rank": 68
+      },
+      {
+        "id": "open-telemetry/opentelemetry-js-contrib",
+        "score": 50,
+        "tier": "tier-2",
+        "rank": 69
+      },
+      {
+        "id": "nicobailon/pi-web-access",
+        "score": 48,
+        "tier": "excluded",
+        "rank": 71
+      },
+      {
+        "id": "nicobailon/pi-review-loop",
+        "score": 48,
+        "tier": "excluded",
+        "rank": 72
+      },
+      {
+        "id": "nicobailon/pi-mcp-adapter",
+        "score": 48,
+        "tier": "excluded",
+        "rank": 73
+      },
+      {
+        "id": "nicobailon/pi-annotate",
+        "score": 48,
+        "tier": "excluded",
+        "rank": 74
+      },
+      {
+        "id": "assagman/agentsbox",
+        "score": 48,
+        "tier": "excluded",
+        "rank": 75
+      },
+      {
+        "id": "nicobailon/pi-powerline-footer",
+        "score": 47,
+        "tier": "excluded",
+        "rank": 76
+      },
+      {
+        "id": "nicobailon/pi-skill-palette",
+        "score": 46,
+        "tier": "excluded",
+        "rank": 77
+      },
+      {
+        "id": "hjanuschka/shitty-extensions",
+        "score": 46,
+        "tier": "excluded",
+        "rank": 78
+      },
+      {
+        "id": "graffioh/pi-screenshots-picker",
+        "score": 46,
+        "tier": "excluded",
+        "rank": 79
+      },
+      {
+        "id": "tmustier/pi-extensions",
+        "score": 44,
+        "tier": "excluded",
+        "rank": 81
+      },
+      {
+        "id": "npm/pi-extensions",
+        "score": 44,
+        "tier": "excluded",
+        "rank": 82
+      },
+      {
+        "id": "badlogic/pi-package-test",
+        "score": 44,
+        "tier": "excluded",
+        "rank": 85
+      },
+      {
+        "id": "jhurliman/node-rate-limiter",
+        "score": 42,
+        "tier": "excluded",
+        "rank": 86
+      }
+    ],
+    "official-pi-mono": [
+      {
+        "id": "with-deps",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 1
+      },
+      {
+        "id": "widget-placement",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 2
+      },
+      {
+        "id": "truncated-tool",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 3
+      },
+      {
+        "id": "trigger-compact",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 4
+      },
+      {
+        "id": "tools",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 5
+      },
+      {
+        "id": "tool-override",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 6
+      },
+      {
+        "id": "todo",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 7
+      },
+      {
+        "id": "titlebar-spinner",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 8
+      },
+      {
+        "id": "timed-confirm",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 9
+      },
+      {
+        "id": "system-prompt-header",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 10
+      },
+      {
+        "id": "summarize",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 11
+      },
+      {
+        "id": "subagent",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 12
+      },
+      {
+        "id": "status-line",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 13
+      },
+      {
+        "id": "ssh",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 14
+      },
+      {
+        "id": "space-invaders",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 15
+      },
+      {
+        "id": "snake",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 16
+      },
+      {
+        "id": "shutdown-command",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 17
+      },
+      {
+        "id": "session-name",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 18
+      },
+      {
+        "id": "send-user-message",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 19
+      },
+      {
+        "id": "sandbox",
+        "score": 60,
+        "tier": "tier-0",
+        "rank": 20
+      }
+    ],
+    "skills": [
+      {
+        "id": "pasky/pi-amplike",
+        "score": 44,
+        "tier": "excluded",
+        "rank": 80
+      },
+      {
+        "id": "badlogic/pi-skills",
+        "score": 18,
+        "tier": "excluded",
+        "rank": 327
+      }
+    ],
+    "third-party-github": [
+      {
+        "id": "igor-makarov/pi-extension-sandbox",
+        "score": 54,
+        "tier": "tier-2",
+        "rank": 61
+      },
+      {
+        "id": "third-party/openclaw-openclaw",
+        "score": 50,
+        "tier": "excluded",
+        "rank": 70
+      },
+      {
+        "id": "christroutner/pi-extensions",
+        "score": 42,
+        "tier": "excluded",
+        "rank": 105
+      },
+      {
+        "id": "sids/pi-extensions",
+        "score": 41,
+        "tier": "excluded",
+        "rank": 106
+      },
+      {
+        "id": "richardgill/pi-extensions",
+        "score": 41,
+        "tier": "excluded",
+        "rank": 107
+      },
+      {
+        "id": "forwardinfinity/pi-extensions",
+        "score": 41,
+        "tier": "excluded",
+        "rank": 108
+      },
+      {
+        "id": "assagman/pi-extensions",
+        "score": 41,
+        "tier": "excluded",
+        "rank": 109
+      },
+      {
+        "id": "nicobailon/pi-model-switch",
+        "score": 40,
+        "tier": "excluded",
+        "rank": 110
+      },
+      {
+        "id": "third-party/pasky-pi-amplike",
+        "score": 40,
+        "tier": "excluded",
+        "rank": 111
+      },
+      {
+        "id": "nrupatunga/pi-extensions",
+        "score": 40,
+        "tier": "excluded",
+        "rank": 112
+      },
+      {
+        "id": "mcollina/pi-bash-confirm",
+        "score": 39,
+        "tier": "excluded",
+        "rank": 114
+      },
+      {
+        "id": "istar-eldritch/pi-wakatime",
+        "score": 39,
+        "tier": "excluded",
+        "rank": 115
+      },
+      {
+        "id": "whamp/pi-agentic-compaction",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 116
+      },
+      {
+        "id": "third-party/zenobi-us-pi-dcp",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 117
+      },
+      {
+        "id": "third-party/raunovillberg-pi-stuffed",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 118
+      },
+      {
+        "id": "third-party/qualisero-pi-agent-scip",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 119
+      },
+      {
+        "id": "third-party/ogulcancelik-pi-sketch",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 120
+      },
+      {
+        "id": "third-party/michalvavra-agents",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 121
+      },
+      {
+        "id": "third-party/marckrenn-pi-sub",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 122
+      },
+      {
+        "id": "third-party/lsj5031-pi-notification-extension",
+        "score": 38,
+        "tier": "excluded",
+        "rank": 123
+      }
+    ]
+  },
+  "manualOverrides": []
+}

@@ -1,0 +1,3233 @@
+{
+  "meta": {
+    "task": "bd-3l39",
+    "description": "GitHub code search for Pi extension signatures",
+    "queries_executed": 10,
+    "total_repos_found": 479,
+    "repos_inspected": 290,
+    "validated_extensions": 189
+  },
+  "extensions": [
+    {
+      "repo": "Deskaunedsei1983/loc_clawdbot_01",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/context-pruning/extension.ts",
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "Dwsy/agent",
+      "path": "checkpoint-v2/index.ts",
+      "all_paths": [
+        "checkpoint-v2/index.ts",
+        "extensions.disabled/sandbox/index.ts",
+        "extensions.disabled/undo-redo/index.ts",
+        "extensions.disabled/undo-redo/tools.ts",
+        "extensions/answer.ts",
+        "extensions/continue.ts",
+        "extensions/custom-footer.ts",
+        "extensions/games/index.ts",
+        "extensions/git-commit.ts",
+        "extensions/insights-llm.ts",
+        "extensions/insights-report.ts",
+        "extensions/insights.ts",
+        "extensions/interview/index.ts",
+        "extensions/loop.ts",
+        "extensions/plan-mode/index.ts",
+        "extensions/ralph/index.ts",
+        "extensions/role-persona/index.ts",
+        "extensions/safety-gates.ts",
+        "extensions/subagent/index.ts",
+        "extensions/tree-view.ts",
+        "extensions/web-fetch.ts",
+        "skills/pi-extensions/assets/examples/session-stats.ts",
+        "skills/pi-extensions/assets/templates/command.ts",
+        "skills/pi-extensions/assets/templates/event-handler.ts",
+        "skills/pi-extensions/assets/templates/full-extension.ts",
+        "skills/pi-extensions/assets/templates/tool.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 26
+    },
+    {
+      "repo": "ElementsAI-Dev/Cognia",
+      "path": "plugin-sdk/typescript/src/index.ts",
+      "all_paths": [
+        "lib/plugin/core/context.ts",
+        "plugin-sdk/typescript/src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "ElwinLiu/pi-config",
+      "path": "agent/extensions/droid-style/index.ts",
+      "all_paths": [
+        "agent/extensions/droid-style/index.ts",
+        "agent/extensions/droid-style/tool-call-tags.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "EthanAlgoX/MarketBot",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        ".pi/extensions/prompt-url-widget.ts",
+        ".pi/extensions/redraws.ts",
+        "src/agents/pi-extensions/context-pruning/extension.ts",
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 5
+    },
+    {
+      "repo": "ForwardInfinity/pi-extensions",
+      "path": "antigravity-rotator/antigravity-account-rotator.ts",
+      "all_paths": [
+        "antigravity-rotator/antigravity-account-rotator.ts",
+        "claude-rotator/claude-account-rotator.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "Iranb/clawdbot",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/context-pruning/extension.ts",
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "Itsnotaka/dot-pi",
+      "path": "agent/extensions/context7/index.ts",
+      "all_paths": [
+        "agent/extensions/ask-user.ts",
+        "agent/extensions/codebase.ts",
+        "agent/extensions/completion-sound.ts",
+        "agent/extensions/context7/index.ts",
+        "agent/extensions/debug.ts",
+        "agent/extensions/get-diagnostics/index.ts",
+        "agent/extensions/git-checkpoint.ts",
+        "agent/extensions/handoff.ts",
+        "agent/extensions/look-at.ts",
+        "agent/extensions/pierre-system-theme.ts",
+        "agent/extensions/sandbox.ts",
+        "agent/extensions/statusline.ts",
+        "agent/extensions/subagents/index.ts",
+        "agent/extensions/tasks.ts",
+        "agent/extensions/websearch/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 15
+    },
+    {
+      "repo": "Lukeus/ai-shell",
+      "path": "apps/extension-host/src/extension-runtime.ts",
+      "all_paths": [
+        "apps/extension-host/src/extension-runtime.ts",
+        "packages/api-contracts/src/types/extension-api.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "Mic92/dotfiles",
+      "path": "home/.pi/agent/extensions/custom-footer.ts",
+      "all_paths": [
+        "home/.pi/agent/extensions/custom-footer.ts",
+        "home/.pi/agent/extensions/custom-instructions.ts",
+        "home/.pi/agent/extensions/permission-gate.ts",
+        "home/.pi/agent/extensions/stable-settings.ts",
+        "home/.pi/agent/extensions/workmux-status.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 5
+    },
+    {
+      "repo": "PSPDFKit-labs/pi-skills",
+      "path": "extensions/buildkite-failures.ts",
+      "all_paths": [
+        "extensions/buildkite-failures.ts",
+        "extensions/cronjob.ts",
+        "extensions/loop.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "Volantk/pi-agent-skills-extensions",
+      "path": "extensions/copy-tool.ts",
+      "all_paths": [
+        "extensions/copy-tool.ts",
+        "extensions/current-time.ts",
+        "extensions/web-search.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "Whamp/pi-brain",
+      "path": "extensions/brain-query/index.ts",
+      "all_paths": [
+        "extensions/brain-query/index.ts",
+        "extensions/dashboard/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "Whamp/pi-rlm",
+      "path": "devdocs/claude_code_RLM/extensions/subagent/index.ts",
+      "all_paths": [
+        "devdocs/claude_code_RLM/extensions/subagent/index.ts",
+        "skills/rlm/extensions/rlm_tools.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "Willyfrog/pi-agent-extensions",
+      "path": "extensions/variable-store.ts",
+      "all_paths": [
+        "extensions/variable-store.ts",
+        "extensions/weather-tool.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "aadishv/dotfiles",
+      "path": "manifests/files/common/.pi/agent/extensions/clean-startup.ts",
+      "all_paths": [
+        "manifests/files/common/.pi/agent/extensions/clean-startup.ts",
+        "manifests/files/common/.pi/agent/extensions/discord.ts",
+        "manifests/files/common/.pi/agent/extensions/fps-counter.ts",
+        "manifests/files/common/.pi/agent/extensions/pricing.ts",
+        "manifests/files/common/.pi/agent/extensions/todo.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 5
+    },
+    {
+      "repo": "adragomir/dotfiles",
+      "path": ".config/pi/agent/extensions/lsp/index.ts",
+      "all_paths": [
+        ".config/pi/agent/autoload-subdir-agents.ts",
+        ".config/pi/agent/extensions/answer.ts",
+        ".config/pi/agent/extensions/finder.ts",
+        ".config/pi/agent/extensions/lsp/index.ts",
+        ".config/pi/agent/extensions/plan-mode/index.ts",
+        ".config/pi/agent/extensions/preset.ts",
+        ".config/pi/agent/extensions/question.ts",
+        ".config/pi/agent/extensions/readlines/index.ts",
+        ".config/pi/agent/extensions/sandbox/index.ts",
+        ".config/pi/agent/extensions/subagent/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 10
+    },
+    {
+      "repo": "aldoborrero/agent-kit",
+      "path": "pi/extensions/questionnaire/index.ts",
+      "all_paths": [
+        "pi/extensions/ast-grep/ast-grep.ts",
+        "pi/extensions/direnv/direnv.ts",
+        "pi/extensions/github-search/github-search.ts",
+        "pi/extensions/jina/jina.ts",
+        "pi/extensions/kagi-search/kagi-search.ts",
+        "pi/extensions/pexpect-cli/pexpect-cli.ts",
+        "pi/extensions/questionnaire/index.ts",
+        "pi/extensions/recorder/recorder.ts",
+        "pi/extensions/subagent/agents.ts",
+        "pi/extensions/subagent/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 10
+    },
+    {
+      "repo": "anntnzrb/agents",
+      "path": "tools/pi/agent/extensions/answer/index.ts",
+      "all_paths": [
+        "tools/pi/agent/extensions/answer/index.ts",
+        "tools/pi/agent/extensions/footer/index.ts",
+        "tools/pi/agent/extensions/todos/index.ts",
+        "tools/pi/agent/extensions/tool-tweaks/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 4
+    },
+    {
+      "repo": "assagman/pi-extensions",
+      "path": "extensions/gamma/src/index.ts",
+      "all_paths": [
+        "extensions/delta/src/tools.ts",
+        "extensions/epsilon/src/tools.ts",
+        "extensions/gamma/src/index.ts",
+        "extensions/mu/src/index.ts",
+        "extensions/omega/src/index.ts",
+        "extensions/sigma/src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 6
+    },
+    {
+      "repo": "az9713/clawdbot",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/context-pruning/extension.ts",
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "bout3fiddy/agents",
+      "path": "extensions/pi-eval/index.ts",
+      "all_paths": [
+        "extensions/pi-eval/index.ts",
+        "extensions/pi-eval/src/worker.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "bytes032/agentkit",
+      "path": "pi-extensions/handoff.ts",
+      "all_paths": [
+        "pi-extensions/handoff.ts",
+        "pi-extensions/review.ts",
+        "pi-extensions/session-breakdown.ts",
+        "pi-extensions/todos.ts",
+        "pi-extensions/web-fetch.ts",
+        "pi-extensions/web-search.ts",
+        "pi-extensions/whimsical.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 7
+    },
+    {
+      "repo": "cameronmaske/agent-stuff",
+      "path": "extensions/pi-annotate/index.ts",
+      "all_paths": [
+        "extensions/copy-code.ts",
+        "extensions/oracle.ts",
+        "extensions/pi-annotate/index.ts",
+        "extensions/plan-mode.ts",
+        "extensions/post-edit-format.ts",
+        "extensions/powerline-footer/index.ts",
+        "extensions/review.ts",
+        "extensions/todos.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 8
+    },
+    {
+      "repo": "can1357/oh-my-pi",
+      "path": "packages/coding-agent/examples/extensions/with-deps/index.ts",
+      "all_paths": [
+        "packages/coding-agent/examples/extensions/api-demo.ts",
+        "packages/coding-agent/examples/extensions/hello.ts",
+        "packages/coding-agent/examples/extensions/todo.ts",
+        "packages/coding-agent/examples/extensions/with-deps/index.ts",
+        "packages/coding-agent/examples/sdk/06-extensions.ts",
+        "packages/coding-agent/src/extensibility/extensions/types.ts",
+        "packages/coding-agent/src/sdk.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 7
+    },
+    {
+      "repo": "charlie-818/CLAWD",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        ".pi/extensions/files.ts",
+        "src/agents/pi-extensions/context-pruning/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 3
+    },
+    {
+      "repo": "christroutner/pi-extensions",
+      "path": "extensions/brave-search.ts",
+      "all_paths": [
+        "extensions/brave-search.ts",
+        "extensions/memory.ts",
+        "extensions/telegram.ts",
+        "extensions/web-fetch.ts",
+        "extensions/web-research.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 5
+    },
+    {
+      "repo": "coltonbatts/Loubot",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/context-pruning/extension.ts",
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "continua-ai/pi-lab",
+      "path": "extensions/live-commentary/index.ts",
+      "all_paths": [
+        "extensions/live-commentary/index.ts",
+        "extensions/subscription-fallback/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "davekilleen/Dex",
+      "path": "pi-extensions/dex/index.ts",
+      "all_paths": [
+        "pi-extensions/dex/index.ts",
+        "pi-extensions/dex/orchestrator.ts",
+        "pi-extensions/dex/tools/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "dctrwatson/pi-squared",
+      "path": "extensions/gh-todo/index.ts",
+      "all_paths": [
+        "extensions/gh-todo/index.ts",
+        "extensions/gh-todo/tool.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "default-anton/dotfiles",
+      "path": "pi/agent/extensions/finder/index.ts",
+      "all_paths": [
+        "pi/agent/extensions/finder/index.ts",
+        "pi/agent/extensions/handoff.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "dejanr/dotfiles",
+      "path": "modules/home/cli/pi-mono/extensions/codex-tuning/index.ts",
+      "all_paths": [
+        "modules/home/cli/pi-mono/extensions/codex-tuning/index.ts",
+        "modules/home/cli/pi-mono/extensions/commit-all/index.ts",
+        "modules/home/cli/pi-mono/extensions/commit/index.ts",
+        "modules/home/cli/pi-mono/extensions/cwd-history/index.ts",
+        "modules/home/cli/pi-mono/extensions/direnv/index.ts",
+        "modules/home/cli/pi-mono/extensions/footer/index.ts",
+        "modules/home/cli/pi-mono/extensions/loop/index.ts",
+        "modules/home/cli/pi-mono/extensions/notify/index.ts",
+        "modules/home/cli/pi-mono/extensions/permission-gate/index.ts",
+        "modules/home/cli/pi-mono/extensions/prompt-model/index.ts",
+        "modules/home/cli/pi-mono/extensions/qna/index.ts",
+        "modules/home/cli/pi-mono/extensions/reveal/index.ts",
+        "modules/home/cli/pi-mono/extensions/review/index.ts",
+        "modules/home/cli/pi-mono/extensions/voice-input/index.ts",
+        "modules/home/cli/pi-mono/extensions/websearch/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 15
+    },
+    {
+      "repo": "deybhayden/bendows",
+      "path": ".pi/agent/extensions/answer.ts",
+      "all_paths": [
+        ".pi/agent/extensions/answer.ts",
+        ".pi/agent/extensions/bitbucket.ts",
+        ".pi/agent/extensions/github.ts",
+        ".pi/agent/extensions/todos.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 4
+    },
+    {
+      "repo": "deybhayden/dotfiles",
+      "path": ".pi/agent/extensions/answer.ts",
+      "all_paths": [
+        ".pi/agent/extensions/answer.ts",
+        ".pi/agent/extensions/bitbucket.ts",
+        ".pi/agent/extensions/github.ts",
+        ".pi/agent/extensions/session-breakdown.ts",
+        ".pi/agent/extensions/super-review.ts",
+        ".pi/agent/extensions/todos.ts",
+        ".pi/agent/extensions/uv.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 7
+    },
+    {
+      "repo": "dungle-scrubs/agent-config",
+      "path": "stow/pi/extensions/lsp/index.ts",
+      "all_paths": [
+        "stow/pi/extensions/agent-commands.ts",
+        "stow/pi/extensions/ask-user-question.ts",
+        "stow/pi/extensions/background-tasks.ts",
+        "stow/pi/extensions/cd.ts",
+        "stow/pi/extensions/custom-footer.ts",
+        "stow/pi/extensions/git-status.ts",
+        "stow/pi/extensions/lsp/index.ts",
+        "stow/pi/extensions/read-summary.ts",
+        "stow/pi/extensions/rm-approval.ts",
+        "stow/pi/extensions/subagent.ts",
+        "stow/pi/extensions/tasks.ts",
+        "stow/pi/extensions/tool-proxy/docs-gate.ts",
+        "stow/pi/extensions/tool-proxy/index.ts",
+        "stow/pi/extensions/tool-proxy/intent-logger.ts",
+        "stow/pi/extensions/web-fetch.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 15
+    },
+    {
+      "repo": "ehtbanton/controlocal",
+      "path": "packages/openclaw/.pi/extensions/prompt-url-widget.ts",
+      "all_paths": [
+        "packages/openclaw/.pi/extensions/prompt-url-widget.ts",
+        "packages/openclaw/.pi/extensions/redraws.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "ex3ndr/daycare",
+      "path": "packages/daycare/sources/plugins/anthropic-fetch/plugin.ts",
+      "all_paths": [
+        "packages/daycare/sources/plugins/anthropic-fetch/plugin.ts",
+        "packages/daycare/sources/plugins/anthropic-search/plugin.ts",
+        "packages/daycare/sources/plugins/brave-search/plugin.ts",
+        "packages/daycare/sources/plugins/database/plugin.ts",
+        "packages/daycare/sources/plugins/exa-ai/plugin.ts",
+        "packages/daycare/sources/plugins/firecrawl/plugin.ts",
+        "packages/daycare/sources/plugins/gemini-search/plugin.ts",
+        "packages/daycare/sources/plugins/openai-search/plugin.ts",
+        "packages/daycare/sources/plugins/perplexity-search/plugin.ts",
+        "packages/daycare/sources/plugins/web-fetch/plugin.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 10
+    },
+    {
+      "repo": "garymjr/dotfiles",
+      "path": "dot_pi/agent/extensions/review/index.ts",
+      "all_paths": [
+        "dot_pi/agent/extensions/review/index.ts",
+        "dot_pi/agent/extensions/zai-vision/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "goncalossilva/.agents",
+      "path": "pi/extensions/loop.ts",
+      "all_paths": [
+        "pi/extensions/loop.ts",
+        "pi/extensions/notify.ts",
+        "pi/extensions/review.ts",
+        "pi/extensions/todos.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 4
+    },
+    {
+      "repo": "goofansu/agent-stuff",
+      "path": "pi-extensions/answer.ts",
+      "all_paths": [
+        "pi-extensions/answer.ts",
+        "pi-extensions/files.ts",
+        "pi-extensions/review.ts",
+        "pi-extensions/snippets.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 4
+    },
+    {
+      "repo": "graycarl/dotshell",
+      "path": "apps/pi/agent/extensions/subagent/index.ts",
+      "all_paths": [
+        "apps/pi/agent/extensions/subagent/index.ts",
+        "apps/pi/agent/extensions/todo.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "haider-patanwala/clawdbot",
+      "path": ".pi/extensions/diff.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        ".pi/extensions/files.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "hjanuschka/shitty-extensions",
+      "path": "extensions/clipboard.ts",
+      "all_paths": [
+        "extensions/clipboard.ts",
+        "extensions/loop.ts",
+        "extensions/memory-mode.ts",
+        "extensions/oracle.ts",
+        "extensions/plan-mode.ts",
+        "extensions/resistance.ts",
+        "extensions/ultrathink.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 7
+    },
+    {
+      "repo": "jamwil/dotfiles",
+      "path": "dot_pi/agent/extensions/context7/index.ts",
+      "all_paths": [
+        "dot_pi/agent/extensions/codesearch.ts",
+        "dot_pi/agent/extensions/context7/index.ts",
+        "dot_pi/agent/extensions/cwd-gate.ts",
+        "dot_pi/agent/extensions/env-json/index.ts",
+        "dot_pi/agent/extensions/usage-bar.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 5
+    },
+    {
+      "repo": "jbuckmccready/dotfiles",
+      "path": "pi/.pi/agent/extensions/sandbox/index.ts",
+      "all_paths": [
+        "pi/.pi/agent/extensions/answer.ts",
+        "pi/.pi/agent/extensions/custom-compaction.ts",
+        "pi/.pi/agent/extensions/handoff.ts",
+        "pi/.pi/agent/extensions/notify.ts",
+        "pi/.pi/agent/extensions/quick-commit.ts",
+        "pi/.pi/agent/extensions/sandbox/index.ts",
+        "pi/.pi/agent/extensions/todo.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ],
+      "file_count": 7
+    },
+    {
+      "repo": "jcolano/openclaw",
+      "path": ".pi/extensions/diff.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        ".pi/extensions/files.ts",
+        ".pi/extensions/redraws.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "joelazar/dotfiles",
+      "path": "dot_pi/agent/extensions/sandbox/index.ts",
+      "all_paths": [
+        "dot_pi/agent/extensions/antigravity-image-gen.ts",
+        "dot_pi/agent/extensions/cwd-history.ts",
+        "dot_pi/agent/extensions/extensions-manager.ts",
+        "dot_pi/agent/extensions/files.ts",
+        "dot_pi/agent/extensions/loop.ts",
+        "dot_pi/agent/extensions/notify.ts",
+        "dot_pi/agent/extensions/permission-gate.ts",
+        "dot_pi/agent/extensions/review.ts",
+        "dot_pi/agent/extensions/sandbox/index.ts",
+        "dot_pi/agent/extensions/session-name.ts",
+        "dot_pi/agent/extensions/subagent/index.ts",
+        "dot_pi/agent/extensions/todos.ts",
+        "dot_pi/agent/extensions/whimsical.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ],
+      "file_count": 13
+    },
+    {
+      "repo": "jorgeavaldez/pi-config",
+      "path": "extensions/subagent/index.ts",
+      "all_paths": [
+        "extensions/edit-prompt.ts",
+        "extensions/jj-status.ts",
+        "extensions/notification.ts",
+        "extensions/qna.ts",
+        "extensions/subagent/index.ts",
+        "extensions/task/index.ts",
+        "extensions/websearch.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 7
+    },
+    {
+      "repo": "joshuadavidthomas/agentkit",
+      "path": "runtimes/pi/extensions/pi-subagents/index.ts",
+      "all_paths": [
+        "runtimes/pi/extensions/answer.ts",
+        "runtimes/pi/extensions/beans.ts",
+        "runtimes/pi/extensions/dcg.ts",
+        "runtimes/pi/extensions/handoff.ts",
+        "runtimes/pi/extensions/notify.ts",
+        "runtimes/pi/extensions/pi-subagents/index.ts",
+        "runtimes/pi/extensions/pi-subagents/notify.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 7
+    },
+    {
+      "repo": "kaofelix/dotfiles",
+      "path": "pi/.pi/agent/extensions/auto-exit.ts",
+      "all_paths": [
+        "pi/.pi/agent/extensions/auto-exit.ts",
+        "pi/.pi/agent/extensions/titlebar-spinner.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerFlag"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "kavia-common/moltbot-311196",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        "src/agents/pi-extensions/context-pruning/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "knoopx/pi",
+      "path": "agent/extensions/bookmarks/index.ts",
+      "all_paths": [
+        "agent/extensions/bookmarks/index.ts",
+        "agent/extensions/duckduckgo/index.ts",
+        "agent/extensions/gog/index.ts",
+        "agent/extensions/guardrails/index.ts",
+        "agent/extensions/home-assistant/index.ts",
+        "agent/extensions/markitdown/index.ts",
+        "agent/extensions/nix/index.ts",
+        "agent/extensions/nomnoml/index.ts",
+        "agent/extensions/notification/index.ts",
+        "agent/extensions/npm/index.ts",
+        "agent/extensions/pypi/index.ts",
+        "agent/extensions/quotas/index.ts",
+        "agent/extensions/reddit/index.ts",
+        "agent/extensions/rodalies/index.ts",
+        "agent/extensions/stocks/index.ts",
+        "agent/extensions/transformers-js/index.ts",
+        "agent/extensions/watch/index.ts",
+        "agent/extensions/weather/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 18
+    },
+    {
+      "repo": "l-lin/dotfiles",
+      "path": "home-manager/modules/share/ai/pi/.pi/agent/extensions/ask-user-question.ts",
+      "all_paths": [
+        "home-manager/modules/share/ai/pi/.pi/agent/extensions/ask-user-question.ts",
+        "home-manager/modules/share/ai/pi/.pi/agent/extensions/copilot-usage.ts",
+        "home-manager/modules/share/ai/pi/.pi/agent/extensions/handoff.ts",
+        "home-manager/modules/share/ai/pi/.pi/agent/extensions/pre-tool-safety.ts",
+        "home-manager/modules/share/ai/pi/.pi/agent/extensions/review.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 5
+    },
+    {
+      "repo": "laulauland/dotfiles",
+      "path": "shared/.pi/agent/extensions/mcp/index.ts",
+      "all_paths": [
+        "shared/.pi/agent/extensions/jj-footer.ts",
+        "shared/.pi/agent/extensions/jj-workflow.ts",
+        "shared/.pi/agent/extensions/mcp/index.ts",
+        "shared/.pi/agent/extensions/orc-mode.ts",
+        "shared/.pi/agent/extensions/shell-completions/index.ts",
+        "shared/.pi/agent/extensions/threads/index.ts",
+        "shared/.pi/agent/extensions/tmux-reference.ts",
+        "shared/.pi/agent/extensions/update.ts",
+        "shared/.pi/agent/extensions/web-tools/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 9
+    },
+    {
+      "repo": "leiserfg/nix-config",
+      "path": "home/leiserfg/pi-extensions/loop.ts",
+      "all_paths": [
+        "home/leiserfg/pi-extensions/loop.ts",
+        "home/leiserfg/pi-extensions/notify.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "leopechnicki/AI-Assistant",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        ".pi/extensions/files.ts",
+        ".pi/extensions/redraws.ts",
+        "src/agents/pi-extensions/context-pruning/extension.ts",
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 5
+    },
+    {
+      "repo": "lllooollpp/clawdbot-cn",
+      "path": "apps/desktop/src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts",
+      "all_paths": [
+        "apps/desktop/src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts",
+        "src/agents/pi-extensions/compaction-safeguard.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "markus1189/nixos-config",
+      "path": "nixos-shared/home-manager/pi-agent/extensions/block-dangerous.ts",
+      "all_paths": [
+        "nixos-shared/home-manager/pi-agent/extensions/block-dangerous.ts",
+        "nixos-shared/home-manager/pi-agent/extensions/glados.ts",
+        "nixos-shared/home-manager/pi-agent/extensions/instruction-resolver.ts",
+        "nixos-shared/home-manager/pi-agent/extensions/questionnaire.ts",
+        "nixos-shared/home-manager/pi-agent/extensions/sounds.ts",
+        "nixos-shared/home-manager/pi-agent/extensions/web-tools.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 6
+    },
+    {
+      "repo": "masonjames/dockhand-sre-agent",
+      "path": "packages/coding-agent/src/core/extensions/loader.ts",
+      "all_paths": [
+        "packages/coding-agent/src/core/extensions/loader.ts",
+        "packages/coding-agent/src/core/extensions/types.ts",
+        "packages/coding-agent/test/resource-loader.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerProvider",
+        "registerFlag",
+        "registerShortcut"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "megalithic/dotfiles",
+      "path": "home/programs/ai/pi-coding-agent/extensions/answer.ts",
+      "all_paths": [
+        "home/programs/ai/pi-coding-agent/extensions/answer.ts",
+        "home/programs/ai/pi-coding-agent/extensions/bridge.ts",
+        "home/programs/ai/pi-coding-agent/extensions/files.ts",
+        "home/programs/ai/pi-coding-agent/extensions/guardrails.ts",
+        "home/programs/ai/pi-coding-agent/extensions/notify.ts",
+        "home/programs/ai/pi-coding-agent/extensions/todos.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 6
+    },
+    {
+      "repo": "meteyou/pi-stuff",
+      "path": "extensions/loop-workflow/index.ts",
+      "all_paths": [
+        "extensions/loop-workflow/index.ts",
+        "extensions/quota-antigravity/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "mikeastock/dotagents",
+      "path": "extensions/pi/AskUserQuestion/index.ts",
+      "all_paths": [
+        "extensions/pi/AskUserQuestion/index.ts",
+        "extensions/pi/agent-status/index.ts",
+        "extensions/pi/handoff/index.ts",
+        "extensions/pi/per-model-thinking/index.ts",
+        "extensions/pi/session-query/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 5
+    },
+    {
+      "repo": "mikeyobrien/pi-agent",
+      "path": "extensions/brave-search.ts",
+      "all_paths": [
+        "extensions/brave-search.ts",
+        "extensions/soul.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "mikeyobrien/rho",
+      "path": "extensions/brain.ts",
+      "all_paths": [
+        "extensions/brain.ts",
+        "extensions/brave-search.ts",
+        "extensions/email.ts",
+        "extensions/memory-viewer.ts",
+        "extensions/moltbook-viewer.ts",
+        "extensions/rho.ts",
+        "extensions/tasks.ts",
+        "extensions/usage-bars.ts",
+        "extensions/vault.ts",
+        "platforms/android/extensions/tasker.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 10
+    },
+    {
+      "repo": "mitsuhiko/agent-stuff",
+      "path": "pi-extensions/answer.ts",
+      "all_paths": [
+        "pi-extensions/answer.ts",
+        "pi-extensions/context.ts",
+        "pi-extensions/control.ts",
+        "pi-extensions/cwd-history.ts",
+        "pi-extensions/files.ts",
+        "pi-extensions/loop.ts",
+        "pi-extensions/review.ts",
+        "pi-extensions/todos.ts",
+        "pi-extensions/uv.ts",
+        "pi-extensions/whimsical.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 10
+    },
+    {
+      "repo": "mrndstvndv/nixdots",
+      "path": "modules/pi/package/extensions/kimi/kimi.ts",
+      "all_paths": [
+        "modules/pi/package/extensions/kimi/kimi.ts",
+        "modules/pi/package/extensions/lsp/lsp-tool.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "neonspectra/dotfiles",
+      "path": ".pi/agent/extensions/commands.ts",
+      "all_paths": [
+        ".pi/agent/extensions/commands.ts",
+        ".pi/agent/extensions/pi-self.ts",
+        ".pi/agent/extensions/web-search.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "nexxeln/dots",
+      "path": "config/pi/agent/extensions/handoff.ts",
+      "all_paths": [
+        "config/pi/agent/extensions/handoff.ts",
+        "config/pi/agent/extensions/review.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "nicobailon/pi-coordination",
+      "path": "coordinate/coordinator-tools/index.ts",
+      "all_paths": [
+        "coordinate/coordinator-tools/index.ts",
+        "coordinate/worker-tools/index.ts",
+        "coordinator.ts",
+        "hooks/enforce-scout-format.ts",
+        "hooks/file-reservation.ts",
+        "hooks/validate-spec-format.ts",
+        "index.ts",
+        "planner.ts",
+        "read-context/index.ts",
+        "scout.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 10
+    },
+    {
+      "repo": "nicobailon/pi-subagents",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts",
+        "notify.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "nof0xgiven/pi-coding-agent-eureka",
+      "path": "extensions/chrome-devtools/index.ts",
+      "all_paths": [
+        "extensions/chrome-devtools/index.ts",
+        "extensions/figma-tools/index.ts",
+        "extensions/figma-tools/tools/design-context.ts",
+        "extensions/figma-tools/tools/metadata.ts",
+        "extensions/figma-tools/tools/screenshot.ts",
+        "extensions/figma-tools/tools/variables.ts",
+        "extensions/linear/index.ts",
+        "extensions/morph-tools/index.ts",
+        "extensions/morph-tools/tools/fast-apply.ts",
+        "extensions/morph-tools/tools/warp-grep.ts",
+        "extensions/plan-mode/index.ts",
+        "extensions/questionnaire.ts",
+        "extensions/repoprompt/tools.ts",
+        "extensions/research/index.ts",
+        "extensions/rewind/index.ts",
+        "extensions/todo.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 16
+    },
+    {
+      "repo": "openclaw/openclaw",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        "src/agents/pi-extensions/context-pruning/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "otahontas/nix",
+      "path": "home/configs/pi-coding-agent/extensions/piception/index.ts",
+      "all_paths": [
+        "home/configs/pi-coding-agent/extensions/double-shot-latte.ts",
+        "home/configs/pi-coding-agent/extensions/guardrails.ts",
+        "home/configs/pi-coding-agent/extensions/model-quota.ts",
+        "home/configs/pi-coding-agent/extensions/nvim-bridge.ts",
+        "home/configs/pi-coding-agent/extensions/piception/index.ts",
+        "home/configs/pi-coding-agent/extensions/ralph-loop.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 6
+    },
+    {
+      "repo": "prateekmedia/pi-hooks",
+      "path": "lsp/lsp-tool.ts",
+      "all_paths": [
+        "lsp/lsp-tool.ts",
+        "lsp/lsp.ts",
+        "permission/permission.ts",
+        "ralph-loop/ralph-loop.ts",
+        "repeat/repeat.ts",
+        "token-rate/token-rate.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 6
+    },
+    {
+      "repo": "richard-devbot/Computer-Agent",
+      "path": ".pi/extensions/diff.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        ".pi/extensions/prompt-url-widget.ts",
+        ".pi/extensions/redraws.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "richardgill/nix",
+      "path": "out-of-store-config/ai-agents/pi/extensions/handoff.ts",
+      "all_paths": [
+        "out-of-store-config/ai-agents/pi/extensions/handoff.ts",
+        "out-of-store-config/ai-agents/pi/extensions/notify.ts",
+        "out-of-store-config/ai-agents/pi/extensions/preset.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "safzanpirani/pi-config",
+      "path": "extensions/antigravity-multi-account/index.ts",
+      "all_paths": [
+        "extensions/antigravity-multi-account/index.ts",
+        "extensions/exa-remote/index.ts",
+        "extensions/mcp-bridge/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerProvider"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "sbattywolf/GAIA",
+      "path": "external/openclaw/.pi/extensions/files.ts",
+      "all_paths": [
+        "external/openclaw/.pi/extensions/files.ts",
+        "external/openclaw/.pi/extensions/prompt-url-widget.ts",
+        "external/openclaw/.pi/extensions/redraws.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "seriousben/serious-nixos-config",
+      "path": "home-manager/files/pi/extensions/answer.ts",
+      "all_paths": [
+        "home-manager/files/pi/extensions/answer.ts",
+        "home-manager/files/pi/extensions/notify.ts",
+        "home-manager/files/pi/extensions/permission-gate.ts",
+        "home-manager/files/pi/extensions/raw-paste.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 4
+    },
+    {
+      "repo": "sids/pi-extensions",
+      "path": "answer/index.ts",
+      "all_paths": [
+        "answer/index.ts",
+        "fetch-url/index.ts",
+        "status/index.ts",
+        "web-search/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 4
+    },
+    {
+      "repo": "skyfallsin/pi-agent-config",
+      "path": "extensions/plan-mode/index.ts",
+      "all_paths": [
+        "extensions/permission-gate.ts",
+        "extensions/plan-mode/index.ts",
+        "extensions/question.ts",
+        "extensions/questionnaire.ts",
+        "extensions/subagent/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerFlag",
+        "registerShortcut"
+      ],
+      "file_count": 5
+    },
+    {
+      "repo": "stefan2904/dockerized-pi",
+      "path": "pi/agent/extensions/antigravity-quota.ts",
+      "all_paths": [
+        "pi/agent/extensions/antigravity-quota.ts",
+        "pi/agent/extensions/copilot-quota.ts",
+        "pi/agent/extensions/files-changed.ts",
+        "pi/agent/extensions/project-root.ts",
+        "pi/agent/extensions/quota.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 5
+    },
+    {
+      "repo": "thrashr888/agentkernel",
+      "path": "packages/pi-agentkernel/index.ts",
+      "all_paths": [
+        "packages/pi-agentkernel/index.ts",
+        "plugins/pi/.pi/extensions/agentkernel/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "towry/agent-share",
+      "path": "nix/hm/ai/pi/extensions/chrome-dev/index.ts",
+      "all_paths": [
+        "nix/hm/ai/pi/extensions/auto-continue.ts",
+        "nix/hm/ai/pi/extensions/chrome-dev/index.ts",
+        "nix/hm/ai/pi/extensions/chrome-dev/subagents/chrome_console_subagent.ts",
+        "nix/hm/ai/pi/extensions/chrome-dev/subagents/chrome_eval_subagent.ts",
+        "nix/hm/ai/pi/extensions/chrome-dev/subagents/chrome_network_subagent.ts",
+        "nix/hm/ai/pi/extensions/chrome-dev/subagents/chrome_screenshot_subagent.ts",
+        "nix/hm/ai/pi/extensions/chrome-dev/subagents/chrome_snapshot_subagent.ts",
+        "nix/hm/ai/pi/extensions/deepwiki/index.ts",
+        "nix/hm/ai/pi/extensions/explore.ts",
+        "nix/hm/ai/pi/extensions/handoff.ts",
+        "nix/hm/ai/pi/extensions/librarian.ts",
+        "nix/hm/ai/pi/extensions/model-preset.ts",
+        "nix/hm/ai/pi/extensions/notify.ts",
+        "nix/hm/ai/pi/extensions/question.ts",
+        "nix/hm/ai/pi/extensions/review.ts",
+        "nix/hm/ai/pi/extensions/semantic-read.ts",
+        "nix/hm/ai/pi/extensions/subagent/index.ts",
+        "nix/hm/ai/pi/extensions/tmux.ts",
+        "nix/hm/ai/pi/extensions/webtool/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 19
+    },
+    {
+      "repo": "tudoroancea/dotfiles",
+      "path": ".pi/agent/extensions/claude-style.ts",
+      "all_paths": [
+        ".pi/agent/extensions/claude-style.ts",
+        ".pi/agent/extensions/custom-header.ts",
+        ".pi/agent/extensions/double-escape.ts",
+        ".pi/agent/extensions/mac-system-theme.ts",
+        ".pi/agent/extensions/minimalist-tools.ts",
+        ".pi/agent/extensions/question.ts",
+        ".pi/agent/extensions/questionnaire.ts",
+        ".pi/agent/extensions/todo.ts",
+        ".pi/agent/extensions/working-word.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 9
+    },
+    {
+      "repo": "verioussmith/pi-openrouter-extension",
+      "path": "openrouter.ts",
+      "all_paths": [
+        "openrouter.ts",
+        "shitty-extensions/loop.ts",
+        "shitty-extensions/memory-mode.ts",
+        "shitty-extensions/oracle.ts",
+        "shitty-extensions/plan-mode.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 5
+    },
+    {
+      "repo": "vrslev/dotfiles",
+      "path": "home/.pi/agent/extensions/mac-system-theme.ts",
+      "all_paths": [
+        "home/.pi/agent/extensions/mac-system-theme.ts",
+        "home/.pi/agent/extensions/todo.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "w-winter/dot314",
+      "path": "extensions/brave-search/index.ts",
+      "all_paths": [
+        "extensions/brave-search/index.ts",
+        "extensions/code-actions/index.ts",
+        "extensions/dedup-agents-files.ts",
+        "extensions/guardrails/index.ts",
+        "extensions/mac-system-theme.ts",
+        "extensions/model-aware-compaction/index.ts",
+        "extensions/oracle.ts",
+        "extensions/plan-mode.ts",
+        "extensions/poly-notify/index.ts",
+        "extensions/preset.ts",
+        "extensions/questionnaire.ts",
+        "extensions/repoprompt-cli.ts",
+        "extensions/repoprompt-mcp/src/index.ts",
+        "extensions/review.ts",
+        "extensions/rewind/index.ts",
+        "extensions/rp-native-tools-lock/index.ts",
+        "extensions/sandbox/index.ts",
+        "extensions/session-ask/index.ts",
+        "extensions/skill-palette/index.ts",
+        "extensions/status-line.ts",
+        "extensions/subagent/index.ts",
+        "extensions/subagent/notify.ts",
+        "extensions/titlebar-spinner.ts",
+        "extensions/todos.ts",
+        "extensions/usage-bar.ts",
+        "extensions/vog/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 26
+    },
+    {
+      "repo": "weolopez/aardvark",
+      "path": "coding-agent/core/extensions/loader.ts",
+      "all_paths": [
+        "coding-agent/core/extensions/loader.ts",
+        "coding-agent/core/extensions/types.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerProvider",
+        "registerFlag",
+        "registerShortcut"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "whodaniel/fuse",
+      "path": "apps/openclaw/.pi/extensions/prompt-url-widget.ts",
+      "all_paths": [
+        "apps/openclaw/.pi/extensions/prompt-url-widget.ts",
+        "apps/openclaw/src/agents/pi-extensions/compaction-safeguard.ts",
+        "apps/openclaw/src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 3
+    },
+    {
+      "repo": "willem4130/Android",
+      "path": "Kotlin/android/01-openclaw-production-app/.pi/extensions/prompt-url-widget.ts",
+      "all_paths": [
+        "Kotlin/android/01-openclaw-production-app/.pi/extensions/prompt-url-widget.ts",
+        "Kotlin/android/01-openclaw-production-app/.pi/extensions/redraws.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "zanieb/pi-plugins",
+      "path": "extensions/clear-alias.ts",
+      "all_paths": [
+        "extensions/clear-alias.ts",
+        "extensions/pr-comments.ts",
+        "extensions/rename.ts",
+        "extensions/review.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 4
+    },
+    {
+      "repo": "ATONCAP/monorepo",
+      "path": "packages/self/.pi/extensions/files.ts",
+      "all_paths": [
+        "packages/self/.pi/extensions/files.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "ArchieCrawford/OpenClaw",
+      "path": "openclaw-main/src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "openclaw-main/src/agents/pi-extensions/context-pruning/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "FlufyBot/openclaw",
+      "path": "prompt-url-widget.ts",
+      "all_paths": [
+        "prompt-url-widget.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "Leechael/pi-provider-kimi-code",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "M-Dev-Lab/ultimate-agent",
+      "path": "Sampling- Resources/openclaw-main/.pi/extensions/prompt-url-widget.ts",
+      "all_paths": [
+        "Sampling- Resources/openclaw-main/.pi/extensions/prompt-url-widget.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "Max-Leopold/dotfiles",
+      "path": "dot_pi/agent/extensions/answer.ts",
+      "all_paths": [
+        "dot_pi/agent/extensions/answer.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "NeoTavern/NeoTavern-Frontend",
+      "path": "src/utils/extensions.ts",
+      "all_paths": [
+        "src/utils/extensions.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "RobExtremeVoice/openclaw-1",
+      "path": "src/agents/pi-extensions/compaction-safeguard.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/compaction-safeguard.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "Tiberriver256/mcp-server-azure-devops",
+      "path": ".pi/extensions/test-watch.ts",
+      "all_paths": [
+        ".pi/extensions/test-watch.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "TimoFreiberg/dotfiles",
+      "path": "agents/extensions/timestamps.ts",
+      "all_paths": [
+        "agents/extensions/timestamps.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "Whamp/glm-vision",
+      "path": "src/index.ts",
+      "all_paths": [
+        "src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "Whamp/pi-agentic-compaction",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "Whamp/pi-automem",
+      "path": "extensions/automem.ts",
+      "all_paths": [
+        "extensions/automem.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "Willyfrog/agents-warning",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "YeSongYun/openclaw-cn",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/context-pruning/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "anthnykr/agent-setups",
+      "path": "pi-extensions/study-commits.ts",
+      "all_paths": [
+        "pi-extensions/study-commits.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "asoules/pi-recall",
+      "path": "src/extension.ts",
+      "all_paths": [
+        "src/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "assagman/agentsbox",
+      "path": "src/pi.ts",
+      "all_paths": [
+        "src/pi.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "az9713/openclaw",
+      "path": "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts",
+      "all_paths": [
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "badlogic/pi-dosbox",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "balaraj74/F.R.I.D.A.Y",
+      "path": "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts",
+      "all_paths": [
+        "src/agents/session-tool-result-guard.tool-result-persist-hook.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "blwsk/pi-test-scope",
+      "path": "extensions/index.ts",
+      "all_paths": [
+        "extensions/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "brianwan19801015/labopenclaw",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/context-pruning/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "carmandale/ralph-loop",
+      "path": "pi-integration/tool/index.ts",
+      "all_paths": [
+        "pi-integration/tool/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "coctostan/pi-superteam",
+      "path": "src/index.ts",
+      "all_paths": [
+        "src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "coctostan/pi-web-tools",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "0xSero/pi-readiness-report",
+      "path": "readiness-report.ts",
+      "all_paths": [
+        "readiness-report.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "9cog/pi-cogno",
+      "path": "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+      "all_paths": [
+        ".pi/extensions/diff.ts",
+        ".pi/extensions/files.ts",
+        ".pi/extensions/prompt-url-widget.ts",
+        ".pi/extensions/redraws.ts",
+        "packages/coding-agent/examples/extensions/antigravity-image-gen.ts",
+        "packages/coding-agent/examples/extensions/auto-commit-on-exit.ts",
+        "packages/coding-agent/examples/extensions/bookmark.ts",
+        "packages/coding-agent/examples/extensions/claude-rules.ts",
+        "packages/coding-agent/examples/extensions/custom-footer.ts",
+        "packages/coding-agent/examples/extensions/custom-header.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-gitlab-duo/index.ts",
+        "packages/coding-agent/examples/extensions/doom-overlay/index.ts",
+        "packages/coding-agent/examples/extensions/event-bus.ts",
+        "packages/coding-agent/examples/extensions/git-checkpoint.ts",
+        "packages/coding-agent/examples/extensions/hello.ts",
+        "packages/coding-agent/examples/extensions/inline-bash.ts",
+        "packages/coding-agent/examples/extensions/mac-system-theme.ts",
+        "packages/coding-agent/examples/extensions/message-renderer.ts",
+        "packages/coding-agent/examples/extensions/modal-editor.ts",
+        "packages/coding-agent/examples/extensions/overlay-qa-tests.ts",
+        "packages/coding-agent/examples/extensions/permission-gate.ts",
+        "packages/coding-agent/examples/extensions/plan-mode/index.ts",
+        "packages/coding-agent/examples/extensions/preset.ts",
+        "packages/coding-agent/examples/extensions/question.ts",
+        "packages/coding-agent/examples/extensions/questionnaire.ts",
+        "packages/coding-agent/examples/extensions/sandbox/index.ts",
+        "packages/coding-agent/examples/extensions/send-user-message.ts",
+        "packages/coding-agent/examples/extensions/session-name.ts",
+        "packages/coding-agent/examples/extensions/shutdown-command.ts",
+        "packages/coding-agent/examples/extensions/snake.ts",
+        "packages/coding-agent/examples/extensions/space-invaders.ts",
+        "packages/coding-agent/examples/extensions/ssh.ts",
+        "packages/coding-agent/examples/extensions/status-line.ts",
+        "packages/coding-agent/examples/extensions/subagent/index.ts",
+        "packages/coding-agent/examples/extensions/summarize.ts",
+        "packages/coding-agent/examples/extensions/timed-confirm.ts",
+        "packages/coding-agent/examples/extensions/todo.ts",
+        "packages/coding-agent/examples/extensions/tool-override.ts",
+        "packages/coding-agent/examples/extensions/trigger-compact.ts",
+        "packages/coding-agent/examples/extensions/truncated-tool.ts",
+        "packages/coding-agent/examples/extensions/widget-placement.ts",
+        "packages/coding-agent/examples/extensions/with-deps/index.ts",
+        "packages/coding-agent/examples/sdk/05-tools.ts",
+        "packages/coding-agent/examples/sdk/06-extensions.ts",
+        "packages/coding-agent/src/core/extensions/loader.ts",
+        "packages/coding-agent/src/core/extensions/types.ts",
+        "packages/coding-agent/test/resource-loader.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 48
+    },
+    {
+      "repo": "assagman/phi",
+      "path": "packages/coding-agent/examples/extensions/best/delta/src/index.ts",
+      "all_paths": [
+        "packages/coding-agent/examples/extensions/best/delta/src/index.ts",
+        "packages/coding-agent/examples/extensions/best/delta/src/tools.ts",
+        "packages/coding-agent/examples/extensions/best/epsilon/src/tools.ts",
+        "packages/coding-agent/examples/extensions/best/questionnaire/src/index.ts",
+        "packages/coding-agent/examples/extensions/best/sigma/src/index.ts",
+        "packages/coding-agent/examples/extensions/hello.ts",
+        "packages/coding-agent/examples/extensions/pirate.ts",
+        "packages/coding-agent/examples/extensions/question.ts",
+        "packages/coding-agent/examples/extensions/questionnaire.ts",
+        "packages/coding-agent/examples/extensions/send-user-message.ts",
+        "packages/coding-agent/examples/extensions/shutdown-command.ts",
+        "packages/coding-agent/examples/extensions/ssh.ts",
+        "packages/coding-agent/examples/extensions/subagent/index.ts",
+        "packages/coding-agent/examples/extensions/summarize.ts",
+        "packages/coding-agent/examples/extensions/timed-confirm.ts",
+        "packages/coding-agent/examples/extensions/todo.ts",
+        "packages/coding-agent/examples/extensions/tool-override.ts",
+        "packages/coding-agent/examples/extensions/tools.ts",
+        "packages/coding-agent/examples/extensions/trigger-compact.ts",
+        "packages/coding-agent/examples/extensions/truncated-tool.ts",
+        "packages/coding-agent/examples/extensions/with-deps/index.ts",
+        "packages/coding-agent/examples/sdk/06-extensions.ts",
+        "packages/coding-agent/src/core/extensions/loader.ts",
+        "packages/coding-agent/src/core/extensions/types.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 24
+    },
+    {
+      "repo": "ayagmar/pi-extmgr",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "badlogic/pi-doom",
+      "path": "src/index.ts",
+      "all_paths": [
+        "src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "badlogic/pi-gitlab-duo",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "bout3fiddy/pi-langlearn",
+      "path": "src/index.ts",
+      "all_paths": [
+        "src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "continua-ai/tinny-pi",
+      "path": "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+      "all_paths": [
+        "packages/coding-agent/examples/extensions/antigravity-image-gen.ts",
+        "packages/coding-agent/examples/extensions/auto-commit-on-exit.ts",
+        "packages/coding-agent/examples/extensions/bash-spawn-hook.ts",
+        "packages/coding-agent/examples/extensions/bookmark.ts",
+        "packages/coding-agent/examples/extensions/claude-rules.ts",
+        "packages/coding-agent/examples/extensions/commands.ts",
+        "packages/coding-agent/examples/extensions/custom-footer.ts",
+        "packages/coding-agent/examples/extensions/custom-header.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-gitlab-duo/index.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-qwen-cli/index.ts",
+        "packages/coding-agent/examples/extensions/doom-overlay/index.ts",
+        "packages/coding-agent/examples/extensions/dynamic-resources/index.ts",
+        "packages/coding-agent/examples/extensions/event-bus.ts",
+        "packages/coding-agent/examples/extensions/git-checkpoint.ts",
+        "packages/coding-agent/examples/extensions/hello.ts",
+        "packages/coding-agent/examples/extensions/inline-bash.ts",
+        "packages/coding-agent/examples/extensions/mac-system-theme.ts",
+        "packages/coding-agent/examples/extensions/message-renderer.ts",
+        "packages/coding-agent/examples/extensions/modal-editor.ts",
+        "packages/coding-agent/examples/extensions/notify.ts",
+        "packages/coding-agent/examples/extensions/overlay-qa-tests.ts",
+        "packages/coding-agent/examples/extensions/plan-mode/index.ts",
+        "packages/coding-agent/examples/extensions/preset.ts",
+        "packages/coding-agent/examples/extensions/question.ts",
+        "packages/coding-agent/examples/extensions/questionnaire.ts",
+        "packages/coding-agent/examples/extensions/rpc-demo.ts",
+        "packages/coding-agent/examples/extensions/sandbox/index.ts",
+        "packages/coding-agent/examples/extensions/session-name.ts",
+        "packages/coding-agent/examples/extensions/shutdown-command.ts",
+        "packages/coding-agent/examples/extensions/snake.ts",
+        "packages/coding-agent/examples/extensions/space-invaders.ts",
+        "packages/coding-agent/examples/extensions/ssh.ts",
+        "packages/coding-agent/examples/extensions/status-line.ts",
+        "packages/coding-agent/examples/extensions/subagent/index.ts",
+        "packages/coding-agent/examples/extensions/summarize.ts",
+        "packages/coding-agent/examples/extensions/timed-confirm.ts",
+        "packages/coding-agent/examples/extensions/titlebar-spinner.ts",
+        "packages/coding-agent/examples/extensions/todo.ts",
+        "packages/coding-agent/examples/extensions/tool-override.ts",
+        "packages/coding-agent/examples/extensions/trigger-compact.ts",
+        "packages/coding-agent/examples/extensions/truncated-tool.ts",
+        "packages/coding-agent/examples/extensions/widget-placement.ts",
+        "packages/coding-agent/examples/extensions/with-deps/index.ts",
+        "packages/coding-agent/examples/sdk/05-tools.ts",
+        "packages/coding-agent/examples/sdk/06-extensions.ts",
+        "packages/coding-agent/src/core/extensions/loader.ts",
+        "packages/coding-agent/src/core/extensions/types.ts",
+        "packages/coding-agent/test/resource-loader.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 49
+    },
+    {
+      "repo": "davidgasquez/dotfiles",
+      "path": "agents/pi/extensions/branch-term.ts",
+      "all_paths": [
+        "agents/pi/extensions/branch-term.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "dinhtungdu/orange",
+      "path": "extensions/pi/index.ts",
+      "all_paths": [
+        "extensions/pi/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "ditfetzt/pi-antigravity-imagen",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "ditfetzt/pi-antigravity-quota",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "dotemacs/pi-multi-prompt",
+      "path": "multi-prompt.ts",
+      "all_paths": [
+        "multi-prompt.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "drshailesh88/Krypto",
+      "path": "src/agents/pi-extensions/context-pruning/extension.ts",
+      "all_paths": [
+        "src/agents/pi-extensions/context-pruning/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "edmundmiller/dotfiles",
+      "path": "packages/pi-dcp/index.ts",
+      "all_paths": [
+        "packages/pi-dcp/index.ts",
+        "packages/pi-dcp/src/config.ts",
+        "packages/pi-dcp/src/types.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 3
+    },
+    {
+      "repo": "fink-andreas/pi-web-reader",
+      "path": "extensions/index.ts",
+      "all_paths": [
+        "extensions/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "forbidden-game/kimicodeprovider",
+      "path": "extensions/index.ts",
+      "all_paths": [
+        "extensions/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "hdresearch/pi-v",
+      "path": "extensions/plan-mode/index.ts",
+      "all_paths": [
+        "extensions/plan-mode/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerFlag",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "hjanuschka/pi-qmd",
+      "path": "extensions/qmd.ts",
+      "all_paths": [
+        "extensions/qmd.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerMessageRenderer"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "isaacraja/agents-config",
+      "path": "agents/pi/extensions/vertex-claude/index.ts",
+      "all_paths": [
+        "agents/pi/extensions/vertex-claude/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "jasonish/pi-sandbox",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "joshleblanc/pi-ext",
+      "path": "custom-provider-venice/index.ts",
+      "all_paths": [
+        "custom-provider-venice/index.ts",
+        "url-browser/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "joshleblanc/pi-minimax",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "joshp123/ai-stack",
+      "path": "extensions/todowrite.ts",
+      "all_paths": [
+        "extensions/todowrite.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "jwrunge/agent",
+      "path": "src/run-workflow.ts",
+      "all_paths": [
+        "src/run-workflow.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "k1000/pi-reflect",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "kanatti/pipi",
+      "path": "extensions/permission-gate.ts",
+      "all_paths": [
+        "extensions/permission-gate.ts",
+        "extensions/sessions.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "lenstr/pi-fetch-url",
+      "path": "extensions/fetch-url.ts",
+      "all_paths": [
+        "extensions/fetch-url.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "lepinkainen/dotfiles",
+      "path": "dot_pi/agent/extensions/files.ts",
+      "all_paths": [
+        "dot_pi/agent/extensions/files.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "maxsumrall/homeycli",
+      "path": ".github/actions/pi-pr-review/ci-sandbox.ts",
+      "all_paths": [
+        ".github/actions/pi-pr-review/ci-sandbox.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "mcasper/dotfiles",
+      "path": "agents/extensions/handoff.ts",
+      "all_paths": [
+        "agents/extensions/handoff.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "mcollina/pi-bash-confirm",
+      "path": "extensions/bash-confirm.ts",
+      "all_paths": [
+        "extensions/bash-confirm.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "messense/pi-parallel-agents",
+      "path": "src/index.ts",
+      "all_paths": [
+        "src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "mrexodia/agent-viewer",
+      "path": ".pi/hooks/devdocs-commands.ts",
+      "all_paths": [
+        ".pi/hooks/devdocs-commands.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "mrexodia/devdocs-cli",
+      "path": "embed/devdocs-commands.ts",
+      "all_paths": [
+        "embed/devdocs-commands.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "neohope/NeoPimonoSrc",
+      "path": "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+      "all_paths": [
+        "packages/coding-agent/examples/extensions/antigravity-image-gen.ts",
+        "packages/coding-agent/examples/extensions/bash-spawn-hook.ts",
+        "packages/coding-agent/examples/extensions/commands.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-anthropic/index.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-gitlab-duo/index.ts",
+        "packages/coding-agent/examples/extensions/custom-provider-qwen-cli/index.ts",
+        "packages/coding-agent/examples/extensions/dynamic-resources/index.ts",
+        "packages/coding-agent/examples/extensions/hello.ts",
+        "packages/coding-agent/examples/extensions/minimal-mode.ts",
+        "packages/coding-agent/examples/extensions/notify.ts",
+        "packages/coding-agent/examples/extensions/plan-mode/index.ts",
+        "packages/coding-agent/examples/extensions/preset.ts",
+        "packages/coding-agent/examples/extensions/question.ts",
+        "packages/coding-agent/examples/extensions/rpc-demo.ts",
+        "packages/coding-agent/examples/extensions/sandbox/index.ts",
+        "packages/coding-agent/examples/extensions/shutdown-command.ts",
+        "packages/coding-agent/examples/extensions/ssh.ts",
+        "packages/coding-agent/examples/extensions/subagent/index.ts",
+        "packages/coding-agent/examples/extensions/titlebar-spinner.ts",
+        "packages/coding-agent/examples/extensions/todo.ts",
+        "packages/coding-agent/examples/extensions/tool-override.ts",
+        "packages/coding-agent/examples/extensions/truncated-tool.ts",
+        "packages/coding-agent/examples/sdk/06-extensions.ts",
+        "packages/coding-agent/src/core/extensions/loader.ts",
+        "packages/coding-agent/src/core/extensions/types.ts",
+        "packages/coding-agent/test/resource-loader.test.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 26
+    },
+    {
+      "repo": "nicobailon/pi-annotate",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-interactive-shell",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-interview-tool",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-mcp-adapter",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-messenger",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-model-switch",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-powerline-footer",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-review-loop",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-skill-palette",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerMessageRenderer"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nicobailon/pi-web-access",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "ninlds/pi-ding",
+      "path": "extensions/ding.ts",
+      "all_paths": [
+        "extensions/ding.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand",
+        "registerFlag"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "nrupatunga/pi-extensions",
+      "path": "quick-model-picker/quick-model-picker.ts",
+      "all_paths": [
+        "quick-model-picker/quick-model-picker.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "opus-workshop/rush",
+      "path": "pi-rush/extensions/rush.ts",
+      "all_paths": [
+        "pi-rush/extensions/rush.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "pauldthomson/dotfiles",
+      "path": ".pi/extensions/web-fetch.ts",
+      "all_paths": [
+        ".pi/extensions/web-fetch.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "prateekmedia/claude-agent-sdk-pi",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "pratos/clanker-setup",
+      "path": "extensions/humanlayer.ts",
+      "all_paths": [
+        "extensions/humanlayer.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "rhnvrm/pi-mesh",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "richardgill/pi-extensions",
+      "path": "extensions/files/src/extension.ts",
+      "all_paths": [
+        "extensions/files/src/extension.ts",
+        "extensions/task-tool/src/extension.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "rkunnamp/pi-apply-patch",
+      "path": "extensions/apply-patch/index.ts",
+      "all_paths": [
+        "extensions/apply-patch/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "rytswd/pi-agent-extensions",
+      "path": "questionnaire/index.ts",
+      "all_paths": [
+        "questionnaire/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "samuelstevens/dotfiles",
+      "path": "pi/.pi/agent/extensions/questions.ts",
+      "all_paths": [
+        "pi/.pi/agent/extensions/questions.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "scooter-lacroix/LeIndex",
+      "path": "pi/src/index.ts",
+      "all_paths": [
+        "pi/src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "screenpipe/screenpipe",
+      "path": "apps/screenpipe-app-tauri/src-tauri/assets/extensions/web-search.ts",
+      "all_paths": [
+        "apps/screenpipe-app-tauri/src-tauri/assets/extensions/web-search.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "sgtest/megarepo",
+      "path": "sourcegraph/client/shared/src/api/extension/extensionApi.ts",
+      "all_paths": [
+        "sourcegraph/client/shared/src/api/extension/extensionApi.ts",
+        "vscode/src/vs/workbench/api/common/extHost.api.impl.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": false,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 2
+    },
+    {
+      "repo": "sibyllinesoft/scribe",
+      "path": "scribe-rs/npm/scribe/scripts/extensions/scribe.ts",
+      "all_paths": [
+        "scribe-rs/npm/scribe/scripts/extensions/scribe.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "sigtom/wow-ocp",
+      "path": ".pi/extensions/homelab-tools.ts",
+      "all_paths": [
+        ".pi/extensions/homelab-tools.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "skyfallsin/pi-vertex-anthropic",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerProvider"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "surma/nixenv",
+      "path": "modules/programs/pi/extensions/plan-mode/claude-plan-mode.ts",
+      "all_paths": [
+        "modules/programs/pi/extensions/plan-mode/claude-plan-mode.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "thurstonsand/ansiblonomicon",
+      "path": "chezmoi/private_dot_pi/agent/extensions/mac-system-theme.ts",
+      "all_paths": [
+        "chezmoi/private_dot_pi/agent/extensions/mac-system-theme.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 1
+    },
+    {
+      "repo": "toorusr/ai-extensions",
+      "path": "semantic-search/index.ts",
+      "all_paths": [
+        "semantic-search/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerShortcut",
+        "registerMessageRenderer"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "ttttmr/pi-search-tool",
+      "path": "src/index.ts",
+      "all_paths": [
+        "src/index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerTool"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "wayanjimmy/agent-stuff",
+      "path": "pi-extensions/stash.ts",
+      "all_paths": [
+        "pi-extensions/stash.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    },
+    {
+      "repo": "xxrenzhe/autobb",
+      "path": "openclaw/.pi/extensions/prompt-url-widget.ts",
+      "all_paths": [
+        "openclaw/.pi/extensions/prompt-url-widget.ts",
+        "openclaw/.pi/extensions/redraws.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [],
+      "file_count": 2
+    },
+    {
+      "repo": "yulqen/conductor-pi",
+      "path": "index.ts",
+      "all_paths": [
+        "index.ts"
+      ],
+      "is_valid_extension": true,
+      "has_api_import": true,
+      "has_export_default": true,
+      "registrations": [
+        "registerCommand"
+      ],
+      "file_count": 1
+    }
+  ]
+}

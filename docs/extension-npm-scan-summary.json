@@ -1,0 +1,253 @@
+{
+  "generated": "2026-02-07",
+  "task": "bd-2p71",
+  "queries_executed": 10,
+  "query_list": [
+    "pi-coding-agent",
+    "@mariozechner",
+    "@oh-my-pi",
+    "pi agent extension",
+    "pi-extension",
+    "pi-agent-tool",
+    "pi-agent hook",
+    "shitty-extensions",
+    "pi-mono extension",
+    "buildwithpi"
+  ],
+  "total_packages_found": 134,
+  "pi_candidates_triaged": 68,
+  "validated_extensions": 33,
+  "packages": [
+    {
+      "name": "@aliou/pi-extension-dev",
+      "version": "0.2.0",
+      "description": "Tools and commands for developing and updating Pi extensions.",
+      "repository": "git+https://github.com/aliou/pi-extensions.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "@aliou/pi-synthetic",
+      "version": "0.4.3",
+      "description": "A Pi extension that adds [Synthetic](https://synthetic.new) as a model provider, giving you access t",
+      "repository": "git+https://github.com/aliou/pi-synthetic.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "@cargo-cult/pi-mom",
+      "version": "0.47.0",
+      "description": "Slack bot that delegates messages to the pi coding agent",
+      "repository": "git+https://github.com/TUstudents/pi-mono.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@imsus/pi-extension-minimax-coding-plan-mcp",
+      "version": "1.0.1",
+      "description": "MiniMax Coding Plan extension for pi coding agent - provides web_search and understand_image tools",
+      "repository": "git+https://github.com/imsus/pi-extension-minimax-coding-plan-mcp.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@oh-my-pi/anthropic-websearch",
+      "version": "1.3.3710",
+      "description": "Anthropic Claude web search tool for pi",
+      "repository": "git+https://github.com/can1357/oh-my-pi.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@oh-my-pi/exa",
+      "version": "1.3.3710",
+      "description": "Exa AI web search and websets tools for pi",
+      "repository": "git+https://github.com/can1357/oh-my-pi.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@oh-my-pi/lsp",
+      "version": "1.3.3710",
+      "description": "LSP (Language Server Protocol) tool for Pi - provides code intelligence, diagnostics, refactoring, a",
+      "repository": "git+https://github.com/can1357/oh-my-pi.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@oh-my-pi/perplexity",
+      "version": "1.3.3710",
+      "description": "Perplexity AI search tools for pi",
+      "repository": "git+https://github.com/can1357/oh-my-pi.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@qualisero/pi-agent-scip",
+      "version": "0.3.0",
+      "description": "SCIP code intelligence tools for pi-coding-agent (Python, TypeScript/JavaScript)",
+      "repository": "git+https://github.com/qualisero/pi-agent-scip.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "@tmustier/pi-arcade",
+      "version": "0.1.5",
+      "description": "Arcade minigames for the Pi coding agent.",
+      "repository": "git+https://github.com/tmustier/pi-extensions.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@vaclav-synacek/pi-coding-agent-termux",
+      "version": "0.51.1-2",
+      "description": "DEPRECATED: Use @mariozechner/pi-coding-agent instead (supports Termux since v0.51.0)",
+      "repository": "git+https://github.com/VaclavSynacek/pi-coding-agent-termux.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "@verioussmith/pi-openrouter",
+      "version": "1.1.0",
+      "description": "OpenRouter provider extension for Pi Coding Agent - access 20+ LLM models through unified API",
+      "repository": "git+https://github.com/verioussmith/pi-openrouter-extension.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "@zenobius/pi-rose-pine",
+      "version": "0.0.2",
+      "description": "Rose Pine themes for Pi Coding Agent",
+      "repository": "git+ssh://git@github.com/zenobi-us/pi-rose-pine.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "mitsupi",
+      "version": "1.1.1",
+      "description": "Armin's pi coding agent commands, skills, extensions, and themes",
+      "repository": "git+https://github.com/mitsuhiko/agent-stuff.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "pi-acp",
+      "version": "0.0.14",
+      "description": "ACP adapter for pi coding agent",
+      "repository": "git+https://github.com/svkozak/pi-acp.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-agentic-compaction",
+      "version": "0.3.0",
+      "description": "Pi extension for intelligent conversation compaction using a virtual filesystem and LLM exploration",
+      "repository": "git+https://github.com/laulauland/dotfiles.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "pi-extensions",
+      "version": "0.1.21",
+      "description": "Personal extensions for the [Pi coding agent](https://github.com/badlogic/pi-mono).",
+      "repository": "",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-interactive-shell",
+      "version": "0.7.1",
+      "description": "Run AI coding agents as foreground subagents in pi TUI overlays with hands-free monitoring",
+      "repository": "git+https://github.com/nicobailon/pi-interactive-shell.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-interview",
+      "version": "0.4.5",
+      "description": "Interactive interview form extension for pi coding agent",
+      "repository": "git+https://github.com/nicobailon/pi-interview-tool.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-mcp-adapter",
+      "version": "2.1.2",
+      "description": "MCP (Model Context Protocol) adapter extension for Pi coding agent",
+      "repository": "git+https://github.com/nicobailon/pi-mcp-adapter.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-messenger",
+      "version": "0.10.0",
+      "description": "Inter-agent messaging and file reservation system for pi coding agent",
+      "repository": "git+https://github.com/nicobailon/pi-messenger.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-moonshot",
+      "version": "1.0.0",
+      "description": "Pi extension adding Moonshot AI provider with Kimi K2.5 and other models",
+      "repository": "git+https://github.com/default-anton/pi-moonshot.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "pi-opensync-plugin",
+      "version": "0.2.0",
+      "description": "Pi extension to sync sessions to OpenSync dashboards",
+      "repository": "git+https://github.com/joshuadavidthomas/pi-opensync-plugin.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "pi-package-test",
+      "version": "0.1.6",
+      "description": "Test package for pi coding agent with extensions, skills, themes, and prompts",
+      "repository": "git+https://github.com/badlogic/pi-package-test.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "pi-powerline-footer",
+      "version": "0.2.22",
+      "description": "Powerline-style status bar extension for pi coding agent",
+      "repository": "git+https://github.com/nicobailon/pi-powerline-footer.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-review-loop",
+      "version": "0.4.2",
+      "description": "Automated code review loop extension for pi coding agent",
+      "repository": "git+https://github.com/nicobailon/pi-review-loop.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-rewind-hook",
+      "version": "1.7.3",
+      "description": "Rewind extension for Pi agent - automatic git checkpoints with file/conversation restore",
+      "repository": "git+https://github.com/nicobailon/pi-rewind-hook.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-screenshots-picker",
+      "version": "1.2.0",
+      "description": "Screenshot picker extension for pi coding agent - quickly select and attach screenshots to your prom",
+      "repository": "git+https://github.com/Graffioh/pi-screenshots-picker.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-shell-completions",
+      "version": "0.1.0",
+      "description": "Pi extension that adds native shell completions (fish/zsh/bash) to ! and !! bash mode commands",
+      "repository": "https://github.com/laulauland/dotfiles",
+      "has_pi_dep": true
+    },
+    {
+      "name": "pi-subagents",
+      "version": "0.6.1",
+      "description": "Pi extension for delegating tasks to subagents with chains, parallel execution, and TUI clarificatio",
+      "repository": "git+https://github.com/nicobailon/pi-subagents.git",
+      "has_pi_dep": false
+    },
+    {
+      "name": "pi-threads",
+      "version": "0.2.1",
+      "description": "Pi extension for searching and reading past conversation threads with ripgrep-powered search",
+      "repository": "https://github.com/laulauland/dotfiles",
+      "has_pi_dep": true
+    },
+    {
+      "name": "pi-watch",
+      "version": "0.1.0",
+      "description": "Pi extension that watches for AI comments in your code and sends them to the agent",
+      "repository": "git+https://github.com/kaofelix/pi-watch.git",
+      "has_pi_dep": true
+    },
+    {
+      "name": "shitty-extensions",
+      "version": "1.0.9",
+      "description": "Custom extensions and skills for pi coding agent",
+      "repository": "git+https://github.com/hjanuschka/shitty-extensions.git",
+      "has_pi_dep": true
+    }
+  ]
+}

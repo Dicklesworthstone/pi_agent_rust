@@ -1,0 +1,355 @@
+{
+  "generated": "2026-02-07",
+  "task": "bd-3gly",
+  "description": "Curated list sweep for Pi extensions",
+  "sources_swept": 10,
+  "total_candidates_found": 45,
+  "new_candidates": 22,
+  "already_known": 23,
+  "sources": [
+    {
+      "source": "qualisero/awesome-pi-agent",
+      "url": "https://github.com/qualisero/awesome-pi-agent",
+      "type": "awesome_list",
+      "stars": 55,
+      "extensions_found": 35,
+      "description": "Curated list of add-ons, hooks, tools, skills for pi coding agent"
+    },
+    {
+      "source": "badlogic/pi-skills",
+      "url": "https://github.com/badlogic/pi-skills",
+      "type": "skills_collection",
+      "stars": 355,
+      "extensions_found": 8,
+      "description": "Official community skills collection (brave-search, browser-tools, etc.)"
+    },
+    {
+      "source": "pi.dev (official site)",
+      "url": "https://shittycodingagent.ai/",
+      "type": "official_docs",
+      "extensions_found": 0,
+      "description": "Official site - references npm and Discord for extension discovery"
+    },
+    {
+      "source": "npmjs.com @oh-my-pi scope",
+      "url": "https://www.npmjs.com/search?q=%40oh-my-pi",
+      "type": "npm_scope",
+      "extensions_found": 6,
+      "description": "oh-my-pi npm scope packages (anthropic-websearch, basics, exa, lsp, pi-git-tool, subagents)"
+    },
+    {
+      "source": "npmjs.com @mariozechner scope",
+      "url": "https://www.npmjs.com/package/@mariozechner/pi-coding-agent",
+      "type": "npm_scope",
+      "extensions_found": 1,
+      "description": "Official pi-coding-agent npm package"
+    },
+    {
+      "source": "GitHub Topics pi-coding-agent",
+      "url": "https://github.com/topics/pi-coding-agent",
+      "type": "github_topic",
+      "extensions_found": 9,
+      "description": "GitHub topic page for pi-coding-agent"
+    },
+    {
+      "source": "GitHub Topics pi-extension",
+      "url": "https://github.com/topics/pi-extension",
+      "type": "github_topic",
+      "extensions_found": 9,
+      "description": "GitHub topic page for pi-extension"
+    },
+    {
+      "source": "lucumr.pocoo.org (Armin Ronacher)",
+      "url": "https://lucumr.pocoo.org/2026/1/31/pi/",
+      "type": "blog_post",
+      "extensions_found": 5,
+      "description": "Blog post by mitsuhiko about Pi agent and extensions"
+    },
+    {
+      "source": "buildwithpi.ai (OpenClaw)",
+      "url": "https://buildwithpi.ai/",
+      "type": "marketplace",
+      "extensions_found": 0,
+      "description": "OpenClaw platform - references extension ecosystem"
+    },
+    {
+      "source": "docs/extension-candidate-pool.json (existing pool)",
+      "url": "local",
+      "type": "existing_catalog",
+      "extensions_found": 224,
+      "description": "Already-cataloged candidates including npm packages"
+    }
+  ],
+  "candidates": [
+    {
+      "name": "mitsuhiko/agent-stuff",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "michalvavra/agents",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "aliou/pi-extensions",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "qualisero/pi-agent-scip",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "kcosr/pi-extensions",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "prateekmedia/pi-hooks",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "jyaunches/pi-canvas",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "mrexodia/pi-cost-dashboard",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "new"
+    },
+    {
+      "name": "tmustier/pi-extensions",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "nicobailon/pi-interview-tool",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "lsj5031/pi-notification-extension",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "nicobailon/pi-powerline-footer",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "nicobailon/pi-rewind-hook",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "cv/pi-ssh-remote",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "qualisero/rhubarb-pi",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "ben-vargas/pi-packages",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "ferologics/pi-notify",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "ogulcancelik/pi-ghostty-theme-sync",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "ogulcancelik/pi-sketch",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "zenobi-us/pi-dcp",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "Graffioh/pi-screenshots-picker",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "Graffioh/pi-super-curl",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "already_known"
+    },
+    {
+      "name": "hjanuschka/shitty-extensions",
+      "source": "awesome-pi-agent",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "pasky/pi-amplike",
+      "source": "awesome-pi-agent",
+      "category": "skills",
+      "status": "already_known"
+    },
+    {
+      "name": "badlogic/pi-skills",
+      "source": "awesome-pi-agent",
+      "category": "skills",
+      "status": "new"
+    },
+    {
+      "name": "KyleAMathews/claude-code-ui",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "new"
+    },
+    {
+      "name": "kcosr/codemap",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "already_known"
+    },
+    {
+      "name": "juanibiapina/gob",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "already_known"
+    },
+    {
+      "name": "lsj5031/PiSwarm",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "already_known"
+    },
+    {
+      "name": "zenobi-us/pi-ds",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "already_known"
+    },
+    {
+      "name": "raunovillberg/pi-stuffed",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "already_known"
+    },
+    {
+      "name": "marckrenn/pi-sub",
+      "source": "awesome-pi-agent",
+      "category": "tools",
+      "status": "already_known"
+    },
+    {
+      "name": "zenobi-us/pi-rose-pine",
+      "source": "awesome-pi-agent",
+      "category": "themes",
+      "status": "already_known"
+    },
+    {
+      "name": "svkozak/pi-acp",
+      "source": "awesome-pi-agent",
+      "category": "providers",
+      "status": "new"
+    },
+    {
+      "name": "aliou/pi-synthetic",
+      "source": "awesome-pi-agent",
+      "category": "providers",
+      "status": "already_known"
+    },
+    {
+      "name": "nicobailon/pi-interactive-shell",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "nicobailon/pi-messenger",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "nicobailon/pi-mcp-adapter",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "nicobailon/pi-web-access",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "nicobailon/pi-review-loop",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "jwintz/pi-island",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "rytswd/pi-agent-extensions",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "galz10/pickle-rick-extension",
+      "source": "web_search",
+      "category": "extensions",
+      "status": "new"
+    },
+    {
+      "name": "Piebald-AI/splitrail",
+      "source": "web_search",
+      "category": "tools",
+      "status": "new"
+    },
+    {
+      "name": "dnouri/pi-coding-agent",
+      "source": "web_search",
+      "category": "tools",
+      "status": "new"
+    }
+  ]
+}

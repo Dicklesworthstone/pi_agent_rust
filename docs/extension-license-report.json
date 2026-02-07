@@ -1,0 +1,2997 @@
+{
+  "generated_at": "2026-02-07T03:57:42Z",
+  "task": "bd-250p",
+  "stats": {
+    "total_screened": 331,
+    "pass": 120,
+    "pass_with_warnings": 0,
+    "excluded": 0,
+    "needs_review": 211,
+    "license_distribution": {
+      "MIT": 119,
+      "UNKNOWN": 211,
+      "Apache-2.0": 1
+    }
+  },
+  "verdicts": [
+    {
+      "canonical_id": "0xsero/pi-readiness-report",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "9cog/pi-cogno",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "aadishv/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "adragomir/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "aldoborrero/agent-kit",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "aliou/pi-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "aliou/pi-linkup",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "aliou/pi-synthetic",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "alphagov/notifications-node-client",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "annapurna-himal/pi-memory-search",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "annapurna-himal/pi-vim-editor",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "anntnzrb/agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "anthnykr/agent-setups",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "antigravity-image-gen",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "archiecrawford/openclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "asoules/pi-recall",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "assagman/agentsbox",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "assagman/phi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "assagman/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "atoncap/monorepo",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "auto-commit-on-exit",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ayagmar/pi-extmgr",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "az9713/clawdbot",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "az9713/openclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "badlogic/pi-doom",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "badlogic/pi-dosbox",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "badlogic/pi-gitlab-duo",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "badlogic/pi-mono",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "badlogic/pi-package-test",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "badlogic/pi-skills",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "balaraj74/f.r.i.d.a.y",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "bash-spawn-hook",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ben-vargas/pi-packages",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "blwsk/pi-test-scope",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "bookmark",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "bout3fiddy/agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "bout3fiddy/pi-langlearn",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "brianwan19801015/labopenclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "bytes032/agentkit",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "cameronmaske/agent-stuff",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "can1357/oh-my-pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "carmandale/ralph-loop",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "charlie-818/clawd",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "christroutner/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "claude-rules",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "coctostan/pi-superteam",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "coctostan/pi-web-tools",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "coder/ghostty-web",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "coltonbatts/loubot",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "confirm-destructive",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "continua-ai/pi-lab",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "continua-ai/tinny-pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "cookiegraves/rarerteatsh",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "custom-compaction",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "custom-footer",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "custom-header",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "custom-provider-anthropic",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "custom-provider-gitlab-duo",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "custom-provider-qwen-cli",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "cv/pi-ssh-remote",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "datadog/sketches-js",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "davekilleen/dex",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "davidgasquez/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "dctrwatson/pi-squared",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "default-anton/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "default-anton/pi-moonshot",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "default-anton/pi-subdir-context",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "dejanr/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "deskaunedsei1983/loc_clawdbot_01",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "deybhayden/bendows",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "deybhayden/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "dinhtungdu/orange",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "dirty-repo-guard",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ditfetzt/pi-antigravity-imagen",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "ditfetzt/pi-antigravity-quota",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "ditfetzt/pi-cline-free-models",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "doom-overlay",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "dotemacs/pi-multi-prompt",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "drshailesh88/krypto",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "dungle-scrubs/agent-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "dwsy/agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "dynamic-resources",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "edmundmiller/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "ehtbanton/controlocal",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "elementsai-dev/cognia",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "elwinliu/pi-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "emzod/pi-subagent-with-logging",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ethanalgox/marketbot",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "event-bus",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ex3ndr/daycare",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "ferologics/pi-notify",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "file-trigger",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "fink-andreas/pi-web-reader",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "flufybot/openclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "forbidden-game/kimicodeprovider",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "forwardinfinity/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "galz10/pickle-rick-extension",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "garymjr/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "git-checkpoint",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "goncalossilva/.agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "goofansu/agent-stuff",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "googlechrome/workbox",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "graffioh/pi-screenshots-picker",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "graffioh/pi-super-curl",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "graycarl/dotshell",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "haider-patanwala/clawdbot",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "handoff",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "hdresearch/pi-v",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "hello",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "hjanuschka/pi-qmd",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "hjanuschka/shitty-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "igor-makarov/pi-extension-sandbox",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "imsus/pi-extension-minimax-coding-plan-mcp",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "inline-bash",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "input-transform",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "interactive-shell",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "iranb/clawdbot",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "isaacraja/agents-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "isaacraja/pi-vertex-claude",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "istar-eldritch/pi-wakatime",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "itsnotaka/dot-pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jamwil/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jasonish/pi-sandbox",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jbuckmccready/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jcolano/openclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jhurliman/node-rate-limiter",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "joelazar/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jonschlinkert/repeat-string",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "jorgeavaldez/pi-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "joshleblanc/pi-ext",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "joshleblanc/pi-minimax",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "joshp123/ai-stack",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "joshuadavidthomas/agentkit",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jwintz/pi-island",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jwrunge/agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "jyaunches/pi-canvas",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "k1000/pi-reflect",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "kanatti/pipi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "kaofelix/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "kaofelix/pi-watch",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "kavia-common/moltbot-311196",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "kcosr/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "knoopx/pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "l-lin/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "langchain-ai/langgraphjs",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "laulauland/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "leechael/pi-provider-kimi-code",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "leiserfg/nix-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "lenstr/pi-fetch-url",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "leopechnicki/ai-assistant",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "lepinkainen/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "lllooollpp/clawdbot-cn",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "lsj5031/pi-notification-extension",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "lukeus/ai-shell",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "m-dev-lab/ultimate-agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mac-system-theme",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "markus1189/nixos-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "masonjames/dockhand-sre-agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "max-leopold/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "maxsumrall/homeycli",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mcasper/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mcollina/pi-bash-confirm",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "megalithic/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mermaid-js/mermaid",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "message-renderer",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "messense/pi-parallel-agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "meteyou/pi-stuff",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mic92/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "michalvavra/agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "microsoft/vscode-languageserver-node",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "mikeastock/agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mikeastock/dotagents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mikeyobrien/pi-agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mikeyobrien/rho",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mitsuhiko/agent-stuff",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "modal-editor",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "model-status",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "mrexodia/agent-viewer",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mrexodia/devdocs-cli",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "mrndstvndv/nixdots",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "neohope/neopimonosrc",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "neonspectra/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "neotavern/neotavern-frontend",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "nexxeln/dots",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "nicobailon/pi-annotate",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-coordination",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "nicobailon/pi-interactive-shell",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-interview-tool",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "nicobailon/pi-mcp-adapter",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-messenger",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-model-switch",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-powerline-footer",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-prompt-template-model",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-review-loop",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-rewind-hook",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "nicobailon/pi-skill-palette",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nicobailon/pi-subagents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "nicobailon/pi-web-access",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ninlds/pi-ding",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "nof0xgiven/pi-coding-agent-eureka",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "notify",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "npm/marckrenn-pi-sub-bar",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "npm/marckrenn-pi-sub-core",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "npm/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "npm/pi-model-switch",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "npm/pi-search-agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "npm/zenobius-pi-dcp",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "nrupatunga/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ogulcancelik/pi-ghostty-theme-sync",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ogulcancelik/pi-sketch",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "open-telemetry/opentelemetry-js-contrib",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "openclaw/openclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "opus-workshop/rush",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "otahontas/nix",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "overlay-qa-tests",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "overlay-test",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "pasky/pi-amplike",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "pauldthomson/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "permission-gate",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "pirate",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "plan-mode",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "prateekmedia/claude-agent-sdk-pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "prateekmedia/pi-hooks",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "pratos/clanker-setup",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "preset",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "protected-paths",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "pspdfkit-labs/pi-skills",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "qna",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "qualisero/pi-agent-scip",
+      "license": "Apache-2.0",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "Apache-2.0: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "qualisero/rhubarb-pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "question",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "questionnaire",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "rainbow-editor",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "rhnvrm/pi-mesh",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "richard-devbot/computer-agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "richardgill/nix",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "richardgill/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "rkunnamp/pi-apply-patch",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "robextremevoice/openclaw-1",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "rpc-demo",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "rytswd/pi-agent-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "safzanpirani/pi-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "samuelstevens/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "sandbox",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "sbattywolf/gaia",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "sboudrias/inquirer.js",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "scooter-lacroix/leindex",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "screenpipe/screenpipe",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "send-user-message",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "seriousben/serious-nixos-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "session-name",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "sgtest/megarepo",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "shutdown-command",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "sibyllinesoft/scribe",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "sids/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "sigtom/wow-ocp",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "skyfallsin/pi-agent-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "skyfallsin/pi-vertex-anthropic",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "snake",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "space-invaders",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ssh",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "status-line",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "stefan2904/dockerized-pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "subagent",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "subsy/ralph-tui",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "summarize",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "surma/nixenv",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "svkozak/pi-acp",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "system-prompt-header",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "third-party/aliou-pi-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/ben-vargas-pi-packages",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/charles-cooper-pi-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/cv-pi-ssh-remote",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/graffioh-pi-screenshots-picker",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/graffioh-pi-super-curl",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/kcosr-pi-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/limouren-agent-things",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/lsj5031-pi-notification-extension",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/marckrenn-pi-sub",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/michalvavra-agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/ogulcancelik-pi-sketch",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/openclaw-openclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/pasky-pi-amplike",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/qualisero-pi-agent-scip",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "third-party/raunovillberg-pi-stuffed",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/rytswd-direnv",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/rytswd-questionnaire",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/rytswd-slow-mode",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/vtemian-pi-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/w-winter-dot314",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "third-party/zenobi-us-pi-dcp",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "thrashr888/agentkernel",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "thurstonsand/ansiblonomicon",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "tiberriver256/mcp-server-azure-devops",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "timed-confirm",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "timofreiberg/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "titlebar-spinner",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "tmustier/pi-extensions",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "todo",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "tool-override",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "tools",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "toorusr/ai-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "towry/agent-share",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "trigger-compact",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "truncated-tool",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "ttttmr/pi-search-tool",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "tudoroancea/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "vaayne/agent-kit",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "verioussmith/pi-openrouter-extension",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "volantk/pi-agent-skills-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "vrslev/dotfiles",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "w-winter/dot314",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "walterra/agent-tools",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "wayanjimmy/agent-stuff",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "weolopez/aardvark",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "whamp/glm-vision",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "whamp/pi-agentic-compaction",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "whamp/pi-automem",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "whamp/pi-brain",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "whamp/pi-rlm",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "whodaniel/fuse",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "widget-placement",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "willem4130/android",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "willyfrog/agents-warning",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "willyfrog/pi-agent-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "with-deps",
+      "license": "MIT",
+      "license_source": "candidate_pool",
+      "redistributable": "yes",
+      "security_findings": [],
+      "verdict": "pass",
+      "notes": "MIT: permissive, freely redistributable"
+    },
+    {
+      "canonical_id": "xxrenzhe/autobb",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "yesongyun/openclaw-cn",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "yulqen/conductor-pi",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "zanieb/pi-plugins",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    },
+    {
+      "canonical_id": "zenobi-us/pi-dcp",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_findings": [],
+      "verdict": "needs_review",
+      "notes": "License unknown; manual review required"
+    }
+  ]
+}
