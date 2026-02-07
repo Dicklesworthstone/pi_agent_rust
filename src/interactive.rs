@@ -2690,7 +2690,7 @@ fn truncate(s: &str, max_len: usize) -> String {
     out
 }
 
-fn strip_thinking_level_suffix(pattern: &str) -> &str {
+pub(crate) fn strip_thinking_level_suffix(pattern: &str) -> &str {
     let Some((prefix, suffix)) = pattern.rsplit_once(':') else {
         return pattern;
     };
@@ -2700,7 +2700,7 @@ fn strip_thinking_level_suffix(pattern: &str) -> &str {
     }
 }
 
-fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
+pub(crate) fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
     args.split(|c: char| c == ',' || c.is_whitespace())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -2708,14 +2708,14 @@ fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
         .collect()
 }
 
-fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
+pub(crate) fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
     left.model
         .provider
         .eq_ignore_ascii_case(&right.model.provider)
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
-fn resolve_scoped_model_entries(
+pub(crate) fn resolve_scoped_model_entries(
     patterns: &[String],
     available_models: &[ModelEntry],
 ) -> Result<Vec<ModelEntry>, String> {
