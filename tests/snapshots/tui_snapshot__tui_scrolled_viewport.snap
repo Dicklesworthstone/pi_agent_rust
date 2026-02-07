@@ -3,6 +3,8 @@ source: tests/tui_snapshot.rs
 expression: view
 ---
   Pi (dummy/dummy-model)
+  ctrl+l: model  ctrl+p: next  ctrl+shift+p: prev  ctrl+o: tools  ctrl+t: thi...
+  resources: 0 skills, 0 prompts, 0 themes, 0 extensions
 
   Assistant:
 
@@ -24,5 +26,3 @@ expression: view
   │ > Type a message... (/help, /exit)
   │ >
   │ >
-
-  Tokens: 0 in / 0 out  |  /help  |  Ctrl+C: quit

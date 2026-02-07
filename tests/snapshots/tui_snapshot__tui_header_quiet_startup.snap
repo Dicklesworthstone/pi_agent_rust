@@ -3,8 +3,10 @@ source: tests/tui_snapshot.rs
 expression: view
 ---
   Pi (dummy/dummy-model)
+  ctrl+l: model  ctrl+p: next  ctrl+shift+p: prev  ctrl+o: tools  ctrl+t: thi...
+  resources: 0 skills, 0 prompts, 0 themes, 0 extensions
 
-  Welcome to Pi! Type a message to begin, or /help for commands.
+
 
   Enter: send  Shift+Enter: newline  Alt+Enter: multi-line  [thinking: off]
   │ > Type a message... (/help, /exit)
