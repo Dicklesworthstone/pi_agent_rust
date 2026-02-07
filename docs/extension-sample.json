@@ -180,7 +180,7 @@
       },
       {
         "extension_id": "plan-mode",
-        "features": ["command", "event"],
+        "features": ["command", "event", "flag", "shortcut"],
         "scenarios": [
           {
             "id": "scn-plan-mode-001",
@@ -206,6 +206,15 @@
             "expect": {
               "block": true,
               "reason_contains": ["Plan mode: command blocked"]
+            }
+          },
+          {
+            "id": "scn-plan-mode-003",
+            "kind": "registration",
+            "summary": "Verifies plan-mode registers flag, shortcut, and command",
+            "expect": {
+              "commands_contains": ["plan"],
+              "event_hooks_contains": ["tool_call"]
             }
           }
         ]
@@ -250,7 +259,7 @@
       },
       {
         "extension_id": "sandbox",
-        "features": ["tool", "command", "event"],
+        "features": ["tool", "command", "event", "flag"],
         "scenarios": [
           {
             "id": "scn-sandbox-001",
@@ -279,6 +288,15 @@
             "input": { "ctx": { "has_ui": true } },
             "expect": {
               "ui_notify_contains": ["Sandbox disabled via --no-sandbox"]
+            }
+          },
+          {
+            "id": "scn-sandbox-004",
+            "kind": "registration",
+            "summary": "Verifies sandbox registers a flag and event hooks",
+            "expect": {
+              "flags_contains": ["no-sandbox"],
+              "event_hooks_contains": ["session_start"]
             }
           }
         ]

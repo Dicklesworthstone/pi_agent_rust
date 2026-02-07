@@ -43,6 +43,7 @@ pub mod cli;
 pub mod compaction;
 pub mod config;
 pub mod conformance;
+pub mod conformance_shapes;
 pub mod connectors;
 pub mod crypto_shim;
 pub mod error;

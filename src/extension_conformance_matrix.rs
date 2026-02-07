@@ -617,11 +617,12 @@ pub fn build_test_plan(
     api_matrix: Option<&ApiMatrix>,
     task_id: &str,
 ) -> ConformanceTestPlan {
-    // Collect all included extensions
+    // Collect all included extensions (supports both v1 and v2 formats)
     let all_entries: Vec<&InclusionEntry> = inclusion
         .tier0
         .iter()
         .chain(inclusion.tier1.iter())
+        .chain(inclusion.tier1_review.iter())
         .chain(inclusion.tier2.iter())
         .collect();
 
@@ -848,8 +849,8 @@ mod tests {
         let inclusion = InclusionList {
             schema: "pi.ext.inclusion.v1".into(),
             generated_at: "2026-01-01T00:00:00Z".into(),
-            task: "test".into(),
-            stats: crate::extension_inclusion::InclusionStats {
+            task: Some("test".into()),
+            stats: Some(crate::extension_inclusion::InclusionStats {
                 total_included: 0,
                 tier0_count: 0,
                 tier1_count: 0,
@@ -859,12 +860,16 @@ mod tests {
                 pinned_git: 0,
                 pinned_url: 0,
                 pinned_checksum_only: 0,
-            },
+            }),
             tier0: vec![],
             tier1: vec![],
             tier2: vec![],
             exclusions: vec![],
             category_coverage: std::collections::HashMap::new(),
+            summary: None,
+            tier1_review: vec![],
+            coverage: None,
+            exclusion_notes: vec![],
         };
 
         let plan = build_test_plan(&inclusion, None, "test-task");

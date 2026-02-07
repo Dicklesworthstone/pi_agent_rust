@@ -195,22 +195,31 @@ fn main() -> Result<()> {
             VersionPin::Checksum => pinned_checksum += 1,
         }
 
-        let rationale =
-            build_rationale(&item.tier, item.score.final_total, &category, &source_tier);
+        let rationale = build_rationale(
+            &item.tier,
+            f64::from(item.score.final_total),
+            &category,
+            &source_tier,
+        );
 
         let entry = InclusionEntry {
             id: item.id.clone(),
-            name: item.name.clone().unwrap_or_else(|| item.id.clone()),
-            tier: item.tier.clone(),
-            score: item.score.final_total,
+            name: Some(item.name.clone().unwrap_or_else(|| item.id.clone())),
+            tier: Some(item.tier.clone()),
+            score: Some(f64::from(item.score.final_total)),
             category: category.clone(),
             registrations,
-            version_pin,
+            version_pin: Some(version_pin),
             sha256,
             artifact_path,
-            license,
-            source_tier: source_tier.clone(),
-            rationale,
+            license: Some(license),
+            source_tier: Some(source_tier.clone()),
+            rationale: Some(rationale),
+            directory: None,
+            provenance: None,
+            capabilities: None,
+            risk_level: None,
+            inclusion_rationale: None,
         };
 
         let cat_key = format!("{category:?}");
@@ -243,7 +252,7 @@ fn main() -> Result<()> {
                     };
                     exclusions.push(ExclusionNote {
                         id: item.id.clone(),
-                        score: item.score.final_total,
+                        score: f64::from(item.score.final_total),
                         reason,
                     });
                 }
@@ -267,13 +276,17 @@ fn main() -> Result<()> {
     let list = InclusionList {
         schema: "pi.ext.inclusion.v1".to_string(),
         generated_at: pi::extension_validation::chrono_now_iso(),
-        task: args.task_id,
-        stats,
+        task: Some(args.task_id),
+        stats: Some(stats),
         tier0,
         tier1,
         tier2,
         exclusions,
         category_coverage,
+        summary: None,
+        tier1_review: vec![],
+        coverage: None,
+        exclusion_notes: vec![],
     };
 
     let json = serde_json::to_string_pretty(&list).context("serializing inclusion list")?;
@@ -281,18 +294,19 @@ fn main() -> Result<()> {
         .with_context(|| format!("writing output to {}", args.out.display()))?;
 
     // Print summary.
+    let stats_ref = list.stats.as_ref().expect("stats");
     eprintln!("=== Final Inclusion List ===");
-    eprintln!("Total included:     {}", list.stats.total_included);
-    eprintln!("  Tier-0 (baseline):{}", list.stats.tier0_count);
-    eprintln!("  Tier-1 (must):    {}", list.stats.tier1_count);
-    eprintln!("  Tier-2 (stretch): {}", list.stats.tier2_count);
-    eprintln!("Exclusion notes:    {}", list.stats.excluded_count);
+    eprintln!("Total included:     {}", stats_ref.total_included);
+    eprintln!("  Tier-0 (baseline):{}", stats_ref.tier0_count);
+    eprintln!("  Tier-1 (must):    {}", stats_ref.tier1_count);
+    eprintln!("  Tier-2 (stretch): {}", stats_ref.tier2_count);
+    eprintln!("Exclusion notes:    {}", stats_ref.excluded_count);
     eprintln!();
     eprintln!("Version pins:");
-    eprintln!("  npm:       {}", list.stats.pinned_npm);
-    eprintln!("  git:       {}", list.stats.pinned_git);
-    eprintln!("  url:       {}", list.stats.pinned_url);
-    eprintln!("  checksum:  {}", list.stats.pinned_checksum_only);
+    eprintln!("  npm:       {}", stats_ref.pinned_npm);
+    eprintln!("  git:       {}", stats_ref.pinned_git);
+    eprintln!("  url:       {}", stats_ref.pinned_url);
+    eprintln!("  checksum:  {}", stats_ref.pinned_checksum_only);
     eprintln!();
 
     let mut cat_list: Vec<_> = list.category_coverage.iter().collect();

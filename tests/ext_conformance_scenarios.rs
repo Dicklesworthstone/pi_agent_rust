@@ -228,6 +228,26 @@ struct ScenarioExpectation {
     ui_status_key: Option<String>,
     #[serde(default)]
     ui_status_contains_sequence: Option<Vec<String>>,
+
+    // ── Registration shape matchers ──────────────────────────────────────
+    /// Check that specific flags are registered (by name).
+    #[serde(default)]
+    flags_contains: Option<Vec<String>>,
+    /// Check that specific shortcuts are registered (by key).
+    #[serde(default)]
+    shortcuts_contains: Option<Vec<String>>,
+    /// Check that specific slash commands are registered (by name).
+    #[serde(default)]
+    commands_contains: Option<Vec<String>>,
+    /// Check that specific event hooks are registered (by event name).
+    #[serde(default)]
+    event_hooks_contains: Option<Vec<String>>,
+    /// Check the total count of registered tools.
+    #[serde(default)]
+    tool_count: Option<usize>,
+    /// Check the total count of registered flags.
+    #[serde(default)]
+    flag_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -845,59 +865,51 @@ fn check_expectations_inner(
 
     // Check returns_contains: deep partial match on result JSON
     if let Some(expected) = &expect.returns_contains {
-        if let Ok(actual) = result {
-            if !json_contains(actual, expected) {
-                diffs.push(format!(
-                    "returns_contains: expected {expected} to be contained in {actual}"
-                ));
-            }
+        if !json_contains(result, expected) {
+            diffs.push(format!(
+                "returns_contains: expected {expected} to be contained in {result}"
+            ));
         }
     }
 
     // Check action: check result action field (for input transforms)
     if let Some(expected_action) = &expect.action {
-        if let Ok(actual) = result {
-            let actual_action = actual.get("action").and_then(Value::as_str).unwrap_or("");
-            if actual_action != expected_action {
-                diffs.push(format!(
-                    "action: expected '{expected_action}' got '{actual_action}'"
-                ));
-            }
+        let actual_action = result.get("action").and_then(Value::as_str).unwrap_or("");
+        if actual_action != expected_action {
+            diffs.push(format!(
+                "action: expected '{expected_action}' got '{actual_action}'"
+            ));
         }
     }
 
     // Check text_contains: check result text field
     if let Some(patterns) = &expect.text_contains {
-        if let Ok(actual) = result {
-            let text = actual.get("text").and_then(Value::as_str).unwrap_or("");
-            for pattern in patterns {
-                if !text.contains(pattern.as_str()) {
-                    diffs.push(format!(
-                        "text_contains: expected '{pattern}' in text: {text}"
-                    ));
-                }
+        let text = result.get("text").and_then(Value::as_str).unwrap_or("");
+        for pattern in patterns {
+            if !text.contains(pattern.as_str()) {
+                diffs.push(format!(
+                    "text_contains: expected '{pattern}' in text: {text}"
+                ));
             }
         }
     }
 
     // Check content_types: check content block types array
     if let Some(expected_types) = &expect.content_types {
-        if let Ok(actual) = result {
-            let actual_types: Vec<String> = actual
-                .get("content")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|b| b.get("type").and_then(Value::as_str).map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for expected_type in expected_types {
-                if !actual_types.iter().any(|t| t == expected_type) {
-                    diffs.push(format!(
-                        "content_types: expected type '{expected_type}' in {actual_types:?}"
-                    ));
-                }
+        let actual_types: Vec<String> = result
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|arr: &Vec<Value>| {
+                arr.iter()
+                    .filter_map(|b| b.get("type").and_then(Value::as_str).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        for expected_type in expected_types {
+            if !actual_types.iter().any(|t| t == expected_type) {
+                diffs.push(format!(
+                    "content_types: expected type '{expected_type}' in {actual_types:?}"
+                ));
             }
         }
     }
@@ -911,6 +923,94 @@ fn check_expectations_inner(
                     "active_tools: expected '{expected_tool}' in {actual_tools:?}"
                 ));
             }
+        }
+    }
+
+    // ── Registration shape matchers ──────────────────────────────────────
+
+    // Check flags_contains: verify flag names via manager.list_flags()
+    if let Some(expected_flags) = &expect.flags_contains {
+        let actual_flags = manager.list_flags();
+        let flag_names: Vec<String> = actual_flags
+            .iter()
+            .filter_map(|f| f.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        for expected_name in expected_flags {
+            if !flag_names.iter().any(|n| n == expected_name) {
+                diffs.push(format!(
+                    "flags_contains: expected flag '{expected_name}' in {flag_names:?}"
+                ));
+            }
+        }
+    }
+
+    // Check shortcuts_contains: verify shortcut keys via manager.list_shortcuts()
+    if let Some(expected_shortcuts) = &expect.shortcuts_contains {
+        let actual_shortcuts = manager.list_shortcuts();
+        let shortcut_keys: Vec<String> = actual_shortcuts
+            .iter()
+            .filter_map(|s| {
+                s.get("key")
+                    .or_else(|| s.get("key_id"))
+                    .or_else(|| s.get("name"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            })
+            .collect();
+        for expected_key in expected_shortcuts {
+            if !shortcut_keys.iter().any(|k| k.contains(expected_key)) {
+                diffs.push(format!(
+                    "shortcuts_contains: expected shortcut '{expected_key}' in {shortcut_keys:?}"
+                ));
+            }
+        }
+    }
+
+    // Check commands_contains: verify command names via manager.list_commands()
+    if let Some(expected_commands) = &expect.commands_contains {
+        let actual_commands = manager.list_commands();
+        let command_names: Vec<String> = actual_commands
+            .iter()
+            .filter_map(|c| c.get("name").and_then(Value::as_str).map(String::from))
+            .collect();
+        for expected_name in expected_commands {
+            if !command_names.iter().any(|n| n == expected_name) {
+                diffs.push(format!(
+                    "commands_contains: expected command '{expected_name}' in {command_names:?}"
+                ));
+            }
+        }
+    }
+
+    // Check event_hooks_contains: verify event hook names via manager.list_event_hooks()
+    if let Some(expected_hooks) = &expect.event_hooks_contains {
+        let actual_hooks = manager.list_event_hooks();
+        for expected_hook in expected_hooks {
+            if !actual_hooks.iter().any(|h| h == expected_hook) {
+                diffs.push(format!(
+                    "event_hooks_contains: expected event hook '{expected_hook}' in {actual_hooks:?}"
+                ));
+            }
+        }
+    }
+
+    // Check tool_count
+    if let Some(expected_count) = expect.tool_count {
+        let actual_count = manager.extension_tool_defs().len();
+        if actual_count != expected_count {
+            diffs.push(format!(
+                "tool_count: expected {expected_count} got {actual_count}"
+            ));
+        }
+    }
+
+    // Check flag_count
+    if let Some(expected_count) = expect.flag_count {
+        let actual_count = manager.list_flags().len();
+        if actual_count != expected_count {
+            diffs.push(format!(
+                "flag_count: expected {expected_count} got {actual_count}"
+            ));
         }
     }
 
@@ -1214,10 +1314,11 @@ impl HostcallInterceptor for MockSpecInterceptor {
                     _ => None,
                 }
             }
-            // Session, Events, Tool → pass through to real dispatch
+            // Session, Events, Tool, Log → pass through to real dispatch
             HostcallKind::Session { .. }
             | HostcallKind::Events { .. }
-            | HostcallKind::Tool { .. } => None,
+            | HostcallKind::Tool { .. }
+            | HostcallKind::Log => None,
         }
     }
 }
@@ -1812,7 +1913,7 @@ fn execute_multi_step_scenario(
                     if let Some(ui_resp) = step_ctx.get("ui_responses") {
                         // Update the interceptor's UI responses for this step
                         if let Some(obj) = ui_resp.as_object() {
-                            for (k, v) in obj {
+                            for (k, _v) in obj {
                                 loaded
                                     .interceptor
                                     .ui_responses
@@ -2019,6 +2120,27 @@ fn run_scenario(
                 ..base
             };
         }
+        // Flag/shortcut/registration scenarios: check registration state only
+        "flag" | "shortcut" | "registration" => {
+            if let Some(expect) = &scenario.expect {
+                let diffs = check_expectations(expect, &Ok(Value::Null), &loaded);
+                return ScenarioResult {
+                    status: if diffs.is_empty() {
+                        "pass".to_string()
+                    } else {
+                        "fail".to_string()
+                    },
+                    diffs,
+                    duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ..base
+                };
+            }
+            return ScenarioResult {
+                status: "pass".to_string(),
+                duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                ..base
+            };
+        }
         other => {
             return ScenarioResult {
                 status: "skip".to_string(),
@@ -2058,7 +2180,7 @@ fn run_scenario(
 /// Run a scenario using mock-based extension loading.
 #[allow(clippy::too_many_lines)]
 fn run_scenario_with_mocks(
-    ext: &ScenarioExtension,
+    _ext: &ScenarioExtension,
     scenario: &Scenario,
     ext_path: &Path,
     start: Instant,
@@ -2133,7 +2255,7 @@ fn run_scenario_with_mocks(
         }
         "command" => execute_command_scenario_with_mocks(&loaded, scenario, ext_path),
         "event" => execute_event_scenario_with_mocks(&loaded, scenario, ext_path),
-        "provider" => {
+        "provider" | "flag" | "shortcut" | "registration" => {
             if let Some(expect) = &scenario.expect {
                 let diffs = check_expectations_with_mocks(expect, &Ok(Value::Null), &loaded);
                 return ScenarioResult {

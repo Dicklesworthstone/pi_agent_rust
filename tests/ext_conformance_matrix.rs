@@ -148,7 +148,10 @@ fn conformance_plan_coverage_summary() {
 #[test]
 fn conformance_plan_exemplar_coverage() {
     let (plan, inclusion, _) = load_test_plan();
-    let total_included = inclusion.tier0.len() + inclusion.tier1.len() + inclusion.tier2.len();
+    let total_included = inclusion.tier0.len()
+        + inclusion.tier1.len()
+        + inclusion.tier1_review.len()
+        + inclusion.tier2.len();
 
     // The exemplar count should be <= total included extensions
     assert!(

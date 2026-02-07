@@ -1110,4 +1110,865 @@ mod tests {
         let join = runtime.handle().spawn(future);
         runtime.block_on(join)
     }
+
+    // ─── sanitize_test_name ──────────────────────────────────────────
+
+    #[test]
+    fn sanitize_preserves_alphanumeric_and_dash_underscore() {
+        assert_eq!(sanitize_test_name("hello-world_123"), "hello-world_123");
+    }
+
+    #[test]
+    fn sanitize_replaces_special_chars() {
+        assert_eq!(sanitize_test_name("a/b::c d.e"), "a_b__c_d_e");
+    }
+
+    #[test]
+    fn sanitize_empty_returns_vcr() {
+        assert_eq!(sanitize_test_name(""), "vcr");
+    }
+
+    #[test]
+    fn sanitize_all_special_returns_underscores() {
+        assert_eq!(sanitize_test_name("..."), "___");
+    }
+
+    #[test]
+    fn sanitize_unicode_replaced() {
+        assert_eq!(sanitize_test_name("café"), "caf_");
+    }
+
+    // ─── short_sha256 ────────────────────────────────────────────────
+
+    #[test]
+    fn short_sha256_deterministic() {
+        let a = short_sha256(b"hello");
+        let b = short_sha256(b"hello");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn short_sha256_length() {
+        let hash = short_sha256(b"test data");
+        assert_eq!(hash.len(), 12, "6 bytes = 12 hex chars");
+    }
+
+    #[test]
+    fn short_sha256_different_inputs() {
+        let a = short_sha256(b"alpha");
+        let b = short_sha256(b"beta");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn short_sha256_empty_input() {
+        let hash = short_sha256(b"");
+        assert_eq!(hash.len(), 12);
+        // SHA-256 of empty is well-known: e3b0c44298fc...
+        assert_eq!(&hash[..6], "e3b0c4");
+    }
+
+    // ─── is_sensitive_key ────────────────────────────────────────────
+
+    #[test]
+    fn sensitive_key_api_key() {
+        assert!(is_sensitive_key("api_key"));
+        assert!(is_sensitive_key("x_api_key"));
+        assert!(is_sensitive_key("MY_APIKEY"));
+    }
+
+    #[test]
+    fn sensitive_key_authorization() {
+        assert!(is_sensitive_key("authorization"));
+        assert!(is_sensitive_key("Authorization"));
+    }
+
+    #[test]
+    fn sensitive_key_token_but_not_tokens() {
+        // "token" (singular) is sensitive
+        assert!(is_sensitive_key("access_token"));
+        assert!(is_sensitive_key("id_token"));
+        assert!(is_sensitive_key("refresh_token"));
+        // "tokens" (count) is NOT sensitive...
+        assert!(!is_sensitive_key("max_tokens"));
+        assert!(!is_sensitive_key("prompt_tokens"));
+        assert!(!is_sensitive_key("completion_tokens"));
+        // ...except the plural versions of auth token names
+        assert!(is_sensitive_key("access_tokens"));
+        assert!(is_sensitive_key("refresh_tokens"));
+    }
+
+    #[test]
+    fn sensitive_key_secret_and_password() {
+        assert!(is_sensitive_key("client_secret"));
+        assert!(is_sensitive_key("password"));
+        assert!(is_sensitive_key("db_password_hash"));
+    }
+
+    #[test]
+    fn sensitive_key_safe_keys() {
+        assert!(!is_sensitive_key("model"));
+        assert!(!is_sensitive_key("content"));
+        assert!(!is_sensitive_key("messages"));
+        assert!(!is_sensitive_key("temperature"));
+    }
+
+    // ─── redact_json ─────────────────────────────────────────────────
+
+    #[test]
+    fn redact_json_flat_object() {
+        let mut val = serde_json::json!({"api_key": "sk-123", "model": "gpt-4"});
+        let count = redact_json(&mut val);
+        assert_eq!(count, 1);
+        assert_eq!(val["api_key"], REDACTED);
+        assert_eq!(val["model"], "gpt-4");
+    }
+
+    #[test]
+    fn redact_json_nested() {
+        let mut val = serde_json::json!({
+            "config": {
+                "secret": "hidden",
+                "name": "test"
+            }
+        });
+        let count = redact_json(&mut val);
+        assert_eq!(count, 1);
+        assert_eq!(val["config"]["secret"], REDACTED);
+        assert_eq!(val["config"]["name"], "test");
+    }
+
+    #[test]
+    fn redact_json_array_of_objects() {
+        let mut val = serde_json::json!([
+            {"api_key": "a"},
+            {"api_key": "b"},
+            {"safe": "c"}
+        ]);
+        let count = redact_json(&mut val);
+        assert_eq!(count, 2);
+        assert_eq!(val[0]["api_key"], REDACTED);
+        assert_eq!(val[1]["api_key"], REDACTED);
+        assert_eq!(val[2]["safe"], "c");
+    }
+
+    #[test]
+    fn redact_json_scalar_returns_zero() {
+        let mut val = serde_json::json!("just a string");
+        assert_eq!(redact_json(&mut val), 0);
+        let mut val = serde_json::json!(42);
+        assert_eq!(redact_json(&mut val), 0);
+        let mut val = serde_json::json!(null);
+        assert_eq!(redact_json(&mut val), 0);
+    }
+
+    #[test]
+    fn redact_json_empty_object() {
+        let mut val = serde_json::json!({});
+        assert_eq!(redact_json(&mut val), 0);
+    }
+
+    // ─── redact_headers ──────────────────────────────────────────────
+
+    #[test]
+    fn redact_headers_case_insensitive() {
+        let sensitive = sensitive_header_keys();
+        let mut headers = vec![
+            ("Authorization".to_string(), "Bearer tok".to_string()),
+            ("X-Api-Key".to_string(), "key".to_string()),
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        let count = redact_headers(&mut headers, &sensitive);
+        assert_eq!(count, 2);
+        assert_eq!(headers[0].1, REDACTED);
+        assert_eq!(headers[1].1, REDACTED);
+        assert_eq!(headers[2].1, "application/json");
+    }
+
+    #[test]
+    fn redact_headers_empty() {
+        let sensitive = sensitive_header_keys();
+        let mut headers = vec![];
+        assert_eq!(redact_headers(&mut headers, &sensitive), 0);
+    }
+
+    #[test]
+    fn redact_headers_all_sensitive_keys() {
+        let sensitive = sensitive_header_keys();
+        let keys = [
+            "authorization",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "x-azure-api-key",
+            "proxy-authorization",
+        ];
+        let mut headers: Vec<(String, String)> = keys
+            .iter()
+            .map(|k| (k.to_string(), "secret".to_string()))
+            .collect();
+        let count = redact_headers(&mut headers, &sensitive);
+        assert_eq!(count, 6);
+        for (_, val) in &headers {
+            assert_eq!(val, REDACTED);
+        }
+    }
+
+    // ─── request_debug_key ───────────────────────────────────────────
+
+    #[test]
+    fn request_debug_key_with_body() {
+        let req = RecordedRequest {
+            method: "post".to_string(),
+            url: "https://api.example.com/v1/chat".to_string(),
+            headers: vec![],
+            body: Some(serde_json::json!({"prompt": "hello"})),
+            body_text: None,
+        };
+        let key = request_debug_key(&req);
+        assert!(key.starts_with("POST https://api.example.com/v1/chat"));
+        assert!(key.contains("body_sha256="));
+        assert!(key.contains("body_text_sha256=<none>"));
+    }
+
+    #[test]
+    fn request_debug_key_no_body() {
+        let req = RecordedRequest {
+            method: "GET".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        let key = request_debug_key(&req);
+        assert!(key.contains("body_sha256=<none>"));
+        assert!(key.contains("body_text_sha256=<none>"));
+    }
+
+    #[test]
+    fn request_debug_key_with_body_text() {
+        let req = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://example.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: Some("raw text body".to_string()),
+        };
+        let key = request_debug_key(&req);
+        assert!(key.contains("body_text_sha256="));
+        assert!(key.contains("body_text_len=13"));
+        assert!(!key.contains("body_text_sha256=<none>"));
+    }
+
+    // ─── match_json_template ─────────────────────────────────────────
+
+    #[test]
+    fn json_template_exact_scalar_match() {
+        let a = serde_json::json!("hello");
+        let b = serde_json::json!("hello");
+        assert!(match_json_template(&a, &b));
+    }
+
+    #[test]
+    fn json_template_scalar_mismatch() {
+        let a = serde_json::json!("hello");
+        let b = serde_json::json!("world");
+        assert!(!match_json_template(&a, &b));
+    }
+
+    #[test]
+    fn json_template_number_match() {
+        let a = serde_json::json!(42);
+        let b = serde_json::json!(42);
+        assert!(match_json_template(&a, &b));
+    }
+
+    #[test]
+    fn json_template_object_extra_incoming_keys_ok() {
+        let recorded = serde_json::json!({"model": "gpt-4"});
+        let incoming = serde_json::json!({"model": "gpt-4", "extra": "ignored"});
+        assert!(match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_object_missing_incoming_key_fails() {
+        let recorded = serde_json::json!({"model": "gpt-4", "required": true});
+        let incoming = serde_json::json!({"model": "gpt-4"});
+        assert!(!match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_null_matches_missing_key() {
+        let recorded = serde_json::json!({"model": "gpt-4", "optional": null});
+        let incoming = serde_json::json!({"model": "gpt-4"});
+        assert!(match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_null_matches_null() {
+        let recorded = serde_json::json!({"field": null});
+        let incoming = serde_json::json!({"field": null});
+        assert!(match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_array_same_length_matches() {
+        let recorded = serde_json::json!([1, 2, 3]);
+        let incoming = serde_json::json!([1, 2, 3]);
+        assert!(match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_array_different_length_fails() {
+        let recorded = serde_json::json!([1, 2]);
+        let incoming = serde_json::json!([1, 2, 3]);
+        assert!(!match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_array_element_mismatch_fails() {
+        let recorded = serde_json::json!([1, 2, 3]);
+        let incoming = serde_json::json!([1, 99, 3]);
+        assert!(!match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_nested_object_in_array() {
+        let recorded = serde_json::json!([{"role": "user"}, {"role": "assistant"}]);
+        let incoming = serde_json::json!([
+            {"role": "user", "id": "1"},
+            {"role": "assistant", "id": "2"}
+        ]);
+        assert!(match_json_template(&recorded, &incoming));
+    }
+
+    #[test]
+    fn json_template_type_mismatch() {
+        let recorded = serde_json::json!({"a": "string"});
+        let incoming = serde_json::json!({"a": 42});
+        assert!(!match_json_template(&recorded, &incoming));
+    }
+
+    // ─── match_optional_json ─────────────────────────────────────────
+
+    #[test]
+    fn optional_json_none_recorded_matches_anything() {
+        assert!(match_optional_json(None, None));
+        assert!(match_optional_json(
+            None,
+            Some(&serde_json::json!({"anything": true}))
+        ));
+    }
+
+    #[test]
+    fn optional_json_some_recorded_none_incoming_fails() {
+        let recorded = serde_json::json!({"a": 1});
+        assert!(!match_optional_json(Some(&recorded), None));
+    }
+
+    // ─── request_matches ─────────────────────────────────────────────
+
+    #[test]
+    fn request_matches_method_case_insensitive() {
+        let recorded = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        let incoming = RecordedRequest {
+            method: "post".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        assert!(request_matches(&recorded, &incoming));
+    }
+
+    #[test]
+    fn request_matches_url_mismatch() {
+        let recorded = RecordedRequest {
+            method: "GET".to_string(),
+            url: "https://a.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        let incoming = RecordedRequest {
+            method: "GET".to_string(),
+            url: "https://b.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        assert!(!request_matches(&recorded, &incoming));
+    }
+
+    #[test]
+    fn request_matches_body_text_constraint() {
+        let recorded = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: Some("expected".to_string()),
+        };
+        let mut incoming = recorded.clone();
+        incoming.body_text = Some("expected".to_string());
+        assert!(request_matches(&recorded, &incoming));
+
+        incoming.body_text = Some("different".to_string());
+        assert!(!request_matches(&recorded, &incoming));
+    }
+
+    #[test]
+    fn request_matches_missing_recorded_body_text_is_wildcard() {
+        let recorded = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        let incoming = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: Some("anything".to_string()),
+        };
+        assert!(request_matches(&recorded, &incoming));
+    }
+
+    #[test]
+    fn request_matches_redacts_incoming_body() {
+        // The cassette body is already redacted; incoming body has real secrets.
+        let recorded = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: Some(serde_json::json!({"api_key": REDACTED, "model": "gpt-4"})),
+            body_text: None,
+        };
+        let incoming = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: Some(serde_json::json!({"api_key": "sk-real-secret", "model": "gpt-4"})),
+            body_text: None,
+        };
+        assert!(request_matches(&recorded, &incoming));
+    }
+
+    // ─── find_interaction_from ───────────────────────────────────────
+
+    #[test]
+    fn find_interaction_from_start() {
+        let cassette = Cassette {
+            version: "1.0".to_string(),
+            test_name: "test".to_string(),
+            recorded_at: "2026-01-01".to_string(),
+            interactions: vec![
+                Interaction {
+                    request: RecordedRequest {
+                        method: "GET".to_string(),
+                        url: "https://a.com".to_string(),
+                        headers: vec![],
+                        body: None,
+                        body_text: None,
+                    },
+                    response: RecordedResponse {
+                        status: 200,
+                        headers: vec![],
+                        body_chunks: vec!["a".to_string()],
+                        body_chunks_base64: None,
+                    },
+                },
+                Interaction {
+                    request: RecordedRequest {
+                        method: "GET".to_string(),
+                        url: "https://b.com".to_string(),
+                        headers: vec![],
+                        body: None,
+                        body_text: None,
+                    },
+                    response: RecordedResponse {
+                        status: 201,
+                        headers: vec![],
+                        body_chunks: vec!["b".to_string()],
+                        body_chunks_base64: None,
+                    },
+                },
+            ],
+        };
+
+        let req_b = RecordedRequest {
+            method: "GET".to_string(),
+            url: "https://b.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+
+        let result = find_interaction_from(&cassette, &req_b, 0);
+        assert!(result.is_some());
+        let (idx, interaction) = result.unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(interaction.response.status, 201);
+    }
+
+    #[test]
+    fn find_interaction_from_with_cursor_skip() {
+        let make_interaction = |url: &str, status: u16| Interaction {
+            request: RecordedRequest {
+                method: "POST".to_string(),
+                url: url.to_string(),
+                headers: vec![],
+                body: None,
+                body_text: None,
+            },
+            response: RecordedResponse {
+                status,
+                headers: vec![],
+                body_chunks: vec![],
+                body_chunks_base64: None,
+            },
+        };
+
+        let cassette = Cassette {
+            version: "1.0".to_string(),
+            test_name: "cursor".to_string(),
+            recorded_at: "2026-01-01".to_string(),
+            interactions: vec![
+                make_interaction("https://x.com", 200),
+                make_interaction("https://x.com", 201),
+                make_interaction("https://x.com", 202),
+            ],
+        };
+
+        let req = RecordedRequest {
+            method: "POST".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+
+        // Start at 0 → finds index 0
+        let (idx, _) = find_interaction_from(&cassette, &req, 0).unwrap();
+        assert_eq!(idx, 0);
+
+        // Start at 1 → skips index 0, finds index 1
+        let (idx, interaction) = find_interaction_from(&cassette, &req, 1).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(interaction.response.status, 201);
+
+        // Start at 3 → past end, nothing found
+        assert!(find_interaction_from(&cassette, &req, 3).is_none());
+    }
+
+    #[test]
+    fn find_interaction_no_match() {
+        let cassette = Cassette {
+            version: "1.0".to_string(),
+            test_name: "empty".to_string(),
+            recorded_at: "2026-01-01".to_string(),
+            interactions: vec![],
+        };
+        let req = RecordedRequest {
+            method: "GET".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        assert!(find_interaction_from(&cassette, &req, 0).is_none());
+    }
+
+    // ─── env_truthy ──────────────────────────────────────────────────
+
+    #[test]
+    fn env_truthy_values() {
+        let _lock = env_test_lock().lock().expect("env test lock");
+        let key = "PI_VCR_TEST_TRUTHY";
+
+        for val in ["1", "true", "TRUE", "yes", "YES"] {
+            let prev = set_test_env_var(key, Some(val));
+            assert!(env_truthy(key), "expected truthy for '{val}'");
+            restore_test_env_var(key, prev);
+        }
+
+        for val in ["0", "false", "no", ""] {
+            let prev = set_test_env_var(key, Some(val));
+            assert!(!env_truthy(key), "expected falsy for '{val}'");
+            restore_test_env_var(key, prev);
+        }
+
+        let prev = set_test_env_var(key, None);
+        assert!(!env_truthy(key), "expected falsy for unset");
+        restore_test_env_var(key, prev);
+    }
+
+    // ─── default_mode ────────────────────────────────────────────────
+
+    #[test]
+    fn default_mode_ci_is_playback() {
+        let _lock = env_test_lock().lock().expect("env test lock");
+        let prev = set_test_env_var("CI", Some("true"));
+        assert_eq!(default_mode(), VcrMode::Playback);
+        restore_test_env_var("CI", prev);
+    }
+
+    #[test]
+    fn default_mode_no_ci_is_auto() {
+        let _lock = env_test_lock().lock().expect("env test lock");
+        let prev = set_test_env_var("CI", None);
+        assert_eq!(default_mode(), VcrMode::Auto);
+        restore_test_env_var("CI", prev);
+    }
+
+    // ─── RecordedResponse::into_byte_stream ──────────────────────────
+
+    #[test]
+    fn into_byte_stream_text_chunks() {
+        let resp = RecordedResponse {
+            status: 200,
+            headers: vec![],
+            body_chunks: vec!["hello ".to_string(), "world".to_string()],
+            body_chunks_base64: None,
+        };
+        let chunks: Vec<Vec<u8>> = run_async(async move {
+            use futures::StreamExt;
+            resp.into_byte_stream()
+                .map(|r| r.expect("chunk"))
+                .collect()
+                .await
+        });
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], b"hello ");
+        assert_eq!(chunks[1], b"world");
+    }
+
+    #[test]
+    fn into_byte_stream_base64_chunks() {
+        let chunk1 = STANDARD.encode(b"binary\x00data");
+        let chunk2 = STANDARD.encode(b"\xff\xfe");
+        let resp = RecordedResponse {
+            status: 200,
+            headers: vec![],
+            body_chunks: vec![],
+            body_chunks_base64: Some(vec![chunk1, chunk2]),
+        };
+        let chunks: Vec<Vec<u8>> = run_async(async move {
+            use futures::StreamExt;
+            resp.into_byte_stream()
+                .map(|r| r.expect("chunk"))
+                .collect()
+                .await
+        });
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0], b"binary\x00data");
+        assert_eq!(chunks[1], b"\xff\xfe");
+    }
+
+    #[test]
+    fn into_byte_stream_base64_takes_precedence() {
+        let resp = RecordedResponse {
+            status: 200,
+            headers: vec![],
+            body_chunks: vec!["ignored".to_string()],
+            body_chunks_base64: Some(vec![STANDARD.encode(b"used")]),
+        };
+        let chunks: Vec<Vec<u8>> = run_async(async move {
+            use futures::StreamExt;
+            resp.into_byte_stream()
+                .map(|r| r.expect("chunk"))
+                .collect()
+                .await
+        });
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0], b"used");
+    }
+
+    #[test]
+    fn into_byte_stream_empty() {
+        let resp = RecordedResponse {
+            status: 200,
+            headers: vec![],
+            body_chunks: vec![],
+            body_chunks_base64: None,
+        };
+        let chunks: Vec<Vec<u8>> = run_async(async move {
+            use futures::StreamExt;
+            resp.into_byte_stream()
+                .map(|r| r.expect("chunk"))
+                .collect()
+                .await
+        });
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn into_byte_stream_invalid_base64_errors() {
+        let resp = RecordedResponse {
+            status: 200,
+            headers: vec![],
+            body_chunks: vec![],
+            body_chunks_base64: Some(vec!["not-valid-base64!!!".to_string()]),
+        };
+        let results: Vec<std::result::Result<Vec<u8>, std::io::Error>> = run_async(async move {
+            use futures::StreamExt;
+            resp.into_byte_stream().collect().await
+        });
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_err());
+    }
+
+    // ─── Cassette serialization ──────────────────────────────────────
+
+    #[test]
+    fn cassette_serde_body_text_omitted_when_none() {
+        let req = RecordedRequest {
+            method: "GET".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(!json.contains("body_text"));
+        assert!(!json.contains("body"));
+    }
+
+    #[test]
+    fn cassette_serde_body_text_present_when_some() {
+        let req = RecordedRequest {
+            method: "GET".to_string(),
+            url: "https://x.com".to_string(),
+            headers: vec![],
+            body: None,
+            body_text: Some("hello".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("body_text"));
+        assert!(json.contains("hello"));
+    }
+
+    #[test]
+    fn cassette_response_base64_omitted_when_none() {
+        let resp = RecordedResponse {
+            status: 200,
+            headers: vec![],
+            body_chunks: vec!["data".to_string()],
+            body_chunks_base64: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(!json.contains("body_chunks_base64"));
+    }
+
+    #[test]
+    fn cassette_save_load_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let path = temp_dir.path().join("subdir/test.json");
+        let cassette = Cassette {
+            version: CASSETTE_VERSION.to_string(),
+            test_name: "save_load".to_string(),
+            recorded_at: "2026-02-06T00:00:00.000Z".to_string(),
+            interactions: vec![Interaction {
+                request: RecordedRequest {
+                    method: "POST".to_string(),
+                    url: "https://api.example.com".to_string(),
+                    headers: vec![("content-type".to_string(), "application/json".to_string())],
+                    body: Some(serde_json::json!({"key": "value"})),
+                    body_text: None,
+                },
+                response: RecordedResponse {
+                    status: 200,
+                    headers: vec![],
+                    body_chunks: vec!["ok".to_string()],
+                    body_chunks_base64: None,
+                },
+            }],
+        };
+
+        save_cassette(&path, &cassette).expect("save");
+        assert!(path.exists());
+
+        let loaded = load_cassette(&path).expect("load");
+        assert_eq!(loaded.version, CASSETTE_VERSION);
+        assert_eq!(loaded.test_name, "save_load");
+        assert_eq!(loaded.interactions.len(), 1);
+        assert_eq!(loaded.interactions[0].request.method, "POST");
+    }
+
+    #[test]
+    fn load_cassette_missing_file_errors() {
+        let result = load_cassette(Path::new("/nonexistent/cassette.json"));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("Failed to read"));
+    }
+
+    // ─── redact_cassette integration ─────────────────────────────────
+
+    #[test]
+    fn redact_cassette_multiple_interactions() {
+        let mut cassette = Cassette {
+            version: "1.0".to_string(),
+            test_name: "multi".to_string(),
+            recorded_at: "now".to_string(),
+            interactions: vec![
+                Interaction {
+                    request: RecordedRequest {
+                        method: "POST".to_string(),
+                        url: "https://a.com".to_string(),
+                        headers: vec![("Authorization".to_string(), "Bearer tok".to_string())],
+                        body: Some(serde_json::json!({"password": "p1"})),
+                        body_text: None,
+                    },
+                    response: RecordedResponse {
+                        status: 200,
+                        headers: vec![("x-api-key".to_string(), "key1".to_string())],
+                        body_chunks: vec![],
+                        body_chunks_base64: None,
+                    },
+                },
+                Interaction {
+                    request: RecordedRequest {
+                        method: "POST".to_string(),
+                        url: "https://b.com".to_string(),
+                        headers: vec![],
+                        body: Some(serde_json::json!({"client_secret": "s1"})),
+                        body_text: None,
+                    },
+                    response: RecordedResponse {
+                        status: 200,
+                        headers: vec![],
+                        body_chunks: vec![],
+                        body_chunks_base64: None,
+                    },
+                },
+            ],
+        };
+
+        let summary = redact_cassette(&mut cassette);
+        assert_eq!(summary.headers_redacted, 2);
+        assert_eq!(summary.json_fields_redacted, 2);
+    }
+
+    // ─── VcrRecorder accessors ───────────────────────────────────────
+
+    #[test]
+    fn recorder_new_with_sets_mode_and_path() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let recorder = VcrRecorder::new_with("my::test_name", VcrMode::Playback, temp_dir.path());
+        assert_eq!(recorder.mode(), VcrMode::Playback);
+        assert!(
+            recorder
+                .cassette_path()
+                .to_string_lossy()
+                .contains("my__test_name.json")
+        );
+    }
 }

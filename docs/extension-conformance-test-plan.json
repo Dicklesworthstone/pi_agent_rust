@@ -1,6 +1,6 @@
 {
   "schema": "pi.ext.conformance-matrix.v1",
-  "generated_at": "2026-02-07T04:43:25Z",
+  "generated_at": "2026-02-07T05:00:44Z",
   "task": "bd-2kyq",
   "matrix": [
     {
@@ -247,7 +247,10 @@
           "fail_criteria": "Execution denied or event not dispatched"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "git-checkpoint",
+        "mac-system-theme"
+      ]
     },
     {
       "category": "event_hook",
@@ -275,7 +278,10 @@
           "fail_criteria": "Hook not fired, wrong event, or session mutation lost"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "git-checkpoint",
+        "tools"
+      ]
     },
     {
       "category": "event_hook",
@@ -289,7 +295,19 @@
           "fail_criteria": "UI call fails or hook not dispatched"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "claude-rules",
+        "file-trigger",
+        "git-checkpoint",
+        "mac-system-theme",
+        "modal-editor",
+        "rainbow-editor",
+        "rpc-demo",
+        "status-line",
+        "tools",
+        "trigger-compact",
+        "widget-placement"
+      ]
     },
     {
       "category": "event_hook",
@@ -331,7 +349,14 @@
           "fail_criteria": "Renderer not found in registration snapshot"
         }
       ],
-      "exemplar_extensions": []
+      "exemplar_extensions": [
+        "custom-header",
+        "doom-overlay",
+        "overlay-qa-tests",
+        "overlay-test",
+        "snake",
+        "space-invaders"
+      ]
     },
     {
       "category": "ui_component",
@@ -574,15 +599,11 @@
         "custom-compaction",
         "custom-footer",
         "event-bus",
-        "git-checkpoint",
         "handoff",
         "qna",
         "session-name",
-        "snake",
-        "space-invaders",
         "summarize",
-        "titlebar-spinner",
-        "tools"
+        "titlebar-spinner"
       ]
     },
     {
@@ -600,45 +621,28 @@
       "exemplar_extensions": [
         "auto-commit-on-exit",
         "bookmark",
-        "claude-rules",
         "confirm-destructive",
         "custom-compaction",
         "custom-footer",
-        "custom-header",
         "dirty-repo-guard",
-        "doom-overlay",
-        "file-trigger",
-        "git-checkpoint",
         "handoff",
         "inline-bash",
         "input-transform",
         "interactive-shell",
-        "mac-system-theme",
-        "modal-editor",
         "model-status",
-        "overlay-qa-tests",
-        "overlay-test",
         "permission-gate",
         "pirate",
         "protected-paths",
         "qna",
-        "rainbow-editor",
-        "rpc-demo",
         "sandbox",
         "send-user-message",
         "session-name",
-        "snake",
-        "space-invaders",
         "ssh",
-        "status-line",
         "subagent",
         "summarize",
         "system-prompt-header",
         "timed-confirm",
-        "titlebar-spinner",
-        "tools",
-        "trigger-compact",
-        "widget-placement"
+        "titlebar-spinner"
       ]
     },
     {
@@ -785,9 +789,12 @@
     },
     {
       "cell_key": "EventHook:Exec",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "git-checkpoint",
+        "mac-system-theme"
+      ],
       "min_fixtures": 2,
-      "coverage_met": false
+      "coverage_met": true
     },
     {
       "cell_key": "EventHook:Http",
@@ -797,15 +804,30 @@
     },
     {
       "cell_key": "EventHook:Session",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "git-checkpoint",
+        "tools"
+      ],
       "min_fixtures": 2,
-      "coverage_met": false
+      "coverage_met": true
     },
     {
       "cell_key": "EventHook:Ui",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "claude-rules",
+        "file-trigger",
+        "git-checkpoint",
+        "mac-system-theme",
+        "modal-editor",
+        "rainbow-editor",
+        "rpc-demo",
+        "status-line",
+        "tools",
+        "trigger-compact",
+        "widget-placement"
+      ],
       "min_fixtures": 2,
-      "coverage_met": false
+      "coverage_met": true
     },
     {
       "cell_key": "EventHook:Log",
@@ -821,9 +843,16 @@
     },
     {
       "cell_key": "UiComponent:Ui",
-      "fixture_extensions": [],
+      "fixture_extensions": [
+        "custom-header",
+        "doom-overlay",
+        "overlay-qa-tests",
+        "overlay-test",
+        "snake",
+        "space-invaders"
+      ],
       "min_fixtures": 2,
-      "coverage_met": false
+      "coverage_met": true
     },
     {
       "cell_key": "UiComponent:Log",
@@ -930,15 +959,11 @@
         "custom-compaction",
         "custom-footer",
         "event-bus",
-        "git-checkpoint",
         "handoff",
         "qna",
         "session-name",
-        "snake",
-        "space-invaders",
         "summarize",
-        "titlebar-spinner",
-        "tools"
+        "titlebar-spinner"
       ],
       "min_fixtures": 2,
       "coverage_met": true
@@ -948,45 +973,28 @@
       "fixture_extensions": [
         "auto-commit-on-exit",
         "bookmark",
-        "claude-rules",
         "confirm-destructive",
         "custom-compaction",
         "custom-footer",
-        "custom-header",
         "dirty-repo-guard",
-        "doom-overlay",
-        "file-trigger",
-        "git-checkpoint",
         "handoff",
         "inline-bash",
         "input-transform",
         "interactive-shell",
-        "mac-system-theme",
-        "modal-editor",
         "model-status",
-        "overlay-qa-tests",
-        "overlay-test",
         "permission-gate",
         "pirate",
         "protected-paths",
         "qna",
-        "rainbow-editor",
-        "rpc-demo",
         "sandbox",
         "send-user-message",
         "session-name",
-        "snake",
-        "space-invaders",
         "ssh",
-        "status-line",
         "subagent",
         "summarize",
         "system-prompt-header",
         "timed-confirm",
-        "titlebar-spinner",
-        "tools",
-        "trigger-compact",
-        "widget-placement"
+        "titlebar-spinner"
       ],
       "min_fixtures": 2,
       "coverage_met": true
@@ -1142,10 +1150,10 @@
   "coverage": {
     "total_cells": 41,
     "required_cells": 25,
-    "covered_cells": 9,
-    "uncovered_required_cells": 17,
-    "total_exemplar_extensions": 69,
-    "categories_covered": 5,
+    "covered_cells": 13,
+    "uncovered_required_cells": 13,
+    "total_exemplar_extensions": 217,
+    "categories_covered": 6,
     "capabilities_covered": 7
   }
 }
