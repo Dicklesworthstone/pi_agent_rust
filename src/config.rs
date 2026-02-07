@@ -417,7 +417,7 @@ impl Config {
             "low" => budgets.and_then(|b| b.low).unwrap_or(2048),
             "medium" => budgets.and_then(|b| b.medium).unwrap_or(8192),
             "high" => budgets.and_then(|b| b.high).unwrap_or(16384),
-            "xhigh" => budgets.and_then(|b| b.xhigh).unwrap_or(32768),
+            "xhigh" => budgets.and_then(|b| b.xhigh).unwrap_or(u32::MAX),
             _ => 0,
         }
     }
