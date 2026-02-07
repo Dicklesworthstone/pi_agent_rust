@@ -1,0 +1,19 @@
+{
+  "extension": {
+    "id": "minimal_resources",
+    "source": {
+      "path": "tests/ext_conformance/artifacts/base_fixtures/minimal_resources/index.ts"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "scn-minimal-resources-001",
+      "kind": "resource_discovery",
+      "summary": "Discovers bundled prompts and skills",
+      "expect": {
+        "prompts_contain": ["test-prompt"],
+        "skills_contain": ["test-skill"]
+      }
+    }
+  ]
+}

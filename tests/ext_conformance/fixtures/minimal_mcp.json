@@ -1,0 +1,18 @@
+{
+  "extension": {
+    "id": "minimal_mcp",
+    "source": {
+      "path": "tests/ext_conformance/artifacts/base_fixtures/minimal_mcp/index.ts"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "scn-minimal-mcp-001",
+      "kind": "mcp",
+      "summary": "Registers an MCP server",
+      "expect": {
+        "mcp_server_registered": true
+      }
+    }
+  ]
+}

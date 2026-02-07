@@ -1,0 +1,18 @@
+{
+  "extension": {
+    "id": "minimal_template",
+    "source": {
+      "path": "tests/ext_conformance/artifacts/base_fixtures/minimal_template/index.ts"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "scn-minimal-template-001",
+      "kind": "template",
+      "summary": "Discovers template",
+      "expect": {
+        "templates_contain": ["test-template"]
+      }
+    }
+  ]
+}

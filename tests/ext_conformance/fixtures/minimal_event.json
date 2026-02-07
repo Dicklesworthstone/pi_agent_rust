@@ -1,0 +1,22 @@
+{
+  "extension": {
+    "id": "minimal_event",
+    "source": {
+      "path": "tests/ext_conformance/artifacts/base_fixtures/minimal_event/index.ts"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "scn-minimal-event-001",
+      "kind": "event",
+      "summary": "Fires agent_start event",
+      "event_name": "agent_start",
+      "input": {
+        "session_id": "test-session"
+      },
+      "expect": {
+        "log_contains": ["Agent started!"]
+      }
+    }
+  ]
+}

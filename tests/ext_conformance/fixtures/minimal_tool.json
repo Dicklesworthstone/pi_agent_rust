@@ -1,0 +1,24 @@
+{
+  "extension": {
+    "id": "minimal_tool",
+    "source": {
+      "path": "tests/ext_conformance/artifacts/base_fixtures/minimal_tool/index.ts"
+    }
+  },
+  "scenarios": [
+    {
+      "id": "scn-minimal-tool-001",
+      "kind": "tool",
+      "summary": "Invokes the greet tool",
+      "tool_name": "greet",
+      "input": {
+        "arguments": {
+          "name": "Developer"
+        }
+      },
+      "expect": {
+        "content_contains": ["Hello, Developer!"]
+      }
+    }
+  ]
+}
