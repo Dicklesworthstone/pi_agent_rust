@@ -51,6 +51,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 105
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -89,6 +94,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 82
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "input"
+        ]
       }
     },
     {
@@ -124,6 +137,15 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation",
+          "git"
+        ]
       }
     },
     {
@@ -163,6 +185,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "untested",
+        "compatibility_score": "red",
+        "maintenance_status": "active"
       }
     },
     {
@@ -197,6 +224,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -230,6 +265,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "data"
+        ]
       }
     },
     {
@@ -263,6 +306,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "security"
+        ]
       }
     },
     {
@@ -295,6 +346,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 73
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -326,6 +382,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -357,6 +418,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 80
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -388,6 +454,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -421,6 +492,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -452,6 +528,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 76
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -487,6 +568,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 84
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -518,6 +604,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 84
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -549,6 +640,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 88
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -586,6 +682,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 126
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -619,6 +720,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 76
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -651,6 +757,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 89
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -684,6 +795,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -717,6 +833,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -749,6 +870,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 98
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -785,6 +911,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 91
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -816,6 +947,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 83
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -853,6 +989,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 109
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -884,6 +1025,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 83
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -916,6 +1062,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 99
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -951,6 +1102,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 82
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -982,6 +1138,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1016,6 +1177,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 98
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1051,6 +1217,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 122
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1084,6 +1255,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 78
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1115,6 +1291,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 86
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1150,6 +1331,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 177
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1188,6 +1374,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 120
+      },
+      "quality_signals": {
+        "conformance_grade": "F",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1226,6 +1417,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 151
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1260,6 +1456,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 139
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1292,6 +1493,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 91
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -1326,6 +1535,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 196
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1358,6 +1572,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 83
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1390,6 +1609,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 100
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -1428,6 +1655,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 121
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1462,6 +1694,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 106
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1498,6 +1735,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 124
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1530,6 +1772,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 86
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1561,6 +1808,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1596,6 +1848,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 80
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1629,6 +1886,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 79
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1665,6 +1927,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1700,6 +1967,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "git"
+        ]
       }
     },
     {
@@ -1733,6 +2008,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 78
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1766,6 +2046,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 81
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1799,6 +2084,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 79
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1830,6 +2120,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1861,6 +2156,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 92
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1892,6 +2192,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 81
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1923,6 +2228,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 81
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1954,6 +2264,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 95
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -1985,6 +2300,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 88
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -2017,6 +2337,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 92
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -2051,6 +2376,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 122
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -2086,6 +2416,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 89
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -2119,6 +2454,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -2150,6 +2490,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -2181,6 +2526,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 86
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -2214,6 +2564,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "security"
+        ]
       }
     },
     {
@@ -2247,6 +2605,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -2280,6 +2646,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -2313,6 +2687,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -2347,6 +2729,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 81
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "active",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -2381,6 +2771,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "active",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -2417,6 +2815,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "active",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -2449,6 +2855,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "tools"
+        ]
       }
     },
     {
@@ -2484,6 +2898,15 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "git",
+          "security"
+        ]
       }
     },
     {
@@ -2517,6 +2940,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 90
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "games"
+        ]
       }
     },
     {
@@ -2544,6 +2975,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "data"
+        ]
       }
     },
     {
@@ -2579,6 +3018,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -2615,6 +3062,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 73
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -2647,6 +3102,15 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "data",
+          "tools"
+        ]
       }
     },
     {
@@ -2682,6 +3146,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "git"
+        ]
       }
     },
     {
@@ -2716,6 +3188,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -2747,6 +3227,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "tools"
+        ]
       }
     },
     {
@@ -2782,6 +3270,15 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "devops",
+          "tools"
+        ]
       }
     },
     {
@@ -2815,6 +3312,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "input"
+        ]
       }
     },
     {
@@ -2851,6 +3356,15 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "devops",
+          "tools"
+        ]
       }
     },
     {
@@ -2886,6 +3400,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -2913,6 +3435,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -2946,6 +3476,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -2979,6 +3517,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -3013,6 +3559,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "security"
+        ]
       }
     },
     {
@@ -3040,6 +3594,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "input"
+        ]
       }
     },
     {
@@ -3071,6 +3633,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 95
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3105,6 +3672,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 111
+      },
+      "quality_signals": {
+        "conformance_grade": "F",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3142,6 +3714,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 83
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3178,6 +3755,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3215,6 +3797,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 86
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -3250,6 +3840,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 90
+      },
+      "quality_signals": {
+        "conformance_grade": "F",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3281,6 +3876,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3312,6 +3912,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 84
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3347,6 +3952,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -3379,6 +3992,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 100
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -3414,6 +4035,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 85
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3445,6 +4071,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3476,6 +4107,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3507,6 +4143,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 100
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3545,6 +4186,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 119
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3583,6 +4229,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 245
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3621,6 +4272,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 246
+      },
+      "quality_signals": {
+        "conformance_grade": "F",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3661,6 +4317,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 78
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3695,6 +4356,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 101
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3727,6 +4393,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "git"
+        ]
       }
     },
     {
@@ -3761,6 +4435,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 100
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3792,6 +4471,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 77
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3827,6 +4511,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3862,6 +4551,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 82
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3897,6 +4591,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 94
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3932,6 +4631,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 98
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3963,6 +4667,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 80
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -3997,6 +4706,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4035,6 +4749,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4067,6 +4786,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 77
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4103,6 +4827,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 172
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4139,6 +4868,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 465
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4177,6 +4911,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 140
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4209,6 +4948,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 86
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4242,6 +4986,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 85
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4278,6 +5027,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 259
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4309,6 +5063,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 79
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4340,6 +5099,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -4376,6 +5143,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 93
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -4408,6 +5183,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4447,6 +5227,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 67
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4481,6 +5266,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 83
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4515,6 +5305,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 133
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4547,6 +5342,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 80
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4583,6 +5383,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 142
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4618,6 +5423,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 84
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4652,6 +5462,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 89
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4690,6 +5505,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 130
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4725,6 +5545,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 104
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4759,6 +5584,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 98
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "git"
+        ]
       }
     },
     {
@@ -4791,6 +5624,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 86
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4824,6 +5662,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 87
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4855,6 +5698,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4889,6 +5737,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 118
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4924,6 +5777,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 90
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4955,6 +5813,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 87
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -4988,6 +5851,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 77
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5022,6 +5890,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 81
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5055,6 +5928,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 79
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5093,6 +5971,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 107
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5126,6 +6009,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5162,6 +6050,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 122
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5194,6 +6087,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 88
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5234,6 +6132,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5267,6 +6170,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 92
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5298,6 +6206,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5336,6 +6249,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 81
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5370,6 +6288,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 82
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5404,6 +6327,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 108
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5435,6 +6363,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5466,6 +6399,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 7129
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -5500,6 +6441,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5532,6 +6478,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 80
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5564,6 +6515,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 80
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5597,6 +6553,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 125
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -5632,6 +6593,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 90
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -5665,6 +6634,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 73
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -5698,6 +6675,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "security"
+        ]
       }
     },
     {
@@ -5731,6 +6716,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 67
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -5768,6 +6761,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 77
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active"
       }
     },
     {
@@ -5808,6 +6806,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 83
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -5840,6 +6846,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 73
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -5873,6 +6887,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 67
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "security"
+        ]
       }
     },
     {
@@ -5906,6 +6928,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "data"
+        ]
       }
     },
     {
@@ -5941,6 +6971,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "input"
+        ]
       }
     },
     {
@@ -5976,6 +7014,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 78
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "input"
+        ]
       }
     },
     {
@@ -6009,6 +7055,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -6040,6 +7094,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -6073,6 +7135,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -6117,6 +7187,15 @@
       },
       "perf_budgets": {
         "cold_load_ms": 79
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "active",
+        "category_tags": [
+          "devops",
+          "security"
+        ]
       }
     },
     {
@@ -6150,6 +7229,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -6184,6 +7271,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 67
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -6218,6 +7313,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -6253,6 +7356,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 74
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "games"
+        ]
       }
     },
     {
@@ -6286,6 +7397,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 78
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "games"
+        ]
       }
     },
     {
@@ -6330,6 +7449,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 76
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "devops"
+        ]
       }
     },
     {
@@ -6363,6 +7490,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -6405,6 +7540,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 102
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "tools"
+        ]
       }
     },
     {
@@ -6438,6 +7581,15 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "data",
+          "tools"
+        ]
       }
     },
     {
@@ -6471,6 +7623,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 66
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -6509,6 +7669,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 107
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6550,6 +7715,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained",
+        "category_tags": [
+          "providers"
+        ]
       }
     },
     {
@@ -6588,6 +7761,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 76
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6624,6 +7802,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 87
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6658,6 +7841,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 90
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6692,6 +7880,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 115
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6727,6 +7920,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 88
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6765,6 +7963,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 94
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6803,6 +8006,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 81
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6837,6 +8045,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 86
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6875,6 +8088,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 250
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6906,6 +8124,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 67
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6940,6 +8163,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 105
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -6976,6 +8204,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7011,6 +8244,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 70
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7047,6 +8285,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 90
+      },
+      "quality_signals": {
+        "conformance_grade": "C",
+        "compatibility_score": "red",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7079,6 +8322,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 79
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7111,6 +8359,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 72
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7142,6 +8395,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 77
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7176,6 +8434,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 79
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7210,6 +8473,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 103
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7250,6 +8518,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 87
+      },
+      "quality_signals": {
+        "conformance_grade": "B",
+        "compatibility_score": "yellow",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7283,6 +8556,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 119
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "maintained"
       }
     },
     {
@@ -7316,6 +8594,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "security"
+        ]
       }
     },
     {
@@ -7350,6 +8636,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 76
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -7385,6 +8679,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 75
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "tools"
+        ]
       }
     },
     {
@@ -7423,6 +8725,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 73
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "tools"
+        ]
       }
     },
     {
@@ -7456,6 +8766,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 71
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "tools"
+        ]
       }
     },
     {
@@ -7489,6 +8807,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 67
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "automation"
+        ]
       }
     },
     {
@@ -7526,6 +8852,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 78
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "tools"
+        ]
       }
     },
     {
@@ -7559,6 +8893,14 @@
       },
       "perf_budgets": {
         "cold_load_ms": 68
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "green",
+        "maintenance_status": "active",
+        "category_tags": [
+          "ui"
+        ]
       }
     },
     {
@@ -7590,6 +8932,11 @@
       },
       "perf_budgets": {
         "cold_load_ms": 69
+      },
+      "quality_signals": {
+        "conformance_grade": "A",
+        "compatibility_score": "yellow",
+        "maintenance_status": "active"
       }
     }
   ]

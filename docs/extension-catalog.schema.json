@@ -67,6 +67,32 @@
         "url": { "type": "string", "minLength": 1 }
       }
     },
+    "QualitySignals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "conformance_grade": {
+          "type": "string",
+          "enum": ["A", "B", "C", "F", "untested"],
+          "description": "A=pass, B=minor issues, C=partial, F=fail, untested=no data"
+        },
+        "compatibility_score": {
+          "type": "string",
+          "enum": ["green", "yellow", "red"],
+          "description": "green=100% compat, yellow=minor shim gaps, red=significant issues"
+        },
+        "maintenance_status": {
+          "type": "string",
+          "enum": ["active", "maintained", "stale", "abandoned", "unknown"],
+          "description": "Based on last update date relative to current date"
+        },
+        "category_tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Category keys from extension-collections.json taxonomy"
+        }
+      }
+    },
     "ExtensionCatalogItem": {
       "type": "object",
       "additionalProperties": false,
@@ -156,7 +182,8 @@
         "license": { "type": "string", "minLength": 1 },
         "category_tags": { "type": "array", "items": { "type": "string" } },
         "compatibility_notes": { "type": "object" },
-        "perf_budgets": { "type": "object" }
+        "perf_budgets": { "type": "object" },
+        "quality_signals": { "$ref": "#/$defs/QualitySignals" }
       }
     }
   }
