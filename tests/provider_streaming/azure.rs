@@ -251,6 +251,103 @@ fn scenario_auth_failure(deployment: &str) -> Scenario {
     }
 }
 
+fn tool_add() -> ToolDef {
+    ToolDef {
+        name: "add".to_string(),
+        description: "Add two numbers.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "number" },
+                "b": { "type": "number" }
+            },
+            "required": ["a", "b"]
+        }),
+    }
+}
+
+fn tool_multiply() -> ToolDef {
+    ToolDef {
+        name: "multiply".to_string(),
+        description: "Multiply two numbers.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": "number" },
+                "b": { "type": "number" }
+            },
+            "required": ["a", "b"]
+        }),
+    }
+}
+
+fn scenario_multi_paragraph(deployment: &str) -> Scenario {
+    Scenario {
+        name: "azure_multi_paragraph",
+        description: "Multi-paragraph response",
+        deployment: deployment.to_string(),
+        messages: vec![user_text(
+            "Reply with two paragraphs separated by a blank line. \
+             Paragraph one must be 'Paragraph 1.' and paragraph two must be 'Paragraph 2.'.",
+        )],
+        tools: Vec::new(),
+        options: ScenarioOptions::default(),
+        expectation: ScenarioExpectation::Stream(StreamExpectations {
+            min_text_deltas: 1,
+            require_blank_line: true,
+            ..StreamExpectations::default()
+        }),
+    }
+}
+
+fn scenario_tool_call_multiple(deployment: &str) -> Scenario {
+    Scenario {
+        name: "azure_tool_call_multiple",
+        description: "Multiple tool calls response",
+        deployment: deployment.to_string(),
+        messages: vec![user_text(
+            "Call add with a=2 b=3, then call multiply with a=4 b=5. Do not answer in text.",
+        )],
+        tools: vec![tool_add(), tool_multiply()],
+        options: ScenarioOptions::default(),
+        expectation: ScenarioExpectation::Stream(StreamExpectations {
+            min_tool_calls: 2,
+            allowed_stop_reasons: Some(vec![StopReason::ToolUse]),
+            ..StreamExpectations::default()
+        }),
+    }
+}
+
+fn scenario_bad_request(deployment: &str) -> Scenario {
+    Scenario {
+        name: "azure_bad_request_400",
+        description: "Bad request error (HTTP 400)",
+        deployment: deployment.to_string(),
+        messages: vec![user_text("Trigger a bad request error.")],
+        tools: Vec::new(),
+        options: ScenarioOptions::default(),
+        expectation: ScenarioExpectation::Error(super::ErrorExpectation {
+            status: 400,
+            contains: None,
+        }),
+    }
+}
+
+fn scenario_rate_limit(deployment: &str) -> Scenario {
+    Scenario {
+        name: "azure_rate_limit_429",
+        description: "Rate limit error (HTTP 429)",
+        deployment: deployment.to_string(),
+        messages: vec![user_text("Trigger a rate limit error.")],
+        tools: Vec::new(),
+        options: ScenarioOptions::default(),
+        expectation: ScenarioExpectation::Error(super::ErrorExpectation {
+            status: 429,
+            contains: None,
+        }),
+    }
+}
+
 fn scenario_long_response(deployment: &str) -> Scenario {
     Scenario {
         name: "azure_very_long_response",
@@ -290,5 +387,9 @@ azure_test!(
     azure_tool_result_processing,
     scenario_tool_result_processing
 );
+azure_test!(azure_multi_paragraph, scenario_multi_paragraph);
+azure_test!(azure_tool_call_multiple, scenario_tool_call_multiple);
+azure_test!(azure_bad_request_400, scenario_bad_request);
+azure_test!(azure_rate_limit_429, scenario_rate_limit);
 azure_test!(azure_auth_failure_401, scenario_auth_failure);
 azure_test!(azure_very_long_response, scenario_long_response);

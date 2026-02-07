@@ -3975,7 +3975,20 @@ export function promisify(fn) {
   });
 }
 
-export default { inspect, promisify };
+export function stripVTControlCharacters(str) {
+  // eslint-disable-next-line no-control-regex
+  return (str || '').replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1B\][^\x07]*\x07/g, '');
+}
+
+export function deprecate(fn) { return fn; }
+export function inherits(ctor, superCtor) { Object.setPrototypeOf(ctor.prototype, superCtor.prototype); }
+export function debuglog() { return () => {}; }
+export function format(f, ...args) { return f; }
+export const types = { isAsyncFunction: (fn) => false, isPromise: (v) => v instanceof Promise };
+export const TextEncoder = globalThis.TextEncoder;
+export const TextDecoder = globalThis.TextDecoder;
+
+export default { inspect, promisify, stripVTControlCharacters, deprecate, inherits, debuglog, format, types, TextEncoder, TextDecoder };
 "#
         .trim()
         .to_string(),
@@ -4512,6 +4525,354 @@ export const memoryUsage = p.memoryUsage || (() => ({ rss: 0, heapTotal: 0, heap
 export const cpuUsage = p.cpuUsage || (() => ({ user: 0, system: 0 }));
 export const release = p.release || { name: 'node' };
 export default p;
+"
+        .trim()
+        .to_string(),
+    );
+
+    // ── npm package stubs ──────────────────────────────────────────────
+    // Minimal virtual modules for npm packages that cannot run in the
+    // QuickJS sandbox (native bindings, large dependency trees, or
+    // companion packages). These stubs let extensions *load* and register
+    // tools/commands even though the actual library behaviour is absent.
+
+    modules.insert(
+        "node-pty".to_string(),
+        r"
+let _pid = 1000;
+export function spawn(shell, args, options) {
+    const pid = _pid++;
+    const handlers = {};
+    return {
+        pid,
+        onData(cb) { handlers.data = cb; },
+        onExit(cb) { if (cb) setTimeout(() => cb({ exitCode: 1, signal: undefined }), 0); },
+        write(d) {},
+        resize(c, r) {},
+        kill(s) {},
+    };
+}
+export default { spawn };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "chokidar".to_string(),
+        r"
+function makeWatcher() {
+    const w = {
+        on(ev, cb) { return w; },
+        once(ev, cb) { return w; },
+        close() { return Promise.resolve(); },
+        add(p) { return w; },
+        unwatch(p) { return w; },
+        getWatched() { return {}; },
+    };
+    return w;
+}
+export function watch(paths, options) { return makeWatcher(); }
+export default { watch };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "jsdom".to_string(),
+        r"
+class Element {
+    constructor(tag, html) { this.tagName = tag; this._html = html || ''; this.childNodes = []; }
+    get innerHTML() { return this._html; }
+    set innerHTML(v) { this._html = v; }
+    get textContent() { return this._html.replace(/<[^>]*>/g, ''); }
+    get outerHTML() { return `<${this.tagName}>${this._html}</${this.tagName}>`; }
+    get parentNode() { return null; }
+    querySelectorAll() { return []; }
+    querySelector() { return null; }
+    getElementsByTagName() { return []; }
+    getElementById() { return null; }
+    remove() {}
+    getAttribute() { return null; }
+    setAttribute() {}
+    cloneNode() { return new Element(this.tagName, this._html); }
+}
+export class JSDOM {
+    constructor(html, opts) {
+        const doc = new Element('html', html || '');
+        doc.body = new Element('body', html || '');
+        doc.title = '';
+        doc.querySelectorAll = () => [];
+        doc.querySelector = () => null;
+        doc.getElementsByTagName = () => [];
+        doc.getElementById = () => null;
+        doc.createElement = (t) => new Element(t, '');
+        doc.documentElement = doc;
+        this.window = { document: doc, location: { href: (opts && opts.url) || '' } };
+    }
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@mozilla/readability".to_string(),
+        r"
+export class Readability {
+    constructor(doc, opts) { this._doc = doc; }
+    parse() {
+        const text = (this._doc && this._doc.body && this._doc.body.textContent) || '';
+        return { title: '', content: text, textContent: text, length: text.length, excerpt: '', byline: '', dir: '', siteName: '', lang: '' };
+    }
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "beautiful-mermaid".to_string(),
+        r"
+export function renderMermaidAscii(source) {
+    const firstLine = (source || '').split('\n')[0] || 'diagram';
+    return '[mermaid: ' + firstLine.trim() + ']';
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@aliou/pi-utils-settings".to_string(),
+        r"
+export class ConfigLoader {
+    constructor(opts) { this._opts = opts || {}; this._data = {}; }
+    load() { return this._data; }
+    save(d) { this._data = d; }
+    get() { return this._data; }
+    set(k, v) { this._data[k] = v; }
+}
+export class ArrayEditor {
+    constructor(arr) { this._arr = arr || []; }
+    add(item) { this._arr.push(item); return this; }
+    remove(idx) { this._arr.splice(idx, 1); return this; }
+    toArray() { return this._arr; }
+}
+export function registerSettingsCommand(pi, opts) {}
+export function getNestedValue(obj, path) {
+    const keys = (path || '').split('.');
+    let cur = obj;
+    for (const k of keys) { if (cur == null) return undefined; cur = cur[k]; }
+    return cur;
+}
+export function setNestedValue(obj, path, value) {
+    const keys = (path || '').split('.');
+    let cur = obj;
+    for (let i = 0; i < keys.length - 1; i++) {
+        if (cur[keys[i]] == null) cur[keys[i]] = {};
+        cur = cur[keys[i]];
+    }
+    cur[keys[keys.length - 1]] = value;
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@aliou/sh".to_string(),
+        r#"
+export function parse(cmd) { return [{ type: 'command', value: cmd }]; }
+export function tokenize(cmd) { return (cmd || '').split(/\s+/); }
+export function quote(s) { return "'" + (s || '').replace(/'/g, "'\\''") + "'"; }
+export class ParseError extends Error { constructor(msg) { super(msg); this.name = 'ParseError'; } }
+"#
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@marckrenn/pi-sub-shared".to_string(),
+        r"
+export const PROVIDERS = ['anthropic', 'openai'];
+export const MODEL_MULTIPLIERS = {};
+export const PROVIDER_DISPLAY_NAMES = {};
+export const PROVIDER_METADATA = {};
+export function getDefaultCoreSettings() {
+    return { providers: {}, behavior: { autoSwitch: false } };
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "turndown".to_string(),
+        r"
+class TurndownService {
+    constructor(opts) { this._opts = opts || {}; }
+    turndown(html) { return (html || '').replace(/<[^>]*>/g, ''); }
+    addRule(name, rule) { return this; }
+    use(plugin) { return this; }
+    remove(filter) { return this; }
+}
+export default TurndownService;
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@xterm/headless".to_string(),
+        r"
+export class Terminal {
+    constructor(opts) { this._opts = opts || {}; this.cols = opts?.cols || 80; this.rows = opts?.rows || 24; this.buffer = { active: { cursorX: 0, cursorY: 0, length: 0, getLine: () => null } }; }
+    write(data) {}
+    writeln(data) {}
+    resize(cols, rows) { this.cols = cols; this.rows = rows; }
+    dispose() {}
+    onData(cb) { return { dispose() {} }; }
+    onLineFeed(cb) { return { dispose() {} }; }
+}
+export default { Terminal };
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@opentelemetry/api".to_string(),
+        r"
+export const SpanStatusCode = { UNSET: 0, OK: 1, ERROR: 2 };
+const noopSpan = {
+    setAttribute() { return this; },
+    setAttributes() { return this; },
+    addEvent() { return this; },
+    setStatus() { return this; },
+    end() {},
+    isRecording() { return false; },
+    recordException() {},
+    spanContext() { return { traceId: '', spanId: '', traceFlags: 0 }; },
+};
+const noopTracer = {
+    startSpan() { return noopSpan; },
+    startActiveSpan(name, optsOrFn, fn) {
+        const cb = typeof optsOrFn === 'function' ? optsOrFn : fn;
+        return cb ? cb(noopSpan) : noopSpan;
+    },
+};
+export const trace = {
+    getTracer() { return noopTracer; },
+    getActiveSpan() { return noopSpan; },
+    setSpan(ctx) { return ctx; },
+};
+export const context = {
+    active() { return {}; },
+    with(ctx, fn) { return fn(); },
+};
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@juanibiapina/pi-extension-settings".to_string(),
+        r"
+export function getSetting(pi, key, defaultValue) { return defaultValue; }
+export function setSetting(pi, key, value) {}
+export function getSettings(pi) { return {}; }
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@xterm/addon-serialize".to_string(),
+        r"
+export class SerializeAddon {
+    activate(terminal) {}
+    serialize(opts) { return ''; }
+    dispose() {}
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "turndown-plugin-gfm".to_string(),
+        r"
+export function gfm(service) {}
+export function tables(service) {}
+export function strikethrough(service) {}
+export function taskListItems(service) {}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@opentelemetry/exporter-trace-otlp-http".to_string(),
+        r"
+export class OTLPTraceExporter {
+    constructor(opts) { this._opts = opts || {}; }
+    export(spans, cb) { if (cb) cb({ code: 0 }); }
+    shutdown() { return Promise.resolve(); }
+}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@opentelemetry/resources".to_string(),
+        r"
+export class Resource {
+    constructor(attrs) { this.attributes = attrs || {}; }
+    merge(other) { return new Resource({ ...this.attributes, ...(other?.attributes || {}) }); }
+}
+export function resourceFromAttributes(attrs) { return new Resource(attrs); }
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@opentelemetry/sdk-trace-base".to_string(),
+        r"
+const noopSpan = { setAttribute() { return this; }, end() {}, isRecording() { return false; }, spanContext() { return {}; } };
+export class BasicTracerProvider {
+    constructor(opts) { this._opts = opts || {}; }
+    addSpanProcessor(p) {}
+    register() {}
+    getTracer() { return { startSpan() { return noopSpan; }, startActiveSpan(n, fn) { return fn(noopSpan); } }; }
+    shutdown() { return Promise.resolve(); }
+}
+export class SimpleSpanProcessor {
+    constructor(exporter) {}
+    onStart() {}
+    onEnd() {}
+    shutdown() { return Promise.resolve(); }
+    forceFlush() { return Promise.resolve(); }
+}
+export class BatchSpanProcessor extends SimpleSpanProcessor {}
+"
+        .trim()
+        .to_string(),
+    );
+
+    modules.insert(
+        "@opentelemetry/semantic-conventions".to_string(),
+        r"
+export const SemanticResourceAttributes = {
+    SERVICE_NAME: 'service.name',
+    SERVICE_VERSION: 'service.version',
+    DEPLOYMENT_ENVIRONMENT: 'deployment.environment',
+};
+export const SEMRESATTRS_SERVICE_NAME = 'service.name';
+export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
 "
         .trim()
         .to_string(),

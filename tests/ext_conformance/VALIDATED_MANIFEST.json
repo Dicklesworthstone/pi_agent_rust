@@ -120,6 +120,40 @@
       }
     },
     {
+      "id": "base_fixtures",
+      "entry_path": "base_fixtures/minimal_command/index.ts",
+      "source_tier": "official-pi-mono",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": true,
+        "registers_flags": false,
+        "registers_providers": true,
+        "subscribes_events": [
+          "agent_start"
+        ],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": true,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 3,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [
+          "greet"
+        ],
+        "commands": [
+          "ping"
+        ],
+        "flags": [],
+        "event_handlers": [
+          "agent_start"
+        ]
+      }
+    },
+    {
       "id": "bash-spawn-hook",
       "entry_path": "bash-spawn-hook/bash-spawn-hook.ts",
       "source_tier": "official-pi-mono",

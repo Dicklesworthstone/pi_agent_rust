@@ -3046,7 +3046,7 @@ fn add_usage(total: &mut Usage, delta: &Usage) {
     total.cost.total += delta.cost.total;
 }
 
-fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
+pub fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
     let title = request
         .payload
         .get("title")
@@ -3058,8 +3058,17 @@ fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
         .and_then(Value::as_str)
         .unwrap_or("");
 
+    // Show provenance: which extension is making this request.
+    let provenance = request
+        .extension_id
+        .as_deref()
+        .or_else(|| request.payload.get("extension_id").and_then(Value::as_str))
+        .unwrap_or("unknown");
+
     match request.method.as_str() {
-        "confirm" => format!("Extension confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'."),
+        "confirm" => {
+            format!("[{provenance}] confirm: {title}\n{message}\n\nEnter yes/no, or 'cancel'.")
+        }
         "select" => {
             let options = request
                 .payload
@@ -3069,7 +3078,7 @@ fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
                 .unwrap_or_default();
 
             let mut out = String::new();
-            let _ = writeln!(&mut out, "Extension select: {title}");
+            let _ = writeln!(&mut out, "[{provenance}] select: {title}");
             if !message.trim().is_empty() {
                 let _ = writeln!(&mut out, "{message}");
             }
@@ -3085,13 +3094,13 @@ fn format_extension_ui_prompt(request: &ExtensionUiRequest) -> String {
             out.push_str("\nEnter a number, label, or 'cancel'.");
             out
         }
-        "input" => format!("Extension input: {title}\n{message}"),
-        "editor" => format!("Extension editor: {title}\n{message}"),
-        _ => format!("Extension UI: {title} {message}"),
+        "input" => format!("[{provenance}] input: {title}\n{message}"),
+        "editor" => format!("[{provenance}] editor: {title}\n{message}"),
+        _ => format!("[{provenance}] {title} {message}"),
     }
 }
 
-fn parse_extension_ui_response(
+pub fn parse_extension_ui_response(
     request: &ExtensionUiRequest,
     input: &str,
 ) -> Result<ExtensionUiResponse, String> {

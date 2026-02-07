@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-07T00:53:11Z
+> Generated: 2026-02-07T01:49:04Z
 
 ## Summary
 
@@ -38,7 +38,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 45 | PASS | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 52 | PASS | No |
 
 ## Policy
 

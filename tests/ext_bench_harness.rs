@@ -1064,10 +1064,7 @@ fn generate_markdown(report: &HarnessReport) -> String {
         let actual_str = check
             .actual_us
             .map_or_else(|| "-".to_string(), |v| format!("{v}us"));
-        let ext_str = check
-            .worst_extension
-            .as_deref()
-            .unwrap_or("-");
+        let ext_str = check.worst_extension.as_deref().unwrap_or("-");
         writeln!(
             md,
             "| {} | {}us | {} | {} | {} |",

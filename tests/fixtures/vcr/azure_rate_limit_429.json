@@ -1,0 +1,28 @@
+{
+  "version": "1.0",
+  "test_name": "azure_rate_limit_429",
+  "recorded_at": "2026-02-07T01:45:00.000Z",
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://test-resource.openai.azure.com/openai/deployments/test-deployment/chat/completions?api-version=2024-02-15-preview",
+        "headers": [
+          ["api-key", "[REDACTED]"],
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"]
+        ]
+      },
+      "response": {
+        "status": 429,
+        "headers": [
+          ["Content-Type", "application/json"],
+          ["Retry-After", "60"]
+        ],
+        "body_chunks": [
+          "{\"error\":{\"code\":\"429\",\"message\":\"Requests to the ChatCompletions_Create Operation under Azure OpenAI API version 2024-02-15-preview have exceeded token rate limit of your current Azure OpenAI S0 pricing tier.\"}}"
+        ]
+      }
+    }
+  ]
+}

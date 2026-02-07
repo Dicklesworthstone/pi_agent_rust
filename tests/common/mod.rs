@@ -10,6 +10,14 @@ use std::sync::OnceLock;
 
 pub mod harness;
 pub mod logging;
+#[allow(
+    dead_code,
+    clippy::needless_pass_by_value,
+    clippy::significant_drop_tightening,
+    clippy::uninlined_format_args,
+    clippy::missing_const_for_fn
+)]
+pub mod mocks;
 #[cfg(unix)]
 pub mod tmux;
 

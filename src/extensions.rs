@@ -1939,6 +1939,8 @@ pub struct ExtensionUiRequest {
     pub method: String,
     pub payload: Value,
     pub timeout_ms: Option<u64>,
+    /// Extension that initiated this UI request (for provenance display).
+    pub extension_id: Option<String>,
 }
 
 impl ExtensionUiRequest {
@@ -1948,7 +1950,15 @@ impl ExtensionUiRequest {
             method: method.into(),
             payload,
             timeout_ms: None,
+            extension_id: None,
         }
+    }
+
+    /// Set the extension ID for provenance tracking.
+    #[must_use]
+    pub fn with_extension_id(mut self, ext_id: Option<String>) -> Self {
+        self.extension_id = ext_id;
+        self
     }
 
     pub fn expects_response(&self) -> bool {
@@ -3011,6 +3021,7 @@ mod wasm_host {
                                         &manager,
                                         &op,
                                         payload.params.clone(),
+                                        self.extension_id.as_deref(),
                                     )
                                     .await
                                 }
@@ -6348,7 +6359,7 @@ async fn dispatch_shared_allowed(
             } else {
                 Value::Null
             };
-            dispatch_hostcall_ui(&call.call_id, manager, op, payload).await
+            dispatch_hostcall_ui(&call.call_id, manager, op, payload, ctx.extension_id).await
         }
         "events" => {
             let op = call
@@ -7007,6 +7018,7 @@ async fn dispatch_hostcall_ui(
     manager: &ExtensionManager,
     op: &str,
     payload: Value,
+    extension_id: Option<&str>,
 ) -> HostcallOutcome {
     let op = op.trim();
     if op.is_empty() {
@@ -7021,6 +7033,7 @@ async fn dispatch_hostcall_ui(
         method: op.to_string(),
         payload,
         timeout_ms: None,
+        extension_id: extension_id.map(ToString::to_string),
     };
 
     match manager.request_ui(request).await {

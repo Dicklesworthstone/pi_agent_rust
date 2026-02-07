@@ -3,13 +3,13 @@
   "generated": "2026-02-05",
   "description": "Static scan of extension corpus entry points (bd-2u2s)",
   "summary": {
-    "total_files": 1382,
-    "entry_points": 385,
+    "total_files": 1389,
+    "entry_points": 392,
     "sub_modules": 872,
     "non_extensions": 119,
     "unknown": 6,
     "by_confidence": {
-      "high": 1278,
+      "high": 1285,
       "low": 14,
       "medium": 90
     },
@@ -35,8 +35,8 @@
         "sub_modules": 371
       },
       "official-pi-mono": {
-        "total_files": 72,
-        "entry_points": 65,
+        "total_files": 79,
+        "entry_points": 72,
         "sub_modules": 6
       },
       "third-party-github": {
@@ -171,6 +171,80 @@
         "event_hook",
         "exec_api",
         "ui_api"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_command/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerCommand"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_event/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "event_hook"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_mcp/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_provider/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerProvider"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_resources/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_template/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_tool/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
       ]
     },
     {

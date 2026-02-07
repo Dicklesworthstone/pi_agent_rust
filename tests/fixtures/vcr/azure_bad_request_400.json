@@ -1,0 +1,27 @@
+{
+  "version": "1.0",
+  "test_name": "azure_bad_request_400",
+  "recorded_at": "2026-02-07T01:45:00.000Z",
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://test-resource.openai.azure.com/openai/deployments/test-deployment/chat/completions?api-version=2024-02-15-preview",
+        "headers": [
+          ["api-key", "[REDACTED]"],
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"]
+        ]
+      },
+      "response": {
+        "status": 400,
+        "headers": [
+          ["Content-Type", "application/json"]
+        ],
+        "body_chunks": [
+          "{\"error\":{\"code\":\"BadRequest\",\"message\":\"Invalid request: the 'messages' field is required and must contain at least one message.\"}}"
+        ]
+      }
+    }
+  ]
+}

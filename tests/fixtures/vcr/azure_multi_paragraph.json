@@ -1,0 +1,37 @@
+{
+  "version": "1.0",
+  "test_name": "azure_multi_paragraph",
+  "recorded_at": "2026-02-07T01:45:00.000Z",
+  "interactions": [
+    {
+      "request": {
+        "method": "POST",
+        "url": "https://test-resource.openai.azure.com/openai/deployments/test-deployment/chat/completions?api-version=2024-02-15-preview",
+        "headers": [
+          ["api-key", "[REDACTED]"],
+          ["Content-Type", "application/json"],
+          ["Accept", "text/event-stream"]
+        ]
+      },
+      "response": {
+        "status": 200,
+        "headers": [
+          ["Content-Type", "text/event-stream"],
+          ["Cache-Control", "no-cache"]
+        ],
+        "body_chunks": [
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Paragraph\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" 1\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\".\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\\n\\n\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Paragraph\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" 2\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\".\"},\"finish_reason\":null}]}\n\n",
+          "data: {\"id\":\"chatcmpl-azure-mp01\",\"object\":\"chat.completion.chunk\",\"created\":1738879200,\"model\":\"gpt-4o\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":8,\"total_tokens\":50}}\n\n",
+          "data: [DONE]\n\n"
+        ]
+      }
+    }
+  ]
+}

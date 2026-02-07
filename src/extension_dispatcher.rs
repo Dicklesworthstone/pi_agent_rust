@@ -169,7 +169,10 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 HostcallKind::Exec { cmd } => self.dispatch_exec(&call_id, &cmd, payload).await,
                 HostcallKind::Http => self.dispatch_http(&call_id, payload).await,
                 HostcallKind::Session { op } => self.dispatch_session(&call_id, &op, payload).await,
-                HostcallKind::Ui { op } => self.dispatch_ui(&call_id, &op, payload).await,
+                HostcallKind::Ui { op } => {
+                    self.dispatch_ui(&call_id, &op, payload, extension_id.as_deref())
+                        .await
+                }
                 HostcallKind::Events { op } => {
                     self.dispatch_events(&call_id, extension_id.as_deref(), &op, payload)
                         .await
@@ -273,7 +276,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         message: "host_call ui requires params.op".to_string(),
                     };
                 };
-                self.dispatch_ui(&payload.call_id, &op, params).await
+                self.dispatch_ui(&payload.call_id, &op, params, None).await
             }
             "events" => {
                 let Some(op) = protocol_hostcall_op(&params) else {
@@ -887,7 +890,13 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
     }
 
     #[allow(clippy::future_not_send)]
-    async fn dispatch_ui(&self, call_id: &str, op: &str, payload: Value) -> HostcallOutcome {
+    async fn dispatch_ui(
+        &self,
+        call_id: &str,
+        op: &str,
+        payload: Value,
+        extension_id: Option<&str>,
+    ) -> HostcallOutcome {
         let op = op.trim();
         if op.is_empty() {
             return HostcallOutcome::Error {
@@ -901,6 +910,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             method: op.to_string(),
             payload,
             timeout_ms: None,
+            extension_id: extension_id.map(ToString::to_string),
         };
 
         match self.ui_handler.request_ui(request).await {
@@ -7294,7 +7304,7 @@ mod tests {
             );
             let dispatcher = build_dispatcher(Rc::clone(&runtime));
             let outcome = dispatcher
-                .dispatch_ui("ui-1", "   ", serde_json::json!({}))
+                .dispatch_ui("ui-1", "   ", serde_json::json!({}), None)
                 .await;
             assert!(
                 matches!(outcome, HostcallOutcome::Error { code, .. } if code == "invalid_request")
@@ -7332,7 +7342,7 @@ mod tests {
             );
 
             let outcome = dispatcher
-                .dispatch_ui("ui-2", "confirm", serde_json::json!({}))
+                .dispatch_ui("ui-2", "confirm", serde_json::json!({}), None)
                 .await;
             assert!(matches!(outcome, HostcallOutcome::Error { code, .. } if code == "timeout"));
         });
@@ -7368,7 +7378,7 @@ mod tests {
             );
 
             let outcome = dispatcher
-                .dispatch_ui("ui-3", "confirm", serde_json::json!({}))
+                .dispatch_ui("ui-3", "confirm", serde_json::json!({}), None)
                 .await;
             assert!(matches!(outcome, HostcallOutcome::Error { code, .. } if code == "denied"));
         });

@@ -119,9 +119,10 @@ fn load_manifest() -> &'static Vec<ManifestEntry> {
 
 // ─── RSS Measurement ────────────────────────────────────────────────────────
 
-fn measure_rss(system: &mut System, pid: sysinfo::Pid, refresh: ProcessRefreshKind) -> u64 {
+fn measure_rss_kb(system: &mut System, pid: sysinfo::Pid, refresh: ProcessRefreshKind) -> u64 {
     system.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pid]), true, refresh);
-    system.process(pid).map_or(0, sysinfo::Process::memory)
+    // sysinfo::Process::memory() returns bytes; convert to KB
+    system.process(pid).map_or(0, |p| p.memory() / 1024)
 }
 
 /// Read `QuickJS` heap estimate from `/proc/self/statm`.
@@ -222,7 +223,11 @@ fn is_monotonic_growth(values: &[u64]) -> bool {
     let medians: Vec<u64> = (0..4)
         .map(|q| {
             let start = q * quarter;
-            let end = if q == 3 { values.len() } else { start + quarter };
+            let end = if q == 3 {
+                values.len()
+            } else {
+                start + quarter
+            };
             let mut slice = values[start..end].to_vec();
             slice.sort_unstable();
             slice[slice.len() / 2]
@@ -245,7 +250,7 @@ fn generate_inline_extensions(
     for i in 0..count {
         let source = format!(
             r#"
-export default function activate(pi) {{
+export default function init(pi) {{
     // Allocate some heap to simulate real extension state
     const state = {{
         buffer: new Array(100).fill("ext{i}_data"),
@@ -255,14 +260,13 @@ export default function activate(pi) {{
     pi.registerTool({{
         name: "mem_probe_{i}",
         description: "Memory probe tool {i}",
-        parameters: {{ type: "object", properties: {{}} }},
-        execute: async (input) => {{
+        execute: async (_callId, _input) => {{
             state.counter++;
-            return {{ content: [{{ type: "text", text: `probe_{i}:${{state.counter}}` }}] }};
+            return {{ ok: true }};
         }},
     }});
 
-    pi.registerEventHook("agent:start", async () => {{
+    pi.on("agent:start", async () => {{
         state.counter++;
         // Allocate a small temporary to exercise GC
         const tmp = new Array(10).fill(state.counter);
@@ -308,7 +312,7 @@ fn run_stress_loop(manager: &ExtensionManager, params: &StressParams) -> StressO
     let refresh = ProcessRefreshKind::nothing().with_memory();
     let mut system = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
 
-    let rss_baseline_kb = measure_rss(&mut system, pid, refresh);
+    let rss_baseline_kb = measure_rss_kb(&mut system, pid, refresh);
     let ps = page_size_bytes();
     let quickjs_baseline_kb = read_statm().map_or(0, |(_, data)| data * ps / 1024);
 
@@ -356,7 +360,7 @@ fn run_stress_loop(manager: &ExtensionManager, params: &StressParams) -> StressO
 
         // Sample memory at intervals
         if Instant::now() >= next_sample {
-            let rss_kb = measure_rss(&mut system, pid, refresh);
+            let rss_kb = measure_rss_kb(&mut system, pid, refresh);
             let quickjs_kb = read_statm().map_or(0, |(_, data)| data * ps / 1024);
 
             if rss_kb > rss_peak_kb {
@@ -454,12 +458,7 @@ struct VerdictData {
     monotonic_quickjs: bool,
 }
 
-fn write_report(
-    outcome: &StressOutcome,
-    vd: &VerdictData,
-    ext_names: &[String],
-    max_ext: usize,
-) {
+fn write_report(outcome: &StressOutcome, vd: &VerdictData, ext_names: &[String], max_ext: usize) {
     let out_dir = output_dir();
     let _ = std::fs::create_dir_all(&out_dir);
 
@@ -609,7 +608,10 @@ fn ext_memory_stress_real_extensions() {
     );
     eprintln!(
         "  QuickJS: baseline={}KB peak={}KB growth={:.2}x monotonic={}",
-        outcome.quickjs_baseline_kb, outcome.quickjs_peak_kb, vd.quickjs_growth_factor, vd.monotonic_quickjs,
+        outcome.quickjs_baseline_kb,
+        outcome.quickjs_peak_kb,
+        vd.quickjs_growth_factor,
+        vd.monotonic_quickjs,
     );
     eprintln!(
         "  Pass: rss_2x={} rss_mono={} qjs_2x={} qjs_mono={} -> {}",
@@ -702,12 +704,12 @@ fn ext_memory_stress_inline() {
     );
     eprintln!(
         "  QuickJS: baseline={}KB peak={}KB growth={:.2}x monotonic={}",
-        outcome.quickjs_baseline_kb, outcome.quickjs_peak_kb, vd.quickjs_growth_factor, vd.monotonic_quickjs,
+        outcome.quickjs_baseline_kb,
+        outcome.quickjs_peak_kb,
+        vd.quickjs_growth_factor,
+        vd.monotonic_quickjs,
     );
-    eprintln!(
-        "  Pass: {}",
-        if vd.verdict.pass { "PASS" } else { "FAIL" }
-    );
+    eprintln!("  Pass: {}", if vd.verdict.pass { "PASS" } else { "FAIL" });
 
     // For CI: verify no gross leak (events dispatched, RSS didn't explode)
     assert!(
@@ -854,7 +856,9 @@ mod monotonic_tests {
     #[test]
     fn detects_monotonic_growth() {
         // Clearly increasing: each quarter median is higher than previous
-        let values = vec![10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33, 40, 41, 42, 43];
+        let values = vec![
+            10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33, 40, 41, 42, 43,
+        ];
         assert!(is_monotonic_growth(&values));
     }
 
@@ -879,7 +883,9 @@ mod monotonic_tests {
     #[test]
     fn saw_tooth_not_monotonic() {
         // Goes up then down — not monotonically growing
-        let values = vec![10, 20, 30, 40, 50, 40, 30, 20, 10, 20, 30, 40, 50, 40, 30, 20];
+        let values = vec![
+            10, 20, 30, 40, 50, 40, 30, 20, 10, 20, 30, 40, 50, 40, 30, 20,
+        ];
         assert!(!is_monotonic_growth(&values));
     }
 
@@ -902,7 +908,9 @@ mod monotonic_tests {
     #[test]
     fn noisy_but_stable_not_monotonic() {
         // Random noise around 100, no trend
-        let values = vec![98, 103, 97, 101, 99, 104, 96, 102, 100, 97, 103, 98, 101, 99, 100, 98];
+        let values = vec![
+            98, 103, 97, 101, 99, 104, 96, 102, 100, 97, 103, 98, 101, 99, 100, 98,
+        ];
         assert!(!is_monotonic_growth(&values));
     }
 }
