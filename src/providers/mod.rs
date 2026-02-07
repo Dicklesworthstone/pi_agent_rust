@@ -1089,4 +1089,333 @@ export default function init(pi) {
             assert!(provider_no_ext.is_err());
         });
     }
+
+    // ========================================================================
+    // bd-g1nx: Provider factory + URL normalization tests
+    // ========================================================================
+
+    use crate::models::ModelEntry;
+    use crate::provider::{InputType, Model, ModelCost};
+    use std::collections::HashMap;
+
+    fn model_entry(provider: &str, api: &str, model_id: &str, base_url: &str) -> ModelEntry {
+        ModelEntry {
+            model: Model {
+                id: model_id.to_string(),
+                name: model_id.to_string(),
+                api: api.to_string(),
+                provider: provider.to_string(),
+                base_url: base_url.to_string(),
+                reasoning: false,
+                input: vec![InputType::Text],
+                cost: ModelCost {
+                    input: 3.0,
+                    output: 15.0,
+                    cache_read: 0.3,
+                    cache_write: 3.75,
+                },
+                context_window: 200_000,
+                max_tokens: 8192,
+                headers: HashMap::new(),
+            },
+            api_key: Some("sk-test-key".to_string()),
+            headers: HashMap::new(),
+            auth_header: true,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    // ── create_provider: built-in provider selection ─────────────────
+
+    #[test]
+    fn create_provider_anthropic_by_name() {
+        let entry = model_entry(
+            "anthropic",
+            "anthropic-messages",
+            "claude-sonnet-4-5",
+            "https://api.anthropic.com",
+        );
+        let provider = create_provider(&entry, None).expect("anthropic provider");
+        assert_eq!(provider.name(), "anthropic");
+        assert_eq!(provider.model_id(), "claude-sonnet-4-5");
+        assert_eq!(provider.api(), "anthropic-messages");
+    }
+
+    #[test]
+    fn create_provider_openai_completions_by_name() {
+        let entry = model_entry(
+            "openai",
+            "openai-completions",
+            "gpt-4o",
+            "https://api.openai.com/v1",
+        );
+        let provider = create_provider(&entry, None).expect("openai completions provider");
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.model_id(), "gpt-4o");
+    }
+
+    #[test]
+    fn create_provider_openai_responses_by_name() {
+        let entry = model_entry(
+            "openai",
+            "openai-responses",
+            "gpt-4o",
+            "https://api.openai.com/v1",
+        );
+        let provider = create_provider(&entry, None).expect("openai responses provider");
+        assert_eq!(provider.name(), "openai");
+        assert_eq!(provider.model_id(), "gpt-4o");
+    }
+
+    #[test]
+    fn create_provider_openai_defaults_to_responses() {
+        // When api is not "openai-completions", OpenAI defaults to Responses API
+        let entry = model_entry("openai", "openai", "gpt-4o", "https://api.openai.com/v1");
+        let provider = create_provider(&entry, None).expect("openai default responses provider");
+        assert_eq!(provider.name(), "openai");
+    }
+
+    #[test]
+    fn create_provider_google_by_name() {
+        let entry = model_entry(
+            "google",
+            "google-generative-ai",
+            "gemini-2.0-flash",
+            "https://generativelanguage.googleapis.com",
+        );
+        let provider = create_provider(&entry, None).expect("google provider");
+        assert_eq!(provider.name(), "google");
+        assert_eq!(provider.model_id(), "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn create_provider_cohere_by_name() {
+        let entry = model_entry(
+            "cohere",
+            "cohere-chat",
+            "command-r-plus",
+            "https://api.cohere.com/v2",
+        );
+        let provider = create_provider(&entry, None).expect("cohere provider");
+        assert_eq!(provider.name(), "cohere");
+        assert_eq!(provider.model_id(), "command-r-plus");
+    }
+
+    #[test]
+    fn create_provider_azure_openai_returns_error() {
+        let entry = model_entry(
+            "azure-openai",
+            "openai-completions",
+            "gpt-4o",
+            "https://myresource.openai.azure.com",
+        );
+        let Err(err) = create_provider(&entry, None) else {
+            panic!("azure should fail");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("resource+deployment"),
+            "expected resource+deployment message, got: {msg}"
+        );
+    }
+
+    // ── create_provider: API fallback path ──────────────────────────
+
+    #[test]
+    fn create_provider_falls_back_to_api_anthropic_messages() {
+        let entry = model_entry(
+            "custom-anthropic",
+            "anthropic-messages",
+            "my-model",
+            "https://custom.api.com",
+        );
+        let provider = create_provider(&entry, None).expect("fallback anthropic provider");
+        // Anthropic fallback uses the standard anthropic provider
+        assert_eq!(provider.model_id(), "my-model");
+    }
+
+    #[test]
+    fn create_provider_falls_back_to_api_openai_completions() {
+        let entry = model_entry(
+            "my-openai-compat",
+            "openai-completions",
+            "local-model",
+            "http://localhost:8080/v1",
+        );
+        let provider = create_provider(&entry, None).expect("fallback openai completions");
+        assert_eq!(provider.model_id(), "local-model");
+    }
+
+    #[test]
+    fn create_provider_falls_back_to_api_openai_responses() {
+        let entry = model_entry(
+            "my-openai-compat",
+            "openai-responses",
+            "local-model",
+            "http://localhost:8080/v1",
+        );
+        let provider = create_provider(&entry, None).expect("fallback openai responses");
+        assert_eq!(provider.model_id(), "local-model");
+    }
+
+    #[test]
+    fn create_provider_falls_back_to_api_cohere_chat() {
+        let entry = model_entry(
+            "custom-cohere",
+            "cohere-chat",
+            "custom-r",
+            "https://custom-cohere.api.com/v2",
+        );
+        let provider = create_provider(&entry, None).expect("fallback cohere provider");
+        assert_eq!(provider.model_id(), "custom-r");
+    }
+
+    #[test]
+    fn create_provider_falls_back_to_api_google() {
+        let entry = model_entry(
+            "custom-google",
+            "google-generative-ai",
+            "custom-gemini",
+            "https://custom.google.com",
+        );
+        let provider = create_provider(&entry, None).expect("fallback google provider");
+        assert_eq!(provider.model_id(), "custom-gemini");
+    }
+
+    #[test]
+    fn create_provider_unknown_provider_and_api_returns_error() {
+        let entry = model_entry(
+            "totally-unknown",
+            "unknown-api",
+            "some-model",
+            "https://example.com",
+        );
+        let Err(err) = create_provider(&entry, None) else {
+            panic!("unknown should fail");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not implemented"),
+            "expected 'not implemented' message, got: {msg}"
+        );
+    }
+
+    // ── normalize_openai_base ───────────────────────────────────────
+
+    #[test]
+    fn normalize_openai_base_appends_chat_completions_to_v1() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_keeps_existing_chat_completions() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_strips_trailing_slash() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_strips_responses_suffix() {
+        assert_eq!(
+            normalize_openai_base("https://api.openai.com/v1/responses"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn normalize_openai_base_bare_url_gets_chat_completions() {
+        assert_eq!(
+            normalize_openai_base("https://my-llm-proxy.com"),
+            "https://my-llm-proxy.com/chat/completions"
+        );
+    }
+
+    // ── normalize_openai_responses_base ─────────────────────────────
+
+    #[test]
+    fn normalize_responses_appends_responses_to_v1() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com/v1"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_keeps_existing_responses() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com/v1/responses"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_strips_trailing_slash() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_strips_chat_completions_suffix() {
+        assert_eq!(
+            normalize_openai_responses_base("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/responses"
+        );
+    }
+
+    #[test]
+    fn normalize_responses_bare_url_gets_responses() {
+        assert_eq!(
+            normalize_openai_responses_base("https://my-llm-proxy.com"),
+            "https://my-llm-proxy.com/responses"
+        );
+    }
+
+    // ── normalize_cohere_base ───────────────────────────────────────
+
+    #[test]
+    fn normalize_cohere_appends_chat_to_v2() {
+        assert_eq!(
+            normalize_cohere_base("https://api.cohere.com/v2"),
+            "https://api.cohere.com/v2/chat"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_keeps_existing_chat() {
+        assert_eq!(
+            normalize_cohere_base("https://api.cohere.com/v2/chat"),
+            "https://api.cohere.com/v2/chat"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_strips_trailing_slash() {
+        assert_eq!(
+            normalize_cohere_base("https://api.cohere.com/v2/"),
+            "https://api.cohere.com/v2/chat"
+        );
+    }
+
+    #[test]
+    fn normalize_cohere_bare_url_gets_chat() {
+        assert_eq!(
+            normalize_cohere_base("https://custom-cohere.example.com"),
+            "https://custom-cohere.example.com/chat"
+        );
+    }
 }
