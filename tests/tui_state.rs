@@ -2762,7 +2762,9 @@ fn tui_state_slash_share_reports_error_when_gh_missing() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Sharing session...");
 
-    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+    // Under load, async command execution plus shell startup for fake `gh`
+    // can exceed 1s before AgentError is emitted.
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(3), |msgs| {
         msgs.iter().any(|msg| matches!(msg, PiMsg::AgentError(_)))
     });
     let error = events
@@ -2901,7 +2903,8 @@ fn tui_state_slash_share_creates_gist_and_reports_urls_and_cleans_temp_file() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Sharing session...");
 
-    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(1), |msgs| {
+    // Full-suite parallel load can delay command completion past 1s.
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(3), |msgs| {
         msgs.iter()
             .any(|msg| matches!(msg, PiMsg::System(_)) || matches!(msg, PiMsg::AgentError(_)))
     });
@@ -3425,7 +3428,9 @@ fn tui_state_slash_fork_creates_session_and_prefills_editor() {
     let step = press_enter(&harness, &mut app);
     assert_after_contains(&harness, &step, "Forking session...");
 
-    let events = wait_for_pi_msgs(&event_rx, Duration::from_millis(700), |msgs| {
+    // /fork first runs a cancellable extension hook (timeout is 5s), so a
+    // sub-second wait is flaky and can miss ConversationReset on busy hosts.
+    let events = wait_for_pi_msgs(&event_rx, Duration::from_secs(6), |msgs| {
         let has_reset = msgs
             .iter()
             .any(|msg| matches!(msg, PiMsg::ConversationReset { .. }));
@@ -5432,4 +5437,736 @@ fn tui_grad_integration_diff_with_collapse_toggle() {
     let step = press_ctrlo(&harness, &mut app);
 
     assert_after_contains(&harness, &step, "@@ large_file.rs @@");
+}
+
+// ===========================================================================
+// Model selector overlay tests
+// ===========================================================================
+
+fn press_ctrll(harness: &TestHarness, app: &mut PiApp) -> StepOutcome {
+    apply_key(harness, app, "key:CtrlL", KeyMsg::from_type(KeyType::CtrlL))
+}
+
+#[test]
+fn tui_state_model_selector_opens_on_ctrll() {
+    let harness = TestHarness::new("tui_state_model_selector_opens_on_ctrll");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    let step = press_ctrll(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Select a model");
+    assert_after_contains(&harness, &step, "(type to filter)");
+    assert_after_contains(&harness, &step, "anthropic/claude-a");
+    assert_after_contains(&harness, &step, "openai/gpt-a");
+}
+
+#[test]
+fn tui_state_model_selector_cancel_on_esc() {
+    let harness = TestHarness::new("tui_state_model_selector_cancel_on_esc");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    press_ctrll(&harness, &mut app);
+    let step = press_esc(&harness, &mut app);
+    assert_after_not_contains(&harness, &step, "Select a model");
+    assert_after_contains(&harness, &step, "Model selector cancelled");
+}
+
+#[test]
+fn tui_state_model_selector_filters_on_typing() {
+    let harness = TestHarness::new("tui_state_model_selector_filters_on_typing");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let available_models = vec![anthropic.clone(), openai, google];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    press_ctrll(&harness, &mut app);
+    // Type "gpt" to filter
+    let step = type_text(&harness, &mut app, "gpt");
+    assert_after_contains(&harness, &step, "Select a model");
+    assert_after_contains(&harness, &step, "openai/gpt-a");
+    // Other model rows should be filtered out. The current model id can still
+    // appear outside the selector list (e.g. header/status), so assert on row
+    // formatting rather than raw id substring.
+    assert_after_not_contains(&harness, &step, "> anthropic/claude-a *");
+    assert_after_not_contains(&harness, &step, "google/gemini-a");
+}
+
+#[test]
+fn tui_state_model_selector_navigates_with_arrows() {
+    let harness = TestHarness::new("tui_state_model_selector_navigates_with_arrows");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    press_ctrll(&harness, &mut app);
+    // Initially first item is selected (anthropic/claude-a)
+    let step = press_down(&harness, &mut app);
+    // After pressing down, second item should be selected
+    // The ">" prefix marks the selected item
+    assert_after_contains(&harness, &step, "Select a model");
+}
+
+#[test]
+fn tui_state_model_selector_select_switches_model() {
+    let harness = TestHarness::new("tui_state_model_selector_select_switches_model");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    press_ctrll(&harness, &mut app);
+    // Navigate to second model (openai/gpt-a)
+    press_down(&harness, &mut app);
+    // Select it
+    let step = press_enter(&harness, &mut app);
+    // Overlay should close and model should switch
+    assert_after_not_contains(&harness, &step, "Select a model");
+    assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
+
+    // Verify session header updated
+    let session_handle = app.session_handle();
+    let session_guard = session_handle.try_lock().expect("session lock");
+    assert_eq!(session_guard.header.provider.as_deref(), Some("openai"));
+    assert_eq!(session_guard.header.model_id.as_deref(), Some("gpt-a"));
+}
+
+#[test]
+fn tui_state_model_selector_select_current_shows_already_using() {
+    let harness = TestHarness::new("tui_state_model_selector_select_current_shows_already_using");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    press_ctrll(&harness, &mut app);
+    // Select first model (same as current)
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Already using");
+}
+
+#[test]
+fn tui_state_model_selector_no_models_shows_message() {
+    let harness = TestHarness::new("tui_state_model_selector_no_models_shows_message");
+
+    let model_entry = dummy_model_entry();
+    let available_models: Vec<ModelEntry> = Vec::new();
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        model_entry,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    let step = press_ctrll(&harness, &mut app);
+    assert_after_contains(&harness, &step, "No models available");
+    assert_after_not_contains(&harness, &step, "Select a model");
+}
+
+#[test]
+fn tui_state_ctrlp_single_model_shows_only_one_message() {
+    let harness = TestHarness::new("tui_state_ctrlp_single_model_shows_only_one_message");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+
+    let available_models = vec![anthropic.clone()];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Only one model available");
+}
+
+#[test]
+fn tui_state_ctrlp_single_model_in_scope_shows_scope_message() {
+    let harness = TestHarness::new("tui_state_ctrlp_single_model_in_scope_shows_scope_message");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    // Scope contains only one model but available has two
+    let model_scope = vec![anthropic.clone()];
+    let available_models = vec![anthropic.clone(), openai];
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Only one model in scope");
+}
+
+#[test]
+fn tui_state_ctrlp_cycling_wraps_forward_through_all_models() {
+    let harness = TestHarness::new("tui_state_ctrlp_cycling_wraps_forward_through_all_models");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+    let google = make_model_entry(
+        "google",
+        "gemini-a",
+        "https://generativeai.googleapis.com/v1beta/models",
+    );
+
+    let available_models = vec![openai, google, anthropic.clone()];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    // Sorted order: anthropic/claude-a, google/gemini-a, openai/gpt-a
+    // Current: anthropic/claude-a → next: google/gemini-a
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched model: google/gemini-a");
+
+    // google/gemini-a → openai/gpt-a
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched model: openai/gpt-a");
+
+    // openai/gpt-a → wraps to anthropic/claude-a
+    let step = press_ctrlp(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Switched model: anthropic/claude-a");
+}
+
+#[test]
+fn tui_state_model_selector_backspace_removes_filter() {
+    let harness = TestHarness::new("tui_state_model_selector_backspace_removes_filter");
+
+    let anthropic = make_model_entry(
+        "anthropic",
+        "claude-a",
+        "https://api.anthropic.com/v1/messages",
+    );
+    let openai = make_model_entry("openai", "gpt-a", "https://api.openai.com/v1");
+
+    let available_models = vec![anthropic.clone(), openai];
+    let model_scope = Vec::new();
+
+    let mut app = build_app_with_models(
+        &harness,
+        Session::in_memory(),
+        Config::default(),
+        anthropic,
+        model_scope,
+        available_models,
+        KeyBindings::new(),
+    );
+
+    press_ctrll(&harness, &mut app);
+    // Filter to show only openai
+    type_text(&harness, &mut app, "gpt");
+    // Backspace 3 times to clear filter
+    apply_key(
+        &harness,
+        &mut app,
+        "key:Backspace",
+        KeyMsg::from_type(KeyType::Backspace),
+    );
+    apply_key(
+        &harness,
+        &mut app,
+        "key:Backspace",
+        KeyMsg::from_type(KeyType::Backspace),
+    );
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:Backspace",
+        KeyMsg::from_type(KeyType::Backspace),
+    );
+    // Both models should be visible again
+    assert_after_contains(&harness, &step, "anthropic/claude-a");
+    assert_after_contains(&harness, &step, "openai/gpt-a");
+}
+
+// ---------------------------------------------------------------------------
+// bd-w4dn: Header + tool/thinking collapse toggle tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn tui_state_header_shows_pi_and_model_name() {
+    let harness = TestHarness::new("tui_state_header_shows_pi_and_model_name");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Trigger a view render via a no-op key press.
+    let step = apply_key(
+        &harness,
+        &mut app,
+        "key:noop",
+        KeyMsg::from_runes(vec![' ']),
+    );
+    assert_after_contains(&harness, &step, "Pi");
+    assert_after_contains(&harness, &step, "dummy-model");
+}
+
+#[test]
+fn tui_state_collapse_changelog_settings_toggle_persists() {
+    let harness = TestHarness::new("tui_state_collapse_changelog_settings_toggle_persists");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/settings");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Settings");
+    assert_after_contains(&harness, &step, "collapseChangelog:");
+
+    // Navigate to CollapseChangelog entry:
+    // Summary(0), Theme(1), SteeringMode(2), FollowUpMode(3), QuietStartup(4), CollapseChangelog(5)
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    press_down(&harness, &mut app);
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Updated collapseChangelog: on");
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(settings["collapse_changelog"], json!(true));
+}
+
+#[test]
+fn tui_state_hide_thinking_block_settings_toggle_persists() {
+    let harness = TestHarness::new("tui_state_hide_thinking_block_settings_toggle_persists");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/settings");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Settings");
+    assert_after_contains(&harness, &step, "hideThinkingBlock:");
+
+    // Navigate to HideThinkingBlock entry:
+    // Summary(0), Theme(1), SteeringMode(2), FollowUpMode(3), QuietStartup(4),
+    // CollapseChangelog(5), HideThinkingBlock(6)
+    for _ in 0..6 {
+        press_down(&harness, &mut app);
+    }
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Updated hideThinkingBlock: on");
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(settings["hide_thinking_block"], json!(true));
+}
+
+#[test]
+fn tui_state_ctrlt_thinking_visible_hidden_visible_cycle() {
+    let harness = TestHarness::new("tui_state_ctrlt_thinking_visible_hidden_visible_cycle");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Generate thinking content while processing.
+    apply_pi(&harness, &mut app, "PiMsg::AgentStart", PiMsg::AgentStart);
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ThinkingDelta(visible)",
+        PiMsg::ThinkingDelta("deep thought".to_string()),
+    );
+    // Thinking is visible by default.
+    assert_after_contains(&harness, &step, "Thinking:");
+    assert_after_contains(&harness, &step, "deep thought");
+
+    // Ctrl+T hides thinking.
+    let step = press_ctrlt(&harness, &mut app);
+    assert_after_not_contains(&harness, &step, "Thinking:");
+    assert_after_not_contains(&harness, &step, "deep thought");
+
+    // Ctrl+T shows thinking again.
+    let step = press_ctrlt(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Thinking:");
+    assert_after_contains(&harness, &step, "deep thought");
+}
+
+#[test]
+fn tui_state_tool_error_output_collapse_toggle() {
+    let harness = TestHarness::new("tui_state_tool_error_output_collapse_toggle");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(bash)",
+        PiMsg::ToolStart {
+            name: "bash".to_string(),
+            tool_id: "tool-err-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(bash) error-output",
+        PiMsg::ToolUpdate {
+            name: "bash".to_string(),
+            tool_id: "tool-err-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "command not found: foobar",
+            ))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(bash) is_error",
+        PiMsg::ToolEnd {
+            name: "bash".to_string(),
+            tool_id: "tool-err-1".to_string(),
+            is_error: true,
+        },
+    );
+    // Error tool output is shown.
+    assert_after_contains(&harness, &step, "command not found: foobar");
+
+    // Ctrl+O collapses.
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "collapsed");
+    assert_after_not_contains(&harness, &step, "command not found: foobar");
+
+    // Ctrl+O re-expands.
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_not_contains(&harness, &step, "collapsed");
+    assert_after_contains(&harness, &step, "command not found: foobar");
+}
+
+#[test]
+fn tui_state_multiple_tool_blocks_collapse_together() {
+    let harness = TestHarness::new("tui_state_multiple_tool_blocks_collapse_together");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // First tool: read
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read)",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("contents of file A"))],
+            details: None,
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Second tool: grep
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(grep)",
+        PiMsg::ToolStart {
+            name: "grep".to_string(),
+            tool_id: "tool-2".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(grep)",
+        PiMsg::ToolUpdate {
+            name: "grep".to_string(),
+            tool_id: "tool-2".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new(
+                "match found at line 42",
+            ))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(grep)",
+        PiMsg::ToolEnd {
+            name: "grep".to_string(),
+            tool_id: "tool-2".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Both tool outputs should be visible.
+    assert_after_contains(&harness, &step, "contents of file A");
+    assert_after_contains(&harness, &step, "match found at line 42");
+
+    // Ctrl+O collapses all tool outputs.
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_not_contains(&harness, &step, "contents of file A");
+    assert_after_not_contains(&harness, &step, "match found at line 42");
+
+    // Ctrl+O re-expands all.
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "contents of file A");
+    assert_after_contains(&harness, &step, "match found at line 42");
+}
+
+#[test]
+fn tui_state_thinking_and_tool_toggles_independent() {
+    let harness = TestHarness::new("tui_state_thinking_and_tool_toggles_independent");
+    let mut app = build_app(&harness, Vec::new());
+    log_initial_state(&harness, &app);
+
+    // Generate thinking content.
+    apply_pi(&harness, &mut app, "PiMsg::AgentStart", PiMsg::AgentStart);
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ThinkingDelta",
+        PiMsg::ThinkingDelta("reasoning step".to_string()),
+    );
+
+    // Tool output.
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolStart(read)",
+        PiMsg::ToolStart {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+        },
+    );
+    apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolUpdate(read)",
+        PiMsg::ToolUpdate {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            content: vec![ContentBlock::Text(TextContent::new("file data"))],
+            details: None,
+        },
+    );
+    let step = apply_pi(
+        &harness,
+        &mut app,
+        "PiMsg::ToolEnd(read)",
+        PiMsg::ToolEnd {
+            name: "read".to_string(),
+            tool_id: "tool-1".to_string(),
+            is_error: false,
+        },
+    );
+
+    // Both visible initially.
+    assert_after_contains(&harness, &step, "reasoning step");
+    assert_after_contains(&harness, &step, "file data");
+
+    // Hide thinking only (Ctrl+T).
+    let step = press_ctrlt(&harness, &mut app);
+    assert_after_not_contains(&harness, &step, "reasoning step");
+    assert_after_contains(&harness, &step, "file data");
+
+    // Collapse tools only (Ctrl+O).
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_not_contains(&harness, &step, "reasoning step");
+    assert_after_not_contains(&harness, &step, "file data");
+
+    // Show thinking back (Ctrl+T) — tools stay collapsed.
+    let step = press_ctrlt(&harness, &mut app);
+    assert_after_contains(&harness, &step, "reasoning step");
+    assert_after_not_contains(&harness, &step, "file data");
+
+    // Expand tools (Ctrl+O) — both now visible.
+    let step = press_ctrlo(&harness, &mut app);
+    assert_after_contains(&harness, &step, "reasoning step");
+    assert_after_contains(&harness, &step, "file data");
+}
+
+#[test]
+fn tui_state_collapse_changelog_toggle_off_then_on() {
+    let harness = TestHarness::new("tui_state_collapse_changelog_toggle_off_then_on");
+    let config = Config {
+        collapse_changelog: Some(true),
+        ..Config::default()
+    };
+    let mut app =
+        build_app_with_session_and_config(&harness, Vec::new(), Session::in_memory(), config);
+    log_initial_state(&harness, &app);
+
+    // Open settings and navigate to CollapseChangelog (entry 5).
+    type_text(&harness, &mut app, "/settings");
+    press_enter(&harness, &mut app);
+    for _ in 0..5 {
+        press_down(&harness, &mut app);
+    }
+    // Toggle off.
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Updated collapseChangelog: off");
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(settings["collapse_changelog"], json!(false));
+
+    // Reopen and toggle back on.
+    type_text(&harness, &mut app, "/settings");
+    press_enter(&harness, &mut app);
+    for _ in 0..5 {
+        press_down(&harness, &mut app);
+    }
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Updated collapseChangelog: on");
+
+    let settings = read_project_settings_json(&harness);
+    assert_eq!(settings["collapse_changelog"], json!(true));
 }

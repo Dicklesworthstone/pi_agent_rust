@@ -673,7 +673,15 @@ fn e2e_tui_reload_resources_and_autocomplete_refresh() {
     ];
 
     session.launch(&args);
-    session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+    let startup_pane = session.wait_and_capture("startup", "Welcome to Pi!", STARTUP_TIMEOUT);
+    assert!(
+        startup_pane.contains("ctrl+l: model"),
+        "Expected header keybinding hints at startup; got:\n{startup_pane}"
+    );
+    assert!(
+        startup_pane.contains("resources: 0 skills, 0 prompts, 0 themes"),
+        "Expected startup resource summary in header; got:\n{startup_pane}"
+    );
 
     let skill_rel = ".pi/skills/e2e-reload-skill/SKILL.md";
     let skill_valid = r"---
@@ -776,6 +784,25 @@ Invalid skill (missing description) to trigger diagnostics.
         "Expected skill diagnostics to mention missing description; got:\n{pane}"
     );
 
+    // Corrupt models.json and ensure reload surfaces model registry diagnostics.
+    let models_path = global_agent_dir.join("models.json");
+    std::fs::create_dir_all(&global_agent_dir).expect("create global agent dir");
+    std::fs::write(&models_path, "{invalid json").expect("write invalid models.json");
+    session
+        .harness
+        .record_artifact("models.invalid.json", &models_path);
+
+    let pane = session.send_text_and_wait(
+        "reload_after_invalid_models_json",
+        "/reload",
+        "models.json:",
+        STARTUP_TIMEOUT,
+    );
+    assert!(
+        pane.contains("models.json:"),
+        "Expected models.json diagnostics after invalid models file; got:\n{pane}"
+    );
+
     // Autocomplete should no longer list the skill after invalidation.
     session.tmux.send_literal("/skill:e2e");
     let pane = session.send_key_and_wait(
@@ -787,6 +814,37 @@ Invalid skill (missing description) to trigger diagnostics.
     assert!(
         !pane.contains("/skill:e2e-reload-skill"),
         "Expected skill autocomplete entry to be removed; got:\n{pane}"
+    );
+
+    session.exit_gracefully();
+    session.write_artifacts();
+}
+
+#[test]
+fn e2e_tui_quiet_startup_hides_welcome_message() {
+    let Some((_lock, mut session)) =
+        new_locked_tui_session("e2e_tui_quiet_startup_hides_welcome_message")
+    else {
+        eprintln!("Skipping: tmux not available");
+        return;
+    };
+
+    let config_path = session.harness.temp_dir().join("env").join("config.toml");
+    std::fs::write(&config_path, "{\n  \"quietStartup\": true\n}\n")
+        .expect("write quiet startup config");
+    session
+        .harness
+        .record_artifact("config.quiet_startup.json", &config_path);
+
+    session.launch(&base_interactive_args());
+    let pane = session.wait_and_capture("startup", "resources:", STARTUP_TIMEOUT);
+    assert!(
+        pane.contains("Pi (openai/gpt-4o-mini)"),
+        "Expected header to render in quiet startup mode; got:\n{pane}"
+    );
+    assert!(
+        !pane.contains("Welcome to Pi!"),
+        "Expected quiet startup to suppress welcome text; got:\n{pane}"
     );
 
     session.exit_gracefully();

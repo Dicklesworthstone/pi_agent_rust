@@ -295,9 +295,7 @@ pub(crate) fn inject_wasm_globals(
                             wasmtime::Extern::Global(_) => "global",
                             _ => "unknown",
                         };
-                        entries.push(format!(
-                            r#"{{"name":"{name}","kind":"{kind}"}}"#
-                        ));
+                        entries.push(format!(r#"{{"name":"{name}","kind":"{kind}"}}"#));
                     }
                     Ok(format!("[{}]", entries.join(",")))
                 },
@@ -368,10 +366,7 @@ pub(crate) fn inject_wasm_globals(
         global.set(
             "__pi_wasm_get_buffer_native",
             Func::from(
-                move |ctx: Ctx<'_>,
-                      instance_id: u32,
-                      mem_name: String|
-                      -> rquickjs::Result<i32> {
+                move |ctx: Ctx<'_>, instance_id: u32, mem_name: String| -> rquickjs::Result<i32> {
                     let mut bridge = st.borrow_mut();
                     let inst = bridge
                         .instances
