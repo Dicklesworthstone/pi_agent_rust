@@ -1062,11 +1062,13 @@ fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<Pro
 
     if description.is_empty() {
         if let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty()) {
-            let mut truncated = first_line.trim().to_string();
-            if truncated.len() > 60 {
-                truncated.truncate(60);
-                truncated.push_str("...");
-            }
+            let trimmed = first_line.trim();
+            let truncated = if trimmed.chars().count() > 60 {
+                let s: String = trimmed.chars().take(57).collect();
+                format!("{s}...")
+            } else {
+                trimmed.to_string()
+            };
             description = truncated;
         }
     }

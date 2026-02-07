@@ -1110,6 +1110,11 @@ impl Agent {
         if *added_partial {
             if let Some(last @ Message::Assistant(_)) = self.messages.last_mut() {
                 *last = Message::Assistant(partial);
+            } else {
+                // Defensive: added_partial is true but last message isn't Assistant.
+                // Push as new message rather than silently dropping the update.
+                tracing::warn!("update_partial_message: expected last message to be Assistant");
+                self.messages.push(Message::Assistant(partial));
             }
             false
         } else {
