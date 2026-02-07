@@ -1277,4 +1277,112 @@ mod tests {
         }
         headers
     }
+
+    // ========================================================================
+    // Fixture-based stream parsing tests
+    // ========================================================================
+
+    #[derive(Debug, Deserialize)]
+    struct ProviderFixture {
+        cases: Vec<ProviderCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ProviderCase {
+        name: String,
+        events: Vec<Value>,
+        expected: Vec<EventSummary>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    struct EventSummary {
+        kind: String,
+        #[serde(default)]
+        content_index: Option<usize>,
+        #[serde(default)]
+        delta: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+
+    fn load_fixture(file_name: &str) -> ProviderFixture {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/provider_responses")
+            .join(file_name);
+        let data = std::fs::read_to_string(&path).expect("read fixture file");
+        serde_json::from_str(&data).expect("parse fixture JSON")
+    }
+
+    fn summarize_event(event: &StreamEvent) -> EventSummary {
+        match event {
+            StreamEvent::Start { .. } => EventSummary {
+                kind: "start".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextStart { content_index, .. } => EventSummary {
+                kind: "text_start".to_string(),
+                content_index: Some(*content_index),
+                delta: None,
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextDelta {
+                content_index,
+                delta,
+                ..
+            } => EventSummary {
+                kind: "text_delta".to_string(),
+                content_index: Some(*content_index),
+                delta: Some(delta.clone()),
+                content: None,
+                reason: None,
+            },
+            StreamEvent::Done { reason, .. } => EventSummary {
+                kind: "done".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: Some(reason_to_string(*reason)),
+            },
+            StreamEvent::Error { reason, .. } => EventSummary {
+                kind: "error".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: Some(reason_to_string(*reason)),
+            },
+            _ => EventSummary {
+                kind: "other".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: None,
+            },
+        }
+    }
+
+    fn reason_to_string(reason: StopReason) -> String {
+        match reason {
+            StopReason::Stop => "stop".to_string(),
+            StopReason::ToolUse => "tool_use".to_string(),
+            StopReason::Length => "length".to_string(),
+            StopReason::Error => "error".to_string(),
+            StopReason::Aborted => "aborted".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_stream_fixtures() {
+        let fixture = load_fixture("openai_responses_stream.json");
+        for case in fixture.cases {
+            let events = collect_events(&case.events);
+            let summaries: Vec<EventSummary> = events.iter().map(summarize_event).collect();
+            assert_eq!(summaries, case.expected, "case: {}", case.name);
+        }
+    }
 }

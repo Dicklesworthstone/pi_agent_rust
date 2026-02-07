@@ -844,8 +844,129 @@ mod tests {
     use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::path::PathBuf;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    // ─── Fixture infrastructure ─────────────────────────────────────────
+
+    #[derive(Debug, Deserialize)]
+    struct ProviderFixture {
+        cases: Vec<ProviderCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct ProviderCase {
+        name: String,
+        events: Vec<Value>,
+        expected: Vec<EventSummary>,
+    }
+
+    #[derive(Debug, Deserialize, Serialize, PartialEq)]
+    struct EventSummary {
+        kind: String,
+        #[serde(default)]
+        content_index: Option<usize>,
+        #[serde(default)]
+        delta: Option<String>,
+        #[serde(default)]
+        content: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+    }
+
+    fn load_fixture(file_name: &str) -> ProviderFixture {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/provider_responses")
+            .join(file_name);
+        let raw = std::fs::read_to_string(path).expect("fixture read");
+        serde_json::from_str(&raw).expect("fixture parse")
+    }
+
+    fn summarize_event(event: &StreamEvent) -> EventSummary {
+        match event {
+            StreamEvent::Start { .. } => EventSummary {
+                kind: "start".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextStart { content_index, .. } => EventSummary {
+                kind: "text_start".to_string(),
+                content_index: Some(*content_index),
+                delta: None,
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextDelta {
+                content_index,
+                delta,
+                ..
+            } => EventSummary {
+                kind: "text_delta".to_string(),
+                content_index: Some(*content_index),
+                delta: Some(delta.clone()),
+                content: None,
+                reason: None,
+            },
+            StreamEvent::TextEnd {
+                content_index,
+                content,
+                ..
+            } => EventSummary {
+                kind: "text_end".to_string(),
+                content_index: Some(*content_index),
+                delta: None,
+                content: Some(content.clone()),
+                reason: None,
+            },
+            StreamEvent::Done { reason, .. } => EventSummary {
+                kind: "done".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: Some(reason_to_string(*reason)),
+            },
+            StreamEvent::Error { reason, .. } => EventSummary {
+                kind: "error".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: Some(reason_to_string(*reason)),
+            },
+            _ => EventSummary {
+                kind: "other".to_string(),
+                content_index: None,
+                delta: None,
+                content: None,
+                reason: None,
+            },
+        }
+    }
+
+    fn reason_to_string(reason: StopReason) -> String {
+        match reason {
+            StopReason::Stop => "stop",
+            StopReason::Length => "length",
+            StopReason::ToolUse => "tool_use",
+            StopReason::Error => "error",
+            StopReason::Aborted => "aborted",
+        }
+        .to_string()
+    }
+
+    #[test]
+    fn test_stream_fixtures() {
+        let fixture = load_fixture("cohere_stream.json");
+        for case in fixture.cases {
+            let events = collect_events(&case.events);
+            let summaries: Vec<EventSummary> = events.iter().map(summarize_event).collect();
+            assert_eq!(summaries, case.expected, "case {}", case.name);
+        }
+    }
+
+    // ─── Existing tests ─────────────────────────────────────────────────
 
     #[test]
     fn test_provider_info() {
