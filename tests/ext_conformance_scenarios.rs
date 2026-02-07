@@ -1207,6 +1207,31 @@ impl MockSpecInterceptor {
                     });
                 }
             }
+
+            // For vcr_or_stub mode without explicit rules, provide a synthetic
+            // SSE stub response so extensions that make HTTP calls don't hang.
+            let mode = mock_http
+                .get("mode")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if mode == "vcr_or_stub" && interceptor.http_rules.is_empty() {
+                // 1px transparent PNG as base64 (valid image for any image-gen stub)
+                let stub_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=";
+                interceptor.http_default = serde_json::json!({
+                    "status": 200,
+                    "headers": {"content-type": "application/json"},
+                    "body": serde_json::json!({
+                        "candidates": [{
+                            "content": {
+                                "parts": [
+                                    {"text": "stubbed image response"},
+                                    {"inlineData": {"mimeType": "image/png", "data": stub_image}}
+                                ]
+                            }
+                        }]
+                    }).to_string()
+                });
+            }
         }
 
         interceptor
@@ -1614,6 +1639,47 @@ fn load_extension_with_mocks(
         }
     }
 
+    // Pre-seed extension state by mapping state keys to flags and dispatching
+    // session_start.  This covers extensions like plan-mode that read flags and
+    // persisted entries during session_start to initialise internal state.
+    if let Some(state) = setup.and_then(|s| s.get("state")).and_then(Value::as_object) {
+        let ext_id = extension_id.clone();
+        // Map well-known state keys to their corresponding flags
+        let state_to_flag: &[(&str, &str)] = &[("plan_mode_enabled", "plan")];
+        for (state_key, flag_name) in state_to_flag {
+            if let Some(value) = state.get(*state_key) {
+                common::run_async({
+                    let manager = manager.clone();
+                    let flag_name = (*flag_name).to_string();
+                    let flag_value = value.clone();
+                    let ext_id = ext_id.clone();
+                    async move {
+                        let _ = manager.set_flag_value(&ext_id, &flag_name, flag_value).await;
+                    }
+                });
+            }
+        }
+
+        // Dispatch session_start so extensions run their initialization logic
+        // (reading flags, restoring persisted state, setting active tools, etc.)
+        let settings = deterministic_settings_for(&cwd);
+        let default_spec_for_ctx = load_default_mock_spec();
+        let ctx = build_ctx_payload_with_mocks(&settings, None, setup, &default_spec_for_ctx);
+        common::run_async({
+            let runtime = runtime.clone();
+            async move {
+                let _ = runtime
+                    .dispatch_event(
+                        "session_start".to_string(),
+                        Value::Object(serde_json::Map::new()),
+                        ctx,
+                        DEFAULT_TIMEOUT_MS,
+                    )
+                    .await;
+            }
+        });
+    }
+
     Ok(LoadedExtensionWithMocks {
         manager,
         runtime,
@@ -1700,22 +1766,11 @@ fn build_ctx_payload_with_mocks(
 /// Check if a scenario needs setup features we cannot provide yet.
 /// Most features are now supported via `MockSpecInterceptor` and
 /// `ConformanceSession`.
-fn needs_unsupported_setup(scenario: &Scenario) -> Option<String> {
-    if let Some(setup) = &scenario.setup {
-        // mock_http with "vcr_or_stub" mode requires actual HTTP stubbing
-        // beyond our simple rule matching
-        if let Some(mock_http) = setup.get("mock_http") {
-            let mode = mock_http.get("mode").and_then(Value::as_str).unwrap_or("");
-            if mode == "vcr_or_stub" {
-                return Some("requires vcr_or_stub HTTP mock mode".to_string());
-            }
-        }
-
-        if setup.get("state").is_some() {
-            return Some("requires pre-seeded extension state".to_string());
-        }
-    }
-
+fn needs_unsupported_setup(_scenario: &Scenario) -> Option<String> {
+    // All previously unsupported setup types are now handled:
+    // - "vcr_or_stub" HTTP mock mode: treated as normal rule-based mock with
+    //   synthetic fallback response
+    // - "state": pre-seeded via flag injection + session_start event dispatch
     None
 }
 
@@ -1730,6 +1785,7 @@ fn needs_mock_loader(scenario: &Scenario) -> bool {
             || setup.get("session_branch").is_some()
             || setup.get("session_leaf_entry").is_some()
             || setup.get("flags").is_some()
+            || setup.get("state").is_some()
         {
             return true;
         }

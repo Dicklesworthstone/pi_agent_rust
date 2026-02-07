@@ -1,0 +1,403 @@
+{
+  "schema_version": "1.0.0",
+  "program_issue_id": "bd-k5q5.7",
+  "program_title": "Comprehensive Verification Program: unit tests, end-to-end scripts, and detailed diagnostics logging",
+  "updated_at": "2026-02-07",
+  "ci_policy": {
+    "required_categories": [
+      "unit_tests",
+      "e2e_scripts",
+      "evidence_logs"
+    ]
+  },
+  "requirements": [
+    {
+      "id": "bd-k5q5.7",
+      "title": "Comprehensive Verification Program: unit tests, end-to-end scripts, and detailed diagnostics logging",
+      "acceptance_criteria": "Every major runtime surface and workflow is covered by deterministic unit tests and end-to-end scripts with structured logs, and evidence is consumable in CI and local workflows.",
+      "unit_tests": [
+        {
+          "path": "tests/tools_conformance.rs",
+          "justification": "Core host tools conformance and behavior checks."
+        },
+        {
+          "path": "tests/ext_conformance_scenarios.rs",
+          "justification": "Extension runtime scenario verification."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Unified end-to-end orchestration script."
+        },
+        {
+          "path": "tests/run_e2e.sh",
+          "justification": "Existing E2E invocation wrapper."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/e2e_results/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Structured E2E run logs and artifact index output."
+        },
+        {
+          "path": "tests/ext_conformance/reports/**/*.json",
+          "generated_by_ci": true,
+          "justification": "Conformance and scenario reports published by CI."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.1",
+      "title": "Traceability matrix linking requirements to unit tests, e2e scripts, and evidence logs",
+      "acceptance_criteria": "Matrix is committed, machine-readable, and used by CI checks to detect uncovered requirements.",
+      "unit_tests": [
+        {
+          "path": "tests/conformance_fixtures.rs",
+          "justification": "Fixture-driven tests validate matrix-linked behavior categories."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Primary E2E entrypoint referenced by matrix entries."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/e2e_results/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "CI artifacts proving runtime coverage."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.2",
+      "title": "Harness unit-test expansion for normalization, dispatch, and determinism",
+      "acceptance_criteria": "Harness unit suite covers all known failure classes with detailed assertion messages and structured test logs.",
+      "unit_tests": [
+        {
+          "path": "tests/event_loop_conformance.rs",
+          "justification": "Deterministic event-loop behavior and ordering checks."
+        },
+        {
+          "path": "tests/js_runtime_ordering.rs",
+          "justification": "Dispatch ordering and deterministic runtime behavior."
+        },
+        {
+          "path": "tests/ext_conformance_fixture_schema.rs",
+          "justification": "Fixture normalization and schema-level validation."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Runs harness-sensitive suites through reproducible command flow."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/ext_conformance/reports/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Harness scenario execution traces and diagnostics."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.3",
+      "title": "Runtime compatibility unit-test matrix for Node and Bun API surfaces",
+      "acceptance_criteria": "API-level compatibility matrix is executable and produces per-API pass/fail output with rich diagnostics.",
+      "unit_tests": [
+        {
+          "path": "tests/node_buffer_shim.rs",
+          "justification": "Buffer API behavior coverage."
+        },
+        {
+          "path": "tests/node_crypto_shim.rs",
+          "justification": "Crypto API behavior coverage."
+        },
+        {
+          "path": "tests/node_http_shim.rs",
+          "justification": "HTTP shim behavior coverage."
+        },
+        {
+          "path": "tests/npm_module_stubs.rs",
+          "justification": "Module-level runtime compatibility checks."
+        },
+        {
+          "path": "tests/ext_conformance_matrix.rs",
+          "justification": "Compatibility matrix regression guard."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Executes compatibility-sensitive integration suites."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/ext_conformance/reports/**/*.json",
+          "generated_by_ci": true,
+          "justification": "Matrix and parity result payloads."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.4",
+      "title": "Capability policy unit tests for precedence, toggles, and scoped enforcement",
+      "acceptance_criteria": "Policy unit tests prove no unauthorized path is silently allowed and logs contain actionable context.",
+      "unit_tests": [
+        {
+          "path": "tests/extensions_policy_negative.rs",
+          "justification": "Negative policy enforcement and denial-path coverage."
+        },
+        {
+          "path": "tests/capability_denial_matrix.rs",
+          "justification": "Capability-denial matrix checks for safety controls."
+        },
+        {
+          "path": "tests/security_http_policy.rs",
+          "justification": "HTTP policy-level guard coverage."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "End-to-end policy behavior under interactive and non-interactive flows."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/ext_conformance/reports/negative/**/*.json*",
+          "generated_by_ci": true,
+          "justification": "Policy negative test reports and event traces."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.5",
+      "title": "End-to-end extension corpus test suite across capability profiles",
+      "acceptance_criteria": "E2E results include per-profile pass rates, blocked-operation summaries, detailed structured logs, and preflight-to-runtime consistency checks suitable for root-cause analysis.",
+      "unit_tests": [
+        {
+          "path": "tests/extensions_registration.rs",
+          "justification": "Registration and baseline runtime correctness before corpus E2E."
+        },
+        {
+          "path": "tests/extensions_provider_streaming.rs",
+          "justification": "Provider-path extension runtime behavior support."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Central script that runs extension-centric E2E suites."
+        },
+        {
+          "path": "tests/run_e2e.sh",
+          "justification": "Baseline shell wrapper for E2E orchestration."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/e2e_results/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Cross-profile E2E logs and artifact index entries."
+        },
+        {
+          "path": "tests/ext_conformance/reports/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Extension corpus parity/scenario traces."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.6",
+      "title": "Fault-injection e2e suite for resilience and error clarity",
+      "acceptance_criteria": "System degrades gracefully with clear user-facing diagnostics and logs sufficient for deterministic reproduction.",
+      "unit_tests": [
+        {
+          "path": "tests/provider_error_paths.rs",
+          "justification": "Provider fault and protocol edge-case coverage."
+        },
+        {
+          "path": "tests/error_handling.rs",
+          "justification": "Cross-provider error-path and messaging validation."
+        },
+        {
+          "path": "tests/extensions_reliability.rs",
+          "justification": "Extension-level resilience behavior checks."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Fault-sensitive E2E suites execute via unified runner."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/e2e_results/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Failure logs and reproducibility artifacts."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.7",
+      "title": "Test logging contract and correlation model",
+      "acceptance_criteria": "All test layers emit contract-compliant logs and tooling validates schema in CI.",
+      "unit_tests": [
+        {
+          "path": "tests/tui_state.rs",
+          "justification": "State tests exercise structured log + artifact emission helpers."
+        },
+        {
+          "path": "tests/ext_conformance_artifacts.rs",
+          "justification": "Artifact/report structure validation for conformance outputs."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Produces normalized multi-suite artifact outputs."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/e2e_results/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Structured E2E logs with correlation metadata."
+        },
+        {
+          "path": "tests/ext_conformance/reports/**/*.jsonl",
+          "generated_by_ci": true,
+          "justification": "Conformance logging outputs for schema validation."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.8",
+      "title": "Unified test runner scripts for local and CI workflows",
+      "acceptance_criteria": "Engineers can run verification quickly, and CI can reuse the exact same scripts for reproducibility.",
+      "unit_tests": [
+        {
+          "path": "tests/bench_scenario_runner.rs",
+          "justification": "Runner semantics and deterministic scenario orchestration checks."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Canonical runner for local + CI workflows."
+        },
+        {
+          "path": "tests/run_e2e.sh",
+          "justification": "Legacy-compatible wrapper still used by contributors."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/e2e_results/**/*.json",
+          "generated_by_ci": true,
+          "justification": "Run metadata summaries and artifact manifests."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.9",
+      "title": "Evidence diff and triage tooling for failed unit or e2e runs",
+      "acceptance_criteria": "Failure triage time is reduced with actionable, ranked diagnostics and reproducible command snippets.",
+      "unit_tests": [
+        {
+          "path": "tests/ext_conformance_diff.rs",
+          "justification": "Differential evidence and regression triage baseline."
+        },
+        {
+          "path": "tests/perf_comparison.rs",
+          "justification": "Comparison tooling for regression diagnostics."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Produces baseline and current artifacts consumed by diff workflows."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/ext_conformance/reports/parity/**/*.json*",
+          "generated_by_ci": true,
+          "justification": "Parity diff artifacts for triage."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.10",
+      "title": "Soak and longevity end-to-end verification",
+      "acceptance_criteria": "Soak reports include memory, timing, and error-rate trends with structured logs and pass/fail thresholds.",
+      "unit_tests": [
+        {
+          "path": "tests/extensions_stress.rs",
+          "justification": "Stress-path checks for prolonged extension runtime behavior."
+        },
+        {
+          "path": "tests/ext_memory_stress.rs",
+          "justification": "Memory-focused longevity checks."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Used as base orchestrator for long-running suites."
+        },
+        {
+          "path": "scripts/bench_extension_workloads.sh",
+          "justification": "Bench-oriented workload runs for sustained execution evidence."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/perf/reports/**/*.json*",
+          "generated_by_ci": true,
+          "justification": "Soak/perf artifacts and trend summaries."
+        }
+      ]
+    },
+    {
+      "id": "bd-k5q5.7.11",
+      "title": "User-focused verification reports and release-readiness summary",
+      "acceptance_criteria": "Reports are generated automatically from test artifacts and directly answer whether users can safely run extensions in each profile.",
+      "unit_tests": [
+        {
+          "path": "tests/conformance_report.rs",
+          "justification": "Conformance reporting shape and output checks."
+        },
+        {
+          "path": "tests/ext_conformance_artifacts.rs",
+          "justification": "Artifact/report integrity validation."
+        }
+      ],
+      "e2e_scripts": [
+        {
+          "path": "scripts/e2e/run_all.sh",
+          "justification": "Generates top-level artifacts consumed by release-readiness summaries."
+        }
+      ],
+      "evidence_logs": [
+        {
+          "path": "tests/ext_conformance/reports/**/*.json",
+          "generated_by_ci": true,
+          "justification": "Machine-readable reporting artifacts for user-facing summaries."
+        },
+        {
+          "path": "tests/e2e_results/**/*.json",
+          "generated_by_ci": true,
+          "justification": "Aggregated E2E run summaries for readiness output."
+        }
+      ]
+    }
+  ]
+}
