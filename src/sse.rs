@@ -212,6 +212,7 @@ where
     S: futures::Stream<Item = Result<Vec<u8>, std::io::Error>> + Unpin,
 {
     /// Poll for the next SSE event.
+    #[allow(clippy::too_many_lines)]
     pub fn poll_next_event(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -243,8 +244,10 @@ where
                                         let events = self.parser.feed(s);
                                         self.pending_events.extend(events);
                                     }
-                                    // Preserve the offending bytes for diagnostics.
-                                    self.utf8_buffer = bytes;
+                                    // Keep only the offending bytes (skip already-processed prefix).
+                                    let mut remainder = bytes;
+                                    remainder.drain(..valid_len);
+                                    self.utf8_buffer = remainder;
                                     return Poll::Ready(Some(Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,
                                         e,
@@ -285,7 +288,8 @@ where
                                         let events = self.parser.feed(s);
                                         self.pending_events.extend(events);
                                     }
-                                    // Restore buffer so callers can inspect state if they want.
+                                    // Keep only the offending bytes (skip already-processed prefix).
+                                    utf8_buffer.drain(..valid_len);
                                     self.utf8_buffer = utf8_buffer;
                                     return Poll::Ready(Some(Err(std::io::Error::new(
                                         std::io::ErrorKind::InvalidData,

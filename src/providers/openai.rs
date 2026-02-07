@@ -245,10 +245,12 @@ impl Provider for OpenAIProvider {
                             }
 
                             if let Err(e) = state.process_event(&msg.data) {
+                                state.done = true;
                                 return Some((Err(e), state));
                             }
                         }
                         Some(Err(e)) => {
+                            state.done = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
                         }
