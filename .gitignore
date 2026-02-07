@@ -1,5 +1,7 @@
 /target/
 target-*/
+target_*/
+.tmp/
 a.out
 rustc-ice-*.txt
 *.snap.new
