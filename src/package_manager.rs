@@ -482,7 +482,9 @@ impl PackageManager {
 
         thread::spawn(move || {
             let resolved = {
-                let accumulator = accumulator.lock().unwrap();
+                let accumulator = accumulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 accumulator.clone().into_resolved_paths()
             };
             maybe_emit_compat_ledgers(&resolved.extensions);

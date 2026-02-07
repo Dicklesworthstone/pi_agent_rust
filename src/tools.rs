@@ -2056,6 +2056,10 @@ impl Tool for EditTool {
         }
 
         // Atomic write (safe improvement vs legacy, behavior-equivalent).
+        // Capture original permissions before the file is replaced.
+        let original_perms = std::fs::metadata(&absolute_path)
+            .ok()
+            .map(|m| m.permissions());
         let parent = absolute_path.parent().unwrap_or_else(|| Path::new("."));
         let temp_file = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| Error::tool("edit", format!("Failed to create temp file: {e}")))?;
@@ -2065,6 +2069,10 @@ impl Tool for EditTool {
         temp_file
             .persist(&absolute_path)
             .map_err(|e| Error::tool("edit", format!("Failed to persist file: {e}")))?;
+        // Restore original file permissions (tempfile defaults to 0o600).
+        if let Some(perms) = original_perms {
+            let _ = std::fs::set_permissions(&absolute_path, perms);
+        }
 
         let (diff, first_changed_line) = generate_diff_string(&base_content, &new_content);
         let mut details = serde_json::Map::new();
@@ -2164,6 +2172,8 @@ impl Tool for WriteTool {
         let bytes_written = input.content.encode_utf16().count();
 
         // Write atomically using tempfile
+        // Capture original permissions before the file is replaced (new files get None).
+        let original_perms = std::fs::metadata(&path).ok().map(|m| m.permissions());
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         let temp_file = tempfile::NamedTempFile::new_in(parent)
             .map_err(|e| Error::tool("write", format!("Failed to create temp file: {e}")))?;
@@ -2176,6 +2186,10 @@ impl Tool for WriteTool {
         temp_file
             .persist(&path)
             .map_err(|e| Error::tool("write", format!("Failed to persist file: {e}")))?;
+        // Restore original file permissions (tempfile defaults to 0o600).
+        if let Some(perms) = original_perms {
+            let _ = std::fs::set_permissions(&path, perms);
+        }
 
         Ok(ToolOutput {
             content: vec![ContentBlock::Text(TextContent::new(format!(

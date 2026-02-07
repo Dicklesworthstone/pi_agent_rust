@@ -50,23 +50,50 @@ pub(crate) struct WasmBridgeState {
     modules: HashMap<u32, WasmModule>,
     instances: HashMap<u32, InstanceState>,
     next_id: u32,
+    max_modules: usize,
+    max_instances: usize,
 }
 
 impl WasmBridgeState {
-    pub fn new() -> Result<Self, String> {
+    pub fn new() -> Self {
         let engine = Engine::default();
-        Ok(Self {
+        Self {
             engine,
             modules: HashMap::new(),
             instances: HashMap::new(),
             next_id: 1,
-        })
+            max_modules: DEFAULT_MAX_MODULES,
+            max_instances: DEFAULT_MAX_INSTANCES,
+        }
     }
 
-    fn alloc_id(&mut self) -> u32 {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        id
+    fn alloc_id(&mut self) -> Result<u32, String> {
+        let start = self.next_id.max(1);
+        let mut candidate = start;
+
+        loop {
+            if !self.modules.contains_key(&candidate) && !self.instances.contains_key(&candidate) {
+                self.next_id = candidate.wrapping_add(1);
+                if self.next_id == 0 {
+                    self.next_id = 1;
+                }
+                return Ok(candidate);
+            }
+
+            candidate = candidate.wrapping_add(1);
+            if candidate == 0 {
+                candidate = 1;
+            }
+            if candidate == start {
+                return Err("WASM instance/module id space exhausted".to_string());
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn set_limits_for_test(&mut self, max_modules: usize, max_instances: usize) {
+        self.max_modules = max_modules.max(1);
+        self.max_instances = max_instances.max(1);
     }
 }
 
@@ -76,11 +103,9 @@ impl WasmBridgeState {
 
 fn throw_wasm(ctx: &Ctx<'_>, class: &str, msg: &str) -> rquickjs::Error {
     let text = format!("{class}: {msg}");
-    let _ = ctx.throw(
-        rquickjs::String::from_str(ctx.clone(), &text)
-            .expect("alloc error string")
-            .into_value(),
-    );
+    if let Ok(js_text) = rquickjs::String::from_str(ctx.clone(), &text) {
+        let _ = ctx.throw(js_text.into_value());
+    }
     rquickjs::Error::Exception
 }
 
@@ -94,7 +119,7 @@ fn extract_bytes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<u8>> 
         if let Some(ab) = obj.as_array_buffer() {
             return ab
                 .as_bytes()
-                .map(|b| b.to_vec())
+                .map(<[u8]>::to_vec)
                 .ok_or_else(|| throw_wasm(ctx, "TypeError", "Detached ArrayBuffer"));
         }
     }
@@ -119,6 +144,7 @@ fn extract_bytes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<u8>> 
 
 /// Convert a WASM `Val` to an f64 for returning to JS.
 /// All WASM numeric types (i32, i64, f32, f64) are representable as f64.
+#[allow(clippy::cast_precision_loss)]
 fn val_to_f64(val: &Val) -> f64 {
     match val {
         Val::I32(v) => f64::from(*v),
@@ -129,6 +155,7 @@ fn val_to_f64(val: &Val) -> f64 {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn js_to_val(ctx: &Ctx<'_>, value: &Value<'_>, ty: &ValType) -> rquickjs::Result<Val> {
     match ty {
         ValType::I32 => {
@@ -174,32 +201,25 @@ fn register_stub_imports(
     for import in module.imports() {
         let mod_name = import.module();
         let imp_name = import.name();
-        match import.ty() {
-            ExternType::Func(func_ty) => {
-                let result_types: Vec<ValType> = func_ty.results().collect();
-                linker
-                    .func_new(
-                        mod_name,
-                        imp_name,
-                        func_ty.clone(),
-                        move |_caller: Caller<'_, WasmHostData>,
-                              _params: &[Val],
-                              results: &mut [Val]| {
-                            for (i, ty) in result_types.iter().enumerate() {
-                                results[i] = Val::default_for_ty(ty).unwrap_or(Val::I32(0));
-                            }
-                            Ok(())
-                        },
-                    )
-                    .map_err(|e| format!("Failed to stub import {mod_name}.{imp_name}: {e}"))?;
-            }
-            ExternType::Memory(_) => {
-                // Memory imports are rare; skip for MVP (instantiation will
-                // fail with a clear wasmtime error if needed).
-            }
-            _ => {
-                // Tables/globals: skip similarly.
-            }
+        if let ExternType::Func(func_ty) = import.ty() {
+            let result_types: Vec<ValType> = func_ty.results().collect();
+            linker
+                .func_new(
+                    mod_name,
+                    imp_name,
+                    func_ty.clone(),
+                    move |_caller: Caller<'_, WasmHostData>,
+                          _params: &[Val],
+                          results: &mut [Val]| {
+                        for (i, ty) in result_types.iter().enumerate() {
+                            results[i] = Val::default_for_ty(ty).unwrap_or(Val::I32(0));
+                        }
+                        Ok(())
+                    },
+                )
+                .map_err(|e| format!("Failed to stub import {mod_name}.{imp_name}: {e}"))?;
+        } else {
+            // Non-function imports are currently skipped for MVP.
         }
     }
     Ok(())
@@ -211,27 +231,40 @@ fn register_stub_imports(
 
 /// Maximum default memory pages (64 KiB per page → 64 MB).
 const DEFAULT_MAX_MEMORY_PAGES: u64 = 1024;
+/// Hard limit on compiled modules kept alive in one JS runtime.
+const DEFAULT_MAX_MODULES: usize = 256;
+/// Hard limit on instantiated modules kept alive in one JS runtime.
+const DEFAULT_MAX_INSTANCES: usize = 256;
 
 /// Inject `globalThis.WebAssembly` polyfill into the QuickJS context.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn inject_wasm_globals(
     ctx: &Ctx<'_>,
-    state: Rc<RefCell<WasmBridgeState>>,
+    state: &Rc<RefCell<WasmBridgeState>>,
 ) -> rquickjs::Result<()> {
     let global = ctx.globals();
 
     // ---- __pi_wasm_compile_native(bytes) → module_id ----
     {
-        let st = state.clone();
+        let st = Rc::clone(state);
         global.set(
             "__pi_wasm_compile_native",
             Func::from(
                 move |ctx: Ctx<'_>, bytes_val: Value<'_>| -> rquickjs::Result<u32> {
                     let bytes = extract_bytes(&ctx, &bytes_val)?;
                     let mut bridge = st.borrow_mut();
+                    if bridge.modules.len() >= bridge.max_modules {
+                        return Err(throw_wasm(
+                            &ctx,
+                            "CompileError",
+                            &format!("Module limit reached ({})", bridge.max_modules),
+                        ));
+                    }
                     let module = WasmModule::from_binary(&bridge.engine, &bytes)
                         .map_err(|e| throw_wasm(&ctx, "CompileError", &e.to_string()))?;
-                    let id = bridge.alloc_id();
+                    let id = bridge
+                        .alloc_id()
+                        .map_err(|e| throw_wasm(&ctx, "CompileError", &e))?;
                     debug!(module_id = id, bytes_len = bytes.len(), "wasm: compiled");
                     bridge.modules.insert(id, module);
                     Ok(id)
@@ -242,12 +275,19 @@ pub(crate) fn inject_wasm_globals(
 
     // ---- __pi_wasm_instantiate_native(module_id) → instance_id ----
     {
-        let st = state.clone();
+        let st = Rc::clone(state);
         global.set(
             "__pi_wasm_instantiate_native",
             Func::from(
                 move |ctx: Ctx<'_>, module_id: u32| -> rquickjs::Result<u32> {
                     let mut bridge = st.borrow_mut();
+                    if bridge.instances.len() >= bridge.max_instances {
+                        return Err(throw_wasm(
+                            &ctx,
+                            "RuntimeError",
+                            &format!("Instance limit reached ({})", bridge.max_instances),
+                        ));
+                    }
                     let module = bridge
                         .modules
                         .get(&module_id)
@@ -268,7 +308,9 @@ pub(crate) fn inject_wasm_globals(
                         .instantiate(&mut store, &module)
                         .map_err(|e| throw_wasm(&ctx, "LinkError", &e.to_string()))?;
 
-                    let id = bridge.alloc_id();
+                    let id = bridge
+                        .alloc_id()
+                        .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e))?;
                     debug!(instance_id = id, module_id, "wasm: instantiated");
                     bridge
                         .instances
@@ -281,7 +323,7 @@ pub(crate) fn inject_wasm_globals(
 
     // ---- __pi_wasm_get_exports_native(instance_id) → JSON string [{name, kind}] ----
     {
-        let st = state.clone();
+        let st = Rc::clone(state);
         global.set(
             "__pi_wasm_get_exports_native",
             Func::from(
@@ -300,7 +342,7 @@ pub(crate) fn inject_wasm_globals(
                             wasmtime::Extern::Memory(_) => "memory",
                             wasmtime::Extern::Table(_) => "table",
                             wasmtime::Extern::Global(_) => "global",
-                            _ => "unknown",
+                            wasmtime::Extern::SharedMemory(_) => "shared-memory",
                         };
                         entries.push(WasmExportEntry { name, kind });
                     }
@@ -313,7 +355,7 @@ pub(crate) fn inject_wasm_globals(
 
     // ---- __pi_wasm_call_export_native(instance_id, name, args_array) → f64 result ----
     {
-        let st = state.clone();
+        let st = Rc::clone(state);
         global.set(
             "__pi_wasm_call_export_native",
             Func::from(
@@ -359,10 +401,7 @@ pub(crate) fn inject_wasm_globals(
                         .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e.to_string()))?;
 
                     // Return first result as f64 (covers i32, i64, f32, f64)
-                    Ok(match results.first() {
-                        Some(val) => val_to_f64(val),
-                        None => 0.0,
-                    })
+                    Ok(results.first().map_or(0.0, val_to_f64))
                 },
             ),
         )?;
@@ -370,7 +409,7 @@ pub(crate) fn inject_wasm_globals(
 
     // ---- __pi_wasm_get_buffer_native(instance_id, mem_name) → stores ArrayBuffer in global ----
     {
-        let st = state.clone();
+        let st = Rc::clone(state);
         global.set(
             "__pi_wasm_get_buffer_native",
             Func::from(
@@ -396,7 +435,7 @@ pub(crate) fn inject_wasm_globals(
 
     // ---- __pi_wasm_memory_grow_native(instance_id, mem_name, delta) → prev_pages ----
     {
-        let st = state.clone();
+        let st = Rc::clone(state);
         global.set(
             "__pi_wasm_memory_grow_native",
             Func::from(
@@ -422,10 +461,9 @@ pub(crate) fn inject_wasm_globals(
                         return Ok(-1); // growth denied by policy
                     }
 
-                    match memory.grow(&mut inst.store, u64::from(delta)) {
-                        Ok(prev) => Ok(i32::try_from(prev).unwrap_or(-1)),
-                        Err(_) => Ok(-1),
-                    }
+                    Ok(memory
+                        .grow(&mut inst.store, u64::from(delta))
+                        .map_or(-1, |prev| i32::try_from(prev).unwrap_or(-1)))
                 },
             ),
         )?;
@@ -433,7 +471,7 @@ pub(crate) fn inject_wasm_globals(
 
     // ---- __pi_wasm_memory_size_native(instance_id, mem_name) → pages ----
     {
-        let st = state.clone();
+        let st = Rc::clone(state);
         global.set(
             "__pi_wasm_memory_size_native",
             Func::from(
@@ -645,10 +683,8 @@ mod tests {
         let rt = rquickjs::Runtime::new().expect("create runtime");
         let ctx = rquickjs::Context::full(&rt).expect("create context");
         ctx.with(|ctx| {
-            let state = Rc::new(RefCell::new(
-                WasmBridgeState::new().expect("create bridge state"),
-            ));
-            inject_wasm_globals(&ctx, state.clone()).expect("inject globals");
+            let state = Rc::new(RefCell::new(WasmBridgeState::new()));
+            inject_wasm_globals(&ctx, &state).expect("inject globals");
             f(&ctx, state);
         });
     }
@@ -671,7 +707,7 @@ mod tests {
             // Store bytes as a JS array
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
@@ -700,7 +736,7 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
@@ -728,7 +764,7 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
@@ -757,18 +793,18 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
             let count: i32 = ctx
                 .eval(
-                    r#"
+                    r"
                     var mid = __pi_wasm_compile_native(__test_bytes);
                     var iid = __pi_wasm_instantiate_native(mid);
                     var exps = JSON.parse(__pi_wasm_get_exports_native(iid));
                     exps.length;
-                "#,
+                ",
                 )
                 .expect("get exports count");
             assert_eq!(count, 3);
@@ -785,17 +821,17 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
             let name: String = ctx
                 .eval(
-                    r#"
+                    r"
                     var mid = __pi_wasm_compile_native(__test_bytes);
                     var iid = __pi_wasm_instantiate_native(mid);
                     JSON.parse(__pi_wasm_get_exports_native(iid))[0].name;
-                "#,
+                ",
                 )
                 .expect("parse export JSON");
             assert_eq!(name, "name\"with_quote");
@@ -808,7 +844,7 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
@@ -839,7 +875,7 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
@@ -868,16 +904,16 @@ mod tests {
         run_wasm_test(|ctx, state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
             let instance_id: u32 = ctx
                 .eval(
-                    r#"
+                    r"
                     var mid = __pi_wasm_compile_native(__test_bytes);
                     __pi_wasm_instantiate_native(mid);
-                "#,
+                ",
                 )
                 .expect("instantiate");
 
@@ -915,12 +951,89 @@ mod tests {
     }
 
     #[test]
+    fn compile_rejects_when_module_limit_reached() {
+        let wasm_bytes = wat_to_wasm(r"(module)");
+        run_wasm_test(|ctx, state| {
+            state.borrow_mut().set_limits_for_test(1, 8);
+
+            let arr = rquickjs::Array::new(ctx.clone()).unwrap();
+            for (i, &b) in wasm_bytes.iter().enumerate() {
+                arr.set(i, i32::from(b)).unwrap();
+            }
+            ctx.globals().set("__test_bytes", arr).unwrap();
+
+            let first: u32 = ctx
+                .eval("__pi_wasm_compile_native(__test_bytes)")
+                .expect("first compile");
+            assert!(first > 0);
+
+            let second: rquickjs::Result<u32> = ctx.eval("__pi_wasm_compile_native(__test_bytes)");
+            assert!(second.is_err());
+        });
+    }
+
+    #[test]
+    fn instantiate_rejects_when_instance_limit_reached() {
+        let wasm_bytes = wat_to_wasm(r"(module)");
+        run_wasm_test(|ctx, state| {
+            state.borrow_mut().set_limits_for_test(8, 1);
+
+            let arr = rquickjs::Array::new(ctx.clone()).unwrap();
+            for (i, &b) in wasm_bytes.iter().enumerate() {
+                arr.set(i, i32::from(b)).unwrap();
+            }
+            ctx.globals().set("__test_bytes", arr).unwrap();
+
+            let module_id: u32 = ctx
+                .eval("__pi_wasm_compile_native(__test_bytes)")
+                .expect("compile");
+
+            let first: u32 = ctx
+                .eval(format!("__pi_wasm_instantiate_native({module_id})"))
+                .expect("first instantiate");
+            assert!(first > 0);
+
+            let second: rquickjs::Result<u32> =
+                ctx.eval(format!("__pi_wasm_instantiate_native({module_id})"));
+            assert!(second.is_err());
+        });
+    }
+
+    #[test]
+    fn alloc_id_skips_zero_on_wrap() {
+        let wasm_bytes = wat_to_wasm(r"(module)");
+        run_wasm_test(|ctx, state| {
+            {
+                let mut bridge = state.borrow_mut();
+                bridge.set_limits_for_test(8, 8);
+                bridge.next_id = u32::MAX;
+            }
+
+            let arr = rquickjs::Array::new(ctx.clone()).unwrap();
+            for (i, &b) in wasm_bytes.iter().enumerate() {
+                arr.set(i, i32::from(b)).unwrap();
+            }
+            ctx.globals().set("__test_bytes", arr).unwrap();
+
+            let first: u32 = ctx
+                .eval("__pi_wasm_compile_native(__test_bytes)")
+                .expect("first compile");
+            let second: u32 = ctx
+                .eval("__pi_wasm_compile_native(__test_bytes)")
+                .expect("second compile");
+
+            assert_eq!(first, u32::MAX);
+            assert_eq!(second, 1);
+        });
+    }
+
+    #[test]
     fn call_nonexistent_export_fails() {
         let wasm_bytes = wat_to_wasm(r#"(module (func (export "f") (result i32) i32.const 1))"#);
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
@@ -946,7 +1059,7 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
@@ -960,13 +1073,13 @@ mod tests {
             // resolve it synchronously via .then()
             let result: i32 = ctx
                 .eval(
-                    r#"
+                    r"
                     var __test_result = -1;
                     WebAssembly.instantiate(__test_bytes).then(function(r) {
                         __test_result = r.instance.exports.add(10, 20);
                     });
                     __test_result;
-                "#,
+                ",
                 )
                 .expect("polyfill instantiate");
             assert_eq!(result, 30);
@@ -979,19 +1092,19 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
             let size: i32 = ctx
                 .eval(
-                    r#"
+                    r"
                     var __test_size = -1;
                     WebAssembly.instantiate(__test_bytes).then(function(r) {
                         __test_size = r.instance.exports.memory.buffer.byteLength;
                     });
                     __test_size;
-                "#,
+                ",
                 )
                 .expect("polyfill memory buffer");
             assert_eq!(size, 65536);
@@ -1012,7 +1125,7 @@ mod tests {
         run_wasm_test(|ctx, _state| {
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
             for (i, &b) in wasm_bytes.iter().enumerate() {
-                arr.set(i, b as i32).unwrap();
+                arr.set(i, i32::from(b)).unwrap();
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 

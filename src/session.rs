@@ -784,21 +784,28 @@ impl Session {
             asupersync::fs::create_dir_all(&project_session_dir).await?;
 
             let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
-            // Robust against malformed/legacy session ids that may be shorter than 8 chars.
+            // Robust against malformed/legacy session ids: keep a short, filename-safe suffix.
             let short_id = {
-                let prefix: String = self.header.id.chars().take(8).collect();
-                if prefix.is_empty() {
+                let prefix: String = self
+                    .header
+                    .id
+                    .chars()
+                    .take(8)
+                    .map(|ch| {
+                        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                            ch
+                        } else {
+                            '_'
+                        }
+                    })
+                    .collect();
+                if prefix.trim_matches('_').is_empty() {
                     "session".to_string()
                 } else {
                     prefix
                 }
             };
-            let filename = format!(
-                "{}_{}.{}",
-                timestamp,
-                short_id,
-                store_kind.extension()
-            );
+            let filename = format!("{}_{}.{}", timestamp, short_id, store_kind.extension());
             self.path = Some(project_session_dir.join(filename));
         }
 
@@ -1379,9 +1386,9 @@ impl Session {
 
             // Find the index of the compaction entry so we can fall back to
             // including everything after it if first_kept_entry_id is orphaned.
-            let compaction_idx = path_entries.iter().position(|e| {
-                matches!(e, SessionEntry::Compaction(c) if std::ptr::eq(c, compaction))
-            });
+            let compaction_idx = path_entries.iter().position(
+                |e| matches!(e, SessionEntry::Compaction(c) if std::ptr::eq(c, compaction)),
+            );
 
             let has_kept_entry = path_entries.iter().any(|e| {
                 e.base_id()
@@ -2656,6 +2663,23 @@ mod tests {
             .and_then(|n| n.to_str())
             .expect("empty id filename");
         assert!(empty_name.contains("_session."));
+
+        let mut unsafe_id_session = Session::create_with_dir(Some(temp.path().to_path_buf()));
+        unsafe_id_session.header.id = "../etc/passwd".to_string();
+        run_async(async { unsafe_id_session.save().await }).expect("save with unsafe id");
+        let unsafe_path = unsafe_id_session.path.as_ref().expect("unsafe id path");
+        let unsafe_name = unsafe_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("unsafe id filename");
+        assert!(unsafe_name.contains("____etc_p."));
+        let expected_dir = temp
+            .path()
+            .join(encode_cwd(&std::env::current_dir().unwrap()));
+        assert_eq!(
+            unsafe_path.parent().expect("unsafe id parent"),
+            expected_dir.as_path()
+        );
     }
 
     #[test]

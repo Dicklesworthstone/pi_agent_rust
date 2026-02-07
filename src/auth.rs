@@ -56,7 +56,17 @@ impl AuthStorage {
             // Read from the locked file handle, not a new handle
             let mut content = String::new();
             locked.as_file_mut().read_to_string(&mut content)?;
-            let parsed: AuthFile = serde_json::from_str(&content).unwrap_or_default();
+            let parsed: AuthFile = match serde_json::from_str(&content) {
+                Ok(file) => file,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "pi.auth.parse_error",
+                        error = %e,
+                        "auth.json is corrupted; starting with empty credentials"
+                    );
+                    AuthFile::default()
+                }
+            };
             parsed.entries
         } else {
             HashMap::new()
@@ -72,7 +82,17 @@ impl AuthStorage {
             let mut locked = lock_file_async(file, Duration::from_secs(30)).await?;
             let mut content = String::new();
             locked.as_file_mut().read_to_string(&mut content)?;
-            let parsed: AuthFile = serde_json::from_str(&content).unwrap_or_default();
+            let parsed: AuthFile = match serde_json::from_str(&content) {
+                Ok(file) => file,
+                Err(e) => {
+                    tracing::warn!(
+                        event = "pi.auth.parse_error",
+                        error = %e,
+                        "auth.json is corrupted; starting with empty credentials"
+                    );
+                    AuthFile::default()
+                }
+            };
             parsed.entries
         } else {
             HashMap::new()
@@ -318,9 +338,8 @@ impl AuthStorage {
                         provider = %provider,
                         error = %e,
                         elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        "Failed to refresh extension OAuth token"
+                        "Failed to refresh extension OAuth token; continuing with remaining providers"
                     );
-                    return Err(e);
                 }
             }
         }

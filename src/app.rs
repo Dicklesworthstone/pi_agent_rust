@@ -851,14 +851,12 @@ fn is_alias(model_id: &str) -> bool {
     if model_id.ends_with("-latest") {
         return true;
     }
-    if model_id.len() < 9 {
+
+    let Some((_, date_suffix)) = model_id.rsplit_once('-') else {
         return true;
-    }
-    let suffix = &model_id[model_id.len() - 9..];
-    if !suffix.starts_with('-') {
-        return true;
-    }
-    !suffix[1..].chars().all(|c| c.is_ascii_digit())
+    };
+
+    date_suffix.len() != 8 || !date_suffix.chars().all(|c| c.is_ascii_digit())
 }
 
 fn models_equal(left: &ModelEntry, right: &ModelEntry) -> bool {
@@ -1000,6 +998,13 @@ mod tests {
         assert_eq!(model.model.id, "gpt-5.1-codex-20250601");
         assert!(parsed.thinking_level.is_none());
         assert!(parsed.warning.is_none());
+    }
+
+    #[test]
+    fn is_alias_handles_non_ascii_model_ids_without_panicking() {
+        assert!(is_alias("é123456789"));
+        assert!(is_alias("model-é2345678"));
+        assert!(!is_alias("model-20250101"));
     }
 
     #[test]

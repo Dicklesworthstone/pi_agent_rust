@@ -23,6 +23,8 @@ const DEFAULT_USER_AGENT: &str = "pi_agent_rust/0.1";
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const READ_CHUNK_BYTES: usize = 16 * 1024;
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
+const MAX_TEXT_BODY_BYTES: usize = 50 * 1024 * 1024;
+const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Debug, Clone)]
 pub struct Client {
@@ -103,7 +105,7 @@ impl<'a> RequestBuilder<'a> {
             url: url.to_string(),
             headers: Vec::new(),
             body: Vec::new(),
-            timeout: None,
+            timeout: Some(DEFAULT_REQUEST_TIMEOUT),
         }
     }
 
@@ -116,6 +118,14 @@ impl<'a> RequestBuilder<'a> {
     #[must_use]
     pub const fn timeout(mut self, duration: std::time::Duration) -> Self {
         self.timeout = Some(duration);
+        self
+    }
+
+    /// Remove the timeout entirely. Use for requests that are expected to take
+    /// an arbitrarily long time (e.g. long-polling SSE streams).
+    #[must_use]
+    pub const fn no_timeout(mut self) -> Self {
+        self.timeout = None;
         self
     }
 
@@ -285,6 +295,9 @@ impl Response {
         let bytes = self
             .stream
             .try_fold(Vec::new(), |mut acc, chunk| async move {
+                if acc.len().saturating_add(chunk.len()) > MAX_TEXT_BODY_BYTES {
+                    return Err(std::io::Error::other("response body too large"));
+                }
                 acc.extend_from_slice(&chunk);
                 Ok::<_, std::io::Error>(acc)
             })
@@ -315,6 +328,11 @@ async fn connect_transport(parsed: &ParsedUrl, client: &Client) -> Result<Transp
     }
 }
 
+/// Strip CR/LF from header names and values to prevent HTTP header injection.
+fn sanitize_header_value(value: &str) -> String {
+    value.chars().filter(|&c| c != '\r' && c != '\n').collect()
+}
+
 fn build_request_bytes(
     method: Method,
     parsed: &ParsedUrl,
@@ -333,7 +351,10 @@ fn build_request_bytes(
         std::fmt::Write::write_fmt(&mut out, format_args!("Content-Length: {}\r\n", body.len()));
 
     for (name, value) in headers {
-        let _ = std::fmt::Write::write_fmt(&mut out, format_args!("{name}: {value}\r\n"));
+        let clean_name = sanitize_header_value(name);
+        let clean_value = sanitize_header_value(value);
+        let _ =
+            std::fmt::Write::write_fmt(&mut out, format_args!("{clean_name}: {clean_value}\r\n"));
     }
 
     out.push_str("\r\n");
@@ -1173,12 +1194,26 @@ mod tests {
     }
 
     #[test]
+    fn request_builder_default_timeout() {
+        let client = Client::new();
+        let builder = client.get("https://api.example.com");
+        assert_eq!(builder.timeout, Some(DEFAULT_REQUEST_TIMEOUT));
+    }
+
+    #[test]
     fn request_builder_timeout() {
         let client = Client::new();
         let builder = client
             .get("https://api.example.com")
             .timeout(std::time::Duration::from_secs(30));
         assert_eq!(builder.timeout, Some(std::time::Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn request_builder_no_timeout() {
+        let client = Client::new();
+        let builder = client.get("https://api.example.com").no_timeout();
+        assert_eq!(builder.timeout, None);
     }
 
     // ── Response ───────────────────────────────────────────────────────
@@ -1342,5 +1377,71 @@ mod tests {
         let req = build_recorded_request(Method::Post, "https://test.com", &headers, &body);
         // Should detect JSON despite case differences
         assert!(req.body.is_some());
+    }
+
+    // ── CRLF header injection prevention ──────────────────────────────
+    #[test]
+    fn sanitize_header_value_strips_crlf() {
+        assert_eq!(sanitize_header_value("normal value"), "normal value");
+        assert_eq!(
+            sanitize_header_value("injected\r\nEvil: header"),
+            "injectedEvil: header"
+        );
+        assert_eq!(sanitize_header_value("bare\nnewline"), "barenewline");
+        assert_eq!(sanitize_header_value("bare\rreturn"), "barereturn");
+        assert_eq!(sanitize_header_value(""), "");
+    }
+
+    #[test]
+    fn build_request_bytes_strips_crlf_from_headers() {
+        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let headers = vec![(
+            "X-Injected\r\nEvil".to_string(),
+            "value\r\nX-Bad: smuggled".to_string(),
+        )];
+        let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
+        let text = String::from_utf8(bytes).unwrap();
+        // CRLF should be stripped — no injected header line
+        assert!(text.contains("X-InjectedEvil: valueX-Bad: smuggled\r\n"));
+        // The smuggled header must NOT appear as a separate line
+        assert!(!text.contains("\r\nX-Bad: smuggled\r\n"));
+    }
+
+    // ── Response body size limit ──────────────────────────────────────
+    #[test]
+    fn response_text_rejects_oversized_body() {
+        asupersync::test_utils::run_test(|| async {
+            // Create a stream that would exceed MAX_TEXT_BODY_BYTES
+            let big_chunk = vec![0u8; MAX_TEXT_BODY_BYTES + 1];
+            let chunks: Vec<std::io::Result<Vec<u8>>> = vec![Ok(big_chunk)];
+            let response = Response {
+                status: 200,
+                headers: Vec::new(),
+                stream: Box::pin(futures::stream::iter(chunks)),
+            };
+            let result = response.text().await;
+            assert!(result.is_err());
+            let err_msg = format!("{}", result.unwrap_err());
+            assert!(
+                err_msg.contains("too large"),
+                "error should mention size: {err_msg}"
+            );
+        });
+    }
+
+    #[test]
+    fn response_text_accepts_body_at_limit() {
+        asupersync::test_utils::run_test(|| async {
+            let chunk = vec![b'a'; MAX_TEXT_BODY_BYTES];
+            let chunks: Vec<std::io::Result<Vec<u8>>> = vec![Ok(chunk)];
+            let response = Response {
+                status: 200,
+                headers: Vec::new(),
+                stream: Box::pin(futures::stream::iter(chunks)),
+            };
+            let result = response.text().await;
+            assert!(result.is_ok());
+            assert_eq!(result.unwrap().len(), MAX_TEXT_BODY_BYTES);
+        });
     }
 }

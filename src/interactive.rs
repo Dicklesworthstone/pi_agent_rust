@@ -1502,7 +1502,7 @@ impl PiApp {
                     .take(28)
                     .collect::<String>();
                 let messages = session.message_count.to_string();
-                let id = &session.id[..8.min(session.id.len())];
+                let id = crate::session_picker::truncate_session_id(&session.id, 8);
 
                 let row = format!(" {time:<20}  {name:<30}  {messages:<8}  {id}");
                 let rendered = if is_selected {
@@ -3764,7 +3764,9 @@ fn build_tree_selector_rows(
         let Some(&idx) = entry_index_by_id.get(id) else {
             return Vec::new();
         };
-        let entry = &session.entries[idx];
+        let Some(entry) = session.entries.get(idx) else {
+            return Vec::new();
+        };
         let is_visible = entry_is_visible(entry, user_only, show_all);
 
         let mut children_out = Vec::new();

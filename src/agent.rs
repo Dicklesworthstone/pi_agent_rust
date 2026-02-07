@@ -1089,6 +1089,11 @@ impl Agent {
             }
         }
 
+        // Clean up the stale partial message before returning the error so
+        // `self.messages` is not left with an incomplete assistant entry.
+        if added_partial && matches!(self.messages.last(), Some(Message::Assistant(_))) {
+            self.messages.pop();
+        }
         Err(Error::api("Stream ended without Done event"))
     }
 
@@ -1103,7 +1108,7 @@ impl Agent {
         added_partial: &mut bool,
     ) -> bool {
         if *added_partial {
-            if let Some(last) = self.messages.last_mut() {
+            if let Some(last @ Message::Assistant(_)) = self.messages.last_mut() {
                 *last = Message::Assistant(partial);
             }
             false
@@ -1121,8 +1126,16 @@ impl Agent {
         added_partial: bool,
     ) -> AssistantMessage {
         if added_partial {
-            if let Some(last) = self.messages.last_mut() {
+            if let Some(last @ Message::Assistant(_)) = self.messages.last_mut() {
                 *last = Message::Assistant(message.clone());
+            } else {
+                // Defensive: added_partial is true but last message isn't Assistant.
+                // Push as new message rather than overwriting an unrelated message.
+                tracing::warn!("finalize_assistant_message: expected last message to be Assistant");
+                self.messages.push(Message::Assistant(message.clone()));
+                on_event(AgentEvent::MessageStart {
+                    message: Message::Assistant(message.clone()),
+                });
             }
         } else {
             self.messages.push(Message::Assistant(message.clone()));

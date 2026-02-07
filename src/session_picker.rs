@@ -25,6 +25,12 @@ pub fn format_time(timestamp: &str) -> String {
     )
 }
 
+/// Truncate a session id by character count for display.
+#[must_use]
+pub fn truncate_session_id(session_id: &str, max_chars: usize) -> String {
+    session_id.chars().take(max_chars).collect()
+}
+
 /// The session picker TUI model.
 #[derive(bubbletea::Model)]
 pub struct SessionPicker {
@@ -253,7 +259,7 @@ impl SessionPicker {
                     .take(28)
                     .collect::<String>();
                 let messages = session.message_count.to_string();
-                let id = &session.id[..8.min(session.id.len())];
+                let id = truncate_session_id(&session.id, 8);
 
                 let _ = writeln!(
                     output,
@@ -564,6 +570,12 @@ mod tests {
     }
 
     #[test]
+    fn truncate_session_id_handles_unicode_boundaries() {
+        assert_eq!(truncate_session_id("abcdefghijk", 8), "abcdefgh");
+        assert_eq!(truncate_session_id("αβγδεζηθικ", 8), "αβγδεζηθ");
+    }
+
+    #[test]
     fn test_is_session_file_path() {
         assert!(is_session_file_path(Path::new("/tmp/sess.jsonl")));
         assert!(!is_session_file_path(Path::new("/tmp/sess.txt")));
@@ -795,6 +807,23 @@ mod tests {
         assert!(view.contains("Messages"));
         assert!(view.contains("Session ID"));
         assert!(view.contains("Delete session? Press y/n to confirm."));
+    }
+
+    #[test]
+    fn session_picker_view_handles_non_ascii_session_ids() {
+        let sessions = vec![SessionMeta {
+            path: "/test/u.jsonl".to_string(),
+            id: "αβγδεζηθι".to_string(),
+            cwd: "/test".to_string(),
+            timestamp: "2025-01-15T10:00:00.000Z".to_string(),
+            message_count: 1,
+            last_modified_ms: 1000,
+            size_bytes: 100,
+            name: Some("unicode".to_string()),
+        }];
+
+        let view = SessionPicker::new(sessions).view();
+        assert!(view.contains("αβγδεζηθ"));
     }
 
     // ── selected_path when nothing chosen ──────────────────────────────

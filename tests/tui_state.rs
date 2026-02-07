@@ -574,6 +574,33 @@ fn create_session_on_disk(
 }
 
 #[allow(dead_code)]
+fn create_session_on_disk_with_id(
+    base_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    name: &str,
+    session_id: &str,
+    user_text: &str,
+) -> std::path::PathBuf {
+    let project_dir = base_dir.join(encode_cwd(cwd));
+    std::fs::create_dir_all(&project_dir).expect("create sessions dir");
+
+    let mut session = Session::create_with_dir(Some(base_dir.to_path_buf()));
+    session.header.cwd = cwd.display().to_string();
+    session.header.id = session_id.to_string();
+    session.set_name(name);
+    session.append_message(SessionMessage::User {
+        content: UserContent::Text(user_text.to_string()),
+        timestamp: Some(0),
+    });
+    let path = project_dir.join(format!("{name}.jsonl"));
+    session.path = Some(path.clone());
+    common::run_async(async move {
+        session.save().await.expect("save session");
+    });
+    path
+}
+
+#[allow(dead_code)]
 fn wait_for_pi_msgs(
     event_rx: &mpsc::Receiver<PiMsg>,
     timeout: Duration,
@@ -3049,6 +3076,25 @@ fn tui_state_slash_resume_selects_latest_session_and_loads_messages() {
     let step = apply_pi(&harness, &mut app, "PiMsg::ConversationReset", reset);
     assert_after_contains(&harness, &step, "Session resumed");
     assert_after_contains(&harness, &step, "Newer session message");
+}
+
+#[test]
+fn tui_state_slash_resume_handles_non_ascii_session_id() {
+    let harness = TestHarness::new("tui_state_slash_resume_handles_non_ascii_session_id");
+    let base_dir = harness.temp_path("sessions");
+    let cwd = harness.temp_dir().to_path_buf();
+
+    create_session_on_disk_with_id(&base_dir, &cwd, "unicode", "αβγδεζηθι", "Unicode session");
+
+    let mut session = Session::create_with_dir(Some(base_dir));
+    session.header.cwd = cwd.display().to_string();
+    let (mut app, _event_rx) = build_app_with_session_and_events(&harness, Vec::new(), session);
+    log_initial_state(&harness, &app);
+
+    type_text(&harness, &mut app, "/resume");
+    let step = press_enter(&harness, &mut app);
+    assert_after_contains(&harness, &step, "Select a session to resume");
+    assert_after_contains(&harness, &step, "αβγδεζηθ");
 }
 
 #[test]

@@ -235,6 +235,14 @@ where
                             }
                             Err(e) => {
                                 if e.error_len().is_some() {
+                                    // Feed valid prefix before returning the error so
+                                    // events preceding the bad byte are not silently lost.
+                                    let valid_len = e.valid_up_to();
+                                    if valid_len > 0 {
+                                        let s = std::str::from_utf8(&bytes[..valid_len]).unwrap();
+                                        let events = self.parser.feed(s);
+                                        self.pending_events.extend(events);
+                                    }
                                     // Preserve the offending bytes for diagnostics.
                                     self.utf8_buffer = bytes;
                                     return Poll::Ready(Some(Err(std::io::Error::new(
@@ -268,6 +276,15 @@ where
                             Ok(s) => Some((utf8_buffer.len(), self.parser.feed(s))),
                             Err(e) => {
                                 if e.error_len().is_some() {
+                                    // Feed valid prefix before returning the error so
+                                    // events preceding the bad byte are not silently lost.
+                                    let valid_len = e.valid_up_to();
+                                    if valid_len > 0 {
+                                        let s =
+                                            std::str::from_utf8(&utf8_buffer[..valid_len]).unwrap();
+                                        let events = self.parser.feed(s);
+                                        self.pending_events.extend(events);
+                                    }
                                     // Restore buffer so callers can inspect state if they want.
                                     self.utf8_buffer = utf8_buffer;
                                     return Poll::Ready(Some(Err(std::io::Error::new(

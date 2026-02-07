@@ -665,6 +665,12 @@ async fn generate_summary(
         .collect::<Vec<_>>()
         .join("\n");
 
+    if text.trim().is_empty() {
+        return Err(Error::api(
+            "Summarization returned empty text; refusing to store empty compaction summary",
+        ));
+    }
+
     Ok(text)
 }
 
@@ -693,7 +699,7 @@ async fn generate_turn_prefix_summary(
     )
     .await?;
 
-    Ok(assistant
+    let text = assistant
         .content
         .iter()
         .filter_map(|block| match block {
@@ -701,7 +707,15 @@ async fn generate_turn_prefix_summary(
             _ => None,
         })
         .collect::<Vec<_>>()
-        .join("\n"))
+        .join("\n");
+
+    if text.trim().is_empty() {
+        return Err(Error::api(
+            "Turn prefix summarization returned empty text; refusing to store empty summary",
+        ));
+    }
+
+    Ok(text)
 }
 
 // =============================================================================

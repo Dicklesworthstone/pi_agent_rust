@@ -412,6 +412,17 @@ where
                     None
                 }
             }
+            "signature_delta" => {
+                // The Anthropic API sends signature_delta for thinking blocks
+                // to deliver the thinking_signature required for multi-turn
+                // extended thinking conversations.
+                if let Some(sig) = delta.signature {
+                    if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
+                        t.thinking_signature = Some(sig);
+                    }
+                }
+                None
+            }
             _ => None,
         }
     }
@@ -487,7 +498,10 @@ where
 
         if let Some(u) = usage {
             self.partial.usage.output = u.output_tokens;
-            self.partial.usage.total_tokens = self.partial.usage.input + self.partial.usage.output;
+            self.partial.usage.total_tokens = self.partial.usage.input
+                + self.partial.usage.output
+                + self.partial.usage.cache_read
+                + self.partial.usage.cache_write;
         }
     }
 }
@@ -642,6 +656,8 @@ struct AnthropicDelta {
     thinking: Option<String>,
     #[serde(default)]
     partial_json: Option<String>,
+    #[serde(default)]
+    signature: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
