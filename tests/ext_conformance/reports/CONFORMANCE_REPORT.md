@@ -1,49 +1,18 @@
 # Extension Conformance Report
 
-> Generated: 2026-02-07T05:49:39Z | Git: 37046d3c
+> Generated: 2026-02-07T21:52:34Z
 
 ## Summary
 
 | Metric | Value |
 |----|----|
 | Total extensions | 223 |
-| PASS | 187 |
-| FAIL | 36 |
-| Pass rate | 83.9% |
+| PASS | 57 |
+| FAIL | 3 |
+| N/A (not yet tested) | 163 |
+| Pass rate | 95.0% |
 | Policy negative tests | 30 pass, 0 fail |
 | Source tiers | 5 |
-
-## By Conformance Tier
-
-| Tier | Pass | Fail | Total | Rate |
-|------|------|------|-------|------|
-| T1 (simple single-file) | 38 | 0 | 38 | 100% |
-| T2 (multi-registration) | 85 | 2 | 87 | 97.7% |
-| T3 (multi-file) | 60 | 30 | 90 | 66.7% |
-| T4 (npm deps) | 2 | 1 | 3 | 66.7% |
-| T5 (exec/network) | 2 | 3 | 5 | 40.0% |
-
-## By Source
-
-| Source | Pass | Fail | Total | Rate |
-|--------|------|------|-------|------|
-| official-pi-mono | 60 | 1* | 61 | 98.4% |
-| community | 52 | 6 | 58 | 89.7% |
-| npm-registry | 48 | 27 | 75 | 64.0% |
-| third-party-github | 16 | 7 | 23 | 69.6% |
-| agents | 0 | 1 | 1 | 0% |
-
-*1 official failure is `base_fixtures` (test fixture, not a real extension)
-
-## Failure Classification
-
-| Category | Count | Description |
-|----------|-------|-------------|
-| manifest_registration_mismatch | 22 | Extension loads but registers different commands/tools than manifest expects |
-| missing_npm_package | 5 | Requires npm package not available as virtual module stub |
-| multi_file_dependency | 4 | Uses relative imports to unbundled sibling/parent directories |
-| runtime_error | 4 | Crashes during init (missing file, broken API, undefined property) |
-| test_fixture | 1 | Not a real extension (base_fixtures) |
 
 ## agents-mikeastock
 
@@ -202,11 +171,11 @@
 
 ## official-pi-mono
 
-66 extensions (60 pass, 0 fail, 6 untested)
+66 extensions (57 pass, 3 fail, 6 untested)
 
 | Extension | Version | Tier | Status | Evidence | Load (Rust) | Scenarios | Failures |
 |---|---|---|---|---|---|---|---|
-| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) [smoke](tests/ext_conformance/reports/smoke/extensions/antigravity-image-gen.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/antigravity-image-gen.jsonl) | 109ms | 0/0 pass |  |
+| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) [smoke](tests/ext_conformance/reports/smoke/extensions/antigravity-image-gen.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/antigravity-image-gen.jsonl) | 109ms | 1/1 pass |  |
 | [`auto-commit-on-exit`](tests/ext_conformance/artifacts/auto-commit-on-exit/auto-commit-on-exit.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
 | [`base_fixtures`](tests/ext_conformance/artifacts/base_fixtures/minimal_command/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`bash-spawn-hook`](tests/ext_conformance/artifacts/bash-spawn-hook/bash-spawn-hook.ts) | - | T1 (simple single-file) | PASS | - | 99ms | - |  |
@@ -221,15 +190,15 @@
 | [`custom-provider-qwen-cli`](tests/ext_conformance/artifacts/custom-provider-qwen-cli/index.ts) | `1.1.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/custom-provider-qwen-cli.json) [smoke](tests/ext_conformance/reports/smoke/extensions/custom-provider-qwen-cli.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/custom-provider-qwen-cli.jsonl) | 105ms | 1/1 pass |  |
 | [`diff`](tests/ext_conformance/artifacts/diff/diff.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
 | [`dirty-repo-guard`](tests/ext_conformance/artifacts/dirty-repo-guard/dirty-repo-guard.ts) | - | T2 (multi-registration) | PASS | - | 99ms | - |  |
-| [`doom-overlay`](tests/ext_conformance/artifacts/doom-overlay/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/doom-overlay.json) [smoke](tests/ext_conformance/reports/smoke/extensions/doom-overlay.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/doom-overlay.jsonl) | 118ms | 0/0 pass |  |
-| [`dynamic-resources`](tests/ext_conformance/artifacts/dynamic-resources/index.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/dynamic-resources.json) [smoke](tests/ext_conformance/reports/smoke/extensions/dynamic-resources.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/dynamic-resources.jsonl) | 104ms | 0/0 pass |  |
+| [`doom-overlay`](tests/ext_conformance/artifacts/doom-overlay/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/doom-overlay.json) [smoke](tests/ext_conformance/reports/smoke/extensions/doom-overlay.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/doom-overlay.jsonl) | 118ms | 1/1 pass |  |
+| [`dynamic-resources`](tests/ext_conformance/artifacts/dynamic-resources/index.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/dynamic-resources.json) [smoke](tests/ext_conformance/reports/smoke/extensions/dynamic-resources.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/dynamic-resources.jsonl) | 104ms | 0/1 pass | Returns skill/prompt/theme resources from the extension directory |
 | [`event-bus`](tests/ext_conformance/artifacts/event-bus/event-bus.ts) | - | T2 (multi-registration) | PASS | - | 99ms | - |  |
 | [`file-trigger`](tests/ext_conformance/artifacts/file-trigger/file-trigger.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
 | [`files`](tests/ext_conformance/artifacts/files/files.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`git-checkpoint`](tests/ext_conformance/artifacts/git-checkpoint/git-checkpoint.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/git-checkpoint.json) [smoke](tests/ext_conformance/reports/smoke/extensions/git-checkpoint.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/git-checkpoint.jsonl) | 101ms | 0/0 pass |  |
+| [`git-checkpoint`](tests/ext_conformance/artifacts/git-checkpoint/git-checkpoint.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/git-checkpoint.json) [smoke](tests/ext_conformance/reports/smoke/extensions/git-checkpoint.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/git-checkpoint.jsonl) | 101ms | 0/1 pass | Offers to restore code state on fork and applies stash when user selects Yes (exec mocked) |
 | [`handoff`](tests/ext_conformance/artifacts/handoff/handoff.ts) | - | T1 (simple single-file) | PASS | - | 103ms | - |  |
 | [`hello`](tests/ext_conformance/artifacts/hello/hello.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/hello.json) [smoke](tests/ext_conformance/reports/smoke/extensions/hello.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/hello.jsonl) | 96ms | 1/1 pass |  |
-| [`inline-bash`](tests/ext_conformance/artifacts/inline-bash/inline-bash.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/inline-bash.json) [smoke](tests/ext_conformance/reports/smoke/extensions/inline-bash.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/inline-bash.jsonl) | 100ms | 0/0 pass |  |
+| [`inline-bash`](tests/ext_conformance/artifacts/inline-bash/inline-bash.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/inline-bash.json) [smoke](tests/ext_conformance/reports/smoke/extensions/inline-bash.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/inline-bash.jsonl) | 100ms | 1/1 pass |  |
 | [`input-transform`](tests/ext_conformance/artifacts/input-transform/input-transform.ts) | - | T2 (multi-registration) | PASS | - | 105ms | - |  |
 | [`interactive-shell`](tests/ext_conformance/artifacts/interactive-shell/interactive-shell.ts) | - | T2 (multi-registration) | PASS | - | 110ms | - |  |
 | [`mac-system-theme`](tests/ext_conformance/artifacts/mac-system-theme/mac-system-theme.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
@@ -240,32 +209,32 @@
 | [`notify`](tests/ext_conformance/artifacts/notify/notify.ts) | - | T2 (multi-registration) | PASS | - | 97ms | - |  |
 | [`overlay-qa-tests`](tests/ext_conformance/artifacts/overlay-qa-tests/overlay-qa-tests.ts) | - | T2 (multi-registration) | PASS | - | 118ms | - |  |
 | [`overlay-test`](tests/ext_conformance/artifacts/overlay-test/overlay-test.ts) | - | T1 (simple single-file) | PASS | - | 103ms | - |  |
-| [`permission-gate`](tests/ext_conformance/artifacts/permission-gate/permission-gate.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/permission-gate.json) [smoke](tests/ext_conformance/reports/smoke/extensions/permission-gate.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/permission-gate.jsonl) | 102ms | 1/1 pass |  |
+| [`permission-gate`](tests/ext_conformance/artifacts/permission-gate/permission-gate.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/permission-gate.json) [smoke](tests/ext_conformance/reports/smoke/extensions/permission-gate.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/permission-gate.jsonl) | 102ms | 2/2 pass |  |
 | [`pirate`](tests/ext_conformance/artifacts/pirate/pirate.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
-| [`plan-mode`](tests/ext_conformance/artifacts/plan-mode/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/plan-mode.json) [smoke](tests/ext_conformance/reports/smoke/extensions/plan-mode.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/plan-mode.jsonl) | 109ms | 0/0 pass |  |
+| [`plan-mode`](tests/ext_conformance/artifacts/plan-mode/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/plan-mode.json) [smoke](tests/ext_conformance/reports/smoke/extensions/plan-mode.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/plan-mode.jsonl) | 109ms | 2/2 pass |  |
 | [`preset`](tests/ext_conformance/artifacts/preset/preset.ts) | - | T2 (multi-registration) | PASS | - | 113ms | - |  |
 | [`prompt-url-widget`](tests/ext_conformance/artifacts/prompt-url-widget/prompt-url-widget.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`protected-paths`](tests/ext_conformance/artifacts/protected-paths/protected-paths.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/protected-paths.json) [smoke](tests/ext_conformance/reports/smoke/extensions/protected-paths.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/protected-paths.jsonl) | 105ms | 0/0 pass |  |
+| [`protected-paths`](tests/ext_conformance/artifacts/protected-paths/protected-paths.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/protected-paths.json) [smoke](tests/ext_conformance/reports/smoke/extensions/protected-paths.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/protected-paths.jsonl) | 105ms | 1/1 pass |  |
 | [`qna`](tests/ext_conformance/artifacts/qna/qna.ts) | - | T1 (simple single-file) | PASS | - | 103ms | - |  |
 | [`question`](tests/ext_conformance/artifacts/question/question.ts) | - | T1 (simple single-file) | PASS | - | 105ms | - |  |
 | [`questionnaire`](tests/ext_conformance/artifacts/questionnaire/questionnaire.ts) | - | T1 (simple single-file) | PASS | - | 108ms | - |  |
 | [`rainbow-editor`](tests/ext_conformance/artifacts/rainbow-editor/rainbow-editor.ts) | - | T2 (multi-registration) | PASS | - | 101ms | - |  |
 | [`redraws`](tests/ext_conformance/artifacts/redraws/redraws.ts) | - | T1 (simple single-file) | N/A | - | - | - |  |
 | [`rpc-demo`](tests/ext_conformance/artifacts/rpc-demo/rpc-demo.ts) | - | T2 (multi-registration) | PASS | - | 103ms | - |  |
-| [`sandbox`](tests/ext_conformance/artifacts/sandbox/index.ts) | `1.0.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/sandbox.json) [smoke](tests/ext_conformance/reports/smoke/extensions/sandbox.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/sandbox.jsonl) | 104ms | 1/1 pass |  |
+| [`sandbox`](tests/ext_conformance/artifacts/sandbox/index.ts) | `1.0.0` | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/sandbox.json) [smoke](tests/ext_conformance/reports/smoke/extensions/sandbox.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/sandbox.jsonl) | 104ms | 4/4 pass |  |
 | [`send-user-message`](tests/ext_conformance/artifacts/send-user-message/send-user-message.ts) | - | T1 (simple single-file) | PASS | - | 100ms | - |  |
 | [`session-name`](tests/ext_conformance/artifacts/session-name/session-name.ts) | - | T1 (simple single-file) | PASS | - | 99ms | - |  |
 | [`shutdown-command`](tests/ext_conformance/artifacts/shutdown-command/shutdown-command.ts) | - | T2 (multi-registration) | PASS | - | 100ms | - |  |
 | [`snake`](tests/ext_conformance/artifacts/snake/snake.ts) | - | T1 (simple single-file) | PASS | - | 105ms | - |  |
 | [`space-invaders`](tests/ext_conformance/artifacts/space-invaders/space-invaders.ts) | - | T1 (simple single-file) | PASS | - | 112ms | - |  |
 | [`ssh`](tests/ext_conformance/artifacts/ssh/ssh.ts) | - | T2 (multi-registration) | PASS | - | 106ms | - |  |
-| [`status-line`](tests/ext_conformance/artifacts/status-line/status-line.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/status-line.json) [smoke](tests/ext_conformance/reports/smoke/extensions/status-line.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/status-line.jsonl) | 101ms | 0/0 pass |  |
+| [`status-line`](tests/ext_conformance/artifacts/status-line/status-line.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/status-line.json) [smoke](tests/ext_conformance/reports/smoke/extensions/status-line.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/status-line.jsonl) | 101ms | 0/1 pass | Updates footer status across session_start → turn_start → turn_end |
 | [`subagent`](tests/ext_conformance/artifacts/subagent/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/subagent.json) [smoke](tests/ext_conformance/reports/smoke/extensions/subagent.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/subagent.jsonl) | 131ms | 1/1 pass |  |
 | [`summarize`](tests/ext_conformance/artifacts/summarize/summarize.ts) | - | T1 (simple single-file) | PASS | - | 105ms | - |  |
 | [`system-prompt-header`](tests/ext_conformance/artifacts/system-prompt-header/system-prompt-header.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
 | [`timed-confirm`](tests/ext_conformance/artifacts/timed-confirm/timed-confirm.ts) | - | T1 (simple single-file) | PASS | - | 98ms | - |  |
 | [`titlebar-spinner`](tests/ext_conformance/artifacts/titlebar-spinner/titlebar-spinner.ts) | - | T2 (multi-registration) | PASS | - | 97ms | - |  |
-| [`todo`](tests/ext_conformance/artifacts/todo/todo.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/todo.json) [smoke](tests/ext_conformance/reports/smoke/extensions/todo.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/todo.jsonl) | 106ms | 1/1 pass |  |
+| [`todo`](tests/ext_conformance/artifacts/todo/todo.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/todo.json) [smoke](tests/ext_conformance/reports/smoke/extensions/todo.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/todo.jsonl) | 106ms | 3/3 pass |  |
 | [`tool-override`](tests/ext_conformance/artifacts/tool-override/tool-override.ts) | - | T2 (multi-registration) | PASS | - | 103ms | - |  |
 | [`tools`](tests/ext_conformance/artifacts/tools/tools.ts) | - | T2 (multi-registration) | PASS | - | 107ms | - |  |
 | [`trigger-compact`](tests/ext_conformance/artifacts/trigger-compact/trigger-compact.ts) | - | T2 (multi-registration) | PASS | - | 106ms | - |  |
@@ -307,69 +276,206 @@
 
 | Evidence Type | Count | Location |
 |---|---|---|
-| Conformance tests | 223 | `tests/ext_conformance_generated.rs` |
 | Golden fixtures | 16 | `tests/ext_conformance/fixtures/*.json` |
 | Smoke test logs | 16 | `tests/ext_conformance/reports/smoke/extensions/` |
 | Parity diff logs | 16 | `tests/ext_conformance/reports/parity/extensions/` |
-| Load time benchmarks | 103 | `tests/perf/reports/ext_bench_baseline.json` |
+| Load time benchmarks | 60 | `tests/ext_conformance/reports/load_time_benchmark.json` |
 | Negative policy tests | 30 | `tests/ext_conformance/reports/negative/` |
-| Conformance baseline | 1 | `tests/ext_conformance/reports/conformance_baseline.json` |
 
-## Coverage
+## Coverage Gaps
 
-All 223 extensions in the manifest are now tested. No coverage gaps remain.
+163 extensions have not been tested yet.
 
-### Remaining Failures (36)
-
-**manifest_registration_mismatch** (22): Extension loads but expected registrations differ
-- `agents-mikeastock/extensions`, `community/prateekmedia-lsp`, `npm/aliou-pi-linkup`,
-  `npm/aliou-pi-synthetic`, `npm/lsp-pi`, `npm/marckrenn-pi-sub-bar`, `npm/mitsupi`,
-  `npm/pi-amplike`, `npm/pi-bash-confirm`, `npm/pi-extensions`, `npm/pi-package-test`,
-  `npm/shitty-extensions`, `npm/tmustier-pi-arcade`, `npm/vaayne-agent-kit`,
-  `third-party/aliou-pi-extensions`, `third-party/ben-vargas-pi-packages`,
-  `third-party/charles-cooper-pi-extensions`, `third-party/kcosr-pi-extensions`,
-  `third-party/marckrenn-pi-sub`, `third-party/openclaw-openclaw`,
-  `third-party/pasky-pi-amplike`, `third-party/w-winter-dot314`
-
-**missing_npm_package** (5): Requires npm package not shimmed in QuickJS
-- `npm/pi-search-agent` (openai), `npm/pi-wakatime` (adm-zip),
-  `npm/pi-web-access` (linkedom), `npm/qualisero-pi-agent-scip` (@sourcegraph/scip-typescript),
-  `third-party/qualisero-pi-agent-scip` (@sourcegraph/scip-typescript)
-
-**multi_file_dependency** (4): Relative imports to unbundled directories
-- `community/qualisero-background-notify` (../../shared),
-  `community/qualisero-pi-agent-scip` (./dist/extension.js),
-  `community/qualisero-safe-git` (../../shared),
-  `npm/aliou-pi-processes` (../components/processes-component)
-
-**runtime_error** (4): Crashes during initialization
-- `community/nicobailon-interview-tool` (ENOENT: form/index.html),
-  `npm/aliou-pi-guardrails` (not a function),
-  `npm/aliou-pi-toolchain` (not a function),
-  `npm/marckrenn-pi-sub-core` (undefined property access)
-
-**test_fixture** (1): Not a real extension
+**Multi-file extension (T3)** (82 extensions):
 - `base_fixtures`
+- `community/jyaunches-canvas`
+- `community/nicobailon-interactive-shell`
+- `community/nicobailon-mcp-adapter`
+- `community/nicobailon-powerline-footer`
+- `community/nicobailon-subagents`
+- `community/prateekmedia-checkpoint`
+- `community/prateekmedia-lsp`
+- `community/prateekmedia-permission`
+- `community/prateekmedia-ralph-loop`
+- `community/prateekmedia-repeat`
+- `community/qualisero-pi-agent-scip`
+- `community/tmustier-code-actions`
+- `community/tmustier-files-widget`
+- `npm/aliou-pi-extension-dev`
+- `npm/aliou-pi-guardrails`
+- `npm/aliou-pi-linkup`
+- `npm/aliou-pi-processes`
+- `npm/aliou-pi-synthetic`
+- `npm/aliou-pi-toolchain`
+- `npm/benvargas-pi-synthetic-provider`
+- `npm/checkpoint-pi`
+- `npm/imsus-pi-extension-minimax-coding-plan-mcp`
+- `npm/juanibiapina-pi-extension-settings`
+- `npm/juanibiapina-pi-files`
+- `npm/juanibiapina-pi-gob`
+- `npm/lsp-pi`
+- `npm/marckrenn-pi-sub-bar`
+- `npm/marckrenn-pi-sub-core`
+- `npm/oh-my-pi-basics`
+- `npm/permission-pi`
+- `npm/pi-agentic-compaction`
+- `npm/pi-amplike`
+- `npm/pi-bash-confirm`
+- `npm/pi-brave-search`
+- `npm/pi-extensions`
+- `npm/pi-interactive-shell`
+- `npm/pi-mcp-adapter`
+- `npm/pi-mermaid`
+- `npm/pi-messenger`
+- `npm/pi-moonshot`
+- `npm/pi-multicodex`
+- `npm/pi-package-test`
+- `npm/pi-powerline-footer`
+- `npm/pi-repoprompt-mcp`
+- `npm/pi-review-loop`
+- `npm/pi-screenshots-picker`
+- `npm/pi-search-agent`
+- `npm/pi-shadow-git`
+- `npm/pi-shell-completions`
+- `npm/pi-subdir-context`
+- `npm/pi-super-curl`
+- `npm/pi-telemetry-otel`
+- `npm/pi-wakatime`
+- `npm/pi-watch`
+- `npm/pi-web-access`
+- `npm/qualisero-pi-agent-scip`
+- `npm/ralph-loop-pi`
+- `npm/repeat-pi`
+- `npm/shitty-extensions`
+- `npm/tmustier-pi-arcade`
+- `npm/vaayne-agent-kit`
+- `npm/vaayne-pi-mcp`
+- `npm/vaayne-pi-subagent`
+- `npm/vaayne-pi-web-tools`
+- `npm/verioussmith-pi-openrouter`
+- `npm/walterra-pi-charts`
+- `npm/walterra-pi-graphviz`
+- `npm/zenobius-pi-dcp`
+- `third-party/aliou-pi-extensions`
+- `third-party/ben-vargas-pi-packages`
+- `third-party/charles-cooper-pi-extensions`
+- `third-party/cv-pi-ssh-remote`
+- `third-party/limouren-agent-things`
+- `third-party/marckrenn-pi-sub`
+- `third-party/michalvavra-agents`
+- `third-party/openclaw-openclaw`
+- `third-party/pasky-pi-amplike`
+- `third-party/qualisero-pi-agent-scip`
+- `third-party/rytswd-slow-mode`
+- `third-party/w-winter-dot314`
+- `third-party/zenobi-us-pi-dcp`
+
+**Not yet scheduled** (73 extensions):
+- `community/ferologics-notify`
+- `community/hjanuschka-clipboard`
+- `community/hjanuschka-cost-tracker`
+- `community/hjanuschka-flicker-corp`
+- `community/hjanuschka-funny-working-message`
+- `community/hjanuschka-handoff`
+- `community/hjanuschka-loop`
+- `community/hjanuschka-memory-mode`
+- `community/hjanuschka-oracle`
+- `community/hjanuschka-plan-mode`
+- `community/hjanuschka-resistance`
+- `community/hjanuschka-speedreading`
+- `community/hjanuschka-status-widget`
+- `community/hjanuschka-ultrathink`
+- `community/hjanuschka-usage-bar`
+- `community/mitsuhiko-answer`
+- `community/mitsuhiko-cwd-history`
+- `community/mitsuhiko-files`
+- `community/mitsuhiko-loop`
+- `community/mitsuhiko-notify`
+- `community/mitsuhiko-review`
+- `community/mitsuhiko-todos`
+- `community/mitsuhiko-uv`
+- `community/mitsuhiko-whimsical`
+- `community/nicobailon-rewind-hook`
+- `community/ogulcancelik-ghostty-theme-sync`
+- `community/prateekmedia-token-rate`
+- `community/qualisero-background-notify`
+- `community/qualisero-compact-config`
+- `community/qualisero-safe-git`
+- `community/qualisero-safe-rm`
+- `community/qualisero-session-color`
+- `community/qualisero-session-emoji`
+- `community/tmustier-agent-guidance`
+- `community/tmustier-arcade-mario-not`
+- `community/tmustier-arcade-picman`
+- `community/tmustier-arcade-ping`
+- `community/tmustier-arcade-spice-invaders`
+- `community/tmustier-arcade-tetris`
+- `community/tmustier-ralph-wiggum`
+- `community/tmustier-raw-paste`
+- `community/tmustier-tab-status`
+- `community/tmustier-usage-extension`
+- `diff`
+- `files`
+- `negative-denied-caps`
+- `npm/benvargas-pi-ancestor-discovery`
+- `npm/benvargas-pi-antigravity-image-gen`
+- `npm/ogulcancelik-pi-sketch`
+- `npm/pi-command-center`
+- `npm/pi-ephemeral`
+- `npm/pi-ghostty-theme-sync`
+- `npm/pi-md-export`
+- `npm/pi-model-switch`
+- `npm/pi-notify`
+- `npm/pi-poly-notify`
+- `npm/pi-prompt-template-model`
+- `npm/pi-session-ask`
+- `npm/pi-skill-palette`
+- `npm/pi-threads`
+- `npm/pi-voice-of-god`
+- `npm/token-rate-pi`
+- `npm/vpellegrino-pi-skills`
+- `prompt-url-widget`
+- `redraws`
+- `third-party/graffioh-pi-screenshots-picker`
+- `third-party/graffioh-pi-super-curl`
+- `third-party/jyaunches-pi-canvas`
+- `third-party/lsj5031-pi-notification-extension`
+- `third-party/ogulcancelik-pi-sketch`
+- `third-party/raunovillberg-pi-stuffed`
+- `third-party/rytswd-direnv`
+- `third-party/rytswd-questionnaire`
+
+**Requires exec/network access (T5)** (5 extensions):
+- `agents-mikeastock/extensions`
+- `community/mitsuhiko-control`
+- `npm/mitsupi`
+- `npm/pi-annotate`
+- `third-party/kcosr-pi-extensions`
+
+**Requires npm dependencies (T4)** (3 extensions):
+- `community/nicobailon-interview-tool`
+- `npm/pi-interview`
+- `third-party/vtemian-pi-config`
 
 ---
 
 ## How to Regenerate
 
 ```bash
-# Run full conformance report (all 223 extensions)
-cargo test --test ext_conformance_generated conformance_full_report \
-  --features ext-conformance -- --nocapture
+# 1. Run conformance tests (generates report data)
+cargo test --test ext_conformance_diff --features ext-conformance
+cargo test --test ext_conformance_scenarios --features ext-conformance
+cargo test --test extensions_policy_negative
 
-# Run individual extension test
-cargo test --test ext_conformance_generated conformance_hello \
-  --features ext-conformance -- --nocapture
+# 2. Generate this consolidated report
+cargo test --test conformance_report generate_conformance_report -- --nocapture
 ```
 
 Report files:
 - `tests/ext_conformance/reports/CONFORMANCE_REPORT.md` (this file)
-- `tests/ext_conformance/reports/conformance_summary.json` (machine-readable summary)
-- `tests/ext_conformance/reports/conformance_baseline.json` (baseline with failure classification)
-- `tests/ext_conformance/reports/conformance/conformance_report.json` (generated full report)
-- `tests/ext_conformance/reports/conformance/conformance_report.md` (generated per-extension table)
+- `tests/ext_conformance/reports/conformance_summary.json` (machine-readable)
+- `tests/ext_conformance/reports/conformance_events.jsonl` (per-extension log)
 
-Regression thresholds: T1 >= 100%, T2 >= 95%, overall >= 80%, max 3 new failures.
+Evidence tracing: each extension row links to its source artifact, golden fixture
+(if available), smoke test logs, and parity diff logs. Machine-readable per-extension
+data including capabilities and registrations is in `conformance_events.jsonl`.

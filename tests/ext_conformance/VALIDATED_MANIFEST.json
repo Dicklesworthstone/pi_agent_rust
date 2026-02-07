@@ -126,7 +126,7 @@
       "capabilities": {
         "registers_tools": true,
         "registers_commands": true,
-        "registers_flags": false,
+        "registers_flags": true,
         "registers_providers": true,
         "subscribes_events": [
           "agent_start"
@@ -142,7 +142,11 @@
       "mock_requirements": [],
       "registrations": {
         "tools": [
-          "greet"
+          "broken",
+          "echo",
+          "greet",
+          "no-handler",
+          "orphan"
         ],
         "commands": [
           "ping"

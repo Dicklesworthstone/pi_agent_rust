@@ -27,8 +27,15 @@ pub fn format_time(timestamp: &str) -> String {
 
 /// Truncate a session id by character count for display.
 #[must_use]
-pub fn truncate_session_id(session_id: &str, max_chars: usize) -> String {
-    session_id.chars().take(max_chars).collect()
+pub fn truncate_session_id(session_id: &str, max_chars: usize) -> &str {
+    if max_chars == 0 {
+        return "";
+    }
+    let end = session_id
+        .char_indices()
+        .nth(max_chars)
+        .map_or(session_id.len(), |(idx, _)| idx);
+    &session_id[..end]
 }
 
 /// The session picker TUI model.

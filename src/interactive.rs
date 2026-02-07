@@ -601,7 +601,7 @@ impl PiApp {
                 .unwrap_or("session");
             return self.cwd.join(format!("pi-session-{stem}.html"));
         }
-        let id = session.header.id.chars().take(8).collect::<String>();
+        let id = crate::session_picker::truncate_session_id(&session.header.id, 8);
         self.cwd.join(format!("pi-session-unsaved-{id}.html"))
     }
 

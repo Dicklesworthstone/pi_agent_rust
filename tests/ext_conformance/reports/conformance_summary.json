@@ -1,70 +1,53 @@
 {
-  "schema": "pi.ext.conformance_summary.v3",
-  "generated_at": "2026-02-07T05:49:39Z",
   "counts": {
-    "total": 223,
-    "pass": 187,
-    "fail": 36,
-    "na": 0
-  },
-  "pass_rate_pct": 83.86,
-  "per_tier": {
-    "official-pi-mono": {
-      "total": 61,
-      "pass": 60,
-      "fail": 1,
-      "na": 0,
-      "note": "1 failure is base_fixtures test fixture"
-    },
-    "community": {
-      "total": 58,
-      "pass": 52,
-      "fail": 6,
-      "na": 0
-    },
-    "npm-registry": {
-      "total": 75,
-      "pass": 48,
-      "fail": 27,
-      "na": 0
-    },
-    "third-party-github": {
-      "total": 23,
-      "pass": 16,
-      "fail": 7,
-      "na": 0
-    },
-    "agents": {
-      "total": 1,
-      "pass": 0,
-      "fail": 1,
-      "na": 0
-    }
-  },
-  "by_conformance_tier": {
-    "1": { "pass": 38, "fail": 0, "total": 38 },
-    "2": { "pass": 85, "fail": 2, "total": 87 },
-    "3": { "pass": 60, "fail": 30, "total": 90 },
-    "4": { "pass": 2, "fail": 1, "total": 3 },
-    "5": { "pass": 2, "fail": 3, "total": 5 }
-  },
-  "failure_categories": {
-    "manifest_registration_mismatch": 22,
-    "missing_npm_package": 5,
-    "multi_file_dependency": 4,
-    "runtime_error": 4,
-    "test_fixture": 1
+    "fail": 3,
+    "na": 163,
+    "pass": 57,
+    "total": 223
   },
   "evidence": {
-    "conformance_tests": 223,
     "golden_fixtures": 16,
-    "load_time_benchmarks": 103,
+    "load_time_benchmarks": 60,
     "parity_logs": 16,
-    "smoke_logs": 16,
-    "negative_tests": 30
+    "smoke_logs": 16
   },
+  "generated_at": "2026-02-07T21:52:34Z",
   "negative": {
-    "pass": 30,
-    "fail": 0
-  }
+    "fail": 0,
+    "pass": 30
+  },
+  "pass_rate_pct": 95.0,
+  "per_tier": {
+    "agents-mikeastock": {
+      "fail": 0,
+      "na": 1,
+      "pass": 0,
+      "total": 1
+    },
+    "community": {
+      "fail": 0,
+      "na": 58,
+      "pass": 0,
+      "total": 58
+    },
+    "npm-registry": {
+      "fail": 0,
+      "na": 75,
+      "pass": 0,
+      "total": 75
+    },
+    "official-pi-mono": {
+      "fail": 3,
+      "na": 6,
+      "pass": 57,
+      "total": 66
+    },
+    "third-party-github": {
+      "fail": 0,
+      "na": 23,
+      "pass": 0,
+      "total": 23
+    }
+  },
+  "schema": "pi.ext.conformance_summary.v2"
 }

@@ -319,6 +319,7 @@ impl AuthStorage {
                 "Refreshing expired extension OAuth tokens"
             );
         }
+        let mut failed_providers: Vec<String> = Vec::new();
         for (provider, refresh_token, config) in refreshes {
             let start = std::time::Instant::now();
             match refresh_extension_oauth_token(client, &config, &refresh_token).await {
@@ -340,10 +341,18 @@ impl AuthStorage {
                         elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
                         "Failed to refresh extension OAuth token; continuing with remaining providers"
                     );
+                    failed_providers.push(provider);
                 }
             }
         }
-        Ok(())
+        if failed_providers.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::api(format!(
+                "Extension OAuth token refresh failed for: {}",
+                failed_providers.join(", ")
+            )))
+        }
     }
 }
 

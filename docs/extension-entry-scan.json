@@ -3,13 +3,13 @@
   "generated": "2026-02-05",
   "description": "Static scan of extension corpus entry points (bd-2u2s)",
   "summary": {
-    "total_files": 1389,
-    "entry_points": 392,
+    "total_files": 1398,
+    "entry_points": 401,
     "sub_modules": 872,
     "non_extensions": 119,
     "unknown": 6,
     "by_confidence": {
-      "high": 1285,
+      "high": 1294,
       "low": 14,
       "medium": 90
     },
@@ -35,8 +35,8 @@
         "sub_modules": 371
       },
       "official-pi-mono": {
-        "total_files": 79,
-        "entry_points": 72,
+        "total_files": 88,
+        "entry_points": 81,
         "sub_modules": 6
       },
       "third-party-github": {
@@ -185,6 +185,18 @@
       ]
     },
     {
+      "path": "base_fixtures/minimal_configuration/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerShortcut",
+        "registerFlag"
+      ]
+    },
+    {
       "path": "base_fixtures/minimal_event/index.ts",
       "classification": "entry_point",
       "confidence": "high",
@@ -203,6 +215,18 @@
         "export_default_function",
         "ExtensionAPI_import",
         "ExtensionAPI_type"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_multi/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool",
+        "event_hook"
       ]
     },
     {
@@ -245,6 +269,80 @@
         "ExtensionAPI_import",
         "ExtensionAPI_type",
         "registerTool"
+      ]
+    },
+    {
+      "path": "base_fixtures/minimal_ui_component/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type"
+      ]
+    },
+    {
+      "path": "base_fixtures/negative_invalid_tool_schema/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
+      ]
+    },
+    {
+      "path": "base_fixtures/negative_missing_handler/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
+      ]
+    },
+    {
+      "path": "base_fixtures/negative_no_export/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
+      ]
+    },
+    {
+      "path": "base_fixtures/negative_syntax_error/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
+      ]
+    },
+    {
+      "path": "base_fixtures/negative_throw_on_load/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type"
+      ]
+    },
+    {
+      "path": "base_fixtures/negative_wrong_type/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type"
       ]
     },
     {
