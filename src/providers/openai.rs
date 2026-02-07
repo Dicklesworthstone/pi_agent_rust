@@ -220,6 +220,9 @@ impl Provider for OpenAIProvider {
         let stream = stream::unfold(
             StreamState::new(event_source, model, api, provider),
             |mut state| async move {
+                if state.done {
+                    return None;
+                }
                 loop {
                     if let Some(event) = state.pending_events.pop_front() {
                         return Some((Ok(event), state));
@@ -229,6 +232,7 @@ impl Provider for OpenAIProvider {
                         Some(Ok(msg)) => {
                             // OpenAI sends "[DONE]" as final message
                             if msg.data == "[DONE]" {
+                                state.done = true;
                                 let reason = state.partial.stop_reason;
                                 return Some((
                                     Ok(StreamEvent::Done {
@@ -252,6 +256,7 @@ impl Provider for OpenAIProvider {
                         // so the agent loop receives the accumulated partial
                         // instead of silently losing it.
                         None => {
+                            state.done = true;
                             let reason = state.partial.stop_reason;
                             return Some((
                                 Ok(StreamEvent::Done {
@@ -284,6 +289,7 @@ where
     tool_calls: Vec<ToolCallState>,
     pending_events: VecDeque<StreamEvent>,
     started: bool,
+    done: bool,
 }
 
 struct ToolCallState {
@@ -315,6 +321,7 @@ where
             tool_calls: Vec::new(),
             pending_events: VecDeque::new(),
             started: false,
+            done: false,
         }
     }
 
