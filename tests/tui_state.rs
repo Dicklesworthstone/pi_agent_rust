@@ -3550,7 +3550,7 @@ fn tui_state_extension_ui_select_invalid_sets_status_and_keeps_prompt() {
         &step,
         "Invalid selection. Enter a number, label, or 'cancel'.",
     );
-    assert_after_contains(&harness, &step, "Extension select: Pick one");
+    assert_after_contains(&harness, &step, "[unknown] select: Pick one");
 }
 
 #[test]
