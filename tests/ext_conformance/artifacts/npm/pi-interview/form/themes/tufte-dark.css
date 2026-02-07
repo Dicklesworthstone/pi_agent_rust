@@ -1,0 +1,29 @@
+:root {
+  --bg-body: #1c1917;
+  --bg-card: #201d1b;
+  --bg-elevated: #252220;
+  --bg-selected: #2d2925;
+  --bg-hover: #302b26;
+  --bg-active-tint: rgba(201, 183, 154, 0.1);
+  --fg: #e7e2d9;
+  --fg-muted: #a9a194;
+  --fg-dim: #8d8476;
+  --accent: #c9b79a;
+  --accent-hover: #d8c5a5;
+  --accent-muted: rgba(201, 183, 154, 0.15);
+  --border: #5a5046;
+  --border-muted: #423a31;
+  --border-focus: #6a6050;
+  --border-active: #5a5046;
+  --success: #b5bd68;
+  --warning: #d2a456;
+  --error: #cc6666;
+  --error-bg: rgba(204, 102, 102, 0.12);
+  --focus-ring: rgba(201, 183, 154, 0.2);
+  --overlay-bg: rgba(28, 25, 23, 0.95);
+
+  --font-body: "Cormorant Garamond", Cormorant, "Crimson Pro", "Libre Baskerville", Georgia, serif;
+  --font-ui: "Cormorant Garamond", Cormorant, "Crimson Pro", "Libre Baskerville", Georgia, serif;
+  --font-mono: "IBM Plex Mono", "JetBrains Mono", "SF Mono", Consolas, monospace;
+  --font-size-base: 15px;
+}

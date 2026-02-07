@@ -1,0 +1,5 @@
+/* Default dark theme uses base styles.css tokens. */
+:root {
+  --overlay-bg: rgba(24, 24, 30, 0.95);
+  --error-bg: rgba(204, 102, 102, 0.12);
+}

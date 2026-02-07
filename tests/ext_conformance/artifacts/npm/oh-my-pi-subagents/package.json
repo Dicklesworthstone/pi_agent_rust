@@ -1,0 +1,60 @@
+{
+  "name": "@oh-my-pi/subagents",
+  "version": "1.3.3710",
+  "description": "Task delegation system with specialized subagents (task, planner, explore, reviewer, browser)",
+  "keywords": [
+    "omp-plugin",
+    "agents",
+    "task-delegation"
+  ],
+  "author": "Can Bölük <me@can.ac>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/can1357/oh-my-pi.git",
+    "directory": "plugins/subagents"
+  },
+  "omp": {
+    "tools": "tools",
+    "runtime": "tools/runtime.json",
+    "install": [
+      {
+        "src": "agents/task.md",
+        "dest": "agent/agents/task.md"
+      },
+      {
+        "src": "agents/planner.md",
+        "dest": "agent/agents/planner.md"
+      },
+      {
+        "src": "agents/explore.md",
+        "dest": "agent/agents/explore.md"
+      },
+      {
+        "src": "agents/reviewer.md",
+        "dest": "agent/agents/reviewer.md"
+      },
+      {
+        "src": "agents/browser.md",
+        "dest": "agent/agents/browser.md"
+      },
+      {
+        "src": "commands/implement.md",
+        "dest": "agent/commands/implement.md"
+      },
+      {
+        "src": "commands/implement-with-critic.md",
+        "dest": "agent/commands/implement-with-critic.md"
+      },
+      {
+        "src": "commands/architect-plan.md",
+        "dest": "agent/commands/architect-plan.md"
+      }
+    ]
+  },
+  "files": [
+    "agents",
+    "tools",
+    "commands"
+  ]
+}

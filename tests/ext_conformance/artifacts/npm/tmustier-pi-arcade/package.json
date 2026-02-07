@@ -1,0 +1,27 @@
+{
+  "name": "@tmustier/pi-arcade",
+  "version": "0.1.5",
+  "description": "Arcade minigames for the Pi coding agent.",
+  "license": "MIT",
+  "author": "Thomas Mustier",
+  "keywords": [
+    "pi-package"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tmustier/pi-extensions.git",
+    "directory": "arcade"
+  },
+  "bugs": "https://github.com/tmustier/pi-extensions/issues",
+  "homepage": "https://github.com/tmustier/pi-extensions/tree/main/arcade",
+  "pi": {
+    "extensions": [
+      "spice-invaders.ts",
+      "picman.ts",
+      "ping.ts",
+      "tetris.ts",
+      "mario-not/mario-not.ts"
+    ],
+    "video": "https://raw.githubusercontent.com/tmustier/pi-extensions/main/arcade/assets/demo.mp4"
+  }
+}

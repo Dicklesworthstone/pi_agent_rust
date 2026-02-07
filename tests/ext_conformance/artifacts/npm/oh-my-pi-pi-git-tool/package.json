@@ -1,0 +1,45 @@
+{
+	"name": "@oh-my-pi/pi-git-tool",
+	"version": "6.8.5",
+	"description": "Structured Git tool with safety guards and typed output",
+	"type": "module",
+	"main": "./src/index.ts",
+	"types": "./src/index.ts",
+	"exports": {
+		".": {
+			"types": "./src/index.ts",
+			"import": "./src/index.ts"
+		}
+	},
+	"files": [
+		"src",
+		"CHANGELOG.md"
+	],
+	"scripts": {
+		"check": "tsgo --noEmit",
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run"
+	},
+	"dependencies": {
+		"@oh-my-pi/pi-utils": "6.8.5"
+	},
+	"devDependencies": {
+		"@types/node": "^24.3.0",
+		"vitest": "^3.2.4"
+	},
+	"keywords": [
+		"git",
+		"tool",
+		"agent"
+	],
+	"author": "Can Bölük",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/can1357/oh-my-pi.git",
+		"directory": "packages/git-tool"
+	},
+	"engines": {
+		"bun": ">=1.0.0"
+	}
+}

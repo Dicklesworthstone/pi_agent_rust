@@ -1,0 +1,37 @@
+{
+  "name": "pi-interview",
+  "version": "0.4.5",
+  "description": "Interactive interview form extension for pi coding agent",
+  "author": "Nico Bailon",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicobailon/pi-interview-tool.git"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "pi-package",
+    "interview",
+    "form",
+    "extension",
+    "cli"
+  ],
+  "bin": {
+    "pi-interview": "bin/install.js"
+  },
+  "files": [
+    "bin/",
+    "form/",
+    "index.ts",
+    "schema.ts",
+    "server.ts",
+    "settings.ts",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  }
+}

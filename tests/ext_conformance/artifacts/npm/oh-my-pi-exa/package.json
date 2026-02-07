@@ -1,0 +1,56 @@
+{
+  "name": "@oh-my-pi/exa",
+  "version": "1.3.3710",
+  "description": "Exa AI web search and websets tools for pi",
+  "keywords": [
+    "omp-plugin",
+    "exa",
+    "web-search",
+    "websets",
+    "ai-search"
+  ],
+  "author": "Can Bölük <me@can.ac>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/can1357/oh-my-pi.git",
+    "directory": "plugins/exa"
+  },
+  "omp": {
+    "tools": "tools",
+    "runtime": "tools/runtime.json",
+    "variables": {
+      "apiKey": {
+        "type": "string",
+        "env": "EXA_API_KEY",
+        "description": "Exa API key for authentication",
+        "required": true
+      }
+    },
+    "features": {
+      "search": {
+        "description": "Core web search (general, deep, code context, URL crawling)",
+        "default": true
+      },
+      "linkedin": {
+        "description": "LinkedIn profile and company search",
+        "default": false
+      },
+      "company": {
+        "description": "Comprehensive company research",
+        "default": false
+      },
+      "researcher": {
+        "description": "Long-running AI research tasks",
+        "default": false
+      },
+      "websets": {
+        "description": "Entity collection management (14 tools)",
+        "default": false
+      }
+    }
+  },
+  "files": [
+    "tools"
+  ]
+}

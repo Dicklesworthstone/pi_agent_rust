@@ -1,0 +1,67 @@
+{
+  "name": "@qualisero/pi-agent-scip",
+  "version": "0.3.0",
+  "description": "SCIP code intelligence tools for pi-coding-agent (Python, TypeScript/JavaScript)",
+  "keywords": [
+    "pi",
+    "scip",
+    "code-intelligence",
+    "python",
+    "typescript",
+    "javascript"
+  ],
+  "homepage": "https://github.com/qualisero/pi-agent-scip#readme",
+  "bugs": {
+    "url": "https://github.com/qualisero/pi-agent-scip/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/qualisero/pi-agent-scip.git"
+  },
+  "license": "Apache-2.0",
+  "author": "Dave dV",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "pi-agent-scip-status": "dist/cli/status.js"
+  },
+  "directories": {
+    "test": "tests"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -w --preserveWatchOutput",
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "version": "node scripts/update-badge-timestamp.cjs && git add README.md",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.46",
+    "@sourcegraph/scip-python": "^0.6.6",
+    "@sourcegraph/scip-typescript": "^0.4.0"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-coding-agent": "^0.37.2",
+    "@types/node": "^25.0.3",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.16"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": ">=0.35.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

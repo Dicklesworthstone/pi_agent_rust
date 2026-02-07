@@ -1,0 +1,123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Interview</title>
+  <link rel="stylesheet" href="/styles.css?session=__SESSION_TOKEN__">
+  <link rel="stylesheet" href="/theme-light.css?session=__SESSION_TOKEN__" data-theme-link="light" media="(prefers-color-scheme: light)">
+  <link rel="stylesheet" href="/theme-dark.css?session=__SESSION_TOKEN__" data-theme-link="dark" media="(prefers-color-scheme: dark)">
+</head>
+<body>
+  <main class="interview-container">
+    <div class="session-bar">
+      <span class="session-project" id="session-project"></span>
+      <span class="session-id" id="session-id"></span>
+    </div>
+    <header class="interview-header">
+      <div class="header-row">
+        <h1 id="form-title"></h1>
+        <button type="button" class="save-btn-header" id="save-btn-header" title="Save snapshot">Save</button>
+      </div>
+      <p id="form-description"></p>
+    </header>
+
+    <form id="interview-form" novalidate>
+      <div id="questions-container" role="list"></div>
+
+      <div id="error-container" aria-live="polite" class="error-message hidden"></div>
+
+      <footer class="form-footer">
+        <button type="button" id="save-btn-footer" class="btn-secondary">Save</button>
+        <button type="submit" id="submit-btn" class="btn-primary">Submit</button>
+      </footer>
+    </form>
+
+    <nav class="shortcuts-bar" aria-label="Keyboard shortcuts">
+      <div class="shortcut">
+        <span class="shortcut-keys"><kbd>↑</kbd><kbd>↓</kbd> <kbd>Tab</kbd></span>
+        <span class="shortcut-label">Options</span>
+      </div>
+      <div class="shortcut">
+        <span class="shortcut-keys"><kbd>←</kbd><kbd>→</kbd></span>
+        <span class="shortcut-label">Questions</span>
+      </div>
+      <div class="shortcut-divider"></div>
+      <div class="shortcut">
+        <span class="shortcut-keys"><kbd>Enter</kbd> <kbd>Space</kbd></span>
+        <span class="shortcut-label">Select</span>
+      </div>
+      <div class="shortcut">
+        <span class="shortcut-keys"><kbd class="mod-key">⌘</kbd><kbd>Enter</kbd></span>
+        <span class="shortcut-label">Submit</span>
+      </div>
+      <div class="shortcut-divider"></div>
+      <div class="shortcut">
+        <span class="shortcut-keys"><kbd>Esc</kbd></span>
+        <span class="shortcut-label">Cancel</span>
+      </div>
+      <div class="shortcut-divider"></div>
+      <div class="shortcut recommended-hint">
+        <span class="shortcut-keys"><span class="star">*</span></span>
+        <span class="shortcut-label">Recommended</span>
+      </div>
+      <div class="shortcut hidden" data-theme-shortcut>
+        <span class="shortcut-keys" data-theme-keys></span>
+        <span class="shortcut-label">Theme</span>
+      </div>
+    </nav>
+
+    <div id="success-overlay" class="success-overlay hidden" aria-live="polite">
+      <div class="success-icon">OK</div>
+      <p>Responses submitted</p>
+    </div>
+
+    <div id="countdown-badge" class="countdown-badge hidden" aria-live="polite">
+      <svg class="countdown-ring" viewBox="0 0 36 36">
+        <circle class="countdown-ring-bg" cx="18" cy="18" r="16" />
+        <circle class="countdown-ring-progress" cx="18" cy="18" r="16" />
+      </svg>
+      <span class="countdown-value"></span>
+    </div>
+
+    <div id="queue-toast" class="queue-toast hidden" role="status" aria-live="polite">
+      <div class="queue-toast-header">
+        <span>Another interview started</span>
+        <button type="button" class="queue-toast-close" aria-label="Dismiss">×</button>
+      </div>
+      <div class="queue-toast-body">
+        <label class="queue-toast-label" for="queue-session-select">Switch to:</label>
+        <div class="queue-toast-controls">
+          <select id="queue-session-select" class="queue-toast-select"></select>
+          <button type="button" id="queue-open-btn" class="btn-secondary">Open</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="expired-overlay" class="expired-overlay hidden" aria-live="polite">
+      <div class="expired-content">
+        <div class="expired-icon">!</div>
+        <h2>Session Ended</h2>
+        <p>The interview session has timed out. Your responses are saved locally and will be restored if restarted.</p>
+        <div class="expired-countdown">Closing in <span id="close-countdown">10</span>s</div>
+        <div class="expired-actions">
+          <button type="button" id="stay-btn" class="btn-primary">Stay Here</button>
+          <button type="button" id="close-tab-btn" class="btn-secondary">Close Now</button>
+        </div>
+        <div class="expired-shortcuts">
+          <span><kbd>Enter</kbd> Confirm</span>
+          <span><kbd>Tab</kbd> Switch</span>
+          <span><kbd>Esc</kbd> Close</span>
+        </div>
+      </div>
+    </div>
+
+    <div id="save-toast" class="save-toast hidden" aria-live="polite"></div>
+  </main>
+
+  <script>
+    window.__INTERVIEW_DATA__ = /* __INTERVIEW_DATA_PLACEHOLDER__ */;
+  </script>
+  <script src="/script.js?session=__SESSION_TOKEN__"></script>
+</body>
+</html>

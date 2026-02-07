@@ -1,0 +1,548 @@
+# Mario-Not Spec (Mario-Style TUI)
+
+- Status: Draft
+- Command: `/mario-not`
+- Goals:
+  - A fast-boot, Mario-like platformer in the TUI that feels playable in under 10 seconds.
+  - Clear, verifiable behavior for each system so implementation can be incremental.
+  - Save/resume across sessions.
+- Non-goals:
+  - Perfect SMB1 fidelity.
+  - Full Mario feature set (fire flower, shells, etc.) unless specified.
+
+- Core Gameplay
+  - Player Experience & Feel
+    - Time-to-fun / quick boot
+      - Design intent:
+        - Boot to playable within a couple seconds; minimal friction.
+        - Resume saved run instantly without menus; avoid accidental movement.
+        - Show controls briefly without blocking play.
+      - Implementation details:
+        - On `/mario-not`, load saved state if present; set `paused=true` and render immediately.
+        - Resume on first non-quit input; do not show multi-screen menus.
+        - If no save, start Level 1 at the start position with `paused=false` after first render.
+        - Keep assets in code; no file/network I/O; precompute tilemaps at startup.
+        - Provide `[R] Restart` and `[Q]/Esc Quit` shortcuts at all times.
+      - Verification:
+        - New game: first rendered frame appears within 1s; first movement key moves on next tick.
+        - Saved game: pressing movement/jump unpauses immediately.
+        - No more than one keypress required to reach active play.
+    - Pace / difficulty ramp
+      - Design intent:
+        - Level 1 teaches core moves quickly: move, jump, stomp, coin, goal.
+        - Ramp from safe to moderate challenge within ~45-90 seconds.
+        - Avoid difficulty spikes; first death should feel "earned".
+      - Implementation details:
+        - Level 1 layout sequence: flat runway → low gap → coin line → single goomba → brick stack → pipe → two goombas → staircase to goal.
+        - Place first enemy after a safe flat stretch to allow movement tests.
+        - Use 1-tile-high gaps early; introduce 2-tile gap only near the end.
+        - Keep enemy density low: max 1 enemy per screen-width in Level 1.
+        - Introduce one "safe" power-up (mushroom) before first multi-enemy segment.
+      - Verification:
+        - First 10 seconds: player can run and jump without hazards.
+        - By 30 seconds: player encounters a coin line and a single goomba.
+        - By 60-90 seconds: player reaches goal if no mistakes.
+    - Failure/respawn cadence
+      - Design intent:
+        - Failures should be quick to recover from; avoid long downtime.
+        - Encourage experimentation; death feels like a short setback, not a reset.
+        - Lives/time create urgency without punishing early learning.
+      - Implementation details:
+        - On death: freeze for 0.5s, play a brief cue, then respawn at last checkpoint or level start.
+        - Checkpoints: one midpoint checkpoint in Level 1 (e.g., after the first pipe).
+        - Lives start at 3; losing all lives ends run (game over screen with restart).
+        - Timer starts at 300s per level; hitting 0 triggers death.
+        - Death causes temporary invulnerability (e.g., 2s) after respawn.
+      - Verification:
+        - Death-to-control regained ≤ 2.5s on average.
+        - Checkpoint restores progress (position, level state) while preserving score/coins.
+        - Game over triggers after 3 deaths without extra lives.
+    - Feel targets vs SMB1
+      - Design intent:
+        - Capture SMB1's tight jump arc and snappy ground control, not exact physics.
+        - Preserve "momentum" feel: fast enough to clear gaps, but not slippery.
+        - Movement must read clearly in a low-res TUI grid.
+      - Implementation details:
+        - Use continuous (float) position/velocity with tile-based collision.
+        - Provide a run modifier (Mario "B") to increase max speed by ~30-40%.
+        - Target metrics (tuned in Physics section):
+          - Walk speed: ~3 tiles/sec; run speed: ~4.2 tiles/sec.
+          - Jump apex time: ~0.35–0.45s; max height: ~3.5–4 tiles.
+          - Coyote time: ~100ms; jump buffer: ~120ms.
+        - Keep air control at ~60–70% of ground accel.
+      - Verification:
+        - Player can clear a 2-tile gap only while running.
+        - Tap jump yields visibly shorter arc than hold jump.
+        - Short hops are possible with quick jump release.
+  - Controls & Input
+    - Key mapping
+      - Design intent:
+        - Support intuitive controls for a terminal: arrows + WASD + vim.
+        - Provide a run modifier for Mario-like speed control.
+        - Keep pause/restart/quit accessible with one key.
+      - Implementation details:
+        - Movement: Left/Right = ←/→, A/D, H/L.
+        - Jump: Up/Space/W/K.
+        - Run modifier: Shift (if detectable) or Alt; fallback key `x` as run toggle/hold.
+        - Crouch/Down: ↓/S/J (used for pipes or future features).
+        - Pause: P. Restart: R. Quit: Q or Esc.
+        - Input handling via `matchesKey` and raw key strings; map to actions each tick.
+      - Verification:
+        - All listed keys move/jump in a visible, immediate way.
+        - Run modifier visibly increases max speed.
+        - Pause and quit work from any state.
+    - Input buffering
+      - Design intent:
+        - Make jumps feel responsive despite low tick rate.
+        - Reduce "I pressed jump but nothing happened" frustration.
+      - Implementation details:
+        - Jump buffer: store jump input for 120ms; if player becomes grounded within window, consume jump.
+        - Coyote time: allow jump for 100ms after leaving ground.
+        - Buffer only jump; movement uses current frame input.
+        - Clear buffer on successful jump or after timeout.
+      - Verification:
+        - Jump pressed slightly before landing still triggers a jump.
+        - Jump pressed slightly after leaving a ledge still triggers a jump.
+    - Pausing/quitting/restart
+      - Design intent:
+        - Make it safe to leave the game at any time without losing progress.
+        - Keep the command responsive while waiting for compaction.
+      - Implementation details:
+        - Pause toggled with P; pause freezes physics, timers, enemies.
+        - Quit with Q/Esc: save state and exit to terminal.
+        - Restart with R: clears save, resets level and stats to defaults.
+        - If game over, show prompt: `[R] Restart  [Q] Quit`.
+        - If paused, show prompt: `[P] Resume  [R] Restart  [Q] Quit`.
+      - Verification:
+        - Pause stops all movement and time countdown.
+        - Quit + relaunch resumes at same spot (unless R used).
+  - Game Loop & States
+    - State machine
+      - Design intent:
+        - Make behavior deterministic and testable.
+        - Separate gameplay, pause, and terminal transitions.
+      - Implementation details:
+        - States: `boot`, `ready`, `playing`, `paused`, `dead`, `level_clear`, `game_over`, `exiting`.
+        - `boot`: load save, initialize level, render first frame.
+        - `ready`: show HUD + controls hint; waiting for first input (if resumed).
+        - `playing`: physics + timers + enemies active.
+        - `paused`: freeze simulation; allow resume/restart/quit.
+        - `dead`: death animation/timeout; then respawn or game over.
+        - `level_clear`: short celebration; then advance.
+        - `game_over`: no simulation; allow restart/quit.
+        - `exiting`: write save and exit UI.
+      - Verification:
+        - Only `playing` advances physics/time.
+        - `paused` and `game_over` ignore movement inputs.
+    - Transitions
+      - Design intent:
+        - Keep transitions predictable and responsive.
+        - Avoid hidden timers or ambiguous state changes.
+      - Implementation details:
+        - `boot` -> `ready` if saved game present; else -> `playing`.
+        - `ready` -> `playing` on first non-quit input.
+        - `playing` -> `paused` on P; `paused` -> `playing` on P.
+        - `playing` -> `dead` on fatal collision or timer=0.
+        - `dead` -> `playing` after respawn delay if lives remain; else -> `game_over`.
+        - `playing` -> `level_clear` on goal; `level_clear` -> `playing` after 1s or on input.
+        - `playing`/`paused`/`game_over` -> `exiting` on Q/Esc (save first).
+        - `game_over` -> `playing` on R (new run).
+      - Verification:
+        - Each transition has a single, documented trigger.
+        - Quit always saves before exit; restart always clears save.
+  - Level Design
+    - Tile palette
+      - Design intent:
+        - Keep a minimal, legible tile set that reads at low resolution.
+        - Separate solid, semi-solid, and decorative tiles clearly.
+      - Implementation details:
+        - Core tiles (solid unless noted):
+          - Ground (`#`), Brick (`B`), Question (`?`), Coin (`o`, non-solid),
+          - Pipe top (`T`), Pipe body (`P`), Flag/Goal (`G`),
+          - Spike (`^`, hazard), Water (`~`, hazard),
+          - Empty (` `), Spawn (`S`, editor-only).
+        - Each tile defines: `solid`, `hazard`, `collectible`, `interaction` flags.
+        - Question blocks spawn coins or mushroom (first-time hit).
+        - Pipes are solid; optional enter behavior when crouching.
+      - Verification:
+        - Solid tiles block movement; non-solid coins do not.
+        - Hazards trigger death on contact.
+    - Layout rules
+      - Design intent:
+        - Keep levels short and readable; avoid visual noise.
+        - Teach one concept at a time; introduce hazards in isolation first.
+      - Implementation details:
+        - Maintain a safe landing after every new gap or hazard.
+        - Max consecutive enemies: 2 (Level 1), 3 (later).
+        - Place coins to hint at optimal jumps or safe platforms.
+        - Pipes should be 2 tiles wide and at least 2 tiles tall.
+        - Minimum ceiling height for jumps: 4 tiles above ground.
+        - No blind drops: always show the landing area within camera view.
+      - Verification:
+        - Each gap in Level 1 has visible landing space.
+        - Coin lines align with intended jump arcs.
+    - Level 1 (short)
+      - Design intent:
+        - Deliver a satisfying "mini 1-1" in under ~90 seconds.
+        - Include all core interactions: move, jump, coin, enemy, block, goal.
+      - Implementation details:
+        - Length target: 3–4 screen widths.
+        - Segment 1 (0–1 screen): flat ground, 3-coin line, low brick step.
+        - Segment 2 (1–2 screens): 4-tile gap, single goomba, question block with coin.
+        - Segment 3 (2–3 screens): pipe (2 tiles wide), 2 goombas spaced, brick stack.
+        - Segment 4 (3–4 screens): 2-tile gap (requires run), staircase to flag.
+        - Midpoint checkpoint: after pipe in Segment 3.
+        - Goal: flag/goal post at far right on solid ground.
+      - Verification:
+        - A running jump is required for final 2-tile gap.
+        - Goal reachable within 60–90 seconds without deaths.
+  - Entities & Interactions
+    - Player
+      - Design intent:
+        - A clear, responsive avatar with distinct power states.
+        - Small/big states affect survivability and collisions.
+      - Implementation details:
+        - States: `small`, `big` (future: `fire`).
+        - Size: small = 1x2 tiles; big = 1x3 tiles (hitbox anchored at feet).
+        - Damage rules: small hit -> death; big hit -> shrink + invuln.
+        - Stomp: downward collision with enemy kills enemy and bounces player.
+        - Head-bump: hitting bricks/questions from below triggers interactions.
+        - Collect coins by overlap; pickups apply immediately.
+      - Verification:
+        - Big Mario fits under 3-tile ceilings; small fits under 2-tile ceilings.
+        - Stomp only works when falling onto enemy top.
+    - Blocks
+      - Design intent:
+        - Provide clear, satisfying interactions with the environment.
+        - Make blocks readable and deterministic.
+      - Implementation details:
+        - Bricks (`B`): solid; small Mario hits from below = no break; big Mario breaks brick.
+        - Question (`?`): first hit spawns coin or mushroom, then becomes "used" tile.
+        - Used block (`U`): solid, no further interactions.
+        - Pipes (`T`/`P`): solid; optional down-entry if player is crouching on top.
+        - Block hit effect: short vertical nudge + particle or text cue.
+      - Verification:
+        - Big Mario breaks brick; small Mario does not.
+        - Question block only yields one item then becomes used.
+    - Items
+      - Design intent:
+        - Keep item set minimal and meaningful.
+        - Each item changes play in a visible, immediate way.
+      - Implementation details:
+        - Coin: +1 coin, +100 score; disappears on pickup.
+        - Mushroom: sets player to `big`; if already big, +1000 score.
+        - (Optional) 1-up: +1 life; rare, only in hidden question block.
+        - Spawn rules: question blocks yield a coin by default; one mushroom per level.
+        - Item motion: mushroom slides along ground, reverses on walls, falls off edges.
+      - Verification:
+        - Coin count increases on pickup; UI updates.
+        - Mushroom collision changes player size immediately.
+    - Enemies
+      - Design intent:
+        - Start with a single, readable enemy type for reliability.
+        - Enemies enforce jump timing without clutter.
+      - Implementation details:
+        - Goomba only (Level 1+): patrols left/right, flips on wall hit.
+        - Speed: slow (approx 1 tile/sec); always grounded.
+        - Stomped goomba dies; side collision damages player.
+        - Goombas fall off edges in later levels; Level 1 uses ground.
+      - Verification:
+        - Stomp kills goomba and triggers bounce.
+        - Side collision kills small or shrinks big.
+    - Hazards
+      - Design intent:
+        - Provide clear, readable dangers with simple rules.
+      - Implementation details:
+        - Pits: falling below level bounds triggers death.
+        - Spikes (`^`): contact triggers death (no invuln bypass).
+        - Water (`~`): contact triggers death (no swim mechanic).
+        - Hazards are static tiles, not moving entities.
+      - Verification:
+        - Falling off-screen kills player within 0.5s.
+        - Touching spikes/water kills regardless of power state.
+  - Physics & Movement
+    - Gravity / accel / friction
+      - Design intent:
+        - Snappy ground control with manageable momentum.
+        - Air control present but reduced.
+      - Implementation details:
+        - Units: tiles/sec for target speeds; update in fixed timestep.
+        - Gravity: 20–24 tiles/sec^2; max fall speed 8–10 tiles/sec.
+        - Ground accel: 30–40 tiles/sec^2; ground decel (friction) 25–35 tiles/sec^2.
+        - Air accel: 60–70% of ground accel; air decel minimal.
+        - Walk max speed: 3 tiles/sec; Run max speed: 4.2 tiles/sec (when run modifier held).
+      - Verification:
+        - Player reaches walk speed in ~0.2–0.3s, run speed in ~0.35–0.45s.
+        - Letting go of input stops within ~0.25–0.35s on ground.
+    - Jump (variable)
+      - Design intent:
+        - Support short hops and full jumps for precise control.
+        - Jump feel should be forgiving but not floaty.
+      - Implementation details:
+        - Initial jump velocity tuned for 3.5–4 tile apex.
+        - If jump released early (within 150ms), apply extra gravity multiplier (e.g., 1.8x).
+        - Use coyote time (100ms) and jump buffer (120ms) from input section.
+        - Disallow jump while in `dead`/`level_clear`/`game_over`.
+      - Verification:
+        - Tap jump yields ~2–2.5 tile height.
+        - Hold jump yields ~3.5–4 tile height.
+        - Coyote and buffered jumps trigger reliably.
+    - Collision resolution
+      - Design intent:
+        - Keep collisions predictable and stable at low resolution.
+      - Implementation details:
+        - Separate horizontal and vertical movement steps each tick.
+        - Resolve vertical first for stomp logic: check downwards collision with enemy top.
+        - Tile collision: clamp position to tile boundary; zero relevant velocity.
+        - Entity collision: AABB overlap; prioritize stomp if vy > 0 and player bottom above enemy midline.
+        - Head-bump: if vy < 0 and tile above is solid, stop upward velocity and trigger block interaction.
+        - Prevent tunneling: limit max velocity or use sub-steps when speed > tile size per tick.
+      - Verification:
+        - No "sticking" on tile edges while running.
+        - Stomps consistently trigger when falling onto enemy.
+
+- Presentation
+  - Camera & Viewport
+    - Target size
+      - Design intent:
+        - Provide a consistent playfield that fits common terminals.
+        - Keep characters readable without scrolling UI.
+      - Implementation details:
+        - Target viewport: 40 cols x 15 rows of tiles (game area).
+        - HUD/header uses 2–3 lines above viewport.
+        - Require minimum terminal width: 60 cols; height: 22 rows.
+        - If terminal smaller: show warning and instructions to resize.
+      - Verification:
+        - At 80x24 terminal, game renders without wrapping.
+        - Resize below minimum shows "Terminal too small" message.
+    - Scroll rules
+      - Design intent:
+        - Keep the player visible with minimal camera jitter.
+        - Allow small backtracking but prevent large reverse scrolling.
+      - Implementation details:
+        - Camera follows player earlier: keep player near 25% of viewport width.
+        - Only scroll forward by default; allow 10–15% backtracking within current screen.
+        - Vertical camera locked (no vertical scrolling) to simplify rendering.
+        - Camera clamps to level bounds; never shows beyond level edges.
+      - Verification:
+        - Player stays within view during jumps and runs.
+        - Camera does not oscillate when player pauses.
+    - Bounds/edges
+      - Design intent:
+        - Prevent camera from exposing empty space outside the level.
+        - Keep player collision consistent near edges.
+      - Implementation details:
+        - Camera clamps X between 0 and (levelWidth - viewportWidth).
+        - Left edge: player cannot move beyond x=0.
+        - Right edge: allow player to reach goal even if camera stops.
+        - Bottom: falling below level height triggers death.
+      - Verification:
+        - No blank columns appear beyond level edges.
+        - Player cannot walk left of level start.
+  - Rendering & Palette
+    - 256-color plan
+      - Design intent:
+        - Use a small, consistent ANSI 256-color palette to keep tiles readable.
+        - Avoid Unicode width issues; prioritize ASCII + color.
+      - Implementation details:
+        - Define palette indices for: sky, ground, grass, brick, coin, player, enemy, hazard, pipe, goal, text.
+        - Use a single foreground color per tile glyph; background optional for sky gradient.
+        - Default glyph width: 2 chars per tile to preserve aspect ratio.
+        - Provide a palette map in code (e.g., array of ANSI color IDs).
+      - Verification:
+        - All tiles render with distinct colors on dark backgrounds.
+        - No layout jitter from multi-width glyphs.
+    - Glyphs / tiles
+      - Design intent:
+        - Keep glyphs simple, ASCII, and 2-char wide per tile.
+      - Implementation details:
+        - Recommended glyphs (2 chars):
+          - Ground: "##"; Brick: "[]"; Question: "??"; Used: "..";
+          - Coin: "o "; Pipe top/body: "||"; Flag/Goal: "|>";
+          - Spike: "/\\"; Water: "~~"; Empty: "  ".
+        - Player: small "<>" body; big uses "<>", "[]" stack (1x3 tiles, 2-char wide).
+        - Enemy (goomba): "GG".
+        - All glyphs must be ASCII; avoid Unicode blocks.
+      - Verification:
+        - All tiles align to a 2-char grid with no drift.
+        - Player/enemy sprites stay within their tile bounds.
+  - HUD & Scoring
+    - HUD layout
+      - Design intent:
+        - Keep HUD compact and readable without stealing play space.
+      - Implementation details:
+        - HUD on 2 lines above viewport.
+        - Line 1: title + level + time. Line 2: score + coins + lives.
+        - Use color accents for warnings (time low, low lives).
+        - Show brief state messages (PAUSED, GAME OVER) centered.
+      - Verification:
+        - HUD never overlaps game area.
+        - Time warning triggers at <= 30 seconds.
+    - Score/lives/time/coins
+      - Design intent:
+        - Provide simple feedback loops: coins and score for actions, lives for risk.
+      - Implementation details:
+        - Score: +100 coin, +50 stomp, +10 brick break, +500 level clear bonus.
+        - Coins: display count; at 100 coins grant +1 life (optional).
+        - Lives: start at 3; display hearts or "x3".
+        - Time: start at 300; decrement every second in playing state.
+      - Verification:
+        - HUD updates instantly on score/coin changes.
+        - Time stops when paused.
+  - FX & Feedback (optional)
+    - Particles
+      - Design intent:
+        - Add small feedback bursts without heavy rendering cost.
+      - Implementation details:
+        - Spawn 4–8 particles on: brick break, enemy stomp, coin pickup.
+        - Particles are short-lived colored dots (1–2 chars), 200–400ms.
+        - Cap total particles to avoid slowdown (e.g., max 40).
+      - Verification:
+        - Particle count never exceeds cap.
+        - Particles do not affect collision or input.
+    - Text cues
+      - Design intent:
+        - Provide immediate state feedback without extra graphics.
+      - Implementation details:
+        - Short overlays: "PAUSED", "LEVEL CLEAR", "GAME OVER", "1-UP".
+        - Display for 0.5–1.0s or until input.
+        - Use dim/bright color to distinguish from HUD.
+      - Verification:
+        - Cues appear on state change and disappear on resume.
+
+- Tech + Delivery
+  - Save/Resume
+    - Autosave cadence
+      - Design intent:
+        - Preserve progress without manual saves.
+        - Avoid saving in unstable states (mid-death, mid-transition).
+      - Implementation details:
+        - Autosave on: pause, quit, level clear, and every 5–10 seconds during play.
+        - Do not autosave during `dead` animation or `game_over`.
+        - Save after physics step to ensure consistent state.
+      - Verification:
+        - Quitting always resumes at last autosave point.
+        - No saves are written during death animation.
+    - Persisted fields
+      - Design intent:
+        - Resume with minimal surprise; preserve meaningful progress.
+      - Implementation details:
+        - Persist: level index, player position/velocity, power state, coins, score, lives, time, checkpoint, RNG seed.
+        - Persist world state: used blocks, removed bricks, collected coins, enemy alive flags.
+        - Do not persist transient particles or text cues.
+      - Verification:
+        - After reload, used blocks remain used and coins stay collected.
+        - Player resumes with same power state and score.
+    - Resume behavior
+      - Design intent:
+        - Resume should feel immediate but safe (no surprise hazards).
+      - Implementation details:
+        - On resume, load saved state and start in `ready` (paused) with hint "Press any key".
+        - Give 0.5s invulnerability on resume to prevent instant death.
+        - If saved during pause, resume stays paused until input.
+        - If no save, start new run at Level 1 start.
+      - Verification:
+        - Resume does not move player until input.
+        - Immediate hazards do not kill player during invuln window.
+  - Technical Architecture
+    - Data model
+      - Design intent:
+        - Keep state structured and serializable for save/resume.
+      - Implementation details:
+        - `GameState`: levelIndex, time, score, coins, lives, rngSeed, state, cameraX.
+        - `PlayerState`: x, y, vx, vy, facing, power, onGround, invulnTimer.
+        - `LevelState`: tiles[][], width, height, usedBlocks set, collectedCoins set.
+        - `EnemyState[]`: type, x, y, vx, vy, alive.
+        - `ItemState[]`: type, x, y, vx, vy, active.
+        - `SaveState`: snapshot of GameState + PlayerState + LevelState + entities.
+      - Verification:
+        - SaveState can be JSON-serialized without custom classes.
+    - Update order
+      - Design intent:
+        - Ensure deterministic behavior per tick.
+      - Implementation details:
+        - Per tick: handle input -> update player physics -> resolve tile collisions -> update enemies -> resolve entity collisions -> update items -> update camera -> render.
+        - Timers (time, invuln, animation) update only in playing state.
+        - Save hook runs after physics/collision step.
+      - Verification:
+        - Stomp logic runs after player movement but before enemy AI for the next frame.
+    - Collision handling
+      - Design intent:
+        - Separate tile vs entity collisions for clarity and testability.
+      - Implementation details:
+        - Tile collisions handled via grid probe (corners) per axis.
+        - Entity collisions via AABB overlap after movement.
+        - Priority: resolve tiles first, then entities (stomp/side hit), then items.
+        - Use discrete tile size; clamp positions on impact.
+      - Verification:
+        - Player never passes through solid tiles at max speed.
+        - Stomp and side-hit outcomes are consistent.
+    - Input handling
+      - Design intent:
+        - Translate raw keypresses into stable per-tick actions.
+      - Implementation details:
+        - Use `handleInput(data)` to set intent flags (left/right/jump/run).
+        - Clear intents after a short timeout (e.g., 100–150ms) to simulate keyup.
+        - Input buffering: store last jump press timestamp for buffer/coyote.
+        - Ignore movement inputs in non-playing states (except ready/unpause).
+      - Verification:
+        - Holding key results in continuous movement via repeated key events.
+        - Jump buffer triggers within specified window.
+    - Serialization
+      - Design intent:
+        - Keep save format stable and forward-compatible.
+      - Implementation details:
+        - Save as JSON via session entries; include version field.
+        - On load, migrate older versions with defaults.
+        - Validate required fields; if invalid, discard save.
+      - Verification:
+        - Old save versions load with reasonable defaults.
+        - Corrupt save is ignored without crashing.
+  - Feature Stories & Sequencing
+    - Design intent:
+      - Enable incremental delivery with playable checkpoints.
+    - Implementation details:
+      - Story 1: Core loop (movement, gravity, tiles, Level 1 layout).
+      - Story 2: Enemies + stomp + hazards.
+      - Story 3: Blocks + coins + scoring + HUD.
+      - Story 4: Power-ups (mushroom) + big state.
+      - Story 5: Save/resume + pause/quit.
+      - Story 6: Polish (particles, text cues, camera dead-zone).
+      - Each story has a playable demo gate.
+    - Verification:
+      - Each story can be validated independently in TUI.
+  - Test Plan
+    - Design intent:
+      - Validate core mechanics quickly in a terminal.
+    - Implementation details:
+      - Manual checks:
+        - Movement/jump feel (walk/run, short/long jumps).
+        - Stomp enemy vs side collision outcomes.
+        - Block interactions (brick break, question use).
+        - Save/resume: quit and resume at same spot.
+        - Camera: dead-zone, no overscroll.
+      - Automated checks (optional):
+        - Simulate physics step for jump apex height.
+        - Serialize/deserialize SaveState and compare fields.
+    - Verification:
+      - All manual checks pass in under 5 minutes.
+  - Milestones
+    - Design intent:
+      - Provide checkpoints for incremental shipping.
+    - Implementation details:
+      - M1: Basic Level 1 playable (movement, tiles, camera).
+      - M2: Enemies + hazards + scoring.
+      - M3: Blocks + items + power-ups.
+      - M4: Save/resume + polish (FX, cues).
+    - Verification:
+      - Each milestone yields a playable build.
+  - Open Questions
+    - Design intent:
+      - Track decisions that affect feel or scope.
+    - Implementation details:
+      - Finalize run modifier key (Shift vs X fallback).
+      - Decide if pipe entry is implemented in v1.
+      - Confirm scoring values and time limit.
+      - Determine if coins grant extra life at 100.
+    - Verification:
+      - Open questions resolved before M3.
