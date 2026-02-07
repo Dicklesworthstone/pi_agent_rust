@@ -7033,7 +7033,7 @@ async fn dispatch_hostcall_ui(
     }
 }
 
-fn ui_response_value_for_op(op: &str, response: &ExtensionUiResponse) -> Value {
+pub(crate) fn ui_response_value_for_op(op: &str, response: &ExtensionUiResponse) -> Value {
     if response.cancelled {
         return match op {
             // Deterministic defaults: confirm cancellation/timeout resolves false.
@@ -7044,7 +7044,7 @@ fn ui_response_value_for_op(op: &str, response: &ExtensionUiResponse) -> Value {
     response.value.clone().unwrap_or(Value::Null)
 }
 
-fn classify_ui_hostcall_error(err: &Error) -> &'static str {
+pub(crate) fn classify_ui_hostcall_error(err: &Error) -> &'static str {
     let msg = err.to_string();
     let lower = msg.to_ascii_lowercase();
     if lower.contains("timeout") || lower.contains("timed out") || lower.contains("cancel") {
@@ -16662,7 +16662,11 @@ mod tests {
             delay_ms: None,
         };
         let json = serde_json::to_value(&bp).unwrap();
-        assert_eq!(json, json!({}), "both-None backpressure should serialize to empty object");
+        assert_eq!(
+            json,
+            json!({}),
+            "both-None backpressure should serialize to empty object"
+        );
 
         let back: HostStreamBackpressure = serde_json::from_value(json).unwrap();
         assert!(back.credits.is_none());

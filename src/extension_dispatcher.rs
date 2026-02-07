@@ -21,11 +21,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::connectors::{Connector, http::HttpConnector};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::extensions::EXTENSION_EVENT_TIMEOUT_MS;
 use crate::extensions::{
     ExtensionBody, ExtensionMessage, ExtensionSession, ExtensionUiRequest, ExtensionUiResponse,
     HostCallError, HostCallErrorCode, HostCallPayload, HostResultPayload, HostStreamChunk,
+    classify_ui_hostcall_error, ui_response_value_for_op,
 };
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, js_to_json, json_to_js};
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
@@ -45,17 +46,6 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
     /// Current working directory for relative path resolution.
     cwd: PathBuf,
-}
-
-fn ui_response_value_for_op(op: &str, response: &ExtensionUiResponse) -> Value {
-    if response.cancelled {
-        return match op {
-            // Deterministic defaults (bd-2hz.1): confirm cancellation/timeout resolves false.
-            "confirm" => Value::Bool(false),
-            _ => Value::Null,
-        };
-    }
-    response.value.clone().unwrap_or(Value::Null)
 }
 
 fn protocol_hostcall_op(params: &Value) -> Option<String> {
@@ -84,21 +74,6 @@ fn protocol_error_code(code: &str) -> HostCallErrorCode {
         "io" | "tool_error" => HostCallErrorCode::Io,
         "invalid_request" => HostCallErrorCode::InvalidRequest,
         _ => HostCallErrorCode::Internal,
-    }
-}
-
-fn classify_ui_hostcall_error(err: &Error) -> &'static str {
-    let msg = err.to_string();
-    let lower = msg.to_ascii_lowercase();
-    if lower.contains("timeout") || lower.contains("timed out") || lower.contains("cancel") {
-        "timeout"
-    } else if lower.contains("not configured")
-        || lower.contains("channel closed")
-        || lower.contains("response dropped")
-    {
-        "denied"
-    } else {
-        err.hostcall_error_code()
     }
 }
 
@@ -1253,6 +1228,7 @@ mod tests {
     use super::*;
 
     use crate::connectors::http::HttpConnectorConfig;
+    use crate::error::Error;
     use crate::extensions::{ExtensionBody, ExtensionMessage, HostCallPayload, PROTOCOL_VERSION};
     use crate::scheduler::DeterministicClock;
     use crate::session::SessionMessage;
