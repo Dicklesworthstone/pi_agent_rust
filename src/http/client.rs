@@ -1141,7 +1141,7 @@ mod tests {
         let recorder = VcrRecorder::new_with(
             "test",
             crate::vcr::VcrMode::Playback,
-            &std::path::PathBuf::from("/tmp"),
+            std::path::Path::new("/tmp"),
         );
         let client = Client::new().with_vcr(recorder);
         assert!(client.vcr().is_some());
