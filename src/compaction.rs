@@ -351,6 +351,16 @@ fn find_valid_cut_points(
     cut_points
 }
 
+fn entry_has_tool_calls(entry: &SessionEntry) -> bool {
+    matches!(
+        entry,
+        SessionEntry::Message(msg) if matches!(
+            &msg.message,
+            SessionMessage::Assistant { message } if message.content.iter().any(|b| matches!(b, ContentBlock::ToolCall(_)))
+        )
+    )
+}
+
 const fn is_user_turn_start(entry: &SessionEntry) -> bool {
     match entry {
         SessionEntry::BranchSummary(_) => true,
@@ -427,6 +437,26 @@ fn find_cut_point(
             break;
         }
         cut_index -= 1;
+    }
+
+    // Advance past tool-call/result chains: if the cut lands on an assistant message
+    // whose tool calls have their results immediately after, skip the whole chain so
+    // the tool call + results stay together in the turn prefix rather than being split.
+    if entry_has_tool_calls(&entries[cut_index]) {
+        let mut scan = cut_index + 1;
+        while scan < end_index {
+            if matches!(
+                &entries[scan],
+                SessionEntry::Message(msg) if matches!(msg.message, SessionMessage::ToolResult { .. })
+            ) {
+                scan += 1;
+            } else {
+                break;
+            }
+        }
+        if scan > cut_index + 1 && scan < end_index {
+            cut_index = scan;
+        }
     }
 
     let is_user_message = is_user_turn_start(&entries[cut_index]);

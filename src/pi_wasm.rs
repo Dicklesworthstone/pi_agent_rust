@@ -166,9 +166,6 @@ fn js_to_i32(value: f64) -> i32 {
         return 0;
     }
 
-    const TWO_POW_32: f64 = 4_294_967_296.0;
-    const TWO_POW_31: f64 = 2_147_483_648.0;
-
     let mut wrapped = value.trunc() % TWO_POW_32;
     if wrapped < 0.0 {
         wrapped += TWO_POW_32;
@@ -263,6 +260,9 @@ const DEFAULT_MAX_MODULES: usize = 256;
 const DEFAULT_MAX_INSTANCES: usize = 256;
 /// Keep IDs within QuickJS signed-int range for stable JS↔Rust roundtrips.
 const MAX_JS_WASM_ID: u32 = i32::MAX as u32;
+/// JS numeric coercion helpers.
+const TWO_POW_32: f64 = 4_294_967_296.0;
+const TWO_POW_31: f64 = 2_147_483_648.0;
 
 /// Inject `globalThis.WebAssembly` polyfill into the QuickJS context.
 #[allow(clippy::too_many_lines)]

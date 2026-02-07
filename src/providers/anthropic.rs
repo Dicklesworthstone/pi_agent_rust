@@ -1197,7 +1197,7 @@ mod tests {
         let body = [
             r#"data: {"type":"message_start","message":{"usage":{"input_tokens":1}}}"#,
             "",
-            r#"data: {invalid-json}"#,
+            r"data: {invalid-json}",
             "",
             // This should not be emitted after parse error.
             r#"data: {"type":"message_stop"}"#,
