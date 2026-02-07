@@ -370,7 +370,7 @@ fn generate_inclusion_list() {
             .and_then(|r| r.risk_level.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
-        let pin = extract_provenance_pin(&item.source, &item.checksum.sha256);
+        let pin = extract_provenance_pin(item.source.as_ref(), &item.checksum.sha256);
 
         let entry = InclusionEntry {
             id: item.id.clone(),
