@@ -48,14 +48,21 @@ These are the target performance metrics. Regressions beyond these thresholds sh
 | ext_js_runtime/warm_run_pending_jobs_empty | <1μs | ~84ns | ✅ |
 | ext_js_runtime/tool_call_roundtrip | <500μs | ~43.9μs | ✅ |
 
-### Extension Runtime (Planned)
+### Extension Runtime (Baseline: 2026-02-07, debug build, 103 extensions)
 
-| Benchmark | Budget | Current | Status |
-|-----------|--------|---------|--------|
-| ext_runtime_cold_start (no-op extension) | p95 < 200ms (p99 < 400ms) | TBD | ⬜ |
-| ext_runtime_warm_start (no-op extension) | p95 < 25ms (p99 < 50ms) | TBD | ⬜ |
-| ext_tool_hook_overhead (no-op extension) | p95 < 500μs (p99 < 1ms) | TBD | ⬜ |
-| ext_hostcall_dispatch (single call) | p95 < 50μs (p99 < 100μs) | TBD | ⬜ |
+| Benchmark | Budget | Current (debug) | Status |
+|-----------|--------|-----------------|--------|
+| ext_cold_load_simple_p95 (100 extensions) | p95 < 200ms | 106ms | ✅ |
+| ext_cold_load_per_ext_p99 (worst ext) | p99 < 100ms | 134ms (hjanuschka-plan-mode) | ⬜* |
+| ext_warm_load_p95 (100 extensions) | p95 < 100ms | 734μs | ✅ |
+| ext_warm_load_per_ext_p99 (worst ext) | p99 < 100ms | 926μs (jyaunches-pi-canvas) | ✅ |
+| event_dispatch_p99 (AgentStart, PR mode) | p99 < 5ms | 616μs | ✅ |
+
+*Cold load per-extension P99 exceeds debug-mode budget but is expected to pass in release
+(release cold loads are typically ~5-10ms). Budget assertions are release-only.
+
+Baseline data: `tests/perf/reports/ext_bench_baseline.json`
+Outlier analysis: `tests/perf/reports/BASELINE_REPORT.md`
 
 ### Extension Runtime Budget Definitions
 

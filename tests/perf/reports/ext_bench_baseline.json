@@ -1,0 +1,1055 @@
+{
+  "schema": "pi.bench.baseline.v1",
+  "generated_at": "2026-02-07T05:44:08Z",
+  "git_commit": "03098489",
+  "build_profile": "debug",
+  "cpu": "AMD EPYC 7282 16-Core Processor",
+  "cpu_cores": 64,
+  "os": "linux",
+  "mode": "nightly",
+  "config": {
+    "max_extensions": 103,
+    "iterations": 10,
+    "event_dispatch_count": 100,
+    "debug_build": true
+  },
+  "aggregate": {
+    "extensions_tested": 100,
+    "extensions_failed": 4,
+    "cold_load": {
+      "p50_of_p50s_us": 77284,
+      "p95_of_p50s_us": 102633,
+      "p50_of_p99s_us": 84202,
+      "p95_of_p99s_us": 114788,
+      "max_p99_us": 133779,
+      "min_p50_us": 66939
+    },
+    "warm_load": {
+      "p50_of_p50s_us": 333,
+      "p95_of_p50s_us": 628,
+      "p50_of_p99s_us": 410,
+      "p95_of_p99s_us": 734,
+      "max_p99_us": 926,
+      "min_p50_us": 280
+    }
+  },
+  "budget_checks": [
+    {
+      "budget_name": "ext_cold_load_simple_p95",
+      "threshold_us": 200000,
+      "actual_us": 105637,
+      "status": "PASS"
+    },
+    {
+      "budget_name": "ext_cold_load_per_ext_p99",
+      "threshold_us": 100000,
+      "actual_us": 133779,
+      "status": "FAIL",
+      "worst_extension": "community/hjanuschka-plan-mode"
+    },
+    {
+      "budget_name": "ext_warm_load_per_ext_p99",
+      "threshold_us": 100000,
+      "actual_us": 926,
+      "status": "PASS",
+      "worst_extension": "third-party/jyaunches-pi-canvas"
+    },
+    {
+      "budget_name": "event_dispatch_p99",
+      "threshold_us": 5000,
+      "actual_us": null,
+      "status": "NO_DATA"
+    },
+    {
+      "budget_name": "ext_warm_load_p95",
+      "threshold_us": 100000,
+      "actual_us": 734,
+      "status": "PASS"
+    }
+  ],
+  "outliers": [
+    {
+      "extension": "community/hjanuschka-plan-mode",
+      "cold_p99_us": 133779,
+      "cold_p50_us": 126023,
+      "warm_p99_us": 820
+    },
+    {
+      "extension": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "cold_p99_us": 124685,
+      "cold_p50_us": 89546,
+      "warm_p99_us": 747
+    },
+    {
+      "extension": "community/mitsuhiko-todos",
+      "cold_p99_us": 123403,
+      "cold_p50_us": 120518,
+      "warm_p99_us": 602
+    },
+    {
+      "extension": "community/qualisero-compact-config",
+      "cold_p99_us": 119093,
+      "cold_p50_us": 113848,
+      "warm_p99_us": 450
+    },
+    {
+      "extension": "community/mitsuhiko-answer",
+      "cold_p99_us": 118005,
+      "cold_p50_us": 83650,
+      "warm_p99_us": 447
+    },
+    {
+      "extension": "session-name",
+      "cold_p99_us": 114788,
+      "cold_p50_us": 70711,
+      "warm_p99_us": 339
+    },
+    {
+      "extension": "npm/juanibiapina-pi-files",
+      "cold_p99_us": 114003,
+      "cold_p50_us": 92452,
+      "warm_p99_us": 723
+    },
+    {
+      "extension": "custom-provider-anthropic",
+      "cold_p99_us": 113493,
+      "cold_p50_us": 83704,
+      "warm_p99_us": 572
+    },
+    {
+      "extension": "community/qualisero-session-emoji",
+      "cold_p99_us": 113344,
+      "cold_p50_us": 90396,
+      "warm_p99_us": 497
+    },
+    {
+      "extension": "community/mitsuhiko-control",
+      "cold_p99_us": 110383,
+      "cold_p50_us": 105081,
+      "warm_p99_us": 734
+    },
+    {
+      "extension": "community/qualisero-safe-rm",
+      "cold_p99_us": 109841,
+      "cold_p50_us": 84742,
+      "warm_p99_us": 475
+    },
+    {
+      "extension": "npm/pi-skill-palette",
+      "cold_p99_us": 109069,
+      "cold_p50_us": 95221,
+      "warm_p99_us": 427
+    },
+    {
+      "extension": "community/hjanuschka-status-widget",
+      "cold_p99_us": 107775,
+      "cold_p50_us": 94099,
+      "warm_p99_us": 354
+    },
+    {
+      "extension": "npm/pi-prompt-template-model",
+      "cold_p99_us": 106935,
+      "cold_p50_us": 87124,
+      "warm_p99_us": 676
+    },
+    {
+      "extension": "community/hjanuschka-ultrathink",
+      "cold_p99_us": 106590,
+      "cold_p50_us": 102633,
+      "warm_p99_us": 453
+    },
+    {
+      "extension": "npm/pi-session-ask",
+      "cold_p99_us": 106561,
+      "cold_p50_us": 103285,
+      "warm_p99_us": 735
+    },
+    {
+      "extension": "rpc-demo",
+      "cold_p99_us": 105637,
+      "cold_p50_us": 88708,
+      "warm_p99_us": 438
+    },
+    {
+      "extension": "third-party/jyaunches-pi-canvas",
+      "cold_p99_us": 104978,
+      "cold_p50_us": 90115,
+      "warm_p99_us": 926
+    },
+    {
+      "extension": "rainbow-editor",
+      "cold_p99_us": 102327,
+      "cold_p50_us": 76880,
+      "warm_p99_us": 305
+    },
+    {
+      "extension": "npm/pi-brave-search",
+      "cold_p99_us": 102186,
+      "cold_p50_us": 96815,
+      "warm_p99_us": 711
+    },
+    {
+      "extension": "send-user-message",
+      "cold_p99_us": 102071,
+      "cold_p50_us": 98643,
+      "warm_p99_us": 395
+    },
+    {
+      "extension": "community/qualisero-session-color",
+      "cold_p99_us": 102001,
+      "cold_p50_us": 90105,
+      "warm_p99_us": 510
+    },
+    {
+      "extension": "community/hjanuschka-oracle",
+      "cold_p99_us": 101315,
+      "cold_p50_us": 88682,
+      "warm_p99_us": 409
+    },
+    {
+      "extension": "redraws",
+      "cold_p99_us": 100572,
+      "cold_p50_us": 84104,
+      "warm_p99_us": 345
+    }
+  ],
+  "failures": [
+    {
+      "extension": "community/qualisero-background-notify",
+      "scenario": "cold_load",
+      "error": "Load error: Extension error: Error resolving module '../../shared' from '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/qualisero-background-notify/index.ts': Unsupported modul"
+    },
+    {
+      "extension": "community/qualisero-safe-git",
+      "scenario": "cold_load",
+      "error": "Load error: Extension error: Error resolving module '../../shared' from '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/qualisero-safe-git/index.ts': Unsupported module specifi"
+    },
+    {
+      "extension": "npm/verioussmith-pi-openrouter",
+      "scenario": "cold_load",
+      "error": "Timeout: exceeded 60s budget after 9 of 10 iterations"
+    },
+    {
+      "extension": "community/qualisero-background-notify",
+      "scenario": "warm_load",
+      "error": "Warmup load error: Extension error: Error resolving module '../../shared' from '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/qualisero-background-notify/index.ts': Unsupporte"
+    },
+    {
+      "extension": "community/qualisero-safe-git",
+      "scenario": "warm_load",
+      "error": "Warmup load error: Extension error: Error resolving module '../../shared' from '/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/community/qualisero-safe-git/index.ts': Unsupported module "
+    },
+    {
+      "extension": "npm/verioussmith-pi-openrouter",
+      "scenario": "warm_load",
+      "error": "unknown"
+    },
+    {
+      "extension": "103_extensions",
+      "scenario": "event_dispatch",
+      "error": "Load error: Extension error: registerTool: tool name collision: bash\n    at __pi_register_tool (eval_script:339:23)\n    at default (/data/projects/pi_agent_rust/tests/ext_conformance/artifacts/communi"
+    }
+  ],
+  "per_extension": {
+    "antigravity-image-gen": {
+      "cold_p50_us": 82937,
+      "cold_p95_us": 96321,
+      "cold_p99_us": 96321,
+      "warm_p50_us": 430,
+      "warm_p95_us": 551,
+      "warm_p99_us": 551
+    },
+    "bash-spawn-hook": {
+      "cold_p50_us": 73317,
+      "cold_p95_us": 95991,
+      "cold_p99_us": 95991,
+      "warm_p50_us": 338,
+      "warm_p95_us": 529,
+      "warm_p99_us": 529
+    },
+    "bookmark": {
+      "cold_p50_us": 71210,
+      "cold_p95_us": 73080,
+      "cold_p99_us": 73080,
+      "warm_p50_us": 327,
+      "warm_p95_us": 347,
+      "warm_p99_us": 347
+    },
+    "claude-rules": {
+      "cold_p50_us": 74312,
+      "cold_p95_us": 75340,
+      "cold_p99_us": 75340,
+      "warm_p50_us": 297,
+      "warm_p95_us": 346,
+      "warm_p99_us": 346
+    },
+    "community/hjanuschka-clipboard": {
+      "cold_p50_us": 72598,
+      "cold_p95_us": 75534,
+      "cold_p99_us": 75534,
+      "warm_p50_us": 334,
+      "warm_p95_us": 437,
+      "warm_p99_us": 437
+    },
+    "community/hjanuschka-cost-tracker": {
+      "cold_p50_us": 81381,
+      "cold_p95_us": 83065,
+      "cold_p99_us": 83065,
+      "warm_p50_us": 318,
+      "warm_p95_us": 376,
+      "warm_p99_us": 376
+    },
+    "community/hjanuschka-flicker-corp": {
+      "cold_p50_us": 74243,
+      "cold_p95_us": 79097,
+      "cold_p99_us": 79097,
+      "warm_p50_us": 311,
+      "warm_p95_us": 484,
+      "warm_p99_us": 484
+    },
+    "community/hjanuschka-funny-working-message": {
+      "cold_p50_us": 73252,
+      "cold_p95_us": 85449,
+      "cold_p99_us": 85449,
+      "warm_p50_us": 293,
+      "warm_p95_us": 314,
+      "warm_p99_us": 314
+    },
+    "community/hjanuschka-handoff": {
+      "cold_p50_us": 74990,
+      "cold_p95_us": 85442,
+      "cold_p99_us": 85442,
+      "warm_p50_us": 288,
+      "warm_p95_us": 381,
+      "warm_p99_us": 381
+    },
+    "community/hjanuschka-loop": {
+      "cold_p50_us": 83526,
+      "cold_p95_us": 89317,
+      "cold_p99_us": 89317,
+      "warm_p50_us": 405,
+      "warm_p95_us": 553,
+      "warm_p99_us": 553
+    },
+    "community/hjanuschka-memory-mode": {
+      "cold_p50_us": 83788,
+      "cold_p95_us": 91216,
+      "cold_p99_us": 91216,
+      "warm_p50_us": 344,
+      "warm_p95_us": 547,
+      "warm_p99_us": 547
+    },
+    "community/hjanuschka-oracle": {
+      "cold_p50_us": 88682,
+      "cold_p95_us": 101315,
+      "cold_p99_us": 101315,
+      "warm_p50_us": 337,
+      "warm_p95_us": 409,
+      "warm_p99_us": 409
+    },
+    "community/hjanuschka-plan-mode": {
+      "cold_p50_us": 126023,
+      "cold_p95_us": 133779,
+      "cold_p99_us": 133779,
+      "warm_p50_us": 657,
+      "warm_p95_us": 820,
+      "warm_p99_us": 820
+    },
+    "community/hjanuschka-resistance": {
+      "cold_p50_us": 85402,
+      "cold_p95_us": 94814,
+      "cold_p99_us": 94814,
+      "warm_p50_us": 333,
+      "warm_p95_us": 359,
+      "warm_p99_us": 359
+    },
+    "community/hjanuschka-status-widget": {
+      "cold_p50_us": 94099,
+      "cold_p95_us": 107775,
+      "cold_p99_us": 107775,
+      "warm_p50_us": 321,
+      "warm_p95_us": 354,
+      "warm_p99_us": 354
+    },
+    "community/hjanuschka-ultrathink": {
+      "cold_p50_us": 102633,
+      "cold_p95_us": 106590,
+      "cold_p99_us": 106590,
+      "warm_p50_us": 422,
+      "warm_p95_us": 453,
+      "warm_p99_us": 453
+    },
+    "community/mitsuhiko-answer": {
+      "cold_p50_us": 83650,
+      "cold_p95_us": 118005,
+      "cold_p99_us": 118005,
+      "warm_p50_us": 331,
+      "warm_p95_us": 447,
+      "warm_p99_us": 447
+    },
+    "community/mitsuhiko-control": {
+      "cold_p50_us": 105081,
+      "cold_p95_us": 110383,
+      "cold_p99_us": 110383,
+      "warm_p50_us": 628,
+      "warm_p95_us": 734,
+      "warm_p99_us": 734
+    },
+    "community/mitsuhiko-cwd-history": {
+      "cold_p50_us": 79282,
+      "cold_p95_us": 90243,
+      "cold_p99_us": 90243,
+      "warm_p50_us": 320,
+      "warm_p95_us": 436,
+      "warm_p99_us": 436
+    },
+    "community/mitsuhiko-loop": {
+      "cold_p50_us": 82907,
+      "cold_p95_us": 91231,
+      "cold_p99_us": 91231,
+      "warm_p50_us": 376,
+      "warm_p95_us": 605,
+      "warm_p99_us": 605
+    },
+    "community/mitsuhiko-notify": {
+      "cold_p50_us": 72159,
+      "cold_p95_us": 79643,
+      "cold_p99_us": 79643,
+      "warm_p50_us": 285,
+      "warm_p95_us": 316,
+      "warm_p99_us": 316
+    },
+    "community/mitsuhiko-todos": {
+      "cold_p50_us": 120518,
+      "cold_p95_us": 123403,
+      "cold_p99_us": 123403,
+      "warm_p50_us": 492,
+      "warm_p95_us": 602,
+      "warm_p99_us": 602
+    },
+    "community/mitsuhiko-uv": {
+      "cold_p50_us": 72310,
+      "cold_p95_us": 75453,
+      "cold_p99_us": 75453,
+      "warm_p50_us": 347,
+      "warm_p95_us": 375,
+      "warm_p99_us": 375
+    },
+    "community/mitsuhiko-whimsical": {
+      "cold_p50_us": 74558,
+      "cold_p95_us": 84608,
+      "cold_p99_us": 84608,
+      "warm_p50_us": 282,
+      "warm_p95_us": 319,
+      "warm_p99_us": 319
+    },
+    "community/prateekmedia-token-rate": {
+      "cold_p50_us": 71536,
+      "cold_p95_us": 77981,
+      "cold_p99_us": 77981,
+      "warm_p50_us": 304,
+      "warm_p95_us": 420,
+      "warm_p99_us": 420
+    },
+    "community/qualisero-compact-config": {
+      "cold_p50_us": 113848,
+      "cold_p95_us": 119093,
+      "cold_p99_us": 119093,
+      "warm_p50_us": 344,
+      "warm_p95_us": 450,
+      "warm_p99_us": 450
+    },
+    "community/qualisero-safe-rm": {
+      "cold_p50_us": 84742,
+      "cold_p95_us": 109841,
+      "cold_p99_us": 109841,
+      "warm_p50_us": 430,
+      "warm_p95_us": 475,
+      "warm_p99_us": 475
+    },
+    "community/qualisero-session-color": {
+      "cold_p50_us": 90105,
+      "cold_p95_us": 102001,
+      "cold_p99_us": 102001,
+      "warm_p50_us": 452,
+      "warm_p95_us": 510,
+      "warm_p99_us": 510
+    },
+    "community/qualisero-session-emoji": {
+      "cold_p50_us": 90396,
+      "cold_p95_us": 113344,
+      "cold_p99_us": 113344,
+      "warm_p50_us": 382,
+      "warm_p95_us": 497,
+      "warm_p99_us": 497
+    },
+    "community/tmustier-agent-guidance": {
+      "cold_p50_us": 75590,
+      "cold_p95_us": 80298,
+      "cold_p99_us": 80298,
+      "warm_p50_us": 424,
+      "warm_p95_us": 475,
+      "warm_p99_us": 475
+    },
+    "community/tmustier-arcade-mario-not": {
+      "cold_p50_us": 92472,
+      "cold_p95_us": 94084,
+      "cold_p99_us": 94084,
+      "warm_p50_us": 333,
+      "warm_p95_us": 411,
+      "warm_p99_us": 411
+    },
+    "community/tmustier-arcade-picman": {
+      "cold_p50_us": 81290,
+      "cold_p95_us": 83118,
+      "cold_p99_us": 83118,
+      "warm_p50_us": 301,
+      "warm_p95_us": 330,
+      "warm_p99_us": 330
+    },
+    "community/tmustier-arcade-ping": {
+      "cold_p50_us": 81626,
+      "cold_p95_us": 83435,
+      "cold_p99_us": 83435,
+      "warm_p50_us": 280,
+      "warm_p95_us": 326,
+      "warm_p99_us": 326
+    },
+    "community/tmustier-arcade-spice-invaders": {
+      "cold_p50_us": 93056,
+      "cold_p95_us": 96404,
+      "cold_p99_us": 96404,
+      "warm_p50_us": 318,
+      "warm_p95_us": 410,
+      "warm_p99_us": 410
+    },
+    "community/tmustier-arcade-tetris": {
+      "cold_p50_us": 86126,
+      "cold_p95_us": 90646,
+      "cold_p99_us": 90646,
+      "warm_p50_us": 301,
+      "warm_p95_us": 343,
+      "warm_p99_us": 343
+    },
+    "community/tmustier-ralph-wiggum": {
+      "cold_p50_us": 90410,
+      "cold_p95_us": 91618,
+      "cold_p99_us": 91618,
+      "warm_p50_us": 590,
+      "warm_p95_us": 696,
+      "warm_p99_us": 696
+    },
+    "community/tmustier-raw-paste": {
+      "cold_p50_us": 73072,
+      "cold_p95_us": 75324,
+      "cold_p99_us": 75324,
+      "warm_p50_us": 326,
+      "warm_p95_us": 438,
+      "warm_p99_us": 438
+    },
+    "community/tmustier-tab-status": {
+      "cold_p50_us": 73730,
+      "cold_p95_us": 76078,
+      "cold_p99_us": 76078,
+      "warm_p50_us": 359,
+      "warm_p95_us": 380,
+      "warm_p99_us": 380
+    },
+    "community/tmustier-usage-extension": {
+      "cold_p50_us": 89254,
+      "cold_p95_us": 99208,
+      "cold_p99_us": 99208,
+      "warm_p50_us": 322,
+      "warm_p95_us": 401,
+      "warm_p99_us": 401
+    },
+    "confirm-destructive": {
+      "cold_p50_us": 69251,
+      "cold_p95_us": 82380,
+      "cold_p99_us": 82380,
+      "warm_p50_us": 283,
+      "warm_p95_us": 323,
+      "warm_p99_us": 323
+    },
+    "custom-compaction": {
+      "cold_p50_us": 73638,
+      "cold_p95_us": 76509,
+      "cold_p99_us": 76509,
+      "warm_p50_us": 280,
+      "warm_p95_us": 325,
+      "warm_p99_us": 325
+    },
+    "custom-footer": {
+      "cold_p50_us": 71083,
+      "cold_p95_us": 72586,
+      "cold_p99_us": 72586,
+      "warm_p50_us": 294,
+      "warm_p95_us": 337,
+      "warm_p99_us": 337
+    },
+    "custom-header": {
+      "cold_p50_us": 71815,
+      "cold_p95_us": 75612,
+      "cold_p99_us": 75612,
+      "warm_p50_us": 320,
+      "warm_p95_us": 401,
+      "warm_p99_us": 401
+    },
+    "custom-provider-anthropic": {
+      "cold_p50_us": 83704,
+      "cold_p95_us": 113493,
+      "cold_p99_us": 113493,
+      "warm_p50_us": 397,
+      "warm_p95_us": 572,
+      "warm_p99_us": 572
+    },
+    "custom-provider-qwen-cli": {
+      "cold_p50_us": 73685,
+      "cold_p95_us": 82247,
+      "cold_p99_us": 82247,
+      "warm_p50_us": 428,
+      "warm_p95_us": 516,
+      "warm_p99_us": 516
+    },
+    "dynamic-resources": {
+      "cold_p50_us": 70068,
+      "cold_p95_us": 75310,
+      "cold_p99_us": 75310,
+      "warm_p50_us": 284,
+      "warm_p95_us": 317,
+      "warm_p99_us": 317
+    },
+    "event-bus": {
+      "cold_p50_us": 69993,
+      "cold_p95_us": 78999,
+      "cold_p99_us": 78999,
+      "warm_p50_us": 344,
+      "warm_p95_us": 383,
+      "warm_p99_us": 383
+    },
+    "file-trigger": {
+      "cold_p50_us": 71831,
+      "cold_p95_us": 72682,
+      "cold_p99_us": 72682,
+      "warm_p50_us": 306,
+      "warm_p95_us": 334,
+      "warm_p99_us": 334
+    },
+    "handoff": {
+      "cold_p50_us": 74073,
+      "cold_p95_us": 79521,
+      "cold_p99_us": 79521,
+      "warm_p50_us": 305,
+      "warm_p95_us": 337,
+      "warm_p99_us": 337
+    },
+    "hello": {
+      "cold_p50_us": 72126,
+      "cold_p95_us": 75472,
+      "cold_p99_us": 75472,
+      "warm_p50_us": 346,
+      "warm_p95_us": 393,
+      "warm_p99_us": 393
+    },
+    "input-transform": {
+      "cold_p50_us": 71909,
+      "cold_p95_us": 79213,
+      "cold_p99_us": 79213,
+      "warm_p50_us": 295,
+      "warm_p95_us": 491,
+      "warm_p99_us": 491
+    },
+    "message-renderer": {
+      "cold_p50_us": 71450,
+      "cold_p95_us": 72913,
+      "cold_p99_us": 72913,
+      "warm_p50_us": 308,
+      "warm_p95_us": 332,
+      "warm_p99_us": 332
+    },
+    "modal-editor": {
+      "cold_p50_us": 73765,
+      "cold_p95_us": 76909,
+      "cold_p99_us": 76909,
+      "warm_p50_us": 313,
+      "warm_p95_us": 339,
+      "warm_p99_us": 339
+    },
+    "model-status": {
+      "cold_p50_us": 69773,
+      "cold_p95_us": 73474,
+      "cold_p99_us": 73474,
+      "warm_p50_us": 304,
+      "warm_p95_us": 530,
+      "warm_p99_us": 530
+    },
+    "notify": {
+      "cold_p50_us": 69569,
+      "cold_p95_us": 70770,
+      "cold_p99_us": 70770,
+      "warm_p50_us": 280,
+      "warm_p95_us": 313,
+      "warm_p99_us": 313
+    },
+    "npm/benvargas-pi-ancestor-discovery": {
+      "cold_p50_us": 79515,
+      "cold_p95_us": 82103,
+      "cold_p99_us": 82103,
+      "warm_p50_us": 322,
+      "warm_p95_us": 370,
+      "warm_p99_us": 370
+    },
+    "npm/benvargas-pi-antigravity-image-gen": {
+      "cold_p50_us": 87260,
+      "cold_p95_us": 90911,
+      "cold_p99_us": 90911,
+      "warm_p50_us": 450,
+      "warm_p95_us": 527,
+      "warm_p99_us": 527
+    },
+    "npm/benvargas-pi-synthetic-provider": {
+      "cold_p50_us": 77284,
+      "cold_p95_us": 87177,
+      "cold_p99_us": 87177,
+      "warm_p50_us": 494,
+      "warm_p95_us": 626,
+      "warm_p99_us": 626
+    },
+    "npm/imsus-pi-extension-minimax-coding-plan-mcp": {
+      "cold_p50_us": 89546,
+      "cold_p95_us": 124685,
+      "cold_p99_us": 124685,
+      "warm_p50_us": 662,
+      "warm_p95_us": 747,
+      "warm_p99_us": 747
+    },
+    "npm/juanibiapina-pi-files": {
+      "cold_p50_us": 92452,
+      "cold_p95_us": 114003,
+      "cold_p99_us": 114003,
+      "warm_p50_us": 617,
+      "warm_p95_us": 723,
+      "warm_p99_us": 723
+    },
+    "npm/pi-agentic-compaction": {
+      "cold_p50_us": 82855,
+      "cold_p95_us": 91044,
+      "cold_p99_us": 91044,
+      "warm_p50_us": 308,
+      "warm_p95_us": 341,
+      "warm_p99_us": 341
+    },
+    "npm/pi-brave-search": {
+      "cold_p50_us": 96815,
+      "cold_p95_us": 102186,
+      "cold_p99_us": 102186,
+      "warm_p50_us": 643,
+      "warm_p95_us": 711,
+      "warm_p99_us": 711
+    },
+    "npm/pi-command-center": {
+      "cold_p50_us": 83530,
+      "cold_p95_us": 84479,
+      "cold_p99_us": 84479,
+      "warm_p50_us": 592,
+      "warm_p95_us": 626,
+      "warm_p99_us": 626
+    },
+    "npm/pi-mermaid": {
+      "cold_p50_us": 83583,
+      "cold_p95_us": 84720,
+      "cold_p99_us": 84720,
+      "warm_p50_us": 368,
+      "warm_p95_us": 395,
+      "warm_p99_us": 395
+    },
+    "npm/pi-model-switch": {
+      "cold_p50_us": 80666,
+      "cold_p95_us": 83775,
+      "cold_p99_us": 83775,
+      "warm_p50_us": 560,
+      "warm_p95_us": 613,
+      "warm_p99_us": 613
+    },
+    "npm/pi-moonshot": {
+      "cold_p50_us": 71541,
+      "cold_p95_us": 73375,
+      "cold_p99_us": 73375,
+      "warm_p50_us": 616,
+      "warm_p95_us": 801,
+      "warm_p99_us": 801
+    },
+    "npm/pi-prompt-template-model": {
+      "cold_p50_us": 87124,
+      "cold_p95_us": 106935,
+      "cold_p99_us": 106935,
+      "warm_p50_us": 586,
+      "warm_p95_us": 676,
+      "warm_p99_us": 676
+    },
+    "npm/pi-session-ask": {
+      "cold_p50_us": 103285,
+      "cold_p95_us": 106561,
+      "cold_p99_us": 106561,
+      "warm_p50_us": 703,
+      "warm_p95_us": 735,
+      "warm_p99_us": 735
+    },
+    "npm/pi-skill-palette": {
+      "cold_p50_us": 95221,
+      "cold_p95_us": 109069,
+      "cold_p99_us": 109069,
+      "warm_p50_us": 342,
+      "warm_p95_us": 427,
+      "warm_p99_us": 427
+    },
+    "npm/pi-threads": {
+      "cold_p50_us": 90489,
+      "cold_p95_us": 92807,
+      "cold_p99_us": 92807,
+      "warm_p50_us": 418,
+      "warm_p95_us": 520,
+      "warm_p99_us": 520
+    },
+    "npm/pi-voice-of-god": {
+      "cold_p50_us": 79214,
+      "cold_p95_us": 81405,
+      "cold_p99_us": 81405,
+      "warm_p50_us": 433,
+      "warm_p95_us": 502,
+      "warm_p99_us": 502
+    },
+    "npm/token-rate-pi": {
+      "cold_p50_us": 70579,
+      "cold_p95_us": 71448,
+      "cold_p99_us": 71448,
+      "warm_p50_us": 323,
+      "warm_p95_us": 353,
+      "warm_p99_us": 353
+    },
+    "overlay-test": {
+      "cold_p50_us": 73347,
+      "cold_p95_us": 76385,
+      "cold_p99_us": 76385,
+      "warm_p50_us": 312,
+      "warm_p95_us": 365,
+      "warm_p99_us": 365
+    },
+    "permission-gate": {
+      "cold_p50_us": 68835,
+      "cold_p95_us": 71317,
+      "cold_p99_us": 71317,
+      "warm_p50_us": 292,
+      "warm_p95_us": 303,
+      "warm_p99_us": 303
+    },
+    "pirate": {
+      "cold_p50_us": 68727,
+      "cold_p95_us": 71888,
+      "cold_p99_us": 71888,
+      "warm_p50_us": 321,
+      "warm_p95_us": 383,
+      "warm_p99_us": 383
+    },
+    "preset": {
+      "cold_p50_us": 83345,
+      "cold_p95_us": 87081,
+      "cold_p99_us": 87081,
+      "warm_p50_us": 439,
+      "warm_p95_us": 546,
+      "warm_p99_us": 546
+    },
+    "protected-paths": {
+      "cold_p50_us": 70385,
+      "cold_p95_us": 71818,
+      "cold_p99_us": 71818,
+      "warm_p50_us": 318,
+      "warm_p95_us": 325,
+      "warm_p99_us": 325
+    },
+    "qna": {
+      "cold_p50_us": 71209,
+      "cold_p95_us": 72987,
+      "cold_p99_us": 72987,
+      "warm_p50_us": 305,
+      "warm_p95_us": 369,
+      "warm_p99_us": 369
+    },
+    "question": {
+      "cold_p50_us": 76888,
+      "cold_p95_us": 80098,
+      "cold_p99_us": 80098,
+      "warm_p50_us": 390,
+      "warm_p95_us": 442,
+      "warm_p99_us": 442
+    },
+    "questionnaire": {
+      "cold_p50_us": 80101,
+      "cold_p95_us": 80438,
+      "cold_p99_us": 80438,
+      "warm_p50_us": 424,
+      "warm_p95_us": 470,
+      "warm_p99_us": 470
+    },
+    "rainbow-editor": {
+      "cold_p50_us": 76880,
+      "cold_p95_us": 102327,
+      "cold_p99_us": 102327,
+      "warm_p50_us": 285,
+      "warm_p95_us": 305,
+      "warm_p99_us": 305
+    },
+    "redraws": {
+      "cold_p50_us": 84104,
+      "cold_p95_us": 100572,
+      "cold_p99_us": 100572,
+      "warm_p50_us": 307,
+      "warm_p95_us": 345,
+      "warm_p99_us": 345
+    },
+    "rpc-demo": {
+      "cold_p50_us": 88708,
+      "cold_p95_us": 105637,
+      "cold_p99_us": 105637,
+      "warm_p50_us": 407,
+      "warm_p95_us": 438,
+      "warm_p99_us": 438
+    },
+    "send-user-message": {
+      "cold_p50_us": 98643,
+      "cold_p95_us": 102071,
+      "cold_p99_us": 102071,
+      "warm_p50_us": 366,
+      "warm_p95_us": 395,
+      "warm_p99_us": 395
+    },
+    "session-name": {
+      "cold_p50_us": 70711,
+      "cold_p95_us": 114788,
+      "cold_p99_us": 114788,
+      "warm_p50_us": 304,
+      "warm_p95_us": 339,
+      "warm_p99_us": 339
+    },
+    "snake": {
+      "cold_p50_us": 81727,
+      "cold_p95_us": 84202,
+      "cold_p99_us": 84202,
+      "warm_p50_us": 309,
+      "warm_p95_us": 380,
+      "warm_p99_us": 380
+    },
+    "space-invaders": {
+      "cold_p50_us": 82594,
+      "cold_p95_us": 84233,
+      "cold_p99_us": 84233,
+      "warm_p50_us": 309,
+      "warm_p95_us": 335,
+      "warm_p99_us": 335
+    },
+    "status-line": {
+      "cold_p50_us": 69520,
+      "cold_p95_us": 71682,
+      "cold_p99_us": 71682,
+      "warm_p50_us": 315,
+      "warm_p95_us": 322,
+      "warm_p99_us": 322
+    },
+    "summarize": {
+      "cold_p50_us": 74504,
+      "cold_p95_us": 75371,
+      "cold_p99_us": 75371,
+      "warm_p50_us": 307,
+      "warm_p95_us": 335,
+      "warm_p99_us": 335
+    },
+    "system-prompt-header": {
+      "cold_p50_us": 69516,
+      "cold_p95_us": 70919,
+      "cold_p99_us": 70919,
+      "warm_p50_us": 284,
+      "warm_p95_us": 308,
+      "warm_p99_us": 308
+    },
+    "third-party/jyaunches-pi-canvas": {
+      "cold_p50_us": 90115,
+      "cold_p95_us": 104978,
+      "cold_p99_us": 104978,
+      "warm_p50_us": 836,
+      "warm_p95_us": 926,
+      "warm_p99_us": 926
+    },
+    "third-party/rytswd-questionnaire": {
+      "cold_p50_us": 80505,
+      "cold_p95_us": 87099,
+      "cold_p99_us": 87099,
+      "warm_p50_us": 442,
+      "warm_p95_us": 580,
+      "warm_p99_us": 580
+    },
+    "timed-confirm": {
+      "cold_p50_us": 70993,
+      "cold_p95_us": 72469,
+      "cold_p99_us": 72469,
+      "warm_p50_us": 368,
+      "warm_p95_us": 391,
+      "warm_p99_us": 391
+    },
+    "titlebar-spinner": {
+      "cold_p50_us": 68933,
+      "cold_p95_us": 71023,
+      "cold_p99_us": 71023,
+      "warm_p50_us": 317,
+      "warm_p95_us": 515,
+      "warm_p99_us": 515
+    },
+    "todo": {
+      "cold_p50_us": 75550,
+      "cold_p95_us": 79186,
+      "cold_p99_us": 79186,
+      "warm_p50_us": 427,
+      "warm_p95_us": 503,
+      "warm_p99_us": 503
+    },
+    "tool-override": {
+      "cold_p50_us": 75049,
+      "cold_p95_us": 77232,
+      "cold_p99_us": 77232,
+      "warm_p50_us": 396,
+      "warm_p95_us": 426,
+      "warm_p99_us": 426
+    },
+    "tools": {
+      "cold_p50_us": 71522,
+      "cold_p95_us": 77882,
+      "cold_p99_us": 77882,
+      "warm_p50_us": 338,
+      "warm_p95_us": 436,
+      "warm_p99_us": 436
+    },
+    "trigger-compact": {
+      "cold_p50_us": 66939,
+      "cold_p95_us": 69426,
+      "cold_p99_us": 69426,
+      "warm_p50_us": 306,
+      "warm_p95_us": 315,
+      "warm_p99_us": 315
+    },
+    "widget-placement": {
+      "cold_p50_us": 67868,
+      "cold_p95_us": 71845,
+      "cold_p99_us": 71845,
+      "warm_p50_us": 285,
+      "warm_p95_us": 314,
+      "warm_p99_us": 314
+    },
+    "with-deps": {
+      "cold_p50_us": 75941,
+      "cold_p95_us": 90569,
+      "cold_p99_us": 90569,
+      "warm_p50_us": 370,
+      "warm_p95_us": 399,
+      "warm_p99_us": 399
+    }
+  }
+}
