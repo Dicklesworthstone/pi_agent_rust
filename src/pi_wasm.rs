@@ -68,20 +68,24 @@ impl WasmBridgeState {
     }
 
     fn alloc_id(&mut self) -> Result<u32, String> {
-        let start = self.next_id.max(1);
+        let start = match self.next_id {
+            0 => 1,
+            id if id > MAX_JS_WASM_ID => 1,
+            id => id,
+        };
         let mut candidate = start;
 
         loop {
             if !self.modules.contains_key(&candidate) && !self.instances.contains_key(&candidate) {
                 self.next_id = candidate.wrapping_add(1);
-                if self.next_id == 0 {
+                if self.next_id == 0 || self.next_id > MAX_JS_WASM_ID {
                     self.next_id = 1;
                 }
                 return Ok(candidate);
             }
 
             candidate = candidate.wrapping_add(1);
-            if candidate == 0 {
+            if candidate == 0 || candidate > MAX_JS_WASM_ID {
                 candidate = 1;
             }
             if candidate == start {
@@ -155,6 +159,28 @@ fn val_to_f64(val: &Val) -> f64 {
     }
 }
 
+/// Emulate JavaScript `ToInt32` semantics for number -> i32 coercion.
+#[allow(clippy::cast_possible_truncation)]
+fn js_to_i32(value: f64) -> i32 {
+    if !value.is_finite() || value == 0.0 {
+        return 0;
+    }
+
+    const TWO_POW_32: f64 = 4_294_967_296.0;
+    const TWO_POW_31: f64 = 2_147_483_648.0;
+
+    let mut wrapped = value.trunc() % TWO_POW_32;
+    if wrapped < 0.0 {
+        wrapped += TWO_POW_32;
+    }
+
+    if wrapped >= TWO_POW_31 {
+        (wrapped - TWO_POW_32) as i32
+    } else {
+        wrapped as i32
+    }
+}
+
 #[allow(clippy::cast_possible_truncation)]
 fn js_to_val(ctx: &Ctx<'_>, value: &Value<'_>, ty: &ValType) -> rquickjs::Result<Val> {
     match ty {
@@ -162,7 +188,7 @@ fn js_to_val(ctx: &Ctx<'_>, value: &Value<'_>, ty: &ValType) -> rquickjs::Result
             let v: f64 = value
                 .as_number()
                 .ok_or_else(|| throw_wasm(ctx, "TypeError", "Expected number for i32"))?;
-            Ok(Val::I32(v as i32))
+            Ok(Val::I32(js_to_i32(v)))
         }
         ValType::I64 => {
             let v: f64 = value
@@ -235,6 +261,8 @@ const DEFAULT_MAX_MEMORY_PAGES: u64 = 1024;
 const DEFAULT_MAX_MODULES: usize = 256;
 /// Hard limit on instantiated modules kept alive in one JS runtime.
 const DEFAULT_MAX_INSTANCES: usize = 256;
+/// Keep IDs within QuickJS signed-int range for stable JS↔Rust roundtrips.
+const MAX_JS_WASM_ID: u32 = i32::MAX as u32;
 
 /// Inject `globalThis.WebAssembly` polyfill into the QuickJS context.
 #[allow(clippy::too_many_lines)]
@@ -695,6 +723,18 @@ mod tests {
     }
 
     #[test]
+    fn js_to_i32_matches_javascript_wrapping_semantics() {
+        assert_eq!(js_to_i32(2_147_483_648.0), -2_147_483_648);
+        assert_eq!(js_to_i32(4_294_967_296.0), 0);
+        assert_eq!(js_to_i32(-2_147_483_649.0), 2_147_483_647);
+        assert_eq!(js_to_i32(-1.9), -1);
+        assert_eq!(js_to_i32(1.9), 1);
+        assert_eq!(js_to_i32(f64::NAN), 0);
+        assert_eq!(js_to_i32(f64::INFINITY), 0);
+        assert_eq!(js_to_i32(f64::NEG_INFINITY), 0);
+    }
+
+    #[test]
     fn compile_and_instantiate_trivial_module() {
         let wasm_bytes = wat_to_wasm(
             r#"(module
@@ -1006,7 +1046,7 @@ mod tests {
             {
                 let mut bridge = state.borrow_mut();
                 bridge.set_limits_for_test(8, 8);
-                bridge.next_id = u32::MAX;
+                bridge.next_id = MAX_JS_WASM_ID;
             }
 
             let arr = rquickjs::Array::new(ctx.clone()).unwrap();
@@ -1015,14 +1055,14 @@ mod tests {
             }
             ctx.globals().set("__test_bytes", arr).unwrap();
 
-            let first: u32 = ctx
+            let first: i32 = ctx
                 .eval("__pi_wasm_compile_native(__test_bytes)")
                 .expect("first compile");
-            let second: u32 = ctx
+            let second: i32 = ctx
                 .eval("__pi_wasm_compile_native(__test_bytes)")
                 .expect("second compile");
 
-            assert_eq!(first, u32::MAX);
+            assert_eq!(first, i32::MAX);
             assert_eq!(second, 1);
         });
     }
