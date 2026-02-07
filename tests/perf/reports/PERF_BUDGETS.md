@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-06T22:36:47Z
+> Generated: 2026-02-07T00:20:03Z
 
 ## Summary
 
@@ -8,9 +8,9 @@
 |---|---|
 | Total budgets | 13 |
 | CI-enforced | 8 |
-| PASS | 3 |
+| PASS | 8 |
 | FAIL | 0 |
-| No data | 10 |
+| No data | 5 |
 
 ## Startup
 
@@ -38,32 +38,32 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | - | NO_DATA | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 54 | PASS | No |
 
 ## Policy
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `policy_eval_p99` | p99 evaluation time | 500 ns | - | NO_DATA | Yes |
+| `policy_eval_p99` | p99 evaluation time | 500 ns | 95 | PASS | Yes |
 
 ## Memory
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | - | NO_DATA | Yes |
+| `idle_memory_rss` | RSS at idle | 50 MB | 4.1 | PASS | Yes |
 | `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | - | NO_DATA | No |
 
 ## Binary
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `binary_size_release` | release binary size | 20 MB | - | NO_DATA | Yes |
+| `binary_size_release` | release binary size | 20 MB | 12.5 | PASS | Yes |
 
 ## Protocol
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `protocol_parse_p99` | p99 parse+validate time | 50 us | - | NO_DATA | Yes |
+| `protocol_parse_p99` | p99 parse+validate time | 50 us | 6 | PASS | Yes |
 
 ## Measurement Methodology
 

@@ -388,6 +388,100 @@ Full per-extension data: `tests/ext_conformance/reports/performance_comparison.j
 
 Regenerate: `cargo test --test performance_comparison generate_performance_comparison -- --nocapture`
 
+## Extension Benchmark Harness (bd-20s9 / bd-2mb1)
+
+The unified benchmark harness (`tests/ext_bench_harness.rs`) runs extension load and event dispatch
+scenarios with per-extension timeouts, budget checks, and full environment fingerprinting.
+
+### Running the Harness
+
+```bash
+# PR mode — diverse 10-extension subset, 10 iterations, ~3-4s in debug
+PI_BENCH_MODE=pr cargo test --test ext_bench_harness --features ext-conformance -- --nocapture
+
+# Nightly mode — full safe corpus, 50 iterations
+PI_BENCH_MODE=nightly cargo test --test ext_bench_harness --features ext-conformance -- --nocapture
+
+# Custom mode — tune all parameters
+PI_BENCH_MODE=custom PI_BENCH_MAX=25 PI_BENCH_ITERATIONS=20 PI_BENCH_EVENT_COUNT=100 \
+  cargo test --test ext_bench_harness --features ext-conformance -- --nocapture
+```
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PI_BENCH_MODE` | `pr` | Mode: `pr`, `nightly`, or `custom` |
+| `PI_BENCH_MAX` | 10 (pr) / 200 (nightly) / 20 (custom) | Max extensions to benchmark |
+| `PI_BENCH_ITERATIONS` | 10 (pr) / 50 (nightly) / 20 (custom) | Iterations per extension per scenario |
+| `PI_BENCH_EVENT_COUNT` | 50 (pr) / 200 (nightly) / 100 (custom) | Event dispatch iterations |
+| `PI_BENCH_TIMEOUT_SECS` | 30 | Per-extension timeout (skips slow extensions) |
+
+### PR Subset Selection Policy
+
+PR mode selects a diverse representative subset to maximize API surface coverage:
+- 2 official extensions (1 with tool registration, 1 with event subscriptions)
+- 2 community extensions (1 with commands+events, 1 with tools+commands+flags)
+- 2 npm-registry extensions (1 with commands, 1 with events)
+- Remaining slots filled from safe pool in manifest order
+
+This ensures each run exercises tools, commands, flags, and event hooks.
+
+### Scenarios
+
+| Scenario | What it measures | Method |
+|----------|-----------------|--------|
+| `cold_load` | Fresh runtime + context creation per iteration | New `ExtensionManager` + `JsExtensionRuntimeHandle::start()` + `load_js_extensions()` |
+| `warm_load` | Repeated load on shared runtime (cache-hit path) | Single runtime, repeated `load_js_extensions()` after warmup |
+| `event_dispatch` | Event hook dispatch latency across loaded extensions | `dispatch_event(AgentStart, payload)` on loaded corpus |
+
+### Budget Checks
+
+| Budget | Threshold | Enforced |
+|--------|-----------|----------|
+| `ext_cold_load_simple_p95` | 200ms | Release builds only |
+| `event_dispatch_p99` | 5ms | Release builds only |
+| `ext_warm_load_p95` | 100ms | Release builds only |
+
+Budget assertions are **skipped in debug builds** (debug mode is naturally 5-10x slower).
+
+### Output Artifacts
+
+All outputs go to `target/perf/`:
+
+| File | Format | Content |
+|------|--------|---------|
+| `ext_bench_harness.jsonl` | JSONL | One `pi.ext.rust_bench.v1` record per extension per scenario |
+| `ext_bench_harness_report.json` | JSON | Full report with env, config, summaries, budget checks |
+| `BENCH_HARNESS_REPORT.md` | Markdown | Human-readable summary with tables |
+
+### Interpreting Results
+
+- **P50/P95/P99** are computed per-extension from raw microsecond samples
+- **Cold load** times include QuickJS runtime creation (~70ms in debug, ~5ms in release)
+- **Warm load** times measure only the `load_js_extensions()` call (~300-800us)
+- **Event dispatch** measures `dispatch_event()` latency (~40-700us depending on loaded extensions)
+- Aggregate budget checks use the P95 across all per-extension P95 values
+
+### Updating Baselines
+
+To intentionally update baseline thresholds:
+
+1. Run the harness in release mode to get accurate numbers:
+   ```bash
+   cargo test --release --test ext_bench_harness --features ext-conformance -- --nocapture
+   ```
+2. Review `target/perf/ext_bench_harness_report.json` for actual P95/P99 values
+3. Update the threshold constants in `check_budgets()` in `tests/ext_bench_harness.rs`
+4. Document the justification in the commit message
+
+### Detecting Noise vs Real Regressions
+
+- Run the harness 3 times and compare P95 values
+- Variance > 20% between runs indicates environmental noise
+- Consistent P95 increase > 50% across runs indicates a real regression
+- Check the `env` fingerprint in JSONL to ensure same hardware/build profile
+
 ## Notes
 
 - Benchmarks run in release mode with LTO enabled

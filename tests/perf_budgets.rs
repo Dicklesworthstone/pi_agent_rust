@@ -212,6 +212,13 @@ fn check_budget(budget: &Budget) -> BudgetResult {
         "ext_cold_load_complex_p95" => read_criterion_load_time(&root, "pirate"),
         "ext_load_60_total" => read_total_load_time(&root),
         "sustained_load_rss_growth" => read_stress_rss_growth(&root),
+        "startup_version_p95" => read_criterion_startup(&root, "version"),
+        "startup_full_agent_p95" => read_criterion_startup(&root, "help"),
+        "event_dispatch_p99" => read_scenario_runner_per_call(&root, "event_dispatch"),
+        "policy_eval_p99" => read_criterion_policy_eval(&root),
+        "idle_memory_rss" => read_idle_memory_rss(),
+        "binary_size_release" => read_binary_size(&root),
+        "protocol_parse_p99" => read_criterion_protocol_parse(&root),
         _ => (None, "no data source configured".to_string()),
     };
 
@@ -328,6 +335,129 @@ fn read_stress_rss_growth(root: &Path) -> (Option<f64>, String) {
         }
     }
     (None, "no stress test data".to_string())
+}
+
+// ─── New Data Readers (bd-20s9) ──────────────────────────────────────────────
+
+fn read_criterion_startup(root: &Path, subcommand: &str) -> (Option<f64>, String) {
+    // Criterion stores startup benchmarks at target/criterion/startup/<subcommand>/warm/new/estimates.json
+    let path = root.join(format!(
+        "target/criterion/startup/{subcommand}/warm/new/estimates.json"
+    ));
+    if let Some(estimates) = read_json_file(&path) {
+        if let Some(mean_ns) = estimates
+            .get("mean")
+            .and_then(|m| m.get("point_estimate"))
+            .and_then(Value::as_f64)
+        {
+            let ms = mean_ns / 1_000_000.0;
+            return (Some(ms), format!("criterion: startup/{subcommand}/warm"));
+        }
+    }
+    (None, format!("no criterion data for startup/{subcommand}"))
+}
+
+fn read_scenario_runner_per_call(root: &Path, scenario: &str) -> (Option<f64>, String) {
+    // Read from target/perf/scenario_runner.jsonl
+    let path = root.join("target/perf/scenario_runner.jsonl");
+    let events = read_jsonl_file(&path);
+    // Find the worst (max) per_call_us across all extensions for this scenario.
+    let mut max_us: Option<f64> = None;
+    for event in &events {
+        if event.get("scenario").and_then(Value::as_str) == Some(scenario) {
+            if let Some(us) = event.get("per_call_us").and_then(Value::as_f64) {
+                max_us = Some(max_us.map_or(us, |prev: f64| prev.max(us)));
+            }
+        }
+    }
+    max_us.map_or_else(
+        || (None, format!("no scenario_runner data for {scenario}")),
+        |us| (Some(us), "target/perf/scenario_runner.jsonl".to_string()),
+    )
+}
+
+fn read_criterion_policy_eval(root: &Path) -> (Option<f64>, String) {
+    // Policy eval benchmarks: target/criterion/ext_policy/evaluate/*/new/estimates.json
+    // Take the worst (max) across all policy variants, convert ns → ns.
+    let base = root.join("target/criterion/ext_policy/evaluate");
+    let mut max_ns: Option<f64> = None;
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("new/estimates.json");
+            if let Some(estimates) = read_json_file(&path) {
+                if let Some(mean_ns) = estimates
+                    .get("mean")
+                    .and_then(|m| m.get("point_estimate"))
+                    .and_then(Value::as_f64)
+                {
+                    max_ns = Some(max_ns.map_or(mean_ns, |prev: f64| prev.max(mean_ns)));
+                }
+            }
+        }
+    }
+    max_ns.map_or_else(
+        || (None, "no criterion data for policy eval".to_string()),
+        |ns| (Some(ns), "criterion: ext_policy/evaluate (max)".to_string()),
+    )
+}
+
+fn read_idle_memory_rss() -> (Option<f64>, String) {
+    // Measure the current process RSS as a proxy for idle memory.
+    // This runs during test, so it's an approximation.
+    let pid = sysinfo::Pid::from_u32(std::process::id());
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[pid]),
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    system.process(pid).map_or_else(
+        || (None, "could not read process RSS".to_string()),
+        |p| {
+            let rss_mb = p.memory() as f64 / 1024.0 / 1024.0;
+            (Some(rss_mb), "sysinfo: current process RSS".to_string())
+        },
+    )
+}
+
+fn read_binary_size(root: &Path) -> (Option<f64>, String) {
+    let release_path = root.join("target/release/pi");
+    if let Ok(meta) = std::fs::metadata(&release_path) {
+        let size_mb = meta.len() as f64 / 1024.0 / 1024.0;
+        return (Some(size_mb), "target/release/pi".to_string());
+    }
+    (None, "no release binary found".to_string())
+}
+
+fn read_criterion_protocol_parse(root: &Path) -> (Option<f64>, String) {
+    // Protocol parse: target/criterion/ext_protocol/parse_and_validate/*/new/estimates.json
+    // Take the worst (max) across variants, convert ns → us.
+    let base = root.join("target/criterion/ext_protocol/parse_and_validate");
+    let mut max_us: Option<f64> = None;
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for entry in entries.flatten() {
+            let path = entry.path().join("new/estimates.json");
+            if let Some(estimates) = read_json_file(&path) {
+                if let Some(mean_ns) = estimates
+                    .get("mean")
+                    .and_then(|m| m.get("point_estimate"))
+                    .and_then(Value::as_f64)
+                {
+                    let us = mean_ns / 1000.0;
+                    max_us = Some(max_us.map_or(us, |prev: f64| prev.max(us)));
+                }
+            }
+        }
+    }
+    max_us.map_or_else(
+        || (None, "no criterion data for protocol parse".to_string()),
+        |us| {
+            (
+                Some(us),
+                "criterion: ext_protocol/parse_and_validate (max)".to_string(),
+            )
+        },
+    )
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────
