@@ -1329,3 +1329,97 @@ fn test_tier_classification_logic() {
 
     assert_eq!(classify_tier(&simple, true), 5);
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot protocol validation (bd-1pqf)
+// ---------------------------------------------------------------------------
+
+/// Validate that ALL provenance entries conform to the snapshot protocol:
+/// - Extension IDs are valid (lowercase, no special chars)
+/// - Directories match their source tier prefix
+/// - Checksums match actual artifacts on disk
+#[test]
+fn test_snapshot_protocol_provenance_entries_valid() {
+    use pi::conformance::snapshot::{
+        SourceTier, digest_artifact_dir as lib_digest, validate_directory, validate_id,
+    };
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let artifacts_root = repo_root.join("tests/ext_conformance/artifacts");
+
+    let provenance_path = repo_root.join("docs/extension-artifact-provenance.json");
+    let provenance_bytes =
+        fs::read(&provenance_path).expect("read docs/extension-artifact-provenance.json");
+    let provenance: ArtifactProvenanceManifest = serde_json::from_slice(&provenance_bytes)
+        .expect("parse docs/extension-artifact-provenance.json");
+
+    let mut failures: Vec<String> = Vec::new();
+
+    for item in &provenance.items {
+        // 1. Validate ID naming
+        if let Err(e) = validate_id(&item.id) {
+            failures.push(format!("{}: id validation: {e}", item.id));
+        }
+
+        // 2. Validate directory matches tier
+        let tier = SourceTier::from_directory(&item.directory);
+        if let Err(e) = validate_directory(&item.directory, tier) {
+            failures.push(format!("{}: directory validation: {e}", item.id));
+        }
+
+        // 3. Validate artifact directory exists
+        let artifact_dir = artifacts_root.join(&item.directory);
+        if !artifact_dir.is_dir() {
+            failures.push(format!(
+                "{}: missing artifact directory: {}",
+                item.id,
+                artifact_dir.display()
+            ));
+            continue;
+        }
+
+        // 4. Validate checksum via library function matches provenance
+        let actual = lib_digest(&artifact_dir)
+            .unwrap_or_else(|err| panic!("digest {} ({}): {err}", item.id, artifact_dir.display()));
+        if actual != item.checksum.sha256 {
+            failures.push(format!(
+                "{}: checksum mismatch: provenance={}, actual={}",
+                item.id, item.checksum.sha256, actual
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "Snapshot protocol violations ({} failures):\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Verify that the library's `digest_artifact_dir` produces identical results
+/// to the test-local implementation, ensuring protocol consistency.
+#[test]
+fn test_snapshot_protocol_digest_matches_local_implementation() {
+    use pi::conformance::snapshot::digest_artifact_dir as lib_digest;
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let artifacts_root = repo_root.join("tests/ext_conformance/artifacts");
+
+    // Pick a few well-known extensions to cross-check
+    let known = ["hello", "bash-spawn-hook", "community/mitsuhiko-answer"];
+
+    for id in &known {
+        let dir = artifacts_root.join(id);
+        if !dir.is_dir() {
+            continue;
+        }
+        let local =
+            digest_artifact_dir(&dir).unwrap_or_else(|err| panic!("local digest {id}: {err}"));
+        let lib = lib_digest(&dir).unwrap_or_else(|err| panic!("lib digest {id}: {err}"));
+        assert_eq!(
+            local, lib,
+            "digest mismatch for {id}: local implementation and library must agree"
+        );
+    }
+}

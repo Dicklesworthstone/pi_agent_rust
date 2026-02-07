@@ -996,12 +996,376 @@ pub mod report {
     }
 }
 
+// ============================================================================
+// Snapshot Protocol (bd-1pqf)
+// ============================================================================
+
+/// Snapshot protocol for extension conformance artifacts.
+///
+/// This module codifies the canonical folder layout, naming conventions,
+/// metadata requirements, and integrity checks that all extension artifacts
+/// must satisfy.  Acquisition tasks (templates, GitHub releases, npm tarballs)
+/// **MUST** use this protocol so that the conformance test infrastructure can
+/// discover and verify artifacts automatically.
+///
+/// # Folder layout
+///
+/// ```text
+/// tests/ext_conformance/artifacts/
+/// ├── <official-extension-id>/         ← top-level = official-pi-mono
+/// ├── community/<extension-id>/        ← community tier
+/// ├── npm/<extension-id>/              ← npm-registry tier
+/// ├── third-party/<extension-id>/      ← third-party-github tier
+/// ├── agents-mikeastock/<id>/          ← agents-mikeastock tier
+/// ├── templates/<id>/                  ← templates tier (future)
+/// ├── CATALOG.json                     ← quick-reference metadata
+/// ├── SHA256SUMS.txt                   ← per-file checksums
+/// └── (test fixture dirs excluded)
+/// ```
+///
+/// # Naming conventions
+///
+/// - Extension IDs: lowercase ASCII, digits, hyphens.  No spaces, underscores
+///   or uppercase.  Forward slashes allowed only for tier-scoped paths
+///   (e.g. `community/my-ext`).
+/// - Directory name == extension ID (within its tier prefix).
+///
+/// # Integrity
+///
+/// Every artifact must have a deterministic SHA-256 directory digest computed
+/// by [`digest_artifact_dir`].  This digest is stored in both
+/// `extension-master-catalog.json` and `extension-artifact-provenance.json`.
+pub mod snapshot {
+    use serde::{Deserialize, Serialize};
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    // === Layout constants ===
+
+    /// Root directory for all extension artifacts (relative to repo root).
+    pub const ARTIFACT_ROOT: &str = "tests/ext_conformance/artifacts";
+
+    /// Reserved tier-scoped subdirectories.  Extensions placed under these
+    /// directories use `<tier>/<extension-id>/` layout.
+    pub const TIER_SCOPED_DIRS: &[&str] = &[
+        "community",
+        "npm",
+        "third-party",
+        "agents-mikeastock",
+        "templates",
+    ];
+
+    /// Directories excluded from conformance testing entirely.
+    pub const EXCLUDED_DIRS: &[&str] = &[
+        "plugins-official",
+        "plugins-community",
+        "plugins-ariff",
+        "agents-wshobson",
+        "templates-davila7",
+    ];
+
+    /// Non-extension directories that contain test fixtures, not artifacts.
+    pub const FIXTURE_DIRS: &[&str] = &[
+        "base_fixtures",
+        "diff",
+        "files",
+        "negative-denied-caps",
+        "reports",
+    ];
+
+    // === Source tier ===
+
+    /// Classification of where an extension artifact was obtained.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum SourceTier {
+        OfficialPiMono,
+        Community,
+        NpmRegistry,
+        ThirdPartyGithub,
+        AgentsMikeastock,
+        Templates,
+    }
+
+    impl SourceTier {
+        /// Directory prefix for this tier (`None` means top-level / official).
+        #[must_use]
+        pub const fn directory_prefix(self) -> Option<&'static str> {
+            match self {
+                Self::OfficialPiMono => None,
+                Self::Community => Some("community"),
+                Self::NpmRegistry => Some("npm"),
+                Self::ThirdPartyGithub => Some("third-party"),
+                Self::AgentsMikeastock => Some("agents-mikeastock"),
+                Self::Templates => Some("templates"),
+            }
+        }
+
+        /// Determine tier from a directory path relative to the artifact root.
+        #[must_use]
+        pub fn from_directory(dir: &str) -> Self {
+            if dir.starts_with("community/") {
+                Self::Community
+            } else if dir.starts_with("npm/") {
+                Self::NpmRegistry
+            } else if dir.starts_with("third-party/") {
+                Self::ThirdPartyGithub
+            } else if dir.starts_with("agents-mikeastock/") {
+                Self::AgentsMikeastock
+            } else if dir.starts_with("templates/") {
+                Self::Templates
+            } else {
+                Self::OfficialPiMono
+            }
+        }
+    }
+
+    // === Artifact source ===
+
+    /// Where an artifact was obtained from.  Stored in the provenance manifest.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case", tag = "type")]
+    pub enum ArtifactSource {
+        /// Cloned from a git repository.
+        Git {
+            repo: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            path: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            commit: Option<String>,
+        },
+        /// Downloaded from the npm registry.
+        Npm {
+            package: String,
+            version: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            url: Option<String>,
+        },
+        /// Downloaded from a direct URL.
+        Url { url: String },
+    }
+
+    // === Artifact spec ===
+
+    /// Specification for a new artifact to be added to the conformance corpus.
+    ///
+    /// Acquisition tasks construct an `ArtifactSpec`, validate it with
+    /// [`validate_artifact_spec`], write the files, then compute and record
+    /// the directory digest.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ArtifactSpec {
+        /// Unique extension ID (lowercase, hyphens, digits).
+        pub id: String,
+        /// Relative directory under the artifact root.
+        pub directory: String,
+        /// Human-readable name.
+        pub name: String,
+        /// Source tier classification.
+        pub source_tier: SourceTier,
+        /// License identifier (SPDX short form, or `"UNKNOWN"`).
+        pub license: String,
+        /// Where the artifact was obtained from.
+        pub source: ArtifactSource,
+    }
+
+    // === Naming validation ===
+
+    /// Validate that an extension ID follows naming conventions.
+    ///
+    /// Rules:
+    /// - Non-empty
+    /// - Lowercase ASCII letters, digits, hyphens, forward slashes
+    /// - Must not start or end with a hyphen
+    pub fn validate_id(id: &str) -> Result<(), String> {
+        if id.is_empty() {
+            return Err("extension ID must not be empty".into());
+        }
+        if id != id.to_ascii_lowercase() {
+            return Err(format!("extension ID must be lowercase: {id:?}"));
+        }
+        for ch in id.chars() {
+            if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' && ch != '/' {
+                return Err(format!(
+                    "extension ID contains invalid character {ch:?}: {id:?}"
+                ));
+            }
+        }
+        if id.starts_with('-') || id.ends_with('-') {
+            return Err(format!(
+                "extension ID must not start or end with hyphen: {id:?}"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validate that a directory follows layout conventions for the given tier.
+    pub fn validate_directory(dir: &str, tier: SourceTier) -> Result<(), String> {
+        if dir.is_empty() {
+            return Err("directory must not be empty".into());
+        }
+        match tier.directory_prefix() {
+            Some(prefix) => {
+                if !dir.starts_with(&format!("{prefix}/")) {
+                    return Err(format!(
+                        "directory {dir:?} must start with \"{prefix}/\" for tier {tier:?}"
+                    ));
+                }
+            }
+            None => {
+                for scoped in TIER_SCOPED_DIRS {
+                    if dir.starts_with(&format!("{scoped}/")) {
+                        return Err(format!(
+                            "official extension directory {dir:?} must not be under \
+                             tier-scoped dir \"{scoped}/\""
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // === Integrity ===
+
+    fn hex_lower(bytes: &[u8]) -> String {
+        let mut output = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(&mut output, "{byte:02x}");
+        }
+        output
+    }
+
+    fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let ft = entry.file_type()?;
+            let path = entry.path();
+            if ft.is_dir() {
+                collect_files_recursive(&path, files)?;
+            } else if ft.is_file() {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    fn relative_posix(root: &Path, path: &Path) -> String {
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Compute a deterministic SHA-256 digest of an artifact directory.
+    ///
+    /// Algorithm:
+    /// 1. Recursively collect all regular files.
+    /// 2. Sort by POSIX relative path (ensures cross-platform determinism).
+    /// 3. For each file, feed `"file\0"`, relative path, `"\0"`, file bytes,
+    ///    `"\0"` into the hasher.
+    /// 4. Return lowercase hex digest (64 chars).
+    pub fn digest_artifact_dir(dir: &Path) -> io::Result<String> {
+        let mut files = Vec::new();
+        collect_files_recursive(dir, &mut files)?;
+        files.sort_by_key(|p| relative_posix(dir, p));
+
+        let mut hasher = Sha256::new();
+        for path in &files {
+            let rel = relative_posix(dir, path);
+            hasher.update(b"file\0");
+            hasher.update(rel.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(&std::fs::read(path)?);
+            hasher.update(b"\0");
+        }
+        Ok(hex_lower(&hasher.finalize()))
+    }
+
+    /// Verify an artifact directory's checksum matches an expected value.
+    ///
+    /// Returns `Ok(Ok(()))` if the checksum matches, `Ok(Err(msg))` on
+    /// mismatch, or `Err(io_err)` if the directory cannot be read.
+    pub fn verify_integrity(dir: &Path, expected_sha256: &str) -> io::Result<Result<(), String>> {
+        let actual = digest_artifact_dir(dir)?;
+        if actual == expected_sha256 {
+            Ok(Ok(()))
+        } else {
+            Ok(Err(format!(
+                "checksum mismatch for {}: expected {expected_sha256}, got {actual}",
+                dir.display()
+            )))
+        }
+    }
+
+    /// Validate a new artifact spec against all protocol rules.
+    ///
+    /// Returns an empty vec on success, or a list of human-readable errors.
+    #[must_use]
+    pub fn validate_artifact_spec(spec: &ArtifactSpec) -> Vec<String> {
+        let mut errors = Vec::new();
+
+        if let Err(e) = validate_id(&spec.id) {
+            errors.push(e);
+        }
+        if let Err(e) = validate_directory(&spec.directory, spec.source_tier) {
+            errors.push(e);
+        }
+        if spec.name.is_empty() {
+            errors.push("name must not be empty".into());
+        }
+        if spec.license.is_empty() {
+            errors.push("license must not be empty (use \"UNKNOWN\" if unknown)".into());
+        }
+
+        match &spec.source {
+            ArtifactSource::Git { repo, .. } => {
+                if repo.is_empty() {
+                    errors.push("git source must have non-empty repo URL".into());
+                }
+            }
+            ArtifactSource::Npm {
+                package, version, ..
+            } => {
+                if package.is_empty() {
+                    errors.push("npm source must have non-empty package name".into());
+                }
+                if version.is_empty() {
+                    errors.push("npm source must have non-empty version".into());
+                }
+            }
+            ArtifactSource::Url { url } => {
+                if url.is_empty() {
+                    errors.push("url source must have non-empty URL".into());
+                }
+            }
+        }
+
+        errors
+    }
+
+    /// Check whether a directory name is reserved (excluded, fixture, or
+    /// tier-scoped) and therefore not a direct extension directory.
+    #[must_use]
+    pub fn is_reserved_dir(name: &str) -> bool {
+        EXCLUDED_DIRS.contains(&name)
+            || FIXTURE_DIRS.contains(&name)
+            || TIER_SCOPED_DIRS.contains(&name)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::compare_conformance_output;
     use super::report::compute_regression;
     use super::report::generate_report;
     use super::report::{ConformanceDiffEntry, ConformanceStatus, ExtensionConformanceResult};
+    use super::snapshot::{
+        self, ArtifactSource, ArtifactSpec, SourceTier, validate_artifact_spec, validate_directory,
+        validate_id,
+    };
     use serde_json::json;
 
     #[test]
@@ -1391,5 +1755,245 @@ mod tests {
             regression.regressed_extensions[0].current,
             Some(ConformanceStatus::Fail)
         );
+    }
+
+    // ================================================================
+    // Snapshot protocol unit tests (bd-1pqf)
+    // ================================================================
+
+    #[test]
+    fn snapshot_validate_id_accepts_valid_ids() {
+        assert!(validate_id("hello").is_ok());
+        assert!(validate_id("auto-commit-on-exit").is_ok());
+        assert!(validate_id("my-ext-2").is_ok());
+        assert!(validate_id("agents-mikeastock/extensions").is_ok());
+    }
+
+    #[test]
+    fn snapshot_validate_id_rejects_invalid_ids() {
+        assert!(validate_id("").is_err());
+        assert!(validate_id("Hello").is_err());
+        assert!(validate_id("my_ext").is_err());
+        assert!(validate_id("-leading").is_err());
+        assert!(validate_id("trailing-").is_err());
+        assert!(validate_id("has space").is_err());
+    }
+
+    #[test]
+    fn snapshot_validate_directory_official_tier() {
+        assert!(validate_directory("hello", SourceTier::OfficialPiMono).is_ok());
+        assert!(validate_directory("community/x", SourceTier::OfficialPiMono).is_err());
+        assert!(validate_directory("npm/x", SourceTier::OfficialPiMono).is_err());
+    }
+
+    #[test]
+    fn snapshot_validate_directory_scoped_tiers() {
+        assert!(validate_directory("community/my-ext", SourceTier::Community).is_ok());
+        assert!(validate_directory("my-ext", SourceTier::Community).is_err());
+
+        assert!(validate_directory("npm/some-pkg", SourceTier::NpmRegistry).is_ok());
+        assert!(validate_directory("some-pkg", SourceTier::NpmRegistry).is_err());
+
+        assert!(validate_directory("third-party/repo", SourceTier::ThirdPartyGithub).is_ok());
+        assert!(validate_directory("repo", SourceTier::ThirdPartyGithub).is_err());
+
+        assert!(validate_directory("templates/my-tpl", SourceTier::Templates).is_ok());
+    }
+
+    #[test]
+    fn snapshot_validate_directory_empty_rejected() {
+        assert!(validate_directory("", SourceTier::OfficialPiMono).is_err());
+    }
+
+    #[test]
+    fn snapshot_source_tier_from_directory() {
+        assert_eq!(
+            SourceTier::from_directory("hello"),
+            SourceTier::OfficialPiMono
+        );
+        assert_eq!(
+            SourceTier::from_directory("community/foo"),
+            SourceTier::Community
+        );
+        assert_eq!(
+            SourceTier::from_directory("npm/bar"),
+            SourceTier::NpmRegistry
+        );
+        assert_eq!(
+            SourceTier::from_directory("third-party/baz"),
+            SourceTier::ThirdPartyGithub
+        );
+        assert_eq!(
+            SourceTier::from_directory("agents-mikeastock/ext"),
+            SourceTier::AgentsMikeastock
+        );
+        assert_eq!(
+            SourceTier::from_directory("templates/tpl"),
+            SourceTier::Templates
+        );
+    }
+
+    #[test]
+    fn snapshot_validate_spec_valid() {
+        let spec = ArtifactSpec {
+            id: "my-ext".into(),
+            directory: "community/my-ext".into(),
+            name: "My Extension".into(),
+            source_tier: SourceTier::Community,
+            license: "MIT".into(),
+            source: ArtifactSource::Git {
+                repo: "https://github.com/user/repo".into(),
+                path: Some("extensions/my-ext.ts".into()),
+                commit: None,
+            },
+        };
+        assert!(validate_artifact_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn snapshot_validate_spec_collects_multiple_errors() {
+        let spec = ArtifactSpec {
+            id: "".into(),
+            directory: "my-ext".into(),
+            name: "".into(),
+            source_tier: SourceTier::Community,
+            license: "".into(),
+            source: ArtifactSource::Git {
+                repo: "".into(),
+                path: None,
+                commit: None,
+            },
+        };
+        let errors = validate_artifact_spec(&spec);
+        assert!(errors.len() >= 4, "expected at least 4 errors: {errors:?}");
+    }
+
+    #[test]
+    fn snapshot_validate_spec_npm_source() {
+        let spec = ArtifactSpec {
+            id: "npm-ext".into(),
+            directory: "npm/npm-ext".into(),
+            name: "NPM Extension".into(),
+            source_tier: SourceTier::NpmRegistry,
+            license: "UNKNOWN".into(),
+            source: ArtifactSource::Npm {
+                package: "npm-ext".into(),
+                version: "1.0.0".into(),
+                url: None,
+            },
+        };
+        assert!(validate_artifact_spec(&spec).is_empty());
+
+        // Missing package name
+        let bad = ArtifactSpec {
+            source: ArtifactSource::Npm {
+                package: "".into(),
+                version: "1.0.0".into(),
+                url: None,
+            },
+            ..spec.clone()
+        };
+        assert!(!validate_artifact_spec(&bad).is_empty());
+    }
+
+    #[test]
+    fn snapshot_validate_spec_url_source() {
+        let spec = ArtifactSpec {
+            id: "url-ext".into(),
+            directory: "third-party/url-ext".into(),
+            name: "URL Extension".into(),
+            source_tier: SourceTier::ThirdPartyGithub,
+            license: "Apache-2.0".into(),
+            source: ArtifactSource::Url {
+                url: "https://example.com/ext.ts".into(),
+            },
+        };
+        assert!(validate_artifact_spec(&spec).is_empty());
+    }
+
+    #[test]
+    fn snapshot_digest_artifact_dir_deterministic() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("hello.ts"), b"console.log('hi');").unwrap();
+        std::fs::write(tmp.path().join("index.ts"), b"export default function() {}").unwrap();
+
+        let d1 = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+        let d2 = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+        assert_eq!(d1, d2, "digest must be deterministic");
+        assert_eq!(d1.len(), 64, "SHA-256 hex must be 64 chars");
+    }
+
+    #[test]
+    fn snapshot_digest_artifact_dir_changes_with_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("a.ts"), b"version1").unwrap();
+        let d1 = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+
+        std::fs::write(tmp.path().join("a.ts"), b"version2").unwrap();
+        let d2 = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+
+        assert_ne!(d1, d2, "different content must produce different digest");
+    }
+
+    #[test]
+    fn snapshot_verify_integrity_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.ts"), b"hello").unwrap();
+        let digest = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+
+        let result = snapshot::verify_integrity(tmp.path(), &digest).unwrap();
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn snapshot_verify_integrity_fail() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("test.ts"), b"hello").unwrap();
+
+        let result = snapshot::verify_integrity(
+            tmp.path(),
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn snapshot_is_reserved_dir() {
+        assert!(snapshot::is_reserved_dir("base_fixtures"));
+        assert!(snapshot::is_reserved_dir("community"));
+        assert!(snapshot::is_reserved_dir("plugins-official"));
+        assert!(!snapshot::is_reserved_dir("hello"));
+        assert!(!snapshot::is_reserved_dir("my-ext"));
+    }
+
+    #[test]
+    fn snapshot_source_tier_roundtrip_serde() {
+        let tier = SourceTier::ThirdPartyGithub;
+        let json = serde_json::to_string(&tier).unwrap();
+        assert_eq!(json, "\"third-party-github\"");
+        let parsed: SourceTier = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, tier);
+    }
+
+    #[test]
+    fn snapshot_artifact_spec_serde_roundtrip() {
+        let spec = ArtifactSpec {
+            id: "test-ext".into(),
+            directory: "community/test-ext".into(),
+            name: "Test".into(),
+            source_tier: SourceTier::Community,
+            license: "MIT".into(),
+            source: ArtifactSource::Git {
+                repo: "https://github.com/user/repo".into(),
+                path: None,
+                commit: Some("abc123".into()),
+            },
+        };
+        let json = serde_json::to_string_pretty(&spec).unwrap();
+        let parsed: ArtifactSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.id, "test-ext");
+        assert_eq!(parsed.source_tier, SourceTier::Community);
     }
 }

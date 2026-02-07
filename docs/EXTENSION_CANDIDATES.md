@@ -1048,8 +1048,82 @@ without manual glue. Each selected candidate should carry:
 
 ---
 
-## E) Notes & Next Steps
+## E) Expanded Research (bd-hhzv, 2026-02-07)
 
-1. **Static capability scan**: parse each candidate to extract exact hostcall usage.  
-2. **Enrich metadata**: add package.json name/version where present.  
-3. **Sampling matrix**: use this list as input for `bd-22h` stratified selection.  
+### Research Pipeline
+
+Four research feeds were executed and merged via the deterministic validation pipeline (`src/extension_validation.rs`):
+
+| Source | Queries | Raw Candidates | Validated Extensions |
+|--------|---------|----------------|---------------------|
+| GitHub Code Search (bd-3l39) | 10 | 479 repos, 290 inspected | 189 true extensions |
+| GitHub Repo Search (bd-kgmr) | 12 | 136 repos | 7 new (beyond code search) |
+| npm Registry Scan (bd-2p71) | 10 | 134 packages, 68 triaged | 33 validated packages |
+| Curated Lists Sweep (bd-3gly) | 10 sources | 45 candidates | 22 new candidates |
+
+### Dedup + Classification Results (bd-28ov)
+
+- **Total input candidates**: 498 (from all sources + existing pool)
+- **After dedup**: 346
+- **True extensions**: 331
+- **Mention-only**: 1
+- **Unknown**: 14
+- **Classification coverage**: 96.0% (exceeds 95% threshold)
+- **Sources merged**: 38 cross-source candidates
+
+### Tier Breakdown
+
+| Tier | Count |
+|------|-------|
+| third-party-github | 200 |
+| official-pi-mono | 60 |
+| npm-registry | 53 |
+| extensions (curated) | 14 |
+| skills (curated) | 2 |
+| community | 1 |
+| agents-mikeastock | 1 |
+
+### Top Registration APIs Used
+
+| API | Count |
+|-----|-------|
+| ExtensionAPI_import | 282 |
+| export_default | 272 |
+| registerCommand | 102 |
+| registerTool | 83 |
+| registerShortcut | 21 |
+| registerProvider | 17 |
+| registerFlag | 14 |
+| registerMessageRenderer | 3 |
+
+### Key Data Files
+
+- `docs/extension-validated-dedup.json` — Full validated + deduped inventory (346 candidates)
+- `docs/extension-individual-enumeration.json` — 331 true extensions with capabilities
+- `docs/extension-code-search-inventory.json` — 189 validated from GitHub code search
+- `docs/extension-repo-search-summary.json` — 7 new from GitHub repo search
+- `docs/extension-npm-scan-summary.json` — 33 validated npm packages
+- `docs/extension-curated-list-summary.json` — 22 new from curated lists
+
+### Pipeline Binary
+
+```bash
+cargo run --bin ext_validate_dedup -- \
+  --code-search docs/extension-code-search-inventory.json \
+  --repo-search docs/extension-repo-search-summary.json \
+  --npm-scan docs/extension-npm-scan-summary.json \
+  --curated-list docs/extension-curated-list-summary.json \
+  --candidate-pool docs/extension-candidate-pool.json \
+  --out docs/extension-validated-dedup.json \
+  --log-out /tmp/validation-decisions.jsonl
+```
+
+---
+
+## F) Notes & Next Steps
+
+1. **Static capability scan**: parse each candidate to extract exact hostcall usage.
+2. **Enrich metadata**: add package.json name/version where present.
+3. **Sampling matrix**: use this list as input for `bd-22h` stratified selection.
+4. **License screening**: feed validated inventory into bd-250p (license + policy screening).
+5. **Scoring + selection**: feed into bd-34io (classify & score candidates; pick tiered corpus).
