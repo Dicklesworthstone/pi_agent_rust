@@ -260,6 +260,252 @@ mod tests {
         let (_, name) = compute_message_count_and_name(&entries);
         assert_eq!(name, Some("Second".to_string()));
     }
+
+    // -- Non-message / non-session-info entries are ignored --
+
+    #[test]
+    fn compute_counts_ignores_model_change_entries() {
+        use crate::session::ModelChangeEntry;
+        let entries = vec![
+            message_entry(),
+            SessionEntry::ModelChange(ModelChangeEntry {
+                base: dummy_base(),
+                provider: "anthropic".to_string(),
+                model_id: "claude-sonnet-4-5".to_string(),
+            }),
+            message_entry(),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 2);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn compute_counts_ignores_label_entries() {
+        use crate::session::LabelEntry;
+        let entries = vec![
+            message_entry(),
+            SessionEntry::Label(LabelEntry {
+                base: dummy_base(),
+                target_id: "some-id".to_string(),
+                label: Some("important".to_string()),
+            }),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 1);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn compute_counts_ignores_custom_entries() {
+        use crate::session::CustomEntry;
+        let entries = vec![
+            SessionEntry::Custom(CustomEntry {
+                base: dummy_base(),
+                custom_type: "my_custom".to_string(),
+                data: Some(serde_json::json!({"key": "value"})),
+            }),
+            message_entry(),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 1);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn compute_counts_ignores_compaction_entries() {
+        use crate::session::CompactionEntry;
+        let entries = vec![
+            message_entry(),
+            SessionEntry::Compaction(CompactionEntry {
+                base: dummy_base(),
+                summary: "summary text".to_string(),
+                first_kept_entry_id: "e1".to_string(),
+                tokens_before: 500,
+                details: None,
+                from_hook: None,
+            }),
+            message_entry(),
+            message_entry(),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 3);
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn compute_counts_mixed_entry_types() {
+        use crate::session::{CompactionEntry, CustomEntry, LabelEntry, ModelChangeEntry};
+        let entries = vec![
+            message_entry(),
+            SessionEntry::ModelChange(ModelChangeEntry {
+                base: dummy_base(),
+                provider: "openai".to_string(),
+                model_id: "gpt-4".to_string(),
+            }),
+            session_info_entry(Some("Named".to_string())),
+            SessionEntry::Label(LabelEntry {
+                base: dummy_base(),
+                target_id: "t1".to_string(),
+                label: None,
+            }),
+            message_entry(),
+            SessionEntry::Compaction(CompactionEntry {
+                base: dummy_base(),
+                summary: "s".to_string(),
+                first_kept_entry_id: "e1".to_string(),
+                tokens_before: 100,
+                details: None,
+                from_hook: None,
+            }),
+            SessionEntry::Custom(CustomEntry {
+                base: dummy_base(),
+                custom_type: "ct".to_string(),
+                data: None,
+            }),
+            message_entry(),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 3);
+        assert_eq!(name, Some("Named".to_string()));
+    }
+
+    // -- map_outcome tests --
+
+    #[test]
+    fn map_outcome_ok() {
+        let outcome: Outcome<i32, SqliteError> = Outcome::Ok(42);
+        let result = map_outcome(outcome);
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn map_outcome_err() {
+        let outcome: Outcome<i32, SqliteError> =
+            Outcome::Err(SqliteError::ConnectionClosed);
+        let result = map_outcome(outcome);
+        let err = result.unwrap_err();
+        match err {
+            Error::Session(message) => {
+                assert!(message.contains("SQLite session error"));
+            }
+            other => panic!("expected Session error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_outcome_cancelled() {
+        use asupersync::types::CancelKind;
+        let reason = asupersync::CancelReason::new(CancelKind::User);
+        let outcome: Outcome<i32, SqliteError> = Outcome::Cancelled(reason);
+        let result = map_outcome(outcome);
+        assert!(matches!(result.unwrap_err(), Error::Aborted));
+    }
+
+    #[test]
+    fn map_outcome_panicked() {
+        use asupersync::types::PanicPayload;
+        let outcome: Outcome<i32, SqliteError> =
+            Outcome::Panicked(PanicPayload::new("test panic"));
+        let result = map_outcome(outcome);
+        let err = result.unwrap_err();
+        match err {
+            Error::Session(message) => {
+                assert!(message.contains("panicked"));
+            }
+            other => panic!("expected Session error, got {other:?}"),
+        }
+    }
+
+    // -- SqliteSessionMeta struct --
+
+    #[test]
+    fn sqlite_session_meta_fields() {
+        let meta = SqliteSessionMeta {
+            header: SessionHeader {
+                id: "test-session".to_string(),
+                ..SessionHeader::default()
+            },
+            message_count: 42,
+            name: Some("My Session".to_string()),
+        };
+        assert_eq!(meta.header.id, "test-session");
+        assert_eq!(meta.message_count, 42);
+        assert_eq!(meta.name.as_deref(), Some("My Session"));
+    }
+
+    #[test]
+    fn sqlite_session_meta_no_name() {
+        let meta = SqliteSessionMeta {
+            header: SessionHeader::default(),
+            message_count: 0,
+            name: None,
+        };
+        assert_eq!(meta.message_count, 0);
+        assert!(meta.name.is_none());
+    }
+
+    // -- compute_message_count_and_name: large input --
+
+    #[test]
+    fn compute_counts_large_message_set() {
+        let entries: Vec<SessionEntry> = (0..1000).map(|_| message_entry()).collect();
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 1000);
+        assert!(name.is_none());
+    }
+
+    // -- compute_message_count_and_name: name then messages only --
+
+    #[test]
+    fn compute_counts_name_set_early_persists() {
+        let entries = vec![
+            session_info_entry(Some("Early Name".to_string())),
+            message_entry(),
+            message_entry(),
+            message_entry(),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 3);
+        assert_eq!(name, Some("Early Name".to_string()));
+    }
+
+    // -- compute_message_count_and_name: branch summary entry --
+
+    #[test]
+    fn compute_counts_ignores_branch_summary() {
+        use crate::session::BranchSummaryEntry;
+        let entries = vec![
+            message_entry(),
+            SessionEntry::BranchSummary(BranchSummaryEntry {
+                base: dummy_base(),
+                from_id: "parent-id".to_string(),
+                summary: "branch summary".to_string(),
+                details: None,
+                from_hook: None,
+            }),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 1);
+        assert!(name.is_none());
+    }
+
+    // -- compute_message_count_and_name: thinking level change --
+
+    #[test]
+    fn compute_counts_ignores_thinking_level_change() {
+        use crate::session::ThinkingLevelChangeEntry;
+        let entries = vec![
+            SessionEntry::ThinkingLevelChange(ThinkingLevelChangeEntry {
+                base: dummy_base(),
+                thinking_level: "high".to_string(),
+            }),
+            message_entry(),
+        ];
+        let (count, name) = compute_message_count_and_name(&entries);
+        assert_eq!(count, 1);
+        assert!(name.is_none());
+    }
 }
 
 pub async fn save_session(
