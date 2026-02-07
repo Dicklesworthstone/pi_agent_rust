@@ -89,19 +89,14 @@ fn load_and_snapshot(
         }
     })?;
 
-    // Extract registration snapshot
+    // Extract registration snapshot from manager
     let snapshot = RegistrationSnapshot {
-        tools: manager
-            .list_commands()
-            .iter()
-            .filter(|_| false) // tools are in the tool registry, not commands
-            .cloned()
-            .collect(),
+        tools: manager.extension_tool_defs(),
         slash_commands: manager.list_commands(),
         shortcuts: manager.list_shortcuts(),
         flags: manager.list_flags(),
         event_hooks: manager.list_event_hooks(),
-        providers: Vec::new(), // providers are stored differently
+        providers: manager.extension_providers(),
         models: Vec::new(),
         message_renderers: Vec::new(),
     };
