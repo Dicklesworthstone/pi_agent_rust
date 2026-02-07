@@ -2256,6 +2256,78 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn dispatcher_exec_hostcall_streaming_timeout_marks_final_chunk_killed() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.timeoutChunks = [];
+                    globalThis.timeoutResult = null;
+                    globalThis.timeoutError = null;
+                    pi.exec("sh", ["-c", "printf 'start\n'; sleep 1; printf 'late\n'"], {
+                        stream: true,
+                        timeoutMs: 50,
+                        onChunk: (chunk, isFinal) => {
+                            globalThis.timeoutChunks.push({ chunk, isFinal });
+                        },
+                    })
+                        .then((r) => { globalThis.timeoutResult = r; })
+                        .catch((e) => { globalThis.timeoutError = e; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.timeoutError !== null) {
+                        throw new Error("Unexpected timeout error: " + JSON.stringify(globalThis.timeoutError));
+                    }
+                    if (globalThis.timeoutResult === null) {
+                        throw new Error("Timeout stream promise not resolved");
+                    }
+                    if (globalThis.timeoutResult.killed !== true) {
+                        throw new Error("Expected killed=true for timeout stream: " + JSON.stringify(globalThis.timeoutResult));
+                    }
+                    const finalEntry = globalThis.timeoutChunks[globalThis.timeoutChunks.length - 1];
+                    if (!finalEntry || finalEntry.isFinal !== true) {
+                        throw new Error("Missing final timeout chunk marker: " + JSON.stringify(globalThis.timeoutChunks));
+                    }
+                    const sawLateOutput = globalThis.timeoutChunks.some((entry) =>
+                        entry.chunk && entry.chunk.stdout && entry.chunk.stdout.includes("late")
+                    );
+                    if (sawLateOutput) {
+                        throw new Error("Process output after timeout kill: " + JSON.stringify(globalThis.timeoutChunks));
+                    }
+                "#,
+                )
+                .await
+                .expect("verify timeout stream result");
+        });
+    }
+
+    #[test]
     fn dispatcher_http_hostcall_executes_and_resolves_promise() {
         futures::executor::block_on(async {
             let addr = spawn_http_server("hello");
