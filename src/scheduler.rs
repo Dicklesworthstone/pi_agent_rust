@@ -1193,4 +1193,169 @@ mod tests {
         let b = Macrotask::new(Seq(1), MacrotaskKind::TimerFired { timer_id: 2 });
         assert_eq!(a, b); // Same seq → equal
     }
+
+    // ── bd-2tl1.5: Streaming concurrency + determinism ──────────────
+
+    #[test]
+    fn scheduler_ten_concurrent_streams_complete_independently() {
+        let clock = DeterministicClock::new(0);
+        let mut sched = Scheduler::with_clock(clock);
+        let n_streams: usize = 10;
+        let chunks_per_stream: usize = 5;
+
+        // Enqueue N streams with M chunks each, interleaved round-robin.
+        for chunk_idx in 0..chunks_per_stream {
+            for stream_idx in 0..n_streams {
+                let is_final = chunk_idx == chunks_per_stream - 1;
+                sched.enqueue_stream_chunk(
+                    format!("stream-{stream_idx}"),
+                    chunk_idx as u64,
+                    serde_json::json!({ "s": stream_idx, "c": chunk_idx }),
+                    is_final,
+                );
+            }
+        }
+
+        let mut per_stream: std::collections::HashMap<String, Vec<(u64, bool)>> =
+            std::collections::HashMap::new();
+        while let Some(task) = sched.tick() {
+            let MacrotaskKind::HostcallComplete { call_id, outcome } = task.kind else {
+                unreachable!("expected hostcall completion");
+            };
+            let HostcallOutcome::StreamChunk {
+                sequence, is_final, ..
+            } = outcome
+            else {
+                unreachable!("expected stream chunk");
+            };
+            per_stream
+                .entry(call_id)
+                .or_default()
+                .push((sequence, is_final));
+        }
+
+        assert_eq!(per_stream.len(), n_streams);
+        for (call_id, chunks) in &per_stream {
+            assert_eq!(
+                chunks.len(),
+                chunks_per_stream,
+                "stream {call_id} incomplete"
+            );
+            // Sequences are monotonically increasing per stream.
+            for (i, (seq, _)) in chunks.iter().enumerate() {
+                assert_eq!(*seq, i as u64, "stream {call_id}: non-monotonic at {i}");
+            }
+            // Exactly one final chunk (the last).
+            let final_count = chunks.iter().filter(|(_, f)| *f).count();
+            assert_eq!(
+                final_count, 1,
+                "stream {call_id}: expected exactly one final"
+            );
+            assert!(
+                chunks.last().unwrap().1,
+                "stream {call_id}: final must be last"
+            );
+        }
+    }
+
+    #[test]
+    fn scheduler_mixed_stream_nonstream_ordering() {
+        let clock = DeterministicClock::new(0);
+        let mut sched = Scheduler::with_clock(clock);
+
+        // Enqueue: event, stream chunk, success, stream final, event.
+        sched.enqueue_event("evt-1".to_string(), serde_json::json!({"n": 1}));
+        sched.enqueue_stream_chunk("stream-x".to_string(), 0, serde_json::json!("data"), false);
+        sched.enqueue_hostcall_complete(
+            "call-y".to_string(),
+            HostcallOutcome::Success(serde_json::json!({"ok": true})),
+        );
+        sched.enqueue_stream_chunk("stream-x".to_string(), 1, serde_json::json!("end"), true);
+        sched.enqueue_event("evt-2".to_string(), serde_json::json!({"n": 2}));
+
+        let mut trace = Vec::new();
+        while let Some(task) = sched.tick() {
+            trace.push(trace_entry(&task));
+        }
+
+        // FIFO ordering: all 5 items in enqueue order.
+        assert_eq!(trace.len(), 5);
+        assert!(trace[0].contains("event:evt-1"));
+        assert!(trace[1].contains("stream-x") && trace[1].contains("chunk"));
+        assert!(trace[2].contains("call-y") && trace[2].contains("ok"));
+        assert!(trace[3].contains("stream-x") && trace[3].contains("stream_final"));
+        assert!(trace[4].contains("event:evt-2"));
+    }
+
+    #[test]
+    fn scheduler_concurrent_streams_deterministic_across_runs() {
+        fn run_ten_streams() -> Vec<String> {
+            let clock = DeterministicClock::new(0);
+            let mut sched = Scheduler::with_clock(clock);
+
+            for chunk in 0..3_u64 {
+                for stream in 0..10 {
+                    sched.enqueue_stream_chunk(
+                        format!("s{stream}"),
+                        chunk,
+                        serde_json::json!(chunk),
+                        chunk == 2,
+                    );
+                }
+            }
+
+            let mut trace = Vec::new();
+            while let Some(task) = sched.tick() {
+                trace.push(trace_entry(&task));
+            }
+            trace
+        }
+
+        let a = run_ten_streams();
+        let b = run_ten_streams();
+        assert_eq!(a, b, "10-stream trace must be deterministic");
+        assert_eq!(a.len(), 30, "expected 10 streams x 3 chunks = 30 entries");
+    }
+
+    #[test]
+    fn scheduler_stream_interleaved_with_timers() {
+        let clock = DeterministicClock::new(0);
+        let mut sched = Scheduler::with_clock(clock);
+
+        // Set a timer for 100ms.
+        let _t = sched.set_timeout(100);
+
+        // Enqueue first stream chunk.
+        sched.enqueue_stream_chunk("s1".to_string(), 0, serde_json::json!("a"), false);
+
+        // Advance clock past timer deadline.
+        sched.clock.advance(150);
+
+        // Enqueue final stream chunk after timer.
+        sched.enqueue_stream_chunk("s1".to_string(), 1, serde_json::json!("b"), true);
+
+        let mut trace = Vec::new();
+        while let Some(task) = sched.tick() {
+            trace.push(trace_entry(&task));
+        }
+
+        // Macrotask queue is drained first (FIFO); timers are only transferred
+        // when the macrotask queue is empty. So: chunk 0, chunk 1, then timer.
+        assert_eq!(trace.len(), 3);
+        assert!(
+            trace[0].contains("s1") && trace[0].contains("chunk"),
+            "first: stream chunk 0, got: {}",
+            trace[0]
+        );
+        assert!(
+            trace[1].contains("s1") && trace[1].contains("stream_final"),
+            "second: stream final, got: {}",
+            trace[1]
+        );
+        assert!(
+            trace[2].contains("timer"),
+            "third: timer, got: {}",
+            trace[2]
+        );
+    }
 }
