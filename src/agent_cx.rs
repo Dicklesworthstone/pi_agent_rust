@@ -10,6 +10,7 @@
 //! `asupersync::Cx`; it just centralizes how Pi threads context through async code.
 
 use asupersync::{Budget, Cx};
+use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
 
@@ -26,6 +27,24 @@ pub struct AgentCx {
 }
 
 impl AgentCx {
+    /// Wrap an existing `asupersync::Cx`.
+    #[must_use]
+    pub const fn from_cx(cx: Cx) -> Self {
+        Self { cx }
+    }
+
+    /// Use the ambient context when available, otherwise fall back to a request-scoped context.
+    ///
+    /// This is useful when helper code may run either inside an already-scoped async task
+    /// (where inheriting the current cancellation/budget is desirable) or at a top-level entry
+    /// point that needs to create a fresh request context.
+    #[must_use]
+    pub fn for_current_or_request() -> Self {
+        Self {
+            cx: Cx::current().unwrap_or_else(Cx::for_request),
+        }
+    }
+
     /// Create a request-scoped context (infinite budget).
     #[must_use]
     pub fn for_request() -> Self {
@@ -86,6 +105,14 @@ impl AgentCx {
     #[must_use]
     pub const fn process(&self) -> AgentProcess<'_> {
         AgentProcess { _cx: self }
+    }
+}
+
+impl Deref for AgentCx {
+    type Target = Cx;
+
+    fn deref(&self) -> &Self::Target {
+        self.cx()
     }
 }
 
@@ -160,6 +187,19 @@ mod tests {
     fn for_request_creates_valid_context() {
         let cx = AgentCx::for_request();
         // Verify the inner Cx is accessible.
+        let _ = cx.cx();
+    }
+
+    #[test]
+    fn from_cx_wraps_existing_context() {
+        let inner = Cx::for_request();
+        let cx = AgentCx::from_cx(inner);
+        let _ = cx.cx();
+    }
+
+    #[test]
+    fn for_current_or_request_creates_valid_context() {
+        let cx = AgentCx::for_current_or_request();
         let _ = cx.cx();
     }
 

@@ -11,7 +11,6 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extension_index::ExtensionIndexStore;
 use crate::extensions::{CompatibilityScanner, load_extension_manifest};
-use asupersync::Cx;
 use asupersync::channel::oneshot;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -534,12 +533,12 @@ impl PackageManager {
 
         thread::spawn(move || {
             let res = this.remove_package_source_sync(&source, scope);
-            let cx = Cx::for_request();
-            let _ = tx.send(&cx, res);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
         });
 
-        let cx = Cx::for_request();
-        rx.recv(&cx)
+        let cx = AgentCx::for_request();
+        rx.recv(cx.cx())
             .await
             .map_err(|_| Error::tool("package_manager", "Remove source task cancelled"))?
     }

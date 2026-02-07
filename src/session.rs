@@ -14,7 +14,6 @@ use crate::model::{
 };
 use crate::session_index::SessionIndex;
 use crate::tui::PiConsole;
-use asupersync::Cx;
 use asupersync::channel::oneshot;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
@@ -39,8 +38,8 @@ pub struct SessionHandle(pub Arc<Mutex<Session>>);
 #[async_trait]
 impl ExtensionSession for SessionHandle {
     async fn get_state(&self) -> Value {
-        let cx = Cx::for_request();
-        let Ok(session) = self.0.lock(&cx).await else {
+        let cx = AgentCx::for_request();
+        let Ok(session) = self.0.lock(cx.cx()).await else {
             return serde_json::json!({
                 "model": null,
                 "thinkingLevel": "off",
@@ -86,8 +85,8 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn get_messages(&self) -> Vec<SessionMessage> {
-        let cx = Cx::for_request();
-        let Ok(session) = self.0.lock(&cx).await else {
+        let cx = AgentCx::for_request();
+        let Ok(session) = self.0.lock(cx.cx()).await else {
             return Vec::new();
         };
         // Return messages for the current branch only, filtered to
@@ -110,8 +109,8 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn get_entries(&self) -> Vec<Value> {
-        let cx = Cx::for_request();
-        let Ok(session) = self.0.lock(&cx).await else {
+        let cx = AgentCx::for_request();
+        let Ok(session) = self.0.lock(cx.cx()).await else {
             return Vec::new();
         };
         session
@@ -122,8 +121,8 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn get_branch(&self) -> Vec<Value> {
-        let cx = Cx::for_request();
-        let Ok(session) = self.0.lock(&cx).await else {
+        let cx = AgentCx::for_request();
+        let Ok(session) = self.0.lock(cx.cx()).await else {
             return Vec::new();
         };
         session
@@ -134,10 +133,10 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn set_name(&self, name: String) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
         let mut session = self
             .0
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.set_name(&name);
@@ -148,10 +147,10 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn append_message(&self, message: SessionMessage) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
         let mut session = self
             .0
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_message(message);
@@ -162,10 +161,10 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
         let mut session = self
             .0
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         if custom_type.trim().is_empty() {
@@ -179,10 +178,10 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
         let mut session = self
             .0
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_model_change(provider.clone(), model_id.clone());
@@ -194,8 +193,8 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn get_model(&self) -> (Option<String>, Option<String>) {
-        let cx = Cx::for_request();
-        let Ok(session) = self.0.lock(&cx).await else {
+        let cx = AgentCx::for_request();
+        let Ok(session) = self.0.lock(cx.cx()).await else {
             return (None, None);
         };
         (
@@ -205,10 +204,10 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn set_thinking_level(&self, level: String) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
         let mut session = self
             .0
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         session.append_thinking_level_change(level.clone());
@@ -220,18 +219,18 @@ impl ExtensionSession for SessionHandle {
     }
 
     async fn get_thinking_level(&self) -> Option<String> {
-        let cx = Cx::for_request();
-        let Ok(session) = self.0.lock(&cx).await else {
+        let cx = AgentCx::for_request();
+        let Ok(session) = self.0.lock(cx.cx()).await else {
             return None;
         };
         session.header.thinking_level.clone()
     }
 
     async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
-        let cx = Cx::for_request();
+        let cx = AgentCx::for_request();
         let mut session = self
             .0
-            .lock(&cx)
+            .lock(cx.cx())
             .await
             .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
         if session.add_label(&target_id, label).is_none() {

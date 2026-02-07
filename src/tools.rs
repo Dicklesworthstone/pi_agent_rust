@@ -6,6 +6,7 @@
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
 //! rendering in the TUI and for inclusion in provider messages as tool results.
 
+use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, ImageContent, TextContent};
@@ -1347,8 +1348,9 @@ pub(crate) async fn run_bash_command(
 
         // Use the runtime's timer driver when available (virtual/lab time),
         // otherwise fall back to wall clock.
-        let now = asupersync::Cx::current()
-            .and_then(|cx| cx.timer_driver())
+        let now = AgentCx::for_current_or_request()
+            .cx()
+            .timer_driver()
             .map_or_else(wall_now, |timer| timer.now());
         sleep(now, tick).await;
     }
@@ -1361,8 +1363,9 @@ pub(crate) async fn run_bash_command(
                 if Instant::now() >= drain_deadline {
                     break;
                 }
-                let now = asupersync::Cx::current()
-                    .and_then(|cx| cx.timer_driver())
+                let now = AgentCx::for_current_or_request()
+                    .cx()
+                    .timer_driver()
                     .map_or_else(wall_now, |timer| timer.now());
                 sleep(now, tick).await;
             }
@@ -2495,8 +2498,9 @@ impl Tool for GrepTool {
             match guard.child.as_mut().unwrap().try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
-                    let now = asupersync::Cx::current()
-                        .and_then(|cx| cx.timer_driver())
+                    let now = AgentCx::for_current_or_request()
+                        .cx()
+                        .timer_driver()
                         .map_or_else(wall_now, |timer| timer.now());
                     sleep(now, tick).await;
                 }
@@ -2837,8 +2841,9 @@ impl Tool for FindTool {
             match guard.child.as_mut().unwrap().try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) => {
-                    let now = asupersync::Cx::current()
-                        .and_then(|cx| cx.timer_driver())
+                    let now = AgentCx::for_current_or_request()
+                        .cx()
+                        .timer_driver()
                         .map_or_else(wall_now, |timer| timer.now());
                     sleep(now, tick).await;
                 }
