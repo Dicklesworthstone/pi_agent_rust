@@ -1,0 +1,331 @@
+{
+  "schema": "pi.ext.collections.v1",
+  "generated_at": "2026-02-07T06:45:00Z",
+  "taxonomy": {
+    "description": "Category taxonomy for extension discovery. Each category has a stable key, display name, and description.",
+    "categories": [
+      {
+        "key": "providers",
+        "name": "Custom Providers",
+        "description": "Connect Pi to alternative LLM backends (OpenAI, local models, GitLab Duo, etc.)",
+        "icon": "cloud"
+      },
+      {
+        "key": "tools",
+        "name": "Additional Tools",
+        "description": "Extend Pi's built-in toolset with new capabilities",
+        "icon": "wrench"
+      },
+      {
+        "key": "automation",
+        "name": "Automation & Hooks",
+        "description": "Lifecycle hooks, auto-commit, session management, scheduled tasks",
+        "icon": "zap"
+      },
+      {
+        "key": "git",
+        "name": "Git & Version Control",
+        "description": "Git workflows, branch management, checkpoints, commit helpers",
+        "icon": "git-branch"
+      },
+      {
+        "key": "ui",
+        "name": "UI & Rendering",
+        "description": "Custom headers, footers, overlays, editors, themes, message renderers",
+        "icon": "layout"
+      },
+      {
+        "key": "security",
+        "name": "Security & Policy",
+        "description": "Guards, permission gates, protected paths, audit tools",
+        "icon": "shield"
+      },
+      {
+        "key": "data",
+        "name": "Data & Analysis",
+        "description": "Data processing, summarization, file management",
+        "icon": "database"
+      },
+      {
+        "key": "games",
+        "name": "Games & Fun",
+        "description": "Terminal games and entertainment (snake, space invaders, doom)",
+        "icon": "gamepad"
+      },
+      {
+        "key": "devops",
+        "name": "DevOps & Infrastructure",
+        "description": "SSH, Docker, sandbox environments, shell integration",
+        "icon": "server"
+      },
+      {
+        "key": "input",
+        "name": "Input & Interaction",
+        "description": "Input transforms, questionnaires, interactive prompts",
+        "icon": "edit"
+      }
+    ]
+  },
+  "extension_categories": {
+    "description": "Maps extension IDs to their primary category. Extensions may appear in multiple categories.",
+    "providers": [
+      "custom-provider-anthropic",
+      "custom-provider-gitlab-duo",
+      "custom-provider-qwen-cli",
+      "npm/aliou-pi-synthetic",
+      "npm/benvargas-pi-synthetic-provider",
+      "npm/pi-moonshot",
+      "npm/pi-multicodex",
+      "npm/verioussmith-pi-openrouter",
+      "third-party/ben-vargas-pi-packages"
+    ],
+    "tools": [
+      "hello",
+      "todo",
+      "tools",
+      "files",
+      "diff",
+      "summarize",
+      "truncated-tool",
+      "tool-override",
+      "inline-bash",
+      "interactive-shell",
+      "subagent"
+    ],
+    "automation": [
+      "auto-commit-on-exit",
+      "bash-spawn-hook",
+      "event-bus",
+      "file-trigger",
+      "trigger-compact",
+      "custom-compaction",
+      "handoff",
+      "shutdown-command",
+      "send-user-message",
+      "session-name",
+      "preset",
+      "community/nicobailon-rewind-hook",
+      "community/prateekmedia-checkpoint",
+      "npm/checkpoint-pi"
+    ],
+    "git": [
+      "git-checkpoint",
+      "dirty-repo-guard",
+      "auto-commit-on-exit",
+      "community/qualisero-safe-git",
+      "npm/pi-shadow-git",
+      "npm/oh-my-pi-basics"
+    ],
+    "ui": [
+      "custom-header",
+      "custom-footer",
+      "status-line",
+      "titlebar-spinner",
+      "model-status",
+      "system-prompt-header",
+      "prompt-url-widget",
+      "widget-placement",
+      "redraws",
+      "pirate",
+      "message-renderer",
+      "rainbow-editor",
+      "modal-editor",
+      "overlay-test",
+      "overlay-qa-tests",
+      "mac-system-theme",
+      "rpc-demo"
+    ],
+    "security": [
+      "permission-gate",
+      "protected-paths",
+      "confirm-destructive",
+      "timed-confirm",
+      "dirty-repo-guard",
+      "negative-denied-caps",
+      "sandbox",
+      "claude-rules"
+    ],
+    "data": [
+      "summarize",
+      "files",
+      "bookmark",
+      "qna",
+      "dynamic-resources"
+    ],
+    "games": [
+      "snake",
+      "space-invaders",
+      "doom-overlay"
+    ],
+    "devops": [
+      "ssh",
+      "sandbox",
+      "interactive-shell",
+      "inline-bash"
+    ],
+    "input": [
+      "input-transform",
+      "question",
+      "questionnaire",
+      "notify",
+      "antigravity-image-gen"
+    ]
+  },
+  "collections": [
+    {
+      "id": "getting-started",
+      "name": "Getting Started",
+      "description": "Essential extensions for new Pi users. Start here.",
+      "extensions": [
+        {
+          "id": "hello",
+          "reason": "Minimal tool example — understand the extension API"
+        },
+        {
+          "id": "todo",
+          "reason": "Practical tool — track tasks within Pi sessions"
+        },
+        {
+          "id": "git-checkpoint",
+          "reason": "Safety net — auto-checkpoint git state before changes"
+        },
+        {
+          "id": "custom-header",
+          "reason": "UI customization — add project context to every prompt"
+        },
+        {
+          "id": "status-line",
+          "reason": "Monitoring — see model, tokens, and session info at a glance"
+        }
+      ]
+    },
+    {
+      "id": "power-user",
+      "name": "Power User Pack",
+      "description": "Advanced extensions for experienced Pi users.",
+      "extensions": [
+        {
+          "id": "plan-mode",
+          "reason": "Architecture planning before implementation"
+        },
+        {
+          "id": "subagent",
+          "reason": "Spawn sub-agents for parallel tasks"
+        },
+        {
+          "id": "interactive-shell",
+          "reason": "Persistent shell sessions within Pi"
+        },
+        {
+          "id": "diff",
+          "reason": "Visual diffs for code review"
+        },
+        {
+          "id": "auto-commit-on-exit",
+          "reason": "Never lose work — auto-commit on session end"
+        },
+        {
+          "id": "custom-compaction",
+          "reason": "Control how conversation history compacts"
+        },
+        {
+          "id": "file-trigger",
+          "reason": "React to file changes automatically"
+        },
+        {
+          "id": "event-bus",
+          "reason": "Coordinate between extensions via events"
+        },
+        {
+          "id": "permission-gate",
+          "reason": "Fine-grained tool permission control"
+        },
+        {
+          "id": "summarize",
+          "reason": "Summarize long outputs and conversations"
+        }
+      ]
+    },
+    {
+      "id": "provider-pack",
+      "name": "Provider Pack",
+      "description": "All custom LLM provider extensions for connecting Pi to alternative backends.",
+      "extensions": [
+        {
+          "id": "custom-provider-anthropic",
+          "reason": "Reference implementation — Anthropic provider with OAuth"
+        },
+        {
+          "id": "custom-provider-qwen-cli",
+          "reason": "Qwen models via CLI with OAuth support"
+        },
+        {
+          "id": "custom-provider-gitlab-duo",
+          "reason": "GitLab Duo as a Pi provider"
+        },
+        {
+          "id": "npm/pi-moonshot",
+          "reason": "Moonshot/Kimi AI provider"
+        },
+        {
+          "id": "npm/verioussmith-pi-openrouter",
+          "reason": "OpenRouter multi-model provider"
+        }
+      ]
+    },
+    {
+      "id": "safety-net",
+      "name": "Safety Net",
+      "description": "Extensions that protect your codebase from accidents.",
+      "extensions": [
+        {
+          "id": "git-checkpoint",
+          "reason": "Checkpoint git state before risky operations"
+        },
+        {
+          "id": "dirty-repo-guard",
+          "reason": "Warn when working in a dirty git repo"
+        },
+        {
+          "id": "confirm-destructive",
+          "reason": "Require confirmation for destructive operations"
+        },
+        {
+          "id": "protected-paths",
+          "reason": "Prevent modifications to critical files"
+        },
+        {
+          "id": "permission-gate",
+          "reason": "Control which tools extensions can use"
+        }
+      ]
+    },
+    {
+      "id": "ui-customization",
+      "name": "UI Customization",
+      "description": "Make Pi's terminal interface your own.",
+      "extensions": [
+        {
+          "id": "custom-header",
+          "reason": "Add project context above the prompt"
+        },
+        {
+          "id": "custom-footer",
+          "reason": "Add status info below the prompt"
+        },
+        {
+          "id": "status-line",
+          "reason": "Persistent status bar with model/token info"
+        },
+        {
+          "id": "titlebar-spinner",
+          "reason": "Visual activity indicator in the titlebar"
+        },
+        {
+          "id": "pirate",
+          "reason": "Fun — pirate-themed response formatting"
+        }
+      ]
+    }
+  ]
+}
