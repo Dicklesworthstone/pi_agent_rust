@@ -15,6 +15,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::{self, Stream};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::pin::Pin;
 
 // ============================================================================
@@ -229,6 +230,7 @@ where
     partial: AssistantMessage,
     current_text: String,
     tool_calls: Vec<ToolCallState>,
+    pending_events: VecDeque<StreamEvent>,
     started: bool,
     finished: bool,
 }
@@ -258,6 +260,7 @@ where
             },
             current_text: String::new(),
             tool_calls: Vec::new(),
+            pending_events: VecDeque::new(),
             started: false,
             finished: false,
         }

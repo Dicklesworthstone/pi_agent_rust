@@ -338,7 +338,7 @@ where
         }
     }
 
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::unnecessary_wraps, clippy::too_many_lines)]
     fn process_event(&mut self, data: &str) -> Result<()> {
         let chunk: AzureStreamChunk =
             serde_json::from_str(data).map_err(|e| Error::api(format!("JSON parse error: {e}")))?;
@@ -378,6 +378,19 @@ where
 
                 // Finalize tool call arguments
                 self.finalize_tool_call_arguments();
+
+                // Emit ToolCallEnd for each accumulated tool call
+                for tc in &self.tool_calls {
+                    if let Some(ContentBlock::ToolCall(tool_call)) =
+                        self.partial.content.get(tc.content_index)
+                    {
+                        self.pending_events.push_back(StreamEvent::ToolCallEnd {
+                            content_index: tc.content_index,
+                            tool_call: tool_call.clone(),
+                            partial: self.partial.clone(),
+                        });
+                    }
+                }
             }
 
             // Handle text content

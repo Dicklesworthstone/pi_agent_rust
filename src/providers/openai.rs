@@ -377,6 +377,19 @@ where
             // Finalize tool call arguments
             self.finalize_tool_call_arguments();
 
+            // Emit ToolCallEnd for each accumulated tool call
+            for tc in &self.tool_calls {
+                if let Some(ContentBlock::ToolCall(tool_call)) =
+                    self.partial.content.get(tc.content_index)
+                {
+                    self.pending_events.push_back(StreamEvent::ToolCallEnd {
+                        content_index: tc.content_index,
+                        tool_call: tool_call.clone(),
+                        partial: self.partial.clone(),
+                    });
+                }
+            }
+
             return; // Done event handled by [DONE] message
         }
 
