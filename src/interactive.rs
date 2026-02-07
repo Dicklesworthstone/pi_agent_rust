@@ -2690,7 +2690,7 @@ fn truncate(s: &str, max_len: usize) -> String {
     out
 }
 
-pub(crate) fn strip_thinking_level_suffix(pattern: &str) -> &str {
+pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
     let Some((prefix, suffix)) = pattern.rsplit_once(':') else {
         return pattern;
     };
@@ -2700,7 +2700,7 @@ pub(crate) fn strip_thinking_level_suffix(pattern: &str) -> &str {
     }
 }
 
-pub(crate) fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
+pub fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
     args.split(|c: char| c == ',' || c.is_whitespace())
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -2708,14 +2708,14 @@ pub(crate) fn parse_scoped_model_patterns(args: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
+pub fn model_entry_matches(left: &ModelEntry, right: &ModelEntry) -> bool {
     left.model
         .provider
         .eq_ignore_ascii_case(&right.model.provider)
         && left.model.id.eq_ignore_ascii_case(&right.model.id)
 }
 
-pub(crate) fn resolve_scoped_model_entries(
+pub fn resolve_scoped_model_entries(
     patterns: &[String],
     available_models: &[ModelEntry],
 ) -> Result<Vec<ModelEntry>, String> {
@@ -5433,6 +5433,11 @@ impl PiApp {
         self.status_message.as_deref()
     }
 
+    /// Get a reference to the model selector overlay (for testing).
+    pub const fn model_selector(&self) -> Option<&crate::model_selector::ModelSelectorOverlay> {
+        self.model_selector.as_ref()
+    }
+
     /// Check if the branch picker is currently open (for testing).
     pub const fn has_branch_picker(&self) -> bool {
         self.branch_picker.is_some()
@@ -6176,8 +6181,9 @@ impl PiApp {
             return;
         }
 
-        self.model_selector =
-            Some(crate::model_selector::ModelSelectorOverlay::new(&self.available_models));
+        self.model_selector = Some(crate::model_selector::ModelSelectorOverlay::new(
+            &self.available_models,
+        ));
     }
 
     /// Handle keyboard input while the model selector is open.
@@ -6279,11 +6285,7 @@ impl PiApp {
         use std::fmt::Write;
         let mut output = String::new();
 
-        let _ = writeln!(
-            output,
-            "\n  {}",
-            self.styles.title.render("Select a model")
-        );
+        let _ = writeln!(output, "\n  {}", self.styles.title.render("Select a model"));
 
         // Search field
         let query = selector.query();
@@ -8630,7 +8632,7 @@ impl PiApp {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn cycle_model(&mut self, delta: i32) {
+    pub fn cycle_model(&mut self, delta: i32) {
         if self.agent_state != AgentState::Idle {
             self.status_message = Some("Cannot switch models while processing".to_string());
             return;
@@ -11961,5 +11963,180 @@ mod tests {
             .join("\n");
         let msg = ConversationMessage::tool(content);
         assert!(msg.collapsed);
+    }
+
+    // --- resolve_scoped_model_entries tests ---
+
+    fn test_model_entry(provider: &str, id: &str) -> ModelEntry {
+        ModelEntry {
+            model: crate::provider::Model {
+                id: id.to_string(),
+                name: id.to_string(),
+                api: "test".to_string(),
+                provider: provider.to_string(),
+                base_url: "https://example.invalid".to_string(),
+                reasoning: false,
+                input: vec![crate::provider::InputType::Text],
+                cost: crate::provider::ModelCost {
+                    input: 0.0,
+                    output: 0.0,
+                    cache_read: 0.0,
+                    cache_write: 0.0,
+                },
+                context_window: 4096,
+                max_tokens: 1024,
+                headers: std::collections::HashMap::new(),
+            },
+            api_key: None,
+            headers: std::collections::HashMap::new(),
+            auth_header: false,
+            compat: None,
+            oauth_config: None,
+        }
+    }
+
+    fn resolved_ids(entries: &[ModelEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|e| format!("{}/{}", e.model.provider, e.model.id))
+            .collect()
+    }
+
+    #[test]
+    fn resolve_scoped_exact_match_by_id() {
+        let models = vec![
+            test_model_entry("anthropic", "claude-sonnet-4"),
+            test_model_entry("openai", "gpt-4o"),
+        ];
+        let patterns = vec!["gpt-4o".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(resolved_ids(&result), vec!["openai/gpt-4o"]);
+    }
+
+    #[test]
+    fn resolve_scoped_exact_match_by_full_id() {
+        let models = vec![
+            test_model_entry("anthropic", "claude-sonnet-4"),
+            test_model_entry("openai", "gpt-4o"),
+        ];
+        let patterns = vec!["anthropic/claude-sonnet-4".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(resolved_ids(&result), vec!["anthropic/claude-sonnet-4"]);
+    }
+
+    #[test]
+    fn resolve_scoped_glob_wildcard() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("openai", "gpt-4o-mini"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+        ];
+        let patterns = vec!["gpt-4*".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(
+            resolved_ids(&result),
+            vec!["openai/gpt-4o", "openai/gpt-4o-mini"]
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_glob_provider_slash() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("openai", "o1"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+        ];
+        let patterns = vec!["openai/*".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(resolved_ids(&result), vec!["openai/gpt-4o", "openai/o1"]);
+    }
+
+    #[test]
+    fn resolve_scoped_case_insensitive() {
+        let models = vec![test_model_entry("OpenAI", "GPT-4o")];
+        let patterns = vec!["gpt-4o".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].model.id, "GPT-4o");
+    }
+
+    #[test]
+    fn resolve_scoped_deduplicates() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+        ];
+        // Both patterns match gpt-4o, but it should appear only once.
+        let patterns = vec!["gpt-4o".to_string(), "openai/*".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(resolved_ids(&result), vec!["openai/gpt-4o"]);
+    }
+
+    #[test]
+    fn resolve_scoped_output_sorted() {
+        let models = vec![
+            test_model_entry("openai", "gpt-4o"),
+            test_model_entry("anthropic", "claude-sonnet-4"),
+            test_model_entry("google", "gemini-pro"),
+        ];
+        let patterns = vec!["*".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        let ids = resolved_ids(&result);
+        assert_eq!(
+            ids,
+            vec![
+                "anthropic/claude-sonnet-4",
+                "google/gemini-pro",
+                "openai/gpt-4o"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_scoped_invalid_glob_returns_error() {
+        let models = vec![test_model_entry("openai", "gpt-4o")];
+        let patterns = vec!["[invalid".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid model pattern"));
+    }
+
+    #[test]
+    fn resolve_scoped_no_match_returns_empty() {
+        let models = vec![test_model_entry("openai", "gpt-4o")];
+        let patterns = vec!["nonexistent-model".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn resolve_scoped_thinking_suffix_stripped() {
+        let models = vec![
+            test_model_entry("anthropic", "claude-sonnet-4"),
+            test_model_entry("openai", "gpt-4o"),
+        ];
+        let patterns = vec!["claude-sonnet-4:high".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(resolved_ids(&result), vec!["anthropic/claude-sonnet-4"]);
+    }
+
+    #[test]
+    fn resolve_scoped_question_mark_glob() {
+        let models = vec![
+            test_model_entry("openai", "o1"),
+            test_model_entry("openai", "o3"),
+            test_model_entry("openai", "gpt-4o"),
+        ];
+        let patterns = vec!["o?".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert_eq!(resolved_ids(&result), vec!["openai/o1", "openai/o3"]);
+    }
+
+    #[test]
+    fn resolve_scoped_empty_available_returns_empty() {
+        let models: Vec<ModelEntry> = Vec::new();
+        let patterns = vec!["*".to_string()];
+        let result = resolve_scoped_model_entries(&patterns, &models).unwrap();
+        assert!(result.is_empty());
     }
 }
