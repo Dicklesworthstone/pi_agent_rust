@@ -1,0 +1,64 @@
+{
+  "description": "Known extension entrypoints for regression testing",
+  "purpose": "Ensure code search queries can rediscover these known extensions",
+  "entrypoints": [
+    {
+      "repo": "mitsuhiko/agent-stuff",
+      "path": "pi-extensions/review.ts",
+      "registrations": [
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "knoopx/pi",
+      "path": "extensions/edit.ts",
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "towry/agent-share",
+      "path": "extensions/review.ts",
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "Dwsy/agent",
+      "path": "extensions/answer.ts",
+      "registrations": []
+    },
+    {
+      "repo": "dejanr/dotfiles",
+      "path": ".pi/extensions/project-context/index.ts",
+      "registrations": [
+        "registerTool"
+      ]
+    },
+    {
+      "repo": "joelazar/dotfiles",
+      "path": ".pi/extensions/commands.ts",
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ]
+    },
+    {
+      "repo": "w-winter/dot314",
+      "path": "extensions/pi-tool-diff/index.ts",
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    },
+    {
+      "repo": "nof0xgiven/pi-coding-agent-eureka",
+      "path": "extensions/review/src/index.ts",
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ]
+    }
+  ]
+}

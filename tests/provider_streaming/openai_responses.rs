@@ -1,4 +1,4 @@
-//! OpenAI Responses API provider streaming tests (VCR playback/recording).
+//! `OpenAI` Responses API provider streaming tests (VCR playback/recording).
 
 use super::{
     ScenarioExpectation, StreamExpectations, assert_stream_expectations, cassette_root,

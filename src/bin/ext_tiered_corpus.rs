@@ -81,7 +81,7 @@ struct MergedCandidate {
     repository_url: Option<String>,
     npm_package: Option<String>,
     pool_item: Option<CandidateItem>,
-    license_verdict: Option<VerdictStatus>,
+    _license_verdict: Option<VerdictStatus>,
     license_spdx: Option<String>,
 }
 
@@ -145,8 +145,7 @@ fn main() -> Result<()> {
 
             let (license_verdict, license_spdx) = license_map
                 .get(&c.canonical_id)
-                .map(|(v, s)| (Some(*v), Some(s.clone())))
-                .unwrap_or((None, None));
+                .map_or((None, None), |(v, s)| (Some(*v), Some(s.clone())));
 
             MergedCandidate {
                 canonical_id: c.canonical_id.clone(),
@@ -156,7 +155,7 @@ fn main() -> Result<()> {
                 repository_url: c.repository_url.clone(),
                 npm_package: c.npm_package.clone(),
                 pool_item,
-                license_verdict,
+                _license_verdict: license_verdict,
                 license_spdx,
             }
         })
@@ -172,8 +171,7 @@ fn main() -> Result<()> {
         .as_ref()
         .map(|s| DateTime::parse_from_rfc3339(s).context("parse as_of"))
         .transpose()?
-        .map(|d| d.with_timezone(&Utc))
-        .unwrap_or_else(Utc::now);
+        .map_or_else(Utc::now, |d| d.with_timezone(&Utc));
 
     let report = score_candidates(&inputs, as_of, as_of, args.top_n);
 
@@ -205,11 +203,7 @@ fn main() -> Result<()> {
     let tier0 = report.items.iter().filter(|i| i.tier == "tier-0").count();
     let tier1 = report.items.iter().filter(|i| i.tier == "tier-1").count();
     let tier2 = report.items.iter().filter(|i| i.tier == "tier-2").count();
-    let excluded = report
-        .items
-        .iter()
-        .filter(|i| i.tier == "excluded")
-        .count();
+    let excluded = report.items.iter().filter(|i| i.tier == "excluded").count();
 
     eprintln!("=== Tiered Corpus Selection ({}) ===", args.task_id);
     eprintln!("Total scored:   {}", report.items.len());
@@ -223,7 +217,9 @@ fn main() -> Result<()> {
     let mut type_counts: HashMap<String, usize> = HashMap::new();
     for m in &merged {
         if m.registrations.is_empty() {
-            *type_counts.entry("(no registrations)".to_string()).or_insert(0) += 1;
+            *type_counts
+                .entry("(no registrations)".to_string())
+                .or_insert(0) += 1;
         }
         for reg in &m.registrations {
             *type_counts.entry(reg.clone()).or_insert(0) += 1;
@@ -262,11 +258,7 @@ fn build_candidate_input(m: &MergedCandidate) -> CandidateInput {
             github_stars: item.popularity.github_stars,
             github_forks: item.popularity.github_forks,
             npm_downloads_month: item.popularity.npm_downloads_monthly,
-            references: item
-                .popularity
-                .mentions_sources
-                .clone()
-                .unwrap_or_default(),
+            references: item.popularity.mentions_sources.clone().unwrap_or_default(),
             marketplace: Some(MarketplaceSignals {
                 rank: item.popularity.marketplace_rank,
                 installs_month: item.popularity.marketplace_installs_monthly,
@@ -278,7 +270,7 @@ fn build_candidate_input(m: &MergedCandidate) -> CandidateInput {
     // Tags: infer from registrations and source tier.
     let interaction = registrations_to_interactions(&m.registrations);
     let capabilities = registrations_to_capabilities(&m.registrations);
-    let runtime = infer_runtime(m);
+    let runtime = Some(infer_runtime(m));
 
     let tags = Tags {
         runtime,
@@ -316,13 +308,7 @@ fn build_candidate_input(m: &MergedCandidate) -> CandidateInput {
         .or_else(|| pool.map(|item| item.license.clone()));
     let redistribution = spdx
         .as_deref()
-        .map(infer_redistribution)
-        .unwrap_or(Redistribution::Unknown);
-    let license_ok = matches!(
-        m.license_verdict,
-        Some(VerdictStatus::Pass) | Some(VerdictStatus::PassWithWarnings)
-    );
-
+        .map_or(Redistribution::Unknown, infer_redistribution);
     let license = LicenseInfo {
         spdx,
         redistribution: Some(redistribution),
@@ -351,12 +337,7 @@ fn build_candidate_input(m: &MergedCandidate) -> CandidateInput {
         license,
         gates,
         risk,
-        manual_override: if !license_ok && m.license_verdict.is_some() {
-            // If license fails, no manual override — the gate check handles it.
-            None
-        } else {
-            None
-        },
+        manual_override: None,
     }
 }
 
@@ -367,11 +348,11 @@ fn registrations_to_interactions(registrations: &[String]) -> Vec<String> {
         let tag = match reg.as_str() {
             "registerProvider" => "provider",
             "registerTool" => "tool_only",
-            "registerCommand" | "registerSlashCommand" => "slash_command",
+            "registerCommand" | "registerSlashCommand" | "registerFlag" | "registerShortcut" => {
+                "slash_command"
+            }
             "registerEvent" | "registerEventHook" => "event_hook",
             "registerMessageRenderer" => "ui_integration",
-            "registerFlag" => "slash_command",
-            "registerShortcut" => "slash_command",
             _ => continue,
         };
         if !interactions.contains(&tag.to_string()) {
@@ -404,17 +385,17 @@ fn registrations_to_capabilities(registrations: &[String]) -> Vec<String> {
 }
 
 /// Infer runtime tier from source data.
-fn infer_runtime(m: &MergedCandidate) -> Option<String> {
+fn infer_runtime(m: &MergedCandidate) -> String {
     // npm packages with deps → pkg-with-deps.
     if m.npm_package.is_some() {
-        return Some("pkg-with-deps".to_string());
+        return "pkg-with-deps".to_string();
     }
     // Provider extensions are often more complex.
     if m.registrations.iter().any(|r| r == "registerProvider") {
-        return Some("provider-ext".to_string());
+        return "provider-ext".to_string();
     }
     // Default: legacy single-file.
-    Some("legacy-js".to_string())
+    "legacy-js".to_string()
 }
 
 /// Infer `Redistribution` from SPDX string.

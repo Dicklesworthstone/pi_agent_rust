@@ -1,0 +1,1702 @@
+{
+  "schema": "pi.ext.inclusion.v1",
+  "generated_at": "2026-02-07T04:20:06Z",
+  "task": "bd-3vb8",
+  "stats": {
+    "total_included": 69,
+    "tier0_count": 60,
+    "tier1_count": 0,
+    "tier2_count": 9,
+    "excluded_count": 70,
+    "pinned_npm": 60,
+    "pinned_git": 63,
+    "pinned_url": 23,
+    "pinned_checksum_only": 185
+  },
+  "tier0": [
+    {
+      "id": "with-deps",
+      "name": "pi-extension-with-deps",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293",
+      "artifact_path": "tests/ext_conformance/artifacts/with-deps",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "widget-placement",
+      "name": "widget-placement",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/widget-placement.ts",
+        "commit": null
+      },
+      "sha256": "9dc59e893eebd95e7a30aaeae140b9dad721ecbe388ac24afb0f034a13be507f",
+      "artifact_path": "tests/ext_conformance/artifacts/widget-placement",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "truncated-tool",
+      "name": "truncated-tool",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/truncated-tool.ts",
+        "commit": null
+      },
+      "sha256": "3751f5db4845438111c8346f4d0c975de07c65d2ee2445b1a6cca3b570a0f077",
+      "artifact_path": "tests/ext_conformance/artifacts/truncated-tool",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "trigger-compact",
+      "name": "trigger-compact",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/trigger-compact.ts",
+        "commit": null
+      },
+      "sha256": "95c4b7b4a624b0998746a53c79a9de84ee56a8a8c015b2af04fb8890b2b8de8d",
+      "artifact_path": "tests/ext_conformance/artifacts/trigger-compact",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "tools",
+      "name": "tools",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/tools.ts",
+        "commit": null
+      },
+      "sha256": "a2d13c338790648a1fea4ce01642765725708d7e88d51e3adef1517153c7b046",
+      "artifact_path": "tests/ext_conformance/artifacts/tools",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "tool-override",
+      "name": "tool-override",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/tool-override.ts",
+        "commit": null
+      },
+      "sha256": "b4d1e4d1aab08c2410958fa690f5dfab120667d0e04f53b8bc9248fbdb3f1fbb",
+      "artifact_path": "tests/ext_conformance/artifacts/tool-override",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "todo",
+      "name": "todo",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/todo.ts",
+        "commit": null
+      },
+      "sha256": "31a2be2d4f47ea22b054f6bb8732c491e9ee08f9b3decf6307495534c4df6dec",
+      "artifact_path": "tests/ext_conformance/artifacts/todo",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "titlebar-spinner",
+      "name": "titlebar-spinner",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/titlebar-spinner.ts",
+        "commit": null
+      },
+      "sha256": "80c0590aab9851dea93d5ece66c5c0f1a1192abdbd41225216375467350ffb47",
+      "artifact_path": "tests/ext_conformance/artifacts/titlebar-spinner",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "timed-confirm",
+      "name": "timed-confirm",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/timed-confirm.ts",
+        "commit": null
+      },
+      "sha256": "1a263aeed2429cd08647d48432bf4aca42806bf801aca1dae7dc5cb40ed17b50",
+      "artifact_path": "tests/ext_conformance/artifacts/timed-confirm",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "system-prompt-header",
+      "name": "system-prompt-header",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/system-prompt-header.ts",
+        "commit": null
+      },
+      "sha256": "ad1a4f20208d1909359fc3e7a9973511984be6c17c8834131001f603f78744c9",
+      "artifact_path": "tests/ext_conformance/artifacts/system-prompt-header",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "summarize",
+      "name": "summarize",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/summarize.ts",
+        "commit": null
+      },
+      "sha256": "00c714ef20680fa7561a2bf9fbb6ef38984b8806a9e35ca31bea0d15bd2a4c31",
+      "artifact_path": "tests/ext_conformance/artifacts/summarize",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "subagent",
+      "name": "subagent",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/agents.ts",
+        "commit": null
+      },
+      "sha256": "f96041857c53f67acb940c4838fe9a48e032e03b147b3313850f23d4e77185fe",
+      "artifact_path": "tests/ext_conformance/artifacts/subagent",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "status-line",
+      "name": "status-line",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/status-line.ts",
+        "commit": null
+      },
+      "sha256": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428",
+      "artifact_path": "tests/ext_conformance/artifacts/status-line",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "ssh",
+      "name": "ssh",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/ssh.ts",
+        "commit": null
+      },
+      "sha256": "215182f7f2cbec3253676800a1634087dec1893938f50e304f859736ef06bc77",
+      "artifact_path": "tests/ext_conformance/artifacts/ssh",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "space-invaders",
+      "name": "space-invaders",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/space-invaders.ts",
+        "commit": null
+      },
+      "sha256": "4503a565b6a6e76e0641322dc81e4ec28c974ca79d1b35a6cbad6a3fd317d7e5",
+      "artifact_path": "tests/ext_conformance/artifacts/space-invaders",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "snake",
+      "name": "snake",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/snake.ts",
+        "commit": null
+      },
+      "sha256": "bbc517362fc270018de83528867dcba5657f2abf246994e5ce3798457ef08f97",
+      "artifact_path": "tests/ext_conformance/artifacts/snake",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "shutdown-command",
+      "name": "shutdown-command",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/shutdown-command.ts",
+        "commit": null
+      },
+      "sha256": "cc0e2521d0649a1f452daea39bdfdf01335fdefcf35d6fc33556b1a3c30a3a78",
+      "artifact_path": "tests/ext_conformance/artifacts/shutdown-command",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "session-name",
+      "name": "session-name",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/session-name.ts",
+        "commit": null
+      },
+      "sha256": "5df0ce9bc28cabed038684803f48d77f786849aa03720f25ef1ca73d77a754ef",
+      "artifact_path": "tests/ext_conformance/artifacts/session-name",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "send-user-message",
+      "name": "send-user-message",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/send-user-message.ts",
+        "commit": null
+      },
+      "sha256": "82fa2ff47441f8c1d21118ffd3c31c5fd6be4a70959c8c8bae5af2d378907f95",
+      "artifact_path": "tests/ext_conformance/artifacts/send-user-message",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "sandbox",
+      "name": "pi-extension-sandbox",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+      "artifact_path": "tests/ext_conformance/artifacts/sandbox",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "rpc-demo",
+      "name": "rpc-demo",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/rpc-demo.ts",
+        "commit": null
+      },
+      "sha256": "ce2c285f6b4900da766fa143dab7ad58d3779cd39b537437807e7458d21a6f83",
+      "artifact_path": "tests/ext_conformance/artifacts/rpc-demo",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "rainbow-editor",
+      "name": "rainbow-editor",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/rainbow-editor.ts",
+        "commit": null
+      },
+      "sha256": "db6b53ced476a4746c77c38c8ae1cf9a74f835899b0a0dcd8795e02fdbac4e15",
+      "artifact_path": "tests/ext_conformance/artifacts/rainbow-editor",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "questionnaire",
+      "name": "questionnaire",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/questionnaire.ts",
+        "commit": null
+      },
+      "sha256": "99cbd301a86000e8a50e861396f7523b2a3c6a4dd10463b2c9e5c8e773f6f1ed",
+      "artifact_path": "tests/ext_conformance/artifacts/questionnaire",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "question",
+      "name": "question",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/question.ts",
+        "commit": null
+      },
+      "sha256": "bc55457385e5c4d4ccc6a1583a69e68cf2ba196b8052ab0abdc1848cd1d65bec",
+      "artifact_path": "tests/ext_conformance/artifacts/question",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "qna",
+      "name": "qna",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/qna.ts",
+        "commit": null
+      },
+      "sha256": "ae359438f308bc86ecc4dbab766a9665853ccf78824c4b1c2192933e27843d66",
+      "artifact_path": "tests/ext_conformance/artifacts/qna",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "protected-paths",
+      "name": "protected-paths",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/protected-paths.ts",
+        "commit": null
+      },
+      "sha256": "4a1d3f6628da9b93f28124085d58a864ceb57852d2df016603b897c3df7ba92b",
+      "artifact_path": "tests/ext_conformance/artifacts/protected-paths",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "preset",
+      "name": "preset",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/preset.ts",
+        "commit": null
+      },
+      "sha256": "5b6675a52c54e0567ad4fb203f7b70adad4994e2e4e2d436b44f3f0f483d7c30",
+      "artifact_path": "tests/ext_conformance/artifacts/preset",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "plan-mode",
+      "name": "plan-mode",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9",
+      "artifact_path": "tests/ext_conformance/artifacts/plan-mode",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "pirate",
+      "name": "pirate",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/pirate.ts",
+        "commit": null
+      },
+      "sha256": "60b73aa9150a1e1e441310691ceeb1fc02c08e119975a9a151fcaa7e334de055",
+      "artifact_path": "tests/ext_conformance/artifacts/pirate",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "permission-gate",
+      "name": "permission-gate",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/permission-gate.ts",
+        "commit": null
+      },
+      "sha256": "d3d73f1d4b2dcea877564979ab797e46a79192e1613121f647da839afbe0bea1",
+      "artifact_path": "tests/ext_conformance/artifacts/permission-gate",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "overlay-test",
+      "name": "overlay-test",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/overlay-test.ts",
+        "commit": null
+      },
+      "sha256": "a7ccdad170e3f68673e415144b2b995f63d116a3b966d351508c8b6e7cedbbc0",
+      "artifact_path": "tests/ext_conformance/artifacts/overlay-test",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "overlay-qa-tests",
+      "name": "overlay-qa-tests",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/overlay-qa-tests.ts",
+        "commit": null
+      },
+      "sha256": "bf9f1a3be8ce1d0d8d4d96d9ef411defab10d06756e7a12ce58febddc9ba3c4b",
+      "artifact_path": "tests/ext_conformance/artifacts/overlay-qa-tests",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "notify",
+      "name": "notify",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/notify.ts",
+        "commit": null
+      },
+      "sha256": "8979cdf28c59201375cdec7c7c704bad425918fda771ec46736e1b627f586960",
+      "artifact_path": "tests/ext_conformance/artifacts/notify",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "model-status",
+      "name": "model-status",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/model-status.ts",
+        "commit": null
+      },
+      "sha256": "b43a7e8bc67c988f230fc730e12f92401870b04ebb1dba7a26667baa63daec0b",
+      "artifact_path": "tests/ext_conformance/artifacts/model-status",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "modal-editor",
+      "name": "modal-editor",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/modal-editor.ts",
+        "commit": null
+      },
+      "sha256": "f875e8d3af9eb78ea88a2e274f798e7c8eae10b543e2728dde8e8fd2c7912da9",
+      "artifact_path": "tests/ext_conformance/artifacts/modal-editor",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "message-renderer",
+      "name": "message-renderer",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/message-renderer.ts",
+        "commit": null
+      },
+      "sha256": "6eda7eaade9a07ff140bbdc88e5c8b8ad414fbbb738fea13dac620c194c4ba50",
+      "artifact_path": "tests/ext_conformance/artifacts/message-renderer",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "mac-system-theme",
+      "name": "mac-system-theme",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/mac-system-theme.ts",
+        "commit": null
+      },
+      "sha256": "a9ac7ae1d161963f4c21cf8116a6ffd561f76aa7c858d9a73288745f2db99eb7",
+      "artifact_path": "tests/ext_conformance/artifacts/mac-system-theme",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "interactive-shell",
+      "name": "interactive-shell",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/interactive-shell.ts",
+        "commit": null
+      },
+      "sha256": "bb511be03dc47da3e31ae2011d3a932d3d0cdc74f8b7c535657d5cd7f699cd33",
+      "artifact_path": "tests/ext_conformance/artifacts/interactive-shell",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "input-transform",
+      "name": "input-transform",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/input-transform.ts",
+        "commit": null
+      },
+      "sha256": "21c653ea09ff9467de4095770ba27709f41fd3540cc8087bfd7af618ce2b8050",
+      "artifact_path": "tests/ext_conformance/artifacts/input-transform",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "inline-bash",
+      "name": "inline-bash",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/inline-bash.ts",
+        "commit": null
+      },
+      "sha256": "41caf5a75b33eface492ba382a98db3745768563da10e35c55d4ef733e5a9287",
+      "artifact_path": "tests/ext_conformance/artifacts/inline-bash",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "hello",
+      "name": "hello",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/hello.ts",
+        "commit": null
+      },
+      "sha256": "6d4d5a97ada168817b9cb3808e51013969c2ce7c2c4d1536b4d630ad3f8b78f1",
+      "artifact_path": "tests/ext_conformance/artifacts/hello",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "handoff",
+      "name": "handoff",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/handoff.ts",
+        "commit": null
+      },
+      "sha256": "c84672af255b3889d99c99fb76382520bc686a18fb26c1c04d341de0865e7fe9",
+      "artifact_path": "tests/ext_conformance/artifacts/handoff",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "git-checkpoint",
+      "name": "git-checkpoint",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/git-checkpoint.ts",
+        "commit": null
+      },
+      "sha256": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6",
+      "artifact_path": "tests/ext_conformance/artifacts/git-checkpoint",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "file-trigger",
+      "name": "file-trigger",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/file-trigger.ts",
+        "commit": null
+      },
+      "sha256": "d9623f289add349102a78ebf6a04df61a1b19cdcca9e6a8f4728138cc32a34fe",
+      "artifact_path": "tests/ext_conformance/artifacts/file-trigger",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "event-bus",
+      "name": "event-bus",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/event-bus.ts",
+        "commit": null
+      },
+      "sha256": "869e3d574d574e68d713f9eb947b26643e800981919f1cf1f1e8097eeafa255a",
+      "artifact_path": "tests/ext_conformance/artifacts/event-bus",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "dynamic-resources",
+      "name": "dynamic-resources",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "7d9bc974bd48ecf0cd39e326b0d53815d1c17228ec14e14da63710ba79540788",
+      "artifact_path": "tests/ext_conformance/artifacts/dynamic-resources",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "doom-overlay",
+      "name": "doom-overlay",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/doom-component.ts",
+        "commit": null
+      },
+      "sha256": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10",
+      "artifact_path": "tests/ext_conformance/artifacts/doom-overlay",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "dirty-repo-guard",
+      "name": "dirty-repo-guard",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/dirty-repo-guard.ts",
+        "commit": null
+      },
+      "sha256": "86b312a1ccde2a74973e340b5fa8377a7926c0232afe4ea0eb239ce93b8b6cfd",
+      "artifact_path": "tests/ext_conformance/artifacts/dirty-repo-guard",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "name": "pi-extension-custom-provider-qwen-cli",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "29278eca3a44361d59e04256e57db294a0cd2fe6c612307b7b5c3139e1dc7286",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-provider-qwen-cli",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "custom-provider-gitlab-duo",
+      "name": "pi-extension-custom-provider-gitlab-duo",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "f4b4c1f5063b56a24ffb9f3746fc2107769ba3b4a0b1a65f7ee3e18e15684d77",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-provider-gitlab-duo",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "name": "pi-extension-custom-provider-anthropic",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-provider-anthropic",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "custom-header",
+      "name": "custom-header",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-header.ts",
+        "commit": null
+      },
+      "sha256": "996f53a6a6dd531c9e3ca2585f5f57fd559ec8b0b6a8c802702205bd26fe2472",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-header",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "custom-footer",
+      "name": "custom-footer",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-footer.ts",
+        "commit": null
+      },
+      "sha256": "3ea51342bd093054762695a878e5c309e1491309e25f1290c09c19231c161965",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-footer",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "custom-compaction",
+      "name": "custom-compaction",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/custom-compaction.ts",
+        "commit": null
+      },
+      "sha256": "f530739cb3e6e36ea2df1e93e1da1fdaad71acc41acf042ac0877dcbfab5ded5",
+      "artifact_path": "tests/ext_conformance/artifacts/custom-compaction",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "confirm-destructive",
+      "name": "confirm-destructive",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/confirm-destructive.ts",
+        "commit": null
+      },
+      "sha256": "1ea07be2d3287b2ca19faa21bef82e578c7872255838d4257d1b86d4876135d2",
+      "artifact_path": "tests/ext_conformance/artifacts/confirm-destructive",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "claude-rules",
+      "name": "claude-rules",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/claude-rules.ts",
+        "commit": null
+      },
+      "sha256": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97",
+      "artifact_path": "tests/ext_conformance/artifacts/claude-rules",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "bookmark",
+      "name": "bookmark",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/bookmark.ts",
+        "commit": null
+      },
+      "sha256": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952",
+      "artifact_path": "tests/ext_conformance/artifacts/bookmark",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "bash-spawn-hook",
+      "name": "bash-spawn-hook",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/bash-spawn-hook.ts",
+        "commit": null
+      },
+      "sha256": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3",
+      "artifact_path": "tests/ext_conformance/artifacts/bash-spawn-hook",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "name": "auto-commit-on-exit",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/auto-commit-on-exit.ts",
+        "commit": null
+      },
+      "sha256": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c",
+      "artifact_path": "tests/ext_conformance/artifacts/auto-commit-on-exit",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    },
+    {
+      "id": "antigravity-image-gen",
+      "name": "antigravity-image-gen",
+      "tier": "tier-0",
+      "score": 60,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/antigravity-image-gen.ts",
+        "commit": null
+      },
+      "sha256": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+      "artifact_path": "tests/ext_conformance/artifacts/antigravity-image-gen",
+      "license": "MIT",
+      "source_tier": "official-pi-mono",
+      "rationale": "Official pi-mono baseline; must-pass conformance target. General extension (export default). Source: official."
+    }
+  ],
+  "tier1": [],
+  "tier2": [
+    {
+      "id": "igor-makarov/pi-extension-sandbox",
+      "name": "pi-extension-sandbox",
+      "tier": "tier-2",
+      "score": 54,
+      "category": "multi",
+      "registrations": [
+        "registerTool",
+        "registerCommand",
+        "registerFlag"
+      ],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/examples/extensions/index.ts",
+        "commit": null
+      },
+      "sha256": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+      "artifact_path": "tests/ext_conformance/artifacts/sandbox",
+      "license": "MIT",
+      "source_tier": "third-party-github",
+      "rationale": "Moderate score (54/100); stretch conformance target. Multi-type: covers multiple registration paths. Source: third-party-github."
+    },
+    {
+      "id": "googlechrome/workbox",
+      "name": "@vaayne/pi-web-tools",
+      "tier": "tier-2",
+      "score": 54,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "npm",
+        "package": "vaayne-pi-web-tools",
+        "version": "0.1.0",
+        "registry_url": "https://www.npmjs.com/package/vaayne-pi-web-tools"
+      },
+      "sha256": "462a1bedf75121c15ead23426a8b86de2b73c2ea95a3da6c38456d9293b7fe50",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/vaayne-pi-web-tools",
+      "license": "MIT",
+      "source_tier": "npm-registry",
+      "rationale": "Moderate score (54/100); stretch conformance target. General extension (export default). Source: npm."
+    },
+    {
+      "id": "badlogic/pi-mono",
+      "name": "ferologics-notify",
+      "tier": "tier-2",
+      "score": 54,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "git",
+        "repo": "https://github.com/badlogic/pi-mono",
+        "path": "packages/coding-agent/community/ferologics/index.ts",
+        "commit": null
+      },
+      "sha256": "65f6df19c08c3eb5b144d9cba749c6651e3a20019d84353beb23094acfce4ae8",
+      "artifact_path": "tests/ext_conformance/artifacts/community/ferologics-notify",
+      "license": "MIT",
+      "source_tier": "community",
+      "rationale": "Moderate score (54/100); stretch conformance target. General extension (export default). Source: community."
+    },
+    {
+      "id": "nicobailon/pi-interactive-shell",
+      "name": "pi-interactive-shell",
+      "tier": "tier-2",
+      "score": 52,
+      "category": "multi",
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "version_pin": {
+        "type": "npm",
+        "package": "pi-interactive-shell",
+        "version": "0.7.1",
+        "registry_url": "https://www.npmjs.com/package/pi-interactive-shell"
+      },
+      "sha256": "7351b6bfd5ddde3d538a863dc8a1ea585a180fa1a33ad73dfd3024a865d5167b",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-interactive-shell",
+      "license": "MIT",
+      "source_tier": "npm-registry",
+      "rationale": "Moderate score (52/100); stretch conformance target. Multi-type: covers multiple registration paths. Source: npm."
+    },
+    {
+      "id": "langchain-ai/langgraphjs",
+      "name": "checkpoint-pi",
+      "tier": "tier-2",
+      "score": 52,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "npm",
+        "package": "checkpoint-pi",
+        "version": "1.0.1",
+        "registry_url": "https://www.npmjs.com/package/checkpoint-pi"
+      },
+      "sha256": "defbcc7d4a4e3d60f48cf19de2ae8e67e91b7126093bbc6ff2c78d954f773236",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/checkpoint-pi",
+      "license": "MIT",
+      "source_tier": "npm-registry",
+      "rationale": "Moderate score (52/100); stretch conformance target. General extension (export default). Source: npm."
+    },
+    {
+      "id": "subsy/ralph-tui",
+      "name": "ralph-loop-pi",
+      "tier": "tier-2",
+      "score": 51,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "npm",
+        "package": "ralph-loop-pi",
+        "version": "1.0.1",
+        "registry_url": "https://www.npmjs.com/package/ralph-loop-pi"
+      },
+      "sha256": "e61f0d3c32b2f4f8cb6e93a313e423c58380e61505d01107a4d9592138506e36",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/ralph-loop-pi",
+      "license": "MIT",
+      "source_tier": "npm-registry",
+      "rationale": "Moderate score (51/100); stretch conformance target. General extension (export default). Source: npm."
+    },
+    {
+      "id": "microsoft/vscode-languageserver-node",
+      "name": "lsp-pi",
+      "tier": "tier-2",
+      "score": 51,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "npm",
+        "package": "lsp-pi",
+        "version": "1.0.1",
+        "registry_url": "https://www.npmjs.com/package/lsp-pi"
+      },
+      "sha256": "d0919dccd283992ed4c4f9589609785f2c737a29978b52bf9a050868c799a30c",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/lsp-pi",
+      "license": "MIT",
+      "source_tier": "npm-registry",
+      "rationale": "Moderate score (51/100); stretch conformance target. General extension (export default). Source: npm."
+    },
+    {
+      "id": "nicobailon/pi-messenger",
+      "name": "pi-messenger",
+      "tier": "tier-2",
+      "score": 50,
+      "category": "multi",
+      "registrations": [
+        "registerTool",
+        "registerCommand"
+      ],
+      "version_pin": {
+        "type": "npm",
+        "package": "pi-messenger",
+        "version": "0.8.2",
+        "registry_url": "https://www.npmjs.com/package/pi-messenger"
+      },
+      "sha256": "648ac76846fab38495eff900e8459f4446bb921bb063308ab76e8075f74040c8",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-messenger",
+      "license": "MIT",
+      "source_tier": "npm-registry",
+      "rationale": "Moderate score (50/100); stretch conformance target. Multi-type: covers multiple registration paths. Source: npm."
+    },
+    {
+      "id": "open-telemetry/opentelemetry-js-contrib",
+      "name": "pi-telemetry-otel",
+      "tier": "tier-2",
+      "score": 50,
+      "category": "general",
+      "registrations": [],
+      "version_pin": {
+        "type": "npm",
+        "package": "pi-telemetry-otel",
+        "version": "0.1.1",
+        "registry_url": "https://www.npmjs.com/package/pi-telemetry-otel"
+      },
+      "sha256": "eaf69b8eb80e8729f654f444497eeb42a1f0aa394dceb2d52a123204e339060b",
+      "artifact_path": "tests/ext_conformance/artifacts/npm/pi-telemetry-otel",
+      "license": "MIT",
+      "source_tier": "npm-registry",
+      "rationale": "Moderate score (50/100); stretch conformance target. General extension (export default). Source: npm."
+    }
+  ],
+  "exclusions": [
+    {
+      "id": "third-party/openclaw-openclaw",
+      "score": 50,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "nicobailon/pi-web-access",
+      "score": 48,
+      "reason": "Score 48/100 below threshold (50)"
+    },
+    {
+      "id": "nicobailon/pi-review-loop",
+      "score": 48,
+      "reason": "Score 48/100 below threshold (50)"
+    },
+    {
+      "id": "nicobailon/pi-mcp-adapter",
+      "score": 48,
+      "reason": "Score 48/100 below threshold (50)"
+    },
+    {
+      "id": "nicobailon/pi-annotate",
+      "score": 48,
+      "reason": "Score 48/100 below threshold (50)"
+    },
+    {
+      "id": "assagman/agentsbox",
+      "score": 48,
+      "reason": "Score 48/100 below threshold (50)"
+    },
+    {
+      "id": "nicobailon/pi-powerline-footer",
+      "score": 47,
+      "reason": "Score 47/100 below threshold (50)"
+    },
+    {
+      "id": "nicobailon/pi-skill-palette",
+      "score": 46,
+      "reason": "Score 46/100 below threshold (50)"
+    },
+    {
+      "id": "hjanuschka/shitty-extensions",
+      "score": 46,
+      "reason": "Score 46/100 below threshold (50)"
+    },
+    {
+      "id": "graffioh/pi-screenshots-picker",
+      "score": 46,
+      "reason": "Score 46/100 below threshold (50)"
+    },
+    {
+      "id": "pasky/pi-amplike",
+      "score": 44,
+      "reason": "Score 44/100 below threshold (50)"
+    },
+    {
+      "id": "tmustier/pi-extensions",
+      "score": 44,
+      "reason": "Score 44/100 below threshold (50)"
+    },
+    {
+      "id": "npm/pi-extensions",
+      "score": 44,
+      "reason": "Score 44/100 below threshold (50)"
+    },
+    {
+      "id": "graffioh/pi-super-curl",
+      "score": 44,
+      "reason": "Score 44/100 below threshold (50)"
+    },
+    {
+      "id": "ferologics/pi-notify",
+      "score": 44,
+      "reason": "Score 44/100 below threshold (50)"
+    },
+    {
+      "id": "badlogic/pi-package-test",
+      "score": 44,
+      "reason": "Score 44/100 below threshold (50)"
+    },
+    {
+      "id": "jhurliman/node-rate-limiter",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "walterra/agent-tools",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "vaayne/agent-kit",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "sboudrias/inquirer.js",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "qualisero/pi-agent-scip",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "npm/pi-search-agent",
+      "score": 42,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "npm/pi-model-switch",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "nicobailon/pi-prompt-template-model",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "mermaid-js/mermaid",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "kaofelix/pi-watch",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "imsus/pi-extension-minimax-coding-plan-mcp",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "emzod/pi-subagent-with-logging",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "default-anton/pi-subdir-context",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "default-anton/pi-moonshot",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "coder/ghostty-web",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "alphagov/notifications-node-client",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "aliou/pi-synthetic",
+      "score": 42,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "aliou/pi-linkup",
+      "score": 42,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "aliou/pi-extensions",
+      "score": 42,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "christroutner/pi-extensions",
+      "score": 42,
+      "reason": "Score 42/100 below threshold (50)"
+    },
+    {
+      "id": "sids/pi-extensions",
+      "score": 41,
+      "reason": "Score 41/100 below threshold (50)"
+    },
+    {
+      "id": "richardgill/pi-extensions",
+      "score": 41,
+      "reason": "Score 41/100 below threshold (50)"
+    },
+    {
+      "id": "forwardinfinity/pi-extensions",
+      "score": 41,
+      "reason": "Score 41/100 below threshold (50)"
+    },
+    {
+      "id": "assagman/pi-extensions",
+      "score": 41,
+      "reason": "Score 41/100 below threshold (50)"
+    },
+    {
+      "id": "nicobailon/pi-model-switch",
+      "score": 40,
+      "reason": "Score 40/100 below threshold (50)"
+    },
+    {
+      "id": "third-party/pasky-pi-amplike",
+      "score": 40,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "nrupatunga/pi-extensions",
+      "score": 40,
+      "reason": "Score 40/100 below threshold (50)"
+    },
+    {
+      "id": "kcosr/pi-extensions",
+      "score": 40,
+      "reason": "Score 40/100 below threshold (50)"
+    },
+    {
+      "id": "mcollina/pi-bash-confirm",
+      "score": 39,
+      "reason": "Score 39/100 below threshold (50)"
+    },
+    {
+      "id": "istar-eldritch/pi-wakatime",
+      "score": 39,
+      "reason": "Score 39/100 below threshold (50)"
+    },
+    {
+      "id": "whamp/pi-agentic-compaction",
+      "score": 38,
+      "reason": "Score 38/100 below threshold (50)"
+    },
+    {
+      "id": "third-party/zenobi-us-pi-dcp",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/raunovillberg-pi-stuffed",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/qualisero-pi-agent-scip",
+      "score": 38,
+      "reason": "Score 38/100 below threshold (50)"
+    },
+    {
+      "id": "third-party/ogulcancelik-pi-sketch",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/michalvavra-agents",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/marckrenn-pi-sub",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/lsj5031-pi-notification-extension",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/limouren-agent-things",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/graffioh-pi-super-curl",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/graffioh-pi-screenshots-picker",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/cv-pi-ssh-remote",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/charles-cooper-pi-extensions",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/ben-vargas-pi-packages",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "ogulcancelik/pi-ghostty-theme-sync",
+      "score": 38,
+      "reason": "Score 38/100 below threshold (50)"
+    },
+    {
+      "id": "mikeastock/agents",
+      "score": 38,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "jyaunches/pi-canvas",
+      "score": 38,
+      "reason": "Score 38/100 below threshold (50)"
+    },
+    {
+      "id": "third-party/vtemian-pi-config",
+      "score": 35,
+      "reason": "Gate failure: license unknown"
+    },
+    {
+      "id": "datadog/sketches-js",
+      "score": 33,
+      "reason": "Score 33/100 below threshold (50)"
+    },
+    {
+      "id": "weolopez/aardvark",
+      "score": 31,
+      "reason": "Gate failure: no provenance, license unknown, not deterministic"
+    },
+    {
+      "id": "masonjames/dockhand-sre-agent",
+      "score": 31,
+      "reason": "Gate failure: no provenance, license unknown, not deterministic"
+    },
+    {
+      "id": "cookiegraves/rarerteatsh",
+      "score": 30,
+      "reason": "Score 30/100 below threshold (50)"
+    }
+  ],
+  "category_coverage": {
+    "Multi": 45,
+    "Provider": 14,
+    "Tool": 40,
+    "General": 173,
+    "Command": 57,
+    "Configuration": 2
+  }
+}

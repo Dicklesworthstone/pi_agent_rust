@@ -25,7 +25,7 @@ use pi::extension_validation::ValidationReport;
 #[command(name = "ext_license_screen")]
 #[command(about = "License + policy screening for Pi extension candidates")]
 struct Args {
-    /// Path to validated-dedup JSON (output of ext_validate_dedup).
+    /// Path to validated-dedup JSON (output of `ext_validate_dedup`).
     #[arg(long)]
     validated: PathBuf,
 

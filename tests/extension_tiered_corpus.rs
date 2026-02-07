@@ -74,7 +74,11 @@ fn tier1_for_high_score_passing_gates() {
     };
     input.tags = Tags {
         runtime: Some("pkg-with-deps".into()),
-        interaction: vec!["provider".into(), "ui_integration".into(), "event_hook".into()],
+        interaction: vec![
+            "provider".into(),
+            "ui_integration".into(),
+            "event_hook".into(),
+        ],
         capabilities: vec!["exec".into(), "http".into(), "ui".into()],
     };
     input.recency.updated_at = Some("2026-01-15T00:00:00Z".into());
@@ -104,7 +108,11 @@ fn tier2_for_moderate_score_passing_gates() {
     input.signals.npm_downloads_month = Some(2000);
     input.tags = Tags {
         runtime: Some("pkg-with-deps".into()),
-        interaction: vec!["provider".into(), "slash_command".into(), "event_hook".into()],
+        interaction: vec![
+            "provider".into(),
+            "slash_command".into(),
+            "event_hook".into(),
+        ],
         capabilities: vec!["http".into(), "session".into(), "exec".into()],
     };
     input.recency.updated_at = Some("2026-01-01T00:00:00Z".into());
@@ -112,7 +120,7 @@ fn tier2_for_moderate_score_passing_gates() {
     let report = score_candidates(&[input], Utc::now(), Utc::now(), 10);
     let score = report.items[0].score.final_total;
     assert!(
-        score >= 50 && score < 70,
+        (50..70).contains(&score),
         "Expected tier-2 score range (50-69), got {score}"
     );
     assert_eq!(report.items[0].tier, "tier-2");
@@ -247,11 +255,7 @@ fn golden_tiered_corpus() {
     let tier0 = report.items.iter().filter(|i| i.tier == "tier-0").count();
     let tier1 = report.items.iter().filter(|i| i.tier == "tier-1").count();
     let tier2 = report.items.iter().filter(|i| i.tier == "tier-2").count();
-    let excluded = report
-        .items
-        .iter()
-        .filter(|i| i.tier == "excluded")
-        .count();
+    let excluded = report.items.iter().filter(|i| i.tier == "excluded").count();
 
     assert!(tier0 >= 50, "Expected >=50 tier-0, got {tier0}");
     assert_eq!(
@@ -310,12 +314,7 @@ fn registrations_affect_coverage_score() {
             "event_hook".into(),
             "slash_command".into(),
         ],
-        capabilities: vec![
-            "exec".into(),
-            "http".into(),
-            "ui".into(),
-            "session".into(),
-        ],
+        capabilities: vec!["exec".into(), "http".into(), "ui".into(), "session".into()],
     };
     rich.recency.updated_at = Some("2026-01-01T00:00:00Z".into());
 

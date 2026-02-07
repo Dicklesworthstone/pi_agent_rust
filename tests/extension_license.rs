@@ -1,4 +1,4 @@
-//! Integration tests for the extension_license module.
+//! Integration tests for the `extension_license` module.
 
 use pi::extension_license::{
     License, PolicyVerdict, Redistributable, ScreeningInput, ScreeningReport, SecuritySeverity,
@@ -33,13 +33,13 @@ IMPLIED."#;
 
 #[test]
 fn detect_apache2_full_header() {
-    let content = r#"
+    let content = r"
                                  Apache License
                            Version 2.0, January 2004
                         http://www.apache.org/licenses/
 
    TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION
-"#;
+";
     assert_eq!(detect_license_from_content(content), License::Apache2);
 }
 

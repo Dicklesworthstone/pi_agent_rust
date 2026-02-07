@@ -1,0 +1,3549 @@
+{
+  "schema": "pi.ext.provenance_verification.v1",
+  "generated_at": "2026-02-07T04:11:05.205553094+00:00",
+  "summary": {
+    "total_artifacts": 208,
+    "verified_ok": 208,
+    "failed": 0,
+    "exceptions": 0,
+    "pass_rate": 1.0
+  },
+  "artifacts": [
+    {
+      "id": "agents-mikeastock/extensions",
+      "directory": "agents-mikeastock/extensions",
+      "source_tier": "AgentsMikeastock",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "95d149ee9ac44275829f5390d30821ae1cbfc81221b89a49eb3566d6b36328ce",
+        "master_catalog_checksum": "95d149ee9ac44275829f5390d30821ae1cbfc81221b89a49eb3566d6b36328ce",
+        "provenance_checksum": "95d149ee9ac44275829f5390d30821ae1cbfc81221b89a49eb3566d6b36328ce",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "antigravity-image-gen",
+      "directory": "antigravity-image-gen",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+        "master_catalog_checksum": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+        "provenance_checksum": "3c383d17632154edd17b3d5322d64d6feefb596bdf09e71026c77ec1fa493924",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "directory": "auto-commit-on-exit",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c",
+        "master_catalog_checksum": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c",
+        "provenance_checksum": "6b915e8a0da9984f85755392adde2db028668c922252733662bd7fa2ed72d47c",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "bash-spawn-hook",
+      "directory": "bash-spawn-hook",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3",
+        "master_catalog_checksum": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3",
+        "provenance_checksum": "dc125f3c69b0da8e452dfa85b45b170be5114b4021e34c8de8e7a5c31f365ed3",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "bookmark",
+      "directory": "bookmark",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952",
+        "master_catalog_checksum": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952",
+        "provenance_checksum": "e1f9c32e3e49f39ff3c3b788e3e5e507fde21e3e785b8227bfc019c86d008952",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "claude-rules",
+      "directory": "claude-rules",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97",
+        "master_catalog_checksum": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97",
+        "provenance_checksum": "59b1c0aad64a423e7cd3d6e084b45b3c84cf8080b9485524a877886fd9870c97",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/ferologics-notify",
+      "directory": "community/ferologics-notify",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "65f6df19c08c3eb5b144d9cba749c6651e3a20019d84353beb23094acfce4ae8",
+        "master_catalog_checksum": "65f6df19c08c3eb5b144d9cba749c6651e3a20019d84353beb23094acfce4ae8",
+        "provenance_checksum": "65f6df19c08c3eb5b144d9cba749c6651e3a20019d84353beb23094acfce4ae8",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-clipboard",
+      "directory": "community/hjanuschka-clipboard",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "0e7cf92783f5eca3c711f74ff1bdbf2634c1b7d4ea0ceaea7370cdaa7cf14b40",
+        "master_catalog_checksum": "0e7cf92783f5eca3c711f74ff1bdbf2634c1b7d4ea0ceaea7370cdaa7cf14b40",
+        "provenance_checksum": "0e7cf92783f5eca3c711f74ff1bdbf2634c1b7d4ea0ceaea7370cdaa7cf14b40",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-cost-tracker",
+      "directory": "community/hjanuschka-cost-tracker",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "0b61091eb8d2a499e416dcd06af57cf77c455e920a4731ed0440fbf31db69844",
+        "master_catalog_checksum": "0b61091eb8d2a499e416dcd06af57cf77c455e920a4731ed0440fbf31db69844",
+        "provenance_checksum": "0b61091eb8d2a499e416dcd06af57cf77c455e920a4731ed0440fbf31db69844",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-flicker-corp",
+      "directory": "community/hjanuschka-flicker-corp",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "256cd4ccd0ee07d81033391b1be01fcf6a34bbfbd0f53a27e34ea4ffca1932c9",
+        "master_catalog_checksum": "256cd4ccd0ee07d81033391b1be01fcf6a34bbfbd0f53a27e34ea4ffca1932c9",
+        "provenance_checksum": "256cd4ccd0ee07d81033391b1be01fcf6a34bbfbd0f53a27e34ea4ffca1932c9",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-funny-working-message",
+      "directory": "community/hjanuschka-funny-working-message",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "2970513c5001c51b85dfbb8474603af0e32a749363a0f70d65e9afacb517987f",
+        "master_catalog_checksum": "2970513c5001c51b85dfbb8474603af0e32a749363a0f70d65e9afacb517987f",
+        "provenance_checksum": "2970513c5001c51b85dfbb8474603af0e32a749363a0f70d65e9afacb517987f",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-handoff",
+      "directory": "community/hjanuschka-handoff",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "33b6c44b1dc54f96f1010db7883ce5fa0a479e2daab4cb656cceb1eb4cefa49d",
+        "master_catalog_checksum": "33b6c44b1dc54f96f1010db7883ce5fa0a479e2daab4cb656cceb1eb4cefa49d",
+        "provenance_checksum": "33b6c44b1dc54f96f1010db7883ce5fa0a479e2daab4cb656cceb1eb4cefa49d",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-loop",
+      "directory": "community/hjanuschka-loop",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+        "master_catalog_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+        "provenance_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-memory-mode",
+      "directory": "community/hjanuschka-memory-mode",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "7629747c2b9ba487e87557a1590ecbf723ce7b6875e7bdd42d35b3e7c412c627",
+        "master_catalog_checksum": "7629747c2b9ba487e87557a1590ecbf723ce7b6875e7bdd42d35b3e7c412c627",
+        "provenance_checksum": "7629747c2b9ba487e87557a1590ecbf723ce7b6875e7bdd42d35b3e7c412c627",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-oracle",
+      "directory": "community/hjanuschka-oracle",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "de236872074c912361fef6c818c75b361e46ff06662fb368a66cb4c1b9efb462",
+        "master_catalog_checksum": "de236872074c912361fef6c818c75b361e46ff06662fb368a66cb4c1b9efb462",
+        "provenance_checksum": "de236872074c912361fef6c818c75b361e46ff06662fb368a66cb4c1b9efb462",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-plan-mode",
+      "directory": "community/hjanuschka-plan-mode",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c4752e61346eb26d3cb040e276c4cc74e33e44e6b947f5195d6cf3a89bd3ffe5",
+        "master_catalog_checksum": "c4752e61346eb26d3cb040e276c4cc74e33e44e6b947f5195d6cf3a89bd3ffe5",
+        "provenance_checksum": "c4752e61346eb26d3cb040e276c4cc74e33e44e6b947f5195d6cf3a89bd3ffe5",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-resistance",
+      "directory": "community/hjanuschka-resistance",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "0c1c12390befdb887dfb01a90a48c67a6370f59910952f71ddda6a2c4bb645bf",
+        "master_catalog_checksum": "0c1c12390befdb887dfb01a90a48c67a6370f59910952f71ddda6a2c4bb645bf",
+        "provenance_checksum": "0c1c12390befdb887dfb01a90a48c67a6370f59910952f71ddda6a2c4bb645bf",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-speedreading",
+      "directory": "community/hjanuschka-speedreading",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "82069bb9932d9f1615d1c2e05b55730bcfe70f2598d69db1fd894045cc0928d8",
+        "master_catalog_checksum": "82069bb9932d9f1615d1c2e05b55730bcfe70f2598d69db1fd894045cc0928d8",
+        "provenance_checksum": "82069bb9932d9f1615d1c2e05b55730bcfe70f2598d69db1fd894045cc0928d8",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-status-widget",
+      "directory": "community/hjanuschka-status-widget",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "7b84c6ed07403380fcd7121b58886fc6998730a93e419a6597cd3834d4a1826f",
+        "master_catalog_checksum": "7b84c6ed07403380fcd7121b58886fc6998730a93e419a6597cd3834d4a1826f",
+        "provenance_checksum": "7b84c6ed07403380fcd7121b58886fc6998730a93e419a6597cd3834d4a1826f",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-ultrathink",
+      "directory": "community/hjanuschka-ultrathink",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "1d053f8505eb2742f8e4f5cf7c3770183c7712f5a4a674fa0031f7a042cbbe0f",
+        "master_catalog_checksum": "1d053f8505eb2742f8e4f5cf7c3770183c7712f5a4a674fa0031f7a042cbbe0f",
+        "provenance_checksum": "1d053f8505eb2742f8e4f5cf7c3770183c7712f5a4a674fa0031f7a042cbbe0f",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/hjanuschka-usage-bar",
+      "directory": "community/hjanuschka-usage-bar",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "27df810602025a27dbe024c31a17c68075267d992d5cf346cc62df8550a65d33",
+        "master_catalog_checksum": "27df810602025a27dbe024c31a17c68075267d992d5cf346cc62df8550a65d33",
+        "provenance_checksum": "27df810602025a27dbe024c31a17c68075267d992d5cf346cc62df8550a65d33",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/jyaunches-canvas",
+      "directory": "community/jyaunches-canvas",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c3f5cabe2c97a8b27d36f3ff7c0b41f7fd5131aa18dc1ac158a1c2ac63779f99",
+        "master_catalog_checksum": "c3f5cabe2c97a8b27d36f3ff7c0b41f7fd5131aa18dc1ac158a1c2ac63779f99",
+        "provenance_checksum": "c3f5cabe2c97a8b27d36f3ff7c0b41f7fd5131aa18dc1ac158a1c2ac63779f99",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-answer",
+      "directory": "community/mitsuhiko-answer",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "bb88cf88385a69ecffa4457b3313ca5892acc792b789b3194647ae73cd6534bd",
+        "master_catalog_checksum": "bb88cf88385a69ecffa4457b3313ca5892acc792b789b3194647ae73cd6534bd",
+        "provenance_checksum": "bb88cf88385a69ecffa4457b3313ca5892acc792b789b3194647ae73cd6534bd",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-control",
+      "directory": "community/mitsuhiko-control",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d62efac581309d30add9dd031bcdb70d053673fa14b5c097e6d807f6e3989515",
+        "master_catalog_checksum": "d62efac581309d30add9dd031bcdb70d053673fa14b5c097e6d807f6e3989515",
+        "provenance_checksum": "d62efac581309d30add9dd031bcdb70d053673fa14b5c097e6d807f6e3989515",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-cwd-history",
+      "directory": "community/mitsuhiko-cwd-history",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e8203f37d45976de19bbc57e859bc5b3ad36df7d2f7915d2740554192e32e977",
+        "master_catalog_checksum": "e8203f37d45976de19bbc57e859bc5b3ad36df7d2f7915d2740554192e32e977",
+        "provenance_checksum": "e8203f37d45976de19bbc57e859bc5b3ad36df7d2f7915d2740554192e32e977",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-files",
+      "directory": "community/mitsuhiko-files",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3893617b45ab5ba20a9d6c96b3c00f794679d04c456fdff2f76aa75839d034ea",
+        "master_catalog_checksum": "3893617b45ab5ba20a9d6c96b3c00f794679d04c456fdff2f76aa75839d034ea",
+        "provenance_checksum": "3893617b45ab5ba20a9d6c96b3c00f794679d04c456fdff2f76aa75839d034ea",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-loop",
+      "directory": "community/mitsuhiko-loop",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+        "master_catalog_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+        "provenance_checksum": "e79dee18ddf96ee3d5d05fe20ef686e5039f8354c5aa7025ce20cfa075308dd7",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-notify",
+      "directory": "community/mitsuhiko-notify",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f89cc98c595e61914571f97ad3201529fe2edeff87ce58630573c2d796fdb81a",
+        "master_catalog_checksum": "f89cc98c595e61914571f97ad3201529fe2edeff87ce58630573c2d796fdb81a",
+        "provenance_checksum": "f89cc98c595e61914571f97ad3201529fe2edeff87ce58630573c2d796fdb81a",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-review",
+      "directory": "community/mitsuhiko-review",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5dadea5b28c0ec1ec315603ebfc09227c9911b7d5e59d1e359066b793eb68c51",
+        "master_catalog_checksum": "5dadea5b28c0ec1ec315603ebfc09227c9911b7d5e59d1e359066b793eb68c51",
+        "provenance_checksum": "5dadea5b28c0ec1ec315603ebfc09227c9911b7d5e59d1e359066b793eb68c51",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-todos",
+      "directory": "community/mitsuhiko-todos",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "530b690fd6f6e7d8a8db52bca6624f9fb14150b3a415a633e536b3d7c48badd5",
+        "master_catalog_checksum": "530b690fd6f6e7d8a8db52bca6624f9fb14150b3a415a633e536b3d7c48badd5",
+        "provenance_checksum": "530b690fd6f6e7d8a8db52bca6624f9fb14150b3a415a633e536b3d7c48badd5",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-uv",
+      "directory": "community/mitsuhiko-uv",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "aa2baf20eddb875e8b923063384b3d86a8856cba835395f63eccc4c01db7c30a",
+        "master_catalog_checksum": "aa2baf20eddb875e8b923063384b3d86a8856cba835395f63eccc4c01db7c30a",
+        "provenance_checksum": "aa2baf20eddb875e8b923063384b3d86a8856cba835395f63eccc4c01db7c30a",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/mitsuhiko-whimsical",
+      "directory": "community/mitsuhiko-whimsical",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "4004c97adeab517b59b7bbca27b0514238431d8235bba558018958c5e8dd8446",
+        "master_catalog_checksum": "4004c97adeab517b59b7bbca27b0514238431d8235bba558018958c5e8dd8446",
+        "provenance_checksum": "4004c97adeab517b59b7bbca27b0514238431d8235bba558018958c5e8dd8446",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/nicobailon-interactive-shell",
+      "directory": "community/nicobailon-interactive-shell",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d25b11404f70137e0dd662f146499c875ae3f15691e803d7993678723f134a31",
+        "master_catalog_checksum": "d25b11404f70137e0dd662f146499c875ae3f15691e803d7993678723f134a31",
+        "provenance_checksum": "d25b11404f70137e0dd662f146499c875ae3f15691e803d7993678723f134a31",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/nicobailon-interview-tool",
+      "directory": "community/nicobailon-interview-tool",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c3589f0daacbf63f54da18e4483efc8d93d98e5ed65fd9f5fd1c6a27db5a53cc",
+        "master_catalog_checksum": "c3589f0daacbf63f54da18e4483efc8d93d98e5ed65fd9f5fd1c6a27db5a53cc",
+        "provenance_checksum": "c3589f0daacbf63f54da18e4483efc8d93d98e5ed65fd9f5fd1c6a27db5a53cc",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/nicobailon-mcp-adapter",
+      "directory": "community/nicobailon-mcp-adapter",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "8f627dce605f88e84ee1d3b254a8942be358d1ef64f9f0724e7ef42f59313fac",
+        "master_catalog_checksum": "8f627dce605f88e84ee1d3b254a8942be358d1ef64f9f0724e7ef42f59313fac",
+        "provenance_checksum": "8f627dce605f88e84ee1d3b254a8942be358d1ef64f9f0724e7ef42f59313fac",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/nicobailon-powerline-footer",
+      "directory": "community/nicobailon-powerline-footer",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "1063f154b4ea058036bae14b60691354482b1787d8884bb91a55db9e4532ae3d",
+        "master_catalog_checksum": "1063f154b4ea058036bae14b60691354482b1787d8884bb91a55db9e4532ae3d",
+        "provenance_checksum": "1063f154b4ea058036bae14b60691354482b1787d8884bb91a55db9e4532ae3d",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/nicobailon-rewind-hook",
+      "directory": "community/nicobailon-rewind-hook",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "b80c0f602fdfd7bcc3e9bb4ed126d8acc32a7fc87b523ecb582cfa178edbfd4d",
+        "master_catalog_checksum": "b80c0f602fdfd7bcc3e9bb4ed126d8acc32a7fc87b523ecb582cfa178edbfd4d",
+        "provenance_checksum": "b80c0f602fdfd7bcc3e9bb4ed126d8acc32a7fc87b523ecb582cfa178edbfd4d",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/nicobailon-subagents",
+      "directory": "community/nicobailon-subagents",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c8f3d576d60ceaf872244112551e83850f9170a52b90f96a9e3d315deb342ef1",
+        "master_catalog_checksum": "c8f3d576d60ceaf872244112551e83850f9170a52b90f96a9e3d315deb342ef1",
+        "provenance_checksum": "c8f3d576d60ceaf872244112551e83850f9170a52b90f96a9e3d315deb342ef1",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/ogulcancelik-ghostty-theme-sync",
+      "directory": "community/ogulcancelik-ghostty-theme-sync",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5d245d0f5513497527dfcbeefd77e37010ce7ffa286014a587380cc34e766aa1",
+        "master_catalog_checksum": "5d245d0f5513497527dfcbeefd77e37010ce7ffa286014a587380cc34e766aa1",
+        "provenance_checksum": "5d245d0f5513497527dfcbeefd77e37010ce7ffa286014a587380cc34e766aa1",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/prateekmedia-checkpoint",
+      "directory": "community/prateekmedia-checkpoint",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "52280b9cc462f877840223fcb2618432bfd7f11d9a37c77f4ac0f9283c8a27e9",
+        "master_catalog_checksum": "52280b9cc462f877840223fcb2618432bfd7f11d9a37c77f4ac0f9283c8a27e9",
+        "provenance_checksum": "52280b9cc462f877840223fcb2618432bfd7f11d9a37c77f4ac0f9283c8a27e9",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/prateekmedia-lsp",
+      "directory": "community/prateekmedia-lsp",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "83d77cd7c3d502d3d473485537b5745716ae70a18907e97d9847896bd165433f",
+        "master_catalog_checksum": "83d77cd7c3d502d3d473485537b5745716ae70a18907e97d9847896bd165433f",
+        "provenance_checksum": "83d77cd7c3d502d3d473485537b5745716ae70a18907e97d9847896bd165433f",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/prateekmedia-permission",
+      "directory": "community/prateekmedia-permission",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "04018afed8ed0a1537ed508d49ab393480bc2f431d1d6d24a60d2929e602743b",
+        "master_catalog_checksum": "04018afed8ed0a1537ed508d49ab393480bc2f431d1d6d24a60d2929e602743b",
+        "provenance_checksum": "04018afed8ed0a1537ed508d49ab393480bc2f431d1d6d24a60d2929e602743b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/prateekmedia-ralph-loop",
+      "directory": "community/prateekmedia-ralph-loop",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f1bc511949b4a67978159b52d23cd875501d03fd1c6990d5f3077f5557656a22",
+        "master_catalog_checksum": "f1bc511949b4a67978159b52d23cd875501d03fd1c6990d5f3077f5557656a22",
+        "provenance_checksum": "f1bc511949b4a67978159b52d23cd875501d03fd1c6990d5f3077f5557656a22",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/prateekmedia-repeat",
+      "directory": "community/prateekmedia-repeat",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3552f0c03d6ebd33ab1fbb30e60603fae643e91638c9d485a694fc39a59ceeb4",
+        "master_catalog_checksum": "3552f0c03d6ebd33ab1fbb30e60603fae643e91638c9d485a694fc39a59ceeb4",
+        "provenance_checksum": "3552f0c03d6ebd33ab1fbb30e60603fae643e91638c9d485a694fc39a59ceeb4",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/prateekmedia-token-rate",
+      "directory": "community/prateekmedia-token-rate",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "bb6b105f0a596d89901d438b0cdcf37c5a4cb64b29a7fa36daf28131f71bcdce",
+        "master_catalog_checksum": "bb6b105f0a596d89901d438b0cdcf37c5a4cb64b29a7fa36daf28131f71bcdce",
+        "provenance_checksum": "bb6b105f0a596d89901d438b0cdcf37c5a4cb64b29a7fa36daf28131f71bcdce",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/qualisero-background-notify",
+      "directory": "community/qualisero-background-notify",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c9ad30c099446cd31a5ae46ef1b96e12ff0cec1739af0c49cc0cb5ce990bb84b",
+        "master_catalog_checksum": "c9ad30c099446cd31a5ae46ef1b96e12ff0cec1739af0c49cc0cb5ce990bb84b",
+        "provenance_checksum": "c9ad30c099446cd31a5ae46ef1b96e12ff0cec1739af0c49cc0cb5ce990bb84b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/qualisero-compact-config",
+      "directory": "community/qualisero-compact-config",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "401cc25921bb2a2b093b12835c58db33faf2f47f0ba71290de1f230d373216af",
+        "master_catalog_checksum": "401cc25921bb2a2b093b12835c58db33faf2f47f0ba71290de1f230d373216af",
+        "provenance_checksum": "401cc25921bb2a2b093b12835c58db33faf2f47f0ba71290de1f230d373216af",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/qualisero-pi-agent-scip",
+      "directory": "community/qualisero-pi-agent-scip",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "0320a754323cc480229a4ed5b931542d0c5095c3033e52f67ec0cc0be78e6d8b",
+        "master_catalog_checksum": "0320a754323cc480229a4ed5b931542d0c5095c3033e52f67ec0cc0be78e6d8b",
+        "provenance_checksum": "0320a754323cc480229a4ed5b931542d0c5095c3033e52f67ec0cc0be78e6d8b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/qualisero-safe-git",
+      "directory": "community/qualisero-safe-git",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "011a8bcaa77ccddcccc8dfba59cf9593242e5718401fc88592677d6623b64f26",
+        "master_catalog_checksum": "011a8bcaa77ccddcccc8dfba59cf9593242e5718401fc88592677d6623b64f26",
+        "provenance_checksum": "011a8bcaa77ccddcccc8dfba59cf9593242e5718401fc88592677d6623b64f26",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/qualisero-safe-rm",
+      "directory": "community/qualisero-safe-rm",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "837283f8a309065e566e48f6eef6469a0e7792ce4f39a7cc9282a8dad080b55b",
+        "master_catalog_checksum": "837283f8a309065e566e48f6eef6469a0e7792ce4f39a7cc9282a8dad080b55b",
+        "provenance_checksum": "837283f8a309065e566e48f6eef6469a0e7792ce4f39a7cc9282a8dad080b55b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/qualisero-session-color",
+      "directory": "community/qualisero-session-color",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "170ca637cfc48b380361b8a52822df80562795a040075d2dae1886b12650c903",
+        "master_catalog_checksum": "170ca637cfc48b380361b8a52822df80562795a040075d2dae1886b12650c903",
+        "provenance_checksum": "170ca637cfc48b380361b8a52822df80562795a040075d2dae1886b12650c903",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/qualisero-session-emoji",
+      "directory": "community/qualisero-session-emoji",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "efbff21a7d33ee75241bb53a8e09c3f24eba6e0e8bd61cdf6090e86e4290fa9e",
+        "master_catalog_checksum": "efbff21a7d33ee75241bb53a8e09c3f24eba6e0e8bd61cdf6090e86e4290fa9e",
+        "provenance_checksum": "efbff21a7d33ee75241bb53a8e09c3f24eba6e0e8bd61cdf6090e86e4290fa9e",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-agent-guidance",
+      "directory": "community/tmustier-agent-guidance",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "97f5c7e76e0ac94c6ca9372feb5d67e0388d3983bb2be47ba71eb35558692b6e",
+        "master_catalog_checksum": "97f5c7e76e0ac94c6ca9372feb5d67e0388d3983bb2be47ba71eb35558692b6e",
+        "provenance_checksum": "97f5c7e76e0ac94c6ca9372feb5d67e0388d3983bb2be47ba71eb35558692b6e",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-arcade-mario-not",
+      "directory": "community/tmustier-arcade-mario-not",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d48d9d4ea3f64f4a7e4e9a6e212de9bc8169883729017fdb59dd742bf0198081",
+        "master_catalog_checksum": "d48d9d4ea3f64f4a7e4e9a6e212de9bc8169883729017fdb59dd742bf0198081",
+        "provenance_checksum": "d48d9d4ea3f64f4a7e4e9a6e212de9bc8169883729017fdb59dd742bf0198081",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-arcade-picman",
+      "directory": "community/tmustier-arcade-picman",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d73d5f0df08b64cce2c604e0a28c2ecd19f54c98b33f1352b9a735f8eb8de888",
+        "master_catalog_checksum": "d73d5f0df08b64cce2c604e0a28c2ecd19f54c98b33f1352b9a735f8eb8de888",
+        "provenance_checksum": "d73d5f0df08b64cce2c604e0a28c2ecd19f54c98b33f1352b9a735f8eb8de888",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-arcade-ping",
+      "directory": "community/tmustier-arcade-ping",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "eeb5418914342f17aac7cfdad9fd689d8923e338b670d5df2dbcdf6d2f12dd22",
+        "master_catalog_checksum": "eeb5418914342f17aac7cfdad9fd689d8923e338b670d5df2dbcdf6d2f12dd22",
+        "provenance_checksum": "eeb5418914342f17aac7cfdad9fd689d8923e338b670d5df2dbcdf6d2f12dd22",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-arcade-spice-invaders",
+      "directory": "community/tmustier-arcade-spice-invaders",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "ea95d81378b212678560194ab1d1d1f9a646146a47faa9d8b7609eaf8410d32e",
+        "master_catalog_checksum": "ea95d81378b212678560194ab1d1d1f9a646146a47faa9d8b7609eaf8410d32e",
+        "provenance_checksum": "ea95d81378b212678560194ab1d1d1f9a646146a47faa9d8b7609eaf8410d32e",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-arcade-tetris",
+      "directory": "community/tmustier-arcade-tetris",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "27e847c070078d640d77de07911267eba54afda1157c8a990086a9bfc53caa6e",
+        "master_catalog_checksum": "27e847c070078d640d77de07911267eba54afda1157c8a990086a9bfc53caa6e",
+        "provenance_checksum": "27e847c070078d640d77de07911267eba54afda1157c8a990086a9bfc53caa6e",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-code-actions",
+      "directory": "community/tmustier-code-actions",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d118c915f5c25ada408ce21a5ed312006a5bb5e0a198d09d2c09701833df9434",
+        "master_catalog_checksum": "d118c915f5c25ada408ce21a5ed312006a5bb5e0a198d09d2c09701833df9434",
+        "provenance_checksum": "d118c915f5c25ada408ce21a5ed312006a5bb5e0a198d09d2c09701833df9434",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-files-widget",
+      "directory": "community/tmustier-files-widget",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a8c2bb0799f0e34c982312f50ca51fff3f21811fa36d42f782284481f8d7bc91",
+        "master_catalog_checksum": "a8c2bb0799f0e34c982312f50ca51fff3f21811fa36d42f782284481f8d7bc91",
+        "provenance_checksum": "a8c2bb0799f0e34c982312f50ca51fff3f21811fa36d42f782284481f8d7bc91",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-ralph-wiggum",
+      "directory": "community/tmustier-ralph-wiggum",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "673fabce1f11ee1580719794b29bca3c268da876d806c8e80113fd92d849263d",
+        "master_catalog_checksum": "673fabce1f11ee1580719794b29bca3c268da876d806c8e80113fd92d849263d",
+        "provenance_checksum": "673fabce1f11ee1580719794b29bca3c268da876d806c8e80113fd92d849263d",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-raw-paste",
+      "directory": "community/tmustier-raw-paste",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a06cb9a8e4acd814816fdb1074c41ff61e5da9731c48c1071dfcaf9735e9919b",
+        "master_catalog_checksum": "a06cb9a8e4acd814816fdb1074c41ff61e5da9731c48c1071dfcaf9735e9919b",
+        "provenance_checksum": "a06cb9a8e4acd814816fdb1074c41ff61e5da9731c48c1071dfcaf9735e9919b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-tab-status",
+      "directory": "community/tmustier-tab-status",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "4666e65023cb9287160667a0d9b4f12c68834ed5aa3946993c6c49645c7cb2d9",
+        "master_catalog_checksum": "4666e65023cb9287160667a0d9b4f12c68834ed5aa3946993c6c49645c7cb2d9",
+        "provenance_checksum": "4666e65023cb9287160667a0d9b4f12c68834ed5aa3946993c6c49645c7cb2d9",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "community/tmustier-usage-extension",
+      "directory": "community/tmustier-usage-extension",
+      "source_tier": "Community",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e0e3878852b677f89d3c6a477321c76d2f8955b0988d6024f905098b61d9f9ce",
+        "master_catalog_checksum": "e0e3878852b677f89d3c6a477321c76d2f8955b0988d6024f905098b61d9f9ce",
+        "provenance_checksum": "e0e3878852b677f89d3c6a477321c76d2f8955b0988d6024f905098b61d9f9ce",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "confirm-destructive",
+      "directory": "confirm-destructive",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "1ea07be2d3287b2ca19faa21bef82e578c7872255838d4257d1b86d4876135d2",
+        "master_catalog_checksum": "1ea07be2d3287b2ca19faa21bef82e578c7872255838d4257d1b86d4876135d2",
+        "provenance_checksum": "1ea07be2d3287b2ca19faa21bef82e578c7872255838d4257d1b86d4876135d2",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "custom-compaction",
+      "directory": "custom-compaction",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f530739cb3e6e36ea2df1e93e1da1fdaad71acc41acf042ac0877dcbfab5ded5",
+        "master_catalog_checksum": "f530739cb3e6e36ea2df1e93e1da1fdaad71acc41acf042ac0877dcbfab5ded5",
+        "provenance_checksum": "f530739cb3e6e36ea2df1e93e1da1fdaad71acc41acf042ac0877dcbfab5ded5",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "custom-footer",
+      "directory": "custom-footer",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3ea51342bd093054762695a878e5c309e1491309e25f1290c09c19231c161965",
+        "master_catalog_checksum": "3ea51342bd093054762695a878e5c309e1491309e25f1290c09c19231c161965",
+        "provenance_checksum": "3ea51342bd093054762695a878e5c309e1491309e25f1290c09c19231c161965",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "custom-header",
+      "directory": "custom-header",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "996f53a6a6dd531c9e3ca2585f5f57fd559ec8b0b6a8c802702205bd26fe2472",
+        "master_catalog_checksum": "996f53a6a6dd531c9e3ca2585f5f57fd559ec8b0b6a8c802702205bd26fe2472",
+        "provenance_checksum": "996f53a6a6dd531c9e3ca2585f5f57fd559ec8b0b6a8c802702205bd26fe2472",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "directory": "custom-provider-anthropic",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68",
+        "master_catalog_checksum": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68",
+        "provenance_checksum": "a91b0512837e0967161e4eedb5d1fc39e8f8c5d847885509c006ec6c40df0c68",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "custom-provider-gitlab-duo",
+      "directory": "custom-provider-gitlab-duo",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f4b4c1f5063b56a24ffb9f3746fc2107769ba3b4a0b1a65f7ee3e18e15684d77",
+        "master_catalog_checksum": "f4b4c1f5063b56a24ffb9f3746fc2107769ba3b4a0b1a65f7ee3e18e15684d77",
+        "provenance_checksum": "f4b4c1f5063b56a24ffb9f3746fc2107769ba3b4a0b1a65f7ee3e18e15684d77",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "directory": "custom-provider-qwen-cli",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "29278eca3a44361d59e04256e57db294a0cd2fe6c612307b7b5c3139e1dc7286",
+        "master_catalog_checksum": "29278eca3a44361d59e04256e57db294a0cd2fe6c612307b7b5c3139e1dc7286",
+        "provenance_checksum": "29278eca3a44361d59e04256e57db294a0cd2fe6c612307b7b5c3139e1dc7286",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "dirty-repo-guard",
+      "directory": "dirty-repo-guard",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "86b312a1ccde2a74973e340b5fa8377a7926c0232afe4ea0eb239ce93b8b6cfd",
+        "master_catalog_checksum": "86b312a1ccde2a74973e340b5fa8377a7926c0232afe4ea0eb239ce93b8b6cfd",
+        "provenance_checksum": "86b312a1ccde2a74973e340b5fa8377a7926c0232afe4ea0eb239ce93b8b6cfd",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "doom-overlay",
+      "directory": "doom-overlay",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10",
+        "master_catalog_checksum": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10",
+        "provenance_checksum": "e1bfb470c443d962bfca79a8863d0a01caf2c2041ee4b7e93988a94335c69b10",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "dynamic-resources",
+      "directory": "dynamic-resources",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "7d9bc974bd48ecf0cd39e326b0d53815d1c17228ec14e14da63710ba79540788",
+        "master_catalog_checksum": "7d9bc974bd48ecf0cd39e326b0d53815d1c17228ec14e14da63710ba79540788",
+        "provenance_checksum": "7d9bc974bd48ecf0cd39e326b0d53815d1c17228ec14e14da63710ba79540788",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "event-bus",
+      "directory": "event-bus",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "869e3d574d574e68d713f9eb947b26643e800981919f1cf1f1e8097eeafa255a",
+        "master_catalog_checksum": "869e3d574d574e68d713f9eb947b26643e800981919f1cf1f1e8097eeafa255a",
+        "provenance_checksum": "869e3d574d574e68d713f9eb947b26643e800981919f1cf1f1e8097eeafa255a",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "file-trigger",
+      "directory": "file-trigger",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d9623f289add349102a78ebf6a04df61a1b19cdcca9e6a8f4728138cc32a34fe",
+        "master_catalog_checksum": "d9623f289add349102a78ebf6a04df61a1b19cdcca9e6a8f4728138cc32a34fe",
+        "provenance_checksum": "d9623f289add349102a78ebf6a04df61a1b19cdcca9e6a8f4728138cc32a34fe",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "git-checkpoint",
+      "directory": "git-checkpoint",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6",
+        "master_catalog_checksum": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6",
+        "provenance_checksum": "89e80e550029c4b9ae6266d7a20f78f8ca14253f5ae0cc0c4eff0bd43dced7c6",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "handoff",
+      "directory": "handoff",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c84672af255b3889d99c99fb76382520bc686a18fb26c1c04d341de0865e7fe9",
+        "master_catalog_checksum": "c84672af255b3889d99c99fb76382520bc686a18fb26c1c04d341de0865e7fe9",
+        "provenance_checksum": "c84672af255b3889d99c99fb76382520bc686a18fb26c1c04d341de0865e7fe9",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "hello",
+      "directory": "hello",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "6d4d5a97ada168817b9cb3808e51013969c2ce7c2c4d1536b4d630ad3f8b78f1",
+        "master_catalog_checksum": "6d4d5a97ada168817b9cb3808e51013969c2ce7c2c4d1536b4d630ad3f8b78f1",
+        "provenance_checksum": "6d4d5a97ada168817b9cb3808e51013969c2ce7c2c4d1536b4d630ad3f8b78f1",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "inline-bash",
+      "directory": "inline-bash",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "41caf5a75b33eface492ba382a98db3745768563da10e35c55d4ef733e5a9287",
+        "master_catalog_checksum": "41caf5a75b33eface492ba382a98db3745768563da10e35c55d4ef733e5a9287",
+        "provenance_checksum": "41caf5a75b33eface492ba382a98db3745768563da10e35c55d4ef733e5a9287",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "input-transform",
+      "directory": "input-transform",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "21c653ea09ff9467de4095770ba27709f41fd3540cc8087bfd7af618ce2b8050",
+        "master_catalog_checksum": "21c653ea09ff9467de4095770ba27709f41fd3540cc8087bfd7af618ce2b8050",
+        "provenance_checksum": "21c653ea09ff9467de4095770ba27709f41fd3540cc8087bfd7af618ce2b8050",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "interactive-shell",
+      "directory": "interactive-shell",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "bb511be03dc47da3e31ae2011d3a932d3d0cdc74f8b7c535657d5cd7f699cd33",
+        "master_catalog_checksum": "bb511be03dc47da3e31ae2011d3a932d3d0cdc74f8b7c535657d5cd7f699cd33",
+        "provenance_checksum": "bb511be03dc47da3e31ae2011d3a932d3d0cdc74f8b7c535657d5cd7f699cd33",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "mac-system-theme",
+      "directory": "mac-system-theme",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a9ac7ae1d161963f4c21cf8116a6ffd561f76aa7c858d9a73288745f2db99eb7",
+        "master_catalog_checksum": "a9ac7ae1d161963f4c21cf8116a6ffd561f76aa7c858d9a73288745f2db99eb7",
+        "provenance_checksum": "a9ac7ae1d161963f4c21cf8116a6ffd561f76aa7c858d9a73288745f2db99eb7",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "message-renderer",
+      "directory": "message-renderer",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "6eda7eaade9a07ff140bbdc88e5c8b8ad414fbbb738fea13dac620c194c4ba50",
+        "master_catalog_checksum": "6eda7eaade9a07ff140bbdc88e5c8b8ad414fbbb738fea13dac620c194c4ba50",
+        "provenance_checksum": "6eda7eaade9a07ff140bbdc88e5c8b8ad414fbbb738fea13dac620c194c4ba50",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "modal-editor",
+      "directory": "modal-editor",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f875e8d3af9eb78ea88a2e274f798e7c8eae10b543e2728dde8e8fd2c7912da9",
+        "master_catalog_checksum": "f875e8d3af9eb78ea88a2e274f798e7c8eae10b543e2728dde8e8fd2c7912da9",
+        "provenance_checksum": "f875e8d3af9eb78ea88a2e274f798e7c8eae10b543e2728dde8e8fd2c7912da9",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "model-status",
+      "directory": "model-status",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "b43a7e8bc67c988f230fc730e12f92401870b04ebb1dba7a26667baa63daec0b",
+        "master_catalog_checksum": "b43a7e8bc67c988f230fc730e12f92401870b04ebb1dba7a26667baa63daec0b",
+        "provenance_checksum": "b43a7e8bc67c988f230fc730e12f92401870b04ebb1dba7a26667baa63daec0b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "notify",
+      "directory": "notify",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "8979cdf28c59201375cdec7c7c704bad425918fda771ec46736e1b627f586960",
+        "master_catalog_checksum": "8979cdf28c59201375cdec7c7c704bad425918fda771ec46736e1b627f586960",
+        "provenance_checksum": "8979cdf28c59201375cdec7c7c704bad425918fda771ec46736e1b627f586960",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/aliou-pi-extension-dev",
+      "directory": "npm/aliou-pi-extension-dev",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c8324f78f8aa70ef574c753d0335f77cfa806506844507064370dc9926c345a6",
+        "master_catalog_checksum": "c8324f78f8aa70ef574c753d0335f77cfa806506844507064370dc9926c345a6",
+        "provenance_checksum": "c8324f78f8aa70ef574c753d0335f77cfa806506844507064370dc9926c345a6",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/aliou-pi-guardrails",
+      "directory": "npm/aliou-pi-guardrails",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "4855fd0c2ba13dc96ff7e4721b4940283ed0091119b93f91aa7b3480b24f6aef",
+        "master_catalog_checksum": "4855fd0c2ba13dc96ff7e4721b4940283ed0091119b93f91aa7b3480b24f6aef",
+        "provenance_checksum": "4855fd0c2ba13dc96ff7e4721b4940283ed0091119b93f91aa7b3480b24f6aef",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/aliou-pi-linkup",
+      "directory": "npm/aliou-pi-linkup",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "50bedf464319de47acf952d2d3bbb6cb835bf892c511626f57526303baad7b29",
+        "master_catalog_checksum": "50bedf464319de47acf952d2d3bbb6cb835bf892c511626f57526303baad7b29",
+        "provenance_checksum": "50bedf464319de47acf952d2d3bbb6cb835bf892c511626f57526303baad7b29",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/aliou-pi-processes",
+      "directory": "npm/aliou-pi-processes",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "b4099b9e789b25e572cbb7ccf478ec4c704b22f633257d5f9a705cf2168e9e6b",
+        "master_catalog_checksum": "b4099b9e789b25e572cbb7ccf478ec4c704b22f633257d5f9a705cf2168e9e6b",
+        "provenance_checksum": "b4099b9e789b25e572cbb7ccf478ec4c704b22f633257d5f9a705cf2168e9e6b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/aliou-pi-synthetic",
+      "directory": "npm/aliou-pi-synthetic",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "9bbf34e97f50ea4cb841f717dd77913a2ef77206bdcef93f32b05a27a0542781",
+        "master_catalog_checksum": "9bbf34e97f50ea4cb841f717dd77913a2ef77206bdcef93f32b05a27a0542781",
+        "provenance_checksum": "9bbf34e97f50ea4cb841f717dd77913a2ef77206bdcef93f32b05a27a0542781",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/aliou-pi-toolchain",
+      "directory": "npm/aliou-pi-toolchain",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f559a9fc862659b808b5a58ae8dc91be444407d4b3e75a0e7d790564cfd14293",
+        "master_catalog_checksum": "f559a9fc862659b808b5a58ae8dc91be444407d4b3e75a0e7d790564cfd14293",
+        "provenance_checksum": "f559a9fc862659b808b5a58ae8dc91be444407d4b3e75a0e7d790564cfd14293",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/benvargas-pi-ancestor-discovery",
+      "directory": "npm/benvargas-pi-ancestor-discovery",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "320f8eceae4a7d834851310b4270f3a34a9139313d5abffc9602e2b827b0bd6e",
+        "master_catalog_checksum": "320f8eceae4a7d834851310b4270f3a34a9139313d5abffc9602e2b827b0bd6e",
+        "provenance_checksum": "320f8eceae4a7d834851310b4270f3a34a9139313d5abffc9602e2b827b0bd6e",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/benvargas-pi-antigravity-image-gen",
+      "directory": "npm/benvargas-pi-antigravity-image-gen",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "2e6b008e4f64167724288d468e2afcf649f7e836afb7fc6a11d4e9738c951b71",
+        "master_catalog_checksum": "2e6b008e4f64167724288d468e2afcf649f7e836afb7fc6a11d4e9738c951b71",
+        "provenance_checksum": "2e6b008e4f64167724288d468e2afcf649f7e836afb7fc6a11d4e9738c951b71",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/benvargas-pi-synthetic-provider",
+      "directory": "npm/benvargas-pi-synthetic-provider",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "2f8cf9b635a26f6e8bdf208fdcedc919c171c2ffe45dcce825e954208607aee1",
+        "master_catalog_checksum": "2f8cf9b635a26f6e8bdf208fdcedc919c171c2ffe45dcce825e954208607aee1",
+        "provenance_checksum": "2f8cf9b635a26f6e8bdf208fdcedc919c171c2ffe45dcce825e954208607aee1",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/checkpoint-pi",
+      "directory": "npm/checkpoint-pi",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "defbcc7d4a4e3d60f48cf19de2ae8e67e91b7126093bbc6ff2c78d954f773236",
+        "master_catalog_checksum": "defbcc7d4a4e3d60f48cf19de2ae8e67e91b7126093bbc6ff2c78d954f773236",
+        "provenance_checksum": "defbcc7d4a4e3d60f48cf19de2ae8e67e91b7126093bbc6ff2c78d954f773236",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "directory": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d01fc2206c107b24fee01f8e18ce04665072dbd9628788bac4f150e55b3dbb91",
+        "master_catalog_checksum": "d01fc2206c107b24fee01f8e18ce04665072dbd9628788bac4f150e55b3dbb91",
+        "provenance_checksum": "d01fc2206c107b24fee01f8e18ce04665072dbd9628788bac4f150e55b3dbb91",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/juanibiapina-pi-extension-settings",
+      "directory": "npm/juanibiapina-pi-extension-settings",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "63990a9a3055005ea9a15e363eb7c69c4193e7422a1f8577d97dd44715fca376",
+        "master_catalog_checksum": "63990a9a3055005ea9a15e363eb7c69c4193e7422a1f8577d97dd44715fca376",
+        "provenance_checksum": "63990a9a3055005ea9a15e363eb7c69c4193e7422a1f8577d97dd44715fca376",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/juanibiapina-pi-files",
+      "directory": "npm/juanibiapina-pi-files",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c9ea095426bbaf6998d8af0ddf2d3f5e03b7affc599af5657063e59a2331a98f",
+        "master_catalog_checksum": "c9ea095426bbaf6998d8af0ddf2d3f5e03b7affc599af5657063e59a2331a98f",
+        "provenance_checksum": "c9ea095426bbaf6998d8af0ddf2d3f5e03b7affc599af5657063e59a2331a98f",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/juanibiapina-pi-gob",
+      "directory": "npm/juanibiapina-pi-gob",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "ff7d0bc4fdef19c3c22bacb3d903c1c5063fd4db03fb2d3e4634290716ee20f4",
+        "master_catalog_checksum": "ff7d0bc4fdef19c3c22bacb3d903c1c5063fd4db03fb2d3e4634290716ee20f4",
+        "provenance_checksum": "ff7d0bc4fdef19c3c22bacb3d903c1c5063fd4db03fb2d3e4634290716ee20f4",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/lsp-pi",
+      "directory": "npm/lsp-pi",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d0919dccd283992ed4c4f9589609785f2c737a29978b52bf9a050868c799a30c",
+        "master_catalog_checksum": "d0919dccd283992ed4c4f9589609785f2c737a29978b52bf9a050868c799a30c",
+        "provenance_checksum": "d0919dccd283992ed4c4f9589609785f2c737a29978b52bf9a050868c799a30c",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-bar",
+      "directory": "npm/marckrenn-pi-sub-bar",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "4c8d489332cd87e504ce064a2cfe32dfe3e9dec4cca1e8b1452a3533b4aeab6c",
+        "master_catalog_checksum": "4c8d489332cd87e504ce064a2cfe32dfe3e9dec4cca1e8b1452a3533b4aeab6c",
+        "provenance_checksum": "4c8d489332cd87e504ce064a2cfe32dfe3e9dec4cca1e8b1452a3533b4aeab6c",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-core",
+      "directory": "npm/marckrenn-pi-sub-core",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "77dcc7f7f2d506a34e1b19f684c72976bb2c304420a98e39acd9ee4b1d234f0b",
+        "master_catalog_checksum": "77dcc7f7f2d506a34e1b19f684c72976bb2c304420a98e39acd9ee4b1d234f0b",
+        "provenance_checksum": "77dcc7f7f2d506a34e1b19f684c72976bb2c304420a98e39acd9ee4b1d234f0b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/ogulcancelik-pi-sketch",
+      "directory": "npm/ogulcancelik-pi-sketch",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a4e95b67e0cc2dd1a0147dd9efcf09d775bb1550c3aee8358329dac16442d399",
+        "master_catalog_checksum": "a4e95b67e0cc2dd1a0147dd9efcf09d775bb1550c3aee8358329dac16442d399",
+        "provenance_checksum": "a4e95b67e0cc2dd1a0147dd9efcf09d775bb1550c3aee8358329dac16442d399",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/permission-pi",
+      "directory": "npm/permission-pi",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "b3b9d427784198407ca84f9c82bbcf35841c36af5a750473222648a756f94a60",
+        "master_catalog_checksum": "b3b9d427784198407ca84f9c82bbcf35841c36af5a750473222648a756f94a60",
+        "provenance_checksum": "b3b9d427784198407ca84f9c82bbcf35841c36af5a750473222648a756f94a60",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-agentic-compaction",
+      "directory": "npm/pi-agentic-compaction",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5c1a2880ced5377656d12585a7966ddd62e9c1b68d06106cc128b197c25b2305",
+        "master_catalog_checksum": "5c1a2880ced5377656d12585a7966ddd62e9c1b68d06106cc128b197c25b2305",
+        "provenance_checksum": "5c1a2880ced5377656d12585a7966ddd62e9c1b68d06106cc128b197c25b2305",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-amplike",
+      "directory": "npm/pi-amplike",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d105f1bfd68bc6f73dbaf7eb1fdada4a07b09772925393ba05c222f376146c65",
+        "master_catalog_checksum": "d105f1bfd68bc6f73dbaf7eb1fdada4a07b09772925393ba05c222f376146c65",
+        "provenance_checksum": "d105f1bfd68bc6f73dbaf7eb1fdada4a07b09772925393ba05c222f376146c65",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-annotate",
+      "directory": "npm/pi-annotate",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "cf98e955a19bb579e4117a0878abcce650cc539d563ef8987da1107536ba8b6b",
+        "master_catalog_checksum": "cf98e955a19bb579e4117a0878abcce650cc539d563ef8987da1107536ba8b6b",
+        "provenance_checksum": "cf98e955a19bb579e4117a0878abcce650cc539d563ef8987da1107536ba8b6b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-bash-confirm",
+      "directory": "npm/pi-bash-confirm",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "705b3c6c504252bfd3d7f3c09c9f22fadcc46a2aeda6e117778b258e1c934ece",
+        "master_catalog_checksum": "705b3c6c504252bfd3d7f3c09c9f22fadcc46a2aeda6e117778b258e1c934ece",
+        "provenance_checksum": "705b3c6c504252bfd3d7f3c09c9f22fadcc46a2aeda6e117778b258e1c934ece",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-brave-search",
+      "directory": "npm/pi-brave-search",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "246fdf04e8877b43a6a27f080b7514815edf719e0719638597a584bc76b28263",
+        "master_catalog_checksum": "246fdf04e8877b43a6a27f080b7514815edf719e0719638597a584bc76b28263",
+        "provenance_checksum": "246fdf04e8877b43a6a27f080b7514815edf719e0719638597a584bc76b28263",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-command-center",
+      "directory": "npm/pi-command-center",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d794ecb901fbf888c52f0b622140c3e8d8d72dd1719ee93f01cabb92e43a8990",
+        "master_catalog_checksum": "d794ecb901fbf888c52f0b622140c3e8d8d72dd1719ee93f01cabb92e43a8990",
+        "provenance_checksum": "d794ecb901fbf888c52f0b622140c3e8d8d72dd1719ee93f01cabb92e43a8990",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-ephemeral",
+      "directory": "npm/pi-ephemeral",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d8460a3d3febe46009d4c9c258b51046a5556d3b79a32ded2294ea67b18d9a79",
+        "master_catalog_checksum": "d8460a3d3febe46009d4c9c258b51046a5556d3b79a32ded2294ea67b18d9a79",
+        "provenance_checksum": "d8460a3d3febe46009d4c9c258b51046a5556d3b79a32ded2294ea67b18d9a79",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-ghostty-theme-sync",
+      "directory": "npm/pi-ghostty-theme-sync",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "b86806b563696a42309c866176201b2d4512b73ae27f10865784b90564aff93c",
+        "master_catalog_checksum": "b86806b563696a42309c866176201b2d4512b73ae27f10865784b90564aff93c",
+        "provenance_checksum": "b86806b563696a42309c866176201b2d4512b73ae27f10865784b90564aff93c",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-interview",
+      "directory": "npm/pi-interview",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3b5d7a8aefbd1d9f316438df6546db48561b205222a8d08b14a6df3aac850e68",
+        "master_catalog_checksum": "3b5d7a8aefbd1d9f316438df6546db48561b205222a8d08b14a6df3aac850e68",
+        "provenance_checksum": "3b5d7a8aefbd1d9f316438df6546db48561b205222a8d08b14a6df3aac850e68",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-md-export",
+      "directory": "npm/pi-md-export",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3f9dd50972e67bdf68ab8e9894de8c54b149d3ea38a79438b79cc034dc4da2a7",
+        "master_catalog_checksum": "3f9dd50972e67bdf68ab8e9894de8c54b149d3ea38a79438b79cc034dc4da2a7",
+        "provenance_checksum": "3f9dd50972e67bdf68ab8e9894de8c54b149d3ea38a79438b79cc034dc4da2a7",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-mermaid",
+      "directory": "npm/pi-mermaid",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "611796b35af8b8b6d4589e7133d4dec918f7ae81331b4c6c321aab24e30c03ed",
+        "master_catalog_checksum": "611796b35af8b8b6d4589e7133d4dec918f7ae81331b4c6c321aab24e30c03ed",
+        "provenance_checksum": "611796b35af8b8b6d4589e7133d4dec918f7ae81331b4c6c321aab24e30c03ed",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-messenger",
+      "directory": "npm/pi-messenger",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "648ac76846fab38495eff900e8459f4446bb921bb063308ab76e8075f74040c8",
+        "master_catalog_checksum": "648ac76846fab38495eff900e8459f4446bb921bb063308ab76e8075f74040c8",
+        "provenance_checksum": "648ac76846fab38495eff900e8459f4446bb921bb063308ab76e8075f74040c8",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-model-switch",
+      "directory": "npm/pi-model-switch",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "c4afaeed5d2cd4349f8e752b52796e52088e672882e839bbee258a9af1356e32",
+        "master_catalog_checksum": "c4afaeed5d2cd4349f8e752b52796e52088e672882e839bbee258a9af1356e32",
+        "provenance_checksum": "c4afaeed5d2cd4349f8e752b52796e52088e672882e839bbee258a9af1356e32",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-moonshot",
+      "directory": "npm/pi-moonshot",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "2cfb6ca621d022e84d3535a0c2367bc9eac55262bf8ba3a5b4b60578b9fbc5a5",
+        "master_catalog_checksum": "2cfb6ca621d022e84d3535a0c2367bc9eac55262bf8ba3a5b4b60578b9fbc5a5",
+        "provenance_checksum": "2cfb6ca621d022e84d3535a0c2367bc9eac55262bf8ba3a5b4b60578b9fbc5a5",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-multicodex",
+      "directory": "npm/pi-multicodex",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5062226f7706474d7fa67a1835cd0428bf86d4e9087f0a4804608ad151048152",
+        "master_catalog_checksum": "5062226f7706474d7fa67a1835cd0428bf86d4e9087f0a4804608ad151048152",
+        "provenance_checksum": "5062226f7706474d7fa67a1835cd0428bf86d4e9087f0a4804608ad151048152",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-notify",
+      "directory": "npm/pi-notify",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "76957c026ee81629146b914d34dd32892ee2db62125d846af5470b516246cbf1",
+        "master_catalog_checksum": "76957c026ee81629146b914d34dd32892ee2db62125d846af5470b516246cbf1",
+        "provenance_checksum": "76957c026ee81629146b914d34dd32892ee2db62125d846af5470b516246cbf1",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-poly-notify",
+      "directory": "npm/pi-poly-notify",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a1b120324b7178392f3f153ab277dde6c62033818a641efc9cae47e1f48be5bc",
+        "master_catalog_checksum": "a1b120324b7178392f3f153ab277dde6c62033818a641efc9cae47e1f48be5bc",
+        "provenance_checksum": "a1b120324b7178392f3f153ab277dde6c62033818a641efc9cae47e1f48be5bc",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-prompt-template-model",
+      "directory": "npm/pi-prompt-template-model",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "faaee501cfc8824e12fc2003885f8b45975159fa90b6cec8ae4618290746a1fe",
+        "master_catalog_checksum": "faaee501cfc8824e12fc2003885f8b45975159fa90b6cec8ae4618290746a1fe",
+        "provenance_checksum": "faaee501cfc8824e12fc2003885f8b45975159fa90b6cec8ae4618290746a1fe",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-repoprompt-mcp",
+      "directory": "npm/pi-repoprompt-mcp",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3e42769cfa41f0ebadfd68972fd1a944222684b45cd5683cfcb8e9d4f6594421",
+        "master_catalog_checksum": "3e42769cfa41f0ebadfd68972fd1a944222684b45cd5683cfcb8e9d4f6594421",
+        "provenance_checksum": "3e42769cfa41f0ebadfd68972fd1a944222684b45cd5683cfcb8e9d4f6594421",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-review-loop",
+      "directory": "npm/pi-review-loop",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "702b84a720521184955491fd2ca72b6b0e15d86a9b1636f87d03fbddcf6bff69",
+        "master_catalog_checksum": "702b84a720521184955491fd2ca72b6b0e15d86a9b1636f87d03fbddcf6bff69",
+        "provenance_checksum": "702b84a720521184955491fd2ca72b6b0e15d86a9b1636f87d03fbddcf6bff69",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-screenshots-picker",
+      "directory": "npm/pi-screenshots-picker",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "cd5ac0eea7259bba6cf02dc7c0793336aa15ffe25bc7b0cfee8226d2172d22d5",
+        "master_catalog_checksum": "cd5ac0eea7259bba6cf02dc7c0793336aa15ffe25bc7b0cfee8226d2172d22d5",
+        "provenance_checksum": "cd5ac0eea7259bba6cf02dc7c0793336aa15ffe25bc7b0cfee8226d2172d22d5",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-search-agent",
+      "directory": "npm/pi-search-agent",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "05ca34ce4cc62058d3ea1e032ffb0d837f33f174b347732689b54a26e96729f6",
+        "master_catalog_checksum": "05ca34ce4cc62058d3ea1e032ffb0d837f33f174b347732689b54a26e96729f6",
+        "provenance_checksum": "05ca34ce4cc62058d3ea1e032ffb0d837f33f174b347732689b54a26e96729f6",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-session-ask",
+      "directory": "npm/pi-session-ask",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "ec08e99817b26d8440e0d3cbfbe64c2d562c8aa0918123b16c5979813633d1bc",
+        "master_catalog_checksum": "ec08e99817b26d8440e0d3cbfbe64c2d562c8aa0918123b16c5979813633d1bc",
+        "provenance_checksum": "ec08e99817b26d8440e0d3cbfbe64c2d562c8aa0918123b16c5979813633d1bc",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-shadow-git",
+      "directory": "npm/pi-shadow-git",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "55eb623f2c2389218d0a6cd8c536df22fc2f54fb955fc0ce89dd70aca52be46c",
+        "master_catalog_checksum": "55eb623f2c2389218d0a6cd8c536df22fc2f54fb955fc0ce89dd70aca52be46c",
+        "provenance_checksum": "55eb623f2c2389218d0a6cd8c536df22fc2f54fb955fc0ce89dd70aca52be46c",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-shell-completions",
+      "directory": "npm/pi-shell-completions",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5ed1e066f294d283beda50e5d94ca846af0d438ffac27b12c91092375958bf1b",
+        "master_catalog_checksum": "5ed1e066f294d283beda50e5d94ca846af0d438ffac27b12c91092375958bf1b",
+        "provenance_checksum": "5ed1e066f294d283beda50e5d94ca846af0d438ffac27b12c91092375958bf1b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-skill-palette",
+      "directory": "npm/pi-skill-palette",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3766ee3bf3613d52d3cbc8ed651ce181c4485e95c2567891e6f28924164176dc",
+        "master_catalog_checksum": "3766ee3bf3613d52d3cbc8ed651ce181c4485e95c2567891e6f28924164176dc",
+        "provenance_checksum": "3766ee3bf3613d52d3cbc8ed651ce181c4485e95c2567891e6f28924164176dc",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-subdir-context",
+      "directory": "npm/pi-subdir-context",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d70ce15a7585b9f585c466499527f02a6bad90edc0a4f63bd6ab1e83a6a6c6cb",
+        "master_catalog_checksum": "d70ce15a7585b9f585c466499527f02a6bad90edc0a4f63bd6ab1e83a6a6c6cb",
+        "provenance_checksum": "d70ce15a7585b9f585c466499527f02a6bad90edc0a4f63bd6ab1e83a6a6c6cb",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-super-curl",
+      "directory": "npm/pi-super-curl",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "790bb671335973eac552dcb6cdd6efcd6e4f9d13625c09f231d697ff25d763b5",
+        "master_catalog_checksum": "790bb671335973eac552dcb6cdd6efcd6e4f9d13625c09f231d697ff25d763b5",
+        "provenance_checksum": "790bb671335973eac552dcb6cdd6efcd6e4f9d13625c09f231d697ff25d763b5",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-telemetry-otel",
+      "directory": "npm/pi-telemetry-otel",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "eaf69b8eb80e8729f654f444497eeb42a1f0aa394dceb2d52a123204e339060b",
+        "master_catalog_checksum": "eaf69b8eb80e8729f654f444497eeb42a1f0aa394dceb2d52a123204e339060b",
+        "provenance_checksum": "eaf69b8eb80e8729f654f444497eeb42a1f0aa394dceb2d52a123204e339060b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-threads",
+      "directory": "npm/pi-threads",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "05f2df644ac2bc5d43326ac5afb6517bb2f5de62391b6df027a59d6d1e0ee252",
+        "master_catalog_checksum": "05f2df644ac2bc5d43326ac5afb6517bb2f5de62391b6df027a59d6d1e0ee252",
+        "provenance_checksum": "05f2df644ac2bc5d43326ac5afb6517bb2f5de62391b6df027a59d6d1e0ee252",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-voice-of-god",
+      "directory": "npm/pi-voice-of-god",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "1ab8d9785881562bef5d417bb6a60e6de42c2e41152c370206ddccdf61bd6096",
+        "master_catalog_checksum": "1ab8d9785881562bef5d417bb6a60e6de42c2e41152c370206ddccdf61bd6096",
+        "provenance_checksum": "1ab8d9785881562bef5d417bb6a60e6de42c2e41152c370206ddccdf61bd6096",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-wakatime",
+      "directory": "npm/pi-wakatime",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "179d05266f2bc580d0c3a2f12856501815d1c308003e80ef22c8c8a1e84a1fa8",
+        "master_catalog_checksum": "179d05266f2bc580d0c3a2f12856501815d1c308003e80ef22c8c8a1e84a1fa8",
+        "provenance_checksum": "179d05266f2bc580d0c3a2f12856501815d1c308003e80ef22c8c8a1e84a1fa8",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-watch",
+      "directory": "npm/pi-watch",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "6d99882ffa560dc01a0418438b7ec664a28c7ec204d50e66862fdfd23d46e5dd",
+        "master_catalog_checksum": "6d99882ffa560dc01a0418438b7ec664a28c7ec204d50e66862fdfd23d46e5dd",
+        "provenance_checksum": "6d99882ffa560dc01a0418438b7ec664a28c7ec204d50e66862fdfd23d46e5dd",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/pi-web-access",
+      "directory": "npm/pi-web-access",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "62427a5f9452041963b260175572780d760599534dc0749ae66ed5154a71011b",
+        "master_catalog_checksum": "62427a5f9452041963b260175572780d760599534dc0749ae66ed5154a71011b",
+        "provenance_checksum": "62427a5f9452041963b260175572780d760599534dc0749ae66ed5154a71011b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/qualisero-pi-agent-scip",
+      "directory": "npm/qualisero-pi-agent-scip",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "943fe8256ac7348f140ff147686c88a11553a79a1eb5af3eadd9ef6a7126b359",
+        "master_catalog_checksum": "943fe8256ac7348f140ff147686c88a11553a79a1eb5af3eadd9ef6a7126b359",
+        "provenance_checksum": "943fe8256ac7348f140ff147686c88a11553a79a1eb5af3eadd9ef6a7126b359",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/ralph-loop-pi",
+      "directory": "npm/ralph-loop-pi",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e61f0d3c32b2f4f8cb6e93a313e423c58380e61505d01107a4d9592138506e36",
+        "master_catalog_checksum": "e61f0d3c32b2f4f8cb6e93a313e423c58380e61505d01107a4d9592138506e36",
+        "provenance_checksum": "e61f0d3c32b2f4f8cb6e93a313e423c58380e61505d01107a4d9592138506e36",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/repeat-pi",
+      "directory": "npm/repeat-pi",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "6e5aaba4109d587d60add0cce8f2c42b434efac9018887ebd5dfa04c18febed7",
+        "master_catalog_checksum": "6e5aaba4109d587d60add0cce8f2c42b434efac9018887ebd5dfa04c18febed7",
+        "provenance_checksum": "6e5aaba4109d587d60add0cce8f2c42b434efac9018887ebd5dfa04c18febed7",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/tmustier-pi-arcade",
+      "directory": "npm/tmustier-pi-arcade",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a198925c198669dcfcc5287ed9f5974d1a58ad43e3619b7a01903328b61602e7",
+        "master_catalog_checksum": "a198925c198669dcfcc5287ed9f5974d1a58ad43e3619b7a01903328b61602e7",
+        "provenance_checksum": "a198925c198669dcfcc5287ed9f5974d1a58ad43e3619b7a01903328b61602e7",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/token-rate-pi",
+      "directory": "npm/token-rate-pi",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "867ddbea5924723a135dca1d06846f5fd4b7a90b5f79f057ff01c9357833ec6b",
+        "master_catalog_checksum": "867ddbea5924723a135dca1d06846f5fd4b7a90b5f79f057ff01c9357833ec6b",
+        "provenance_checksum": "867ddbea5924723a135dca1d06846f5fd4b7a90b5f79f057ff01c9357833ec6b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/vaayne-agent-kit",
+      "directory": "npm/vaayne-agent-kit",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a",
+        "master_catalog_checksum": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a",
+        "provenance_checksum": "a5a45c18ab6b231f8f1f98e584a253353e57c2cd2ff2a3f23a2dca9a6b68a15a",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/vaayne-pi-mcp",
+      "directory": "npm/vaayne-pi-mcp",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3d4e7d11ed0d4e145bbb1d48e2a0073197eade13079cad7ceacae3317435412e",
+        "master_catalog_checksum": "3d4e7d11ed0d4e145bbb1d48e2a0073197eade13079cad7ceacae3317435412e",
+        "provenance_checksum": "3d4e7d11ed0d4e145bbb1d48e2a0073197eade13079cad7ceacae3317435412e",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/vaayne-pi-subagent",
+      "directory": "npm/vaayne-pi-subagent",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "46686ae22598dfae424b80fcbe00dd5a7332e7db5eedc3048c490b46aacc70e0",
+        "master_catalog_checksum": "46686ae22598dfae424b80fcbe00dd5a7332e7db5eedc3048c490b46aacc70e0",
+        "provenance_checksum": "46686ae22598dfae424b80fcbe00dd5a7332e7db5eedc3048c490b46aacc70e0",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/vaayne-pi-web-tools",
+      "directory": "npm/vaayne-pi-web-tools",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "462a1bedf75121c15ead23426a8b86de2b73c2ea95a3da6c38456d9293b7fe50",
+        "master_catalog_checksum": "462a1bedf75121c15ead23426a8b86de2b73c2ea95a3da6c38456d9293b7fe50",
+        "provenance_checksum": "462a1bedf75121c15ead23426a8b86de2b73c2ea95a3da6c38456d9293b7fe50",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/vpellegrino-pi-skills",
+      "directory": "npm/vpellegrino-pi-skills",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "8f6034974269cb16a2afd43af934ed82cc7f8c69a2c37ef7b4048aa39b531994",
+        "master_catalog_checksum": "8f6034974269cb16a2afd43af934ed82cc7f8c69a2c37ef7b4048aa39b531994",
+        "provenance_checksum": "8f6034974269cb16a2afd43af934ed82cc7f8c69a2c37ef7b4048aa39b531994",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/walterra-pi-charts",
+      "directory": "npm/walterra-pi-charts",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "fdc7f399ad65241a2dce435ff95066d9726dd094dab63e0ba00fca2b44f3e438",
+        "master_catalog_checksum": "fdc7f399ad65241a2dce435ff95066d9726dd094dab63e0ba00fca2b44f3e438",
+        "provenance_checksum": "fdc7f399ad65241a2dce435ff95066d9726dd094dab63e0ba00fca2b44f3e438",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/walterra-pi-graphviz",
+      "directory": "npm/walterra-pi-graphviz",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "39ddfa33a2431d8078ae2c49e1e1d4fdd1ccc5d398e191a316053df0726cb101",
+        "master_catalog_checksum": "39ddfa33a2431d8078ae2c49e1e1d4fdd1ccc5d398e191a316053df0726cb101",
+        "provenance_checksum": "39ddfa33a2431d8078ae2c49e1e1d4fdd1ccc5d398e191a316053df0726cb101",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "npm/zenobius-pi-dcp",
+      "directory": "npm/zenobius-pi-dcp",
+      "source_tier": "NpmRegistry",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2",
+        "master_catalog_checksum": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2",
+        "provenance_checksum": "da28d9056b5f3447ff5fc6c4a224d39625355b656333845189d890532f12b4a2",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "overlay-qa-tests",
+      "directory": "overlay-qa-tests",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "bf9f1a3be8ce1d0d8d4d96d9ef411defab10d06756e7a12ce58febddc9ba3c4b",
+        "master_catalog_checksum": "bf9f1a3be8ce1d0d8d4d96d9ef411defab10d06756e7a12ce58febddc9ba3c4b",
+        "provenance_checksum": "bf9f1a3be8ce1d0d8d4d96d9ef411defab10d06756e7a12ce58febddc9ba3c4b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "overlay-test",
+      "directory": "overlay-test",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a7ccdad170e3f68673e415144b2b995f63d116a3b966d351508c8b6e7cedbbc0",
+        "master_catalog_checksum": "a7ccdad170e3f68673e415144b2b995f63d116a3b966d351508c8b6e7cedbbc0",
+        "provenance_checksum": "a7ccdad170e3f68673e415144b2b995f63d116a3b966d351508c8b6e7cedbbc0",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "permission-gate",
+      "directory": "permission-gate",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d3d73f1d4b2dcea877564979ab797e46a79192e1613121f647da839afbe0bea1",
+        "master_catalog_checksum": "d3d73f1d4b2dcea877564979ab797e46a79192e1613121f647da839afbe0bea1",
+        "provenance_checksum": "d3d73f1d4b2dcea877564979ab797e46a79192e1613121f647da839afbe0bea1",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "pirate",
+      "directory": "pirate",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "60b73aa9150a1e1e441310691ceeb1fc02c08e119975a9a151fcaa7e334de055",
+        "master_catalog_checksum": "60b73aa9150a1e1e441310691ceeb1fc02c08e119975a9a151fcaa7e334de055",
+        "provenance_checksum": "60b73aa9150a1e1e441310691ceeb1fc02c08e119975a9a151fcaa7e334de055",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "plan-mode",
+      "directory": "plan-mode",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9",
+        "master_catalog_checksum": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9",
+        "provenance_checksum": "509b3f4365c9c2c556ab1e96e5124dac41e7a70e627d6a593c4e2e5086d3aed9",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "preset",
+      "directory": "preset",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5b6675a52c54e0567ad4fb203f7b70adad4994e2e4e2d436b44f3f0f483d7c30",
+        "master_catalog_checksum": "5b6675a52c54e0567ad4fb203f7b70adad4994e2e4e2d436b44f3f0f483d7c30",
+        "provenance_checksum": "5b6675a52c54e0567ad4fb203f7b70adad4994e2e4e2d436b44f3f0f483d7c30",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "protected-paths",
+      "directory": "protected-paths",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "4a1d3f6628da9b93f28124085d58a864ceb57852d2df016603b897c3df7ba92b",
+        "master_catalog_checksum": "4a1d3f6628da9b93f28124085d58a864ceb57852d2df016603b897c3df7ba92b",
+        "provenance_checksum": "4a1d3f6628da9b93f28124085d58a864ceb57852d2df016603b897c3df7ba92b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "qna",
+      "directory": "qna",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "ae359438f308bc86ecc4dbab766a9665853ccf78824c4b1c2192933e27843d66",
+        "master_catalog_checksum": "ae359438f308bc86ecc4dbab766a9665853ccf78824c4b1c2192933e27843d66",
+        "provenance_checksum": "ae359438f308bc86ecc4dbab766a9665853ccf78824c4b1c2192933e27843d66",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "question",
+      "directory": "question",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "bc55457385e5c4d4ccc6a1583a69e68cf2ba196b8052ab0abdc1848cd1d65bec",
+        "master_catalog_checksum": "bc55457385e5c4d4ccc6a1583a69e68cf2ba196b8052ab0abdc1848cd1d65bec",
+        "provenance_checksum": "bc55457385e5c4d4ccc6a1583a69e68cf2ba196b8052ab0abdc1848cd1d65bec",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "questionnaire",
+      "directory": "questionnaire",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "99cbd301a86000e8a50e861396f7523b2a3c6a4dd10463b2c9e5c8e773f6f1ed",
+        "master_catalog_checksum": "99cbd301a86000e8a50e861396f7523b2a3c6a4dd10463b2c9e5c8e773f6f1ed",
+        "provenance_checksum": "99cbd301a86000e8a50e861396f7523b2a3c6a4dd10463b2c9e5c8e773f6f1ed",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "rainbow-editor",
+      "directory": "rainbow-editor",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "db6b53ced476a4746c77c38c8ae1cf9a74f835899b0a0dcd8795e02fdbac4e15",
+        "master_catalog_checksum": "db6b53ced476a4746c77c38c8ae1cf9a74f835899b0a0dcd8795e02fdbac4e15",
+        "provenance_checksum": "db6b53ced476a4746c77c38c8ae1cf9a74f835899b0a0dcd8795e02fdbac4e15",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "rpc-demo",
+      "directory": "rpc-demo",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "ce2c285f6b4900da766fa143dab7ad58d3779cd39b537437807e7458d21a6f83",
+        "master_catalog_checksum": "ce2c285f6b4900da766fa143dab7ad58d3779cd39b537437807e7458d21a6f83",
+        "provenance_checksum": "ce2c285f6b4900da766fa143dab7ad58d3779cd39b537437807e7458d21a6f83",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "sandbox",
+      "directory": "sandbox",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+        "master_catalog_checksum": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+        "provenance_checksum": "00f18a305d1cccc657ca161e7df1d03575b3415ada3906fd481a217b5d71c9cf",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "send-user-message",
+      "directory": "send-user-message",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "82fa2ff47441f8c1d21118ffd3c31c5fd6be4a70959c8c8bae5af2d378907f95",
+        "master_catalog_checksum": "82fa2ff47441f8c1d21118ffd3c31c5fd6be4a70959c8c8bae5af2d378907f95",
+        "provenance_checksum": "82fa2ff47441f8c1d21118ffd3c31c5fd6be4a70959c8c8bae5af2d378907f95",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "session-name",
+      "directory": "session-name",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5df0ce9bc28cabed038684803f48d77f786849aa03720f25ef1ca73d77a754ef",
+        "master_catalog_checksum": "5df0ce9bc28cabed038684803f48d77f786849aa03720f25ef1ca73d77a754ef",
+        "provenance_checksum": "5df0ce9bc28cabed038684803f48d77f786849aa03720f25ef1ca73d77a754ef",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "shutdown-command",
+      "directory": "shutdown-command",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "cc0e2521d0649a1f452daea39bdfdf01335fdefcf35d6fc33556b1a3c30a3a78",
+        "master_catalog_checksum": "cc0e2521d0649a1f452daea39bdfdf01335fdefcf35d6fc33556b1a3c30a3a78",
+        "provenance_checksum": "cc0e2521d0649a1f452daea39bdfdf01335fdefcf35d6fc33556b1a3c30a3a78",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "snake",
+      "directory": "snake",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "bbc517362fc270018de83528867dcba5657f2abf246994e5ce3798457ef08f97",
+        "master_catalog_checksum": "bbc517362fc270018de83528867dcba5657f2abf246994e5ce3798457ef08f97",
+        "provenance_checksum": "bbc517362fc270018de83528867dcba5657f2abf246994e5ce3798457ef08f97",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "space-invaders",
+      "directory": "space-invaders",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "4503a565b6a6e76e0641322dc81e4ec28c974ca79d1b35a6cbad6a3fd317d7e5",
+        "master_catalog_checksum": "4503a565b6a6e76e0641322dc81e4ec28c974ca79d1b35a6cbad6a3fd317d7e5",
+        "provenance_checksum": "4503a565b6a6e76e0641322dc81e4ec28c974ca79d1b35a6cbad6a3fd317d7e5",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "ssh",
+      "directory": "ssh",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "215182f7f2cbec3253676800a1634087dec1893938f50e304f859736ef06bc77",
+        "master_catalog_checksum": "215182f7f2cbec3253676800a1634087dec1893938f50e304f859736ef06bc77",
+        "provenance_checksum": "215182f7f2cbec3253676800a1634087dec1893938f50e304f859736ef06bc77",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "status-line",
+      "directory": "status-line",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428",
+        "master_catalog_checksum": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428",
+        "provenance_checksum": "754c687426cbbb58ed030fd93b16963a2486f6689ecea18b314ca2ec9ef81428",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "subagent",
+      "directory": "subagent",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f96041857c53f67acb940c4838fe9a48e032e03b147b3313850f23d4e77185fe",
+        "master_catalog_checksum": "f96041857c53f67acb940c4838fe9a48e032e03b147b3313850f23d4e77185fe",
+        "provenance_checksum": "f96041857c53f67acb940c4838fe9a48e032e03b147b3313850f23d4e77185fe",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "summarize",
+      "directory": "summarize",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "00c714ef20680fa7561a2bf9fbb6ef38984b8806a9e35ca31bea0d15bd2a4c31",
+        "master_catalog_checksum": "00c714ef20680fa7561a2bf9fbb6ef38984b8806a9e35ca31bea0d15bd2a4c31",
+        "provenance_checksum": "00c714ef20680fa7561a2bf9fbb6ef38984b8806a9e35ca31bea0d15bd2a4c31",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "system-prompt-header",
+      "directory": "system-prompt-header",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "ad1a4f20208d1909359fc3e7a9973511984be6c17c8834131001f603f78744c9",
+        "master_catalog_checksum": "ad1a4f20208d1909359fc3e7a9973511984be6c17c8834131001f603f78744c9",
+        "provenance_checksum": "ad1a4f20208d1909359fc3e7a9973511984be6c17c8834131001f603f78744c9",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions",
+      "directory": "third-party/aliou-pi-extensions",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "60a1caf25626d1442662f3d1f7fbdc570727e26b049868798d49ec9c023f3863",
+        "master_catalog_checksum": "60a1caf25626d1442662f3d1f7fbdc570727e26b049868798d49ec9c023f3863",
+        "provenance_checksum": "60a1caf25626d1442662f3d1f7fbdc570727e26b049868798d49ec9c023f3863",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/ben-vargas-pi-packages",
+      "directory": "third-party/ben-vargas-pi-packages",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "cfcde6f2e0ad8e86c94a3235ddcfee996a19b690b3d3293e42d46a1e3ea5ceda",
+        "master_catalog_checksum": "cfcde6f2e0ad8e86c94a3235ddcfee996a19b690b3d3293e42d46a1e3ea5ceda",
+        "provenance_checksum": "cfcde6f2e0ad8e86c94a3235ddcfee996a19b690b3d3293e42d46a1e3ea5ceda",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/charles-cooper-pi-extensions",
+      "directory": "third-party/charles-cooper-pi-extensions",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3cac3471b6c4bcb5b4d9782aad3acb7bcd73c2a56812754a35c1e8e0501e932d",
+        "master_catalog_checksum": "3cac3471b6c4bcb5b4d9782aad3acb7bcd73c2a56812754a35c1e8e0501e932d",
+        "provenance_checksum": "3cac3471b6c4bcb5b4d9782aad3acb7bcd73c2a56812754a35c1e8e0501e932d",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/cv-pi-ssh-remote",
+      "directory": "third-party/cv-pi-ssh-remote",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "0bd8627f38acdff48bd1ac65507275b8e31d521d82881f0a4faa4780f842d9dd",
+        "master_catalog_checksum": "0bd8627f38acdff48bd1ac65507275b8e31d521d82881f0a4faa4780f842d9dd",
+        "provenance_checksum": "0bd8627f38acdff48bd1ac65507275b8e31d521d82881f0a4faa4780f842d9dd",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/graffioh-pi-screenshots-picker",
+      "directory": "third-party/graffioh-pi-screenshots-picker",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "5181a60a6713abfcdd6c160d0ec25eb195ef44c2bb6692545dd1b8e4a52d2729",
+        "master_catalog_checksum": "5181a60a6713abfcdd6c160d0ec25eb195ef44c2bb6692545dd1b8e4a52d2729",
+        "provenance_checksum": "5181a60a6713abfcdd6c160d0ec25eb195ef44c2bb6692545dd1b8e4a52d2729",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/graffioh-pi-super-curl",
+      "directory": "third-party/graffioh-pi-super-curl",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "37e872926c3497b53ac9ae1b212a8fde43469fa489077b68b019117a4a12bc40",
+        "master_catalog_checksum": "37e872926c3497b53ac9ae1b212a8fde43469fa489077b68b019117a4a12bc40",
+        "provenance_checksum": "37e872926c3497b53ac9ae1b212a8fde43469fa489077b68b019117a4a12bc40",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/jyaunches-pi-canvas",
+      "directory": "third-party/jyaunches-pi-canvas",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d4618898cb6343e1c0f92bd4c57aa12e58d67a75f301c0ef934a6f0503d02856",
+        "master_catalog_checksum": "d4618898cb6343e1c0f92bd4c57aa12e58d67a75f301c0ef934a6f0503d02856",
+        "provenance_checksum": "d4618898cb6343e1c0f92bd4c57aa12e58d67a75f301c0ef934a6f0503d02856",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions",
+      "directory": "third-party/kcosr-pi-extensions",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f6b3ff290505757043ea983c7dd25450fb9c72de3fac14a38a2bcbe6f97ddb93",
+        "master_catalog_checksum": "f6b3ff290505757043ea983c7dd25450fb9c72de3fac14a38a2bcbe6f97ddb93",
+        "provenance_checksum": "f6b3ff290505757043ea983c7dd25450fb9c72de3fac14a38a2bcbe6f97ddb93",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/limouren-agent-things",
+      "directory": "third-party/limouren-agent-things",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "21eee9be6d91393d856e1db08abadf41b691c0f704ff68c4e00f37d5af510b7d",
+        "master_catalog_checksum": "21eee9be6d91393d856e1db08abadf41b691c0f704ff68c4e00f37d5af510b7d",
+        "provenance_checksum": "21eee9be6d91393d856e1db08abadf41b691c0f704ff68c4e00f37d5af510b7d",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/lsj5031-pi-notification-extension",
+      "directory": "third-party/lsj5031-pi-notification-extension",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e21fe411676c1cdabefe6cc2453f143fd3ad3f3db698074c5e0c1d400a679815",
+        "master_catalog_checksum": "e21fe411676c1cdabefe6cc2453f143fd3ad3f3db698074c5e0c1d400a679815",
+        "provenance_checksum": "e21fe411676c1cdabefe6cc2453f143fd3ad3f3db698074c5e0c1d400a679815",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/marckrenn-pi-sub",
+      "directory": "third-party/marckrenn-pi-sub",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "33ba799ac71a1086058ad47fec013f18d08fcf5021cfa5f4729538a3ab90fe36",
+        "master_catalog_checksum": "33ba799ac71a1086058ad47fec013f18d08fcf5021cfa5f4729538a3ab90fe36",
+        "provenance_checksum": "33ba799ac71a1086058ad47fec013f18d08fcf5021cfa5f4729538a3ab90fe36",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/michalvavra-agents",
+      "directory": "third-party/michalvavra-agents",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "0dcfa4b6a577b6cea9c328b19f0d42d6df4fec2dfa1d0eb7d8251d26c6a94637",
+        "master_catalog_checksum": "0dcfa4b6a577b6cea9c328b19f0d42d6df4fec2dfa1d0eb7d8251d26c6a94637",
+        "provenance_checksum": "0dcfa4b6a577b6cea9c328b19f0d42d6df4fec2dfa1d0eb7d8251d26c6a94637",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/ogulcancelik-pi-sketch",
+      "directory": "third-party/ogulcancelik-pi-sketch",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "893ecf1c25c7c23b5b2a65c1b9812144fbd4b42a87a838b11b93f538c8e98568",
+        "master_catalog_checksum": "893ecf1c25c7c23b5b2a65c1b9812144fbd4b42a87a838b11b93f538c8e98568",
+        "provenance_checksum": "893ecf1c25c7c23b5b2a65c1b9812144fbd4b42a87a838b11b93f538c8e98568",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/openclaw-openclaw",
+      "directory": "third-party/openclaw-openclaw",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "12eb25733887d8915edff35621a62e7f23d938a1a39cdeacb18c0a7add061d23",
+        "master_catalog_checksum": "12eb25733887d8915edff35621a62e7f23d938a1a39cdeacb18c0a7add061d23",
+        "provenance_checksum": "12eb25733887d8915edff35621a62e7f23d938a1a39cdeacb18c0a7add061d23",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/pasky-pi-amplike",
+      "directory": "third-party/pasky-pi-amplike",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "659340b537fa7e1fd67a970f5f7f562a6b3fe0fdac3d24c29941a38f7db6e6a3",
+        "master_catalog_checksum": "659340b537fa7e1fd67a970f5f7f562a6b3fe0fdac3d24c29941a38f7db6e6a3",
+        "provenance_checksum": "659340b537fa7e1fd67a970f5f7f562a6b3fe0fdac3d24c29941a38f7db6e6a3",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/qualisero-pi-agent-scip",
+      "directory": "third-party/qualisero-pi-agent-scip",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "7144f23e52b21cff9cbd631f405309bbd3e3003a6b6c0a6b0814d14dd61e9ecd",
+        "master_catalog_checksum": "7144f23e52b21cff9cbd631f405309bbd3e3003a6b6c0a6b0814d14dd61e9ecd",
+        "provenance_checksum": "7144f23e52b21cff9cbd631f405309bbd3e3003a6b6c0a6b0814d14dd61e9ecd",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/raunovillberg-pi-stuffed",
+      "directory": "third-party/raunovillberg-pi-stuffed",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e7202fee521d6e42ee4ff59fe17deebcca3f59de01b1d675bbd819d25f451a90",
+        "master_catalog_checksum": "e7202fee521d6e42ee4ff59fe17deebcca3f59de01b1d675bbd819d25f451a90",
+        "provenance_checksum": "e7202fee521d6e42ee4ff59fe17deebcca3f59de01b1d675bbd819d25f451a90",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/rytswd-direnv",
+      "directory": "third-party/rytswd-direnv",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d6d18409b31c3b471c83f7b6b2c3d22538ecc526ad608af40a04f9a8b512161c",
+        "master_catalog_checksum": "d6d18409b31c3b471c83f7b6b2c3d22538ecc526ad608af40a04f9a8b512161c",
+        "provenance_checksum": "d6d18409b31c3b471c83f7b6b2c3d22538ecc526ad608af40a04f9a8b512161c",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/rytswd-questionnaire",
+      "directory": "third-party/rytswd-questionnaire",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a96794e0f579c28b7277e3e0a937cdf43fc5b1e8b636bb567312bf13ff359e86",
+        "master_catalog_checksum": "a96794e0f579c28b7277e3e0a937cdf43fc5b1e8b636bb567312bf13ff359e86",
+        "provenance_checksum": "a96794e0f579c28b7277e3e0a937cdf43fc5b1e8b636bb567312bf13ff359e86",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/rytswd-slow-mode",
+      "directory": "third-party/rytswd-slow-mode",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "d29e116e17bcac2ca9d14509b9ab3b522c75f77b7d30d3c62cd7b2296510842b",
+        "master_catalog_checksum": "d29e116e17bcac2ca9d14509b9ab3b522c75f77b7d30d3c62cd7b2296510842b",
+        "provenance_checksum": "d29e116e17bcac2ca9d14509b9ab3b522c75f77b7d30d3c62cd7b2296510842b",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/vtemian-pi-config",
+      "directory": "third-party/vtemian-pi-config",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "369c6db4b029cd0b7c5e5a09792130b908af87d01b1d1a818991a74c2dbc54fc",
+        "master_catalog_checksum": "369c6db4b029cd0b7c5e5a09792130b908af87d01b1d1a818991a74c2dbc54fc",
+        "provenance_checksum": "369c6db4b029cd0b7c5e5a09792130b908af87d01b1d1a818991a74c2dbc54fc",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/w-winter-dot314",
+      "directory": "third-party/w-winter-dot314",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "f91b288aab011778eb0cbac75849731c3d36ac2e2369cf23a28ccb990461b6a1",
+        "master_catalog_checksum": "f91b288aab011778eb0cbac75849731c3d36ac2e2369cf23a28ccb990461b6a1",
+        "provenance_checksum": "f91b288aab011778eb0cbac75849731c3d36ac2e2369cf23a28ccb990461b6a1",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "third-party/zenobi-us-pi-dcp",
+      "directory": "third-party/zenobi-us-pi-dcp",
+      "source_tier": "ThirdPartyGithub",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "0d1ae83f96d31489bbb01bc8cf27969a560fbe1510e5594b41a62126da5b9932",
+        "master_catalog_checksum": "0d1ae83f96d31489bbb01bc8cf27969a560fbe1510e5594b41a62126da5b9932",
+        "provenance_checksum": "0d1ae83f96d31489bbb01bc8cf27969a560fbe1510e5594b41a62126da5b9932",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "timed-confirm",
+      "directory": "timed-confirm",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "1a263aeed2429cd08647d48432bf4aca42806bf801aca1dae7dc5cb40ed17b50",
+        "master_catalog_checksum": "1a263aeed2429cd08647d48432bf4aca42806bf801aca1dae7dc5cb40ed17b50",
+        "provenance_checksum": "1a263aeed2429cd08647d48432bf4aca42806bf801aca1dae7dc5cb40ed17b50",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "titlebar-spinner",
+      "directory": "titlebar-spinner",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "80c0590aab9851dea93d5ece66c5c0f1a1192abdbd41225216375467350ffb47",
+        "master_catalog_checksum": "80c0590aab9851dea93d5ece66c5c0f1a1192abdbd41225216375467350ffb47",
+        "provenance_checksum": "80c0590aab9851dea93d5ece66c5c0f1a1192abdbd41225216375467350ffb47",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "todo",
+      "directory": "todo",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "31a2be2d4f47ea22b054f6bb8732c491e9ee08f9b3decf6307495534c4df6dec",
+        "master_catalog_checksum": "31a2be2d4f47ea22b054f6bb8732c491e9ee08f9b3decf6307495534c4df6dec",
+        "provenance_checksum": "31a2be2d4f47ea22b054f6bb8732c491e9ee08f9b3decf6307495534c4df6dec",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "tool-override",
+      "directory": "tool-override",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "b4d1e4d1aab08c2410958fa690f5dfab120667d0e04f53b8bc9248fbdb3f1fbb",
+        "master_catalog_checksum": "b4d1e4d1aab08c2410958fa690f5dfab120667d0e04f53b8bc9248fbdb3f1fbb",
+        "provenance_checksum": "b4d1e4d1aab08c2410958fa690f5dfab120667d0e04f53b8bc9248fbdb3f1fbb",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "tools",
+      "directory": "tools",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "a2d13c338790648a1fea4ce01642765725708d7e88d51e3adef1517153c7b046",
+        "master_catalog_checksum": "a2d13c338790648a1fea4ce01642765725708d7e88d51e3adef1517153c7b046",
+        "provenance_checksum": "a2d13c338790648a1fea4ce01642765725708d7e88d51e3adef1517153c7b046",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "trigger-compact",
+      "directory": "trigger-compact",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "95c4b7b4a624b0998746a53c79a9de84ee56a8a8c015b2af04fb8890b2b8de8d",
+        "master_catalog_checksum": "95c4b7b4a624b0998746a53c79a9de84ee56a8a8c015b2af04fb8890b2b8de8d",
+        "provenance_checksum": "95c4b7b4a624b0998746a53c79a9de84ee56a8a8c015b2af04fb8890b2b8de8d",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "truncated-tool",
+      "directory": "truncated-tool",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "3751f5db4845438111c8346f4d0c975de07c65d2ee2445b1a6cca3b570a0f077",
+        "master_catalog_checksum": "3751f5db4845438111c8346f4d0c975de07c65d2ee2445b1a6cca3b570a0f077",
+        "provenance_checksum": "3751f5db4845438111c8346f4d0c975de07c65d2ee2445b1a6cca3b570a0f077",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "widget-placement",
+      "directory": "widget-placement",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "9dc59e893eebd95e7a30aaeae140b9dad721ecbe388ac24afb0f034a13be507f",
+        "master_catalog_checksum": "9dc59e893eebd95e7a30aaeae140b9dad721ecbe388ac24afb0f034a13be507f",
+        "provenance_checksum": "9dc59e893eebd95e7a30aaeae140b9dad721ecbe388ac24afb0f034a13be507f",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    },
+    {
+      "id": "with-deps",
+      "directory": "with-deps",
+      "source_tier": "OfficialPiMono",
+      "checks": {
+        "directory_exists": true,
+        "id_naming_valid": true,
+        "directory_layout_valid": true,
+        "on_disk_checksum": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293",
+        "master_catalog_checksum": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293",
+        "provenance_checksum": "e848bd4a5eb766f5426ee885f6ad611bad2a639d0b6671c970d3eea25480f293",
+        "checksums_consistent": true,
+        "has_source_url": true,
+        "has_license": true
+      },
+      "verdict": "PASS"
+    }
+  ]
+}

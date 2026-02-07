@@ -1,0 +1,2955 @@
+{
+  "schema": "pi.ext.risk_review.v1",
+  "generated_at": "2026-02-07T04:11:05.768444245+00:00",
+  "summary": {
+    "total_artifacts": 208,
+    "license_clear": 179,
+    "license_copyleft": 0,
+    "license_unknown": 29,
+    "security_clean": 107,
+    "security_info_only": 95,
+    "security_warnings": 6,
+    "security_critical": 0,
+    "has_npm_deps": 32,
+    "has_heavy_deps": 0,
+    "overall_risk": "MEDIUM"
+  },
+  "license_distribution": {
+    "Apache-2.0": 1,
+    "MIT": 178,
+    "UNKNOWN": 29
+  },
+  "artifacts": [
+    {
+      "id": "agents-mikeastock/extensions",
+      "directory": "agents-mikeastock/extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "antigravity-image-gen",
+      "directory": "antigravity-image-gen",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "directory": "auto-commit-on-exit",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "bash-spawn-hook",
+      "directory": "bash-spawn-hook",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "bookmark",
+      "directory": "bookmark",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "claude-rules",
+      "directory": "claude-rules",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/ferologics-notify",
+      "directory": "community/ferologics-notify",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-clipboard",
+      "directory": "community/hjanuschka-clipboard",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-cost-tracker",
+      "directory": "community/hjanuschka-cost-tracker",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-flicker-corp",
+      "directory": "community/hjanuschka-flicker-corp",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-funny-working-message",
+      "directory": "community/hjanuschka-funny-working-message",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-handoff",
+      "directory": "community/hjanuschka-handoff",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-loop",
+      "directory": "community/hjanuschka-loop",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-memory-mode",
+      "directory": "community/hjanuschka-memory-mode",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-oracle",
+      "directory": "community/hjanuschka-oracle",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-plan-mode",
+      "directory": "community/hjanuschka-plan-mode",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-resistance",
+      "directory": "community/hjanuschka-resistance",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-speedreading",
+      "directory": "community/hjanuschka-speedreading",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-status-widget",
+      "directory": "community/hjanuschka-status-widget",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-ultrathink",
+      "directory": "community/hjanuschka-ultrathink",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/hjanuschka-usage-bar",
+      "directory": "community/hjanuschka-usage-bar",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/jyaunches-canvas",
+      "directory": "community/jyaunches-canvas",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-answer",
+      "directory": "community/mitsuhiko-answer",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-control",
+      "directory": "community/mitsuhiko-control",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-cwd-history",
+      "directory": "community/mitsuhiko-cwd-history",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-files",
+      "directory": "community/mitsuhiko-files",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-loop",
+      "directory": "community/mitsuhiko-loop",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-notify",
+      "directory": "community/mitsuhiko-notify",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-review",
+      "directory": "community/mitsuhiko-review",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-todos",
+      "directory": "community/mitsuhiko-todos",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-uv",
+      "directory": "community/mitsuhiko-uv",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/mitsuhiko-whimsical",
+      "directory": "community/mitsuhiko-whimsical",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/nicobailon-interactive-shell",
+      "directory": "community/nicobailon-interactive-shell",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/nicobailon-interview-tool",
+      "directory": "community/nicobailon-interview-tool",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/nicobailon-mcp-adapter",
+      "directory": "community/nicobailon-mcp-adapter",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/nicobailon-powerline-footer",
+      "directory": "community/nicobailon-powerline-footer",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/nicobailon-rewind-hook",
+      "directory": "community/nicobailon-rewind-hook",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/nicobailon-subagents",
+      "directory": "community/nicobailon-subagents",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/ogulcancelik-ghostty-theme-sync",
+      "directory": "community/ogulcancelik-ghostty-theme-sync",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/prateekmedia-checkpoint",
+      "directory": "community/prateekmedia-checkpoint",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/prateekmedia-lsp",
+      "directory": "community/prateekmedia-lsp",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/prateekmedia-permission",
+      "directory": "community/prateekmedia-permission",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/prateekmedia-ralph-loop",
+      "directory": "community/prateekmedia-ralph-loop",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/prateekmedia-repeat",
+      "directory": "community/prateekmedia-repeat",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/prateekmedia-token-rate",
+      "directory": "community/prateekmedia-token-rate",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/qualisero-background-notify",
+      "directory": "community/qualisero-background-notify",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/qualisero-compact-config",
+      "directory": "community/qualisero-compact-config",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/qualisero-pi-agent-scip",
+      "directory": "community/qualisero-pi-agent-scip",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/qualisero-safe-git",
+      "directory": "community/qualisero-safe-git",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/qualisero-safe-rm",
+      "directory": "community/qualisero-safe-rm",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/qualisero-session-color",
+      "directory": "community/qualisero-session-color",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/qualisero-session-emoji",
+      "directory": "community/qualisero-session-emoji",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-agent-guidance",
+      "directory": "community/tmustier-agent-guidance",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-arcade-mario-not",
+      "directory": "community/tmustier-arcade-mario-not",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-arcade-picman",
+      "directory": "community/tmustier-arcade-picman",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-arcade-ping",
+      "directory": "community/tmustier-arcade-ping",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-arcade-spice-invaders",
+      "directory": "community/tmustier-arcade-spice-invaders",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-arcade-tetris",
+      "directory": "community/tmustier-arcade-tetris",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-code-actions",
+      "directory": "community/tmustier-code-actions",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-files-widget",
+      "directory": "community/tmustier-files-widget",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-ralph-wiggum",
+      "directory": "community/tmustier-ralph-wiggum",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-raw-paste",
+      "directory": "community/tmustier-raw-paste",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-tab-status",
+      "directory": "community/tmustier-tab-status",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "community/tmustier-usage-extension",
+      "directory": "community/tmustier-usage-extension",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "confirm-destructive",
+      "directory": "confirm-destructive",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "custom-compaction",
+      "directory": "custom-compaction",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "custom-footer",
+      "directory": "custom-footer",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "custom-header",
+      "directory": "custom-header",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "directory": "custom-provider-anthropic",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@anthropic-ai/sdk"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "custom-provider-gitlab-duo",
+      "directory": "custom-provider-gitlab-duo",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "directory": "custom-provider-qwen-cli",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "dirty-repo-guard",
+      "directory": "dirty-repo-guard",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "doom-overlay",
+      "directory": "doom-overlay",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "warning",
+      "security_findings": [
+        "[Warning] new Function(: Dynamic function construction",
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] XMLHttpRequest: Uses XMLHttpRequest",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "medium"
+    },
+    {
+      "id": "dynamic-resources",
+      "directory": "dynamic-resources",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "event-bus",
+      "directory": "event-bus",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "file-trigger",
+      "directory": "file-trigger",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "git-checkpoint",
+      "directory": "git-checkpoint",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "handoff",
+      "directory": "handoff",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "hello",
+      "directory": "hello",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "inline-bash",
+      "directory": "inline-bash",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "input-transform",
+      "directory": "input-transform",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "interactive-shell",
+      "directory": "interactive-shell",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "mac-system-theme",
+      "directory": "mac-system-theme",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "message-renderer",
+      "directory": "message-renderer",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "modal-editor",
+      "directory": "modal-editor",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "model-status",
+      "directory": "model-status",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "notify",
+      "directory": "notify",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/aliou-pi-extension-dev",
+      "directory": "npm/aliou-pi-extension-dev",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@sinclair/typebox"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/aliou-pi-guardrails",
+      "directory": "npm/aliou-pi-guardrails",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@aliou/pi-utils-settings",
+        "@aliou/sh"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/aliou-pi-linkup",
+      "directory": "npm/aliou-pi-linkup",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/aliou-pi-processes",
+      "directory": "npm/aliou-pi-processes",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@sinclair/typebox"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/aliou-pi-synthetic",
+      "directory": "npm/aliou-pi-synthetic",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/aliou-pi-toolchain",
+      "directory": "npm/aliou-pi-toolchain",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@aliou/pi-utils-settings",
+        "@aliou/sh"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/benvargas-pi-ancestor-discovery",
+      "directory": "npm/benvargas-pi-ancestor-discovery",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/benvargas-pi-antigravity-image-gen",
+      "directory": "npm/benvargas-pi-antigravity-image-gen",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/benvargas-pi-synthetic-provider",
+      "directory": "npm/benvargas-pi-synthetic-provider",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/checkpoint-pi",
+      "directory": "npm/checkpoint-pi",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "directory": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@sinclair/typebox"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/juanibiapina-pi-extension-settings",
+      "directory": "npm/juanibiapina-pi-extension-settings",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/juanibiapina-pi-files",
+      "directory": "npm/juanibiapina-pi-files",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@juanibiapina/pi-extension-settings"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/juanibiapina-pi-gob",
+      "directory": "npm/juanibiapina-pi-gob",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/lsp-pi",
+      "directory": "npm/lsp-pi",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@mariozechner/pi-ai",
+        "@mariozechner/pi-coding-agent",
+        "@mariozechner/pi-tui",
+        "@sinclair/typebox",
+        "vscode-languageserver-protocol"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-bar",
+      "directory": "npm/marckrenn-pi-sub-bar",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@marckrenn/pi-sub-core",
+        "@marckrenn/pi-sub-shared"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-core",
+      "directory": "npm/marckrenn-pi-sub-core",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@marckrenn/pi-sub-shared"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/ogulcancelik-pi-sketch",
+      "directory": "npm/ogulcancelik-pi-sketch",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/permission-pi",
+      "directory": "npm/permission-pi",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "shell-quote"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-agentic-compaction",
+      "directory": "npm/pi-agentic-compaction",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "just-bash"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-amplike",
+      "directory": "npm/pi-amplike",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@mariozechner/pi-coding-agent",
+        "@mariozechner/pi-tui"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-annotate",
+      "directory": "npm/pi-annotate",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-bash-confirm",
+      "directory": "npm/pi-bash-confirm",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-brave-search",
+      "directory": "npm/pi-brave-search",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@mozilla/readability",
+        "jsdom",
+        "turndown",
+        "turndown-plugin-gfm"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-command-center",
+      "directory": "npm/pi-command-center",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-ephemeral",
+      "directory": "npm/pi-ephemeral",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-ghostty-theme-sync",
+      "directory": "npm/pi-ghostty-theme-sync",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-interview",
+      "directory": "npm/pi-interview",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "warning",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Warning] localStorage: Accesses localStorage",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "medium"
+    },
+    {
+      "id": "npm/pi-md-export",
+      "directory": "npm/pi-md-export",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-mermaid",
+      "directory": "npm/pi-mermaid",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "beautiful-mermaid",
+        "mermaid"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-messenger",
+      "directory": "npm/pi-messenger",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-model-switch",
+      "directory": "npm/pi-model-switch",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-moonshot",
+      "directory": "npm/pi-moonshot",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-multicodex",
+      "directory": "npm/pi-multicodex",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-notify",
+      "directory": "npm/pi-notify",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-poly-notify",
+      "directory": "npm/pi-poly-notify",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-prompt-template-model",
+      "directory": "npm/pi-prompt-template-model",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-repoprompt-mcp",
+      "directory": "npm/pi-repoprompt-mcp",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@modelcontextprotocol/sdk",
+        "diff"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-review-loop",
+      "directory": "npm/pi-review-loop",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-screenshots-picker",
+      "directory": "npm/pi-screenshots-picker",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "glob"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-search-agent",
+      "directory": "npm/pi-search-agent",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] crypto.createHash: Uses cryptographic hashing",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "dotenv",
+        "openai"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-session-ask",
+      "directory": "npm/pi-session-ask",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-shadow-git",
+      "directory": "npm/pi-shadow-git",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-shell-completions",
+      "directory": "npm/pi-shell-completions",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-skill-palette",
+      "directory": "npm/pi-skill-palette",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-subdir-context",
+      "directory": "npm/pi-subdir-context",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-super-curl",
+      "directory": "npm/pi-super-curl",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "dotenv",
+        "jsonwebtoken",
+        "uuid"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-telemetry-otel",
+      "directory": "npm/pi-telemetry-otel",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@opentelemetry/api",
+        "@opentelemetry/exporter-trace-otlp-http",
+        "@opentelemetry/resources",
+        "@opentelemetry/sdk-trace-base",
+        "@opentelemetry/semantic-conventions"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-threads",
+      "directory": "npm/pi-threads",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-voice-of-god",
+      "directory": "npm/pi-voice-of-god",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/pi-wakatime",
+      "directory": "npm/pi-wakatime",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "adm-zip"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-watch",
+      "directory": "npm/pi-watch",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] crypto.createHash: Uses cryptographic hashing"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "chokidar"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/pi-web-access",
+      "directory": "npm/pi-web-access",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@mozilla/readability",
+        "linkedom",
+        "p-limit",
+        "turndown",
+        "unpdf"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/qualisero-pi-agent-scip",
+      "directory": "npm/qualisero-pi-agent-scip",
+      "license": "Apache-2.0",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@sinclair/typebox",
+        "@sourcegraph/scip-python",
+        "@sourcegraph/scip-typescript"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/ralph-loop-pi",
+      "directory": "npm/ralph-loop-pi",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/repeat-pi",
+      "directory": "npm/repeat-pi",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/tmustier-pi-arcade",
+      "directory": "npm/tmustier-pi-arcade",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/token-rate-pi",
+      "directory": "npm/token-rate-pi",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/vaayne-agent-kit",
+      "directory": "npm/vaayne-agent-kit",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "warning",
+      "security_findings": [
+        "[Warning] new Function(: Dynamic function construction",
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "medium"
+    },
+    {
+      "id": "npm/vaayne-pi-mcp",
+      "directory": "npm/vaayne-pi-mcp",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "warning",
+      "security_findings": [
+        "[Warning] new Function(: Dynamic function construction",
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@modelcontextprotocol/sdk"
+      ],
+      "risk_level": "medium"
+    },
+    {
+      "id": "npm/vaayne-pi-subagent",
+      "directory": "npm/vaayne-pi-subagent",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/vaayne-pi-web-tools",
+      "directory": "npm/vaayne-pi-web-tools",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "jsdom",
+        "turndown"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/vpellegrino-pi-skills",
+      "directory": "npm/vpellegrino-pi-skills",
+      "license": "MIT",
+      "license_source": "license_file",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "npm/walterra-pi-charts",
+      "directory": "npm/walterra-pi-charts",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@sinclair/typebox"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/walterra-pi-graphviz",
+      "directory": "npm/walterra-pi-graphviz",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@sinclair/typebox"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "npm/zenobius-pi-dcp",
+      "directory": "npm/zenobius-pi-dcp",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "bunfig"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "overlay-qa-tests",
+      "directory": "overlay-qa-tests",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "overlay-test",
+      "directory": "overlay-test",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "permission-gate",
+      "directory": "permission-gate",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "pirate",
+      "directory": "pirate",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "plan-mode",
+      "directory": "plan-mode",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "preset",
+      "directory": "preset",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "protected-paths",
+      "directory": "protected-paths",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "qna",
+      "directory": "qna",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "question",
+      "directory": "question",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "questionnaire",
+      "directory": "questionnaire",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "rainbow-editor",
+      "directory": "rainbow-editor",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "rpc-demo",
+      "directory": "rpc-demo",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "sandbox",
+      "directory": "sandbox",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "@anthropic-ai/sandbox-runtime"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "send-user-message",
+      "directory": "send-user-message",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "session-name",
+      "directory": "session-name",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "shutdown-command",
+      "directory": "shutdown-command",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "snake",
+      "directory": "snake",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "space-invaders",
+      "directory": "space-invaders",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "ssh",
+      "directory": "ssh",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "status-line",
+      "directory": "status-line",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "subagent",
+      "directory": "subagent",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "summarize",
+      "directory": "summarize",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "system-prompt-header",
+      "directory": "system-prompt-header",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "third-party/aliou-pi-extensions",
+      "directory": "third-party/aliou-pi-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "warning",
+      "security_findings": [
+        "[Warning] eval(: Dynamic code evaluation via eval()",
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] crypto.createHash: Uses cryptographic hashing",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "medium"
+    },
+    {
+      "id": "third-party/ben-vargas-pi-packages",
+      "directory": "third-party/ben-vargas-pi-packages",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/charles-cooper-pi-extensions",
+      "directory": "third-party/charles-cooper-pi-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/cv-pi-ssh-remote",
+      "directory": "third-party/cv-pi-ssh-remote",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/graffioh-pi-screenshots-picker",
+      "directory": "third-party/graffioh-pi-screenshots-picker",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/graffioh-pi-super-curl",
+      "directory": "third-party/graffioh-pi-super-curl",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/jyaunches-pi-canvas",
+      "directory": "third-party/jyaunches-pi-canvas",
+      "license": "MIT",
+      "license_source": "package_json",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions",
+      "directory": "third-party/kcosr-pi-extensions",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "warning",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Warning] localStorage: Accesses localStorage"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "medium"
+    },
+    {
+      "id": "third-party/limouren-agent-things",
+      "directory": "third-party/limouren-agent-things",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/lsj5031-pi-notification-extension",
+      "directory": "third-party/lsj5031-pi-notification-extension",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/marckrenn-pi-sub",
+      "directory": "third-party/marckrenn-pi-sub",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/michalvavra-agents",
+      "directory": "third-party/michalvavra-agents",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/ogulcancelik-pi-sketch",
+      "directory": "third-party/ogulcancelik-pi-sketch",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/openclaw-openclaw",
+      "directory": "third-party/openclaw-openclaw",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/pasky-pi-amplike",
+      "directory": "third-party/pasky-pi-amplike",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/qualisero-pi-agent-scip",
+      "directory": "third-party/qualisero-pi-agent-scip",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/raunovillberg-pi-stuffed",
+      "directory": "third-party/raunovillberg-pi-stuffed",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/rytswd-direnv",
+      "directory": "third-party/rytswd-direnv",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/rytswd-questionnaire",
+      "directory": "third-party/rytswd-questionnaire",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/rytswd-slow-mode",
+      "directory": "third-party/rytswd-slow-mode",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": true,
+      "npm_deps": [
+        "diff"
+      ],
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/vtemian-pi-config",
+      "directory": "third-party/vtemian-pi-config",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/w-winter-dot314",
+      "directory": "third-party/w-winter-dot314",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "third-party/zenobi-us-pi-dcp",
+      "directory": "third-party/zenobi-us-pi-dcp",
+      "license": "UNKNOWN",
+      "license_source": "none",
+      "redistributable": "unknown",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "low"
+    },
+    {
+      "id": "timed-confirm",
+      "directory": "timed-confirm",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "titlebar-spinner",
+      "directory": "titlebar-spinner",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "todo",
+      "directory": "todo",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "tool-override",
+      "directory": "tool-override",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] .env: References .env files"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "tools",
+      "directory": "tools",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "trigger-compact",
+      "directory": "trigger-compact",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "truncated-tool",
+      "directory": "truncated-tool",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "info",
+      "security_findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ],
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "widget-placement",
+      "directory": "widget-placement",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": false,
+      "risk_level": "minimal"
+    },
+    {
+      "id": "with-deps",
+      "directory": "with-deps",
+      "license": "MIT",
+      "license_source": "provenance_manifest",
+      "redistributable": "yes",
+      "security_severity": "clean",
+      "has_npm_deps": true,
+      "npm_deps": [
+        "ms"
+      ],
+      "risk_level": "low"
+    }
+  ],
+  "security_flagged": [
+    {
+      "id": "doom-overlay",
+      "severity": "warning",
+      "findings": [
+        "[Warning] new Function(: Dynamic function construction",
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Info] XMLHttpRequest: Uses XMLHttpRequest",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ]
+    },
+    {
+      "id": "npm/pi-interview",
+      "severity": "warning",
+      "findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Warning] localStorage: Accesses localStorage",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ]
+    },
+    {
+      "id": "npm/vaayne-agent-kit",
+      "severity": "warning",
+      "findings": [
+        "[Warning] new Function(: Dynamic function construction",
+        "[Info] child_process: Uses child_process module (common in extensions)"
+      ]
+    },
+    {
+      "id": "npm/vaayne-pi-mcp",
+      "severity": "warning",
+      "findings": [
+        "[Warning] new Function(: Dynamic function construction",
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files"
+      ]
+    },
+    {
+      "id": "third-party/aliou-pi-extensions",
+      "severity": "warning",
+      "findings": [
+        "[Warning] eval(: Dynamic code evaluation via eval()",
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] crypto.createHash: Uses cryptographic hashing",
+        "[Info] .env: References .env files",
+        "[Info] Buffer.from(: Binary buffer operations"
+      ]
+    },
+    {
+      "id": "third-party/kcosr-pi-extensions",
+      "severity": "warning",
+      "findings": [
+        "[Info] child_process: Uses child_process module (common in extensions)",
+        "[Info] .env: References .env files",
+        "[Warning] localStorage: Accesses localStorage"
+      ]
+    }
+  ],
+  "npm_dependency_risks": [
+    {
+      "id": "custom-provider-anthropic",
+      "dep_count": 1,
+      "deps": [
+        "@anthropic-ai/sdk"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/aliou-pi-extension-dev",
+      "dep_count": 1,
+      "deps": [
+        "@sinclair/typebox"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/aliou-pi-guardrails",
+      "dep_count": 2,
+      "deps": [
+        "@aliou/pi-utils-settings",
+        "@aliou/sh"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/aliou-pi-processes",
+      "dep_count": 1,
+      "deps": [
+        "@sinclair/typebox"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/aliou-pi-toolchain",
+      "dep_count": 2,
+      "deps": [
+        "@aliou/pi-utils-settings",
+        "@aliou/sh"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/imsus-pi-extension-minimax-coding-plan-mcp",
+      "dep_count": 1,
+      "deps": [
+        "@sinclair/typebox"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/juanibiapina-pi-files",
+      "dep_count": 1,
+      "deps": [
+        "@juanibiapina/pi-extension-settings"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/lsp-pi",
+      "dep_count": 5,
+      "deps": [
+        "@mariozechner/pi-ai",
+        "@mariozechner/pi-coding-agent",
+        "@mariozechner/pi-tui",
+        "@sinclair/typebox",
+        "vscode-languageserver-protocol"
+      ],
+      "notes": "5 npm dependencies"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-bar",
+      "dep_count": 2,
+      "deps": [
+        "@marckrenn/pi-sub-core",
+        "@marckrenn/pi-sub-shared"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/marckrenn-pi-sub-core",
+      "dep_count": 1,
+      "deps": [
+        "@marckrenn/pi-sub-shared"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/permission-pi",
+      "dep_count": 1,
+      "deps": [
+        "shell-quote"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/pi-agentic-compaction",
+      "dep_count": 1,
+      "deps": [
+        "just-bash"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/pi-amplike",
+      "dep_count": 2,
+      "deps": [
+        "@mariozechner/pi-coding-agent",
+        "@mariozechner/pi-tui"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/pi-brave-search",
+      "dep_count": 4,
+      "deps": [
+        "@mozilla/readability",
+        "jsdom",
+        "turndown",
+        "turndown-plugin-gfm"
+      ],
+      "notes": "4 npm dependencies"
+    },
+    {
+      "id": "npm/pi-mermaid",
+      "dep_count": 2,
+      "deps": [
+        "beautiful-mermaid",
+        "mermaid"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/pi-repoprompt-mcp",
+      "dep_count": 2,
+      "deps": [
+        "@modelcontextprotocol/sdk",
+        "diff"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/pi-screenshots-picker",
+      "dep_count": 1,
+      "deps": [
+        "glob"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/pi-search-agent",
+      "dep_count": 2,
+      "deps": [
+        "dotenv",
+        "openai"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/pi-super-curl",
+      "dep_count": 3,
+      "deps": [
+        "dotenv",
+        "jsonwebtoken",
+        "uuid"
+      ],
+      "notes": "3 npm dependencies"
+    },
+    {
+      "id": "npm/pi-telemetry-otel",
+      "dep_count": 5,
+      "deps": [
+        "@opentelemetry/api",
+        "@opentelemetry/exporter-trace-otlp-http",
+        "@opentelemetry/resources",
+        "@opentelemetry/sdk-trace-base",
+        "@opentelemetry/semantic-conventions"
+      ],
+      "notes": "5 npm dependencies"
+    },
+    {
+      "id": "npm/pi-wakatime",
+      "dep_count": 1,
+      "deps": [
+        "adm-zip"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/pi-watch",
+      "dep_count": 1,
+      "deps": [
+        "chokidar"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/pi-web-access",
+      "dep_count": 5,
+      "deps": [
+        "@mozilla/readability",
+        "linkedom",
+        "p-limit",
+        "turndown",
+        "unpdf"
+      ],
+      "notes": "5 npm dependencies"
+    },
+    {
+      "id": "npm/qualisero-pi-agent-scip",
+      "dep_count": 3,
+      "deps": [
+        "@sinclair/typebox",
+        "@sourcegraph/scip-python",
+        "@sourcegraph/scip-typescript"
+      ],
+      "notes": "3 npm dependencies"
+    },
+    {
+      "id": "npm/vaayne-pi-mcp",
+      "dep_count": 1,
+      "deps": [
+        "@modelcontextprotocol/sdk"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/vaayne-pi-web-tools",
+      "dep_count": 2,
+      "deps": [
+        "jsdom",
+        "turndown"
+      ],
+      "notes": "2 npm dependencies"
+    },
+    {
+      "id": "npm/walterra-pi-charts",
+      "dep_count": 1,
+      "deps": [
+        "@sinclair/typebox"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/walterra-pi-graphviz",
+      "dep_count": 1,
+      "deps": [
+        "@sinclair/typebox"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "npm/zenobius-pi-dcp",
+      "dep_count": 1,
+      "deps": [
+        "bunfig"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "sandbox",
+      "dep_count": 1,
+      "deps": [
+        "@anthropic-ai/sandbox-runtime"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "third-party/rytswd-slow-mode",
+      "dep_count": 1,
+      "deps": [
+        "diff"
+      ],
+      "notes": "1 npm dependencies"
+    },
+    {
+      "id": "with-deps",
+      "dep_count": 1,
+      "deps": [
+        "ms"
+      ],
+      "notes": "1 npm dependencies"
+    }
+  ]
+}

@@ -49,6 +49,7 @@ pub mod error;
 pub mod error_hints;
 pub mod extension_dispatcher;
 pub mod extension_events;
+pub mod extension_inclusion;
 pub mod extension_index;
 pub mod extension_license;
 pub mod extension_popularity;

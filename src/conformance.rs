@@ -1853,13 +1853,13 @@ mod tests {
     #[test]
     fn snapshot_validate_spec_collects_multiple_errors() {
         let spec = ArtifactSpec {
-            id: "".into(),
+            id: String::new(),
             directory: "my-ext".into(),
-            name: "".into(),
+            name: String::new(),
             source_tier: SourceTier::Community,
-            license: "".into(),
+            license: String::new(),
             source: ArtifactSource::Git {
-                repo: "".into(),
+                repo: String::new(),
                 path: None,
                 commit: None,
             },
@@ -1887,11 +1887,11 @@ mod tests {
         // Missing package name
         let bad = ArtifactSpec {
             source: ArtifactSource::Npm {
-                package: "".into(),
+                package: String::new(),
                 version: "1.0.0".into(),
                 url: None,
             },
-            ..spec.clone()
+            ..spec
         };
         assert!(!validate_artifact_spec(&bad).is_empty());
     }

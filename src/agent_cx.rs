@@ -73,7 +73,7 @@ impl AgentCx {
     /// Time capability accessor.
     #[must_use]
     pub const fn time(&self) -> AgentTime<'_> {
-        AgentTime { _cx: self }
+        AgentTime { cx: self }
     }
 
     /// HTTP capability accessor.
@@ -114,13 +114,13 @@ impl AgentFs<'_> {
 
 /// Time-related operations.
 pub struct AgentTime<'a> {
-    _cx: &'a AgentCx,
+    cx: &'a AgentCx,
 }
 
 impl AgentTime<'_> {
     pub async fn sleep(&self, duration: Duration) {
         let now = self
-            ._cx
+            .cx
             .cx()
             .timer_driver()
             .map_or_else(asupersync::time::wall_now, |timer| timer.now());
