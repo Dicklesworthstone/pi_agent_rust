@@ -1422,7 +1422,7 @@ Reports:
 
 ---
 
-## 8. Best‑Effort Compatibility Rules
+## 8. Best-Effort Compatibility Rules
 
 Compatibility scanner outputs:
 - **compatible** (safe)
@@ -1431,12 +1431,80 @@ Compatibility scanner outputs:
 
 The system always **tries to run** with warnings unless `strict` is set.
 
+### 8.1 Known Limitations
+
+Extensions that rely on the following will not work in the Rust QuickJS runtime:
+
+| Limitation | Impact | Workaround |
+|------------|--------|------------|
+| **npm packages not stubbed** | 5 failures (`openai`, `adm-zip`, `linkedom`, `@sourcegraph/scip-typescript`) | Add virtual module stubs |
+| **Multi-file imports across directories** | 4 failures (`../../shared`, `./dist/extension.js`, etc.) | Bundle into single file before loading |
+| **Native Node addons** | Blocked | Use hostcalls or WASM |
+| **Worker threads / cluster** | Blocked | Unsupported concurrency model |
+| **Raw sockets (`net`/`tls`/`dgram`)** | Blocked | Use `pi.http()` connector |
+| **Manifest registration mismatches** | 22 failures | Audit manifests against actual registrations |
+
+### 8.2 Supported Node API Shims
+
+The QuickJS runtime provides shims for common Node APIs. See §2A.6 for the
+full compatibility matrix. Key supported modules:
+
+- `node:fs` — `readFileSync`, `writeFileSync`, `existsSync`, `readdirSync`,
+  `statSync`, `mkdirSync`, `realpathSync`, promises API
+- `node:path` — `join`, `resolve`, `dirname`, `basename`, `extname`, `sep`
+- `node:os` — `platform`, `homedir`, `tmpdir`, `hostname`, `type`, `arch`
+- `node:crypto` — `randomBytes`, `createHash`, `randomUUID`
+- `node:url` — `URL`, `parse`, `fileURLToPath`
+- `node:child_process` — `spawn`, `exec`, `execSync` (via `exec` capability)
+- `node:readline` — basic interface for interactive prompts
+- `node:module` — `createRequire` stub
+
+16+ npm package stubs are provided for common third-party dependencies
+(`node-pty`, `chokidar`, `jsdom`, `turndown`, `@opentelemetry/*`, etc.).
+
 ---
 
-## 9. Next Implementation Steps
+## 9. Adding New Extensions
 
-1. Implement the protocol structs + JSON schema validation.
-2. Implement the connector dispatcher + capability checks (works for JS/WASM/MCP).
-3. Add the WASM host scaffold (component model) using the same connector layer.
-4. Build the SWC‑based `extc` pipeline + cache.
-5. Create conformance fixtures from legacy Pi extensions.
+To add a new extension to the validated corpus:
+
+1. **Place the extension source** under the appropriate corpus directory
+   (e.g., `legacy_pi_mono_code/corpus/community/`).
+
+2. **Validate in the TS oracle** — run the extension through the Bun-based
+   harness to capture its expected registrations:
+   ```bash
+   cd tests/ext_conformance/ts_oracle
+   bun run validate.ts /path/to/extension.ts
+   ```
+
+3. **Add to `VALIDATED_MANIFEST.json`** — merge the oracle output into the
+   manifest so the Rust conformance test has a ground-truth comparison.
+
+4. **Regenerate the conformance test** — the `conformance_test!` macro entries
+   in `tests/ext_conformance_generated.rs` are generated from the manifest.
+
+5. **Run conformance** — verify the extension passes:
+   ```bash
+   cargo test --test ext_conformance_generated test_<extension_id> \
+     --features ext-conformance -- --nocapture
+   ```
+
+6. **Update the catalog** — add an entry to `docs/extension-catalog.json`
+   following the `pi.ext.catalog.v1` schema (§1C.4).
+
+If the extension fails conformance, classify the failure (see §1C.5 failure
+breakdown) and determine whether a new Node shim, npm stub, or manifest
+correction is needed.
+
+## 10. Future Work
+
+- **WASM component runtime** (Tier A) — wasmtime integration with WIT hostcalls.
+- **`extc` compiler pipeline** — SWC-based TS→JS bundling + QuickJS bytecode
+  precompilation for faster cold loads.
+- **Remaining npm stubs** — `openai`, `adm-zip`, `linkedom`,
+  `@sourcegraph/scip-typescript`.
+- **Multi-file bundling** — resolve cross-directory imports for complex
+  extensions.
+- **Release build benchmarks** — establish release-mode baselines (expected
+  5-10x faster than debug).

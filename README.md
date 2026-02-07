@@ -195,12 +195,21 @@ Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
 - **Prompt templates**: Markdown files under `~/.pi/agent/prompts/` or `.pi/prompts/`; invoke via `/<template> [args]`.
 - **Packages**: Share bundles with `pi install npm:@org/pi-packages` (skills, prompts, themes, extensions).
 
-### Extensions (Planned)
+### Extensions
 
-Pi’s extension runtime is designed to be **Node/Bun-free**:
-- **Default:** WASM components (portable, sandboxed) via WIT hostcalls
-- **JS compatibility:** compiled JS → QuickJS bytecode (or JS→WASM), with a tiny Pi event loop + capability-gated connectors
-- **Security:** no ambient OS access; extensions call explicit host connectors (`tool/exec/http/session/ui`) with audit logging
+Pi runs legacy JS/TS extensions **without Node or Bun**, using an embedded
+QuickJS runtime with capability-gated host connectors:
+
+- **187 of 223 extensions pass** automated conformance tests unmodified
+- **100% pass rate** for simple single-file extensions; **98.4%** for official upstream
+- **Sub-100ms cold load** (P95), **sub-1ms warm load** (P99)
+- Node API shims for `fs`, `path`, `os`, `crypto`, `child_process`, `url`, and more
+- Capability-based security: extensions call explicit connectors (`tool/exec/http/session/ui`) with audit logging
+
+Extensions can register tools, slash commands, event hooks, flags, providers,
+and shortcuts. See [EXTENSIONS.md](EXTENSIONS.md) for the full architecture
+and [docs/extension-catalog.json](docs/extension-catalog.json) for the
+223-entry catalog with per-extension conformance status and perf budgets.
 
 ---
 
@@ -356,17 +365,18 @@ Pi reads configuration from `~/.pi/agent/settings.json`:
 ┌─────────────────────────────────▼───────────────────────────────┐
 │                          Agent Loop                             │
 │  • Message history     • Tool iteration    • Event callbacks    │
-└────────────┬────────────────────────────────────────┬───────────┘
-             │                                        │
-┌────────────▼────────────┐              ┌───────────▼────────────┐
-│    Provider Layer       │              │    Tool Registry       │
-│  • Anthropic (SSE)      │              │  • read    • bash      │
-│  • OpenAI               │              │  • write   • grep      │
-│  • Gemini               │              │  • edit    • find      │
-│  • Azure OpenAI         │              │                        │
-└────────────┬────────────┘              │  • ls                  │
-             │                           └───────────┬────────────┘
-┌────────────▼─────────────────────────────────────▼─────────────┐
+└────────┬──────────────────────┬──────────────────────┬──────────┘
+         │                      │                      │
+┌────────▼────────┐  ┌─────────▼──────────┐  ┌───────▼──────────┐
+│ Provider Layer  │  │  Tool Registry     │  │  Extension Mgr   │
+│ • Anthropic     │  │  • read  • bash    │  │  • QuickJS RT    │
+│ • OpenAI        │  │  • write • grep    │  │  • Capability    │
+│ • Gemini        │  │  • edit  • find    │  │    policy        │
+│ • Azure OpenAI  │  │  • ls              │  │  • Node shims    │
+│ • Extensions    │  │  • ext-registered  │  │  • Event hooks   │
+└────────┬────────┘  └─────────┬──────────┘  └───────┬──────────┘
+         │                     │                      │
+┌────────▼─────────────────────▼──────────────────────▼──────────┐
 │                     Session Persistence                         │
 │  • JSONL format (v3)   • Tree structure   • Per-project dirs    │
 └─────────────────────────────────────────────────────────────────┘
@@ -776,7 +786,7 @@ Pi is honest about what it doesn't do:
 | **Not all legacy providers** | Anthropic/OpenAI/Gemini/Azure supported; others TBD |
 | **No web browsing** | Use bash with curl |
 | **No GUI** | Terminal-only by design |
-| **No plugins** | Fork and extend directly |
+| **Some extensions need npm stubs** | 5 npm packages not yet shimmed; see EXTENSIONS.md §8.1 |
 | **English-centric** | Works but not optimized for other languages |
 | **Nightly Rust required** | Uses 2024 edition features |
 
@@ -830,16 +840,19 @@ Each fixture specifies:
 
 This allows validating that the Rust implementation produces equivalent results to the TypeScript original without coupling to implementation details.
 
-### No Plugin Architecture
+### Extension System
 
-Pi deliberately excludes a plugin system. The reasoning:
+Pi supports legacy JS/TS extensions via an embedded QuickJS runtime. Unlike
+traditional plugin systems, extensions run in a **sandboxed, capability-gated**
+environment with no ambient OS access:
 
-1. **Complexity cost**: Plugin systems require stable APIs, versioning, sandboxing, and documentation
-2. **Security surface**: Plugins executing arbitrary code in a tool that runs shell commands is risky
-3. **Maintenance burden**: Plugin compatibility across versions creates ongoing work
-4. **Fork-friendly**: The codebase is small enough (~5K lines) that forking is practical
+1. **No Node/Bun required**: QuickJS + Pi-provided shims for common Node APIs
+2. **Capability-based security**: each host connector call is policy-checked and logged
+3. **Conformance-tested**: 187 of 223 known extensions pass automated tests
+4. **Sub-100ms load times**: extensions load in <100ms (P95) with no JIT warmup
 
-To add a tool: fork the repo, implement the `Tool` trait in `src/tools.rs`, and build your custom binary. This takes less time than learning a plugin API.
+See [EXTENSIONS.md](EXTENSIONS.md) for the full architecture, runtime contract,
+and conformance results.
 
 ### Unsafe Forbidden
 
@@ -872,7 +885,7 @@ A: Each session is a JSONL file with message entries. Sessions are per-project (
 A: Memory safety is non-negotiable for a tool that executes arbitrary commands. The performance cost is negligible for this use case.
 
 **Q: How do I extend Pi?**
-A: Fork it. Adding a new tool means implementing the `Tool` trait in `src/tools.rs`. No plugin system by design.
+A: Pi has a full extension system. Drop a `.ts` or `.js` extension file into your project and it runs in an embedded QuickJS runtime with capability-gated host access. Extensions can register tools, slash commands, event hooks, flags, and custom providers. See [EXTENSIONS.md](EXTENSIONS.md) for details. For built-in tool changes, implement the `Tool` trait in `src/tools.rs`.
 
 **Q: Why isn't X feature included?**
 A: Pi focuses on core coding assistance. Features like web browsing, image generation, etc. are out of scope. Use specialized tools for those.
