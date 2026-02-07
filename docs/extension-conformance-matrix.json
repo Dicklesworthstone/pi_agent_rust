@@ -1,0 +1,2252 @@
+{
+  "schema": "pi.ext.conformance_matrix.v1",
+  "generated_at": "2026-02-07T04:35:32Z",
+  "task": "bd-2kyq",
+  "summary": {
+    "total_vendored": 208,
+    "official_tested": 60,
+    "scenario_fixtures": 16,
+    "parity_tested": 16,
+    "negative_tested": 30,
+    "registration_types_covered": 7,
+    "registration_types_total": 7,
+    "capabilities_covered": 11,
+    "capabilities_total": 12
+  },
+  "registration_types": [
+    {
+      "id": "tool",
+      "description": "Extensions that register custom tools via registerTool()",
+      "protocol_surface": "registerTool",
+      "typical_hostcalls": [
+        "pi.tool()",
+        "pi.exec()",
+        "pi.http()"
+      ],
+      "required_capabilities": [
+        "tool"
+      ],
+      "optional_capabilities": [
+        "read",
+        "write",
+        "exec",
+        "http",
+        "env"
+      ],
+      "pass_criteria": [
+        "Tool appears in getActiveTools() after registration",
+        "Tool invocation returns valid ToolResult with content + details",
+        "Tool handles missing/invalid arguments gracefully (error, not crash)",
+        "Tool respects capability scoping (e.g., fs paths if read/write)"
+      ],
+      "fail_criteria": [
+        "Extension crashes during registration",
+        "Tool invocation throws unhandled exception",
+        "Tool returns malformed ToolResult (missing content field)",
+        "Tool accesses capabilities not declared in manifest"
+      ]
+    },
+    {
+      "id": "event_hook",
+      "description": "Extensions that register event hooks for lifecycle events",
+      "protocol_surface": "event_hook",
+      "typical_hostcalls": [
+        "pi.session.*",
+        "pi.ui.*",
+        "pi.exec()"
+      ],
+      "required_capabilities": [
+        "event_hook"
+      ],
+      "optional_capabilities": [
+        "exec",
+        "read",
+        "write",
+        "ui",
+        "session"
+      ],
+      "pass_criteria": [
+        "Event handler fires on correct event type",
+        "Handler can block tool_call events by returning {block: true, reason}",
+        "Handler can pass through events by returning undefined/null",
+        "Handler executes within timeout budget (5s default)",
+        "Multiple hooks chain correctly (all-or-block semantics)"
+      ],
+      "fail_criteria": [
+        "Handler fires on wrong event type",
+        "Handler blocks events without providing a reason",
+        "Handler exceeds timeout causing extension kill",
+        "Handler mutation of event payload causes data corruption"
+      ]
+    },
+    {
+      "id": "command",
+      "description": "Extensions that register slash commands",
+      "protocol_surface": "registerCommand",
+      "typical_hostcalls": [
+        "pi.ui.*",
+        "pi.session.*"
+      ],
+      "required_capabilities": [
+        "ui"
+      ],
+      "optional_capabilities": [
+        "session",
+        "exec",
+        "read",
+        "write"
+      ],
+      "pass_criteria": [
+        "Command appears in slash command registry",
+        "Command handler receives correct arguments",
+        "Command can invoke UI primitives (select, input, confirm)",
+        "Command gracefully handles non-interactive mode"
+      ],
+      "fail_criteria": [
+        "Command name conflicts with built-in command",
+        "Command handler crashes on empty arguments",
+        "Command blocks indefinitely waiting for UI in non-interactive mode"
+      ]
+    },
+    {
+      "id": "provider",
+      "description": "Extensions that register custom LLM providers via registerProvider()",
+      "protocol_surface": "registerProvider",
+      "typical_hostcalls": [
+        "pi.http()"
+      ],
+      "required_capabilities": [
+        "http",
+        "provider"
+      ],
+      "optional_capabilities": [
+        "env"
+      ],
+      "pass_criteria": [
+        "Provider appears in model listing",
+        "streamSimple() returns AsyncIterable<string> chunks",
+        "Provider handles API errors with structured error messages",
+        "OAuth flow (if applicable) completes token exchange"
+      ],
+      "fail_criteria": [
+        "Provider registration crashes or hangs",
+        "streamSimple() returns non-string chunks",
+        "Provider silently swallows API errors",
+        "Provider leaks API keys in error messages"
+      ]
+    },
+    {
+      "id": "flag",
+      "description": "Extensions that register custom flags via registerFlag()",
+      "protocol_surface": "registerFlag",
+      "typical_hostcalls": [],
+      "required_capabilities": [
+        "flag"
+      ],
+      "optional_capabilities": [
+        "ui",
+        "session"
+      ],
+      "pass_criteria": [
+        "Flag appears in list_flags() output",
+        "Flag value accessible via getFlag()",
+        "Flag deduplication works (last-registered wins)",
+        "Flag snapshot pipeline preserves value across session"
+      ],
+      "fail_criteria": [
+        "Flag name conflicts with built-in flag",
+        "Flag value lost during snapshot pipeline",
+        "Flag registration causes extension load failure"
+      ]
+    },
+    {
+      "id": "shortcut",
+      "description": "Extensions that register keyboard shortcuts",
+      "protocol_surface": "registerShortcut",
+      "typical_hostcalls": [
+        "pi.ui.*"
+      ],
+      "required_capabilities": [
+        "shortcut"
+      ],
+      "optional_capabilities": [
+        "ui",
+        "read",
+        "write"
+      ],
+      "pass_criteria": [
+        "Shortcut appears in shortcut registry",
+        "Shortcut handler fires on key combination",
+        "Shortcut spec follows correct format (key, modifiers, description)"
+      ],
+      "fail_criteria": [
+        "Shortcut key conflicts with built-in binding",
+        "Shortcut handler crashes on activation",
+        "Shortcut spec malformed (missing required fields)"
+      ]
+    },
+    {
+      "id": "message_renderer",
+      "description": "Extensions that register custom message renderers",
+      "protocol_surface": "registerMessageRenderer",
+      "typical_hostcalls": [
+        "pi.ui.*"
+      ],
+      "required_capabilities": [
+        "ui"
+      ],
+      "optional_capabilities": [],
+      "pass_criteria": [
+        "Renderer registered for specified content type",
+        "Renderer receives message content and returns rendered output",
+        "Renderer handles empty/null content gracefully"
+      ],
+      "fail_criteria": [
+        "Renderer crashes on unexpected content type",
+        "Renderer returns invalid rendered output format"
+      ]
+    },
+    {
+      "id": "ui_widget",
+      "description": "Extensions that register UI widgets (header, footer, overlay, status-line)",
+      "protocol_surface": "registerHeader/registerFooter/registerOverlay/registerStatusLine",
+      "typical_hostcalls": [
+        "pi.ui.*",
+        "pi.session.*"
+      ],
+      "required_capabilities": [
+        "ui"
+      ],
+      "optional_capabilities": [
+        "session",
+        "read"
+      ],
+      "pass_criteria": [
+        "Widget renders in correct UI slot (header/footer/overlay/status)",
+        "Widget receives session state updates",
+        "Widget handles resize/reflow without crash",
+        "Widget cleanup fires on extension unload"
+      ],
+      "fail_criteria": [
+        "Widget renders in wrong slot",
+        "Widget blocks main render loop",
+        "Widget leaks resources on unload"
+      ]
+    }
+  ],
+  "capabilities": [
+    {
+      "id": "read",
+      "description": "Filesystem read operations (read, grep, find, ls)",
+      "hostcalls": [
+        "pi.fs.read()",
+        "pi.fs.grep()",
+        "pi.fs.find()",
+        "pi.fs.ls()"
+      ],
+      "scope": "Path allowlist",
+      "test_strategy": "Verify reads succeed within scope, fail outside scope"
+    },
+    {
+      "id": "write",
+      "description": "Filesystem write operations (write, edit, mkdir)",
+      "hostcalls": [
+        "pi.fs.write()",
+        "pi.fs.edit()",
+        "pi.fs.mkdir()"
+      ],
+      "scope": "Path allowlist",
+      "test_strategy": "Verify writes succeed within scope, verify content integrity"
+    },
+    {
+      "id": "exec",
+      "description": "Process execution (bash, spawn)",
+      "hostcalls": [
+        "pi.exec()",
+        "pi.bash()"
+      ],
+      "scope": "Command allowlist",
+      "test_strategy": "Verify execution succeeds, output captured, timeout respected"
+    },
+    {
+      "id": "http",
+      "description": "Network HTTP calls",
+      "hostcalls": [
+        "pi.http()"
+      ],
+      "scope": "Host allowlist",
+      "test_strategy": "VCR-recorded responses, verify request/response handling"
+    },
+    {
+      "id": "session",
+      "description": "Session metadata access (name, model, labels, messages)",
+      "hostcalls": [
+        "pi.session.*"
+      ],
+      "scope": "Session-scoped",
+      "test_strategy": "Verify get/set operations round-trip correctly"
+    },
+    {
+      "id": "ui",
+      "description": "UI primitives (select, input, confirm, notify)",
+      "hostcalls": [
+        "pi.ui.*"
+      ],
+      "scope": "Interactive mode only",
+      "test_strategy": "Mock UI responses, verify prompts and notifications"
+    },
+    {
+      "id": "env",
+      "description": "Environment variable access",
+      "hostcalls": [
+        "process.env"
+      ],
+      "scope": "Read-only",
+      "test_strategy": "Verify env reads succeed, no env mutation"
+    },
+    {
+      "id": "tool",
+      "description": "Tool registry management",
+      "hostcalls": [
+        "pi.tool.*"
+      ],
+      "scope": "Session-scoped",
+      "test_strategy": "Verify tool registration, listing, activation"
+    }
+  ],
+  "coverage_by_registration_type": {
+    "event_hook": {
+      "total": 5,
+      "scenario_tested": 3,
+      "parity_tested": 3,
+      "scenario_coverage_pct": 60.0
+    },
+    "flag": {
+      "total": 4,
+      "scenario_tested": 2,
+      "parity_tested": 2,
+      "scenario_coverage_pct": 50.0
+    },
+    "provider": {
+      "total": 3,
+      "scenario_tested": 2,
+      "parity_tested": 2,
+      "scenario_coverage_pct": 66.7
+    },
+    "shortcut": {
+      "total": 2,
+      "scenario_tested": 1,
+      "parity_tested": 1,
+      "scenario_coverage_pct": 50.0
+    },
+    "tool": {
+      "total": 13,
+      "scenario_tested": 6,
+      "parity_tested": 6,
+      "scenario_coverage_pct": 46.2
+    },
+    "ui_widget": {
+      "total": 38,
+      "scenario_tested": 6,
+      "parity_tested": 6,
+      "scenario_coverage_pct": 15.8
+    },
+    "unregistered": {
+      "total": 3,
+      "scenario_tested": 1,
+      "parity_tested": 1,
+      "scenario_coverage_pct": 33.3
+    }
+  },
+  "coverage_by_capability": {
+    "env": {
+      "total": 2,
+      "scenario_tested": 1,
+      "scenario_coverage_pct": 50.0
+    },
+    "event_hook": {
+      "total": 5,
+      "scenario_tested": 3,
+      "scenario_coverage_pct": 60.0
+    },
+    "exec": {
+      "total": 14,
+      "scenario_tested": 4,
+      "scenario_coverage_pct": 28.6
+    },
+    "flag": {
+      "total": 4,
+      "scenario_tested": 2,
+      "scenario_coverage_pct": 50.0
+    },
+    "http": {
+      "total": 4,
+      "scenario_tested": 3,
+      "scenario_coverage_pct": 75.0
+    },
+    "provider": {
+      "total": 3,
+      "scenario_tested": 2,
+      "scenario_coverage_pct": 66.7
+    },
+    "read": {
+      "total": 8,
+      "scenario_tested": 3,
+      "scenario_coverage_pct": 37.5
+    },
+    "session": {
+      "total": 3,
+      "scenario_tested": 0,
+      "scenario_coverage_pct": 0.0
+    },
+    "shortcut": {
+      "total": 2,
+      "scenario_tested": 1,
+      "scenario_coverage_pct": 50.0
+    },
+    "tool": {
+      "total": 13,
+      "scenario_tested": 6,
+      "scenario_coverage_pct": 46.2
+    },
+    "ui": {
+      "total": 48,
+      "scenario_tested": 10,
+      "scenario_coverage_pct": 20.8
+    },
+    "write": {
+      "total": 8,
+      "scenario_tested": 3,
+      "scenario_coverage_pct": 37.5
+    }
+  },
+  "test_levels": {
+    "load": {
+      "description": "Extension loads without error (import + activate())",
+      "current_pass": 60,
+      "total": 60,
+      "gate": "MUST pass for all Tier-0 and Tier-1 extensions"
+    },
+    "register": {
+      "description": "All registration calls succeed (tools, commands, hooks, providers, flags, shortcuts)",
+      "current_pass": 60,
+      "total": 60,
+      "gate": "MUST pass for all Tier-0 and Tier-1 extensions"
+    },
+    "scenario": {
+      "description": "Scenario-specific input/output assertions from golden fixtures",
+      "current_pass": 16,
+      "total": 60,
+      "gate": "MUST pass for Tier-0 sample (16); SHOULD cover all Tier-0"
+    },
+    "parity": {
+      "description": "Rust QuickJS output matches TS oracle (differential testing)",
+      "current_pass": 16,
+      "total": 60,
+      "gate": "MUST pass for Tier-0 sample; informational for Tier-1+"
+    },
+    "negative": {
+      "description": "Policy denial tests (forbidden APIs, capability violations, sandbox escapes)",
+      "current_pass": 3,
+      "total": 60,
+      "gate": "MUST pass for security-critical extensions; SHOULD cover all"
+    },
+    "performance": {
+      "description": "Load time and execution time within budget",
+      "current_pass": 60,
+      "total": 60,
+      "gate": "Load < 500ms, execution < 5s per operation"
+    }
+  },
+  "official_test_plan": [
+    {
+      "id": "antigravity-image-gen",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "env",
+        "http",
+        "read",
+        "tool",
+        "write"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "large",
+      "has_scenario_fixture": true,
+      "scenario_count": 2,
+      "scenario_kinds": [
+        "tool"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "auto-commit-on-exit",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "bash-spawn-hook",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "exec",
+        "tool"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "bookmark",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "claude-rules",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "confirm-destructive",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pass"
+      }
+    },
+    {
+      "id": "custom-compaction",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "custom-footer",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "custom-header",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "custom-provider-anthropic",
+      "registration_types": [
+        "provider"
+      ],
+      "capabilities": [
+        "http",
+        "provider"
+      ],
+      "runtime_tier": "pkg-with-deps",
+      "complexity": "large",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "provider"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "custom-provider-gitlab-duo",
+      "registration_types": [
+        "provider"
+      ],
+      "capabilities": [
+        "http",
+        "provider"
+      ],
+      "runtime_tier": "pkg-with-deps",
+      "complexity": "large",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "custom-provider-qwen-cli",
+      "registration_types": [
+        "event_hook",
+        "provider"
+      ],
+      "capabilities": [
+        "event_hook",
+        "http",
+        "provider"
+      ],
+      "runtime_tier": "pkg-with-deps",
+      "complexity": "large",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "provider"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "dirty-repo-guard",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "doom-overlay",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "multi-file",
+      "complexity": "large",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "command"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "dynamic-resources",
+      "registration_types": [
+        "unregistered"
+      ],
+      "capabilities": [],
+      "runtime_tier": "multi-file",
+      "complexity": "medium",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "event"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "event-bus",
+      "registration_types": [
+        "event_hook"
+      ],
+      "capabilities": [
+        "event_hook",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "file-trigger",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "read",
+        "ui",
+        "write"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "git-checkpoint",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "event"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "handoff",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "session",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "hello",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "tool"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "tool"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "inline-bash",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "event"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "input-transform",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "interactive-shell",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "env",
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "mac-system-theme",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "message-renderer",
+      "registration_types": [
+        "unregistered"
+      ],
+      "capabilities": [],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "modal-editor",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "model-status",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "notify",
+      "registration_types": [
+        "unregistered"
+      ],
+      "capabilities": [],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "overlay-qa-tests",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "large",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "overlay-test",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "permission-gate",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": true,
+      "scenario_count": 2,
+      "scenario_kinds": [
+        "event"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pass"
+      }
+    },
+    {
+      "id": "pirate",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "plan-mode",
+      "registration_types": [
+        "flag",
+        "shortcut"
+      ],
+      "capabilities": [
+        "flag",
+        "shortcut",
+        "ui"
+      ],
+      "runtime_tier": "multi-file",
+      "complexity": "large",
+      "has_scenario_fixture": true,
+      "scenario_count": 2,
+      "scenario_kinds": [
+        "event",
+        "command"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "preset",
+      "registration_types": [
+        "flag",
+        "shortcut"
+      ],
+      "capabilities": [
+        "flag",
+        "read",
+        "shortcut",
+        "ui",
+        "write"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "large",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "protected-paths",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "event"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pass"
+      }
+    },
+    {
+      "id": "qna",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "question",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "tool",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "questionnaire",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "tool",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "large",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "rainbow-editor",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "rpc-demo",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "sandbox",
+      "registration_types": [
+        "event_hook",
+        "flag",
+        "tool"
+      ],
+      "capabilities": [
+        "event_hook",
+        "exec",
+        "flag",
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "runtime_tier": "pkg-with-deps",
+      "complexity": "large",
+      "has_scenario_fixture": true,
+      "scenario_count": 3,
+      "scenario_kinds": [
+        "event",
+        "command",
+        "tool"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "send-user-message",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "session-name",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "session",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "shutdown-command",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "exec",
+        "tool"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "snake",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "exec",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "space-invaders",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "large",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "ssh",
+      "registration_types": [
+        "event_hook",
+        "flag",
+        "tool"
+      ],
+      "capabilities": [
+        "event_hook",
+        "exec",
+        "flag",
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "status-line",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "event"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "subagent",
+      "registration_types": [
+        "event_hook",
+        "tool"
+      ],
+      "capabilities": [
+        "event_hook",
+        "exec",
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "runtime_tier": "multi-file",
+      "complexity": "large",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "tool"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "summarize",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "system-prompt-header",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "timed-confirm",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "titlebar-spinner",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "session",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "todo",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "tool",
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": true,
+      "scenario_count": 3,
+      "scenario_kinds": [
+        "event",
+        "command",
+        "tool"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "tool-override",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "read",
+        "tool",
+        "ui",
+        "write"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "tools",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "trigger-compact",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "truncated-tool",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "exec",
+        "read",
+        "tool",
+        "write"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "medium",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "widget-placement",
+      "registration_types": [
+        "ui_widget"
+      ],
+      "capabilities": [
+        "ui"
+      ],
+      "runtime_tier": "legacy-js",
+      "complexity": "small",
+      "has_scenario_fixture": false,
+      "scenario_count": 0,
+      "scenario_kinds": [],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pending",
+        "parity": "pending",
+        "negative": "pending"
+      }
+    },
+    {
+      "id": "with-deps",
+      "registration_types": [
+        "tool"
+      ],
+      "capabilities": [
+        "tool"
+      ],
+      "runtime_tier": "pkg-with-deps",
+      "complexity": "medium",
+      "has_scenario_fixture": true,
+      "scenario_count": 1,
+      "scenario_kinds": [
+        "tool"
+      ],
+      "test_levels": {
+        "load": "pass",
+        "register": "pass",
+        "scenario": "pass",
+        "parity": "pass",
+        "negative": "pending"
+      }
+    }
+  ],
+  "extended_tier_plan": [
+    {
+      "tier": "npm",
+      "count": 66,
+      "test_strategy": "load + register + random-trial smoke",
+      "target_scenario_coverage": 0.3,
+      "extensions": [
+        "npm/aliou-pi-extension-dev",
+        "npm/aliou-pi-guardrails",
+        "npm/aliou-pi-linkup",
+        "npm/aliou-pi-processes",
+        "npm/aliou-pi-synthetic",
+        "npm/aliou-pi-toolchain",
+        "npm/benvargas-pi-ancestor-discovery",
+        "npm/benvargas-pi-antigravity-image-gen",
+        "npm/benvargas-pi-synthetic-provider",
+        "npm/checkpoint-pi"
+      ],
+      "extensions_total": 66
+    },
+    {
+      "tier": "community",
+      "count": 58,
+      "test_strategy": "load + register + random-trial smoke",
+      "target_scenario_coverage": 0.2,
+      "extensions": [
+        "community/ferologics-notify",
+        "community/hjanuschka-clipboard",
+        "community/hjanuschka-cost-tracker",
+        "community/hjanuschka-flicker-corp",
+        "community/hjanuschka-funny-working-message",
+        "community/hjanuschka-handoff",
+        "community/hjanuschka-loop",
+        "community/hjanuschka-memory-mode",
+        "community/hjanuschka-oracle",
+        "community/hjanuschka-plan-mode"
+      ],
+      "extensions_total": 58
+    },
+    {
+      "tier": "third-party",
+      "count": 23,
+      "test_strategy": "load + register + random-trial smoke",
+      "target_scenario_coverage": 0.2,
+      "extensions": [
+        "third-party/aliou-pi-extensions",
+        "third-party/ben-vargas-pi-packages",
+        "third-party/charles-cooper-pi-extensions",
+        "third-party/cv-pi-ssh-remote",
+        "third-party/graffioh-pi-screenshots-picker",
+        "third-party/graffioh-pi-super-curl",
+        "third-party/jyaunches-pi-canvas",
+        "third-party/kcosr-pi-extensions",
+        "third-party/limouren-agent-things",
+        "third-party/lsj5031-pi-notification-extension"
+      ],
+      "extensions_total": 23
+    },
+    {
+      "tier": "agents",
+      "count": 1,
+      "test_strategy": "load + register + random-trial smoke",
+      "target_scenario_coverage": 0.2,
+      "extensions": [
+        "agents-mikeastock/extensions"
+      ],
+      "extensions_total": 1
+    }
+  ],
+  "gap_analysis": {
+    "scenario_gaps": [
+      "auto-commit-on-exit",
+      "bash-spawn-hook",
+      "bookmark",
+      "claude-rules",
+      "confirm-destructive",
+      "custom-compaction",
+      "custom-footer",
+      "custom-header",
+      "custom-provider-gitlab-duo",
+      "dirty-repo-guard",
+      "event-bus",
+      "file-trigger",
+      "handoff",
+      "input-transform",
+      "interactive-shell",
+      "mac-system-theme",
+      "message-renderer",
+      "modal-editor",
+      "model-status",
+      "notify",
+      "overlay-qa-tests",
+      "overlay-test",
+      "pirate",
+      "preset",
+      "qna",
+      "question",
+      "questionnaire",
+      "rainbow-editor",
+      "rpc-demo",
+      "send-user-message",
+      "session-name",
+      "shutdown-command",
+      "snake",
+      "space-invaders",
+      "ssh",
+      "summarize",
+      "system-prompt-header",
+      "timed-confirm",
+      "titlebar-spinner",
+      "tool-override",
+      "tools",
+      "trigger-compact",
+      "truncated-tool",
+      "widget-placement"
+    ],
+    "negative_gaps": [
+      "antigravity-image-gen",
+      "auto-commit-on-exit",
+      "bash-spawn-hook",
+      "bookmark",
+      "claude-rules",
+      "custom-compaction",
+      "custom-footer",
+      "custom-header",
+      "custom-provider-anthropic",
+      "custom-provider-gitlab-duo",
+      "custom-provider-qwen-cli",
+      "dirty-repo-guard",
+      "doom-overlay",
+      "dynamic-resources",
+      "event-bus",
+      "file-trigger",
+      "git-checkpoint",
+      "handoff",
+      "hello",
+      "inline-bash",
+      "input-transform",
+      "interactive-shell",
+      "mac-system-theme",
+      "message-renderer",
+      "modal-editor",
+      "model-status",
+      "notify",
+      "overlay-qa-tests",
+      "overlay-test",
+      "pirate",
+      "plan-mode",
+      "preset",
+      "qna",
+      "question",
+      "questionnaire",
+      "rainbow-editor",
+      "rpc-demo",
+      "sandbox",
+      "send-user-message",
+      "session-name",
+      "shutdown-command",
+      "snake",
+      "space-invaders",
+      "ssh",
+      "status-line",
+      "subagent",
+      "summarize",
+      "system-prompt-header",
+      "timed-confirm",
+      "titlebar-spinner",
+      "todo",
+      "tool-override",
+      "tools",
+      "trigger-compact",
+      "truncated-tool",
+      "widget-placement",
+      "with-deps"
+    ],
+    "registration_type_gaps": {
+      "tool": {
+        "untested": [
+          "bash-spawn-hook",
+          "question",
+          "questionnaire",
+          "shutdown-command",
+          "ssh",
+          "tool-override",
+          "truncated-tool"
+        ]
+      },
+      "ui_widget": {
+        "untested": [
+          "auto-commit-on-exit",
+          "bookmark",
+          "claude-rules",
+          "confirm-destructive",
+          "custom-compaction",
+          "custom-footer",
+          "custom-header",
+          "dirty-repo-guard",
+          "file-trigger",
+          "handoff",
+          "input-transform",
+          "interactive-shell",
+          "mac-system-theme",
+          "modal-editor",
+          "model-status",
+          "overlay-qa-tests",
+          "overlay-test",
+          "pirate",
+          "qna",
+          "rainbow-editor",
+          "rpc-demo",
+          "send-user-message",
+          "session-name",
+          "snake",
+          "space-invaders",
+          "summarize",
+          "system-prompt-header",
+          "timed-confirm",
+          "titlebar-spinner",
+          "tools",
+          "trigger-compact",
+          "widget-placement"
+        ]
+      },
+      "provider": {
+        "untested": [
+          "custom-provider-gitlab-duo"
+        ]
+      },
+      "event_hook": {
+        "untested": [
+          "event-bus",
+          "ssh"
+        ]
+      },
+      "unregistered": {
+        "untested": [
+          "message-renderer",
+          "notify"
+        ]
+      },
+      "flag": {
+        "untested": [
+          "preset",
+          "ssh"
+        ]
+      },
+      "shortcut": {
+        "untested": [
+          "preset"
+        ]
+      }
+    },
+    "capability_gaps": {
+      "env": {
+        "untested": [
+          "interactive-shell"
+        ]
+      },
+      "http": {
+        "untested": [
+          "custom-provider-gitlab-duo"
+        ]
+      },
+      "read": {
+        "untested": [
+          "file-trigger",
+          "preset",
+          "ssh",
+          "tool-override",
+          "truncated-tool"
+        ]
+      },
+      "tool": {
+        "untested": [
+          "bash-spawn-hook",
+          "question",
+          "questionnaire",
+          "shutdown-command",
+          "ssh",
+          "tool-override",
+          "truncated-tool"
+        ]
+      },
+      "write": {
+        "untested": [
+          "file-trigger",
+          "preset",
+          "ssh",
+          "tool-override",
+          "truncated-tool"
+        ]
+      },
+      "exec": {
+        "untested": [
+          "auto-commit-on-exit",
+          "bash-spawn-hook",
+          "dirty-repo-guard",
+          "interactive-shell",
+          "mac-system-theme",
+          "overlay-qa-tests",
+          "shutdown-command",
+          "snake",
+          "ssh",
+          "truncated-tool"
+        ]
+      },
+      "ui": {
+        "untested": [
+          "auto-commit-on-exit",
+          "bookmark",
+          "claude-rules",
+          "confirm-destructive",
+          "custom-compaction",
+          "custom-footer",
+          "custom-header",
+          "dirty-repo-guard",
+          "event-bus",
+          "file-trigger",
+          "handoff",
+          "input-transform",
+          "interactive-shell",
+          "mac-system-theme",
+          "modal-editor",
+          "model-status",
+          "overlay-qa-tests",
+          "overlay-test",
+          "pirate",
+          "preset",
+          "qna",
+          "question",
+          "questionnaire",
+          "rainbow-editor",
+          "rpc-demo",
+          "send-user-message",
+          "session-name",
+          "snake",
+          "space-invaders",
+          "ssh",
+          "summarize",
+          "system-prompt-header",
+          "timed-confirm",
+          "titlebar-spinner",
+          "tool-override",
+          "tools",
+          "trigger-compact",
+          "widget-placement"
+        ]
+      },
+      "provider": {
+        "untested": [
+          "custom-provider-gitlab-duo"
+        ]
+      },
+      "event_hook": {
+        "untested": [
+          "event-bus",
+          "ssh"
+        ]
+      },
+      "session": {
+        "untested": [
+          "handoff",
+          "session-name",
+          "titlebar-spinner"
+        ]
+      },
+      "flag": {
+        "untested": [
+          "preset",
+          "ssh"
+        ]
+      },
+      "shortcut": {
+        "untested": [
+          "preset"
+        ]
+      }
+    }
+  },
+  "priority_test_additions": [
+    {
+      "priority": 1,
+      "description": "Add scenario fixtures for remaining tool-registering extensions",
+      "extensions": [
+        "trigger-compact",
+        "tools",
+        "tool-override",
+        "bash-spawn-hook",
+        "custom-compaction",
+        "truncated-tool",
+        "with-deps"
+      ],
+      "reason": "Tool registration is the most common type; need >80% coverage"
+    },
+    {
+      "priority": 2,
+      "description": "Add scenario fixtures for event_hook extensions without coverage",
+      "extensions": [
+        "confirm-destructive",
+        "custom-compaction"
+      ],
+      "reason": "Event hooks are security-critical (can block tool calls)"
+    },
+    {
+      "priority": 3,
+      "description": "Add negative tests for all UI-widget extensions",
+      "extensions": [
+        "auto-commit-on-exit",
+        "bookmark",
+        "claude-rules",
+        "custom-compaction",
+        "custom-footer",
+        "custom-header",
+        "dirty-repo-guard",
+        "doom-overlay",
+        "file-trigger",
+        "git-checkpoint"
+      ],
+      "reason": "UI widgets must not block render loop or leak resources"
+    },
+    {
+      "priority": 4,
+      "description": "Add load + register smoke tests for npm-registry tier",
+      "extensions": "all 66 npm artifacts",
+      "reason": "Largest untested tier; need load/register baseline"
+    },
+    {
+      "priority": 5,
+      "description": "Add load + register smoke tests for community tier",
+      "extensions": "all 58 community artifacts",
+      "reason": "Second-largest untested tier"
+    }
+  ]
+}

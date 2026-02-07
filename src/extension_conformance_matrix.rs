@@ -650,12 +650,12 @@ pub fn build_test_plan(
 
     for category in &categories {
         for capability in HostCapability::all() {
-            let behaviors = build_behaviors(category, capability);
+            let behaviors = build_behaviors(category, *capability);
             if behaviors.is_empty() {
                 continue;
             }
 
-            let required = is_required_cell(category, capability);
+            let required = is_required_cell(category, *capability);
 
             // Find exemplar extensions
             let exemplars: Vec<String> = ext_map
@@ -767,21 +767,21 @@ mod tests {
 
     #[test]
     fn build_behaviors_tool_read() {
-        let behaviors = build_behaviors(&ExtensionCategory::Tool, &HostCapability::Read);
+        let behaviors = build_behaviors(&ExtensionCategory::Tool, HostCapability::Read);
         assert_eq!(behaviors.len(), 1);
         assert!(behaviors[0].description.contains("reads files"));
     }
 
     #[test]
     fn build_behaviors_provider_http() {
-        let behaviors = build_behaviors(&ExtensionCategory::Provider, &HostCapability::Http);
+        let behaviors = build_behaviors(&ExtensionCategory::Provider, HostCapability::Http);
         assert_eq!(behaviors.len(), 1);
         assert!(behaviors[0].description.contains("streams LLM"));
     }
 
     #[test]
     fn build_behaviors_empty_for_irrelevant_cell() {
-        let behaviors = build_behaviors(&ExtensionCategory::UiComponent, &HostCapability::Exec);
+        let behaviors = build_behaviors(&ExtensionCategory::UiComponent, HostCapability::Exec);
         assert!(behaviors.is_empty());
     }
 
@@ -789,7 +789,7 @@ mod tests {
     fn is_required_tool_read() {
         assert!(is_required_cell(
             &ExtensionCategory::Tool,
-            &HostCapability::Read
+            HostCapability::Read
         ));
     }
 
@@ -797,7 +797,7 @@ mod tests {
     fn is_required_provider_http() {
         assert!(is_required_cell(
             &ExtensionCategory::Provider,
-            &HostCapability::Http
+            HostCapability::Http
         ));
     }
 
@@ -805,7 +805,7 @@ mod tests {
     fn not_required_tool_session() {
         assert!(!is_required_cell(
             &ExtensionCategory::Tool,
-            &HostCapability::Session
+            HostCapability::Session
         ));
     }
 
