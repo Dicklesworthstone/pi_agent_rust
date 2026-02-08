@@ -2,12 +2,12 @@
 //!
 //! Covers:
 //!   - Config-based policy resolution (`resolve_extension_policy`)
-//!   - `allow_dangerous` toggle removing exec/env from deny_caps
+//!   - `allow_dangerous` toggle removing exec/env from `deny_caps`
 //!   - Config merge logic for `ExtensionPolicyConfig`
 //!   - Per-extension scoped enforcement through `evaluate_for` at the policy level
 //!   - Prompt cache semantics (cache-key independence, revocation clearing)
 //!   - `required_capability_for_host_call()` tool-name → capability mapping
-//!   - FsOp parsing and capability mapping (all variants)
+//!   - `FsOp` parsing and capability mapping (all variants)
 //!   - Dispatch edge cases (validation, error codes)
 #![allow(clippy::needless_raw_string_hashes)]
 
@@ -455,29 +455,21 @@ mod per_extension_scoped {
 
         // reader-only: read allowed, write denied.
         assert_eq!(
-            policy
-                .evaluate_for("read", Some("reader-only"))
-                .decision,
+            policy.evaluate_for("read", Some("reader-only")).decision,
             PolicyDecision::Allow
         );
         assert_eq!(
-            policy
-                .evaluate_for("write", Some("reader-only"))
-                .decision,
+            policy.evaluate_for("write", Some("reader-only")).decision,
             PolicyDecision::Deny
         );
 
         // writer-only: write allowed, read denied.
         assert_eq!(
-            policy
-                .evaluate_for("write", Some("writer-only"))
-                .decision,
+            policy.evaluate_for("write", Some("writer-only")).decision,
             PolicyDecision::Allow
         );
         assert_eq!(
-            policy
-                .evaluate_for("read", Some("writer-only"))
-                .decision,
+            policy.evaluate_for("read", Some("writer-only")).decision,
             PolicyDecision::Deny
         );
     }
@@ -495,15 +487,11 @@ mod per_extension_scoped {
 
         // Global deny_caps is layer 2, extension allow is layer 3 → deny wins.
         assert_eq!(
-            policy
-                .evaluate_for("exec", Some("sneaky-ext"))
-                .decision,
+            policy.evaluate_for("exec", Some("sneaky-ext")).decision,
             PolicyDecision::Deny
         );
         assert_eq!(
-            policy
-                .evaluate_for("exec", Some("sneaky-ext"))
-                .reason,
+            policy.evaluate_for("exec", Some("sneaky-ext")).reason,
             "deny_caps"
         );
     }
@@ -913,8 +901,8 @@ mod method_capability_mapping {
     fn empty_method_returns_none() {
         let call = HostCallPayload {
             call_id: "test-empty".to_string(),
-            capability: "".to_string(),
-            method: "".to_string(),
+            capability: String::new(),
+            method: String::new(),
             params: json!({}),
             timeout_ms: None,
             cancel_token: None,
