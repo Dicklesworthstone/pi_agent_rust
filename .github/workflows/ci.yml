@@ -179,6 +179,12 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo test --all-targets --features wasm-host
 
+      - name: Unified verification runner (ci profile) [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          ./scripts/e2e/run_all.sh --profile ci
+
       - name: Coverage summary (llvm-cov)
         if: runner.os == 'Linux'
         run: |
@@ -222,4 +228,7 @@ jobs:
           path: |
             pi_agent_rust/tests/ext_conformance/reports/**/*.json
             pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
+            pi_agent_rust/tests/e2e_results/**/*.json
+            pi_agent_rust/tests/e2e_results/**/*.jsonl
+            pi_agent_rust/tests/e2e_results/**/*.log
           if-no-files-found: ignore

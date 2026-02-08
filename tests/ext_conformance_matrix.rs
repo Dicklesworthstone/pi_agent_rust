@@ -11,7 +11,7 @@ use pi::extension_inclusion::InclusionList;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn load_test_plan() -> (ConformanceTestPlan, InclusionList, Option<ApiMatrix>) {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -126,6 +126,47 @@ fn runtime_case_status(
             ),
         )
     }
+}
+
+#[allow(dead_code)]
+fn jsonl_line_count(path: &Path) -> u64 {
+    match fs::read_to_string(path) {
+        Ok(content) => content.lines().count() as u64,
+        Err(_) => 0,
+    }
+}
+
+#[allow(dead_code)]
+fn latest_e2e_summary(repo_root: &Path) -> Option<(String, Value)> {
+    let e2e_root = repo_root.join("tests/e2e_results");
+    let mut runs: Vec<PathBuf> = fs::read_dir(&e2e_root)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+
+    runs.sort_unstable();
+    runs.reverse();
+
+    for run in runs {
+        let summary_path = run.join("summary.json");
+        let bytes = match fs::read(&summary_path) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let summary = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let relative = match summary_path.strip_prefix(repo_root) {
+            Ok(path) => path.display().to_string(),
+            Err(_) => summary_path.display().to_string(),
+        };
+        return Some((relative, summary));
+    }
+
+    None
 }
 
 #[allow(clippy::items_after_statements, clippy::too_many_lines)]
@@ -293,6 +334,107 @@ fn build_runtime_api_matrix_report() -> Value {
     let mut bun_fail = 0_u64;
     let mut entries = Vec::with_capacity(cases.len());
 
+    let structured_logs = [
+        "tests/ext_conformance/reports/parity/parity_events.jsonl",
+        "tests/ext_conformance/reports/conformance_events.jsonl",
+    ]
+    .iter()
+    .map(|rel_path| {
+        let path = repo_root.join(rel_path);
+        if path.exists() {
+            let line_count = jsonl_line_count(&path);
+            json!({
+                "path": rel_path,
+                "status": "pass",
+                "line_count": line_count,
+                "diagnostics": format!("structured log available with {line_count} line(s)")
+            })
+        } else {
+            json!({
+                "path": rel_path,
+                "status": "fail",
+                "line_count": 0,
+                "diagnostics": format!("missing structured log: {rel_path}")
+            })
+        }
+    })
+    .collect::<Vec<Value>>();
+
+    let unit_outcomes = [
+        (
+            "node_buffer_shim",
+            "tests/node_buffer_shim.rs",
+            &["fn from_string_utf8_roundtrip()", "fn alloc_zero_filled()"][..],
+        ),
+        (
+            "node_crypto_shim",
+            "tests/node_crypto_shim.rs",
+            &["fn sha256_hello_hex()", "fn random_uuid_format()"][..],
+        ),
+        (
+            "node_http_shim",
+            "tests/node_http_shim.rs",
+            &[
+                "fn request_returns_object_with_write()",
+                "fn get_receives_response_body()",
+            ][..],
+        ),
+        (
+            "npm_module_stubs",
+            "tests/npm_module_stubs.rs",
+            &[
+                "fn node_pty_spawn_returns_pty()",
+                "fn chokidar_watch_returns_watcher()",
+            ][..],
+        ),
+    ]
+    .iter()
+    .map(|(target, file, markers)| {
+        let (status, diagnostics) = runtime_case_status(repo_root, file, markers);
+        json!({
+            "target": target,
+            "status": status,
+            "evidence_file": file,
+            "diagnostics": diagnostics
+        })
+    })
+    .collect::<Vec<Value>>();
+
+    let e2e_script = "scripts/e2e/run_all.sh";
+    let e2e_script_exists = repo_root.join(e2e_script).exists();
+    let e2e_workflow = if let Some((summary_path, summary)) = latest_e2e_summary(repo_root) {
+        let total = summary
+            .get("total_suites")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let passed = summary
+            .get("passed_suites")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let failed = summary
+            .get("failed_suites")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        json!({
+            "script_path": e2e_script,
+            "script_exists": e2e_script_exists,
+            "latest_summary": summary_path,
+            "status": if failed == 0 { "pass" } else { "fail" },
+            "diagnostics": format!(
+                "latest e2e summary reports total={total}, passed={passed}, failed={failed}"
+            )
+        })
+    } else {
+        json!({
+            "script_path": e2e_script,
+            "script_exists": e2e_script_exists,
+            "latest_summary": Value::Null,
+            "status": "fail",
+            "diagnostics": "no tests/e2e_results/*/summary.json artifact found"
+        })
+    };
+
     for case in &cases {
         let call_count = if case.surface == "bun" {
             bun_api_call_count(&usage, case.api)
@@ -326,7 +468,15 @@ fn build_runtime_api_matrix_report() -> Value {
             "call_count": call_count,
             "status": status,
             "evidence_file": case.evidence_file,
-            "diagnostics": diagnostics
+            "diagnostics": diagnostics,
+            "linked_outcomes": {
+                "unit_test_file": case.evidence_file,
+                "e2e_workflow_script": e2e_script,
+                "structured_logs": [
+                    "tests/ext_conformance/reports/parity/parity_events.jsonl",
+                    "tests/ext_conformance/reports/conformance_events.jsonl"
+                ]
+            }
         }));
     }
 
@@ -334,6 +484,11 @@ fn build_runtime_api_matrix_report() -> Value {
         "schema": "pi.runtime.compat-matrix.v1",
         "task": "bd-k5q5.7.3",
         "source_usage_matrix": "tests/ext_conformance/api_usage_matrix.json",
+        "linked_outcomes": {
+            "unit_tests": unit_outcomes,
+            "e2e_workflow": e2e_workflow,
+            "structured_logs": structured_logs
+        },
         "entries": entries,
         "summary": {
             "total": pass_count + fail_count,
@@ -723,6 +878,39 @@ fn generate_runtime_api_matrix_report() {
     assert!(
         bun_fail > 0,
         "runtime matrix should currently surface Bun API gaps explicitly"
+    );
+
+    let linked_outcomes = report.get("linked_outcomes").expect("linked_outcomes");
+    let unit_tests = linked_outcomes
+        .get("unit_tests")
+        .and_then(Value::as_array)
+        .expect("linked_outcomes.unit_tests");
+    assert!(
+        !unit_tests.is_empty(),
+        "linked_outcomes.unit_tests should not be empty"
+    );
+    assert_eq!(
+        linked_outcomes
+            .get("e2e_workflow")
+            .and_then(|e2e| e2e.get("script_path"))
+            .and_then(Value::as_str),
+        Some("scripts/e2e/run_all.sh"),
+        "runtime matrix should link e2e workflow script"
+    );
+    let structured_logs = linked_outcomes
+        .get("structured_logs")
+        .and_then(Value::as_array)
+        .expect("linked_outcomes.structured_logs");
+    assert!(
+        structured_logs.iter().any(|entry| {
+            entry
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(|path| {
+                    path == "tests/ext_conformance/reports/parity/parity_events.jsonl"
+                })
+        }),
+        "runtime matrix should link parity structured logs"
     );
 
     eprintln!(

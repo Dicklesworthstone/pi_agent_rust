@@ -920,6 +920,11 @@ cargo clippy         # Lint check
 ### Testing
 
 ```bash
+# Unified verification runner (recommended for deterministic evidence artifacts)
+./scripts/e2e/run_all.sh --profile focused
+./scripts/e2e/run_all.sh --profile ci
+./scripts/e2e/run_all.sh --rerun-from tests/e2e_results/<timestamp>/summary.json --skip-unit
+
 # All tests
 cargo test
 

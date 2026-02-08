@@ -199,6 +199,11 @@ Extension conformance tests validate that the Rust QuickJS runtime behaves ident
 ### Quick Reference
 
 ```bash
+# Unified verification runner (unit + e2e with structured artifacts)
+./scripts/e2e/run_all.sh --profile focused
+./scripts/e2e/run_all.sh --profile ci
+./scripts/e2e/run_all.sh --rerun-from tests/e2e_results/<timestamp>/summary.json --skip-unit
+
 # Policy enforcement tests (no feature flag, runs in default cargo test)
 cargo test --test extensions_policy_negative
 
@@ -236,6 +241,16 @@ cargo test --test ext_conformance_artifacts
 cargo test conformance
 cargo test extensions_policy_negative
 ```
+
+### Unified Verification Profiles (`scripts/e2e/run_all.sh`)
+
+| Profile | Unit Targets | E2E Suites | Typical Use |
+|---|---|---|---|
+| `full` | `ext_conformance_matrix`, `node_buffer_shim`, `node_crypto_shim`, `node_http_shim`, `npm_module_stubs` | all `e2e_*` suites | Full local verification before broad changes |
+| `focused` | `ext_conformance_matrix`, `node_buffer_shim`, `node_crypto_shim` | `e2e_extension_registration`, `e2e_tools` | Fast inner loop while iterating |
+| `ci` | same as `full` unit target set | `e2e_extension_registration` | Deterministic CI smoke gate |
+
+Each run writes `environment.json`, per-target/per-suite `result.json`, logs, and a top-level `summary.json` under `tests/e2e_results/<timestamp>/`.
 
 ### CI Integration
 
