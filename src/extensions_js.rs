@@ -3954,12 +3954,35 @@ export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, rmdir, sta
     modules.insert(
         "node:util".to_string(),
         r#"
-export function inspect(value) {
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value ?? "");
+export function inspect(value, opts) {
+  const depth = (opts && typeof opts.depth === 'number') ? opts.depth : 2;
+  const seen = new Set();
+  function fmt(v, d) {
+    if (v === null) return 'null';
+    if (v === undefined) return 'undefined';
+    const t = typeof v;
+    if (t === 'string') return d > 0 ? "'" + v + "'" : v;
+    if (t === 'number' || t === 'boolean' || t === 'bigint') return String(v);
+    if (t === 'symbol') return v.toString();
+    if (t === 'function') return '[Function: ' + (v.name || 'anonymous') + ']';
+    if (v instanceof Date) return v.toISOString();
+    if (v instanceof RegExp) return v.toString();
+    if (v instanceof Error) return v.stack || v.message || String(v);
+    if (seen.has(v)) return '[Circular]';
+    seen.add(v);
+    if (d > depth) { seen.delete(v); return Array.isArray(v) ? '[Array]' : '[Object]'; }
+    if (Array.isArray(v)) {
+      const items = v.map(x => fmt(x, d + 1));
+      seen.delete(v);
+      return '[ ' + items.join(', ') + ' ]';
+    }
+    const keys = Object.keys(v);
+    if (keys.length === 0) { seen.delete(v); return '{}'; }
+    const pairs = keys.map(k => k + ': ' + fmt(v[k], d + 1));
+    seen.delete(v);
+    return '{ ' + pairs.join(', ') + ' }';
   }
+  return fmt(value, 0);
 }
 
 export function promisify(fn) {
@@ -3980,15 +4003,70 @@ export function stripVTControlCharacters(str) {
   return (str || '').replace(/\x1B\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1B\][^\x07]*\x07/g, '');
 }
 
-export function deprecate(fn) { return fn; }
+export function deprecate(fn, msg) {
+  let warned = false;
+  return function(...args) {
+    if (!warned) { warned = true; if (typeof console !== 'undefined') console.error('DeprecationWarning: ' + (msg || '')); }
+    return fn.apply(this, args);
+  };
+}
 export function inherits(ctor, superCtor) { Object.setPrototypeOf(ctor.prototype, superCtor.prototype); }
-export function debuglog() { return () => {}; }
-export function format(f, ...args) { return f; }
-export const types = { isAsyncFunction: (fn) => false, isPromise: (v) => v instanceof Promise };
+export function debuglog(section) {
+  const env = (typeof process !== 'undefined' && process.env && process.env.NODE_DEBUG) || '';
+  const enabled = env.split(',').some(s => s.trim().toLowerCase() === (section || '').toLowerCase());
+  if (!enabled) return () => {};
+  return (...args) => { if (typeof console !== 'undefined') console.error(section.toUpperCase() + ': ' + args.map(String).join(' ')); };
+}
+export function format(f, ...args) {
+  if (typeof f !== 'string') return [f, ...args].map(v => typeof v === 'string' ? v : inspect(v)).join(' ');
+  let i = 0;
+  let result = f.replace(/%[sdifjoO%]/g, (m) => {
+    if (m === '%%') return '%';
+    if (i >= args.length) return m;
+    const a = args[i++];
+    switch (m) {
+      case '%s': return String(a);
+      case '%d': case '%f': return Number(a).toString();
+      case '%i': return parseInt(a, 10).toString();
+      case '%j': try { return JSON.stringify(a); } catch { return '[Circular]'; }
+      case '%o': case '%O': return inspect(a);
+      default: return m;
+    }
+  });
+  while (i < args.length) result += ' ' + (typeof args[i] === 'string' ? args[i] : inspect(args[i])), i++;
+  return result;
+}
+export function callbackify(fn) {
+  return function(...args) {
+    const cb = args.pop();
+    fn(...args).then(r => cb(null, r), e => cb(e));
+  };
+}
+export const types = {
+  isAsyncFunction: (fn) => typeof fn === 'function' && fn.constructor && fn.constructor.name === 'AsyncFunction',
+  isPromise: (v) => v instanceof Promise,
+  isDate: (v) => v instanceof Date,
+  isRegExp: (v) => v instanceof RegExp,
+  isNativeError: (v) => v instanceof Error,
+  isSet: (v) => v instanceof Set,
+  isMap: (v) => v instanceof Map,
+  isTypedArray: (v) => ArrayBuffer.isView(v) && !(v instanceof DataView),
+  isArrayBuffer: (v) => v instanceof ArrayBuffer,
+  isArrayBufferView: (v) => ArrayBuffer.isView(v),
+  isDataView: (v) => v instanceof DataView,
+  isGeneratorFunction: (fn) => typeof fn === 'function' && fn.constructor && fn.constructor.name === 'GeneratorFunction',
+  isGeneratorObject: (v) => v && typeof v.next === 'function' && typeof v.throw === 'function',
+  isBooleanObject: (v) => typeof v === 'object' && v instanceof Boolean,
+  isNumberObject: (v) => typeof v === 'object' && v instanceof Number,
+  isStringObject: (v) => typeof v === 'object' && v instanceof String,
+  isSymbolObject: () => false,
+  isWeakMap: (v) => v instanceof WeakMap,
+  isWeakSet: (v) => v instanceof WeakSet,
+};
 export const TextEncoder = globalThis.TextEncoder;
 export const TextDecoder = globalThis.TextDecoder;
 
-export default { inspect, promisify, stripVTControlCharacters, deprecate, inherits, debuglog, format, types, TextEncoder, TextDecoder };
+export default { inspect, promisify, stripVTControlCharacters, deprecate, inherits, debuglog, format, callbackify, types, TextEncoder, TextDecoder };
 "#
         .trim()
         .to_string(),
