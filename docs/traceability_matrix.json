@@ -24,6 +24,10 @@
         {
           "path": "tests/ext_conformance_scenarios.rs",
           "justification": "Extension runtime scenario verification."
+        },
+        {
+          "path": "tests/conformance_regression_gate.rs",
+          "justification": "12 regression gate tests validating pass-rate thresholds, N/A limits, exception policy, and verdict generation."
         }
       ],
       "e2e_scripts": [
@@ -387,6 +391,10 @@
         {
           "path": "tests/release_readiness.rs",
           "justification": "Unified release-readiness report aggregating conformance, performance, security, provenance, and traceability evidence."
+        },
+        {
+          "path": "tests/release_evidence_gate.rs",
+          "justification": "Release gate validating evidence bundle completeness, schema, thresholds, and exception policy."
         }
       ],
       "e2e_scripts": [

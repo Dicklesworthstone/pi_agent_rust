@@ -61,6 +61,7 @@ pub mod extension_tools;
 pub mod extension_validation;
 pub mod extensions;
 pub mod extensions_js;
+pub mod flake_classifier;
 pub mod http;
 pub mod http_shim;
 pub mod interactive;
