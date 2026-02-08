@@ -87,6 +87,18 @@ jobs:
             exit 1
           fi
 
+      - name: Traceability matrix guard
+        run: |
+          set -euxo pipefail
+          if command -v python3 >/dev/null 2>&1; then
+            python3 scripts/check_traceability_matrix.py
+          elif command -v python >/dev/null 2>&1; then
+            python scripts/check_traceability_matrix.py
+          else
+            echo "python interpreter not found"
+            exit 1
+          fi
+
       - name: Suite classification guard
         run: |
           set -euo pipefail

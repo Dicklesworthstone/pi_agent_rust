@@ -2,7 +2,7 @@
 
 This document inventories test coverage for **all `src/` modules** and **all `tests/` files**, flags mock usage, and lists prioritized gaps.
 
-> Last updated: 2026-02-05
+> Last updated: 2026-02-08
 
 ### Legend
 - **Unit**: `#[cfg(test)]` tests inside the module file.
@@ -10,6 +10,12 @@ This document inventories test coverage for **all `src/` modules** and **all `te
 - **Conformance**: fixture-based behavior verification against legacy expectations.
 - **E2E**: end-to-end CLI, real provider flows, or full tool roundtrips (VCR-backed or deterministic).
 - **JSONL**: test emits JSONL logs + artifact index per bd-4u9.
+
+### Traceability Governance
+
+- Machine-readable source of truth: `docs/traceability_matrix.json`
+- CI enforcement guard: `scripts/check_traceability_matrix.py` (run by `.github/workflows/ci.yml`)
+- Policy: each requirement entry must include non-empty `unit_tests`, `e2e_scripts`, and `evidence_logs` mappings, with path validation for non-CI-generated artifacts.
 
 ---
 
