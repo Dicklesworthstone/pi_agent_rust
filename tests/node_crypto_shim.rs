@@ -366,3 +366,115 @@ fn digest_no_encoding_returns_buffer() {
         "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
     );
 }
+
+#[test]
+fn create_hash_unsupported_encoding_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        try {
+            createHash("sha256").update("hello").digest("utf16le");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("unsupported encoding"),
+        "Expected unsupported-encoding error, got: {result}"
+    );
+}
+
+#[test]
+fn create_hmac_unsupported_encoding_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        try {
+            createHmac("sha256", "secret").update("hello").digest("utf16le");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("unsupported encoding"),
+        "Expected unsupported-encoding error, got: {result}"
+    );
+}
+
+#[test]
+fn create_hash_without_hostcall_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        globalThis.__pi_crypto_hash_native = undefined;
+        try {
+            createHash("sha256").update("hello").digest("hex");
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("createHash not available"),
+        "Expected clear missing-hostcall error, got: {result}"
+    );
+}
+
+#[test]
+fn random_bytes_without_hostcall_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        globalThis.__pi_crypto_random_bytes_native = undefined;
+        try {
+            randomBytes(8);
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("randomBytes not available"),
+        "Expected clear missing-hostcall error, got: {result}"
+    );
+}
+
+#[test]
+fn random_uuid_without_hostcall_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        globalThis.__pi_crypto_random_uuid_native = undefined;
+        try {
+            randomUUID();
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("randomUUID not available"),
+        "Expected clear missing-hostcall error, got: {result}"
+    );
+}
+
+#[test]
+fn random_int_without_hostcall_throws() {
+    let result = eval_crypto(
+        r#"(() => {
+        globalThis.__pi_crypto_random_int_native = undefined;
+        try {
+            randomInt(1, 3);
+            return "no-throw";
+        } catch (e) {
+            return "threw:" + e.message;
+        }
+    })()"#,
+    );
+    assert!(
+        result.contains("randomInt not available"),
+        "Expected clear missing-hostcall error, got: {result}"
+    );
+}

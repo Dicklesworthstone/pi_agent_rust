@@ -59,6 +59,29 @@ fn is_env_var_allowed_permits_pi_prefix() {
 }
 
 #[test]
+fn is_env_var_allowed_blocks_case_variants_of_sensitive_keys() {
+    for key in &[
+        "openai_api_key",
+        "OpenAI_API_Key",
+        "anthropic_api_key",
+        "gItHuB_tOkEn",
+    ] {
+        assert!(!is_env_var_allowed(key), "{key} should be blocked");
+    }
+}
+
+#[test]
+fn is_env_var_allowed_blocks_pi_prefixed_secret_like_keys() {
+    for key in &[
+        "PI_OPENAI_API_KEY",
+        "PI_DEPLOY_SECRET",
+        "PI_AWS_SECRET_ACCESS_KEY",
+    ] {
+        assert!(!is_env_var_allowed(key), "{key} should be blocked");
+    }
+}
+
+#[test]
 fn is_env_var_allowed_blocks_api_keys() {
     for key in &[
         "ANTHROPIC_API_KEY",

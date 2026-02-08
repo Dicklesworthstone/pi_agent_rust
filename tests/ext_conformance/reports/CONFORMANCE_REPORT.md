@@ -1,16 +1,16 @@
 # Extension Conformance Report
 
-> Generated: 2026-02-07T21:52:34Z
+> Generated: 2026-02-08T02:44:04Z
 
 ## Summary
 
 | Metric | Value |
 |----|----|
 | Total extensions | 223 |
-| PASS | 57 |
-| FAIL | 3 |
+| PASS | 56 |
+| FAIL | 4 |
 | N/A (not yet tested) | 163 |
-| Pass rate | 95.0% |
+| Pass rate | 93.3% |
 | Policy negative tests | 30 pass, 0 fail |
 | Source tiers | 5 |
 
@@ -171,11 +171,11 @@
 
 ## official-pi-mono
 
-66 extensions (57 pass, 3 fail, 6 untested)
+66 extensions (56 pass, 4 fail, 6 untested)
 
 | Extension | Version | Tier | Status | Evidence | Load (Rust) | Scenarios | Failures |
 |---|---|---|---|---|---|---|---|
-| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) [smoke](tests/ext_conformance/reports/smoke/extensions/antigravity-image-gen.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/antigravity-image-gen.jsonl) | 109ms | 1/1 pass |  |
+| [`antigravity-image-gen`](tests/ext_conformance/artifacts/antigravity-image-gen/antigravity-image-gen.ts) | - | T1 (simple single-file) | FAIL | [fixture](tests/ext_conformance/fixtures/antigravity-image-gen.json) [smoke](tests/ext_conformance/reports/smoke/extensions/antigravity-image-gen.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/antigravity-image-gen.jsonl) | 109ms | 1/2 pass | Happy-path: mocked SSE stream returns text + image blocks with saveMode=none |
 | [`auto-commit-on-exit`](tests/ext_conformance/artifacts/auto-commit-on-exit/auto-commit-on-exit.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
 | [`base_fixtures`](tests/ext_conformance/artifacts/base_fixtures/minimal_command/index.ts) | - | T3 (multi-file) | N/A | - | - | - |  |
 | [`bash-spawn-hook`](tests/ext_conformance/artifacts/bash-spawn-hook/bash-spawn-hook.ts) | - | T1 (simple single-file) | PASS | - | 99ms | - |  |
@@ -191,11 +191,11 @@
 | [`diff`](tests/ext_conformance/artifacts/diff/diff.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
 | [`dirty-repo-guard`](tests/ext_conformance/artifacts/dirty-repo-guard/dirty-repo-guard.ts) | - | T2 (multi-registration) | PASS | - | 99ms | - |  |
 | [`doom-overlay`](tests/ext_conformance/artifacts/doom-overlay/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/doom-overlay.json) [smoke](tests/ext_conformance/reports/smoke/extensions/doom-overlay.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/doom-overlay.jsonl) | 118ms | 1/1 pass |  |
-| [`dynamic-resources`](tests/ext_conformance/artifacts/dynamic-resources/index.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/dynamic-resources.json) [smoke](tests/ext_conformance/reports/smoke/extensions/dynamic-resources.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/dynamic-resources.jsonl) | 104ms | 0/1 pass | Returns skill/prompt/theme resources from the extension directory |
+| [`dynamic-resources`](tests/ext_conformance/artifacts/dynamic-resources/index.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/dynamic-resources.json) [smoke](tests/ext_conformance/reports/smoke/extensions/dynamic-resources.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/dynamic-resources.jsonl) | 104ms | 1/1 pass |  |
 | [`event-bus`](tests/ext_conformance/artifacts/event-bus/event-bus.ts) | - | T2 (multi-registration) | PASS | - | 99ms | - |  |
 | [`file-trigger`](tests/ext_conformance/artifacts/file-trigger/file-trigger.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
 | [`files`](tests/ext_conformance/artifacts/files/files.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
-| [`git-checkpoint`](tests/ext_conformance/artifacts/git-checkpoint/git-checkpoint.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/git-checkpoint.json) [smoke](tests/ext_conformance/reports/smoke/extensions/git-checkpoint.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/git-checkpoint.jsonl) | 101ms | 0/1 pass | Offers to restore code state on fork and applies stash when user selects Yes (exec mocked) |
+| [`git-checkpoint`](tests/ext_conformance/artifacts/git-checkpoint/git-checkpoint.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/git-checkpoint.json) [smoke](tests/ext_conformance/reports/smoke/extensions/git-checkpoint.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/git-checkpoint.jsonl) | 101ms | 1/1 pass |  |
 | [`handoff`](tests/ext_conformance/artifacts/handoff/handoff.ts) | - | T1 (simple single-file) | PASS | - | 103ms | - |  |
 | [`hello`](tests/ext_conformance/artifacts/hello/hello.ts) | - | T1 (simple single-file) | PASS | [fixture](tests/ext_conformance/fixtures/hello.json) [smoke](tests/ext_conformance/reports/smoke/extensions/hello.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/hello.jsonl) | 96ms | 1/1 pass |  |
 | [`inline-bash`](tests/ext_conformance/artifacts/inline-bash/inline-bash.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/inline-bash.json) [smoke](tests/ext_conformance/reports/smoke/extensions/inline-bash.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/inline-bash.jsonl) | 100ms | 1/1 pass |  |
@@ -211,7 +211,7 @@
 | [`overlay-test`](tests/ext_conformance/artifacts/overlay-test/overlay-test.ts) | - | T1 (simple single-file) | PASS | - | 103ms | - |  |
 | [`permission-gate`](tests/ext_conformance/artifacts/permission-gate/permission-gate.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/permission-gate.json) [smoke](tests/ext_conformance/reports/smoke/extensions/permission-gate.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/permission-gate.jsonl) | 102ms | 2/2 pass |  |
 | [`pirate`](tests/ext_conformance/artifacts/pirate/pirate.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |
-| [`plan-mode`](tests/ext_conformance/artifacts/plan-mode/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/plan-mode.json) [smoke](tests/ext_conformance/reports/smoke/extensions/plan-mode.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/plan-mode.jsonl) | 109ms | 2/2 pass |  |
+| [`plan-mode`](tests/ext_conformance/artifacts/plan-mode/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/plan-mode.json) [smoke](tests/ext_conformance/reports/smoke/extensions/plan-mode.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/plan-mode.jsonl) | 109ms | 3/3 pass |  |
 | [`preset`](tests/ext_conformance/artifacts/preset/preset.ts) | - | T2 (multi-registration) | PASS | - | 113ms | - |  |
 | [`prompt-url-widget`](tests/ext_conformance/artifacts/prompt-url-widget/prompt-url-widget.ts) | - | T2 (multi-registration) | N/A | - | - | - |  |
 | [`protected-paths`](tests/ext_conformance/artifacts/protected-paths/protected-paths.ts) | - | T2 (multi-registration) | PASS | [fixture](tests/ext_conformance/fixtures/protected-paths.json) [smoke](tests/ext_conformance/reports/smoke/extensions/protected-paths.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/protected-paths.jsonl) | 105ms | 1/1 pass |  |
@@ -228,7 +228,7 @@
 | [`snake`](tests/ext_conformance/artifacts/snake/snake.ts) | - | T1 (simple single-file) | PASS | - | 105ms | - |  |
 | [`space-invaders`](tests/ext_conformance/artifacts/space-invaders/space-invaders.ts) | - | T1 (simple single-file) | PASS | - | 112ms | - |  |
 | [`ssh`](tests/ext_conformance/artifacts/ssh/ssh.ts) | - | T2 (multi-registration) | PASS | - | 106ms | - |  |
-| [`status-line`](tests/ext_conformance/artifacts/status-line/status-line.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/status-line.json) [smoke](tests/ext_conformance/reports/smoke/extensions/status-line.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/status-line.jsonl) | 101ms | 0/1 pass | Updates footer status across session_start → turn_start → turn_end |
+| [`status-line`](tests/ext_conformance/artifacts/status-line/status-line.ts) | - | T2 (multi-registration) | FAIL | [fixture](tests/ext_conformance/fixtures/status-line.json) [smoke](tests/ext_conformance/reports/smoke/extensions/status-line.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/status-line.jsonl) | 101ms | 1/1 pass |  |
 | [`subagent`](tests/ext_conformance/artifacts/subagent/index.ts) | - | T3 (multi-file) | PASS | [fixture](tests/ext_conformance/fixtures/subagent.json) [smoke](tests/ext_conformance/reports/smoke/extensions/subagent.jsonl) [parity](tests/ext_conformance/reports/parity/extensions/subagent.jsonl) | 131ms | 1/1 pass |  |
 | [`summarize`](tests/ext_conformance/artifacts/summarize/summarize.ts) | - | T1 (simple single-file) | PASS | - | 105ms | - |  |
 | [`system-prompt-header`](tests/ext_conformance/artifacts/system-prompt-header/system-prompt-header.ts) | - | T2 (multi-registration) | PASS | - | 98ms | - |  |

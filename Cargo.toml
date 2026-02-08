@@ -120,6 +120,7 @@ criterion = { version = "0.7", features = ["html_reports"] }
 jsonschema = { version = "0.40.2", default-features = false }
 proptest = "1.6"
 wat = "1"
+toml = "0.8"
 
 [[bench]]
 name = "tools"

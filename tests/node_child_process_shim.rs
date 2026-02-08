@@ -407,6 +407,32 @@ fn spawn_detached_option_accepted() {
     assert_eq!(result, "true");
 }
 
+#[test]
+fn spawn_timeout_option_accepted() {
+    let result = eval_cp(
+        r#"(() => {
+        const child = spawn("echo", ["hi"], { timeout: 100 });
+        return typeof child.pid === "number";
+    })()"#,
+    );
+    assert_eq!(result, "true");
+}
+
+#[test]
+fn spawn_timeout_must_be_non_negative_number() {
+    let result = eval_cp(
+        r#"(() => {
+        try {
+            spawn("echo", ["hi"], { timeout: "100" });
+            return "should_have_thrown";
+        } catch (e) {
+            return e.message.includes("timeout must be a non-negative number") ? "ok" : e.message;
+        }
+    })()"#,
+    );
+    assert_eq!(result, "ok");
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 4. spawn() — kill() semantics
 // ═══════════════════════════════════════════════════════════════════════════
@@ -771,6 +797,22 @@ fn exec_accepts_options_and_callback() {
 }
 
 #[test]
+fn exec_returns_child_process_handle() {
+    let result = eval_cp(
+        r#"(() => {
+        const child = exec("echo hello", { timeout: 50 }, (err, stdout, stderr) => {});
+        return (
+            child &&
+            typeof child.pid === "number" &&
+            typeof child.kill === "function" &&
+            typeof child.on === "function"
+        );
+    })()"#,
+    );
+    assert_eq!(result, "true");
+}
+
+#[test]
 fn exec_file_accepts_args_and_callback() {
     let result = eval_cp(
         r#"(() => {
@@ -783,6 +825,22 @@ fn exec_file_accepts_args_and_callback() {
     })()"#,
     );
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn exec_file_returns_child_process_handle() {
+    let result = eval_cp(
+        r#"(() => {
+        const child = execFile("echo", ["hello"], { timeout: 50 }, (err, stdout, stderr) => {});
+        return (
+            child &&
+            typeof child.pid === "number" &&
+            typeof child.kill === "function" &&
+            typeof child.on === "function"
+        );
+    })()"#,
+    );
+    assert_eq!(result, "true");
 }
 
 #[test]

@@ -16,6 +16,11 @@ jobs:
       VCR_MODE: "playback"
       VCR_CASSETTE_DIR: "tests/fixtures/vcr"
       RUST_BACKTRACE: "1"
+      CI_GATE_PROMOTION_MODE: ${{ vars.CI_GATE_PROMOTION_MODE || 'strict' }}
+      CI_GATE_THRESHOLD_VERSION: ${{ vars.CI_GATE_THRESHOLD_VERSION || '2026-02-08.v1' }}
+      CI_GATE_MIN_PASS_RATE_PCT: ${{ vars.CI_GATE_MIN_PASS_RATE_PCT || '80.0' }}
+      CI_GATE_MAX_FAIL_COUNT: ${{ vars.CI_GATE_MAX_FAIL_COUNT || '36' }}
+      CI_GATE_MAX_NA_COUNT: ${{ vars.CI_GATE_MAX_NA_COUNT || '170' }}
     defaults:
       run:
         working-directory: pi_agent_rust
@@ -184,6 +189,248 @@ jobs:
         run: |
           set -euxo pipefail
           ./scripts/e2e/run_all.sh --profile ci
+
+      - name: CI gate promotion (strict/rollback) [linux]
+        if: runner.os == 'Linux'
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+
+          def parse_float(name: str) -> float:
+              raw = os.environ.get(name, "").strip()
+              try:
+                  return float(raw)
+              except ValueError:
+                  print(f"invalid {name}: {raw!r}", file=sys.stderr)
+                  sys.exit(1)
+
+
+          def parse_int(name: str) -> int:
+              raw = os.environ.get(name, "").strip()
+              try:
+                  return int(raw)
+              except ValueError:
+                  print(f"invalid {name}: {raw!r}", file=sys.stderr)
+                  sys.exit(1)
+
+
+          def load_json(path: Path, label: str) -> dict:
+              if not path.is_file():
+                  raise RuntimeError(f"missing required {label}: {path}")
+              with path.open(encoding="utf-8") as handle:
+                  payload = json.load(handle)
+              if not isinstance(payload, dict):
+                  raise RuntimeError(f"invalid {label}: expected JSON object at {path}")
+              return payload
+
+
+          mode = os.environ.get("CI_GATE_PROMOTION_MODE", "strict").strip().lower()
+          if mode not in {"strict", "rollback"}:
+              print(
+                  f"invalid CI_GATE_PROMOTION_MODE={mode!r}; expected 'strict' or 'rollback'",
+                  file=sys.stderr,
+              )
+              sys.exit(1)
+
+          threshold_version = os.environ.get("CI_GATE_THRESHOLD_VERSION", "2026-02-08.v1").strip()
+          thresholds = {
+              "min_pass_rate_pct": parse_float("CI_GATE_MIN_PASS_RATE_PCT"),
+              "max_fail_count": parse_int("CI_GATE_MAX_FAIL_COUNT"),
+              "max_na_count": parse_int("CI_GATE_MAX_NA_COUNT"),
+          }
+
+          # Rollback semantics are intentionally simple and asserted each run.
+          def gate_allows(mode_name: str, has_failures: bool) -> bool:
+              return not (has_failures and mode_name == "strict")
+
+
+          assert gate_allows("strict", False)
+          assert not gate_allows("strict", True)
+          assert gate_allows("rollback", True)
+
+          summary_candidates = sorted(
+              Path("tests/e2e_results").rglob("summary.json"),
+              key=lambda path: path.stat().st_mtime,
+              reverse=True,
+          )
+          if not summary_candidates:
+              print("no summary.json found under tests/e2e_results", file=sys.stderr)
+              sys.exit(1)
+
+          summary_path = summary_candidates[0]
+          artifact_dir = summary_path.parent
+          evidence_path = artifact_dir / "evidence_contract.json"
+          conformance_summary_path = Path("tests/ext_conformance/reports/conformance_summary.json")
+
+          try:
+              summary = load_json(summary_path, "summary")
+              evidence = load_json(evidence_path, "evidence_contract")
+              conformance_summary = load_json(conformance_summary_path, "conformance_summary")
+          except RuntimeError as exc:
+              print(str(exc), file=sys.stderr)
+              sys.exit(1)
+
+          checks = []
+          failures = []
+
+          def add_check(check_id: str, actual, threshold, ok: bool) -> None:
+              checks.append(
+                  {
+                      "id": check_id,
+                      "actual": actual,
+                      "threshold": threshold,
+                      "ok": ok,
+                  }
+              )
+              if not ok:
+                  failures.append(check_id)
+
+
+          evidence_schema = evidence.get("schema")
+          evidence_status = evidence.get("status")
+          evidence_errors = evidence.get("errors")
+          if not isinstance(evidence_errors, list):
+              evidence_errors = []
+          evidence_warnings = evidence.get("warnings")
+          if not isinstance(evidence_warnings, list):
+              evidence_warnings = []
+
+          add_check(
+              "evidence_contract.schema",
+              evidence_schema,
+              "pi.evidence.contract.v1",
+              evidence_schema == "pi.evidence.contract.v1",
+          )
+          add_check(
+              "evidence_contract.status",
+              evidence_status,
+              "pass",
+              evidence_status == "pass",
+          )
+          add_check(
+              "evidence_contract.errors",
+              len(evidence_errors),
+              0,
+              len(evidence_errors) == 0,
+          )
+
+          conformance_schema = conformance_summary.get("schema")
+          counts = conformance_summary.get("counts")
+          if not isinstance(counts, dict):
+              counts = {}
+          pass_rate_pct = conformance_summary.get("pass_rate_pct")
+          fail_count = counts.get("fail")
+          na_count = counts.get("na")
+          total_count = counts.get("total")
+
+          try:
+              pass_rate_pct = float(pass_rate_pct)
+          except (TypeError, ValueError):
+              pass_rate_pct = None
+          try:
+              fail_count = int(fail_count)
+          except (TypeError, ValueError):
+              fail_count = None
+          try:
+              na_count = int(na_count)
+          except (TypeError, ValueError):
+              na_count = None
+          try:
+              total_count = int(total_count)
+          except (TypeError, ValueError):
+              total_count = None
+
+          evidence_payload = conformance_summary.get("evidence")
+          required_evidence_keys = {"golden_fixtures", "load_time_benchmarks", "parity_logs", "smoke_logs"}
+          if isinstance(evidence_payload, dict):
+              evidence_keys = set(evidence_payload.keys())
+          else:
+              evidence_keys = set()
+
+          add_check(
+              "conformance_summary.schema",
+              conformance_schema,
+              "pi.ext.conformance_summary.v2",
+              conformance_schema == "pi.ext.conformance_summary.v2",
+          )
+          add_check(
+              "conformance_summary.total",
+              total_count,
+              "> 0",
+              total_count is not None and total_count > 0,
+          )
+          add_check(
+              "conformance_summary.pass_rate_pct",
+              pass_rate_pct,
+              f">= {thresholds['min_pass_rate_pct']}",
+              pass_rate_pct is not None and pass_rate_pct >= thresholds["min_pass_rate_pct"],
+          )
+          add_check(
+              "conformance_summary.fail_count",
+              fail_count,
+              f"<= {thresholds['max_fail_count']}",
+              fail_count is not None and fail_count <= thresholds["max_fail_count"],
+          )
+          add_check(
+              "conformance_summary.na_count",
+              na_count,
+              f"<= {thresholds['max_na_count']}",
+              na_count is not None and na_count <= thresholds["max_na_count"],
+          )
+          add_check(
+              "conformance_summary.evidence_keys",
+              sorted(evidence_keys),
+              sorted(required_evidence_keys),
+              required_evidence_keys.issubset(evidence_keys),
+          )
+
+          observed = {
+              "summary_profile": summary.get("profile"),
+              "summary_artifact_dir": summary.get("artifact_dir"),
+              "pass_rate_pct": pass_rate_pct,
+              "fail_count": fail_count,
+              "na_count": na_count,
+              "total_count": total_count,
+              "evidence_contract_status": evidence_status,
+              "evidence_contract_error_count": len(evidence_errors),
+              "evidence_contract_warning_count": len(evidence_warnings),
+          }
+
+          status = "pass" if not failures else ("rollback_warning" if mode == "rollback" else "fail")
+          verdict = {
+              "schema": "pi.ci.gate_promotion.v1",
+              "generated_at": datetime.now(timezone.utc).isoformat(),
+              "threshold_version": threshold_version,
+              "mode": mode,
+              "status": status,
+              "paths": {
+                  "summary_json": str(summary_path),
+                  "evidence_contract_json": str(evidence_path),
+                  "conformance_summary_json": str(conformance_summary_path),
+              },
+              "thresholds": thresholds,
+              "observed": observed,
+              "checks": checks,
+              "failures": failures,
+          }
+
+          verdict_path = artifact_dir / "ci_gate_promotion_v1.json"
+          verdict_path.write_text(json.dumps(verdict, indent=2) + "\n", encoding="utf-8")
+          print(f"CI gate verdict written: {verdict_path}")
+
+          if failures:
+              print("CI gate promotion failures:", file=sys.stderr)
+              for check_id in failures:
+                  print(f"  - {check_id}", file=sys.stderr)
+          if not gate_allows(mode, bool(failures)):
+              sys.exit(1)
+          PY
 
       - name: Coverage summary (llvm-cov)
         if: runner.os == 'Linux'

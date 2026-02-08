@@ -13,7 +13,7 @@
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -932,6 +932,115 @@ fn summary_json_has_evidence_counts() {
         evidence["smoke_logs"],
         evidence["parity_logs"],
         evidence["load_time_benchmarks"]
+    );
+}
+
+#[test]
+fn exception_policy_covers_full_conformance_failures() {
+    let baseline_path = reports_dir().join("conformance_baseline.json");
+    let full_report_path = reports_dir()
+        .join("conformance")
+        .join("conformance_report.json");
+
+    if !baseline_path.exists() || !full_report_path.exists() {
+        eprintln!(
+            "Missing exception policy inputs (baseline={}, full_report={}) — skipping",
+            baseline_path.exists(),
+            full_report_path.exists()
+        );
+        return;
+    }
+
+    let baseline = read_json_file(&baseline_path).expect("parse conformance_baseline.json");
+    let exception_policy = baseline
+        .get("exception_policy")
+        .and_then(Value::as_object)
+        .expect("conformance_baseline.json must contain exception_policy object");
+
+    assert_eq!(
+        exception_policy.get("schema").and_then(Value::as_str),
+        Some("pi.ext.exception_policy.v1"),
+        "unexpected exception policy schema"
+    );
+
+    let required_fields = [
+        "id",
+        "kind",
+        "status",
+        "cause_code",
+        "rationale",
+        "mitigation",
+        "owner",
+        "review_by",
+        "tracking_issue",
+    ];
+
+    let entries = exception_policy
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("exception_policy.entries must be an array");
+    assert!(
+        !entries.is_empty(),
+        "exception_policy.entries should not be empty"
+    );
+
+    let today = Utc::now().date_naive();
+    let mut approved_ids = HashSet::new();
+
+    for entry in entries {
+        for field in required_fields {
+            assert!(
+                entry.get(field).is_some(),
+                "exception entry missing required field: {field}"
+            );
+        }
+
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .expect("entry.id should be a string");
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .expect("entry.status should be a string");
+        assert!(
+            status == "approved" || status == "temporary",
+            "entry.status must be approved|temporary (got {status})"
+        );
+
+        let review_by = entry
+            .get("review_by")
+            .and_then(Value::as_str)
+            .expect("entry.review_by should be YYYY-MM-DD");
+        let review_date = chrono::NaiveDate::parse_from_str(review_by, "%Y-%m-%d")
+            .expect("entry.review_by must parse as YYYY-MM-DD");
+        assert!(
+            review_date >= today,
+            "entry.review_by must not be in the past (id={id}, review_by={review_by}, today={today})"
+        );
+
+        assert!(
+            approved_ids.insert(id.to_string()),
+            "duplicate exception policy entry for id={id}"
+        );
+    }
+
+    let full_report = read_json_file(&full_report_path).expect("parse conformance_report.json");
+    let failures = full_report
+        .get("failures")
+        .and_then(Value::as_array)
+        .expect("conformance_report.failures must be an array");
+
+    let missing = failures
+        .iter()
+        .filter_map(|failure| failure.get("id").and_then(Value::as_str))
+        .filter(|id| !approved_ids.contains(*id))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<String>>();
+
+    assert!(
+        missing.is_empty(),
+        "all current full conformance failures must be covered by exception policy entries; missing={missing:?}"
     );
 }
 

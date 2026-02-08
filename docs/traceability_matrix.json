@@ -8,7 +8,8 @@
       "unit_tests",
       "e2e_scripts",
       "evidence_logs"
-    ]
+    ],
+    "min_classified_trace_coverage_pct": 20
   },
   "requirements": [
     {
@@ -128,6 +129,10 @@
         {
           "path": "tests/ext_conformance_matrix.rs",
           "justification": "Compatibility matrix regression guard."
+        },
+        {
+          "path": "tests/node_bun_api_matrix.rs",
+          "justification": "151-test cross-module API surface coverage for Node/Bun shims."
         }
       ],
       "e2e_scripts": [

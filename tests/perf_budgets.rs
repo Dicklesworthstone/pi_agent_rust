@@ -328,10 +328,35 @@ fn read_total_load_time(root: &Path) -> (Option<f64>, String) {
 }
 
 fn read_stress_rss_growth(root: &Path) -> (Option<f64>, String) {
-    let path = root.join("tests/perf/reports/stress_triage.json");
-    if let Some(triage) = read_json_file(&path) {
-        if let Some(pct) = triage.get("rss_growth_pct").and_then(Value::as_f64) {
-            return (Some(pct), "stress_triage.json".to_string());
+    let candidate_paths = [
+        (
+            "target/perf/stress_triage.json",
+            "target/perf/stress_triage.json",
+        ),
+        (
+            "tests/perf/reports/stress_triage.json",
+            "tests/perf/reports/stress_triage.json",
+        ),
+    ];
+
+    for (relative_path, source) in candidate_paths {
+        let path = root.join(relative_path);
+        if let Some(triage) = read_json_file(&path) {
+            let pct = triage
+                .get("rss_growth_pct")
+                .and_then(Value::as_f64)
+                .or_else(|| {
+                    triage
+                        .get("results")
+                        .and_then(|results| results.get("rss"))
+                        .and_then(|rss| rss.get("growth_pct"))
+                        .and_then(Value::as_f64)
+                });
+
+            if let Some(value) = pct {
+                let normalized_percent = if value <= 1.0 { value * 100.0 } else { value };
+                return (Some(normalized_percent), source.to_string());
+            }
         }
     }
     (None, "no stress test data".to_string())
@@ -514,6 +539,37 @@ fn ci_enforced_budgets_have_data_sources() {
 }
 
 #[test]
+fn ci_enforced_budgets_fail_on_regression_when_data_present() {
+    let mut checked_with_data = 0usize;
+    let mut checked_without_data = 0usize;
+    let mut regressions = Vec::new();
+
+    for budget in BUDGETS.iter().filter(|budget| budget.ci_enforced) {
+        let result = check_budget(budget);
+        if let Some(actual) = result.actual {
+            checked_with_data += 1;
+            if result.status == "FAIL" {
+                regressions.push(format!(
+                    "{}: actual={actual:.3}{} threshold={:.3}{} source={}",
+                    budget.name, budget.unit, budget.threshold, budget.unit, result.source
+                ));
+            }
+        } else {
+            checked_without_data += 1;
+        }
+    }
+
+    eprintln!(
+        "[budget] CI-enforced: with_data={checked_with_data}, without_data={checked_without_data}"
+    );
+    assert!(
+        regressions.is_empty(),
+        "CI budget regressions detected:\n{}",
+        regressions.join("\n")
+    );
+}
+
+#[test]
 fn check_tool_call_budget() {
     let budget = BUDGETS
         .iter()
@@ -617,12 +673,30 @@ fn generate_budget_report() {
     let fail_count = results.iter().filter(|r| r.status == "FAIL").count();
     let no_data_count = results.iter().filter(|r| r.status == "NO_DATA").count();
     let ci_enforced_count = BUDGETS.iter().filter(|b| b.ci_enforced).count();
+    let ci_results: Vec<_> = results
+        .iter()
+        .filter(|result| {
+            BUDGETS
+                .iter()
+                .any(|budget| budget.name == result.budget_name && budget.ci_enforced)
+        })
+        .collect();
+    let ci_with_data_count = ci_results
+        .iter()
+        .filter(|result| result.actual.is_some())
+        .count();
+    let ci_fail_count = ci_results
+        .iter()
+        .filter(|result| result.status == "FAIL")
+        .count();
 
     let summary = json!({
         "schema": "pi.perf.budget_summary.v1",
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "total_budgets": BUDGETS.len(),
         "ci_enforced": ci_enforced_count,
+        "ci_with_data": ci_with_data_count,
+        "ci_fail": ci_fail_count,
         "pass": pass_count,
         "fail": fail_count,
         "no_data": no_data_count,
@@ -659,6 +733,8 @@ fn generate_budget_report() {
     md.push_str("|---|---|\n");
     let _ = writeln!(md, "| Total budgets | {} |", BUDGETS.len());
     let _ = writeln!(md, "| CI-enforced | {ci_enforced_count} |");
+    let _ = writeln!(md, "| CI-enforced with data | {ci_with_data_count} |");
+    let _ = writeln!(md, "| CI-enforced FAIL | {ci_fail_count} |");
     let _ = writeln!(md, "| PASS | {pass_count} |");
     let _ = writeln!(md, "| FAIL | {fail_count} |");
     let _ = writeln!(md, "| No data | {no_data_count} |\n");

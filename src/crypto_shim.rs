@@ -240,12 +240,20 @@ function bufToHex(buf) {
   return Array.from(buf).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-export function randomUUID() {
-  if (typeof globalThis.__pi_crypto_random_uuid_native === 'function') {
-    return globalThis.__pi_crypto_random_uuid_native();
+function requireCryptoHostcall(hostcallName, apiName) {
+  const hostcall = globalThis[hostcallName];
+  if (typeof hostcall !== 'function') {
+    throw new Error(`${apiName} not available: crypto hostcalls not registered`);
   }
-  const r = Math.random().toString(16).slice(2);
-  return `00000000-0000-4000-8000-${r.padEnd(12, '0').slice(0, 12)}`;
+  return hostcall;
+}
+
+export function randomUUID() {
+  const randomUuidNative = requireCryptoHostcall(
+    '__pi_crypto_random_uuid_native',
+    'randomUUID',
+  );
+  return randomUuidNative();
 }
 
 export function createHash(algorithm) {
@@ -256,22 +264,14 @@ export function createHash(algorithm) {
       return this;
     },
     digest(encoding) {
-      if (typeof globalThis.__pi_crypto_hash_native === 'function') {
-        const hex = globalThis.__pi_crypto_hash_native(algorithm, data, 'hex');
-        if (!encoding) return hexToBuffer(hex);
-        if (encoding === 'hex') return hex;
-        if (encoding === 'base64') {
-          return globalThis.__pi_crypto_hash_native(algorithm, data, 'base64');
-        }
-        return hex;
+      const hashNative = requireCryptoHostcall('__pi_crypto_hash_native', 'createHash');
+      const hex = hashNative(algorithm, data, 'hex');
+      if (!encoding) return hexToBuffer(hex);
+      if (encoding === 'hex') return hex;
+      if (encoding === 'base64') {
+        return hashNative(algorithm, data, 'base64');
       }
-      // Fallback: djb2 (non-cryptographic)
-      let hash = 5381;
-      for (let i = 0; i < data.length; i++) {
-        hash = ((hash << 5) + hash) + data.charCodeAt(i);
-        hash = hash >>> 0;
-      }
-      return hash.toString(16).padStart(8, '0');
+      throw new Error(`createHash.digest: unsupported encoding '${encoding}'`);
     },
   };
 }
@@ -284,42 +284,46 @@ export function createHmac(algorithm, key) {
       return this;
     },
     digest(encoding) {
-      if (typeof globalThis.__pi_crypto_hmac_native === 'function') {
-        const hex = globalThis.__pi_crypto_hmac_native(algorithm, String(key), data, 'hex');
-        if (!encoding) return hexToBuffer(hex);
-        if (encoding === 'hex') return hex;
-        if (encoding === 'base64') {
-          return globalThis.__pi_crypto_hmac_native(algorithm, String(key), data, 'base64');
-        }
-        return hex;
+      const hmacNative = requireCryptoHostcall('__pi_crypto_hmac_native', 'createHmac');
+      const hex = hmacNative(algorithm, String(key), data, 'hex');
+      if (!encoding) return hexToBuffer(hex);
+      if (encoding === 'hex') return hex;
+      if (encoding === 'base64') {
+        return hmacNative(algorithm, String(key), data, 'base64');
       }
-      throw new Error('HMAC not available: crypto hostcalls not registered');
+      throw new Error(`createHmac.digest: unsupported encoding '${encoding}'`);
     },
   };
 }
 
 export function randomBytes(size) {
-  if (typeof globalThis.__pi_crypto_random_bytes_native === 'function') {
-    const arr = new Uint8Array(globalThis.__pi_crypto_random_bytes_native(size));
-    const hex = bufToHex(arr);
-    arr.toString = function(enc) {
-      if (enc === 'hex') return hex;
-      if (enc === 'base64') return globalThis.btoa(String.fromCharCode(...this));
-      return new TextDecoder().decode(this);
-    };
-    return arr;
+  if (!Number.isInteger(size) || size < 0) {
+    throw new Error('randomBytes: size must be a non-negative integer');
   }
-  const arr = new Uint8Array(size);
-  for (let i = 0; i < size; i++) arr[i] = Math.floor(Math.random() * 256);
+  const randomBytesNative = requireCryptoHostcall(
+    '__pi_crypto_random_bytes_native',
+    'randomBytes',
+  );
+  const arr = new Uint8Array(randomBytesNative(size));
+  const hex = bufToHex(arr);
+  arr.toString = function(enc) {
+    if (enc === 'hex') return hex;
+    if (enc === 'base64') return globalThis.btoa(String.fromCharCode(...this));
+    return new TextDecoder().decode(this);
+  };
   return arr;
 }
 
 export function randomInt(min, max) {
   if (max === undefined) { max = min; min = 0; }
-  if (typeof globalThis.__pi_crypto_random_int_native === 'function') {
-    return globalThis.__pi_crypto_random_int_native(min, max);
+  if (!Number.isInteger(min) || !Number.isInteger(max)) {
+    throw new Error('randomInt: min/max must be integers');
   }
-  return min + Math.floor(Math.random() * (max - min));
+  const randomIntNative = requireCryptoHostcall(
+    '__pi_crypto_random_int_native',
+    'randomInt',
+  );
+  return randomIntNative(min, max);
 }
 
 export function timingSafeEqual(a, b) {

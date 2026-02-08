@@ -126,6 +126,89 @@
       "scenarios": ["scn-antigravity-image-gen-002"]
     }
   },
+  "remediation_buckets": {
+    "harness_gap": {
+      "count": 3,
+      "description": "Mock/VCR infrastructure gap prevents testing this extension.",
+      "remediation": "Enhance MockSpecInterceptor, ConformanceSession, or VCR stubs.",
+      "cause_codes": ["mock_gap", "vcr_stub_gap", "assertion_gap"],
+      "scenarios": ["scn-status-line-001", "scn-git-checkpoint-001", "scn-antigravity-image-gen-002"]
+    },
+    "missing_fixture": {
+      "count": 22,
+      "description": "No test fixture (manifest/expected-output snapshot) matches actual registrations.",
+      "remediation": "Audit manifests and author correct expected-output fixture files.",
+      "cause_codes": ["manifest_mismatch"],
+      "extensions": [
+        "agents-mikeastock/extensions",
+        "community/prateekmedia-lsp",
+        "npm/aliou-pi-linkup",
+        "npm/aliou-pi-synthetic",
+        "npm/lsp-pi",
+        "npm/marckrenn-pi-sub-bar",
+        "npm/mitsupi",
+        "npm/pi-amplike",
+        "npm/pi-bash-confirm",
+        "npm/pi-extensions",
+        "npm/pi-package-test",
+        "npm/shitty-extensions",
+        "npm/tmustier-pi-arcade",
+        "npm/vaayne-agent-kit",
+        "third-party/aliou-pi-extensions",
+        "third-party/ben-vargas-pi-packages",
+        "third-party/charles-cooper-pi-extensions",
+        "third-party/kcosr-pi-extensions",
+        "third-party/marckrenn-pi-sub",
+        "third-party/openclaw-openclaw",
+        "third-party/pasky-pi-amplike",
+        "third-party/w-winter-dot314"
+      ]
+    },
+    "missing_runtime_api": {
+      "count": 9,
+      "description": "Extension requires a QuickJS virtual-module stub or host API not yet implemented.",
+      "remediation": "Add virtual module stub in extensions_js.rs or implement missing hostcall.",
+      "cause_codes": ["missing_npm_package", "runtime_error"],
+      "extensions": [
+        "npm/pi-search-agent",
+        "npm/pi-wakatime",
+        "npm/pi-web-access",
+        "npm/qualisero-pi-agent-scip",
+        "third-party/qualisero-pi-agent-scip",
+        "community/nicobailon-interview-tool",
+        "npm/aliou-pi-guardrails",
+        "npm/aliou-pi-toolchain",
+        "npm/marckrenn-pi-sub-core"
+      ],
+      "missing_packages": ["openai", "adm-zip", "linkedom", "@sourcegraph/scip-typescript"]
+    },
+    "policy_blocked": {
+      "count": 0,
+      "description": "Extension capability blocked by conformance-harness policy.",
+      "remediation": "Add policy override or extend harness sandbox allowlist.",
+      "cause_codes": [],
+      "extensions": []
+    },
+    "intentionally_unsupported": {
+      "count": 5,
+      "description": "Intentionally excluded from conformance testing (test fixtures, multi-file bundles).",
+      "remediation": "No action required.",
+      "cause_codes": ["test_fixture", "multi_file_dependency"],
+      "extensions": [
+        "base_fixtures",
+        "community/qualisero-background-notify",
+        "community/qualisero-pi-agent-scip",
+        "community/qualisero-safe-git",
+        "npm/aliou-pi-processes"
+      ]
+    },
+    "summary": {
+      "total_classified": 36,
+      "actionable": 34,
+      "non_actionable": 5,
+      "note": "3 scenario failures overlap with extension failures. 36 = 22 + 9 + 5 extension failures; 3 scenario failures are all harness_gap."
+    }
+  },
   "actionable_improvements": [
     {
       "category": "manifest_mismatch",
@@ -172,5 +255,220 @@
     "scenario_report": "tests/ext_conformance/reports/scenario_conformance.json",
     "scenario_events": "tests/ext_conformance/reports/scenario_conformance.jsonl",
     "triage": "tests/ext_conformance/reports/smoke_triage.json"
+  },
+  "exception_policy": {
+    "schema": "pi.ext.exception_policy.v1",
+    "generated_at": "2026-02-08T02:00:00Z",
+    "required_fields": [
+      "id",
+      "kind",
+      "status",
+      "cause_code",
+      "rationale",
+      "mitigation",
+      "owner",
+      "review_by",
+      "tracking_issue"
+    ],
+    "entries": [
+      {
+        "id": "base_fixtures",
+        "kind": "extension",
+        "status": "approved",
+        "cause_code": "test_fixture",
+        "rationale": "Fixture-only manifest sentinel; not a user-installable extension.",
+        "mitigation": "Keep excluded from user-facing pass-rate decisions.",
+        "owner": "pi-conformance-team",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.2.7"
+      },
+      {
+        "id": "community/nicobailon-interview-tool",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "runtime_error",
+        "rationale": "Bundle expects local HTML artifact not currently packaged in runtime artifact set.",
+        "mitigation": "Add deterministic bundling/asset-pack inclusion for required form assets.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "community/qualisero-background-notify",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "multi_file_dependency",
+        "rationale": "Relative import outside single-file artifact is unresolved in current loader.",
+        "mitigation": "Land multi-file dependency packaging/resolution support.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "community/qualisero-pi-agent-scip",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "multi_file_dependency",
+        "rationale": "Runtime cannot resolve bundled dist-relative module path for this layout.",
+        "mitigation": "Support package-style dist entry resolution during extension load.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "community/qualisero-safe-git",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "multi_file_dependency",
+        "rationale": "Cross-directory relative import is unresolved by current single-entry resolver.",
+        "mitigation": "Enable deterministic multi-file import resolution for validated artifacts.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/aliou-pi-guardrails",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "runtime_error",
+        "rationale": "Expected runtime shape diverges from shim implementation (`not a function`).",
+        "mitigation": "Align shim API surface and add regression tests for aliou guardrails flow.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/aliou-pi-processes",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "multi_file_dependency",
+        "rationale": "Unbundled component import path cannot be resolved by current loader.",
+        "mitigation": "Add package-style module graph resolution for this dependency pattern.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/aliou-pi-toolchain",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "runtime_error",
+        "rationale": "Runtime shim mismatch triggers callable-shape failure at activation.",
+        "mitigation": "Patch shim API contract and validate with extension-specific parity checks.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/marckrenn-pi-sub-core",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "runtime_error",
+        "rationale": "Extension expects provider detection shape not fully represented in runtime stubs.",
+        "mitigation": "Implement missing detection/runtime utility behavior or canonical fallback shim.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/ogulcancelik-pi-sketch",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "policy_blocked",
+        "rationale": "Activation attempts extension-external file access blocked by sandbox policy.",
+        "mitigation": "Move required assets into extension root or support approved packaged assets.",
+        "owner": "pi-policy-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.4"
+      },
+      {
+        "id": "npm/pi-interview",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "policy_blocked",
+        "rationale": "Activation reads HTML asset outside extension root and is denied.",
+        "mitigation": "Bundle form assets inside extension root and update load path resolution.",
+        "owner": "pi-policy-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.4"
+      },
+      {
+        "id": "npm/pi-search-agent",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "missing_npm_package",
+        "rationale": "Depends on unsupported package specifier (`openai`).",
+        "mitigation": "Add vetted virtual module stub for `openai` with deterministic behavior.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/pi-wakatime",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "missing_npm_package",
+        "rationale": "Depends on unsupported package specifier (`adm-zip`).",
+        "mitigation": "Provide minimal audited `adm-zip` virtual module behavior required by corpus.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/pi-web-access",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "missing_npm_package",
+        "rationale": "Depends on unsupported package specifier (`linkedom`).",
+        "mitigation": "Implement compatible `linkedom` stub subset used by this extension.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "npm/qualisero-pi-agent-scip",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "missing_npm_package",
+        "rationale": "Depends on unsupported package specifier (`@sourcegraph/scip-typescript`).",
+        "mitigation": "Provide deterministic scip-typescript stub path used in indexing flow.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      },
+      {
+        "id": "third-party/kcosr-pi-extensions",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "policy_blocked",
+        "rationale": "Reads prompt artifact outside extension root and is blocked by path policy.",
+        "mitigation": "Package prompt assets in-root or extend safe packaged-asset mapping.",
+        "owner": "pi-policy-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.4"
+      },
+      {
+        "id": "third-party/ogulcancelik-pi-sketch",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "policy_blocked",
+        "rationale": "Activation reads HTML asset outside extension root and is denied.",
+        "mitigation": "Restructure extension artifact layout or allow audited packaged asset mapping.",
+        "owner": "pi-policy-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.4"
+      },
+      {
+        "id": "third-party/qualisero-pi-agent-scip",
+        "kind": "extension",
+        "status": "temporary",
+        "cause_code": "missing_npm_package",
+        "rationale": "Depends on unsupported package specifier (`@sourcegraph/scip-typescript`).",
+        "mitigation": "Implement audited virtual module support for required SCIP API subset.",
+        "owner": "pi-parity-runtime",
+        "review_by": "2026-03-31",
+        "tracking_issue": "bd-k5q5.3.9"
+      }
+    ]
   }
 }

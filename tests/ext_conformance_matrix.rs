@@ -130,10 +130,7 @@ fn runtime_case_status(
 
 #[allow(dead_code)]
 fn jsonl_line_count(path: &Path) -> u64 {
-    match fs::read_to_string(path) {
-        Ok(content) => content.lines().count() as u64,
-        Err(_) => 0,
-    }
+    fs::read_to_string(path).map_or(0, |content| content.lines().count() as u64)
 }
 
 #[allow(dead_code)]
@@ -151,18 +148,16 @@ fn latest_e2e_summary(repo_root: &Path) -> Option<(String, Value)> {
 
     for run in runs {
         let summary_path = run.join("summary.json");
-        let bytes = match fs::read(&summary_path) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let Ok(bytes) = fs::read(&summary_path) else {
+            continue;
         };
-        let summary = match serde_json::from_slice::<Value>(&bytes) {
-            Ok(value) => value,
-            Err(_) => continue,
+        let Ok(summary) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
         };
-        let relative = match summary_path.strip_prefix(repo_root) {
-            Ok(path) => path.display().to_string(),
-            Err(_) => summary_path.display().to_string(),
-        };
+        let relative = summary_path.strip_prefix(repo_root).map_or_else(
+            |_| summary_path.display().to_string(),
+            |path| path.display().to_string(),
+        );
         return Some((relative, summary));
     }
 

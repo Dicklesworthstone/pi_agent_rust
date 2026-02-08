@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-02-07T21:55:06Z
+> Generated: 2026-02-08T02:11:50Z
 
 ## Summary
 
@@ -8,6 +8,8 @@
 |---|---|
 | Total budgets | 13 |
 | CI-enforced | 8 |
+| CI-enforced with data | 1 |
+| CI-enforced FAIL | 0 |
 | PASS | 3 |
 | FAIL | 0 |
 | No data | 10 |
@@ -38,7 +40,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 46 | PASS | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | - | NO_DATA | No |
 
 ## Policy
 
@@ -50,8 +52,8 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 4.0 | PASS | Yes |
-| `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | - | NO_DATA | No |
+| `idle_memory_rss` | RSS at idle | 50 MB | 4.2 | PASS | Yes |
+| `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 0.0 | PASS | No |
 
 ## Binary
 

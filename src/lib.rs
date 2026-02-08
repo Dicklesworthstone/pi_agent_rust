@@ -55,6 +55,7 @@ pub mod extension_inclusion;
 pub mod extension_index;
 pub mod extension_license;
 pub mod extension_popularity;
+pub mod extension_preflight;
 pub mod extension_scoring;
 pub mod extension_tools;
 pub mod extension_validation;

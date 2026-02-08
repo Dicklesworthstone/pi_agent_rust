@@ -12,7 +12,9 @@
 mod common;
 
 use chrono::{SecondsFormat, Utc};
-use pi::extensions::{ExtensionEventName, ExtensionManager, JsExtensionLoadSpec};
+use pi::extensions::{
+    ExtensionEventName, ExtensionManager, ExtensionPolicy, JsExtensionLoadSpec, PolicyProfile,
+};
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::tools::ToolRegistry;
 use serde::Serialize;
@@ -38,6 +40,14 @@ const MAX_RSS_GROWTH_PCT: f64 = 0.10;
 const MAX_LATENCY_DEGRADATION: u64 = 2;
 /// Absolute p99 cap for noisy shared CI/agent hosts.
 const MAX_P99_LAST_US: u64 = 25_000;
+/// Default per-profile duration for policy-rotation soak slice.
+const PROFILE_ROTATION_DURATION_SECS: u64 = 8;
+/// Event rate for policy-rotation soak slice.
+const PROFILE_ROTATION_EVENTS_PER_SEC: u64 = 30;
+/// Sampling interval for policy-rotation soak slice.
+const PROFILE_ROTATION_RSS_INTERVAL_SECS: u64 = 3;
+/// Error-rate budget for policy-rotation soak slices.
+const MAX_PROFILE_ERROR_RATE_PCT: f64 = 25.0;
 
 // ─── Helper Types ───────────────────────────────────────────────────────────
 
@@ -62,6 +72,46 @@ struct StressResult {
     rss_ok: bool,
     latency_ok: bool,
     extensions_loaded: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[allow(clippy::struct_field_names)]
+struct ProfileRotationThresholds {
+    rss_growth_pct_max: f64,
+    latency_degradation_ratio_max: u64,
+    p99_last_us_max: u64,
+    error_rate_pct_max: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfileRotationSlice {
+    profile: String,
+    policy_mode: String,
+    duration_secs: u64,
+    events_per_sec: u64,
+    extensions_loaded: usize,
+    event_count: u64,
+    error_count: u64,
+    error_rate_pct: f64,
+    p99_first_us: Option<u64>,
+    p99_last_us: Option<u64>,
+    latency_degradation_ratio: Option<f64>,
+    rss_growth_pct: Option<f64>,
+    rss_ok: bool,
+    latency_ok: bool,
+    pass: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfileRotationReport {
+    schema: String,
+    generated_at: String,
+    duration_secs_per_profile: u64,
+    events_per_sec: u64,
+    rss_interval_secs: u64,
+    thresholds: ProfileRotationThresholds,
+    slices: Vec<ProfileRotationSlice>,
+    overall_pass: bool,
 }
 
 // ─── Pure Helper Functions ──────────────────────────────────────────────────
@@ -145,6 +195,29 @@ const fn latency_within_budget(p99_first: Option<u64>, p99_last: Option<u64>) ->
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn error_rate_pct(error_count: u64, event_count: u64) -> f64 {
+    if event_count == 0 {
+        return 0.0;
+    }
+    (error_count as f64 / event_count as f64) * 100.0
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn latency_degradation_ratio(p99_first: Option<u64>, p99_last: Option<u64>) -> Option<f64> {
+    match (p99_first, p99_last) {
+        (Some(first), Some(last)) if first > 0 => Some(last as f64 / first as f64),
+        _ => None,
+    }
+}
+
+fn profile_rotation_duration_secs() -> u64 {
+    std::env::var("PI_STRESS_PROFILE_ROTATION_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(PROFILE_ROTATION_DURATION_SECS)
+}
+
 // ─── Setup Functions ────────────────────────────────────────────────────────
 
 fn project_root() -> PathBuf {
@@ -200,6 +273,13 @@ fn collect_safe_extensions(max: usize) -> Vec<PathBuf> {
 }
 
 fn load_extensions(paths: &[PathBuf]) -> (ExtensionManager, usize) {
+    load_extensions_with_policy(paths, ExtensionPolicy::default())
+}
+
+fn load_extensions_with_policy(
+    paths: &[PathBuf],
+    policy: ExtensionPolicy,
+) -> (ExtensionManager, usize) {
     let cwd = project_root();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
     let manager = ExtensionManager::new();
@@ -212,9 +292,11 @@ fn load_extensions(paths: &[PathBuf]) -> (ExtensionManager, usize) {
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
         async move {
-            pi::extensions::JsExtensionRuntimeHandle::start(js_config, tools, manager)
-                .await
-                .expect("start JS runtime for stress test")
+            pi::extensions::JsExtensionRuntimeHandle::start_with_policy(
+                js_config, tools, manager, policy,
+            )
+            .await
+            .expect("start JS runtime for stress test")
         }
     });
     manager.set_js_runtime(runtime);
@@ -760,6 +842,130 @@ fn stress_short_10_extensions() {
             let _ = manager.shutdown(Duration::from_millis(500)).await;
         }
     });
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn stress_policy_profile_rotation() {
+    let ext_paths = collect_safe_extensions(12);
+    assert!(
+        ext_paths.len() >= MIN_EXTENSIONS,
+        "Need at least {MIN_EXTENSIONS} extensions for profile-rotation stress, found {}",
+        ext_paths.len()
+    );
+
+    let duration_secs = profile_rotation_duration_secs().max(2);
+    let duration = Duration::from_secs(duration_secs);
+    let payload = json!({
+        "systemPrompt": "You are Pi in soak profile rotation mode.",
+        "model": "claude-sonnet-4-5",
+    });
+
+    let mut slices = Vec::new();
+
+    for (profile_name, profile) in [
+        ("safe", PolicyProfile::Safe),
+        ("balanced", PolicyProfile::Standard),
+        ("permissive", PolicyProfile::Permissive),
+    ] {
+        let policy = ExtensionPolicy::from_profile(profile);
+        let (manager, loaded_count) = load_extensions_with_policy(&ext_paths, policy);
+        assert!(
+            loaded_count >= MIN_EXTENSIONS,
+            "Need at least {MIN_EXTENSIONS} loaded for profile={profile_name}, got {loaded_count}"
+        );
+
+        eprintln!(
+            "  Profile {profile_name}: running {duration_secs}s at {PROFILE_ROTATION_EVENTS_PER_SEC} events/s",
+        );
+
+        let mut result = run_stress_loop(
+            &manager,
+            ExtensionEventName::AgentStart,
+            Some(&payload),
+            PROFILE_ROTATION_EVENTS_PER_SEC,
+            duration,
+            PROFILE_ROTATION_RSS_INTERVAL_SECS,
+        );
+        result.extensions_loaded = loaded_count;
+
+        let error_rate = error_rate_pct(result.error_count, result.event_count);
+        let latency_ratio = latency_degradation_ratio(result.p99_first, result.p99_last);
+        let pass = result.event_count > 0
+            && result.rss_ok
+            && result.latency_ok
+            && error_rate <= MAX_PROFILE_ERROR_RATE_PCT;
+
+        eprintln!(
+            "    profile={profile_name} events={} errors={} error_rate={:.2}% rss_ok={} latency_ok={} latency_ratio={:?}",
+            result.event_count,
+            result.error_count,
+            error_rate,
+            result.rss_ok,
+            result.latency_ok,
+            latency_ratio
+        );
+
+        slices.push(ProfileRotationSlice {
+            profile: profile_name.to_string(),
+            policy_mode: format!("{profile:?}"),
+            duration_secs,
+            events_per_sec: PROFILE_ROTATION_EVENTS_PER_SEC,
+            extensions_loaded: loaded_count,
+            event_count: result.event_count,
+            error_count: result.error_count,
+            error_rate_pct: error_rate,
+            p99_first_us: result.p99_first,
+            p99_last_us: result.p99_last,
+            latency_degradation_ratio: latency_ratio,
+            rss_growth_pct: result.rss_growth_pct.map(|pct| pct * 100.0),
+            rss_ok: result.rss_ok,
+            latency_ok: result.latency_ok,
+            pass,
+        });
+
+        common::run_async({
+            let manager = manager;
+            async move {
+                let _ = manager.shutdown(Duration::from_millis(750)).await;
+            }
+        });
+    }
+
+    let report = ProfileRotationReport {
+        schema: "pi.ext.stress_profile_rotation.v1".to_string(),
+        generated_at: Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+        duration_secs_per_profile: duration_secs,
+        events_per_sec: PROFILE_ROTATION_EVENTS_PER_SEC,
+        rss_interval_secs: PROFILE_ROTATION_RSS_INTERVAL_SECS,
+        thresholds: ProfileRotationThresholds {
+            rss_growth_pct_max: MAX_RSS_GROWTH_PCT * 100.0,
+            latency_degradation_ratio_max: MAX_LATENCY_DEGRADATION,
+            p99_last_us_max: MAX_P99_LAST_US,
+            error_rate_pct_max: MAX_PROFILE_ERROR_RATE_PCT,
+        },
+        overall_pass: slices.iter().all(|slice| slice.pass),
+        slices,
+    };
+
+    let output_dir = report_dir();
+    let _ = std::fs::create_dir_all(&output_dir);
+    let output_path = output_dir.join("stress_profile_rotation.json");
+    std::fs::write(
+        &output_path,
+        serde_json::to_string_pretty(&report).expect("serialize stress profile rotation report"),
+    )
+    .expect("write stress profile rotation report");
+
+    eprintln!(
+        "  Profile-rotation soak report: {}",
+        output_path.to_string_lossy()
+    );
+    assert!(
+        report.overall_pass,
+        "Profile-rotation stress slice failed (see {})",
+        output_path.to_string_lossy()
+    );
 }
 
 #[test]

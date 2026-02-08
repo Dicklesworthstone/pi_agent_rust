@@ -563,6 +563,292 @@ impl Drop for TmuxInstance {
 }
 
 #[test]
+fn e2e_cli_explain_extension_policy_outputs_remediation() {
+    let harness = CliTestHarness::new("e2e_cli_explain_extension_policy_outputs_remediation");
+    let result = harness.run(&[
+        "--explain-extension-policy",
+        "--extension-policy",
+        "balanced",
+    ]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert!(result.stderr.trim().is_empty(), "stderr should be empty");
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.stdout).expect("explain output should be valid JSON");
+    assert_eq!(payload["requested_profile"], "balanced");
+    assert_eq!(payload["effective_profile"], "balanced");
+    assert_eq!(payload["profile_source"], "cli");
+    assert_eq!(payload["profile_aliases"]["standard"], "balanced");
+    assert_eq!(
+        payload["dangerous_capability_opt_in"]["config_example"]["extensionPolicy"]["allowDangerous"],
+        true
+    );
+    assert_eq!(payload["migration_guardrails"]["default_profile"], "safe");
+    assert!(
+        payload["migration_guardrails"]["opt_in_cli"]["balanced_prompt_mode"]
+            .as_str()
+            .is_some_and(|value| value.contains("--extension-policy balanced"))
+    );
+
+    let profile_presets = payload["profile_presets"]
+        .as_array()
+        .expect("profile_presets should be array");
+    assert!(
+        profile_presets
+            .iter()
+            .any(|entry| entry["profile"] == "balanced"),
+        "balanced profile preset should be present"
+    );
+
+    let capability_decisions = payload["capability_decisions"]
+        .as_array()
+        .expect("capability_decisions should be array");
+    let exec_decision = capability_decisions
+        .iter()
+        .find(|entry| entry["capability"] == "exec")
+        .expect("exec decision should be present");
+    assert_eq!(exec_decision["decision"], "deny");
+    assert_eq!(exec_decision["reason"], "deny_caps");
+
+    let to_allow_cli = exec_decision["remediation"]["to_allow_cli"]
+        .as_array()
+        .expect("to_allow_cli should be array");
+    assert!(
+        to_allow_cli.iter().any(|entry| {
+            entry
+                .as_str()
+                .is_some_and(|text| text.contains("PI_EXTENSION_ALLOW_DANGEROUS=1"))
+        }),
+        "exec remediation should include allow-dangerous CLI guidance"
+    );
+}
+
+#[test]
+fn e2e_cli_explain_extension_policy_supports_legacy_standard_alias() {
+    let harness =
+        CliTestHarness::new("e2e_cli_explain_extension_policy_supports_legacy_standard_alias");
+    let result = harness.run(&[
+        "--explain-extension-policy",
+        "--extension-policy",
+        "standard",
+    ]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.stdout).expect("explain output should be valid JSON");
+    assert_eq!(payload["requested_profile"], "standard");
+    assert_eq!(payload["effective_profile"], "balanced");
+    assert_eq!(payload["profile_source"], "cli");
+}
+
+#[test]
+fn e2e_cli_explain_extension_policy_default_is_safe_with_guardrails() {
+    let harness =
+        CliTestHarness::new("e2e_cli_explain_extension_policy_default_is_safe_with_guardrails");
+    let result = harness.run(&["--explain-extension-policy"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    assert!(result.stderr.trim().is_empty(), "stderr should be empty");
+
+    let payload: serde_json::Value =
+        serde_json::from_str(&result.stdout).expect("explain output should be valid JSON");
+    assert_eq!(payload["requested_profile"], "safe");
+    assert_eq!(payload["effective_profile"], "safe");
+    assert_eq!(payload["profile_source"], "default");
+    assert_eq!(payload["migration_guardrails"]["default_profile"], "safe");
+    assert_eq!(
+        payload["migration_guardrails"]["active_default_profile"],
+        true
+    );
+}
+
+#[test]
+fn e2e_cli_explain_extension_policy_profile_matrix_decisions() {
+    let mut deny_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+
+    for profile in ["safe", "balanced", "permissive"] {
+        let harness = CliTestHarness::new(&format!(
+            "e2e_cli_explain_extension_policy_profile_matrix_{profile}"
+        ));
+        let result = harness.run(&["--explain-extension-policy", "--extension-policy", profile]);
+
+        assert_exit_code(&harness.harness, &result, 0);
+        assert!(
+            result.stderr.trim().is_empty(),
+            "stderr should be empty for profile={profile}"
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&result.stdout).expect("explain output should be valid JSON");
+        assert_eq!(payload["effective_profile"], profile);
+
+        let capability_decisions = payload["capability_decisions"]
+            .as_array()
+            .expect("capability_decisions should be array");
+        assert!(
+            !capability_decisions.is_empty(),
+            "capability_decisions should not be empty for profile={profile}"
+        );
+
+        let deny_count = capability_decisions
+            .iter()
+            .filter(|entry| entry["decision"] == "deny")
+            .count();
+        let prompt_count = capability_decisions
+            .iter()
+            .filter(|entry| entry["decision"] == "prompt")
+            .count();
+        let allow_count = capability_decisions
+            .iter()
+            .filter(|entry| entry["decision"] == "allow")
+            .count();
+
+        assert_eq!(
+            deny_count + prompt_count + allow_count,
+            capability_decisions.len(),
+            "every capability decision should be classified for profile={profile}"
+        );
+
+        match profile {
+            "safe" => {
+                assert!(
+                    deny_count > 0,
+                    "safe profile should deny at least one capability"
+                );
+            }
+            "balanced" => {
+                assert!(
+                    prompt_count > 0,
+                    "balanced profile should prompt for at least one capability"
+                );
+            }
+            "permissive" => {
+                assert_eq!(
+                    deny_count, 0,
+                    "permissive profile should not deny capabilities by default"
+                );
+            }
+            _ => unreachable!("covered profiles are exhaustive"),
+        }
+
+        deny_counts.insert(profile, deny_count);
+    }
+
+    assert!(
+        deny_counts["safe"] >= deny_counts["balanced"],
+        "safe should be at least as restrictive as balanced"
+    );
+}
+
+#[test]
+fn e2e_cli_policy_preflight_matches_runtime_negative_events() {
+    let negative_events_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/ext_conformance/reports/negative/negative_events.jsonl");
+    assert!(
+        negative_events_path.exists(),
+        "negative policy events must exist at {}",
+        negative_events_path.display()
+    );
+
+    let negative_events_raw =
+        std::fs::read_to_string(&negative_events_path).expect("read negative_events.jsonl");
+
+    let mode_by_profile = [
+        ("safe", "strict"),
+        ("balanced", "prompt"),
+        ("permissive", "permissive"),
+    ];
+
+    for (profile, mode) in mode_by_profile {
+        let harness = CliTestHarness::new(&format!(
+            "e2e_cli_policy_preflight_matches_runtime_{profile}"
+        ));
+        let explain = harness.run(&["--explain-extension-policy", "--extension-policy", profile]);
+
+        assert_exit_code(&harness.harness, &explain, 0);
+        assert!(
+            explain.stderr.trim().is_empty(),
+            "stderr should be empty for profile={profile}"
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(&explain.stdout).expect("explain output should be JSON");
+        let capability_decisions = payload["capability_decisions"]
+            .as_array()
+            .expect("capability_decisions should be array");
+
+        let mut preflight_map: BTreeMap<String, String> = BTreeMap::new();
+        for decision in capability_decisions {
+            let capability = decision["capability"]
+                .as_str()
+                .expect("capability should be string")
+                .to_string();
+            let action = decision["decision"]
+                .as_str()
+                .expect("decision should be string")
+                .to_ascii_lowercase();
+            preflight_map.insert(capability, action);
+        }
+
+        let mut checked = 0usize;
+        let mut mismatches = Vec::new();
+
+        for line in negative_events_raw
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+        {
+            let event: serde_json::Value =
+                serde_json::from_str(line).expect("negative event should be JSON");
+            if event["mode"].as_str() != Some(mode) {
+                continue;
+            }
+            let capability = event["capability"]
+                .as_str()
+                .expect("capability should be string")
+                .trim()
+                .to_string();
+            if capability.is_empty() {
+                continue;
+            }
+            // The negative-conformance runtime fixture enforces an explicit deny-list
+            // for dangerous caps even in permissive mode. That context intentionally
+            // differs from `--explain-extension-policy`.
+            if profile == "permissive" && (capability == "exec" || capability == "env") {
+                continue;
+            }
+            let Some(preflight_decision) = preflight_map.get(&capability) else {
+                continue;
+            };
+            let runtime_decision = event["actual_decision"]
+                .as_str()
+                .expect("actual_decision should be string")
+                .to_ascii_lowercase();
+
+            checked += 1;
+            if preflight_decision != &runtime_decision {
+                mismatches.push(format!(
+                    "profile={profile} mode={mode} capability={capability} preflight={} runtime={runtime_decision} test={}",
+                    preflight_decision,
+                    event["test_name"].as_str().unwrap_or("unknown"),
+                ));
+            }
+        }
+
+        assert!(
+            checked > 0,
+            "expected at least one runtime decision comparison for profile={profile}"
+        );
+        assert!(
+            mismatches.is_empty(),
+            "preflight/runtime policy mismatches for profile={profile}:\n{}",
+            mismatches.join("\n")
+        );
+    }
+}
+
+#[test]
 fn e2e_cli_extension_compat_ledger_logged_when_enabled() {
     let mut harness = CliTestHarness::new("e2e_cli_extension_compat_ledger_logged_when_enabled");
     harness

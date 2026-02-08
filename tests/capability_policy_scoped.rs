@@ -101,13 +101,13 @@ mod config_resolution {
     use super::*;
 
     #[test]
-    fn default_config_resolves_to_standard() {
+    fn default_config_resolves_to_safe() {
         let config = Config::default();
         let policy = config.resolve_extension_policy(None);
-        let standard = PolicyProfile::Standard.to_policy();
-        assert_eq!(policy.mode, standard.mode);
-        assert_eq!(policy.default_caps, standard.default_caps);
-        assert_eq!(policy.deny_caps, standard.deny_caps);
+        let safe = PolicyProfile::Safe.to_policy();
+        assert_eq!(policy.mode, safe.mode);
+        assert_eq!(policy.default_caps, safe.default_caps);
+        assert_eq!(policy.deny_caps, safe.deny_caps);
     }
 
     #[test]
@@ -128,11 +128,30 @@ mod config_resolution {
     }
 
     #[test]
-    fn cli_override_unknown_name_falls_to_standard() {
+    fn cli_override_balanced_profile() {
+        let config = Config::default();
+        let policy = config.resolve_extension_policy(Some("balanced"));
+        assert_eq!(policy.mode, ExtensionPolicyMode::Prompt);
+        assert!(policy.deny_caps.contains(&"exec".to_string()));
+        assert!(policy.deny_caps.contains(&"env".to_string()));
+    }
+
+    #[test]
+    fn cli_override_legacy_standard_alias_matches_balanced() {
+        let config = Config::default();
+        let balanced = config.resolve_extension_policy(Some("balanced"));
+        let standard = config.resolve_extension_policy(Some("standard"));
+        assert_eq!(standard.mode, balanced.mode);
+        assert_eq!(standard.default_caps, balanced.default_caps);
+        assert_eq!(standard.deny_caps, balanced.deny_caps);
+    }
+
+    #[test]
+    fn cli_override_unknown_name_falls_to_safe() {
         let config = Config::default();
         let policy = config.resolve_extension_policy(Some("nonsense"));
-        let standard = PolicyProfile::Standard.to_policy();
-        assert_eq!(policy.mode, standard.mode);
+        let safe = PolicyProfile::Safe.to_policy();
+        assert_eq!(policy.mode, safe.mode);
     }
 
     #[test]
@@ -231,9 +250,9 @@ mod config_resolution {
             ..Default::default()
         };
         let policy = config.resolve_extension_policy(None);
-        let standard = PolicyProfile::Standard.to_policy();
-        assert_eq!(policy.mode, standard.mode);
-        assert_eq!(policy.default_caps, standard.default_caps);
+        let safe = PolicyProfile::Safe.to_policy();
+        assert_eq!(policy.mode, safe.mode);
+        assert_eq!(policy.default_caps, safe.default_caps);
     }
 }
 

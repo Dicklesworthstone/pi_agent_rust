@@ -3,21 +3,21 @@
 //!
 //! Measures extension load time for every extension in the conformance suite.
 //! Each extension is measured in two modes:
-//! - cold start: fresh QuickJS runtime + context (includes context creation)
+//! - cold start: fresh `QuickJS` runtime + context (includes context creation)
 //! - warm start: same runtime/context after one warmup load (cached module/loader)
 //!
 //! P50/P95/P99 statistics are computed per extension and aggregated by tier and
 //! by "group" (official-simple / official-complex / community).
 //!
 //! Run:
-//!   cargo test --test ext_load_time_benchmark --features ext-conformance -- --nocapture
+//!   `cargo test --test ext_load_time_benchmark --features ext-conformance -- --nocapture`
 //!
 //! Environment variables:
-//!   PI_LOAD_BENCH_ITERATIONS  - iterations per extension (default: 100)
-//!   PI_LOAD_BENCH_WARMUP      - warmup loads before warm-start sampling (default: 1)
-//!   PI_LOAD_BENCH_BUDGET_MS   - P99 budget in ms (default: 100)
-//!   PI_LOAD_BENCH_SCOPE       - "all" (default) or "official"
-//!   PI_LOAD_BENCH_MAX         - limit to first N extensions after filtering
+//!   `PI_LOAD_BENCH_ITERATIONS`  - iterations per extension (default: 100)
+//!   `PI_LOAD_BENCH_WARMUP`      - warmup loads before warm-start sampling (default: 1)
+//!   `PI_LOAD_BENCH_BUDGET_MS`   - P99 budget in ms (default: 100)
+//!   `PI_LOAD_BENCH_SCOPE`       - "all" (default) or "official"
+//!   `PI_LOAD_BENCH_MAX`         - limit to first N extensions after filtering
 
 mod common;
 
@@ -154,6 +154,11 @@ fn load_manifest() -> &'static Manifest {
 
 // ─── Statistics ─────────────────────────────────────────────────────────────
 
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn percentile(sorted: &[u64], p: f64) -> u64 {
     if sorted.is_empty() {
         return 0;
@@ -246,8 +251,9 @@ struct ExtLoadResult {
 
 /// Benchmark one extension in both cold-start and warm-start modes.
 ///
-/// Cold-start samples create a fresh QuickJS runtime+context each iteration.
+/// Cold-start samples create a fresh `QuickJS` runtime+context each iteration.
 /// Warm-start samples reuse a single runtime+context after `warmup` loads.
+#[allow(clippy::too_many_lines)]
 fn benchmark_extension(entry: &ManifestEntry, warmup: usize, n: usize) -> ExtLoadResult {
     let entry_file = artifacts_dir().join(&entry.entry_path);
     let group = group_for(entry);
@@ -321,6 +327,7 @@ fn benchmark_extension(entry: &ManifestEntry, warmup: usize, n: usize) -> ExtLoa
 
         match load_result {
             Ok(()) => {
+                #[allow(clippy::cast_possible_truncation)]
                 let elapsed_ms = start.elapsed().as_millis() as u64;
                 cold_samples.push(elapsed_ms);
             }
@@ -328,11 +335,10 @@ fn benchmark_extension(entry: &ManifestEntry, warmup: usize, n: usize) -> ExtLoa
                 cold_failures += 1;
                 last_error = Some(format!("Load error: {e}"));
             }
-        };
+        }
 
         // Shut down to avoid thread leaks.
         common::run_async({
-            let manager = manager.clone();
             async move {
                 let _ = manager.shutdown(Duration::from_millis(250)).await;
             }
@@ -349,7 +355,6 @@ fn benchmark_extension(entry: &ManifestEntry, warmup: usize, n: usize) -> ExtLoa
     let warm_runtime_result = common::run_async({
         let manager = warm_manager.clone();
         let tools = Arc::clone(&tools);
-        let js_config = js_config.clone();
         async move { JsExtensionRuntimeHandle::start(js_config, tools, manager).await }
     });
     match warm_runtime_result {
@@ -384,6 +389,7 @@ fn benchmark_extension(entry: &ManifestEntry, warmup: usize, n: usize) -> ExtLoa
                 });
                 match load_result {
                     Ok(()) => {
+                        #[allow(clippy::cast_possible_truncation)]
                         let elapsed_ms = start.elapsed().as_millis() as u64;
                         warm_samples.push(elapsed_ms);
                     }
@@ -396,9 +402,8 @@ fn benchmark_extension(entry: &ManifestEntry, warmup: usize, n: usize) -> ExtLoa
         }
 
         common::run_async({
-            let manager = warm_manager.clone();
             async move {
-                let _ = manager.shutdown(Duration::from_millis(250)).await;
+                let _ = warm_manager.shutdown(Duration::from_millis(250)).await;
             }
         });
     }
@@ -566,6 +571,7 @@ struct BenchmarkSummary {
     global_warm_p99_ms: u64,
 }
 
+#[allow(clippy::too_many_lines)]
 fn generate_markdown(report: &BenchmarkReport) -> String {
     let mut md = String::with_capacity(8192);
     writeln!(md, "# Extension Load-Time Benchmark Report").unwrap();
@@ -777,6 +783,7 @@ fn generate_markdown(report: &BenchmarkReport) -> String {
 // ─── Test entry point ───────────────────────────────────────────────────────
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn load_time_benchmark() {
     let manifest = load_manifest();
     let n = iterations();
@@ -791,7 +798,7 @@ fn load_time_benchmark() {
     };
     if let Some(limit) = max {
         entries.truncate(limit);
-    };
+    }
 
     eprintln!(
         "[load-bench] scope={scope:?} extensions={} iterations={} warmup={} budget={}ms debug={}",
@@ -921,8 +928,7 @@ fn load_time_benchmark() {
 
     if over_budget_any_count > 0 {
         eprintln!(
-            "\n  OVER-BUDGET: {} extension(s) exceeded P99 budget of {}ms:",
-            over_budget_any_count, budget_ms
+            "\n  OVER-BUDGET: {over_budget_any_count} extension(s) exceeded P99 budget of {budget_ms}ms:"
         );
         for r in &report.results {
             if r.success && (r.cold.stats.p99_ms > budget_ms || r.warm.stats.p99_ms > budget_ms) {

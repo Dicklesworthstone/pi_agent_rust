@@ -4023,6 +4023,7 @@ dependencies = [
  "tempfile",
  "textwrap",
  "thiserror 2.0.18",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",

@@ -88,6 +88,26 @@ fn eval_fs(js_expr: &str) -> String {
         .unwrap_or_else(|| "NO_RESPONSE".to_string())
 }
 
+fn eval_fs_with_setup<F>(setup: F, js_expr: &str) -> String
+where
+    F: FnOnce(&common::TestHarness),
+{
+    let harness = common::TestHarness::new("fs_escape");
+    setup(&harness);
+    let source = fs_ext_source(js_expr);
+    let mgr = load_ext(&harness, &source);
+
+    let response = common::run_async(async move {
+        mgr.dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10000)
+            .await
+            .expect("dispatch agent_start")
+    });
+
+    response
+        .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
+        .unwrap_or_else(|| "NO_RESPONSE".to_string())
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // VFS normalizePath: path traversal via ..
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -224,13 +244,9 @@ fn vfs_mkdir_does_not_create_real_dir() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn host_read_fallback_can_read_real_files() {
-    // This test documents current behavior: the host read fallback
-    // CAN read files from the real filesystem. This is the baseline
-    // that hardening should eventually restrict.
+fn host_read_fallback_denies_outside_workspace() {
     let result = eval_fs(
         r"(() => {
-        // /etc/hostname should exist on Linux
         try {
             const content = fs.readFileSync('/etc/hostname', 'utf8');
             return content.length > 0 ? 'read_ok' : 'empty';
@@ -239,11 +255,9 @@ fn host_read_fallback_can_read_real_files() {
         }
     })()",
     );
-    // On Linux test machines /etc/hostname exists
-    // This test documents the current UNSANDBOXED behavior
     assert!(
-        result == "read_ok" || result.contains("ERROR:"),
-        "expected either successful read or error, got: {result}"
+        result.contains("ERROR:") && result.contains("outside extension root"),
+        "expected host read deny error, got: {result}"
     );
 }
 
@@ -251,13 +265,24 @@ fn host_read_fallback_can_read_real_files() {
 fn host_read_nonexistent_file_throws() {
     let result = eval_fs(
         r"(() => {
-        return fs.readFileSync('/nonexistent_file_xyzzy_12345', 'utf8');
+        return fs.readFileSync('nonexistent_file_xyzzy_12345', 'utf8');
     })()",
     );
     assert!(
         result.contains("ERROR:") && result.contains("ENOENT"),
         "expected ENOENT error, got: {result}"
     );
+}
+
+#[test]
+fn host_read_fallback_allows_workspace_file() {
+    let result = eval_fs_with_setup(
+        |harness| {
+            harness.create_file("host_visible/inside.txt", b"host fallback visible");
+        },
+        r"(() => fs.readFileSync('host_visible/inside.txt', 'utf8'))()",
+    );
+    assert_eq!(result, "host fallback visible");
 }
 
 #[test]
@@ -291,11 +316,9 @@ fn read_file_traversal_with_dot_dot() {
         }
     })()",
     );
-    // Documents current behavior: traversal may succeed (reads /etc/hostname)
-    // or fail (ENOENT). Either way, we're documenting it.
     assert!(
-        result.starts_with("read:") || result.contains("ERROR:"),
-        "unexpected result: {result}"
+        result.contains("ERROR:") && result.contains("outside extension root"),
+        "expected traversal read denial, got: {result}"
     );
 }
 

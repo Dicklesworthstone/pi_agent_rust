@@ -128,6 +128,22 @@ New:
 | Node native addons | Blocked | Use hostcalls or WASM |
 | Unbounded filesystem access | Warning/Blocked | Requires explicit capability |
 
+### 3A. Bun Compatibility Subset (Current)
+
+Pi exposes a targeted Bun surface for compatibility (via `globalThis.Bun` and
+`import "bun"`):
+
+- `Bun.argv`
+- `Bun.file(path)` (`exists`, `text`, `arrayBuffer`, `json`)
+- `Bun.write(pathOrFileLike, data)`
+- `Bun.which(command)`
+- `Bun.spawn(...)`
+
+Explicitly unsupported in current runtime:
+
+- `Bun.connect(...)` — use `pi.http(...)` / `node:http` patterns instead
+- `Bun.listen(...)` — server/listener APIs are outside the extension sandbox
+
 ---
 
 ## 4. Compatibility Scanner (Static + Dynamic)

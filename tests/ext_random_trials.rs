@@ -37,11 +37,11 @@ struct SplitMix64 {
 }
 
 impl SplitMix64 {
-    fn new(seed: u64) -> Self {
+    const fn new(seed: u64) -> Self {
         Self { state: seed }
     }
 
-    fn next_u64(&mut self) -> u64 {
+    const fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.state;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -316,6 +316,7 @@ fn select_extensions(
     let mut indices: Vec<usize> = (0..n).collect();
     let mut rng = SplitMix64::new(seed);
     for i in 0..actual_size {
+        #[allow(clippy::cast_possible_truncation)]
         let j = i + rng.next_bounded((n - i) as u64) as usize;
         indices.swap(i, j);
     }
@@ -338,9 +339,11 @@ fn classify_failure(reason: &str) -> &'static str {
         "shim/fs"
     } else if reason.contains("not available in PiJS") {
         "shim/missing"
-    } else if reason.contains("Missing command") || reason.contains("Missing flag") {
-        "registration"
-    } else if reason.contains("expects tools") || reason.contains("expects providers") {
+    } else if reason.contains("Missing command")
+        || reason.contains("Missing flag")
+        || reason.contains("expects tools")
+        || reason.contains("expects providers")
+    {
         "registration"
     } else if reason.contains("Runtime start error") || reason.contains("Load spec error") {
         "runtime"
@@ -677,16 +680,19 @@ fn run_random_trials() -> TrialRun {
     let filter = parse_filter(&filter_str);
 
     // Determine selected extensions
-    let selected_ids = if let Some(ids_str) = explicit_ids {
-        ids_str
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        let pool = load_na_pool();
-        select_extensions(&pool, seed, sample_size, &filter)
-    };
+    let selected_ids = explicit_ids.map_or_else(
+        || {
+            let pool = load_na_pool();
+            select_extensions(&pool, seed, sample_size, &filter)
+        },
+        |ids_str| {
+            ids_str
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        },
+    );
 
     eprintln!(
         "[random_trials] seed={seed} n={sample_size} filter={filter_str:?} selected={}",
@@ -722,6 +728,7 @@ fn run_random_trials() -> TrialRun {
     let pass = results.iter().filter(|r| r.status == "pass").count();
     let fail = results.iter().filter(|r| r.status == "fail").count();
     let skip = results.iter().filter(|r| r.status == "skip").count();
+    #[allow(clippy::cast_precision_loss)]
     let pass_rate_pct = if total > 0 {
         (pass as f64 / total as f64) * 100.0
     } else {
@@ -813,7 +820,7 @@ fn write_trial_output(run: &TrialRun) {
 ///
 /// This test is `#[ignore]` by default — run with `--include-ignored`.
 #[test]
-#[ignore]
+#[ignore = "long-running random trial batch"]
 fn random_trials_batch() {
     let run = run_random_trials();
     write_trial_output(&run);
@@ -963,8 +970,7 @@ fn trial_smoke_single_extension() {
     let target = pool.iter().find(|id| {
         manifest
             .find(id)
-            .map(|e| e.conformance_tier == 1 && e.source_tier == "community")
-            .unwrap_or(false)
+            .is_some_and(|e| e.conformance_tier == 1 && e.source_tier == "community")
     });
 
     if let Some(id) = target {

@@ -262,10 +262,12 @@ impl CompatibilityScanner {
         };
 
         let rel = relative_posix(&self.root, path);
+        let mut in_block_comment = false;
 
-        for (idx, line) in content.lines().enumerate() {
+        for (idx, raw_line) in content.lines().enumerate() {
             let line_no = idx + 1;
-            let trimmed = line.trim_end().to_string();
+            let stripped = strip_js_comments(raw_line, &mut in_block_comment);
+            let trimmed = stripped.trim_end().to_string();
             if trimmed.is_empty() {
                 continue;
             }
@@ -770,6 +772,181 @@ fn looks_like_node_builtin(module_root: &str) -> bool {
             | "worker_threads"
             | "zlib"
     )
+}
+
+/// Strip single-line (`//`) and block (`/* ... */`) JS comments from a line,
+/// respecting string literals (double/single/backtick).
+///
+/// `in_block_comment` carries block-comment state across lines.
+fn strip_js_comments(line: &str, in_block_comment: &mut bool) -> String {
+    let mut result = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut in_template = false;
+    let mut escaped = false;
+
+    while let Some(ch) = chars.next() {
+        if *in_block_comment {
+            if ch == '*' && matches!(chars.peek(), Some('/')) {
+                chars.next();
+                *in_block_comment = false;
+            }
+            continue;
+        }
+
+        if escaped {
+            result.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' && (in_single_quote || in_double_quote || in_template) {
+            result.push(ch);
+            escaped = true;
+            continue;
+        }
+
+        if in_single_quote {
+            if ch == '\'' {
+                in_single_quote = false;
+            }
+            result.push(ch);
+            continue;
+        }
+
+        if in_double_quote {
+            if ch == '"' {
+                in_double_quote = false;
+            }
+            result.push(ch);
+            continue;
+        }
+
+        if in_template {
+            if ch == '`' {
+                in_template = false;
+            }
+            result.push(ch);
+            continue;
+        }
+
+        match ch {
+            '/' if matches!(chars.peek(), Some('/')) => break,
+            '/' if matches!(chars.peek(), Some('*')) => {
+                chars.next();
+                *in_block_comment = true;
+            }
+            '\'' => {
+                in_single_quote = true;
+                result.push(ch);
+            }
+            '"' => {
+                in_double_quote = true;
+                result.push(ch);
+            }
+            '`' => {
+                in_template = true;
+                result.push(ch);
+            }
+            _ => result.push(ch),
+        }
+    }
+
+    result
+}
+
+#[cfg(test)]
+mod compatibility_scanner_comment_tests {
+    use super::{CompatibilityScanner, strip_js_comments};
+    use std::fs;
+
+    #[test]
+    fn strip_js_comments_keeps_comment_markers_inside_strings() {
+        let mut in_block_comment = false;
+        let line = r#"const code = "import('fs') // not a comment"; // real comment"#;
+        let stripped = strip_js_comments(line, &mut in_block_comment);
+        assert_eq!(
+            stripped.trim(),
+            r#"const code = "import('fs') // not a comment";"#
+        );
+        assert!(!in_block_comment);
+    }
+
+    #[test]
+    fn compatibility_scanner_ignores_commented_patterns() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("commented.js");
+        fs::write(
+            &entry,
+            r#"
+// import fs from "fs";
+// pi.exec("echo should-not-count");
+/* process.binding("fs");
+   eval("bad");
+*/
+"#,
+        )
+        .expect("write test file");
+
+        let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
+        let ledger = scanner.scan_path(&entry).expect("scan");
+
+        assert!(ledger.capabilities.is_empty());
+        assert!(ledger.rewrites.is_empty());
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
+    }
+
+    #[test]
+    fn compatibility_scanner_still_reports_live_code_with_nearby_comments() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("mixed.js");
+        fs::write(
+            &entry,
+            r#"
+/* import child_process from "child_process"; */
+import fs from "fs"; // real import
+pi.exec("echo hello");
+"#,
+        )
+        .expect("write test file");
+
+        let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
+        let ledger = scanner.scan_path(&entry).expect("scan");
+
+        assert_eq!(
+            ledger.rewrites.len(),
+            1,
+            "live fs import should be rewritten"
+        );
+        assert!(
+            ledger
+                .rewrites
+                .iter()
+                .any(|rewrite| rewrite.from == "fs" && rewrite.to == "pi:node/fs")
+        );
+        assert!(
+            ledger
+                .capabilities
+                .iter()
+                .any(|cap| cap.capability == "read")
+        );
+        assert!(
+            ledger
+                .capabilities
+                .iter()
+                .any(|cap| cap.capability == "write")
+        );
+        assert!(
+            ledger
+                .capabilities
+                .iter()
+                .any(|cap| cap.capability == "exec")
+        );
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
+    }
 }
 
 // ============================================================================
@@ -15022,7 +15199,10 @@ mod tests {
 
         run_async(async {
             let result = dispatch_host_call_shared(&ctx, call).await;
-            assert!(result.is_error, "expected denial from per-extension override");
+            assert!(
+                result.is_error,
+                "expected denial from per-extension override"
+            );
             let err = result.error.expect("expected error payload");
             assert_eq!(err.code, HostCallErrorCode::Denied);
             assert!(

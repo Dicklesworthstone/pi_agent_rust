@@ -696,6 +696,10 @@ fn ext_memory_stress_inline() {
     });
 
     let vd = compute_verdict(&outcome);
+    let inline_extension_names: Vec<String> = (0..ext_count)
+        .map(|index| format!("inline/mem_ext_{index}"))
+        .collect();
+    write_report(&outcome, &vd, &inline_extension_names, ext_count);
 
     eprintln!("[mem-stress-inline] === VERDICT ===");
     eprintln!(

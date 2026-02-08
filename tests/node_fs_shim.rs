@@ -556,3 +556,60 @@ fn lstat_sync_works() {
     );
     assert_eq!(result, "true");
 }
+
+// ─── symlink/readlink coverage ──────────────────────────────────────────────
+
+#[test]
+fn symlink_readlink_and_promises_append() {
+    let harness = common::TestHarness::new("fs_symlink_readlink");
+    let source = r#"
+import fs from "node:fs";
+import fsp from "node:fs/promises";
+
+export default function activate(pi) {
+  pi.on("agent_start", async () => {
+    fs.mkdirSync("/tmp/links", { recursive: true });
+    fs.writeFileSync("/tmp/links/target.txt", "payload");
+    fs.symlinkSync("/tmp/links/target.txt", "/tmp/links/alias.txt");
+
+    const syncReadlink = fs.readlinkSync("/tmp/links/alias.txt");
+    const statIsFile = fs.statSync("/tmp/links/alias.txt").isFile();
+    const lstatIsSymlink = fs.lstatSync("/tmp/links/alias.txt").isSymbolicLink();
+
+    await fsp.symlink("/tmp/links/target.txt", "/tmp/links/alias2.txt");
+    const promiseReadlink = await fsp.readlink("/tmp/links/alias2.txt");
+    await fsp.appendFile("/tmp/links/alias2.txt", "-more");
+    const appended = await fsp.readFile("/tmp/links/target.txt", "utf8");
+
+    fs.symlinkSync("/tmp/links/missing.txt", "/tmp/links/broken.txt");
+    const brokenExists = fs.existsSync("/tmp/links/broken.txt");
+    const brokenLstat = fs.lstatSync("/tmp/links/broken.txt").isSymbolicLink();
+
+    const result = [
+      syncReadlink,
+      String(statIsFile),
+      String(lstatIsSymlink),
+      promiseReadlink,
+      appended,
+      String(brokenExists),
+      String(brokenLstat),
+    ].join("|");
+    return { result };
+  });
+}
+"#;
+
+    let mgr = load_ext(&harness, source);
+    let response = common::run_async(async move {
+        mgr.dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10_000)
+            .await
+            .expect("dispatch")
+    });
+    let result = response
+        .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
+        .unwrap_or_default();
+    assert_eq!(
+        result,
+        "/tmp/links/target.txt|true|true|/tmp/links/target.txt|payload-more|false|true"
+    );
+}

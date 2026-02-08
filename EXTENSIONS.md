@@ -786,9 +786,12 @@ with explicit capability requirements:
 | `os.platform`            | `pi:node/os`            | sync       | `env`        | Returns host platform          |
 | `os.homedir`             | `pi:node/os`            | sync       | `env`        | Returns home directory         |
 | `os.tmpdir`              | `pi:node/os`            | sync       | `env`        | Returns temp directory         |
-| `child_process.spawn`    | `pi:node/child_process` | async      | `exec`       | Streams stdout/stderr          |
-| `child_process.exec`     | `pi:node/child_process` | async      | `exec`       | Buffers output                 |
+| `child_process.spawn`    | `pi:node/child_process` | async      | `exec`       | Streams stdout/stderr; supports `timeout` |
+| `child_process.exec`     | `pi:node/child_process` | async      | `exec`       | Buffers output; returns `ChildProcess` |
+| `child_process.execFile` | `pi:node/child_process` | async      | `exec`       | Direct command execution; returns `ChildProcess` |
 | `child_process.execSync` | `pi:node/child_process` | sync       | `exec`       | Blocks; prefer async           |
+| `child_process.execFileSync` | `pi:node/child_process` | sync  | `exec`       | Direct command execution       |
+| `child_process.spawnSync` | `pi:node/child_process` | sync      | `exec`       | Structured result object       |
 | `crypto.randomBytes`     | `pi:node/crypto`        | sync       | (none)       | CSPRNG                         |
 | `crypto.createHash`      | `pi:node/crypto`        | sync       | (none)       | Pure computation               |
 | `url.parse`              | `pi:node/url`           | sync       | (none)       | Pure computation               |
@@ -1298,6 +1301,85 @@ Suggested config (document‑only for now):
 
 Capabilities are enforced per‑hostcall and logged in an **audit ledger**.
 
+### 4.1 Operator Profile Presets (Implemented)
+
+Pi exposes user-facing presets through `extensionPolicy.profile` and
+`--extension-policy`:
+- `safe` → strict deny-by-default.
+- `balanced` → prompt mode with safe defaults (legacy alias: `standard`).
+- `permissive` → allow-most, primarily for short-lived troubleshooting.
+
+To inspect exactly why each capability is allowed/prompted/denied, run:
+
+```bash
+pi --explain-extension-policy
+pi --explain-extension-policy --extension-policy safe
+pi --explain-extension-policy --extension-policy balanced
+PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced --explain-extension-policy
+```
+
+`--explain-extension-policy` emits:
+- the resolved profile and source (CLI/env/config/default),
+- per-capability decisions with reasons,
+- exact CLI and `settings.json` remediation snippets.
+
+### 4.2 Operator Rollout Playbooks (Local + CI)
+
+Recommended rollout order:
+1. Start in `safe` and inspect decisions (`pi --explain-extension-policy`).
+2. Move to `balanced` to validate prompt-mode UX while dangerous caps remain denied.
+3. Use `PI_EXTENSION_ALLOW_DANGEROUS=1` only for runs that require dangerous caps.
+4. Use `permissive` only as a short-lived debugging override, then revert.
+
+Local operator baseline (`settings.json`):
+
+```json
+{
+  "extensionPolicy": {
+    "profile": "balanced",
+    "allowDangerous": false
+  }
+}
+```
+
+Local verification:
+
+```bash
+pi --explain-extension-policy
+pi --extension-policy balanced --explain-extension-policy
+PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced --explain-extension-policy
+```
+
+CI baseline (default deny posture):
+
+```bash
+pi --extension-policy safe --explain-extension-policy
+```
+
+CI opt-in job (only for suites that require dangerous capabilities):
+
+```bash
+PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced --explain-extension-policy
+```
+
+Rollback:
+- remove `PI_EXTENSION_ALLOW_DANGEROUS` from the environment,
+- set `extensionPolicy.profile` to `safe`,
+- re-run `pi --explain-extension-policy` and verify dangerous capability decisions are `deny`.
+
+### 4.3 Audit Expectations for Dangerous-Capability Runs
+
+When dangerous capabilities are enabled, operators SHOULD capture:
+- explain-policy JSON output for the exact invocation,
+- structured `policy.decision` logs for allow/prompt/deny results,
+- hostcall ledger entries (`host_call.start` / `host_call.end`) for sensitive methods.
+
+Minimum incident-ready artifact set:
+- command invocation (including profile/env),
+- explain-policy payload snapshot,
+- stderr/stdout logs for the run,
+- test/e2e summary artifact path when executed in CI.
+
 ---
 
 ## 5. Alien‑Artifact Safety (Formal Decisioning)
@@ -1466,9 +1548,30 @@ full compatibility matrix. Key supported modules:
 - `node:os` — `platform`, `homedir`, `tmpdir`, `hostname`, `type`, `arch`
 - `node:crypto` — `randomBytes`, `createHash`, `randomUUID`
 - `node:url` — `URL`, `parse`, `fileURLToPath`
-- `node:child_process` — `spawn`, `exec`, `execSync` (via `exec` capability)
+- `node:child_process` — `spawn`, `spawnSync`, `exec`, `execFile`, `execSync`, `execFileSync` (via `exec` capability)
 - `node:readline` — basic interface for interactive prompts
 - `node:module` — `createRequire` stub
+
+### 8.3 Bun Global/Module Compatibility Subset
+
+The runtime also exposes a focused Bun subset through both `globalThis.Bun` and
+`import "bun"`:
+
+- `Bun.argv`
+- `Bun.file(path)` (`exists()`, `text()`, `arrayBuffer()`, `json()`)
+- `Bun.write(pathOrFileLike, data)`
+- `Bun.which(command)`
+- `Bun.spawn(command, options)` / `Bun.spawn([cmd, ...args], options)`
+
+Unsupported Bun APIs are explicit:
+
+- `Bun.connect(...)` — **not supported** (use `pi.http(...)` or `node:http`)
+- `Bun.listen(...)` — **not supported** (extension runtime does not expose raw
+  socket/server listeners)
+
+If an extension requires unsupported Bun APIs, keep the extension unchanged and
+address it via runtime compatibility work (new generic shim/connector support)
+or capability-governed alternative APIs.
 
 16+ npm package stubs are provided for common third-party dependencies
 (`node-pty`, `chokidar`, `jsdom`, `turndown`, `@opentelemetry/*`, etc.).

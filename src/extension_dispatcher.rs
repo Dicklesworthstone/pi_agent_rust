@@ -24,9 +24,10 @@ use crate::connectors::{Connector, http::HttpConnector};
 use crate::error::Result;
 use crate::extensions::EXTENSION_EVENT_TIMEOUT_MS;
 use crate::extensions::{
-    ExtensionBody, ExtensionMessage, ExtensionSession, ExtensionUiRequest, ExtensionUiResponse,
-    HostCallError, HostCallErrorCode, HostCallPayload, HostResultPayload, HostStreamChunk,
-    classify_ui_hostcall_error, ui_response_value_for_op,
+    ExtensionBody, ExtensionMessage, ExtensionPolicy, ExtensionSession, ExtensionUiRequest,
+    ExtensionUiResponse, HostCallError, HostCallErrorCode, HostCallPayload, HostResultPayload,
+    HostStreamChunk, PolicyDecision, PolicyProfile, classify_ui_hostcall_error,
+    required_capability_for_host_call, ui_response_value_for_op,
 };
 use crate::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, js_to_json, json_to_js};
 use crate::scheduler::{Clock as SchedulerClock, HostcallOutcome, WallClock};
@@ -46,6 +47,8 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
     /// Current working directory for relative path resolution.
     cwd: PathBuf,
+    /// Capability policy governing which hostcalls are allowed.
+    policy: ExtensionPolicy,
 }
 
 fn protocol_hostcall_op(params: &Value) -> Option<String> {
@@ -133,6 +136,27 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
         cwd: PathBuf,
     ) -> Self {
+        Self::new_with_policy(
+            runtime,
+            tool_registry,
+            http_connector,
+            session,
+            ui_handler,
+            cwd,
+            ExtensionPolicy::from_profile(PolicyProfile::Permissive),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_policy(
+        runtime: Rc<PiJsRuntime<C>>,
+        tool_registry: Arc<ToolRegistry>,
+        http_connector: Arc<HttpConnector>,
+        session: Arc<dyn ExtensionSession + Send + Sync>,
+        ui_handler: Arc<dyn ExtensionUiHandler + Send + Sync>,
+        cwd: PathBuf,
+        policy: ExtensionPolicy,
+    ) -> Self {
         Self {
             runtime,
             tool_registry,
@@ -140,6 +164,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             session,
             ui_handler,
             cwd,
+            policy,
         }
     }
 
@@ -156,6 +181,19 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         request: HostcallRequest,
     ) -> Pin<Box<dyn Future<Output = ()> + '_>> {
         Box::pin(async move {
+            let cap = request.required_capability();
+            let check = self
+                .policy
+                .evaluate_for(&cap, request.extension_id.as_deref());
+            if check.decision != PolicyDecision::Allow {
+                let outcome = HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: format!("Capability '{}' denied by policy ({})", cap, check.reason),
+                };
+                self.runtime.complete_hostcall(request.call_id, outcome);
+                return;
+            }
+
             let HostcallRequest {
                 call_id,
                 kind,
@@ -221,6 +259,16 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
     #[allow(clippy::future_not_send)]
     async fn dispatch_protocol_host_call(&self, payload: &HostCallPayload) -> HostcallOutcome {
+        if let Some(cap) = required_capability_for_host_call(payload) {
+            let check = self.policy.evaluate_for(&cap, None);
+            if check.decision != PolicyDecision::Allow {
+                return HostcallOutcome::Error {
+                    code: "denied".to_string(),
+                    message: format!("Capability '{}' denied by policy ({})", cap, check.reason),
+                };
+            }
+        }
+
         let method = payload.method.trim().to_ascii_lowercase();
         let params = payload.params.clone();
 
@@ -1239,10 +1287,14 @@ mod tests {
 
     use crate::connectors::http::HttpConnectorConfig;
     use crate::error::Error;
-    use crate::extensions::{ExtensionBody, ExtensionMessage, HostCallPayload, PROTOCOL_VERSION};
+    use crate::extensions::{
+        ExtensionBody, ExtensionMessage, ExtensionOverride, ExtensionPolicyMode, HostCallPayload,
+        PROTOCOL_VERSION, PolicyProfile,
+    };
     use crate::scheduler::DeterministicClock;
     use crate::session::SessionMessage;
     use serde_json::Value;
+    use std::collections::HashMap;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
@@ -1466,13 +1518,24 @@ mod tests {
     fn build_dispatcher(
         runtime: Rc<PiJsRuntime<DeterministicClock>>,
     ) -> ExtensionDispatcher<DeterministicClock> {
-        ExtensionDispatcher::new(
+        build_dispatcher_with_policy(
+            runtime,
+            ExtensionPolicy::from_profile(PolicyProfile::Permissive),
+        )
+    }
+
+    fn build_dispatcher_with_policy(
+        runtime: Rc<PiJsRuntime<DeterministicClock>>,
+        policy: ExtensionPolicy,
+    ) -> ExtensionDispatcher<DeterministicClock> {
+        ExtensionDispatcher::new_with_policy(
             runtime,
             Arc::new(ToolRegistry::new(&[], Path::new("."), None)),
             Arc::new(HttpConnector::with_defaults()),
             Arc::new(NullSession),
             Arc::new(NullUiHandler),
             PathBuf::from("."),
+            policy,
         )
     }
 
@@ -7499,6 +7562,366 @@ mod tests {
                     .contains("dispatch_protocol_message expects host_call"),
                 "unexpected error: {err}"
             );
+        });
+    }
+
+    // -----------------------------------------------------------------------
+    // Policy enforcement tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dispatch_denied_capability_returns_error() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Set up JS promise handler for pi.exec()
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.exec("echo", ["hello"]).catch((e) => { globalThis.err = e; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            // Safe profile denies "exec"
+            let policy = ExtensionPolicy::from_profile(PolicyProfile::Safe);
+            let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            let _ = runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err.code !== "denied") {
+                        throw new Error("Expected denied code, got: " + globalThis.err.code);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify denied error");
+        });
+    }
+
+    #[test]
+    fn dispatch_allowed_capability_proceeds() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.log("test message").then((r) => { globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let policy = ExtensionPolicy::from_profile(PolicyProfile::Permissive);
+            let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            let _ = runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.result === null) throw new Error("Promise not resolved");
+                "#,
+                )
+                .await
+                .expect("verify allowed");
+        });
+    }
+
+    #[test]
+    fn dispatch_strict_mode_denies_unknown_capability() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.http({ url: "http://localhost" }).catch((e) => { globalThis.err = e; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            // Strict mode with no default_caps: everything denied
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+                per_extension: HashMap::new(),
+            };
+            let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            let _ = runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err.code !== "denied") {
+                        throw new Error("Expected denied code, got: " + globalThis.err.code);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify strict denied");
+        });
+    }
+
+    #[test]
+    fn protocol_dispatch_denied_returns_error() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+            // Safe profile denies "exec"
+            let policy = ExtensionPolicy::from_profile(PolicyProfile::Safe);
+            let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
+
+            let message = ExtensionMessage {
+                id: "msg-policy-deny".to_string(),
+                version: PROTOCOL_VERSION.to_string(),
+                body: ExtensionBody::HostCall(HostCallPayload {
+                    call_id: "call-policy-deny".to_string(),
+                    capability: "exec".to_string(),
+                    method: "exec".to_string(),
+                    params: serde_json::json!({ "cmd": "echo hello" }),
+                    timeout_ms: None,
+                    cancel_token: None,
+                    context: None,
+                }),
+            };
+
+            let response = dispatcher
+                .dispatch_protocol_message(message)
+                .await
+                .expect("protocol dispatch");
+
+            match response.body {
+                ExtensionBody::HostResult(result) => {
+                    assert!(result.is_error, "expected denied error result");
+                    let error = result.error.expect("error payload");
+                    assert_eq!(error.code, HostCallErrorCode::Denied);
+                    assert!(
+                        error.message.contains("exec"),
+                        "error should mention denied capability: {}",
+                        error.message
+                    );
+                }
+                other => panic!("expected host_result body, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn dispatch_deny_caps_blocks_http() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.http({ url: "http://localhost" }).catch((e) => { globalThis.err = e; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: vec!["http".to_string()],
+                per_extension: HashMap::new(),
+            };
+            let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            let _ = runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err.code !== "denied") {
+                        throw new Error("Expected denied code, got: " + globalThis.err.code);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify deny_caps http blocked");
+        });
+    }
+
+    #[test]
+    fn per_extension_deny_blocks_specific_extension() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            // Trigger a session hostcall from JS
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    globalThis.result = null;
+                    pi.session("getState", {}).catch((e) => { globalThis.err = e; })
+                        .then((r) => { if (r) globalThis.result = r; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let mut per_extension = HashMap::new();
+            per_extension.insert(
+                "blocked-ext".to_string(),
+                ExtensionOverride {
+                    mode: None,
+                    allow: Vec::new(),
+                    deny: vec!["session".to_string()],
+                },
+            );
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+                per_extension,
+            };
+            let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
+
+            // Modify the request to come from the blocked extension
+            let mut request = requests.into_iter().next().unwrap();
+            request.extension_id = Some("blocked-ext".to_string());
+
+            dispatcher.dispatch_and_complete(request).await;
+
+            let _ = runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err.code !== "denied") {
+                        throw new Error("Expected denied code, got: " + globalThis.err.code);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify per-extension deny");
+        });
+    }
+
+    #[test]
+    fn prompt_decision_treated_as_deny_in_dispatcher() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.err = null;
+                    pi.exec("echo", ["hello"]).catch((e) => { globalThis.err = e; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            // Prompt mode with no defaults → exec falls through to Prompt
+            let policy = ExtensionPolicy {
+                mode: ExtensionPolicyMode::Prompt,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+                per_extension: HashMap::new(),
+            };
+            let dispatcher = build_dispatcher_with_policy(Rc::clone(&runtime), policy);
+
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            let _ = runtime.tick().await.expect("tick");
+
+            runtime
+                .eval(
+                    r#"
+                    if (globalThis.err === null) throw new Error("Promise not rejected");
+                    if (globalThis.err.code !== "denied") {
+                        throw new Error("Expected denied, got: " + globalThis.err.code);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify prompt treated as deny");
         });
     }
 }

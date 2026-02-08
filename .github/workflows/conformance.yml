@@ -8,20 +8,108 @@ on:
     # Weekly extended conformance (Saturday 02:00 UTC)
     - cron: "0 2 * * 6"
   workflow_dispatch:
+    inputs:
+      profile:
+        description: "Conformance profile to run"
+        required: false
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - fast
+          - full
+          - weekly
 
+# Deterministic execution settings applied to all jobs.
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
+  RUST_TEST_THREADS: "1"
+  PI_TEST_MODE: "1"
   PI_TS_ORACLE_TIMEOUT_SECS: "30"
+  PI_CONFORMANCE_SEED: "42"
 
 jobs:
-  conformance-fast:
-    if: github.event_name == 'pull_request'
+  # ─── Shared setup (reusable via needs) ────────────────────────────────────
+
+  conformance-matrix:
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: pi_agent_rust
         shell: bash
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # PR: fast conformance (official sample + generated tier 1-2 + negative)
+          - name: fast-official
+            if_event: pull_request
+            test_cmd: cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture
+            env_extra: "PI_OFFICIAL_MAX=5"
+          - name: fast-generated
+            if_event: pull_request
+            test_cmd: cargo test --test ext_conformance_generated --features ext-conformance -- --nocapture
+            env_extra: ""
+          - name: fast-negative
+            if_event: pull_request
+            test_cmd: cargo test --test extensions_policy_negative -- --nocapture
+            env_extra: ""
+          - name: fast-capability-matrix
+            if_event: pull_request
+            test_cmd: cargo test --test capability_denial_matrix -- --nocapture
+            env_extra: ""
+          # Nightly: full official + all tiers + scenarios + fixture schema + artifacts
+          - name: full-official
+            if_event: nightly
+            test_cmd: cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture
+            env_extra: ""
+          - name: full-generated
+            if_event: nightly
+            test_cmd: cargo test --test ext_conformance_generated --features ext-conformance -- --include-ignored --nocapture
+            env_extra: ""
+          - name: full-scenarios
+            if_event: nightly
+            test_cmd: cargo test --test ext_conformance_scenarios --features ext-conformance -- --nocapture
+            env_extra: ""
+          - name: full-negative
+            if_event: nightly
+            test_cmd: cargo test --test extensions_policy_negative -- --nocapture
+            env_extra: ""
+          - name: full-fixture-schema
+            if_event: nightly
+            test_cmd: cargo test --test ext_conformance_fixture_schema -- --nocapture
+            env_extra: ""
+          - name: full-artifacts
+            if_event: nightly
+            test_cmd: cargo test --test ext_conformance_artifacts -- --nocapture
+            env_extra: ""
+          - name: full-report
+            if_event: nightly
+            test_cmd: cargo test --test conformance_report generate_conformance_report -- --nocapture
+            env_extra: ""
+          # Weekly: community + npm + third-party
+          - name: weekly-community
+            if_event: weekly
+            test_cmd: cargo test --test ext_conformance_diff --features ext-conformance -- --ignored --skip load_time_benchmark_official --skip event_dispatch_latency_benchmark
+            env_extra: ""
+
+    # Conditional: run matrix entries matching the current trigger.
+    # PR → fast-*, nightly schedule → full-*, Saturday schedule → weekly-*, dispatch → profile input.
+    if: >-
+      (github.event_name == 'pull_request' && contains(matrix.if_event, 'pull_request')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *' && contains(matrix.if_event, 'nightly')) ||
+      (github.event_name == 'schedule' && github.event.schedule == '0 2 * * 6' && contains(matrix.if_event, 'weekly')) ||
+      (github.event_name == 'workflow_dispatch' && (
+        inputs.profile == 'auto' ||
+        (inputs.profile == 'fast' && contains(matrix.if_event, 'pull_request')) ||
+        (inputs.profile == 'full' && contains(matrix.if_event, 'nightly')) ||
+        (inputs.profile == 'weekly' && contains(matrix.if_event, 'weekly'))
+      ))
+
+    name: "conformance (${{ matrix.name }})"
+
     steps:
       - name: Checkout pi_agent_rust
         uses: actions/checkout@v4
@@ -68,6 +156,17 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Cargo cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            pi_agent_rust/target/
+          key: conformance-${{ runner.os }}-${{ hashFiles('pi_agent_rust/Cargo.lock') }}
+          restore-keys: conformance-${{ runner.os }}-
+
       - name: Install Bun
         uses: oven-sh/setup-bun@v1
         with:
@@ -83,320 +182,21 @@ jobs:
           sudo mkdir -p /home/ubuntu/.bun/bin
           sudo ln -sf "$(command -v bun)" /home/ubuntu/.bun/bin/bun
 
-      - name: Conformance fast (official sample)
+      - name: "Run: ${{ matrix.name }}"
         env:
-          PI_OFFICIAL_MAX: "5"
+          PI_OFFICIAL_MAX: ${{ matrix.env_extra == 'PI_OFFICIAL_MAX=5' && '5' || '' }}
         run: |
           set -euxo pipefail
-          cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture 2>&1 | tee conformance-fast.log
-
-      - name: Generated conformance tests (tier 1-2)
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_generated --features ext-conformance -- --nocapture 2>&1 | tee conformance-generated.log
-
-      - name: Negative conformance tests
-        run: |
-          set -euxo pipefail
-          cargo test --test extensions_policy_negative -- --nocapture 2>&1 | tee negative-conformance.log
+          ${{ matrix.test_cmd }} 2>&1 | tee "conformance-${{ matrix.name }}.log"
 
       - name: Upload conformance logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: conformance-fast-${{ github.sha }}
+          name: conformance-${{ matrix.name }}-${{ github.sha }}
           path: |
-            pi_agent_rust/conformance-fast.log
-            pi_agent_rust/conformance-generated.log
-            pi_agent_rust/negative-conformance.log
-            pi_agent_rust/tests/ext_conformance/reports/**/*.json
-            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
-          if-no-files-found: warn
-
-  conformance-full:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: pi_agent_rust
-        shell: bash
-    steps:
-      - name: Checkout pi_agent_rust
-        uses: actions/checkout@v4
-        with:
-          path: pi_agent_rust
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: asupersync
-          fetch-depth: 1
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: rich_rust
-          fetch-depth: 1
-
-      - name: Checkout charmed_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/charmed_rust
-          path: charmed_rust
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
-
-      - name: Install system deps (fd, rg) [linux]
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y fd-find ripgrep
-          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
-
-      - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v1
-        with:
-          bun-version: "1.3.8"
-
-      - name: Install pi-mono dependencies
-        working-directory: pi_agent_rust/legacy_pi_mono_code/pi-mono
-        run: npm ci
-
-      - name: Symlink bun for conformance tests
-        run: |
-          set -euxo pipefail
-          sudo mkdir -p /home/ubuntu/.bun/bin
-          sudo ln -sf "$(command -v bun)" /home/ubuntu/.bun/bin/bun
-
-      - name: Conformance full (official)
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_diff --features ext-conformance -- --nocapture 2>&1 | tee conformance-full.log
-
-      - name: Generated conformance tests (all tiers)
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_generated --features ext-conformance -- --include-ignored --nocapture 2>&1 | tee conformance-generated-full.log
-
-      - name: Upload conformance logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: conformance-full-${{ github.sha }}
-          path: |
-            pi_agent_rust/conformance-full.log
-            pi_agent_rust/conformance-generated-full.log
-            pi_agent_rust/tests/ext_conformance/reports/**/*.json
-            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
-          if-no-files-found: warn
-
-  conformance-full-scenario:
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '0 2 * * *')
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: pi_agent_rust
-        shell: bash
-    steps:
-      - name: Checkout pi_agent_rust
-        uses: actions/checkout@v4
-        with:
-          path: pi_agent_rust
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: asupersync
-          fetch-depth: 1
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: rich_rust
-          fetch-depth: 1
-
-      - name: Checkout charmed_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/charmed_rust
-          path: charmed_rust
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
-
-      - name: Install system deps (fd, rg) [linux]
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y fd-find ripgrep
-          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
-
-      - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v1
-        with:
-          bun-version: "1.3.8"
-
-      - name: Install pi-mono dependencies
-        working-directory: pi_agent_rust/legacy_pi_mono_code/pi-mono
-        run: npm ci
-
-      - name: Symlink bun for conformance tests
-        run: |
-          set -euxo pipefail
-          sudo mkdir -p /home/ubuntu/.bun/bin
-          sudo ln -sf "$(command -v bun)" /home/ubuntu/.bun/bin/bun
-
-      - name: Negative conformance tests
-        run: cargo test --test extensions_policy_negative -- --nocapture 2>&1 | tee negative-conformance.log
-
-      - name: Scenario conformance tests
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_scenarios --features ext-conformance -- --nocapture 2>&1 | tee scenario-conformance.log
-
-      - name: Generated conformance tests (all tiers)
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_generated --features ext-conformance -- --include-ignored --nocapture 2>&1 | tee conformance-generated-nightly.log
-
-      - name: Fixture schema validation
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_fixture_schema -- --nocapture 2>&1 | tee fixture-schema.log
-
-      - name: Artifact checksum validation
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_artifacts -- --nocapture 2>&1 | tee artifact-checksums.log
-
-      - name: Generate conformance report
-        if: always()
-        run: |
-          set -euxo pipefail
-          cargo test --test conformance_report generate_conformance_report -- --nocapture 2>&1 | tee conformance-report.log
-
-      - name: Upload scenario conformance artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: conformance-scenarios-${{ github.sha }}
-          path: |
-            pi_agent_rust/negative-conformance.log
-            pi_agent_rust/scenario-conformance.log
-            pi_agent_rust/conformance-generated-nightly.log
-            pi_agent_rust/fixture-schema.log
-            pi_agent_rust/artifact-checksums.log
-            pi_agent_rust/conformance-report.log
+            pi_agent_rust/conformance-${{ matrix.name }}.log
             pi_agent_rust/tests/ext_conformance/reports/**/*.json
             pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
             pi_agent_rust/tests/ext_conformance/reports/**/*.md
-          if-no-files-found: warn
-
-  conformance-weekly:
-    if: github.event_name == 'schedule' && github.event.schedule == '0 2 * * 6'
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: pi_agent_rust
-        shell: bash
-    steps:
-      - name: Checkout pi_agent_rust
-        uses: actions/checkout@v4
-        with:
-          path: pi_agent_rust
-
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: asupersync
-          fetch-depth: 1
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: rich_rust
-          fetch-depth: 1
-
-      - name: Checkout charmed_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/charmed_rust
-          path: charmed_rust
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
-
-      - name: Install system deps (fd, rg) [linux]
-        run: |
-          set -euxo pipefail
-          sudo apt-get update
-          sudo apt-get install -y fd-find ripgrep
-          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
-
-      - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: rustfmt, clippy
-
-      - name: Install Bun
-        uses: oven-sh/setup-bun@v1
-        with:
-          bun-version: "1.3.8"
-
-      - name: Install pi-mono dependencies
-        working-directory: pi_agent_rust/legacy_pi_mono_code/pi-mono
-        run: npm ci
-
-      - name: Symlink bun for conformance tests
-        run: |
-          set -euxo pipefail
-          sudo mkdir -p /home/ubuntu/.bun/bin
-          sudo ln -sf "$(command -v bun)" /home/ubuntu/.bun/bin/bun
-
-      - name: Conformance weekly (community + npm + third-party)
-        run: |
-          set -euxo pipefail
-          cargo test --test ext_conformance_diff --features ext-conformance -- --ignored --skip load_time_benchmark_official --skip event_dispatch_latency_benchmark 2>&1 | tee conformance-weekly.log
-
-      - name: Upload conformance logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: conformance-weekly-${{ github.sha }}
-          path: |
-            pi_agent_rust/conformance-weekly.log
-            pi_agent_rust/tests/ext_conformance/reports/**/*.json
-            pi_agent_rust/tests/ext_conformance/reports/**/*.jsonl
           if-no-files-found: warn

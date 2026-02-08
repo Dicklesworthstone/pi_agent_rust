@@ -1,105 +1,88 @@
-# Extension Compatibility & Performance Summary
+# Extension Compatibility Validation Pack Summary
 
-> Generated: 2026-02-07 | Git: 37046d3c | Build: debug | Corpus: 223 extensions
+> Generated: 2026-02-08T02:01:00Z | Git: e8ea2a6e | Corpus: 223 extensions
 
-## What Is Proven to Work
+## Current Snapshot
 
-**187 of 223 extensions (83.9%) run unmodified** in the Rust QuickJS runtime, validated
-by automated conformance tests that load each extension and verify its registered
-commands, tools, flags, and providers match expectations.
+| Surface | Result | Source |
+|---|---:|---|
+| Extension conformance corpus | 205/223 pass (91.9%) | `tests/ext_conformance/reports/conformance/conformance_report.json` |
+| Scenario conformance corpus | 24/25 pass (96.0%) | `tests/ext_conformance/reports/scenario_conformance.json` |
+| Node/Bun runtime API matrix | 18/20 pass (90.0%) | `tests/ext_conformance/reports/parity/runtime_api_matrix.json` |
 
-**Key compatibility guarantees:**
-- All 38 Tier 1 extensions (simple single-file): **100% pass**
-- All 87 Tier 2 extensions (multi-registration): **97.7% pass** (85/87)
-- Official pi-mono extensions: **98.4% pass** (60/61, 1 test fixture)
-- Community extensions: **89.7% pass** (52/58)
+## Regression History
 
-## Compatibility by Extension Type
+| Metric | Previous baseline (2026-02-07) | Current validation run (2026-02-08) | Delta |
+|---|---:|---:|---:|
+| Extension pass count | 187 | 205 | +18 |
+| Extension fail count | 36 | 18 | -18 |
+| Extension pass rate | 83.9% | 91.9% | +8.0 pp |
+| Scenario pass count | 22 | 24 | +2 |
+| Scenario fail count | 3 | 1 | -2 |
+| Scenario pass rate | 88.0% | 96.0% | +8.0 pp |
 
-| Extension Type | Total | Pass | Fail | Rate | Notes |
-|----------------|-------|------|------|------|-------|
-| Simple single-file (T1) | 38 | 38 | 0 | 100% | Full compatibility |
-| Multi-registration (T2) | 87 | 85 | 2 | 97.7% | 2 multi-file dependency failures |
-| Multi-file / complex (T3) | 90 | 60 | 30 | 66.7% | Most failures are manifest mismatches or missing npm stubs |
-| npm dependencies (T4) | 3 | 2 | 1 | 66.7% | 1 ENOENT (missing bundled file) |
-| exec/network (T5) | 5 | 2 | 3 | 40.0% | Expected: these need system access |
+## Extension Coverage by Tier
 
-## Compatibility by Source
+| Tier | Pass | Fail | Total | Pass rate |
+|---|---:|---:|---:|---:|
+| 1 | 38 | 0 | 38 | 100.0% |
+| 2 | 83 | 4 | 87 | 95.4% |
+| 3 | 79 | 11 | 90 | 87.8% |
+| 4 | 1 | 2 | 3 | 33.3% |
+| 5 | 4 | 1 | 5 | 80.0% |
 
-| Source | Total | Pass | Fail | Rate |
-|--------|-------|------|------|------|
-| Official (pi-mono) | 61 | 60 | 1* | 98.4% |
-| Community | 58 | 52 | 6 | 89.7% |
-| npm registry | 75 | 48 | 27 | 64.0% |
-| Third-party GitHub | 23 | 16 | 7 | 69.6% |
-| Agents | 1 | 0 | 1 | 0% |
+## Remaining Failure Buckets (18 total)
 
-*Official failure is `base_fixtures` (test infrastructure, not a real extension).
+| Bucket | Count | Examples |
+|---|---:|---|
+| Multi-file dependency (unsupported relative specifiers) | 4 | `community/qualisero-background-notify`, `community/qualisero-pi-agent-scip`, `community/qualisero-safe-git`, `npm/aliou-pi-processes` |
+| Package module specifiers not supported in PiJS | 5 | `npm/pi-search-agent` (`openai`), `npm/pi-wakatime` (`adm-zip`), `npm/pi-web-access` (`linkedom`), `npm/qualisero-pi-agent-scip`, `third-party/qualisero-pi-agent-scip` |
+| Host-read policy denials (outside extension root) | 4 | `npm/ogulcancelik-pi-sketch`, `npm/pi-interview`, `third-party/kcosr-pi-extensions`, `third-party/ogulcancelik-pi-sketch` |
+| Runtime shape/load errors | 4 | `community/nicobailon-interview-tool`, `npm/aliou-pi-guardrails`, `npm/aliou-pi-toolchain`, `npm/marckrenn-pi-sub-core` |
+| Test fixture / non-product artifact | 1 | `base_fixtures` |
 
-## Performance Summary
+## Runtime API Matrix Gaps
 
-Measured on 103 safe extensions (single-file, no exec), 10 iterations each, debug build.
+- Failing Bun APIs: `Bun.connect`, `Bun.listen`
+- Matrix summary: Node `13/13` pass, Bun `5/7` pass
+- Evidence includes linked unit targets, structured logs, and e2e workflow metadata in:
+  `tests/ext_conformance/reports/parity/runtime_api_matrix.json`
 
-| Budget | Threshold | Actual | Status |
-|--------|-----------|--------|--------|
-| Cold load P95 (across extensions) | < 200ms | 106ms | PASS |
-| Cold load per-extension P99 | < 100ms | 134ms | FAIL* |
-| Warm load P95 | < 100ms | 734us | PASS |
-| Warm load per-extension P99 | < 100ms | 926us | PASS |
-| Event dispatch P99 (PR mode) | < 5ms | 616us | PASS |
+## Structured Evidence Bundle
 
-*Debug build only; release builds are 5-10x faster (~5-10ms cold load).
+| Artifact | Path |
+|---|---|
+| Full per-extension conformance JSON | `tests/ext_conformance/reports/conformance/conformance_report.json` |
+| Full per-extension conformance JSONL | `tests/ext_conformance/reports/conformance/conformance_events.jsonl` |
+| Human-readable conformance report | `tests/ext_conformance/reports/conformance/conformance_report.md` |
+| Scenario conformance summary | `tests/ext_conformance/reports/scenario_conformance.json` |
+| Scenario conformance JSONL | `tests/ext_conformance/reports/scenario_conformance.jsonl` |
+| Scenario triage summary | `tests/ext_conformance/reports/smoke_triage.json` |
+| Inventory rollup | `tests/ext_conformance/reports/inventory.json` |
+| Runtime API matrix | `tests/ext_conformance/reports/parity/runtime_api_matrix.json` |
+| e2e workflow summary | `tests/e2e_results/20260208T015811Z/summary.json` |
+| e2e evidence contract | `tests/e2e_results/20260208T015811Z/evidence_contract.json` |
 
-### Performance Highlights
-
-| Metric | Value |
-|--------|-------|
-| Median cold load (P50) | 77ms |
-| Fastest cold load | 67ms (trigger-compact) |
-| Slowest cold load | 126ms (hjanuschka-plan-mode) |
-| Median warm load (P50) | 333us |
-| Slowest warm load | 836us (jyaunches-pi-canvas) |
-| Extensions benchmarked | 100 of 103 (3 failures) |
-
-## Failure Classification
-
-36 extensions fail conformance. Root causes:
-
-| Category | Count | Fixable? | Impact |
-|----------|-------|----------|--------|
-| Manifest registration mismatch | 22 | Yes (audit manifests) | +9.8% pass rate |
-| Missing npm package stub | 5 | Yes (add virtual modules) | +2.2% pass rate |
-| Multi-file dependency | 4 | Partial (needs bundling) | +1.8% pass rate |
-| Runtime error | 4 | Investigation needed | +1.8% pass rate |
-| Test fixture (not real) | 1 | N/A | N/A |
-
-### Missing npm packages to add
-`openai`, `adm-zip`, `linkedom`, `@sourcegraph/scip-typescript`
-
-### Multi-file dependencies to resolve
-`../../shared` (qualisero), `./dist/extension.js`, `../components/processes-component`
-
-## Data Sources
-
-All data is derived from automated test outputs:
-
-| Source | File |
-|--------|------|
-| Conformance baseline | `tests/ext_conformance/reports/conformance_baseline.json` |
-| Conformance report | `tests/ext_conformance/reports/CONFORMANCE_REPORT.md` |
-| Performance baseline | `tests/perf/reports/ext_bench_baseline.json` |
-| Performance report | `tests/perf/reports/BASELINE_REPORT.md` |
-| Budget checks | `tests/perf/reports/budget_summary.json` |
-| Full per-extension results | `tests/ext_conformance/reports/conformance/conformance_report.md` |
-
-## Regeneration
+## Reproducible Commands
 
 ```bash
-# Conformance (all 223 extensions)
-cargo test --test ext_conformance_generated conformance_full_report \
+# 223-extension conformance campaign
+CARGO_TARGET_DIR=target-emeralddog cargo test \
+  --test ext_conformance_generated conformance_full_report \
   --features ext-conformance -- --nocapture
 
-# Performance (103 safe extensions)
-PI_BENCH_MODE=nightly PI_BENCH_MAX=103 PI_BENCH_ITERATIONS=10 \
-  cargo test --test ext_bench_harness --features ext-conformance -- --nocapture
+# Scenario campaign
+CARGO_TARGET_DIR=target-emeralddog cargo test \
+  --test ext_conformance_scenarios --features ext-conformance \
+  scenario_conformance_suite -- --nocapture
+
+# Runtime API matrix
+cargo test --test ext_conformance_matrix runtime_api_matrix_node_critical_entries_pass -- --nocapture
+cargo test --test ext_conformance_matrix generate_runtime_api_matrix_report -- --nocapture
+
+# Inventory rollup
+python3 tests/ext_conformance/build_inventory.py
+
+# e2e linkage evidence
+./scripts/e2e/run_all.sh --profile quick --suite e2e_extension_registration --skip-lint --skip-unit
 ```

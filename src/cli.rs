@@ -104,9 +104,13 @@ pub struct Cli {
     #[arg(long)]
     pub no_extensions: bool,
 
-    /// Extension capability policy: safe, standard, or permissive
+    /// Extension capability policy: safe, balanced, or permissive (legacy alias: standard)
     #[arg(long, value_name = "PROFILE")]
     pub extension_policy: Option<String>,
+
+    /// Print the resolved extension policy with per-capability decisions and exit
+    #[arg(long)]
+    pub explain_extension_policy: bool,
 
     // === Skills ===
     /// Load skill file/directory (can use multiple times)
@@ -682,9 +686,21 @@ mod tests {
     }
 
     #[test]
+    fn extension_policy_flag_balanced() {
+        let cli = Cli::parse_from(["pi", "--extension-policy", "balanced"]);
+        assert_eq!(cli.extension_policy.as_deref(), Some("balanced"));
+    }
+
+    #[test]
     fn extension_policy_flag_absent() {
         let cli = Cli::parse_from(["pi"]);
         assert!(cli.extension_policy.is_none());
+    }
+
+    #[test]
+    fn explain_extension_policy_flag_parses() {
+        let cli = Cli::parse_from(["pi", "--explain-extension-policy"]);
+        assert!(cli.explain_extension_policy);
     }
 }
 
@@ -745,6 +761,18 @@ pub enum Commands {
 
     /// Open configuration UI
     Config,
+
+    /// Diagnose extension compatibility and suggest fixes
+    Doctor {
+        /// Extension path or directory to check
+        path: String,
+        /// Output format: text (default), json, markdown
+        #[arg(long, default_value = "text")]
+        format: String,
+        /// Extension policy profile to check against
+        #[arg(long)]
+        policy: Option<String>,
+    },
 }
 
 impl Cli {

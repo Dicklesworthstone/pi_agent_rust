@@ -851,6 +851,62 @@ environment with no ambient OS access:
 3. **Conformance-tested**: 187 of 223 known extensions pass automated tests
 4. **Sub-100ms load times**: extensions load in <100ms (P95) with no JIT warmup
 
+Policy preset quick-start:
+
+```bash
+# Inspect current effective policy
+pi --explain-extension-policy
+
+# Switch profile for one command (safe | balanced | permissive)
+pi --extension-policy balanced --explain-extension-policy
+
+# Legacy alias is still accepted:
+pi --extension-policy standard --explain-extension-policy
+
+# Narrow dangerous-capability opt-in (preferred over permissive)
+PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced --explain-extension-policy
+```
+
+Operator rollout playbook (safe local + CI adoption):
+
+```bash
+# 1) Baseline: verify defaults are fail-closed (`safe`)
+pi --explain-extension-policy
+
+# 2) Staging: use balanced prompting, dangerous caps still denied by default
+pi --extension-policy balanced --explain-extension-policy
+
+# 3) Narrow opt-in for dangerous capabilities (preferred path)
+PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced --explain-extension-policy
+
+# 4) Emergency troubleshooting only (short-lived)
+pi --extension-policy permissive --explain-extension-policy
+```
+
+`settings.json` baseline for local/dev:
+
+```json
+{
+  "extensionPolicy": {
+    "profile": "balanced",
+    "allowDangerous": false
+  }
+}
+```
+
+CI guidance:
+
+```bash
+# CI default: keep dangerous capabilities disabled
+pi --extension-policy safe --explain-extension-policy
+
+# CI opt-in job (only where required), keep explicit and auditable
+PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced --explain-extension-policy
+```
+
+Rollback rule: remove `PI_EXTENSION_ALLOW_DANGEROUS`, set `extensionPolicy.profile`
+back to `safe`, and re-run `pi --explain-extension-policy` to confirm deny decisions.
+
 See [EXTENSIONS.md](EXTENSIONS.md) for the full architecture, runtime contract,
 and conformance results.
 

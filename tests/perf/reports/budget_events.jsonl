@@ -5,9 +5,9 @@
 {"budget_name":"ext_load_60_total","category":"extension","threshold":10000.0,"unit":"ms","actual":6198.0,"status":"PASS","source":"load_time_benchmark.json (sum of Rust load times)"}
 {"budget_name":"tool_call_latency_p99","category":"tool_call","threshold":200.0,"unit":"us","actual":null,"status":"NO_DATA","source":"no pijs_workload data"}
 {"budget_name":"tool_call_throughput_min","category":"tool_call","threshold":5000.0,"unit":"calls/sec","actual":null,"status":"NO_DATA","source":"no pijs_workload data"}
-{"budget_name":"event_dispatch_p99","category":"event_dispatch","threshold":5000.0,"unit":"us","actual":45.855788,"status":"PASS","source":"target/perf/scenario_runner.jsonl"}
+{"budget_name":"event_dispatch_p99","category":"event_dispatch","threshold":5000.0,"unit":"us","actual":null,"status":"NO_DATA","source":"no scenario_runner data for event_dispatch"}
 {"budget_name":"policy_eval_p99","category":"policy","threshold":500.0,"unit":"ns","actual":null,"status":"NO_DATA","source":"no criterion data for policy eval"}
-{"budget_name":"idle_memory_rss","category":"memory","threshold":50.0,"unit":"MB","actual":4.01953125,"status":"PASS","source":"sysinfo: current process RSS"}
-{"budget_name":"sustained_load_rss_growth","category":"memory","threshold":5.0,"unit":"percent","actual":null,"status":"NO_DATA","source":"no stress test data"}
+{"budget_name":"idle_memory_rss","category":"memory","threshold":50.0,"unit":"MB","actual":4.19921875,"status":"PASS","source":"sysinfo: current process RSS"}
+{"budget_name":"sustained_load_rss_growth","category":"memory","threshold":5.0,"unit":"percent","actual":0.0,"status":"PASS","source":"tests/perf/reports/stress_triage.json"}
 {"budget_name":"binary_size_release","category":"binary","threshold":20.0,"unit":"MB","actual":null,"status":"NO_DATA","source":"no release binary found"}
 {"budget_name":"protocol_parse_p99","category":"protocol","threshold":50.0,"unit":"us","actual":null,"status":"NO_DATA","source":"no criterion data for protocol parse"}

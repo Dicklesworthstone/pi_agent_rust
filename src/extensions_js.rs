@@ -203,6 +203,7 @@ pub fn is_env_var_allowed(key: &str) -> bool {
         "GITHUB_TOKEN",
     ];
     const BLOCKED_SUFFIXES: &[&str] = &[
+        "_API_KEY",
         "_SECRET",
         "_SECRET_KEY",
         "_ACCESS_KEY",
@@ -214,13 +215,13 @@ pub fn is_env_var_allowed(key: &str) -> bool {
     ];
     const BLOCKED_PREFIXES: &[&str] = &["AWS_SECRET_", "AWS_SESSION_"];
 
-    if key.starts_with("PI_") {
-        return true;
-    }
-    if BLOCKED_EXACT.contains(&key) {
+    let upper = key.to_ascii_uppercase();
+
+    // Block sensitive names/patterns first so case variants (and PI_-prefixed
+    // lookalikes) cannot bypass filtering.
+    if BLOCKED_EXACT.contains(&upper.as_str()) {
         return false;
     }
-    let upper = key.to_ascii_uppercase();
     for suffix in BLOCKED_SUFFIXES {
         if upper.ends_with(suffix) {
             return false;
@@ -231,6 +232,11 @@ pub fn is_env_var_allowed(key: &str) -> bool {
             return false;
         }
     }
+
+    if upper.starts_with("PI_") {
+        return true;
+    }
+
     true
 }
 
@@ -2754,6 +2760,22 @@ export default { define, loadConfig };
         .to_string(),
     );
 
+    // ── bun ────────────────────────────────────────────────────────
+    modules.insert(
+        "bun".to_string(),
+        r"
+const bun = globalThis.Bun || {};
+export const argv = bun.argv || [];
+export const file = (...args) => bun.file(...args);
+export const write = (...args) => bun.write(...args);
+export const spawn = (...args) => bun.spawn(...args);
+export const which = (...args) => bun.which(...args);
+export default bun;
+"
+        .trim()
+        .to_string(),
+    );
+
     // ── dotenv ─────────────────────────────────────────────────────
     modules.insert(
         "dotenv".to_string(),
@@ -2956,16 +2978,19 @@ function __makeEmitter() {
   return emitter;
 }
 
-function __emitCloseOnce(child, code) {
+function __emitCloseOnce(child, code, signal = null) {
   if (child.__pi_done) return;
   child.__pi_done = true;
+  child.exitCode = code;
+  child.signalCode = signal;
   __pi_child_process_state.children.delete(child.pid);
-  child.emit("close", code);
+  child.emit("exit", code, signal);
+  child.emit("close", code, signal);
 }
 
 function __parseSpawnOptions(raw) {
   const options = raw && typeof raw === "object" ? raw : {};
-  const allowed = new Set(["cwd", "detached", "shell", "stdio"]);
+  const allowed = new Set(["cwd", "detached", "shell", "stdio", "timeout"]);
   for (const key of Object.keys(options)) {
     if (!allowed.has(key)) {
       throw new Error(`node:child_process.spawn: unsupported option '${key}'`);
@@ -2999,11 +3024,25 @@ function __parseSpawnOptions(raw) {
     typeof options.cwd === "string" && options.cwd.trim().length > 0
       ? options.cwd
       : undefined;
+  let timeoutMs = undefined;
+  if (options.timeout !== undefined) {
+    if (
+      typeof options.timeout !== "number" ||
+      !Number.isFinite(options.timeout) ||
+      options.timeout < 0
+    ) {
+      throw new Error(
+        "node:child_process.spawn: options.timeout must be a non-negative number",
+      );
+    }
+    timeoutMs = Math.floor(options.timeout);
+  }
 
   return {
     cwd,
     detached: Boolean(options.detached),
     stdio,
+    timeoutMs,
   };
 }
 
@@ -3044,6 +3083,8 @@ export function spawn(command, args = [], options = {}) {
   const child = __makeEmitter();
   child.pid = __pi_child_process_state.nextPid++;
   child.killed = false;
+  child.exitCode = null;
+  child.signalCode = null;
   child.__pi_done = false;
   child.__pi_kill_resolver = null;
   child.stdout = opts.stdio[1] === "pipe" ? __makeEmitter() : null;
@@ -3060,13 +3101,16 @@ export function spawn(command, args = [], options = {}) {
       });
       child.__pi_kill_resolver = null;
     }
-    __emitCloseOnce(child, null);
+    __emitCloseOnce(child, null, String(signal || "SIGTERM"));
     return true;
   };
 
   __pi_child_process_state.children.set(child.pid, child);
 
-  const execPromise = pi.exec(cmd, argv, { cwd: opts.cwd }).then(
+  const execOptions = {};
+  if (opts.cwd !== undefined) execOptions.cwd = opts.cwd;
+  if (opts.timeoutMs !== undefined) execOptions.timeout = opts.timeoutMs;
+  const execPromise = pi.exec(cmd, argv, execOptions).then(
     (result) => ({ kind: "result", result }),
     (error) => ({ kind: "error", error }),
   );
@@ -3093,7 +3137,11 @@ export function spawn(command, args = [], options = {}) {
         typeof result.code === "number" && Number.isFinite(result.code)
           ? result.code
           : 0;
-      __emitCloseOnce(child, code);
+      const signal =
+        result.killed || child.killed
+          ? String(result.signal || "SIGTERM")
+          : null;
+      __emitCloseOnce(child, signal ? null : code, signal);
       return;
     }
 
@@ -3107,7 +3155,7 @@ export function spawn(command, args = [], options = {}) {
         error.code = String(source.code);
       }
       child.emit("error", error);
-      __emitCloseOnce(child, 1);
+      __emitCloseOnce(child, 1, null);
     }
   });
 
@@ -3232,40 +3280,124 @@ export function execSync(command, options) {
   return stdout;
 }
 
+function __normalizeExecOptions(raw) {
+  const options = raw && typeof raw === "object" ? raw : {};
+  let timeoutMs = undefined;
+  if (
+    typeof options.timeout === "number" &&
+    Number.isFinite(options.timeout) &&
+    options.timeout >= 0
+  ) {
+    timeoutMs = Math.floor(options.timeout);
+  }
+  const maxBuffer =
+    typeof options.maxBuffer === "number" &&
+    Number.isFinite(options.maxBuffer) &&
+    options.maxBuffer > 0
+      ? Math.floor(options.maxBuffer)
+      : 1024 * 1024;
+  return {
+    cwd: typeof options.cwd === "string" && options.cwd.trim().length > 0 ? options.cwd : undefined,
+    timeoutMs,
+    maxBuffer,
+    encoding: options.encoding,
+  };
+}
+
+function __wrapExecLike(commandForError, child, opts, callback) {
+  let stdout = "";
+  let stderr = "";
+  let callbackDone = false;
+  const finish = (err, out, errOut) => {
+    if (callbackDone) return;
+    callbackDone = true;
+    if (typeof callback === "function") {
+      callback(err, out, errOut);
+    }
+  };
+
+  child.stdout?.on("data", (chunk) => {
+    stdout += String(chunk ?? "");
+  });
+  child.stderr?.on("data", (chunk) => {
+    stderr += String(chunk ?? "");
+  });
+
+  child.on("error", (error) => {
+    finish(
+      error instanceof Error ? error : new Error(String(error)),
+      "",
+      "",
+    );
+  });
+
+  child.on("close", (code) => {
+    let out = stdout;
+    let errOut = stderr;
+
+    if (out.length > opts.maxBuffer) {
+      const err = new Error("stdout maxBuffer length exceeded");
+      err.stdout = out.slice(0, opts.maxBuffer);
+      err.stderr = errOut;
+      finish(err, err.stdout, errOut);
+      return;
+    }
+
+    if (errOut.length > opts.maxBuffer) {
+      const err = new Error("stderr maxBuffer length exceeded");
+      err.stdout = out;
+      err.stderr = errOut.slice(0, opts.maxBuffer);
+      finish(err, out, err.stderr);
+      return;
+    }
+
+    if (opts.encoding !== "buffer" && opts.encoding !== null) {
+      out = String(out);
+      errOut = String(errOut);
+    }
+
+    if (code !== 0 && code !== undefined && code !== null) {
+      const err = new Error(`Command failed: ${commandForError}`);
+      err.code = code;
+      err.killed = Boolean(child.killed);
+      err.stdout = out;
+      err.stderr = errOut;
+      finish(err, out, errOut);
+      return;
+    }
+
+    if (child.killed) {
+      const err = new Error(`Command timed out: ${commandForError}`);
+      err.code = null;
+      err.killed = true;
+      err.signal = child.signalCode || "SIGTERM";
+      err.stdout = out;
+      err.stderr = errOut;
+      finish(err, out, errOut);
+      return;
+    }
+
+    finish(null, out, errOut);
+  });
+
+  return child;
+}
+
 export function exec(command, optionsOrCallback, callbackArg) {
   const opts = typeof optionsOrCallback === "object" ? optionsOrCallback : {};
   const callback = typeof optionsOrCallback === "function"
     ? optionsOrCallback
     : callbackArg;
   const cmdStr = String(command ?? "").trim();
-  const cwd = opts && typeof opts.cwd === "string" ? opts.cwd : undefined;
-
-  // Use pi.exec via shell
-  pi.exec("sh", ["-c", cmdStr], { cwd }).then(
-    (result) => {
-      const stdout = String(result.stdout || "");
-      const stderr = String(result.stderr || "");
-      if (typeof callback === "function") {
-        if (result.code !== 0 && result.code !== undefined && result.code !== null) {
-          const err = new Error(`Command failed: ${cmdStr}`);
-          err.code = result.code;
-          err.killed = Boolean(result.killed);
-          callback(err, stdout, stderr);
-        } else {
-          callback(null, stdout, stderr);
-        }
-      }
-    },
-    (error) => {
-      if (typeof callback === "function") {
-        callback(
-          error instanceof Error ? error : new Error(String(error)),
-          "",
-          "",
-        );
-      }
-    },
-  );
+  const normalized = __normalizeExecOptions(opts);
+  const spawnOpts = {
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  };
+  if (normalized.cwd !== undefined) spawnOpts.cwd = normalized.cwd;
+  if (normalized.timeoutMs !== undefined) spawnOpts.timeout = normalized.timeoutMs;
+  const child = spawn("sh", ["-c", cmdStr], spawnOpts);
+  return __wrapExecLike(cmdStr, child, normalized, callback);
 }
 
 export function execFileSync(file, argsInput, options) {
@@ -3317,32 +3449,15 @@ export function execFile(file, argsOrOptsOrCb, optsOrCb, callbackArg) {
     callback = typeof optsOrCb === "function" ? optsOrCb : callbackArg;
   }
 
-  const cwd = opts && typeof opts.cwd === "string" ? opts.cwd : undefined;
-
-  pi.exec(fileStr, args, { cwd }).then(
-    (result) => {
-      const stdout = String(result.stdout || "");
-      const stderr = String(result.stderr || "");
-      if (typeof callback === "function") {
-        if (result.code !== 0 && result.code !== undefined && result.code !== null) {
-          const err = new Error(`Command failed: ${fileStr}`);
-          err.code = result.code;
-          callback(err, stdout, stderr);
-        } else {
-          callback(null, stdout, stderr);
-        }
-      }
-    },
-    (error) => {
-      if (typeof callback === "function") {
-        callback(
-          error instanceof Error ? error : new Error(String(error)),
-          "",
-          "",
-        );
-      }
-    },
-  );
+  const normalized = __normalizeExecOptions(opts);
+  const spawnOpts = {
+    shell: false,
+    stdio: ["ignore", "pipe", "pipe"],
+  };
+  if (normalized.cwd !== undefined) spawnOpts.cwd = normalized.cwd;
+  if (normalized.timeoutMs !== undefined) spawnOpts.timeout = normalized.timeoutMs;
+  const child = spawn(fileStr, args, spawnOpts);
+  return __wrapExecLike(fileStr, child, normalized, callback);
 }
 
 export function fork(_modulePath, _args, _opts) {
@@ -3367,6 +3482,9 @@ import * as url from "node:url";
 import * as processMod from "node:process";
 import * as buffer from "node:buffer";
 import * as childProcess from "node:child_process";
+import * as stream from "node:stream";
+import * as streamPromises from "node:stream/promises";
+import * as stringDecoder from "node:string_decoder";
 
 function __normalizeBuiltin(id) {
   const spec = String(id ?? "");
@@ -3398,6 +3516,15 @@ function __normalizeBuiltin(id) {
     case "child_process":
     case "node:child_process":
       return "node:child_process";
+    case "stream":
+    case "node:stream":
+      return "node:stream";
+    case "stream/promises":
+    case "node:stream/promises":
+      return "node:stream/promises";
+    case "string_decoder":
+    case "node:string_decoder":
+      return "node:string_decoder";
     default:
       return spec;
   }
@@ -3413,6 +3540,9 @@ const __builtinModules = {
   "node:process": processMod,
   "node:buffer": buffer,
   "node:child_process": childProcess,
+  "node:stream": stream,
+  "node:stream/promises": streamPromises,
+  "node:string_decoder": stringDecoder,
 };
 
 export function createRequire(_path) {
@@ -3435,7 +3565,21 @@ export default { createRequire };
     modules.insert(
         "node:fs".to_string(),
         r#"
-export const constants = { R_OK: 4, W_OK: 2, X_OK: 1, F_OK: 0 };
+import { Readable, Writable } from "node:stream";
+
+export const constants = {
+  R_OK: 4,
+  W_OK: 2,
+  X_OK: 1,
+  F_OK: 0,
+  O_RDONLY: 0,
+  O_WRONLY: 1,
+  O_RDWR: 2,
+  O_CREAT: 64,
+  O_EXCL: 128,
+  O_TRUNC: 512,
+  O_APPEND: 1024,
+};
 const __pi_vfs = (() => {
   if (globalThis.__pi_vfs_state) {
     return globalThis.__pi_vfs_state;
@@ -3444,6 +3588,9 @@ const __pi_vfs = (() => {
   const state = {
     files: new Map(),
     dirs: new Set(["/"]),
+    symlinks: new Map(),
+    fds: new Map(),
+    nextFd: 100,
   };
 
   function normalizePath(input) {
@@ -3533,12 +3680,105 @@ const __pi_vfs = (() => {
     return new TextDecoder().decode(bytes);
   }
 
-  function makeDirent(name, isDir) {
+  function resolveSymlinkPath(linkPath, target) {
+    const raw = String(target ?? "");
+    if (raw.startsWith("/")) {
+      return normalizePath(raw);
+    }
+    return normalizePath(`${dirname(linkPath)}/${raw}`);
+  }
+
+  function resolvePath(path, followSymlinks = true) {
+    let normalized = normalizePath(path);
+    if (!followSymlinks) {
+      return normalized;
+    }
+
+    const seen = new Set();
+    while (state.symlinks.has(normalized)) {
+      if (seen.has(normalized)) {
+        throw new Error(`ELOOP: too many symbolic links encountered, stat '${String(path ?? "")}'`);
+      }
+      seen.add(normalized);
+      normalized = resolveSymlinkPath(normalized, state.symlinks.get(normalized));
+    }
+    return normalized;
+  }
+
+  function parseOpenFlags(rawFlags) {
+    if (typeof rawFlags === "number" && Number.isFinite(rawFlags)) {
+      const flags = rawFlags | 0;
+      const accessMode = flags & 3;
+      const readable = accessMode === constants.O_RDONLY || accessMode === constants.O_RDWR;
+      const writable = accessMode === constants.O_WRONLY || accessMode === constants.O_RDWR;
+      return {
+        readable,
+        writable,
+        append: (flags & constants.O_APPEND) !== 0,
+        create: (flags & constants.O_CREAT) !== 0,
+        truncate: (flags & constants.O_TRUNC) !== 0,
+        exclusive: (flags & constants.O_EXCL) !== 0,
+      };
+    }
+
+    const normalized = String(rawFlags ?? "r");
+    switch (normalized) {
+      case "r":
+      case "rs":
+        return { readable: true, writable: false, append: false, create: false, truncate: false, exclusive: false };
+      case "r+":
+      case "rs+":
+        return { readable: true, writable: true, append: false, create: false, truncate: false, exclusive: false };
+      case "w":
+        return { readable: false, writable: true, append: false, create: true, truncate: true, exclusive: false };
+      case "w+":
+        return { readable: true, writable: true, append: false, create: true, truncate: true, exclusive: false };
+      case "wx":
+        return { readable: false, writable: true, append: false, create: true, truncate: true, exclusive: true };
+      case "wx+":
+        return { readable: true, writable: true, append: false, create: true, truncate: true, exclusive: true };
+      case "a":
+      case "as":
+        return { readable: false, writable: true, append: true, create: true, truncate: false, exclusive: false };
+      case "a+":
+      case "as+":
+        return { readable: true, writable: true, append: true, create: true, truncate: false, exclusive: false };
+      case "ax":
+        return { readable: false, writable: true, append: true, create: true, truncate: false, exclusive: true };
+      case "ax+":
+        return { readable: true, writable: true, append: true, create: true, truncate: false, exclusive: true };
+      default:
+        throw new Error(`EINVAL: invalid open flags '${normalized}'`);
+    }
+  }
+
+  function getFdEntry(fd) {
+    const entry = state.fds.get(fd);
+    if (!entry) {
+      throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+    }
+    return entry;
+  }
+
+  function toWritableView(buffer) {
+    if (buffer instanceof Uint8Array) {
+      return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    }
+    if (buffer instanceof ArrayBuffer) {
+      return new Uint8Array(buffer);
+    }
+    if (ArrayBuffer.isView(buffer)) {
+      return new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+    }
+    throw new Error("TypeError: buffer must be an ArrayBuffer view");
+  }
+
+  function makeDirent(name, entryKind) {
     return {
       name,
-      isDirectory() { return isDir; },
-      isFile() { return !isDir; },
-      isSymbolicLink() { return false; },
+      isDirectory() { return entryKind === "dir"; },
+      isFile() { return entryKind === "file"; },
+      isSymbolicLink() { return entryKind === "symlink"; },
     };
   }
 
@@ -3551,13 +3791,19 @@ const __pi_vfs = (() => {
       if (!dir.startsWith(prefix) || dir === normalized) continue;
       const rest = dir.slice(prefix.length);
       if (!rest || rest.includes("/")) continue;
-      children.set(rest, true);
+      children.set(rest, "dir");
     }
     for (const file of state.files.keys()) {
       if (!file.startsWith(prefix)) continue;
       const rest = file.slice(prefix.length);
       if (!rest || rest.includes("/")) continue;
-      if (!children.has(rest)) children.set(rest, false);
+      if (!children.has(rest)) children.set(rest, "file");
+    }
+    for (const link of state.symlinks.keys()) {
+      if (!link.startsWith(prefix)) continue;
+      const rest = link.slice(prefix.length);
+      if (!rest || rest.includes("/")) continue;
+      if (!children.has(rest)) children.set(rest, "symlink");
     }
 
     const names = Array.from(children.keys()).sort();
@@ -3567,8 +3813,43 @@ const __pi_vfs = (() => {
     return names;
   }
 
-  function makeStat(path) {
+  function makeStat(path, followSymlinks = true) {
     const normalized = normalizePath(path);
+    const linkTarget = state.symlinks.get(normalized);
+    if (linkTarget !== undefined) {
+      if (!followSymlinks) {
+        const size = new TextEncoder().encode(String(linkTarget)).byteLength;
+        return {
+          isFile() { return false; },
+          isDirectory() { return false; },
+          isSymbolicLink() { return true; },
+          isBlockDevice() { return false; },
+          isCharacterDevice() { return false; },
+          isFIFO() { return false; },
+          isSocket() { return false; },
+          size,
+          mode: 0o777,
+          uid: 0,
+          gid: 0,
+          atimeMs: 0,
+          mtimeMs: 0,
+          ctimeMs: 0,
+          birthtimeMs: 0,
+          atime: new Date(0),
+          mtime: new Date(0),
+          ctime: new Date(0),
+          birthtime: new Date(0),
+          dev: 0,
+          ino: 0,
+          nlink: 1,
+          rdev: 0,
+          blksize: 4096,
+          blocks: 0,
+        };
+      }
+      return makeStat(resolvePath(normalized, true), true);
+    }
+
     const isDir = state.dirs.has(normalized);
     let bytes = state.files.get(normalized);
     if (!isDir && bytes === undefined && typeof globalThis.__pi_host_read_file_sync === "function") {
@@ -3577,7 +3858,13 @@ const __pi_vfs = (() => {
         bytes = toBytes(content);
         ensureDir(dirname(normalized));
         state.files.set(normalized, bytes);
-      } catch (_e) { /* not on host FS */ }
+      } catch (e) {
+        const message = String((e && e.message) ? e.message : e);
+        if (message.includes("host read denied")) {
+          throw e;
+        }
+        /* not on host FS */
+      }
     }
     const isFile = bytes !== undefined;
     if (!isDir && !isFile) {
@@ -3620,35 +3907,39 @@ const __pi_vfs = (() => {
   state.decodeBytes = decodeBytes;
   state.listChildren = listChildren;
   state.makeStat = makeStat;
+  state.resolvePath = resolvePath;
+  state.parseOpenFlags = parseOpenFlags;
+  state.getFdEntry = getFdEntry;
+  state.toWritableView = toWritableView;
   globalThis.__pi_vfs_state = state;
   return state;
 })();
 
 export function existsSync(path) {
-  const normalized = __pi_vfs.normalizePath(path);
-  if (__pi_vfs.dirs.has(normalized) || __pi_vfs.files.has(normalized)) return true;
-  if (typeof globalThis.__pi_host_read_file_sync === "function") {
-    try {
-      const content = globalThis.__pi_host_read_file_sync(normalized);
-      const bytes = __pi_vfs.toBytes(content);
-      __pi_vfs.ensureDir(__pi_vfs.dirname(normalized));
-      __pi_vfs.files.set(normalized, bytes);
-      return true;
-    } catch (_e) { /* file not found on real FS */ }
+  try {
+    statSync(path);
+    return true;
+  } catch (_err) {
+    return false;
   }
-  return false;
 }
 
 export function readFileSync(path, encoding) {
-  const normalized = __pi_vfs.normalizePath(path);
-  let bytes = __pi_vfs.files.get(normalized);
+  const resolved = __pi_vfs.resolvePath(path, true);
+  let bytes = __pi_vfs.files.get(resolved);
   if (!bytes && typeof globalThis.__pi_host_read_file_sync === "function") {
     try {
-      const content = globalThis.__pi_host_read_file_sync(normalized);
+      const content = globalThis.__pi_host_read_file_sync(resolved);
       bytes = __pi_vfs.toBytes(content);
-      __pi_vfs.ensureDir(__pi_vfs.dirname(normalized));
-      __pi_vfs.files.set(normalized, bytes);
-    } catch (_e) { /* fall through to ENOENT */ }
+      __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
+      __pi_vfs.files.set(resolved, bytes);
+    } catch (e) {
+      const message = String((e && e.message) ? e.message : e);
+      if (message.includes("host read denied")) {
+        throw e;
+      }
+      /* fall through to ENOENT */
+    }
   }
   if (!bytes) {
     throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'`);
@@ -3657,29 +3948,29 @@ export function readFileSync(path, encoding) {
 }
 
 export function appendFileSync(path, data, opts) {
-  const normalized = __pi_vfs.normalizePath(path);
-  const current = __pi_vfs.files.get(normalized) || new Uint8Array();
+  const resolved = __pi_vfs.resolvePath(path, true);
+  const current = __pi_vfs.files.get(resolved) || new Uint8Array();
   const next = __pi_vfs.toBytes(data, opts);
   const merged = new Uint8Array(current.byteLength + next.byteLength);
   merged.set(current, 0);
   merged.set(next, current.byteLength);
-  __pi_vfs.ensureDir(__pi_vfs.dirname(normalized));
-  __pi_vfs.files.set(normalized, merged);
+  __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
+  __pi_vfs.files.set(resolved, merged);
 }
 
 export function writeFileSync(path, data, opts) {
-  const normalized = __pi_vfs.normalizePath(path);
-  __pi_vfs.ensureDir(__pi_vfs.dirname(normalized));
-  __pi_vfs.files.set(normalized, __pi_vfs.toBytes(data, opts));
+  const resolved = __pi_vfs.resolvePath(path, true);
+  __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
+  __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
 }
 
 export function readdirSync(path, opts) {
-  const normalized = __pi_vfs.normalizePath(path);
-  if (!__pi_vfs.dirs.has(normalized)) {
+  const resolved = __pi_vfs.resolvePath(path, true);
+  if (!__pi_vfs.dirs.has(resolved)) {
     throw new Error(`ENOENT: no such file or directory, scandir '${String(path ?? "")}'`);
   }
   const withFileTypes = !!(opts && typeof opts === "object" && opts.withFileTypes);
-  return __pi_vfs.listChildren(normalized, withFileTypes);
+  return __pi_vfs.listChildren(resolved, withFileTypes);
 }
 
 const __fakeStat = {
@@ -3695,8 +3986,8 @@ const __fakeStat = {
   atime: new Date(0), mtime: new Date(0), ctime: new Date(0), birthtime: new Date(0),
   dev: 0, ino: 0, nlink: 1, rdev: 0, blksize: 4096, blocks: 0,
 };
-export function statSync(path) { return __pi_vfs.makeStat(path); }
-export function lstatSync(path) { return __pi_vfs.makeStat(path); }
+export function statSync(path) { return __pi_vfs.makeStat(path, true); }
+export function lstatSync(path) { return __pi_vfs.makeStat(path, false); }
 export function mkdtempSync(prefix, _opts) {
   const p = String(prefix ?? "/tmp/tmp-");
   const out = `${p}${Date.now().toString(36)}`;
@@ -3704,10 +3995,13 @@ export function mkdtempSync(prefix, _opts) {
   return out;
 }
 export function realpathSync(path, _opts) {
-  return __pi_vfs.normalizePath(path);
+  return __pi_vfs.resolvePath(path, true);
 }
 export function unlinkSync(path) {
   const normalized = __pi_vfs.normalizePath(path);
+  if (__pi_vfs.symlinks.delete(normalized)) {
+    return;
+  }
   if (!__pi_vfs.files.delete(normalized)) {
     throw new Error(`ENOENT: no such file or directory, unlink '${String(path ?? "")}'`);
   }
@@ -3716,6 +4010,9 @@ export function rmdirSync(path, _opts) {
   const normalized = __pi_vfs.normalizePath(path);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
+  }
+  if (__pi_vfs.symlinks.has(normalized)) {
+    throw new Error(`ENOTDIR: not a directory, rmdir '${String(path ?? "")}'`);
   }
   for (const filePath of __pi_vfs.files.keys()) {
     if (filePath.startsWith(`${normalized}/`)) {
@@ -3727,6 +4024,11 @@ export function rmdirSync(path, _opts) {
       throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
     }
   }
+  for (const linkPath of __pi_vfs.symlinks.keys()) {
+    if (linkPath.startsWith(`${normalized}/`)) {
+      throw new Error(`ENOTEMPTY: directory not empty, rmdir '${String(path ?? "")}'`);
+    }
+  }
   if (!__pi_vfs.dirs.delete(normalized)) {
     throw new Error(`ENOENT: no such file or directory, rmdir '${String(path ?? "")}'`);
   }
@@ -3735,6 +4037,10 @@ export function rmSync(path, opts) {
   const normalized = __pi_vfs.normalizePath(path);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
+    return;
+  }
+  if (__pi_vfs.symlinks.has(normalized)) {
+    __pi_vfs.symlinks.delete(normalized);
     return;
   }
   if (__pi_vfs.dirs.has(normalized)) {
@@ -3753,6 +4059,11 @@ export function rmSync(path, opts) {
         __pi_vfs.dirs.delete(dirPath);
       }
     }
+    for (const linkPath of Array.from(__pi_vfs.symlinks.keys())) {
+      if (linkPath === normalized || linkPath.startsWith(`${normalized}/`)) {
+        __pi_vfs.symlinks.delete(linkPath);
+      }
+    }
     if (!__pi_vfs.dirs.has("/")) {
       __pi_vfs.dirs.add("/");
     }
@@ -3766,13 +4077,21 @@ export function copyFileSync(src, dest, _mode) {
 export function renameSync(oldPath, newPath) {
   const src = __pi_vfs.normalizePath(oldPath);
   const dst = __pi_vfs.normalizePath(newPath);
-  const bytes = __pi_vfs.files.get(src);
-  if (!bytes) {
-    throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
+  const linkTarget = __pi_vfs.symlinks.get(src);
+  if (linkTarget !== undefined) {
+    __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
+    __pi_vfs.symlinks.set(dst, linkTarget);
+    __pi_vfs.symlinks.delete(src);
+    return;
   }
-  __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
-  __pi_vfs.files.set(dst, bytes);
-  __pi_vfs.files.delete(src);
+  const bytes = __pi_vfs.files.get(src);
+  if (bytes !== undefined) {
+    __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
+    __pi_vfs.files.set(dst, bytes);
+    __pi_vfs.files.delete(src);
+    return;
+  }
+  throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
 }
 export function mkdirSync(path, _opts) {
   __pi_vfs.ensureDir(path);
@@ -3785,12 +4104,180 @@ export function accessSync(path, _mode) {
 }
 export function chmodSync(_path, _mode) { return; }
 export function chownSync(_path, _uid, _gid) { return; }
-export function openSync(_path, _flags, _mode) { return 99; }
-export function closeSync(_fd) { return; }
-export function readSync(_fd, _buf, _off, _len, _pos) { return 0; }
-export function writeSync(_fd, _buf, _off, _len, _pos) { return typeof _buf === 'string' ? _buf.length : (_len || 0); }
-export function fstatSync(_fd) { return __fakeStat; }
-export function ftruncateSync(_fd, _len) { return; }
+export function readlinkSync(path, opts) {
+  const normalized = __pi_vfs.normalizePath(path);
+  if (!__pi_vfs.symlinks.has(normalized)) {
+    if (__pi_vfs.files.has(normalized) || __pi_vfs.dirs.has(normalized)) {
+      throw new Error(`EINVAL: invalid argument, readlink '${String(path ?? "")}'`);
+    }
+    throw new Error(`ENOENT: no such file or directory, readlink '${String(path ?? "")}'`);
+  }
+  const target = String(__pi_vfs.symlinks.get(normalized));
+  const encoding =
+    typeof opts === "string"
+      ? opts
+      : opts && typeof opts === "object" && typeof opts.encoding === "string"
+        ? opts.encoding
+        : undefined;
+  if (encoding && String(encoding).toLowerCase() === "buffer") {
+    return Buffer.from(target, "utf8");
+  }
+  return target;
+}
+export function symlinkSync(target, path, _type) {
+  const normalized = __pi_vfs.normalizePath(path);
+  const parent = __pi_vfs.dirname(normalized);
+  if (!__pi_vfs.dirs.has(parent)) {
+    throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
+  }
+  if (__pi_vfs.files.has(normalized) || __pi_vfs.dirs.has(normalized) || __pi_vfs.symlinks.has(normalized)) {
+    throw new Error(`EEXIST: file already exists, symlink '${String(path ?? "")}'`);
+  }
+  __pi_vfs.symlinks.set(normalized, String(target ?? ""));
+}
+export function openSync(path, flags = "r", _mode) {
+  const resolved = __pi_vfs.resolvePath(path, true);
+  const opts = __pi_vfs.parseOpenFlags(flags);
+
+  if (__pi_vfs.dirs.has(resolved)) {
+    throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
+  }
+
+  const exists = __pi_vfs.files.has(resolved);
+  if (!exists && !opts.create) {
+    throw new Error(`ENOENT: no such file or directory, open '${String(path ?? "")}'`);
+  }
+  if (exists && opts.create && opts.exclusive) {
+    throw new Error(`EEXIST: file already exists, open '${String(path ?? "")}'`);
+  }
+  if (!exists && opts.create) {
+    __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
+    __pi_vfs.files.set(resolved, new Uint8Array());
+  }
+  if (opts.truncate && opts.writable) {
+    __pi_vfs.files.set(resolved, new Uint8Array());
+  }
+
+  const fd = __pi_vfs.nextFd++;
+  const current = __pi_vfs.files.get(resolved) || new Uint8Array();
+  __pi_vfs.fds.set(fd, {
+    path: resolved,
+    readable: opts.readable,
+    writable: opts.writable,
+    append: opts.append,
+    position: opts.append ? current.byteLength : 0,
+  });
+  return fd;
+}
+export function closeSync(fd) {
+  if (!__pi_vfs.fds.delete(fd)) {
+    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+  }
+}
+export function readSync(fd, buffer, offset = 0, length, position = null) {
+  const entry = __pi_vfs.getFdEntry(fd);
+  if (!entry.readable) {
+    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+  }
+  const out = __pi_vfs.toWritableView(buffer);
+  const start = Number.isInteger(offset) && offset >= 0 ? offset : 0;
+  const maxLen =
+    Number.isInteger(length) && length >= 0
+      ? length
+      : Math.max(0, out.byteLength - start);
+  let cursor =
+    typeof position === "number" && Number.isFinite(position) && position >= 0
+      ? Math.floor(position)
+      : entry.position;
+  const source = __pi_vfs.files.get(entry.path) || new Uint8Array();
+  if (cursor >= source.byteLength || maxLen <= 0 || start >= out.byteLength) {
+    return 0;
+  }
+  const readLen = Math.min(maxLen, out.byteLength - start, source.byteLength - cursor);
+  out.set(source.subarray(cursor, cursor + readLen), start);
+  if (position === null || position === undefined) {
+    entry.position = cursor + readLen;
+  }
+  return readLen;
+}
+export function writeSync(fd, buffer, offset, length, position) {
+  const entry = __pi_vfs.getFdEntry(fd);
+  if (!entry.writable) {
+    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+  }
+
+  let chunk;
+  let explicitPosition = false;
+  let cursor = null;
+
+  if (typeof buffer === "string") {
+    const encoding =
+      typeof length === "string"
+        ? length
+        : typeof offset === "string"
+          ? offset
+          : undefined;
+    chunk = __pi_vfs.toBytes(buffer, encoding);
+    if (
+      arguments.length >= 3 &&
+      typeof offset === "number" &&
+      Number.isFinite(offset) &&
+      offset >= 0
+    ) {
+      explicitPosition = true;
+      cursor = Math.floor(offset);
+    }
+  } else {
+    const input = __pi_vfs.toWritableView(buffer);
+    const start = Number.isInteger(offset) && offset >= 0 ? offset : 0;
+    const maxLen =
+      Number.isInteger(length) && length >= 0
+        ? length
+        : Math.max(0, input.byteLength - start);
+    chunk = input.subarray(start, Math.min(input.byteLength, start + maxLen));
+    if (typeof position === "number" && Number.isFinite(position) && position >= 0) {
+      explicitPosition = true;
+      cursor = Math.floor(position);
+    }
+  }
+
+  if (!explicitPosition) {
+    cursor = entry.append
+      ? (__pi_vfs.files.get(entry.path)?.byteLength || 0)
+      : entry.position;
+  }
+
+  const current = __pi_vfs.files.get(entry.path) || new Uint8Array();
+  const required = cursor + chunk.byteLength;
+  const next = new Uint8Array(Math.max(current.byteLength, required));
+  next.set(current, 0);
+  next.set(chunk, cursor);
+  __pi_vfs.files.set(entry.path, next);
+
+  if (!explicitPosition) {
+    entry.position = cursor + chunk.byteLength;
+  }
+  return chunk.byteLength;
+}
+export function fstatSync(fd) {
+  const entry = __pi_vfs.getFdEntry(fd);
+  return __pi_vfs.makeStat(entry.path, true);
+}
+export function ftruncateSync(fd, len = 0) {
+  const entry = __pi_vfs.getFdEntry(fd);
+  if (!entry.writable) {
+    throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
+  }
+  const targetLen =
+    Number.isInteger(len) && len >= 0 ? len : 0;
+  const current = __pi_vfs.files.get(entry.path) || new Uint8Array();
+  const next = new Uint8Array(targetLen);
+  next.set(current.subarray(0, Math.min(current.byteLength, targetLen)));
+  __pi_vfs.files.set(entry.path, next);
+  if (entry.position > targetLen) {
+    entry.position = targetLen;
+  }
+}
 export function futimesSync(_fd, _atime, _mtime) { return; }
 function __fakeWatcher() {
   const w = { close() {}, unref() { return w; }, ref() { return w; }, on() { return w; }, once() { return w; }, removeListener() { return w; }, removeAllListeners() { return w; } };
@@ -3799,11 +4286,108 @@ function __fakeWatcher() {
 export function watch(_path, _optsOrListener, _listener) { return __fakeWatcher(); }
 export function watchFile(_path, _optsOrListener, _listener) { return __fakeWatcher(); }
 export function unwatchFile(_path, _listener) { return; }
-export function createReadStream(_path, _opts) {
-  return { on() { return this; }, pipe() { return this; }, destroy() {}, read() { return null; }, resume() { return this; }, pause() { return this; } };
+function __queueMicrotaskPolyfill(fn) {
+  if (typeof queueMicrotask === "function") {
+    queueMicrotask(fn);
+    return;
+  }
+  Promise.resolve().then(fn);
 }
-export function createWriteStream(_path, _opts) {
-  return { on() { return this; }, write() { return true; }, end() {}, destroy() {}, cork() {}, uncork() {} };
+export function createReadStream(path, opts) {
+  const options = opts && typeof opts === "object" ? opts : {};
+  const encoding = typeof options.encoding === "string" ? options.encoding : null;
+  const highWaterMark =
+    Number.isInteger(options.highWaterMark) && options.highWaterMark > 0
+      ? options.highWaterMark
+      : 64 * 1024;
+
+  const stream = new Readable({ encoding: encoding || undefined, autoDestroy: false });
+  stream.path = __pi_vfs.normalizePath(path);
+
+  __queueMicrotaskPolyfill(() => {
+    try {
+      const bytes = readFileSync(path, "buffer");
+      const source =
+        bytes instanceof Uint8Array
+          ? bytes
+          : (typeof Buffer !== "undefined" && Buffer.from
+              ? Buffer.from(bytes)
+              : __pi_vfs.toBytes(bytes));
+
+      if (source.byteLength === 0) {
+        stream.push(null);
+        return;
+      }
+
+      let offset = 0;
+      while (offset < source.byteLength) {
+        const nextOffset = Math.min(source.byteLength, offset + highWaterMark);
+        const slice = source.subarray(offset, nextOffset);
+        if (encoding && typeof Buffer !== "undefined" && Buffer.from) {
+          stream.push(Buffer.from(slice).toString(encoding));
+        } else {
+          stream.push(slice);
+        }
+        offset = nextOffset;
+      }
+      stream.push(null);
+    } catch (err) {
+      stream.emit("error", err instanceof Error ? err : new Error(String(err)));
+    }
+  });
+
+  return stream;
+}
+export function createWriteStream(path, opts) {
+  const options = opts && typeof opts === "object" ? opts : {};
+  const encoding = typeof options.encoding === "string" ? options.encoding : "utf8";
+  const flags = typeof options.flags === "string" ? options.flags : "w";
+  const appendMode = flags.startsWith("a");
+  const bufferedChunks = [];
+
+  const stream = new Writable({
+    autoDestroy: false,
+    write(chunk, chunkEncoding, callback) {
+      try {
+        const normalizedEncoding =
+          typeof chunkEncoding === "string" && chunkEncoding
+            ? chunkEncoding
+            : encoding;
+        const bytes = __pi_vfs.toBytes(chunk, normalizedEncoding);
+        bufferedChunks.push(bytes);
+        this.bytesWritten += bytes.byteLength;
+        callback(null);
+      } catch (err) {
+        callback(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+    final(callback) {
+      try {
+        if (appendMode) {
+          for (const bytes of bufferedChunks) {
+            appendFileSync(path, bytes);
+          }
+        } else {
+          const totalSize = bufferedChunks.reduce((sum, bytes) => sum + bytes.byteLength, 0);
+          const merged = new Uint8Array(totalSize);
+          let offset = 0;
+          for (const bytes of bufferedChunks) {
+            merged.set(bytes, offset);
+            offset += bytes.byteLength;
+          }
+          writeFileSync(path, merged);
+        }
+        callback(null);
+      } catch (err) {
+        callback(err instanceof Error ? err : new Error(String(err)));
+      }
+    },
+  });
+  stream.path = __pi_vfs.normalizePath(path);
+  stream.bytesWritten = 0;
+  stream.cork = () => stream;
+  stream.uncork = () => stream;
+  return stream;
 }
 export function readFile(path, optOrCb, cb) {
   const callback = typeof optOrCb === 'function' ? optOrCb : cb;
@@ -3848,6 +4432,22 @@ export function unlink(path, cb) {
   if (typeof cb === 'function') {
     try { unlinkSync(path); cb(null); }
     catch (err) { cb(err); }
+  }
+}
+export function readlink(path, optOrCb, cb) {
+  const callback = typeof optOrCb === 'function' ? optOrCb : cb;
+  const opts = typeof optOrCb === 'function' ? undefined : optOrCb;
+  if (typeof callback === 'function') {
+    try { callback(null, readlinkSync(path, opts)); }
+    catch (err) { callback(err); }
+  }
+}
+export function symlink(target, path, typeOrCb, cb) {
+  const callback = typeof typeOrCb === 'function' ? typeOrCb : cb;
+  const type = typeof typeOrCb === 'function' ? undefined : typeOrCb;
+  if (typeof callback === 'function') {
+    try { symlinkSync(target, path, type); callback(null); }
+    catch (err) { callback(err); }
   }
 }
 export function lstat(path, optOrCb, cb) {
@@ -3934,6 +4534,8 @@ export const promises = {
   readFile: async (path, opts) => readFileSync(path, opts),
   writeFile: async (path, data, opts) => writeFileSync(path, data, opts),
   unlink: async (path) => unlinkSync(path),
+  readlink: async (path, opts) => readlinkSync(path, opts),
+  symlink: async (target, path, type) => symlinkSync(target, path, type),
   rmdir: async (path, opts) => rmdirSync(path, opts),
   stat: async (path) => statSync(path),
   lstat: async (path) => lstatSync(path),
@@ -3945,7 +4547,7 @@ export const promises = {
   appendFile: async (path, data, opts) => appendFileSync(path, data, opts),
   chmod: async (_path, _mode) => {},
 };
-export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, stat, lstat, readdir, mkdir, unlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, realpath, access, promises };
+export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, readlinkSync, symlinkSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, stat, lstat, readdir, mkdir, unlink, readlink, symlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, realpath, access, promises };
 "#
         .trim()
         .to_string(),
@@ -3962,21 +4564,23 @@ export async function mkdtemp(prefix, opts) { return fs.promises.mkdtemp(prefix,
 export async function readFile(path, opts) { return fs.promises.readFile(path, opts); }
 export async function writeFile(path, data, opts) { return fs.promises.writeFile(path, data, opts); }
 export async function unlink(path) { return fs.promises.unlink(path); }
+export async function readlink(path, opts) { return fs.promises.readlink(path, opts); }
+export async function symlink(target, path, type) { return fs.promises.symlink(target, path, type); }
 export async function rmdir(path, opts) { return fs.promises.rmdir(path, opts); }
 export async function stat(path) { return fs.promises.stat(path); }
 export async function realpath(path, opts) { return fs.promises.realpath(path, opts); }
 export async function readdir(path, opts) { return fs.promises.readdir(path, opts); }
 export async function rm(path, opts) { return fs.promises.rm(path, opts); }
-export async function lstat(path) { return fs.promises.stat(path); }
+export async function lstat(path) { return fs.promises.lstat(path); }
 export async function copyFile(src, dest) { return fs.promises.copyFile(src, dest); }
 export async function rename(oldPath, newPath) { return fs.promises.rename(oldPath, newPath); }
 export async function chmod(path, mode) { return; }
 export async function chown(path, uid, gid) { return; }
 export async function utimes(path, atime, mtime) { return; }
-export async function appendFile(path, data, opts) { return fs.promises.writeFile(path, data, opts); }
+export async function appendFile(path, data, opts) { return fs.promises.appendFile(path, data, opts); }
 export async function open(path, flags, mode) { return { close: async () => {} }; }
 export async function truncate(path, len) { return; }
-export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, rmdir, stat, lstat, realpath, readdir, rm, copyFile, rename, chmod, chown, utimes, appendFile, open, truncate };
+export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, readlink, symlink, rmdir, stat, lstat, realpath, readdir, rm, copyFile, rename, chmod, chown, utimes, appendFile, open, truncate };
 "
         .trim()
         .to_string(),
@@ -4488,34 +5092,567 @@ export { assert };
         r#"
 import EventEmitter from "node:events";
 
-class Stream extends EventEmitter {}
+function __streamToError(err) {
+  return err instanceof Error ? err : new Error(String(err ?? "stream error"));
+}
+
+function __streamQueueMicrotask(fn) {
+  if (typeof queueMicrotask === "function") {
+    queueMicrotask(fn);
+    return;
+  }
+  Promise.resolve().then(fn);
+}
+
+function __normalizeChunk(chunk, encoding) {
+  if (chunk === null || chunk === undefined) return chunk;
+  if (typeof chunk === "string") return chunk;
+  if (typeof Buffer !== "undefined" && Buffer.isBuffer && Buffer.isBuffer(chunk)) {
+    return encoding ? chunk.toString(encoding) : chunk;
+  }
+  if (chunk instanceof Uint8Array) {
+    return encoding && typeof Buffer !== "undefined" && Buffer.from
+      ? Buffer.from(chunk).toString(encoding)
+      : chunk;
+  }
+  if (chunk instanceof ArrayBuffer) {
+    const view = new Uint8Array(chunk);
+    return encoding && typeof Buffer !== "undefined" && Buffer.from
+      ? Buffer.from(view).toString(encoding)
+      : view;
+  }
+  if (ArrayBuffer.isView(chunk)) {
+    const view = new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    return encoding && typeof Buffer !== "undefined" && Buffer.from
+      ? Buffer.from(view).toString(encoding)
+      : view;
+  }
+  return encoding ? String(chunk) : chunk;
+}
+
+class Stream extends EventEmitter {
+  constructor() {
+    super();
+    this.destroyed = false;
+  }
+
+  destroy(err) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    if (err) this.emit("error", __streamToError(err));
+    this.emit("close");
+    return this;
+  }
+}
 
 class Readable extends Stream {
-  constructor(opts) { super(); this._readableState = { flowing: null }; }
-  read(_size) { return null; }
-  pipe(dest) { return dest; }
-  unpipe(_dest) { return this; }
-  resume() { return this; }
-  pause() { return this; }
-  destroy() { this.emit('close'); return this; }
+  constructor(opts = {}) {
+    super();
+    this._readableState = { flowing: null, ended: false, encoding: opts.encoding || null };
+    this.readable = true;
+    this._queue = [];
+    this._pipeCleanup = new Map();
+    this._autoDestroy = opts.autoDestroy !== false;
+  }
+
+  push(chunk) {
+    if (chunk === null) {
+      if (this._readableState.ended) return false;
+      this._readableState.ended = true;
+      __streamQueueMicrotask(() => {
+        this.emit("end");
+        if (this._autoDestroy) this.emit("close");
+      });
+      return false;
+    }
+    const normalized = __normalizeChunk(chunk, this._readableState.encoding);
+    this._queue.push(normalized);
+    this.emit("data", normalized);
+    return true;
+  }
+
+  read(_size) {
+    return this._queue.length > 0 ? this._queue.shift() : null;
+  }
+
+  pipe(dest) {
+    if (!dest || typeof dest.write !== "function") {
+      throw new Error("stream.pipe destination must implement write()");
+    }
+
+    const onData = (chunk) => {
+      const writable = dest.write(chunk);
+      if (writable === false && typeof this.pause === "function") {
+        this.pause();
+      }
+    };
+    const onDrain = () => {
+      if (typeof this.resume === "function") this.resume();
+    };
+    const onEnd = () => {
+      if (typeof dest.end === "function") dest.end();
+      cleanup();
+    };
+    const onError = (err) => {
+      cleanup();
+      if (typeof dest.destroy === "function") {
+        dest.destroy(err);
+      } else if (typeof dest.emit === "function") {
+        dest.emit("error", err);
+      }
+    };
+    const cleanup = () => {
+      this.removeListener("data", onData);
+      this.removeListener("end", onEnd);
+      this.removeListener("error", onError);
+      if (typeof dest.removeListener === "function") {
+        dest.removeListener("drain", onDrain);
+      }
+      this._pipeCleanup.delete(dest);
+    };
+
+    this.on("data", onData);
+    this.on("end", onEnd);
+    this.on("error", onError);
+    if (typeof dest.on === "function") {
+      dest.on("drain", onDrain);
+    }
+    this._pipeCleanup.set(dest, cleanup);
+    return dest;
+  }
+
+  unpipe(dest) {
+    if (dest) {
+      const cleanup = this._pipeCleanup.get(dest);
+      if (cleanup) cleanup();
+      return this;
+    }
+    for (const cleanup of this._pipeCleanup.values()) {
+      cleanup();
+    }
+    this._pipeCleanup.clear();
+    return this;
+  }
+
+  resume() {
+    this._readableState.flowing = true;
+    return this;
+  }
+
+  pause() {
+    this._readableState.flowing = false;
+    return this;
+  }
+
+  [Symbol.asyncIterator]() {
+    const stream = this;
+    const queue = [];
+    const waiters = [];
+    let done = false;
+    let failure = null;
+
+    const settleDone = () => {
+      done = true;
+      while (waiters.length > 0) {
+        waiters.shift().resolve({ value: undefined, done: true });
+      }
+    };
+    const settleError = (err) => {
+      failure = __streamToError(err);
+      while (waiters.length > 0) {
+        waiters.shift().reject(failure);
+      }
+    };
+    const onData = (value) => {
+      if (waiters.length > 0) {
+        waiters.shift().resolve({ value, done: false });
+      } else {
+        queue.push(value);
+      }
+    };
+    const onEnd = () => settleDone();
+    const onError = (err) => settleError(err);
+    const cleanup = () => {
+      stream.removeListener("data", onData);
+      stream.removeListener("end", onEnd);
+      stream.removeListener("error", onError);
+    };
+
+    stream.on("data", onData);
+    stream.on("end", onEnd);
+    stream.on("error", onError);
+
+    return {
+      async next() {
+        if (queue.length > 0) return { value: queue.shift(), done: false };
+        if (failure) throw failure;
+        if (done) return { value: undefined, done: true };
+        return await new Promise((resolve, reject) => waiters.push({ resolve, reject }));
+      },
+      async return() {
+        cleanup();
+        settleDone();
+        return { value: undefined, done: true };
+      },
+      [Symbol.asyncIterator]() { return this; },
+    };
+  }
+
+  static from(iterable, opts = {}) {
+    const readable = new Readable(opts);
+    (async () => {
+      try {
+        for await (const chunk of iterable) {
+          readable.push(chunk);
+        }
+        readable.push(null);
+      } catch (err) {
+        readable.emit("error", __streamToError(err));
+      }
+    })();
+    return readable;
+  }
+
+  static fromWeb(webReadable, opts = {}) {
+    if (!webReadable || typeof webReadable.getReader !== "function") {
+      throw new Error("Readable.fromWeb expects a Web ReadableStream");
+    }
+    const reader = webReadable.getReader();
+    const readable = new Readable(opts);
+    (async () => {
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          readable.push(value);
+        }
+        readable.push(null);
+      } catch (err) {
+        readable.emit("error", __streamToError(err));
+      } finally {
+        try { reader.releaseLock(); } catch (_) {}
+      }
+    })();
+    return readable;
+  }
+
+  static toWeb(nodeReadable) {
+    if (typeof ReadableStream !== "function") {
+      throw new Error("Readable.toWeb requires global ReadableStream");
+    }
+    if (!nodeReadable || typeof nodeReadable.on !== "function") {
+      throw new Error("Readable.toWeb expects a Node Readable stream");
+    }
+    return new ReadableStream({
+      start(controller) {
+        const onData = (chunk) => controller.enqueue(chunk);
+        const onEnd = () => {
+          cleanup();
+          controller.close();
+        };
+        const onError = (err) => {
+          cleanup();
+          controller.error(__streamToError(err));
+        };
+        const cleanup = () => {
+          nodeReadable.removeListener?.("data", onData);
+          nodeReadable.removeListener?.("end", onEnd);
+          nodeReadable.removeListener?.("error", onError);
+        };
+        nodeReadable.on("data", onData);
+        nodeReadable.on("end", onEnd);
+        nodeReadable.on("error", onError);
+        if (typeof nodeReadable.resume === "function") nodeReadable.resume();
+      },
+      cancel(reason) {
+        if (typeof nodeReadable.destroy === "function") {
+          nodeReadable.destroy(__streamToError(reason ?? "stream cancelled"));
+        }
+      },
+    });
+  }
 }
 
 class Writable extends Stream {
-  constructor(opts) { super(); this._writableState = {}; }
-  write(_chunk, _encoding, _cb) { return true; }
-  end(_chunk, _encoding, _cb) { this.emit('finish'); return this; }
-  destroy() { this.emit('close'); return this; }
+  constructor(opts = {}) {
+    super();
+    this._writableState = { ended: false, finished: false };
+    this.writable = true;
+    this._autoDestroy = opts.autoDestroy !== false;
+    this._writeImpl = typeof opts.write === "function" ? opts.write.bind(this) : null;
+    this._finalImpl = typeof opts.final === "function" ? opts.final.bind(this) : null;
+  }
+
+  _write(chunk, encoding, callback) {
+    if (this._writeImpl) {
+      this._writeImpl(chunk, encoding, callback);
+      return;
+    }
+    callback(null);
+  }
+
+  write(chunk, encoding, callback) {
+    let cb = callback;
+    let enc = encoding;
+    if (typeof encoding === "function") {
+      cb = encoding;
+      enc = undefined;
+    }
+    if (this._writableState.ended) {
+      const err = new Error("write after end");
+      if (typeof cb === "function") cb(err);
+      this.emit("error", err);
+      return false;
+    }
+
+    try {
+      this._write(chunk, enc, (err) => {
+        if (err) {
+          const normalized = __streamToError(err);
+          if (typeof cb === "function") cb(normalized);
+          this.emit("error", normalized);
+          return;
+        }
+        if (typeof cb === "function") cb(null);
+        this.emit("drain");
+      });
+    } catch (err) {
+      const normalized = __streamToError(err);
+      if (typeof cb === "function") cb(normalized);
+      this.emit("error", normalized);
+      return false;
+    }
+    return true;
+  }
+
+  _finish(callback) {
+    if (this._finalImpl) {
+      try {
+        this._finalImpl(callback);
+      } catch (err) {
+        callback(__streamToError(err));
+      }
+      return;
+    }
+    callback(null);
+  }
+
+  end(chunk, encoding, callback) {
+    let cb = callback;
+    let enc = encoding;
+    if (typeof encoding === "function") {
+      cb = encoding;
+      enc = undefined;
+    }
+
+    const finalize = () => {
+      if (this._writableState.ended) {
+        if (typeof cb === "function") cb(null);
+        return;
+      }
+      this._writableState.ended = true;
+      this._finish((err) => {
+        if (err) {
+          const normalized = __streamToError(err);
+          if (typeof cb === "function") cb(normalized);
+          this.emit("error", normalized);
+          return;
+        }
+        this._writableState.finished = true;
+        this.emit("finish");
+        if (this._autoDestroy) this.emit("close");
+        if (typeof cb === "function") cb(null);
+      });
+    };
+
+    if (chunk !== undefined && chunk !== null) {
+      this.write(chunk, enc, (err) => {
+        if (err) {
+          if (typeof cb === "function") cb(err);
+          return;
+        }
+        finalize();
+      });
+      return this;
+    }
+
+    finalize();
+    return this;
+  }
+
+  static fromWeb(webWritable, opts = {}) {
+    if (!webWritable || typeof webWritable.getWriter !== "function") {
+      throw new Error("Writable.fromWeb expects a Web WritableStream");
+    }
+    const writer = webWritable.getWriter();
+    return new Writable({
+      ...opts,
+      write(chunk, _encoding, callback) {
+        Promise.resolve(writer.write(chunk))
+          .then(() => callback(null))
+          .catch((err) => callback(__streamToError(err)));
+      },
+      final(callback) {
+        Promise.resolve(writer.close())
+          .then(() => {
+            try { writer.releaseLock(); } catch (_) {}
+            callback(null);
+          })
+          .catch((err) => callback(__streamToError(err)));
+      },
+    });
+  }
+
+  static toWeb(nodeWritable) {
+    if (typeof WritableStream !== "function") {
+      throw new Error("Writable.toWeb requires global WritableStream");
+    }
+    if (!nodeWritable || typeof nodeWritable.write !== "function") {
+      throw new Error("Writable.toWeb expects a Node Writable stream");
+    }
+    return new WritableStream({
+      write(chunk) {
+        return new Promise((resolve, reject) => {
+          try {
+            const ok = nodeWritable.write(chunk, (err) => {
+              if (err) reject(__streamToError(err));
+              else resolve();
+            });
+            if (ok === true) resolve();
+          } catch (err) {
+            reject(__streamToError(err));
+          }
+        });
+      },
+      close() {
+        return new Promise((resolve, reject) => {
+          try {
+            nodeWritable.end((err) => {
+              if (err) reject(__streamToError(err));
+              else resolve();
+            });
+          } catch (err) {
+            reject(__streamToError(err));
+          }
+        });
+      },
+      abort(reason) {
+        if (typeof nodeWritable.destroy === "function") {
+          nodeWritable.destroy(__streamToError(reason ?? "stream aborted"));
+        }
+      },
+    });
+  }
 }
 
 class Duplex extends Readable {
-  constructor(opts) { super(opts); }
-  write(_chunk, _encoding, _cb) { return true; }
-  end(_chunk, _encoding, _cb) { this.emit('finish'); return this; }
+  constructor(opts = {}) {
+    super(opts);
+    this._writableState = { ended: false, finished: false };
+    this.writable = true;
+    this._autoDestroy = opts.autoDestroy !== false;
+    this._writeImpl = typeof opts.write === "function" ? opts.write.bind(this) : null;
+    this._finalImpl = typeof opts.final === "function" ? opts.final.bind(this) : null;
+  }
+
+  _write(chunk, encoding, callback) {
+    if (this._writeImpl) {
+      this._writeImpl(chunk, encoding, callback);
+      return;
+    }
+    callback(null);
+  }
+
+  _finish(callback) {
+    if (this._finalImpl) {
+      try {
+        this._finalImpl(callback);
+      } catch (err) {
+        callback(__streamToError(err));
+      }
+      return;
+    }
+    callback(null);
+  }
+
+  write(chunk, encoding, callback) {
+    return Writable.prototype.write.call(this, chunk, encoding, callback);
+  }
+
+  end(chunk, encoding, callback) {
+    return Writable.prototype.end.call(this, chunk, encoding, callback);
+  }
 }
 
 class Transform extends Duplex {
-  constructor(opts) { super(opts); }
-  _transform(_chunk, _encoding, callback) { callback(); }
+  constructor(opts = {}) {
+    super(opts);
+    this._transformImpl = typeof opts.transform === "function" ? opts.transform.bind(this) : null;
+  }
+
+  _transform(chunk, encoding, callback) {
+    if (this._transformImpl) {
+      this._transformImpl(chunk, encoding, callback);
+      return;
+    }
+    callback(null, chunk);
+  }
+
+  write(chunk, encoding, callback) {
+    let cb = callback;
+    let enc = encoding;
+    if (typeof encoding === "function") {
+      cb = encoding;
+      enc = undefined;
+    }
+    try {
+      this._transform(chunk, enc, (err, data) => {
+        if (err) {
+          const normalized = __streamToError(err);
+          if (typeof cb === "function") cb(normalized);
+          this.emit("error", normalized);
+          return;
+        }
+        if (data !== undefined && data !== null) {
+          this.push(data);
+        }
+        if (typeof cb === "function") cb(null);
+      });
+    } catch (err) {
+      const normalized = __streamToError(err);
+      if (typeof cb === "function") cb(normalized);
+      this.emit("error", normalized);
+      return false;
+    }
+    return true;
+  }
+
+  end(chunk, encoding, callback) {
+    let cb = callback;
+    let enc = encoding;
+    if (typeof encoding === "function") {
+      cb = encoding;
+      enc = undefined;
+    }
+    const finalize = () => {
+      this.push(null);
+      this.emit("finish");
+      this.emit("close");
+      if (typeof cb === "function") cb(null);
+    };
+    if (chunk !== undefined && chunk !== null) {
+      this.write(chunk, enc, (err) => {
+        if (err) {
+          if (typeof cb === "function") cb(err);
+          return;
+        }
+        finalize();
+      });
+      return this;
+    }
+    finalize();
+    return this;
+  }
 }
 
 class PassThrough extends Transform {
@@ -4534,13 +5671,125 @@ export default { Stream, Readable, Writable, Duplex, Transform, PassThrough };
         "node:stream/promises".to_string(),
         r"
 import { Readable, Writable } from 'node:stream';
-export async function pipeline(...streams) {
-  // Stub pipeline: just resolves immediately
-  return;
+
+function __streamToError(err) {
+  return err instanceof Error ? err : new Error(String(err ?? 'stream error'));
 }
+
+function __isReadableLike(stream) {
+  return !!stream && typeof stream.pipe === 'function' && typeof stream.on === 'function';
+}
+
+function __isWritableLike(stream) {
+  return !!stream && typeof stream.write === 'function' && typeof stream.on === 'function';
+}
+
+export async function pipeline(...streams) {
+  if (streams.length === 1 && Array.isArray(streams[0])) {
+    streams = streams[0];
+  }
+  if (streams.length < 2) {
+    throw new Error('pipeline requires at least two streams');
+  }
+
+  if (!__isReadableLike(streams[0]) && streams[0] && (typeof streams[0][Symbol.asyncIterator] === 'function' || typeof streams[0][Symbol.iterator] === 'function')) {
+    streams = [Readable.from(streams[0]), ...streams.slice(1)];
+  }
+
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanups = [];
+    const cleanup = () => {
+      while (cleanups.length > 0) {
+        try { cleanups.pop()(); } catch (_) {}
+      }
+    };
+    const settleResolve = (value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(value);
+    };
+    const settleReject = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(__streamToError(err));
+    };
+    const addListener = (target, event, handler) => {
+      if (!target || typeof target.on !== 'function') return;
+      target.on(event, handler);
+      cleanups.push(() => {
+        if (typeof target.removeListener === 'function') {
+          target.removeListener(event, handler);
+        }
+      });
+    };
+
+    for (let i = 0; i < streams.length - 1; i += 1) {
+      const source = streams[i];
+      const dest = streams[i + 1];
+      if (!__isReadableLike(source)) {
+        settleReject(new Error(`pipeline source at index ${i} is not readable`));
+        return;
+      }
+      if (!__isWritableLike(dest)) {
+        settleReject(new Error(`pipeline destination at index ${i + 1} is not writable`));
+        return;
+      }
+      try {
+        source.pipe(dest);
+      } catch (err) {
+        settleReject(err);
+        return;
+      }
+    }
+
+    const last = streams[streams.length - 1];
+    for (const stream of streams) {
+      addListener(stream, 'error', settleReject);
+    }
+    addListener(last, 'finish', () => settleResolve(last));
+    addListener(last, 'end', () => settleResolve(last));
+    addListener(last, 'close', () => settleResolve(last));
+
+    const first = streams[0];
+    if (first && typeof first.resume === 'function') {
+      try { first.resume(); } catch (_) {}
+    }
+  });
+}
+
 export async function finished(stream) {
-  // Stub finished: resolves immediately
-  return;
+  if (!stream || typeof stream.on !== 'function') {
+    throw new Error('finished expects a stream-like object');
+  }
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      if (typeof stream.removeListener !== 'function') return;
+      stream.removeListener('finish', onDone);
+      stream.removeListener('end', onDone);
+      stream.removeListener('close', onDone);
+      stream.removeListener('error', onError);
+    };
+    const onDone = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(stream);
+    };
+    const onError = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(__streamToError(err));
+    };
+    stream.on('finish', onDone);
+    stream.on('end', onDone);
+    stream.on('close', onDone);
+    stream.on('error', onError);
+  });
 }
 export default { pipeline, finished };
 "
@@ -4998,6 +6247,15 @@ export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
     );
 
     modules
+}
+
+/// Returns the set of all module specifiers available as virtual modules.
+///
+/// Used by the preflight analyzer to determine whether an extension's
+/// imports can be resolved without hitting the filesystem.
+#[must_use]
+pub fn available_virtual_module_names() -> std::collections::BTreeSet<String> {
+    default_virtual_modules().into_keys().collect()
 }
 
 /// Integrated PiJS runtime combining QuickJS, scheduler, and Promise bridge.
@@ -6144,12 +7402,59 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
 
                 // __pi_host_read_file_sync(path) -> string (throws on error)
                 // Synchronous real-filesystem read fallback for node:fs readFileSync.
+                // Reads are confined to the extension runtime cwd to prevent host
+                // filesystem probing outside the project boundary.
                 global.set(
                     "__pi_host_read_file_sync",
-                    Func::from(|path: String| -> rquickjs::Result<String> {
-                        std::fs::read_to_string(&path).map_err(|err| {
-                            rquickjs::Error::new_loading_message(&path, format!("host read: {err}"))
-                        })
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        move |path: String| -> rquickjs::Result<String> {
+                            let workspace_root = std::fs::canonicalize(&process_cwd)
+                                .unwrap_or_else(|_| PathBuf::from(&process_cwd));
+
+                            let requested = PathBuf::from(&path);
+                            let requested_abs = if requested.is_absolute() {
+                                requested
+                            } else {
+                                workspace_root.join(requested)
+                            };
+
+                            let checked_path = std::fs::canonicalize(&requested_abs)
+                                .or_else(|err| {
+                                    if err.kind() == std::io::ErrorKind::NotFound {
+                                        if let Some(parent) = requested_abs.parent() {
+                                            if let Ok(canonical_parent) =
+                                                std::fs::canonicalize(parent)
+                                            {
+                                                if canonical_parent.starts_with(&workspace_root) {
+                                                    return Ok(requested_abs.clone());
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(err)
+                                })
+                                .map_err(|err| {
+                                    rquickjs::Error::new_loading_message(
+                                        &path,
+                                        format!("host read: {err}"),
+                                    )
+                                })?;
+
+                            if !checked_path.starts_with(&workspace_root) {
+                                return Err(rquickjs::Error::new_loading_message(
+                                    &path,
+                                    "host read denied: path outside extension root".to_string(),
+                                ));
+                            }
+
+                            std::fs::read_to_string(&checked_path).map_err(|err| {
+                                rquickjs::Error::new_loading_message(
+                                    &path,
+                                    format!("host read: {err}"),
+                                )
+                            })
+                        }
                     }),
                 )?;
 
@@ -8716,6 +10021,273 @@ if (typeof globalThis.process === 'undefined') {
     // Do NOT freeze globalThis.process — extensions may need to monkey-patch it
 }
 
+if (typeof globalThis.Bun === 'undefined') {
+    const __pi_bun_require = (specifier) => {
+        try {
+            if (typeof require === 'function') {
+                return require(specifier);
+            }
+        } catch (_) {}
+        return null;
+    };
+
+    const __pi_bun_fs = () => __pi_bun_require('node:fs');
+    const __pi_bun_import_fs = () => import('node:fs');
+    const __pi_bun_child_process = () => __pi_bun_require('node:child_process');
+
+    const __pi_bun_to_uint8 = (value) => {
+        if (value instanceof Uint8Array) {
+            return value;
+        }
+        if (value instanceof ArrayBuffer) {
+            return new Uint8Array(value);
+        }
+        if (ArrayBuffer.isView && ArrayBuffer.isView(value)) {
+            return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        }
+        if (typeof value === 'string') {
+            return new TextEncoder().encode(value);
+        }
+        if (value === undefined || value === null) {
+            return new Uint8Array();
+        }
+        return new TextEncoder().encode(String(value));
+    };
+
+    const __pi_bun_make_text_stream = (fetchText) => ({
+        async text() {
+            return fetchText();
+        },
+        async arrayBuffer() {
+            const text = await fetchText();
+            const bytes = new TextEncoder().encode(String(text ?? ''));
+            return bytes.buffer;
+        },
+    });
+
+    const Bun = {};
+
+    Bun.argv = Array.isArray(globalThis.process && globalThis.process.argv)
+        ? globalThis.process.argv.slice()
+        : [];
+
+    Bun.file = (path) => {
+        const targetPath = String(path ?? '');
+        return {
+            path: targetPath,
+            name: targetPath,
+            async exists() {
+                const fs = __pi_bun_fs() || (await __pi_bun_import_fs());
+                return Boolean(fs && typeof fs.existsSync === 'function' && fs.existsSync(targetPath));
+            },
+            async text() {
+                const fs = __pi_bun_fs() || (await __pi_bun_import_fs());
+                if (!fs || typeof fs.readFileSync !== 'function') {
+                    throw new Error('Bun.file.text: node:fs is unavailable');
+                }
+                return String(fs.readFileSync(targetPath, 'utf8'));
+            },
+            async arrayBuffer() {
+                const fs = __pi_bun_fs() || (await __pi_bun_import_fs());
+                if (!fs || typeof fs.readFileSync !== 'function') {
+                    throw new Error('Bun.file.arrayBuffer: node:fs is unavailable');
+                }
+                const bytes = __pi_bun_to_uint8(fs.readFileSync(targetPath));
+                return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            },
+            async json() {
+                return JSON.parse(await this.text());
+            },
+        };
+    };
+
+    Bun.write = async (destination, data) => {
+        const targetPath =
+            destination && typeof destination === 'object' && typeof destination.path === 'string'
+                ? destination.path
+                : String(destination ?? '');
+        if (!targetPath) {
+            throw new Error('Bun.write: destination path is required');
+        }
+        const fs = __pi_bun_fs() || (await __pi_bun_import_fs());
+        if (!fs || typeof fs.writeFileSync !== 'function') {
+            throw new Error('Bun.write: node:fs is unavailable');
+        }
+
+        let payload = data;
+        if (payload && typeof payload === 'object' && typeof payload.text === 'function') {
+            payload = payload.text();
+        }
+        if (payload && typeof payload === 'object' && typeof payload.arrayBuffer === 'function') {
+            payload = payload.arrayBuffer();
+        }
+        if (payload && typeof payload.then === 'function') {
+            payload = await payload;
+        }
+
+        const bytes = __pi_bun_to_uint8(payload);
+        fs.writeFileSync(targetPath, bytes);
+        return bytes.byteLength;
+    };
+
+    Bun.which = (command) => {
+        const name = String(command ?? '').trim();
+        if (!name) return null;
+        const cwd =
+            globalThis.process && typeof globalThis.process.cwd === 'function'
+                ? globalThis.process.cwd()
+                : '/';
+        const raw = __pi_exec_sync_native('which', JSON.stringify([name]), cwd, 2000);
+        try {
+            const parsed = JSON.parse(raw || '{}');
+            if (Number(parsed && parsed.code) !== 0) return null;
+            const out = String((parsed && parsed.stdout) || '').trim();
+            return out ? out.split('\n')[0] : null;
+        } catch (_) {
+            return null;
+        }
+    };
+
+    Bun.spawn = (commandOrArgv, rawOptions = {}) => {
+        const options = rawOptions && typeof rawOptions === 'object' ? rawOptions : {};
+
+        let command = '';
+        let args = [];
+        if (Array.isArray(commandOrArgv)) {
+            if (commandOrArgv.length === 0) {
+                throw new Error('Bun.spawn: command is required');
+            }
+            command = String(commandOrArgv[0] ?? '');
+            args = commandOrArgv.slice(1).map((arg) => String(arg ?? ''));
+        } else {
+            command = String(commandOrArgv ?? '');
+            if (Array.isArray(options.args)) {
+                args = options.args.map((arg) => String(arg ?? ''));
+            }
+        }
+
+        if (!command.trim()) {
+            throw new Error('Bun.spawn: command is required');
+        }
+
+        const spawnOptions = {
+            shell: false,
+            stdio: [
+                options.stdin === 'pipe' ? 'pipe' : 'ignore',
+                options.stdout === 'ignore' ? 'ignore' : 'pipe',
+                options.stderr === 'ignore' ? 'ignore' : 'pipe',
+            ],
+        };
+        if (typeof options.cwd === 'string' && options.cwd.trim().length > 0) {
+            spawnOptions.cwd = options.cwd;
+        }
+        if (
+            typeof options.timeout === 'number' &&
+            Number.isFinite(options.timeout) &&
+            options.timeout >= 0
+        ) {
+            spawnOptions.timeout = Math.floor(options.timeout);
+        }
+
+        const childProcess = __pi_bun_child_process();
+        if (childProcess && typeof childProcess.spawn === 'function') {
+            const child = childProcess.spawn(command, args, spawnOptions);
+            let stdoutText = '';
+            let stderrText = '';
+
+            if (child && child.stdout && typeof child.stdout.on === 'function') {
+                child.stdout.on('data', (chunk) => {
+                    stdoutText += String(chunk ?? '');
+                });
+            }
+            if (child && child.stderr && typeof child.stderr.on === 'function') {
+                child.stderr.on('data', (chunk) => {
+                    stderrText += String(chunk ?? '');
+                });
+            }
+
+            const exited = new Promise((resolve, reject) => {
+                let settled = false;
+                child.on('error', (err) => {
+                    if (settled) return;
+                    settled = true;
+                    reject(err instanceof Error ? err : new Error(String(err)));
+                });
+                child.on('close', (code) => {
+                    if (settled) return;
+                    settled = true;
+                    resolve(typeof code === 'number' ? code : null);
+                });
+            });
+
+            return {
+                pid: typeof child.pid === 'number' ? child.pid : 0,
+                stdin: child.stdin || null,
+                stdout: __pi_bun_make_text_stream(async () => {
+                    await exited.catch(() => null);
+                    return stdoutText;
+                }),
+                stderr: __pi_bun_make_text_stream(async () => {
+                    await exited.catch(() => null);
+                    return stderrText;
+                }),
+                exited,
+                kill(signal) {
+                    try {
+                        return child.kill(signal);
+                    } catch (_) {
+                        return false;
+                    }
+                },
+                ref() { return this; },
+                unref() { return this; },
+            };
+        }
+
+        // Fallback path if node:child_process is unavailable in context.
+        const execOptions = {};
+        if (spawnOptions.cwd !== undefined) execOptions.cwd = spawnOptions.cwd;
+        if (spawnOptions.timeout !== undefined) execOptions.timeout = spawnOptions.timeout;
+        const execPromise = pi.exec(command, args, execOptions);
+        let killed = false;
+
+        const exited = execPromise.then(
+            (result) => (killed ? null : (Number(result && result.code) || 0)),
+            () => (killed ? null : 1),
+        );
+
+        return {
+            pid: 0,
+            stdin: null,
+            stdout: __pi_bun_make_text_stream(async () => {
+                try {
+                    const result = await execPromise;
+                    return String((result && result.stdout) || '');
+                } catch (_) {
+                    return '';
+                }
+            }),
+            stderr: __pi_bun_make_text_stream(async () => {
+                try {
+                    const result = await execPromise;
+                    return String((result && result.stderr) || '');
+                } catch (_) {
+                    return '';
+                }
+            }),
+            exited,
+            kill() {
+                killed = true;
+                return true;
+            },
+            ref() { return this; },
+            unref() { return this; },
+        };
+    };
+
+    globalThis.Bun = Bun;
+}
+
 if (typeof globalThis.setTimeout !== 'function') {
     globalThis.setTimeout = (callback, delay, ...args) => {
         const ms = Number(delay || 0);
@@ -11148,6 +12720,11 @@ mod tests {
                                 String((err && err.message) || err || '');
                             globalThis.childProcessResult.done = true;
                         });
+                        child.on('exit', (code, signal) => {
+                            globalThis.childProcessResult.events.push('exit');
+                            globalThis.childProcessResult.exitCode = code;
+                            globalThis.childProcessResult.exitSignal = signal;
+                        });
                         child.on('close', (code) => {
                             globalThis.childProcessResult.events.push('close');
                             globalThis.childProcessResult.code = code;
@@ -11186,13 +12763,201 @@ mod tests {
             let r = get_global_json(&runtime, "childProcessResult").await;
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["code"], serde_json::json!(0));
+            assert_eq!(r["exitCode"], serde_json::json!(0));
+            assert_eq!(r["exitSignal"], serde_json::Value::Null);
             assert_eq!(r["stdout"], serde_json::json!("line-1\n"));
             assert_eq!(r["stderr"], serde_json::json!("warn-1\n"));
             assert_eq!(r["killed"], serde_json::json!(false));
             assert_eq!(
                 r["events"],
-                serde_json::json!(["stdout", "stderr", "close"])
+                serde_json::json!(["stdout", "stderr", "exit", "close"])
             );
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_spawn_forwards_timeout_option_to_hostcall() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.childTimeoutResult = {};
+                    import('node:child_process').then(({ spawn }) => {
+                        const child = spawn('pi', ['--version'], {
+                            shell: false,
+                            timeout: 250,
+                            stdio: ['ignore', 'pipe', 'pipe'],
+                        });
+                        child.on('close', (code) => {
+                            globalThis.childTimeoutResult.code = code;
+                            globalThis.childTimeoutResult.killed = child.killed;
+                            globalThis.childTimeoutResult.done = true;
+                        });
+                    });
+                    ",
+                )
+                .await
+                .expect("eval child_process timeout script");
+
+            let mut requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let request = requests.pop_front().expect("exec hostcall");
+            assert!(
+                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == "pi"),
+                "unexpected hostcall kind: {:?}",
+                request.kind
+            );
+            assert_eq!(
+                request.payload["options"]["timeout"].as_i64(),
+                Some(250),
+                "spawn timeout should be forwarded to hostcall options"
+            );
+
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(serde_json::json!({
+                    "stdout": "",
+                    "stderr": "",
+                    "code": 0,
+                    "killed": true
+                })),
+            );
+
+            drain_until_idle(&runtime, &clock).await;
+            let r = get_global_json(&runtime, "childTimeoutResult").await;
+            assert_eq!(r["done"], serde_json::json!(true));
+            assert_eq!(r["killed"], serde_json::json!(true));
+            assert_eq!(r["code"], serde_json::Value::Null);
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_exec_returns_child_and_forwards_timeout() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.execShimResult = {};
+                    import('node:child_process').then(({ exec }) => {
+                        const child = exec('echo hello-exec', { timeout: 321 }, (err, stdout, stderr) => {
+                            globalThis.execShimResult.cbDone = true;
+                            globalThis.execShimResult.cbErr = err ? String((err && err.message) || err) : null;
+                            globalThis.execShimResult.stdout = stdout;
+                            globalThis.execShimResult.stderr = stderr;
+                        });
+                        globalThis.execShimResult.hasPid = typeof child.pid === 'number';
+                        globalThis.execShimResult.hasKill = typeof child.kill === 'function';
+                        child.on('close', () => {
+                            globalThis.execShimResult.closed = true;
+                        });
+                    });
+                    ",
+                )
+                .await
+                .expect("eval child_process exec script");
+
+            let mut requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let request = requests.pop_front().expect("exec hostcall");
+            assert!(
+                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == "sh"),
+                "unexpected hostcall kind: {:?}",
+                request.kind
+            );
+            assert_eq!(
+                request.payload["args"],
+                serde_json::json!(["-c", "echo hello-exec"])
+            );
+            assert_eq!(request.payload["options"]["timeout"].as_i64(), Some(321));
+
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(serde_json::json!({
+                    "stdout": "hello-exec\n",
+                    "stderr": "",
+                    "code": 0,
+                    "killed": false
+                })),
+            );
+
+            drain_until_idle(&runtime, &clock).await;
+            let r = get_global_json(&runtime, "execShimResult").await;
+            assert_eq!(r["hasPid"], serde_json::json!(true));
+            assert_eq!(r["hasKill"], serde_json::json!(true));
+            assert_eq!(r["closed"], serde_json::json!(true));
+            assert_eq!(r["cbDone"], serde_json::json!(true));
+            assert_eq!(r["cbErr"], serde_json::Value::Null);
+            assert_eq!(r["stdout"], serde_json::json!("hello-exec\n"));
+            assert_eq!(r["stderr"], serde_json::json!(""));
+        });
+    }
+
+    #[test]
+    fn pijs_child_process_exec_file_returns_child_and_forwards_timeout() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.execFileShimResult = {};
+                    import('node:child_process').then(({ execFile }) => {
+                        const child = execFile('echo', ['hello-file'], { timeout: 222 }, (err, stdout, stderr) => {
+                            globalThis.execFileShimResult.cbDone = true;
+                            globalThis.execFileShimResult.cbErr = err ? String((err && err.message) || err) : null;
+                            globalThis.execFileShimResult.stdout = stdout;
+                            globalThis.execFileShimResult.stderr = stderr;
+                        });
+                        globalThis.execFileShimResult.hasPid = typeof child.pid === 'number';
+                        globalThis.execFileShimResult.hasKill = typeof child.kill === 'function';
+                    });
+                    ",
+                )
+                .await
+                .expect("eval child_process execFile script");
+
+            let mut requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+            let request = requests.pop_front().expect("execFile hostcall");
+            assert!(
+                matches!(&request.kind, HostcallKind::Exec { cmd } if cmd == "echo"),
+                "unexpected hostcall kind: {:?}",
+                request.kind
+            );
+            assert_eq!(request.payload["args"], serde_json::json!(["hello-file"]));
+            assert_eq!(request.payload["options"]["timeout"].as_i64(), Some(222));
+
+            runtime.complete_hostcall(
+                request.call_id,
+                HostcallOutcome::Success(serde_json::json!({
+                    "stdout": "hello-file\n",
+                    "stderr": "",
+                    "code": 0,
+                    "killed": false
+                })),
+            );
+
+            drain_until_idle(&runtime, &clock).await;
+            let r = get_global_json(&runtime, "execFileShimResult").await;
+            assert_eq!(r["hasPid"], serde_json::json!(true));
+            assert_eq!(r["hasKill"], serde_json::json!(true));
+            assert_eq!(r["cbDone"], serde_json::json!(true));
+            assert_eq!(r["cbErr"], serde_json::Value::Null);
+            assert_eq!(r["stdout"], serde_json::json!("hello-file\n"));
+            assert_eq!(r["stderr"], serde_json::json!(""));
         });
     }
 
@@ -12085,6 +13850,166 @@ mod tests {
             let r = get_global_json(&runtime, "rlResult").await;
             assert_eq!(r["done"], serde_json::json!(true));
             assert_eq!(r["hasCreateInterface"], serde_json::json!(true));
+        });
+    }
+
+    #[test]
+    fn pijs_node_stream_promises_pipeline_pass_through() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.streamInterop = { done: false };
+                    (async () => {
+                        const { Readable, PassThrough, Writable } = await import("node:stream");
+                        const { pipeline } = await import("node:stream/promises");
+
+                        const collected = [];
+                        const source = Readable.from(["alpha", "-", "omega"]);
+                        const through = new PassThrough();
+                        const sink = new Writable({
+                          write(chunk, _encoding, callback) {
+                            collected.push(String(chunk));
+                            callback(null);
+                          }
+                        });
+
+                        await pipeline(source, through, sink);
+                        globalThis.streamInterop.value = collected.join("");
+                        globalThis.streamInterop.done = true;
+                    })().catch((e) => {
+                        globalThis.streamInterop.error = String(e && e.message ? e.message : e);
+                        globalThis.streamInterop.done = false;
+                    });
+                    "#,
+                )
+                .await
+                .expect("eval node:stream pipeline");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let result = get_global_json(&runtime, "streamInterop").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["value"], serde_json::json!("alpha-omega"));
+        });
+    }
+
+    #[test]
+    fn pijs_fs_create_stream_pipeline_copies_content() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.fsStreamCopy = { done: false };
+                    (async () => {
+                        const fs = await import("node:fs");
+                        const { pipeline } = await import("node:stream/promises");
+
+                        fs.writeFileSync("/tmp/source.txt", "stream-data-123");
+                        const src = fs.createReadStream("/tmp/source.txt");
+                        const dst = fs.createWriteStream("/tmp/dest.txt");
+                        await pipeline(src, dst);
+
+                        globalThis.fsStreamCopy.value = fs.readFileSync("/tmp/dest.txt", "utf8");
+                        globalThis.fsStreamCopy.done = true;
+                    })().catch((e) => {
+                        globalThis.fsStreamCopy.error = String(e && e.message ? e.message : e);
+                        globalThis.fsStreamCopy.done = false;
+                    });
+                    "#,
+                )
+                .await
+                .expect("eval fs stream copy");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let result = get_global_json(&runtime, "fsStreamCopy").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["value"], serde_json::json!("stream-data-123"));
+        });
+    }
+
+    #[test]
+    fn pijs_node_stream_web_stream_bridge_roundtrip() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.webBridge = { done: false, skipped: false };
+                    (async () => {
+                        if (typeof ReadableStream !== "function" || typeof WritableStream !== "function") {
+                            globalThis.webBridge.skipped = true;
+                            globalThis.webBridge.done = true;
+                            return;
+                        }
+
+                        const { Readable, Writable } = await import("node:stream");
+                        const { pipeline } = await import("node:stream/promises");
+
+                        const webReadable = new ReadableStream({
+                          start(controller) {
+                            controller.enqueue("ab");
+                            controller.enqueue("cd");
+                            controller.close();
+                          }
+                        });
+                        const nodeReadable = Readable.fromWeb(webReadable);
+
+                        const fromWebChunks = [];
+                        const webWritable = new WritableStream({
+                          write(chunk) {
+                            fromWebChunks.push(String(chunk));
+                          }
+                        });
+                        const nodeWritable = Writable.fromWeb(webWritable);
+                        await pipeline(nodeReadable, nodeWritable);
+
+                        const nodeReadableRoundtrip = Readable.from(["x", "y"]);
+                        const webReadableRoundtrip = Readable.toWeb(nodeReadableRoundtrip);
+                        const reader = webReadableRoundtrip.getReader();
+                        const toWebChunks = [];
+                        while (true) {
+                          const { done, value } = await reader.read();
+                          if (done) break;
+                          toWebChunks.push(String(value));
+                        }
+
+                        globalThis.webBridge.fromWeb = fromWebChunks.join("");
+                        globalThis.webBridge.toWeb = toWebChunks.join("");
+                        globalThis.webBridge.done = true;
+                    })().catch((e) => {
+                        globalThis.webBridge.error = String(e && e.message ? e.message : e);
+                        globalThis.webBridge.done = false;
+                    });
+                    "#,
+                )
+                .await
+                .expect("eval web stream bridge");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let result = get_global_json(&runtime, "webBridge").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            if result["skipped"] == serde_json::json!(true) {
+                return;
+            }
+            assert_eq!(result["fromWeb"], serde_json::json!("abcd"));
+            assert_eq!(result["toWeb"], serde_json::json!("xy"));
         });
     }
 

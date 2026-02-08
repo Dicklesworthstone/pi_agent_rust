@@ -883,6 +883,223 @@ impl ShapeBatchSummary {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
+// N/A remediation bucket classification
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Remediation bucket for N/A (not-applicable) extension conformance states.
+///
+/// Each N/A extension is classified into exactly one bucket that describes
+/// why it cannot currently be tested and what action would unblock it.
+/// The buckets are ordered by actionability (most actionable first).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RemediationBucket {
+    /// Mock/VCR infrastructure doesn't cover the extension's hostcall or
+    /// HTTP interaction pattern. Fix: enhance `MockSpecInterceptor`,
+    /// `ConformanceSession`, or VCR stubs.
+    HarnessGap,
+    /// No test fixture (manifest, expected-output snapshot, or scenario spec)
+    /// exists for this extension. Fix: author the missing fixture file(s).
+    MissingFixture,
+    /// Extension requires a `QuickJS` virtual-module stub or host API that is
+    /// not yet implemented. Fix: add the stub in `extensions_js.rs` or
+    /// implement the missing hostcall.
+    MissingRuntimeApi,
+    /// Extension's required capability is denied by the conformance-harness
+    /// policy (e.g., `Exec` or `Http` blocked in sandbox). Fix: add a
+    /// policy override for the specific capability or extend the harness
+    /// sandbox allowlist.
+    PolicyBlocked,
+    /// Extension is intentionally excluded from conformance testing
+    /// (test fixtures, deprecated extensions, multi-file bundles that are
+    /// out-of-scope). No action required.
+    IntentionallyUnsupported,
+}
+
+impl RemediationBucket {
+    /// All buckets in canonical order.
+    #[must_use]
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::HarnessGap,
+            Self::MissingFixture,
+            Self::MissingRuntimeApi,
+            Self::PolicyBlocked,
+            Self::IntentionallyUnsupported,
+        ]
+    }
+
+    /// Human-readable description of what this bucket means.
+    #[must_use]
+    pub const fn description(&self) -> &'static str {
+        match self {
+            Self::HarnessGap => "Mock/VCR infrastructure gap prevents testing this extension",
+            Self::MissingFixture => "No test fixture exists for this extension",
+            Self::MissingRuntimeApi => {
+                "Extension requires a QuickJS shim or host API not yet implemented"
+            }
+            Self::PolicyBlocked => "Extension capability blocked by conformance-harness policy",
+            Self::IntentionallyUnsupported => "Intentionally excluded from conformance testing",
+        }
+    }
+
+    /// Short remediation hint.
+    #[must_use]
+    pub const fn remediation_hint(&self) -> &'static str {
+        match self {
+            Self::HarnessGap => "Enhance MockSpecInterceptor, ConformanceSession, or VCR stubs",
+            Self::MissingFixture => "Author manifest and expected-output fixture files",
+            Self::MissingRuntimeApi => {
+                "Add virtual module stub in extensions_js.rs or implement hostcall"
+            }
+            Self::PolicyBlocked => "Add policy override or extend harness sandbox allowlist",
+            Self::IntentionallyUnsupported => "No action required",
+        }
+    }
+}
+
+impl fmt::Display for RemediationBucket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HarnessGap => write!(f, "harness_gap"),
+            Self::MissingFixture => write!(f, "missing_fixture"),
+            Self::MissingRuntimeApi => write!(f, "missing_runtime_api"),
+            Self::PolicyBlocked => write!(f, "policy_blocked"),
+            Self::IntentionallyUnsupported => write!(f, "intentionally_unsupported"),
+        }
+    }
+}
+
+/// A single N/A classification entry: one extension mapped to a bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NaClassification {
+    /// Extension identifier (e.g., `"npm/pi-wakatime"`).
+    pub extension_id: String,
+    /// Which remediation bucket this falls into.
+    pub bucket: RemediationBucket,
+    /// The underlying cause code from the failure taxonomy (e.g.,
+    /// `"missing_npm_package"`, `"manifest_mismatch"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause_code: Option<String>,
+    /// Free-text detail about why this is N/A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+impl NaClassification {
+    #[must_use]
+    pub fn new(extension_id: impl Into<String>, bucket: RemediationBucket) -> Self {
+        Self {
+            extension_id: extension_id.into(),
+            bucket,
+            cause_code: None,
+            detail: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_cause(mut self, cause: impl Into<String>) -> Self {
+        self.cause_code = Some(cause.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// Aggregate summary of N/A classifications.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NaClassificationSummary {
+    /// Total number of N/A extensions classified.
+    pub total: usize,
+    /// Count per remediation bucket.
+    pub by_bucket: BTreeMap<String, usize>,
+    /// All individual classifications.
+    pub classifications: Vec<NaClassification>,
+}
+
+impl NaClassificationSummary {
+    /// Build from a list of classifications.
+    #[must_use]
+    pub fn from_classifications(classifications: Vec<NaClassification>) -> Self {
+        let total = classifications.len();
+        let mut by_bucket: BTreeMap<String, usize> = BTreeMap::new();
+        for c in &classifications {
+            *by_bucket.entry(c.bucket.to_string()).or_insert(0) += 1;
+        }
+        Self {
+            total,
+            by_bucket,
+            classifications,
+        }
+    }
+
+    /// Render a compact Markdown summary table.
+    #[must_use]
+    pub fn render_markdown(&self) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        out.push_str("# N/A Classification Summary\n\n");
+        let _ = writeln!(out, "Total N/A extensions: {}\n", self.total);
+        out.push_str("| Bucket | Count | Description |\n");
+        out.push_str("|---|---:|---|\n");
+        for bucket in RemediationBucket::all() {
+            let count = self
+                .by_bucket
+                .get(&bucket.to_string())
+                .copied()
+                .unwrap_or(0);
+            let _ = writeln!(out, "| {bucket} | {count} | {} |", bucket.description());
+        }
+        out
+    }
+}
+
+/// Classify a failure cause code into a remediation bucket.
+///
+/// Maps the cause codes from `build_inventory.py` and the baseline JSON
+/// to the five canonical remediation buckets.
+#[must_use]
+pub fn classify_cause_to_bucket(cause_code: &str) -> RemediationBucket {
+    match cause_code {
+        // Infrastructure / harness limitations
+        "mock_gap" | "vcr_stub_gap" | "assertion_gap" => RemediationBucket::HarnessGap,
+
+        // Extension loads but expected registrations don't match
+        "manifest_mismatch" => RemediationBucket::MissingFixture,
+
+        // Multi-file extensions and test fixtures are intentionally unsupported
+        "multi_file_dependency" | "test_fixture" => RemediationBucket::IntentionallyUnsupported,
+
+        // Missing npm package, runtime error, or anything else → missing runtime API
+        _ => RemediationBucket::MissingRuntimeApi,
+    }
+}
+
+/// Classify a `FailureClass` into a remediation bucket.
+///
+/// Maps the structured enum to the five canonical buckets.
+#[must_use]
+pub const fn classify_failure_to_bucket(failure: &FailureClass) -> RemediationBucket {
+    match failure {
+        FailureClass::LoadError | FailureClass::RuntimeShimGap => {
+            RemediationBucket::MissingRuntimeApi
+        }
+        FailureClass::MissingRegistration | FailureClass::MalformedRegistration => {
+            RemediationBucket::MissingFixture
+        }
+        FailureClass::InvocationError
+        | FailureClass::OutputMismatch
+        | FailureClass::Timeout
+        | FailureClass::ShutdownError => RemediationBucket::HarnessGap,
+        FailureClass::IncompatibleShape => RemediationBucket::IntentionallyUnsupported,
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 // Unit tests
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -1352,5 +1569,291 @@ mod tests {
         assert!(ExtensionShape::Multi.supports_invocation());
         assert!(!ExtensionShape::Provider.supports_invocation());
         assert!(!ExtensionShape::General.supports_invocation());
+    }
+
+    // ── N/A remediation bucket tests ─────────────────────────────────────
+
+    #[test]
+    fn remediation_bucket_all_is_complete() {
+        assert_eq!(RemediationBucket::all().len(), 5);
+    }
+
+    #[test]
+    fn remediation_bucket_display() {
+        assert_eq!(RemediationBucket::HarnessGap.to_string(), "harness_gap");
+        assert_eq!(
+            RemediationBucket::MissingFixture.to_string(),
+            "missing_fixture"
+        );
+        assert_eq!(
+            RemediationBucket::MissingRuntimeApi.to_string(),
+            "missing_runtime_api"
+        );
+        assert_eq!(
+            RemediationBucket::PolicyBlocked.to_string(),
+            "policy_blocked"
+        );
+        assert_eq!(
+            RemediationBucket::IntentionallyUnsupported.to_string(),
+            "intentionally_unsupported"
+        );
+    }
+
+    #[test]
+    fn remediation_bucket_serde_roundtrip() {
+        for bucket in RemediationBucket::all() {
+            let json = serde_json::to_string(bucket).unwrap();
+            let back: RemediationBucket = serde_json::from_str(&json).unwrap();
+            assert_eq!(*bucket, back);
+        }
+    }
+
+    #[test]
+    fn remediation_bucket_descriptions_nonempty() {
+        for bucket in RemediationBucket::all() {
+            assert!(
+                !bucket.description().is_empty(),
+                "Bucket {bucket} should have a description"
+            );
+            assert!(
+                !bucket.remediation_hint().is_empty(),
+                "Bucket {bucket} should have a remediation hint"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_cause_mock_gap_to_harness() {
+        assert_eq!(
+            classify_cause_to_bucket("mock_gap"),
+            RemediationBucket::HarnessGap
+        );
+    }
+
+    #[test]
+    fn classify_cause_vcr_stub_gap_to_harness() {
+        assert_eq!(
+            classify_cause_to_bucket("vcr_stub_gap"),
+            RemediationBucket::HarnessGap
+        );
+    }
+
+    #[test]
+    fn classify_cause_assertion_gap_to_harness() {
+        assert_eq!(
+            classify_cause_to_bucket("assertion_gap"),
+            RemediationBucket::HarnessGap
+        );
+    }
+
+    #[test]
+    fn classify_cause_manifest_mismatch_to_missing_fixture() {
+        assert_eq!(
+            classify_cause_to_bucket("manifest_mismatch"),
+            RemediationBucket::MissingFixture
+        );
+    }
+
+    #[test]
+    fn classify_cause_missing_npm_to_runtime_api() {
+        assert_eq!(
+            classify_cause_to_bucket("missing_npm_package"),
+            RemediationBucket::MissingRuntimeApi
+        );
+    }
+
+    #[test]
+    fn classify_cause_runtime_error_to_runtime_api() {
+        assert_eq!(
+            classify_cause_to_bucket("runtime_error"),
+            RemediationBucket::MissingRuntimeApi
+        );
+    }
+
+    #[test]
+    fn classify_cause_multi_file_to_unsupported() {
+        assert_eq!(
+            classify_cause_to_bucket("multi_file_dependency"),
+            RemediationBucket::IntentionallyUnsupported
+        );
+    }
+
+    #[test]
+    fn classify_cause_test_fixture_to_unsupported() {
+        assert_eq!(
+            classify_cause_to_bucket("test_fixture"),
+            RemediationBucket::IntentionallyUnsupported
+        );
+    }
+
+    #[test]
+    fn classify_cause_unknown_defaults_to_runtime_api() {
+        assert_eq!(
+            classify_cause_to_bucket("some_unknown_cause"),
+            RemediationBucket::MissingRuntimeApi
+        );
+    }
+
+    #[test]
+    fn classify_failure_load_error_to_runtime_api() {
+        assert_eq!(
+            classify_failure_to_bucket(&FailureClass::LoadError),
+            RemediationBucket::MissingRuntimeApi
+        );
+    }
+
+    #[test]
+    fn classify_failure_runtime_shim_gap_to_runtime_api() {
+        assert_eq!(
+            classify_failure_to_bucket(&FailureClass::RuntimeShimGap),
+            RemediationBucket::MissingRuntimeApi
+        );
+    }
+
+    #[test]
+    fn classify_failure_missing_registration_to_fixture() {
+        assert_eq!(
+            classify_failure_to_bucket(&FailureClass::MissingRegistration),
+            RemediationBucket::MissingFixture
+        );
+    }
+
+    #[test]
+    fn classify_failure_invocation_error_to_harness() {
+        assert_eq!(
+            classify_failure_to_bucket(&FailureClass::InvocationError),
+            RemediationBucket::HarnessGap
+        );
+    }
+
+    #[test]
+    fn classify_failure_timeout_to_harness() {
+        assert_eq!(
+            classify_failure_to_bucket(&FailureClass::Timeout),
+            RemediationBucket::HarnessGap
+        );
+    }
+
+    #[test]
+    fn classify_failure_incompatible_shape_to_unsupported() {
+        assert_eq!(
+            classify_failure_to_bucket(&FailureClass::IncompatibleShape),
+            RemediationBucket::IntentionallyUnsupported
+        );
+    }
+
+    #[test]
+    fn na_classification_builder() {
+        let c = NaClassification::new("npm/pi-wakatime", RemediationBucket::MissingRuntimeApi)
+            .with_cause("missing_npm_package")
+            .with_detail("Requires openai npm package");
+        assert_eq!(c.extension_id, "npm/pi-wakatime");
+        assert_eq!(c.bucket, RemediationBucket::MissingRuntimeApi);
+        assert_eq!(c.cause_code.as_deref(), Some("missing_npm_package"));
+        assert_eq!(c.detail.as_deref(), Some("Requires openai npm package"));
+    }
+
+    #[test]
+    fn na_classification_serde_roundtrip() {
+        let c =
+            NaClassification::new("test/ext", RemediationBucket::HarnessGap).with_cause("mock_gap");
+        let json = serde_json::to_string(&c).unwrap();
+        let back: NaClassification = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.extension_id, "test/ext");
+        assert_eq!(back.bucket, RemediationBucket::HarnessGap);
+        assert_eq!(back.cause_code.as_deref(), Some("mock_gap"));
+        assert!(back.detail.is_none());
+    }
+
+    #[test]
+    fn na_classification_summary_from_empty() {
+        let summary = NaClassificationSummary::from_classifications(vec![]);
+        assert_eq!(summary.total, 0);
+        assert!(summary.by_bucket.is_empty());
+    }
+
+    #[test]
+    fn na_classification_summary_counts_buckets() {
+        let classifications = vec![
+            NaClassification::new("a", RemediationBucket::HarnessGap),
+            NaClassification::new("b", RemediationBucket::HarnessGap),
+            NaClassification::new("c", RemediationBucket::MissingFixture),
+            NaClassification::new("d", RemediationBucket::MissingRuntimeApi),
+            NaClassification::new("e", RemediationBucket::IntentionallyUnsupported),
+        ];
+        let summary = NaClassificationSummary::from_classifications(classifications);
+        assert_eq!(summary.total, 5);
+        assert_eq!(summary.by_bucket["harness_gap"], 2);
+        assert_eq!(summary.by_bucket["missing_fixture"], 1);
+        assert_eq!(summary.by_bucket["missing_runtime_api"], 1);
+        assert_eq!(summary.by_bucket["intentionally_unsupported"], 1);
+        assert!(!summary.by_bucket.contains_key("policy_blocked"));
+    }
+
+    #[test]
+    fn na_classification_summary_markdown() {
+        let classifications = vec![
+            NaClassification::new("x", RemediationBucket::MissingRuntimeApi),
+            NaClassification::new("y", RemediationBucket::MissingRuntimeApi),
+        ];
+        let summary = NaClassificationSummary::from_classifications(classifications);
+        let md = summary.render_markdown();
+        assert!(md.contains("N/A Classification Summary"));
+        assert!(md.contains("Total N/A extensions: 2"));
+        assert!(md.contains("missing_runtime_api"));
+        assert!(md.contains("| 2 |"));
+    }
+
+    #[test]
+    fn classify_all_baseline_causes_covered() {
+        // Verify all cause codes from conformance_baseline.json map to valid buckets
+        let baseline_causes = [
+            "manifest_mismatch",
+            "missing_npm_package",
+            "multi_file_dependency",
+            "runtime_error",
+            "test_fixture",
+            "mock_gap",
+            "vcr_stub_gap",
+        ];
+        for cause in baseline_causes {
+            let bucket = classify_cause_to_bucket(cause);
+            // Every cause should map to a known bucket (not panic)
+            assert!(
+                RemediationBucket::all().contains(&bucket),
+                "Cause {cause} mapped to unknown bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_all_failure_classes_covered() {
+        let all_classes = [
+            FailureClass::LoadError,
+            FailureClass::MissingRegistration,
+            FailureClass::MalformedRegistration,
+            FailureClass::InvocationError,
+            FailureClass::OutputMismatch,
+            FailureClass::Timeout,
+            FailureClass::IncompatibleShape,
+            FailureClass::ShutdownError,
+            FailureClass::RuntimeShimGap,
+        ];
+        for class in &all_classes {
+            let bucket = classify_failure_to_bucket(class);
+            assert!(
+                RemediationBucket::all().contains(&bucket),
+                "FailureClass {class} mapped to unknown bucket"
+            );
+        }
+    }
+
+    #[test]
+    fn na_classification_optional_fields_skip_serialization() {
+        let c = NaClassification::new("ext", RemediationBucket::HarnessGap);
+        let json = serde_json::to_string(&c).unwrap();
+        // cause_code and detail should be absent (skip_serializing_if)
+        assert!(!json.contains("cause_code"));
+        assert!(!json.contains("detail"));
     }
 }

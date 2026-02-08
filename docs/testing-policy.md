@@ -132,6 +132,51 @@ with the bead ID. Update the CI allowlist regex in `.github/workflows/ci.yml`.
 5. **Mock leak guard:** Enhanced version of guard #2 that also checks Suite 1 `src/` test modules
    for `NullSession`, `NullUiHandler`, `DummyProvider`.
 
+### CI Gate Promotion Runbook (bd-k5q5.5.7)
+
+The Linux CI lane includes a promotion gate step after `./scripts/e2e/run_all.sh --profile ci`.
+This gate is intentionally **blocking by default** and evaluates the newest
+`tests/e2e_results/**/summary.json` alongside:
+
+- `tests/e2e_results/**/evidence_contract.json`
+- `tests/ext_conformance/reports/conformance_summary.json`
+
+The step writes a structured verdict at:
+
+- `tests/e2e_results/**/ci_gate_promotion_v1.json`
+
+#### Versioned threshold controls
+
+Thresholds are configured in `.github/workflows/ci.yml` with a version marker.
+Defaults are provided in-repo and can be overridden via repository variables.
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `CI_GATE_PROMOTION_MODE` | `strict` | `strict` blocks merges; `rollback` emits warnings without blocking. |
+| `CI_GATE_THRESHOLD_VERSION` | `2026-02-08.v1` | Auditable threshold set version. |
+| `CI_GATE_MIN_PASS_RATE_PCT` | `80.0` | Minimum allowed conformance pass rate. |
+| `CI_GATE_MAX_FAIL_COUNT` | `36` | Maximum allowed conformance failure count. |
+| `CI_GATE_MAX_NA_COUNT` | `170` | Maximum allowed conformance N/A count. |
+
+#### Rollback procedure (emergency, short-lived)
+
+1. Set repository variable `CI_GATE_PROMOTION_MODE=rollback`.
+2. Re-run CI and confirm `ci_gate_promotion_v1.json` reports `status=rollback_warning`.
+3. Triage failures using:
+   - `tests/e2e_results/**/ci_gate_promotion_v1.json`
+   - `tests/e2e_results/**/evidence_contract.json`
+   - `tests/ext_conformance/reports/conformance_summary.json`
+4. Fix root cause or adjust thresholds with a **new** `CI_GATE_THRESHOLD_VERSION`.
+5. Restore `CI_GATE_PROMOTION_MODE=strict` and verify the gate returns `status=pass`.
+
+#### Gate behavior self-test
+
+The CI step includes inline assertions that verify mode semantics every run:
+
+- `strict + failures` must fail the job.
+- `rollback + failures` must remain non-blocking.
+- `strict + no failures` must pass.
+
 ---
 
 ## Suite Classification File

@@ -213,13 +213,10 @@ struct ScenarioExpectation {
     #[serde(default)]
     content_types: Option<Vec<String>>,
     #[serde(default)]
-    #[allow(dead_code)]
     final_content_contains: Option<Vec<String>>,
     #[serde(default)]
-    #[allow(dead_code)]
     action: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     text_contains: Option<Vec<String>>,
     #[serde(default)]
     returns_contains: Option<Value>,
@@ -750,16 +747,18 @@ fn check_expectations_inner(
     // Check ui_notify_contains: verify notifications captured by interceptor
     if let Some(patterns) = &expect.ui_notify_contains {
         if let Some(interceptor) = &interceptor {
-            let notifications = interceptor.ui_notifications.lock().unwrap();
-            let all_text: String = notifications
-                .iter()
-                .filter_map(|n| {
-                    n.get("message")
-                        .or_else(|| n.get("text"))
-                        .and_then(Value::as_str)
-                })
-                .collect::<Vec<_>>()
-                .join(" ");
+            let all_text: String = {
+                let notifications = interceptor.ui_notifications.lock().unwrap();
+                notifications
+                    .iter()
+                    .filter_map(|n| {
+                        n.get("message")
+                            .or_else(|| n.get("text"))
+                            .and_then(Value::as_str)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             for pattern in patterns {
                 if !all_text.to_lowercase().contains(&pattern.to_lowercase()) {
                     diffs.push(format!(
@@ -775,7 +774,7 @@ fn check_expectations_inner(
     // Check exec_called: verify exec calls logged by interceptor
     if let Some(expected_calls) = &expect.exec_called {
         if let Some(interceptor) = &interceptor {
-            let exec_log = interceptor.exec_log.lock().unwrap();
+            let exec_log = interceptor.exec_log.lock().unwrap().clone();
             if let Some(expected_arr) = expected_calls.as_array() {
                 for (i, expected_call) in expected_arr.iter().enumerate() {
                     if let Some(call_arr) = expected_call.as_array() {
@@ -822,12 +821,15 @@ fn check_expectations_inner(
     // Check ui_status_key: verify status updates captured by interceptor
     if let Some(expected_key) = &expect.ui_status_key {
         if let Some(interceptor) = &interceptor {
-            let status_updates = interceptor.ui_status_updates.lock().unwrap();
-            let has_key = status_updates.iter().any(|s| {
-                s.get("key")
-                    .and_then(Value::as_str)
-                    .map_or(false, |k| k == expected_key)
-            });
+            let has_key = {
+                let status_updates = interceptor.ui_status_updates.lock().unwrap();
+                status_updates.iter().any(|s| {
+                    s.get("key")
+                        .or_else(|| s.get("statusKey"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|k| k == expected_key)
+                })
+            };
             if !has_key {
                 diffs.push(format!(
                     "ui_status_key: expected key '{expected_key}' in status updates"
@@ -841,11 +843,14 @@ fn check_expectations_inner(
     // Check ui_status_contains_sequence
     if let Some(patterns) = &expect.ui_status_contains_sequence {
         if let Some(interceptor) = &interceptor {
-            let status_updates = interceptor.ui_status_updates.lock().unwrap();
-            let all_values: Vec<String> = status_updates
+            let all_values: Vec<String> = interceptor
+                .ui_status_updates
+                .lock()
+                .unwrap()
                 .iter()
                 .filter_map(|s| {
                     s.get("value")
+                        .or_else(|| s.get("statusText"))
                         .or_else(|| s.get("text"))
                         .and_then(Value::as_str)
                         .map(String::from)
@@ -910,6 +915,21 @@ fn check_expectations_inner(
             if !actual_types.iter().any(|t| t == expected_type) {
                 diffs.push(format!(
                     "content_types: expected type '{expected_type}' in {actual_types:?}"
+                ));
+            }
+        }
+    }
+
+    // Check final_content_contains: check final assembled content text
+    if let Some(patterns) = &expect.final_content_contains {
+        // "final content" is the assembled text from the result — same as
+        // content_contains but semantically represents the final state after
+        // all processing steps (multi-step scenarios, streaming, etc.).
+        let text = extract_content_text(result);
+        for pattern in patterns {
+            if !text.contains(pattern.as_str()) {
+                diffs.push(format!(
+                    "final_content_contains: expected '{pattern}' in final content: {text}"
                 ));
             }
         }
@@ -1033,16 +1053,14 @@ fn json_contains_inner(actual: &Value, expected: &Value, key: Option<&str>) -> b
             expected_map.iter().all(|(k, v)| {
                 actual_map
                     .get(k)
-                    .map_or(false, |av| json_contains_inner(av, v, Some(k)))
+                    .is_some_and(|av| json_contains_inner(av, v, Some(k)))
             })
         }
         (Value::Array(actual_arr), Value::Array(expected_arr)) => expected_arr
             .iter()
             .all(|ev| actual_arr.iter().any(|av| json_contains_inner(av, ev, key))),
         // Path-typed string comparison: suffix match (bd-k5q5.1.2)
-        (Value::String(actual_s), Value::String(expected_s))
-            if key.is_some_and(|k| is_path_key(k)) =>
-        {
+        (Value::String(actual_s), Value::String(expected_s)) if key.is_some_and(is_path_key) => {
             path_suffix_match(actual_s, expected_s)
         }
         _ => actual == expected,
@@ -1082,7 +1100,7 @@ struct MockSpecInterceptor {
 }
 
 impl MockSpecInterceptor {
-    /// Parse from the mock_spec JSON format (mock_spec_default.json).
+    /// Parse from the `mock_spec` JSON format (`mock_spec_default.json`).
     fn from_mock_spec(spec: &Value) -> Self {
         let exec_rules = spec
             .pointer("/exec/rules")
@@ -1316,7 +1334,8 @@ impl HostcallInterceptor for MockSpecInterceptor {
                 Some(HostcallOutcome::Success(result))
             }
             HostcallKind::Ui { op } => {
-                match op.as_str() {
+                let op_key = op.to_ascii_lowercase();
+                match op_key.as_str() {
                     "notify" => {
                         self.ui_notifications
                             .lock()
@@ -1324,36 +1343,37 @@ impl HostcallInterceptor for MockSpecInterceptor {
                             .push(request.payload.clone());
                         Some(HostcallOutcome::Success(serde_json::json!({"ok": true})))
                     }
-                    "status" => {
+                    "status" | "setstatus" | "set_status" => {
                         self.ui_status_updates
                             .lock()
                             .unwrap()
                             .push(request.payload.clone());
                         Some(HostcallOutcome::Success(serde_json::json!({"ok": true})))
                     }
-                    "confirm" => {
-                        let result = self.ui_confirm_default;
-                        Some(HostcallOutcome::Success(
-                            serde_json::json!({ "confirmed": result }),
-                        ))
-                    }
+                    "confirm" => Some(HostcallOutcome::Success(Value::Bool(
+                        self.ui_confirm_default,
+                    ))),
                     "select" => {
                         // Check ui_responses for a "select" key
-                        let locked = self.ui_responses.lock().unwrap();
-                        let value = locked.get("select").cloned().unwrap_or(Value::Null);
-                        Some(HostcallOutcome::Success(
-                            serde_json::json!({ "selected": value }),
-                        ))
+                        let value = self
+                            .ui_responses
+                            .lock()
+                            .unwrap()
+                            .get("select")
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        Some(HostcallOutcome::Success(value))
                     }
                     "input" => {
                         let locked = self.ui_responses.lock().unwrap();
-                        let value = locked
-                            .get("input")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string();
                         Some(HostcallOutcome::Success(
-                            serde_json::json!({ "value": value }),
+                            locked.get("input").cloned().unwrap_or(Value::Null),
+                        ))
+                    }
+                    "editor" => {
+                        let locked = self.ui_responses.lock().unwrap();
+                        Some(HostcallOutcome::Success(
+                            locked.get("editor").cloned().unwrap_or(Value::Null),
                         ))
                     }
                     // Pass through unknown UI ops to real dispatch
@@ -1385,7 +1405,7 @@ struct ConformanceSession {
 }
 
 impl ConformanceSession {
-    /// Create from mock_spec JSON and optional scenario setup overrides.
+    /// Create from `mock_spec` JSON and optional scenario setup overrides.
     fn from_spec(default_spec: &Value, setup: Option<&Value>) -> Self {
         let session_spec = default_spec.get("session").cloned().unwrap_or(Value::Null);
 
@@ -1440,7 +1460,7 @@ impl ConformanceSession {
         // Apply scenario setup overrides
         if let Some(setup) = setup {
             if let Some(sb) = setup.get("session_branch").and_then(Value::as_array) {
-                branch = sb.clone();
+                branch.clone_from(sb);
             }
             if let Some(le) = setup.get("session_leaf_entry") {
                 // Add leaf entry to entries if not already there
@@ -1536,6 +1556,7 @@ struct LoadedExtensionWithMocks {
 }
 
 /// Load an extension with mock interceptor and conformance session.
+#[allow(clippy::too_many_lines)]
 fn load_extension_with_mocks(
     extension_path: &Path,
     setup: Option<&Value>,
@@ -1707,8 +1728,7 @@ fn build_ctx_payload_with_mocks(
     let model_registry = setup
         .and_then(|s| s.get("mock_model_registry"))
         .and_then(Value::as_object)
-        .map(|obj| Value::Object(obj.clone()))
-        .unwrap_or_else(|| serde_json::json!({}));
+        .map_or_else(|| serde_json::json!({}), |obj| Value::Object(obj.clone()));
 
     // Session data from default spec
     let session_spec = default_spec.get("session").cloned().unwrap_or(Value::Null);
@@ -1727,10 +1747,10 @@ fn build_ctx_payload_with_mocks(
     // Override from setup
     if let Some(setup) = setup {
         if let Some(sb) = setup.get("session_branch").and_then(Value::as_array) {
-            session_branch = sb.clone();
+            session_branch.clone_from(sb);
         }
         if let Some(le) = setup.get("session_leaf_entry") {
-            session_leaf_entry = le.clone();
+            session_leaf_entry.clone_from(le);
         }
     }
     // Merge leaf entry into entries
@@ -1768,7 +1788,7 @@ fn build_ctx_payload_with_mocks(
 /// Check if a scenario needs setup features we cannot provide yet.
 /// Most features are now supported via `MockSpecInterceptor` and
 /// `ConformanceSession`.
-fn needs_unsupported_setup(_scenario: &Scenario) -> Option<String> {
+const fn needs_unsupported_setup(_scenario: &Scenario) -> Option<String> {
     // All previously unsupported setup types are now handled:
     // - "vcr_or_stub" HTTP mock mode: treated as normal rule-based mock with
     //   synthetic fallback response
@@ -2102,6 +2122,23 @@ fn execute_multi_step_scenario(
             }
             other => {
                 return Err(format!("unknown step type: {other}"));
+            }
+        }
+
+        // Drain detached hostcalls (e.g. fire-and-forget ui.notify/setStatus)
+        // so expectation checks observe side effects produced by the step.
+        for _ in 0..8 {
+            let has_pending = common::run_async({
+                let runtime = loaded.runtime.clone();
+                async move {
+                    runtime
+                        .pump_once()
+                        .await
+                        .map_err(|e| format!("pump_once: {e}"))
+                }
+            })?;
+            if !has_pending {
+                break;
             }
         }
     }

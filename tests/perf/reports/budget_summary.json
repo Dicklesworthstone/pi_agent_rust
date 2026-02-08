@@ -119,8 +119,10 @@
     }
   ],
   "ci_enforced": 8,
+  "ci_fail": 0,
+  "ci_with_data": 1,
   "fail": 0,
-  "generated_at": "2026-02-07T21:55:06.981355576+00:00",
+  "generated_at": "2026-02-08T02:11:50.551273351+00:00",
   "no_data": 10,
   "pass": 3,
   "schema": "pi.perf.budget_summary.v1",

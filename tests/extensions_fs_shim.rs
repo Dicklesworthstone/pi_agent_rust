@@ -510,6 +510,106 @@ fn fs_promises_copy_rename() {
 }
 
 // ---------------------------------------------------------------------------
+// symlink/readlink + dirent/lstat semantics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fs_symlink_readlink_and_dirent_semantics() {
+    futures::executor::block_on(async {
+        let runtime = PiJsRuntime::with_clock_and_config(
+            Arc::new(DeterministicClock::new(0)),
+            default_config(),
+        )
+        .await
+        .expect("create runtime");
+
+        runtime
+            .eval(
+                r#"
+                (async () => {
+                    const fs = await import('node:fs');
+                    const fsp = await import('node:fs/promises');
+
+                    fs.mkdirSync('/links', { recursive: true });
+                    fs.writeFileSync('/links/target.txt', 'payload');
+                    fs.symlinkSync('/links/target.txt', '/links/alias.txt');
+                    fs.symlinkSync('/links/missing.txt', '/links/broken.txt');
+
+                    globalThis.symlinkReadlinkSync = fs.readlinkSync('/links/alias.txt');
+                    globalThis.symlinkStatIsFile = fs.statSync('/links/alias.txt').isFile();
+                    globalThis.symlinkLstatIsSymlink = fs.lstatSync('/links/alias.txt').isSymbolicLink();
+                    globalThis.brokenExists = fs.existsSync('/links/broken.txt');
+                    globalThis.brokenLstatIsSymlink = fs.lstatSync('/links/broken.txt').isSymbolicLink();
+
+                    const dirents = fs.readdirSync('/links', { withFileTypes: true });
+                    const aliasEntry = dirents.find((d) => d.name === 'alias.txt');
+                    globalThis.direntIsSymlink = aliasEntry ? aliasEntry.isSymbolicLink() : null;
+
+                    await fsp.symlink('/links/target.txt', '/links/alias2.txt');
+                    globalThis.symlinkReadlinkPromise = await fsp.readlink('/links/alias2.txt');
+                    const lstat = await fsp.lstat('/links/alias2.txt');
+                    globalThis.promisesLstatIsSymlink = lstat.isSymbolicLink();
+                    await fsp.appendFile('/links/alias2.txt', '-more');
+                    globalThis.promisesAppendContent = await fsp.readFile('/links/target.txt', 'utf8');
+                })();
+                "#,
+            )
+            .await
+            .expect("eval");
+
+        runtime.drain_microtasks().await.expect("drain");
+
+        let readlink_sync: serde_json::Value = runtime
+            .read_global_json("symlinkReadlinkSync")
+            .await
+            .unwrap();
+        assert_eq!(readlink_sync, "/links/target.txt");
+
+        let stat_is_file: serde_json::Value =
+            runtime.read_global_json("symlinkStatIsFile").await.unwrap();
+        assert_eq!(stat_is_file, true);
+
+        let lstat_is_symlink: serde_json::Value = runtime
+            .read_global_json("symlinkLstatIsSymlink")
+            .await
+            .unwrap();
+        assert_eq!(lstat_is_symlink, true);
+
+        let broken_exists: serde_json::Value =
+            runtime.read_global_json("brokenExists").await.unwrap();
+        assert_eq!(broken_exists, false);
+
+        let broken_lstat: serde_json::Value = runtime
+            .read_global_json("brokenLstatIsSymlink")
+            .await
+            .unwrap();
+        assert_eq!(broken_lstat, true);
+
+        let dirent_symlink: serde_json::Value =
+            runtime.read_global_json("direntIsSymlink").await.unwrap();
+        assert_eq!(dirent_symlink, true);
+
+        let readlink_promise: serde_json::Value = runtime
+            .read_global_json("symlinkReadlinkPromise")
+            .await
+            .unwrap();
+        assert_eq!(readlink_promise, "/links/target.txt");
+
+        let promises_lstat: serde_json::Value = runtime
+            .read_global_json("promisesLstatIsSymlink")
+            .await
+            .unwrap();
+        assert_eq!(promises_lstat, true);
+
+        let appended: serde_json::Value = runtime
+            .read_global_json("promisesAppendContent")
+            .await
+            .unwrap();
+        assert_eq!(appended, "payload-more");
+    });
+}
+
+// ---------------------------------------------------------------------------
 // callback-based readFile / writeFile
 // ---------------------------------------------------------------------------
 
@@ -1027,7 +1127,7 @@ fn fs_watch_stubs() {
 }
 
 // ---------------------------------------------------------------------------
-// fd-based stubs (openSync, closeSync, etc.)
+// fd-based operations (openSync, readSync, writeSync, fstatSync)
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -1044,13 +1144,34 @@ fn fs_fd_stubs() {
             .eval(
                 r#"
                 import('node:fs').then((fs) => {
-                    const fd = fs.openSync('/test', 'r');
-                    globalThis.fdVal = typeof fd === 'number';
-                    fs.closeSync(fd);
+                    fs.writeFileSync('/test', 'abcdef');
+                    const readFd = fs.openSync('/test', 'r');
+                    globalThis.fdVal = typeof readFd === 'number';
+
+                    const buf = new Uint8Array(3);
+                    globalThis.readBytes = fs.readSync(readFd, buf, 0, 3, 0);
+                    globalThis.readText = Buffer.from(buf).toString('utf8');
+
+                    const fstat = fs.fstatSync(readFd);
+                    globalThis.fstatHasIsFile = typeof fstat.isFile === 'function';
+                    globalThis.fstatSize = fstat.size;
+
+                    fs.closeSync(readFd);
                     globalThis.closeOk = true;
 
-                    const fstat = fs.fstatSync(fd);
-                    globalThis.fstatHasIsFile = typeof fstat.isFile === 'function';
+                    const appendFd = fs.openSync('/test', 'a');
+                    globalThis.writeBytes = fs.writeSync(appendFd, '!');
+                    fs.closeSync(appendFd);
+                    globalThis.afterWrite = fs.readFileSync('/test', 'utf8');
+
+                    const lockFd = fs.openSync('/lock', fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR);
+                    fs.closeSync(lockFd);
+                    try {
+                        fs.openSync('/lock', fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_RDWR);
+                        globalThis.exclusiveCreateFailed = false;
+                    } catch (e) {
+                        globalThis.exclusiveCreateFailed = String(e && e.message || e).includes('EEXIST');
+                    }
                 });
                 "#,
             )
@@ -1063,8 +1184,23 @@ fn fs_fd_stubs() {
         assert_eq!(fd_val, true);
         let close_ok: serde_json::Value = runtime.read_global_json("closeOk").await.unwrap();
         assert_eq!(close_ok, true);
+        let read_bytes: serde_json::Value = runtime.read_global_json("readBytes").await.unwrap();
+        assert_eq!(read_bytes, 3);
+        let read_text: serde_json::Value = runtime.read_global_json("readText").await.unwrap();
+        assert_eq!(read_text, "abc");
         let fstat: serde_json::Value = runtime.read_global_json("fstatHasIsFile").await.unwrap();
         assert_eq!(fstat, true);
+        let fstat_size: serde_json::Value = runtime.read_global_json("fstatSize").await.unwrap();
+        assert_eq!(fstat_size, 6);
+        let write_bytes: serde_json::Value = runtime.read_global_json("writeBytes").await.unwrap();
+        assert_eq!(write_bytes, 1);
+        let after_write: serde_json::Value = runtime.read_global_json("afterWrite").await.unwrap();
+        assert_eq!(after_write, "abcdef!");
+        let exclusive: serde_json::Value = runtime
+            .read_global_json("exclusiveCreateFailed")
+            .await
+            .unwrap();
+        assert_eq!(exclusive, true);
     });
 }
 
@@ -1075,31 +1211,35 @@ fn fs_fd_stubs() {
 #[test]
 fn fs_stat_host_fallback() {
     futures::executor::block_on(async {
-        let runtime = PiJsRuntime::with_clock_and_config(
-            Arc::new(DeterministicClock::new(0)),
-            default_config(),
-        )
-        .await
-        .expect("create runtime");
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let host_file = temp_dir.path().join("host-visible.txt");
+        std::fs::write(&host_file, "host-fallback").expect("write host file");
 
-        // The host read fallback reads from the real filesystem.
-        // /etc/hostname should exist on most Linux systems.
+        let mut config = default_config();
+        config.cwd = temp_dir.path().display().to_string();
+        let runtime =
+            PiJsRuntime::with_clock_and_config(Arc::new(DeterministicClock::new(0)), config)
+                .await
+                .expect("create runtime");
+
         runtime
             .eval(
                 r#"
                 import('node:fs').then((fs) => {
-                    // First verify existsSync works for a real file
-                    globalThis.hostExists = fs.existsSync('/etc/hostname');
-
-                    // Now stat should also work (our fix)
+                    const insidePath = process.cwd() + '/host-visible.txt';
+                    globalThis.hostExists = fs.existsSync(insidePath);
                     if (globalThis.hostExists) {
-                        try {
-                            const s = fs.statSync('/etc/hostname');
-                            globalThis.hostStatIsFile = s.isFile();
-                            globalThis.hostStatSize = s.size;
-                        } catch (e) {
-                            globalThis.hostStatErr = e.message;
-                        }
+                        const s = fs.statSync(insidePath);
+                        globalThis.hostStatIsFile = s.isFile();
+                        globalThis.hostStatSize = s.size;
+                    }
+
+                    globalThis.outsideExists = fs.existsSync('/etc/hostname');
+                    try {
+                        fs.statSync('/etc/hostname');
+                        globalThis.outsideStat = 'ok';
+                    } catch (e) {
+                        globalThis.outsideStat = String(e.message || e);
                     }
                 });
                 "#,
@@ -1110,14 +1250,22 @@ fn fs_stat_host_fallback() {
         runtime.drain_microtasks().await.expect("drain");
 
         let exists: serde_json::Value = runtime.read_global_json("hostExists").await.unwrap();
-        if exists == true {
-            let is_file: serde_json::Value =
-                runtime.read_global_json("hostStatIsFile").await.unwrap();
-            assert_eq!(is_file, true);
+        assert_eq!(exists, true);
+        let is_file: serde_json::Value = runtime.read_global_json("hostStatIsFile").await.unwrap();
+        assert_eq!(is_file, true);
+        let size: serde_json::Value = runtime.read_global_json("hostStatSize").await.unwrap();
+        assert!(size.as_u64().unwrap() > 0);
 
-            let size: serde_json::Value = runtime.read_global_json("hostStatSize").await.unwrap();
-            assert!(size.as_u64().unwrap() > 0);
-        }
+        let outside_exists: serde_json::Value =
+            runtime.read_global_json("outsideExists").await.unwrap();
+        assert_eq!(outside_exists, false);
+        let outside_stat: serde_json::Value =
+            runtime.read_global_json("outsideStat").await.unwrap();
+        let outside_message = outside_stat.as_str().unwrap_or_default();
+        assert!(
+            outside_message.contains("outside extension root"),
+            "outside stat should be denied, got: {outside_message}"
+        );
     });
 }
 
@@ -1178,10 +1326,11 @@ fn fs_default_export_complete() {
                         'appendFileSync', 'readdirSync', 'statSync', 'lstatSync',
                         'mkdtempSync', 'realpathSync', 'unlinkSync', 'rmdirSync',
                         'rmSync', 'copyFileSync', 'renameSync', 'mkdirSync',
-                        'accessSync', 'chmodSync', 'chownSync', 'openSync', 'closeSync',
+                        'accessSync', 'chmodSync', 'chownSync', 'readlinkSync', 'symlinkSync',
+                        'openSync', 'closeSync',
                         'createReadStream', 'createWriteStream',
                         'readFile', 'writeFile', 'stat', 'lstat', 'readdir',
-                        'mkdir', 'unlink', 'rmdir', 'rm', 'rename', 'copyFile',
+                        'mkdir', 'unlink', 'readlink', 'symlink', 'rmdir', 'rm', 'rename', 'copyFile',
                         'appendFile', 'access', 'realpath', 'promises',
                     ];
                     globalThis.missingExports = expected.filter(

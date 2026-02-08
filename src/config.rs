@@ -116,11 +116,27 @@ pub struct Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ExtensionPolicyConfig {
-    /// Policy profile: "safe", "standard" (default), or "permissive".
+    /// Policy profile: "safe" (default), "balanced", or "permissive".
+    /// Legacy alias "standard" is also accepted.
     pub profile: Option<String>,
     /// Allow dangerous capabilities (exec, env). Overrides profile's deny list.
     #[serde(alias = "allowDangerous")]
     pub allow_dangerous: Option<bool>,
+}
+
+/// Resolved extension policy plus explainability metadata.
+#[derive(Debug, Clone)]
+pub struct ResolvedExtensionPolicy {
+    /// Raw profile token selected by precedence resolution.
+    pub requested_profile: String,
+    /// Effective normalized profile name after fallback.
+    pub effective_profile: String,
+    /// Source of the selected profile token: cli, env, config, or default.
+    pub profile_source: &'static str,
+    /// Whether dangerous capabilities were explicitly enabled.
+    pub allow_dangerous: bool,
+    /// Final effective policy used by runtime components.
+    pub policy: crate::extensions::ExtensionPolicy,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -476,31 +492,46 @@ impl Config {
     /// 1. `cli_override` (from `--extension-policy` flag)
     /// 2. `PI_EXTENSION_POLICY` environment variable
     /// 3. `extension_policy.profile` from settings.json
-    /// 4. Default: "standard"
+    /// 4. Default: "safe"
     ///
     /// If `allow_dangerous` is true (from config or env), exec/env are removed
     /// from the policy's deny list.
-    pub fn resolve_extension_policy(
+    pub fn resolve_extension_policy_with_metadata(
         &self,
         cli_override: Option<&str>,
-    ) -> crate::extensions::ExtensionPolicy {
+    ) -> ResolvedExtensionPolicy {
         use crate::extensions::PolicyProfile;
 
-        // Determine profile name: CLI > env > config > default
-        let profile_name = cli_override
-            .map(ToString::to_string)
-            .or_else(|| std::env::var("PI_EXTENSION_POLICY").ok())
-            .or_else(|| {
-                self.extension_policy
-                    .as_ref()
-                    .and_then(|p| p.profile.clone())
-            })
-            .unwrap_or_else(|| "standard".to_string());
+        // Determine profile name with source: CLI > env > config > default
+        let (requested_profile, profile_source) = cli_override.map_or_else(
+            || {
+                std::env::var("PI_EXTENSION_POLICY").map_or_else(
+                    |_| {
+                        self.extension_policy
+                            .as_ref()
+                            .and_then(|p| p.profile.clone())
+                            .map_or_else(
+                                || ("safe".to_string(), "default"),
+                                |value| (value, "config"),
+                            )
+                    },
+                    |value| (value, "env"),
+                )
+            },
+            |value| (value.to_string(), "cli"),
+        );
 
-        let profile = match profile_name.to_ascii_lowercase().as_str() {
-            "safe" => PolicyProfile::Safe,
-            "permissive" => PolicyProfile::Permissive,
-            _ => PolicyProfile::Standard,
+        let normalized_profile = requested_profile.to_ascii_lowercase();
+        let profile = if normalized_profile == "safe" {
+            PolicyProfile::Safe
+        } else if normalized_profile == "permissive" {
+            PolicyProfile::Permissive
+        } else if normalized_profile == "balanced" || normalized_profile == "standard" {
+            // "balanced" (and legacy "standard") map to the standard policy.
+            PolicyProfile::Standard
+        } else {
+            // Unknown values fail closed to the safe profile.
+            PolicyProfile::Safe
         };
 
         let mut policy = profile.to_policy();
@@ -518,7 +549,27 @@ impl Config {
             policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
         }
 
-        policy
+        let effective_profile = match profile {
+            PolicyProfile::Safe => "safe",
+            PolicyProfile::Standard => "balanced",
+            PolicyProfile::Permissive => "permissive",
+        };
+
+        ResolvedExtensionPolicy {
+            requested_profile,
+            effective_profile: effective_profile.to_string(),
+            profile_source,
+            allow_dangerous,
+            policy,
+        }
+    }
+
+    pub fn resolve_extension_policy(
+        &self,
+        cli_override: Option<&str>,
+    ) -> crate::extensions::ExtensionPolicy {
+        self.resolve_extension_policy_with_metadata(cli_override)
+            .policy
     }
 
     fn emit_queue_mode_diagnostics(&self) {
@@ -1386,12 +1437,62 @@ mod tests {
     // ====================================================================
 
     #[test]
-    fn extension_policy_defaults_to_standard() {
+    fn extension_policy_defaults_to_safe_behavior() {
         let config = Config::default();
         let policy = config.resolve_extension_policy(None);
-        // Standard mode: exec and env should be in deny_caps
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
+        // Safe mode: dangerous capabilities are denied by default.
         assert!(policy.deny_caps.contains(&"exec".to_string()));
         assert!(policy.deny_caps.contains(&"env".to_string()));
+    }
+
+    #[test]
+    fn extension_policy_metadata_reports_cli_source() {
+        let config = Config::default();
+        let resolved = config.resolve_extension_policy_with_metadata(Some("safe"));
+        assert_eq!(resolved.profile_source, "cli");
+        assert_eq!(resolved.requested_profile, "safe");
+        assert_eq!(resolved.effective_profile, "safe");
+        assert_eq!(
+            resolved.policy.mode,
+            crate::extensions::ExtensionPolicyMode::Strict
+        );
+    }
+
+    #[test]
+    fn extension_policy_metadata_unknown_profile_falls_back_to_safe() {
+        let config = Config::default();
+        let resolved = config.resolve_extension_policy_with_metadata(Some("unknown-value"));
+        assert_eq!(resolved.requested_profile, "unknown-value");
+        assert_eq!(resolved.effective_profile, "safe");
+        assert_eq!(
+            resolved.policy.mode,
+            crate::extensions::ExtensionPolicyMode::Strict
+        );
+    }
+
+    #[test]
+    fn extension_policy_metadata_balanced_profile_maps_to_prompt_mode() {
+        let config = Config::default();
+        let resolved = config.resolve_extension_policy_with_metadata(Some("balanced"));
+        assert_eq!(resolved.requested_profile, "balanced");
+        assert_eq!(resolved.effective_profile, "balanced");
+        assert_eq!(
+            resolved.policy.mode,
+            crate::extensions::ExtensionPolicyMode::Prompt
+        );
+    }
+
+    #[test]
+    fn extension_policy_metadata_legacy_standard_alias_maps_to_balanced() {
+        let config = Config::default();
+        let resolved = config.resolve_extension_policy_with_metadata(Some("standard"));
+        assert_eq!(resolved.requested_profile, "standard");
+        assert_eq!(resolved.effective_profile, "balanced");
+        assert_eq!(
+            resolved.policy.mode,
+            crate::extensions::ExtensionPolicyMode::Prompt
+        );
     }
 
     #[test]
@@ -1458,7 +1559,7 @@ mod tests {
 
         let config = Config::load_with_roots(None, &global_dir, &cwd).expect("load");
         let policy = config.resolve_extension_policy(None);
-        // Standard mode but exec/env removed from deny
+        // Safe mode still drops explicit deny-caps when allowDangerous=true.
         assert!(!policy.deny_caps.contains(&"exec".to_string()));
         assert!(!policy.deny_caps.contains(&"env".to_string()));
     }
@@ -1486,10 +1587,10 @@ mod tests {
     }
 
     #[test]
-    fn extension_policy_unknown_profile_defaults_to_standard() {
+    fn extension_policy_unknown_profile_defaults_to_safe() {
         let config = Config::default();
         let policy = config.resolve_extension_policy(Some("unknown-value"));
-        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Prompt);
+        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
     }
 
     #[test]
