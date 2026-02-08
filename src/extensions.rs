@@ -776,6 +776,182 @@ fn looks_like_node_builtin(module_root: &str) -> bool {
 // Policy
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// Capability taxonomy
+// ---------------------------------------------------------------------------
+
+/// Enumeration of all recognised extension capabilities.
+///
+/// Each variant maps 1-to-1 with a string token used in policy configuration
+/// (e.g. `"read"`, `"exec"`). The canonical string is the
+/// `#[serde(rename_all = "snake_case")]` form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Read files and directories.
+    Read,
+    /// Write / create / delete files and directories.
+    Write,
+    /// Outbound HTTP requests.
+    Http,
+    /// Subscribe to and emit lifecycle events.
+    Events,
+    /// Access session state (messages, model, labels, etc.).
+    Session,
+    /// UI operations (status, widgets, notifications).
+    Ui,
+    /// Execute shell commands (dangerous).
+    Exec,
+    /// Read environment variables (dangerous — may leak secrets).
+    Env,
+    /// Generic tool invocation.
+    Tool,
+    /// Logging (always allowed, included for completeness).
+    Log,
+}
+
+/// All known capabilities in definition order.
+pub const ALL_CAPABILITIES: &[Capability] = &[
+    Capability::Read,
+    Capability::Write,
+    Capability::Http,
+    Capability::Events,
+    Capability::Session,
+    Capability::Ui,
+    Capability::Exec,
+    Capability::Env,
+    Capability::Tool,
+    Capability::Log,
+];
+
+impl Capability {
+    /// Parse a string token into a [`Capability`], case-insensitive.
+    /// Returns `None` for unrecognised tokens.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read" => Some(Self::Read),
+            "write" => Some(Self::Write),
+            "http" => Some(Self::Http),
+            "events" => Some(Self::Events),
+            "session" => Some(Self::Session),
+            "ui" => Some(Self::Ui),
+            "exec" => Some(Self::Exec),
+            "env" => Some(Self::Env),
+            "tool" => Some(Self::Tool),
+            "log" => Some(Self::Log),
+            _ => None,
+        }
+    }
+
+    /// Canonical string token (matches serde rename).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Http => "http",
+            Self::Events => "events",
+            Self::Session => "session",
+            Self::Ui => "ui",
+            Self::Exec => "exec",
+            Self::Env => "env",
+            Self::Tool => "tool",
+            Self::Log => "log",
+        }
+    }
+
+    /// Whether this capability is classified as *dangerous*.
+    ///
+    /// Dangerous capabilities default to Deny in Strict/Prompt modes and
+    /// require explicit opt-in or user confirmation.
+    pub const fn is_dangerous(self) -> bool {
+        matches!(self, Self::Exec | Self::Env)
+    }
+}
+
+impl std::fmt::Display for Capability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Policy profile presets
+// ---------------------------------------------------------------------------
+
+/// Named policy profiles providing curated defaults.
+///
+/// Profiles are convenience constructors for [`ExtensionPolicy`] — once
+/// constructed the policy is fully mutable and can be further customised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyProfile {
+    /// Safe defaults: only non-dangerous capabilities allowed, dangerous
+    /// denied. Mode = Strict.
+    Safe,
+    /// Standard defaults (current production behaviour): non-dangerous
+    /// allowed, dangerous prompt. Mode = Prompt.
+    Standard,
+    /// Everything allowed, nothing denied. Mode = Permissive.
+    Permissive,
+}
+
+impl PolicyProfile {
+    /// Expand this profile into a concrete [`ExtensionPolicy`].
+    pub fn to_policy(self) -> ExtensionPolicy {
+        match self {
+            Self::Safe => ExtensionPolicy {
+                mode: ExtensionPolicyMode::Strict,
+                max_memory_mb: 256,
+                default_caps: vec![
+                    "read".to_string(),
+                    "write".to_string(),
+                    "http".to_string(),
+                    "events".to_string(),
+                    "session".to_string(),
+                ],
+                deny_caps: vec!["exec".to_string(), "env".to_string()],
+                per_extension: HashMap::new(),
+            },
+            Self::Standard => ExtensionPolicy::default(),
+            Self::Permissive => ExtensionPolicy {
+                mode: ExtensionPolicyMode::Permissive,
+                max_memory_mb: 256,
+                default_caps: Vec::new(),
+                deny_caps: Vec::new(),
+                per_extension: HashMap::new(),
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-extension overrides
+// ---------------------------------------------------------------------------
+
+/// Per-extension policy override.
+///
+/// When present for an extension ID, these fields take precedence over the
+/// global policy fields at the corresponding layer in the precedence chain.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionOverride {
+    /// Mode override for this extension. `None` inherits the global mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ExtensionPolicyMode>,
+    /// Additional capabilities to allow for this extension (merged with
+    /// global `default_caps`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Additional capabilities to deny for this extension (merged with
+    /// global `deny_caps`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Core policy types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ExtensionPolicyMode {
@@ -791,6 +967,9 @@ pub struct ExtensionPolicy {
     pub max_memory_mb: u32,
     pub default_caps: Vec<String>,
     pub deny_caps: Vec<String>,
+    /// Per-extension overrides keyed by extension ID.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub per_extension: HashMap<String, ExtensionOverride>,
 }
 
 impl Default for ExtensionPolicy {
@@ -806,6 +985,7 @@ impl Default for ExtensionPolicy {
                 "session".to_string(),
             ],
             deny_caps: vec!["exec".to_string(), "env".to_string()],
+            per_extension: HashMap::new(),
         }
     }
 }
@@ -825,8 +1005,40 @@ pub struct PolicyCheck {
     pub reason: String,
 }
 
+// ---------------------------------------------------------------------------
+// Precedence chain
+// ---------------------------------------------------------------------------
+//
+// Policy evaluation follows a strict precedence order. Each layer either
+// produces a terminal decision (Allow / Deny) or defers to the next layer.
+//
+//   1. **Per-extension deny** — if the capability is in the extension
+//      override's `deny` list → Deny ("extension_deny").
+//   2. **Global deny_caps** — if the capability is in the global `deny_caps`
+//      list → Deny ("deny_caps").
+//   3. **Per-extension allow** — if the capability is in the extension
+//      override's `allow` list → Allow ("extension_allow").
+//   4. **Global default_caps** — if the capability is in `default_caps`
+//      → Allow ("default_caps").
+//   5. **Mode fallback** — Strict → Deny, Prompt → Prompt, Permissive →
+//      Allow.
+//
+// The effective mode is the per-extension override mode if set, otherwise
+// the global mode.
+
 impl ExtensionPolicy {
+    /// Evaluate policy for a capability without extension context.
+    ///
+    /// Equivalent to `evaluate_for(capability, None)`.
     pub fn evaluate(&self, capability: &str) -> PolicyCheck {
+        self.evaluate_for(capability, None)
+    }
+
+    /// Evaluate policy for a capability with optional extension context.
+    ///
+    /// Applies the full precedence chain documented above.
+    #[allow(clippy::too_many_lines)]
+    pub fn evaluate_for(&self, capability: &str, extension_id: Option<&str>) -> PolicyCheck {
         let normalized = capability.trim().to_ascii_lowercase();
         if normalized.is_empty() {
             return PolicyCheck {
@@ -836,6 +1048,25 @@ impl ExtensionPolicy {
             };
         }
 
+        let ext_override = extension_id
+            .and_then(|id| self.per_extension.get(id));
+
+        // Layer 1: per-extension deny.
+        if let Some(ovr) = ext_override {
+            if ovr
+                .deny
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(&normalized))
+            {
+                return PolicyCheck {
+                    decision: PolicyDecision::Deny,
+                    capability: normalized,
+                    reason: "extension_deny".to_string(),
+                };
+            }
+        }
+
+        // Layer 2: global deny_caps.
         if self
             .deny_caps
             .iter()
@@ -848,12 +1079,33 @@ impl ExtensionPolicy {
             };
         }
 
+        // Layer 3: per-extension allow.
+        if let Some(ovr) = ext_override {
+            if ovr
+                .allow
+                .iter()
+                .any(|cap| cap.eq_ignore_ascii_case(&normalized))
+            {
+                return PolicyCheck {
+                    decision: PolicyDecision::Allow,
+                    capability: normalized,
+                    reason: "extension_allow".to_string(),
+                };
+            }
+        }
+
+        // Layer 4: global default_caps.
         let in_default_caps = self
             .default_caps
             .iter()
             .any(|cap| cap.eq_ignore_ascii_case(&normalized));
 
-        match self.mode {
+        // Layer 5: mode fallback (use per-extension mode if set).
+        let effective_mode = ext_override
+            .and_then(|ovr| ovr.mode)
+            .unwrap_or(self.mode);
+
+        match effective_mode {
             ExtensionPolicyMode::Strict => PolicyCheck {
                 decision: if in_default_caps {
                     PolicyDecision::Allow
@@ -886,6 +1138,16 @@ impl ExtensionPolicy {
                 reason: "permissive".to_string(),
             },
         }
+    }
+
+    /// Check whether a specific extension has any overrides configured.
+    pub fn has_override(&self, extension_id: &str) -> bool {
+        self.per_extension.contains_key(extension_id)
+    }
+
+    /// Create a policy from a named profile.
+    pub fn from_profile(profile: PolicyProfile) -> Self {
+        profile.to_policy()
     }
 }
 
@@ -3264,6 +3526,7 @@ mod wasm_host {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+                ..Default::default()
             }
         }
 
@@ -3273,6 +3536,7 @@ mod wasm_host {
                 max_memory_mb: 256,
                 default_caps: default_caps.iter().map(|cap| (*cap).to_string()).collect(),
                 deny_caps: deny_caps.iter().map(|cap| (*cap).to_string()).collect(),
+                ..Default::default()
             }
         }
 
@@ -4761,7 +5025,17 @@ impl JsExtensionRuntimeHandle {
         tools: Arc<ToolRegistry>,
         manager: ExtensionManager,
     ) -> Result<Self> {
-        Self::start_inner(config, tools, manager, None).await
+        Self::start_inner(config, tools, manager, None, None).await
+    }
+
+    /// Like [`start`](Self::start) but uses a specific [`ExtensionPolicy`].
+    pub async fn start_with_policy(
+        config: PiJsRuntimeConfig,
+        tools: Arc<ToolRegistry>,
+        manager: ExtensionManager,
+        policy: ExtensionPolicy,
+    ) -> Result<Self> {
+        Self::start_inner(config, tools, manager, None, Some(policy)).await
     }
 
     /// Like [`start`](Self::start) but installs a [`HostcallInterceptor`] that
@@ -4773,7 +5047,7 @@ impl JsExtensionRuntimeHandle {
         manager: ExtensionManager,
         interceptor: Arc<dyn HostcallInterceptor>,
     ) -> Result<Self> {
-        Self::start_inner(config, tools, manager, Some(interceptor)).await
+        Self::start_inner(config, tools, manager, Some(interceptor), None).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4782,6 +5056,7 @@ impl JsExtensionRuntimeHandle {
         tools: Arc<ToolRegistry>,
         manager: ExtensionManager,
         interceptor: Option<Arc<dyn HostcallInterceptor>>,
+        policy: Option<ExtensionPolicy>,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(32);
         let (init_tx, init_rx) = oneshot::channel();
@@ -4790,7 +5065,7 @@ impl JsExtensionRuntimeHandle {
             tools,
             manager_ref: Arc::downgrade(&manager.inner),
             http: Arc::new(HttpConnector::with_defaults()),
-            policy: ExtensionPolicy::default(),
+            policy: policy.unwrap_or_default(),
             interceptor,
         };
 
@@ -9598,6 +9873,7 @@ mod tests {
                     max_memory_mb: 256,
                     default_caps: Vec::new(),
                     deny_caps: Vec::new(),
+                    ..Default::default()
                 },
                 interceptor: None,
             };
@@ -9710,6 +9986,7 @@ mod tests {
                     max_memory_mb: 256,
                     default_caps: Vec::new(),
                     deny_caps: Vec::new(),
+                    ..Default::default()
                 },
                 interceptor: None,
             };
@@ -9813,6 +10090,7 @@ mod tests {
                     max_memory_mb: 256,
                     default_caps: Vec::new(),
                     deny_caps: Vec::new(),
+                    ..Default::default()
                 },
                 interceptor: None,
             };
@@ -9905,6 +10183,7 @@ mod tests {
                     max_memory_mb: 256,
                     default_caps: Vec::new(),
                     deny_caps: Vec::new(),
+                    ..Default::default()
                 },
                 interceptor: None,
             };
@@ -9992,6 +10271,7 @@ mod tests {
                     max_memory_mb: 256,
                     default_caps: Vec::new(),
                     deny_caps: Vec::new(),
+                    ..Default::default()
                 },
                 interceptor: None,
             };
@@ -10671,6 +10951,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -10811,6 +11092,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: vec!["read".to_string()],
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -10866,6 +11148,7 @@ mod tests {
             max_memory_mb: 256,
             default_caps: Vec::new(),
             deny_caps: Vec::new(),
+            ..Default::default()
         };
         let call = HostCallPayload {
             call_id: "runtime-log-1".to_string(),
@@ -10929,6 +11212,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: vec!["ui".to_string()],
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -10966,6 +11250,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: vec!["ui".to_string()],
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -11085,6 +11370,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: vec!["read".to_string()],
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -11173,6 +11459,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: vec!["read".to_string()],
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -11264,6 +11551,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: vec!["http".to_string()],
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -11310,6 +11598,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: vec!["read".to_string(), "write".to_string()],
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -14607,6 +14896,7 @@ mod tests {
             max_memory_mb: 256,
             default_caps: Vec::new(),
             deny_caps: Vec::new(),
+            ..Default::default()
         }
     }
 
@@ -14625,6 +14915,7 @@ mod tests {
                 "ui".to_string(),
                 "events".to_string(),
             ],
+            ..Default::default()
         }
     }
 
@@ -15511,6 +15802,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -15555,6 +15847,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -15601,6 +15894,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -15649,6 +15943,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -15713,6 +16008,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: Vec::new(),
                 deny_caps: Vec::new(),
+                ..Default::default()
             },
             interceptor: None,
         };
@@ -15759,6 +16055,7 @@ mod tests {
                 max_memory_mb: 256,
                 default_caps: vec!["read".to_string()],
                 deny_caps: vec!["exec".to_string()],
+                ..Default::default()
             },
             interceptor: None,
         };

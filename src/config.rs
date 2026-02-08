@@ -20,8 +20,11 @@ pub struct Config {
     pub show_hardware_cursor: Option<bool>,
 
     // Model Configuration
+    #[serde(alias = "defaultProvider")]
     pub default_provider: Option<String>,
+    #[serde(alias = "defaultModel")]
     pub default_model: Option<String>,
+    #[serde(alias = "defaultThinkingLevel")]
     pub default_thinking_level: Option<String>,
     #[serde(alias = "enabledModels")]
     pub enabled_models: Option<Vec<String>>,
@@ -56,13 +59,16 @@ pub struct Config {
     pub compaction: Option<CompactionSettings>,
 
     // Branch Summarization
+    #[serde(alias = "branchSummary")]
     pub branch_summary: Option<BranchSummarySettings>,
 
     // Retry Configuration
     pub retry: Option<RetrySettings>,
 
     // Shell
+    #[serde(alias = "shellPath")]
     pub shell_path: Option<String>,
+    #[serde(alias = "shellCommandPrefix")]
     pub shell_command_prefix: Option<String>,
     /// Override path to GitHub CLI (`gh`) for features like `/share`.
     #[serde(alias = "ghPath")]
@@ -75,6 +81,7 @@ pub struct Config {
     pub terminal: Option<TerminalSettings>,
 
     // Thinking Budgets
+    #[serde(alias = "thinkingBudgets")]
     pub thinking_budgets: Option<ThinkingBudgets>,
 
     // Extensions/Skills/etc.
@@ -83,7 +90,37 @@ pub struct Config {
     pub skills: Option<Vec<String>>,
     pub prompts: Option<Vec<String>>,
     pub themes: Option<Vec<String>>,
+    #[serde(alias = "enableSkillCommands")]
     pub enable_skill_commands: Option<bool>,
+
+    // Extension Policy
+    #[serde(alias = "extensionPolicy")]
+    pub extension_policy: Option<ExtensionPolicyConfig>,
+}
+
+/// Extension capability policy configuration.
+///
+/// Controls which dangerous capabilities (exec, env) are available to extensions.
+/// Can be set in `settings.json` or via the `--extension-policy` CLI flag.
+///
+/// # Example (settings.json)
+///
+/// ```json
+/// {
+///   "extensionPolicy": {
+///     "profile": "safe",
+///     "allowDangerous": false
+///   }
+/// }
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ExtensionPolicyConfig {
+    /// Policy profile: "safe", "standard" (default), or "permissive".
+    pub profile: Option<String>,
+    /// Allow dangerous capabilities (exec, env). Overrides profile's deny list.
+    #[serde(alias = "allowDangerous")]
+    pub allow_dangerous: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -330,6 +367,12 @@ impl Config {
             prompts: other.prompts.or(base.prompts),
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
+
+            // Extension Policy
+            extension_policy: merge_extension_policy(
+                base.extension_policy,
+                other.extension_policy,
+            ),
         }
     }
 
@@ -428,6 +471,57 @@ impl Config {
 
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
+    }
+
+    /// Resolve the extension policy from config, CLI override, and env var.
+    ///
+    /// Resolution order (highest precedence first):
+    /// 1. `cli_override` (from `--extension-policy` flag)
+    /// 2. `PI_EXTENSION_POLICY` environment variable
+    /// 3. `extension_policy.profile` from settings.json
+    /// 4. Default: "standard"
+    ///
+    /// If `allow_dangerous` is true (from config or env), exec/env are removed
+    /// from the policy's deny list.
+    pub fn resolve_extension_policy(
+        &self,
+        cli_override: Option<&str>,
+    ) -> crate::extensions::ExtensionPolicy {
+        use crate::extensions::PolicyProfile;
+
+        // Determine profile name: CLI > env > config > default
+        let profile_name = cli_override
+            .map(ToString::to_string)
+            .or_else(|| std::env::var("PI_EXTENSION_POLICY").ok())
+            .or_else(|| {
+                self.extension_policy
+                    .as_ref()
+                    .and_then(|p| p.profile.clone())
+            })
+            .unwrap_or_else(|| "standard".to_string());
+
+        let profile = match profile_name.to_ascii_lowercase().as_str() {
+            "safe" => PolicyProfile::Safe,
+            "permissive" => PolicyProfile::Permissive,
+            _ => PolicyProfile::Standard,
+        };
+
+        let mut policy = profile.to_policy();
+
+        // Check allow_dangerous: config setting or PI_EXTENSION_ALLOW_DANGEROUS env
+        let allow_dangerous = self
+            .extension_policy
+            .as_ref()
+            .and_then(|p| p.allow_dangerous)
+            .unwrap_or(false)
+            || std::env::var("PI_EXTENSION_ALLOW_DANGEROUS")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+
+        if allow_dangerous {
+            policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
+        }
+
+        policy
     }
 
     fn emit_queue_mode_diagnostics(&self) {
@@ -598,12 +692,30 @@ fn merge_thinking_budgets(
     }
 }
 
+fn merge_extension_policy(
+    base: Option<ExtensionPolicyConfig>,
+    other: Option<ExtensionPolicyConfig>,
+) -> Option<ExtensionPolicyConfig> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(ExtensionPolicyConfig {
+            profile: other.profile.or(base.profile),
+            allow_dangerous: other.allow_dangerous.or(base.allow_dangerous),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
 fn load_settings_json_object(path: &Path) -> Result<Value> {
     if !path.exists() {
         return Ok(Value::Object(serde_json::Map::new()));
     }
 
     let content = std::fs::read_to_string(path)?;
+    if content.trim().is_empty() {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
     let value: Value = serde_json::from_str(&content)?;
     if !value.is_object() {
         return Err(Error::config(format!(

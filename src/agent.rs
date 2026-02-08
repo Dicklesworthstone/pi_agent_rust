@@ -18,11 +18,11 @@ use crate::extension_events::{InputEventOutcome, apply_input_event_response};
 use crate::extension_tools::collect_extension_tool_wrappers;
 use crate::extensions::{
     EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
-    ExtensionLoadSpec, ExtensionManager, ExtensionRegion, ExtensionSendMessage,
+    ExtensionLoadSpec, ExtensionManager, ExtensionPolicy, ExtensionRegion, ExtensionSendMessage,
     ExtensionSendUserMessage, JsExtensionRuntimeHandle, resolve_extension_load_spec,
 };
 #[cfg(feature = "wasm-host")]
-use crate::extensions::{ExtensionPolicy, WasmExtensionHost, WasmExtensionLoadSpec};
+use crate::extensions::{WasmExtensionHost, WasmExtensionLoadSpec};
 use crate::extensions_js::PiJsRuntimeConfig;
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message,
@@ -3412,6 +3412,24 @@ impl AgentSession {
         config: Option<&crate::config::Config>,
         extension_entries: &[std::path::PathBuf],
     ) -> Result<()> {
+        self.enable_extensions_with_policy(
+            enabled_tools,
+            cwd,
+            config,
+            extension_entries,
+            None,
+        )
+        .await
+    }
+
+    pub async fn enable_extensions_with_policy(
+        &mut self,
+        enabled_tools: &[&str],
+        cwd: &std::path::Path,
+        config: Option<&crate::config::Config>,
+        extension_entries: &[std::path::PathBuf],
+        policy: Option<ExtensionPolicy>,
+    ) -> Result<()> {
         let manager = ExtensionManager::new();
         manager.set_cwd(cwd.display().to_string());
         manager.set_session(Arc::new(SessionHandle(self.session.clone())));
@@ -3450,14 +3468,16 @@ impl AgentSession {
             );
         }
 
+        let resolved_policy = policy.unwrap_or_default();
         let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config));
-        let js_runtime = JsExtensionRuntimeHandle::start(
+        let js_runtime = JsExtensionRuntimeHandle::start_with_policy(
             PiJsRuntimeConfig {
                 cwd: cwd.display().to_string(),
                 ..Default::default()
             },
             Arc::clone(&tools),
             manager.clone(),
+            resolved_policy.clone(),
         )
         .await?;
         manager.set_js_runtime(js_runtime.clone());
@@ -3480,7 +3500,7 @@ impl AgentSession {
 
         #[cfg(feature = "wasm-host")]
         if !wasm_specs.is_empty() {
-            let host = WasmExtensionHost::new(cwd, ExtensionPolicy::default())?;
+            let host = WasmExtensionHost::new(cwd, resolved_policy.clone())?;
             manager
                 .load_wasm_extensions(&host, wasm_specs, Arc::clone(&tools))
                 .await?;

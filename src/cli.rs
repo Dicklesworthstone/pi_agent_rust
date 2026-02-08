@@ -104,6 +104,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_extensions: bool,
 
+    /// Extension capability policy: safe, standard, or permissive
+    #[arg(long, value_name = "PROFILE")]
+    pub extension_policy: Option<String>,
+
     // === Skills ===
     /// Load skill file/directory (can use multiple times)
     #[arg(long, action = clap::ArgAction::Append)]

@@ -362,8 +362,16 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     }
 
     if !resources.extensions().is_empty() {
+        let ext_policy =
+            config.resolve_extension_policy(cli.extension_policy.as_deref());
         agent_session
-            .enable_extensions(&enabled_tools, &cwd, Some(&config), resources.extensions())
+            .enable_extensions_with_policy(
+                &enabled_tools,
+                &cwd,
+                Some(&config),
+                resources.extensions(),
+                Some(ext_policy),
+            )
             .await
             .map_err(anyhow::Error::new)?;
 
