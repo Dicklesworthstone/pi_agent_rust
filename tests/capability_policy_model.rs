@@ -8,8 +8,8 @@
 //   - Edge cases (empty, unknown, case sensitivity)
 
 use pi::extensions::{
-    Capability, ExtensionOverride, ExtensionPolicy, ExtensionPolicyMode, PolicyDecision,
-    PolicyProfile, ALL_CAPABILITIES,
+    ALL_CAPABILITIES, Capability, ExtensionOverride, ExtensionPolicy, ExtensionPolicyMode,
+    PolicyDecision, PolicyProfile,
 };
 
 // ─── Capability Enum ───────────────────────────────────────────────────────
@@ -98,7 +98,10 @@ fn all_capabilities_is_exhaustive() {
         let back: Capability = serde_json::from_str(&json).unwrap();
         assert_eq!(*cap, back);
     }
-    assert!(ALL_CAPABILITIES.len() >= 10, "expected at least 10 capabilities");
+    assert!(
+        ALL_CAPABILITIES.len() >= 10,
+        "expected at least 10 capabilities"
+    );
 }
 
 // ─── Policy Profiles ───────────────────────────────────────────────────────
@@ -291,10 +294,9 @@ fn extension_mode_strict_restricts_more_than_global() {
 fn has_override_reflects_presence() {
     let mut policy = ExtensionPolicy::default();
     assert!(!policy.has_override("some-ext"));
-    policy.per_extension.insert(
-        "some-ext".to_string(),
-        ExtensionOverride::default(),
-    );
+    policy
+        .per_extension
+        .insert("some-ext".to_string(), ExtensionOverride::default());
     assert!(policy.has_override("some-ext"));
     assert!(!policy.has_override("other-ext"));
 }
@@ -508,7 +510,8 @@ fn policy_serde_roundtrip_with_overrides() {
 
 #[test]
 fn policy_deserialize_without_per_extension_gets_empty_map() {
-    let json = r#"{"mode":"prompt","max_memory_mb":256,"default_caps":["read"],"deny_caps":["exec"]}"#;
+    let json =
+        r#"{"mode":"prompt","max_memory_mb":256,"default_caps":["read"],"deny_caps":["exec"]}"#;
     let policy: ExtensionPolicy = serde_json::from_str(json).unwrap();
     assert!(policy.per_extension.is_empty());
 }
@@ -524,7 +527,11 @@ fn capability_serde_roundtrip() {
 
 #[test]
 fn profile_serde_roundtrip() {
-    for profile in &[PolicyProfile::Safe, PolicyProfile::Standard, PolicyProfile::Permissive] {
+    for profile in &[
+        PolicyProfile::Safe,
+        PolicyProfile::Standard,
+        PolicyProfile::Permissive,
+    ] {
         let json = serde_json::to_string(profile).unwrap();
         let back: PolicyProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(*profile, back);

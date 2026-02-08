@@ -1332,7 +1332,13 @@ fn resolve_existing_module_candidate(path: PathBuf) -> Option<PathBuf> {
     }
 
     if path.is_dir() {
-        for candidate in ["index.ts", "index.tsx", "index.js", "index.mjs", "index.json"] {
+        for candidate in [
+            "index.ts",
+            "index.tsx",
+            "index.js",
+            "index.mjs",
+            "index.json",
+        ] {
             let full = path.join(candidate);
             if full.is_file() {
                 return Some(full);
@@ -9116,8 +9122,8 @@ mod tests {
         let only_json = root.join("only_json.json");
         std::fs::write(&only_json, "{\"ok\":true}\n").expect("write only_json.json");
 
-        let resolved_pkg = resolve_module_path(base.to_string_lossy().as_ref(), "./pkg")
-            .expect("resolve ./pkg");
+        let resolved_pkg =
+            resolve_module_path(base.to_string_lossy().as_ref(), "./pkg").expect("resolve ./pkg");
         assert_eq!(resolved_pkg, pkg_index_ts);
 
         let resolved_module = resolve_module_path(base.to_string_lossy().as_ref(), "./module")

@@ -1210,10 +1210,7 @@ impl MockSpecInterceptor {
 
             // For vcr_or_stub mode without explicit rules, provide a synthetic
             // SSE stub response so extensions that make HTTP calls don't hang.
-            let mode = mock_http
-                .get("mode")
-                .and_then(Value::as_str)
-                .unwrap_or("");
+            let mode = mock_http.get("mode").and_then(Value::as_str).unwrap_or("");
             if mode == "vcr_or_stub" && interceptor.http_rules.is_empty() {
                 // 1px transparent PNG as base64 (valid image for any image-gen stub)
                 let stub_image = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+XvU8AAAAASUVORK5CYII=";
@@ -1642,7 +1639,10 @@ fn load_extension_with_mocks(
     // Pre-seed extension state by mapping state keys to flags and dispatching
     // session_start.  This covers extensions like plan-mode that read flags and
     // persisted entries during session_start to initialise internal state.
-    if let Some(state) = setup.and_then(|s| s.get("state")).and_then(Value::as_object) {
+    if let Some(state) = setup
+        .and_then(|s| s.get("state"))
+        .and_then(Value::as_object)
+    {
         let ext_id = extension_id.clone();
         // Map well-known state keys to their corresponding flags
         let state_to_flag: &[(&str, &str)] = &[("plan_mode_enabled", "plan")];
@@ -1654,7 +1654,9 @@ fn load_extension_with_mocks(
                     let flag_value = value.clone();
                     let ext_id = ext_id.clone();
                     async move {
-                        let _ = manager.set_flag_value(&ext_id, &flag_name, flag_value).await;
+                        let _ = manager
+                            .set_flag_value(&ext_id, &flag_name, flag_value)
+                            .await;
                     }
                 });
             }

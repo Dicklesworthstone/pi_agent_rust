@@ -8,6 +8,7 @@ use pi::extension_conformance_matrix::{
     ApiMatrix, ConformanceTestPlan, HostCapability, build_test_plan,
 };
 use pi::extension_inclusion::InclusionList;
+use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -27,6 +28,321 @@ fn load_test_plan() -> (ConformanceTestPlan, InclusionList, Option<ApiMatrix>) {
 
     let plan = build_test_plan(&inclusion, api_matrix.as_ref(), "bd-2kyq");
     (plan, inclusion, api_matrix)
+}
+
+#[allow(dead_code)]
+fn load_api_usage_matrix() -> Value {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let usage_path = repo_root.join("tests/ext_conformance/api_usage_matrix.json");
+    serde_json::from_slice(&fs::read(&usage_path).expect("read api usage matrix"))
+        .expect("parse api usage matrix")
+}
+
+#[allow(dead_code)]
+fn node_api_call_count(usage: &Value, module: &str, api: &str) -> u64 {
+    usage
+        .get("node_modules")
+        .and_then(Value::as_array)
+        .and_then(|mods| {
+            mods.iter().find(|m| {
+                m.get("module")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == module)
+            })
+        })
+        .and_then(|module_obj| {
+            module_obj
+                .get("apis")
+                .and_then(Value::as_array)
+                .and_then(|apis| {
+                    apis.iter().find(|entry| {
+                        entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value == api)
+                    })
+                })
+        })
+        .and_then(|entry| entry.get("call_count").and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+#[allow(dead_code)]
+fn bun_api_call_count(usage: &Value, api: &str) -> u64 {
+    usage
+        .get("bun_apis")
+        .and_then(|bun| bun.get("apis"))
+        .and_then(Value::as_array)
+        .and_then(|apis| {
+            apis.iter().find(|entry| {
+                entry
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| value == api)
+            })
+        })
+        .and_then(|entry| entry.get("call_count").and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+#[allow(dead_code)]
+fn runtime_case_status(
+    repo_root: &Path,
+    evidence_file: &str,
+    evidence_markers: &[&str],
+) -> (String, String) {
+    let evidence_path = repo_root.join(evidence_file);
+    if !evidence_path.exists() {
+        return (
+            "fail".to_string(),
+            format!("missing evidence file: {}", evidence_path.display()),
+        );
+    }
+
+    let content = fs::read_to_string(&evidence_path)
+        .unwrap_or_else(|_| String::from("<<unreadable evidence file>>"));
+    let missing: Vec<&str> = evidence_markers
+        .iter()
+        .copied()
+        .filter(|needle| !content.contains(needle))
+        .collect();
+
+    if missing.is_empty() {
+        (
+            "pass".to_string(),
+            format!(
+                "evidence verified in {} via markers: {}",
+                evidence_file,
+                evidence_markers.join(", ")
+            ),
+        )
+    } else {
+        (
+            "fail".to_string(),
+            format!(
+                "missing markers in {}: {}",
+                evidence_file,
+                missing.join(", ")
+            ),
+        )
+    }
+}
+
+#[allow(clippy::items_after_statements, clippy::too_many_lines)]
+#[allow(dead_code)]
+fn build_runtime_api_matrix_report() -> Value {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let usage = load_api_usage_matrix();
+
+    struct RuntimeCase {
+        surface: &'static str,
+        module: &'static str,
+        api: &'static str,
+        evidence_file: &'static str,
+        evidence_markers: &'static [&'static str],
+    }
+
+    let cases = vec![
+        RuntimeCase {
+            surface: "node",
+            module: "node:buffer",
+            api: "Buffer.from",
+            evidence_file: "tests/node_buffer_shim.rs",
+            evidence_markers: &["fn from_string_utf8_roundtrip()", "Buffer.from(\"hello\")"],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:buffer",
+            api: "Buffer.alloc",
+            evidence_file: "tests/node_buffer_shim.rs",
+            evidence_markers: &["fn alloc_zero_filled()", "Buffer.alloc("],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:buffer",
+            api: "Buffer.concat",
+            evidence_file: "tests/node_buffer_shim.rs",
+            evidence_markers: &["fn concat_two_buffers()", "Buffer.concat("],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:crypto",
+            api: "createHash",
+            evidence_file: "tests/node_crypto_shim.rs",
+            evidence_markers: &["fn sha256_hello_hex()", "createHash(\"sha256\")"],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:crypto",
+            api: "createHmac",
+            evidence_file: "tests/node_crypto_shim.rs",
+            evidence_markers: &["fn hmac_sha256_hex()", "createHmac(\"sha256\""],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:crypto",
+            api: "randomUUID",
+            evidence_file: "tests/node_crypto_shim.rs",
+            evidence_markers: &["fn random_uuid_format()", "randomUUID()"],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:crypto",
+            api: "randomBytes",
+            evidence_file: "tests/node_crypto_shim.rs",
+            evidence_markers: &["fn random_bytes_length()", "randomBytes(16)"],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:crypto",
+            api: "timingSafeEqual",
+            evidence_file: "tests/node_crypto_shim.rs",
+            evidence_markers: &["fn timing_safe_equal_same()", "timingSafeEqual("],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:http",
+            api: "request",
+            evidence_file: "tests/node_http_shim.rs",
+            evidence_markers: &["fn request_returns_object_with_write()", "http.request("],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:http",
+            api: "get",
+            evidence_file: "tests/node_http_shim.rs",
+            evidence_markers: &["fn get_receives_response_body()", "http.get("],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:http",
+            api: "createServer",
+            evidence_file: "tests/node_http_shim.rs",
+            evidence_markers: &["fn create_server_throws()", "http.createServer()"],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:https",
+            api: "request",
+            evidence_file: "tests/node_http_shim.rs",
+            evidence_markers: &["fn https_request_exists()", "typeof https.request"],
+        },
+        RuntimeCase {
+            surface: "node",
+            module: "node:https",
+            api: "get",
+            evidence_file: "tests/node_http_shim.rs",
+            evidence_markers: &["fn https_request_exists()", "typeof https.get"],
+        },
+        RuntimeCase {
+            surface: "bun",
+            module: "bun",
+            api: "Bun.write",
+            evidence_file: "src/extensions_js.rs",
+            evidence_markers: &["Bun.write"],
+        },
+        RuntimeCase {
+            surface: "bun",
+            module: "bun",
+            api: "Bun.connect",
+            evidence_file: "src/extensions_js.rs",
+            evidence_markers: &["Bun.connect"],
+        },
+        RuntimeCase {
+            surface: "bun",
+            module: "bun",
+            api: "Bun.which",
+            evidence_file: "src/extensions_js.rs",
+            evidence_markers: &["Bun.which"],
+        },
+        RuntimeCase {
+            surface: "bun",
+            module: "bun",
+            api: "Bun.spawn",
+            evidence_file: "src/extensions_js.rs",
+            evidence_markers: &["Bun.spawn"],
+        },
+        RuntimeCase {
+            surface: "bun",
+            module: "bun",
+            api: "Bun.listen",
+            evidence_file: "src/extensions_js.rs",
+            evidence_markers: &["Bun.listen"],
+        },
+        RuntimeCase {
+            surface: "bun",
+            module: "bun",
+            api: "Bun.file",
+            evidence_file: "src/extensions_js.rs",
+            evidence_markers: &["Bun.file"],
+        },
+        RuntimeCase {
+            surface: "bun",
+            module: "bun",
+            api: "Bun.argv",
+            evidence_file: "src/extensions_js.rs",
+            evidence_markers: &["Bun.argv"],
+        },
+    ];
+
+    let mut pass_count = 0_u64;
+    let mut fail_count = 0_u64;
+    let mut node_pass = 0_u64;
+    let mut node_fail = 0_u64;
+    let mut bun_pass = 0_u64;
+    let mut bun_fail = 0_u64;
+    let mut entries = Vec::with_capacity(cases.len());
+
+    for case in &cases {
+        let call_count = if case.surface == "bun" {
+            bun_api_call_count(&usage, case.api)
+        } else {
+            node_api_call_count(&usage, case.module, case.api)
+        };
+
+        let (status, diagnostics) =
+            runtime_case_status(repo_root, case.evidence_file, case.evidence_markers);
+
+        if status == "pass" {
+            pass_count += 1;
+            if case.surface == "bun" {
+                bun_pass += 1;
+            } else {
+                node_pass += 1;
+            }
+        } else {
+            fail_count += 1;
+            if case.surface == "bun" {
+                bun_fail += 1;
+            } else {
+                node_fail += 1;
+            }
+        }
+
+        entries.push(json!({
+            "surface": case.surface,
+            "module": case.module,
+            "api": case.api,
+            "call_count": call_count,
+            "status": status,
+            "evidence_file": case.evidence_file,
+            "diagnostics": diagnostics
+        }));
+    }
+
+    json!({
+        "schema": "pi.runtime.compat-matrix.v1",
+        "task": "bd-k5q5.7.3",
+        "source_usage_matrix": "tests/ext_conformance/api_usage_matrix.json",
+        "entries": entries,
+        "summary": {
+            "total": pass_count + fail_count,
+            "pass": pass_count,
+            "fail": fail_count,
+            "node": { "pass": node_pass, "fail": node_fail },
+            "bun": { "pass": bun_pass, "fail": bun_fail }
+        }
+    })
 }
 
 #[test]
@@ -340,5 +656,79 @@ fn generate_conformance_test_plan() {
         HostCapability::all().len(),
         "All {} capabilities should be in matrix",
         HostCapability::all().len(),
+    );
+}
+
+// ── Runtime Node/Bun API compatibility matrix (bd-k5q5.7.3) ───────────────
+
+#[test]
+fn runtime_api_matrix_node_critical_entries_pass() {
+    let report = build_runtime_api_matrix_report();
+    let entries = report
+        .get("entries")
+        .and_then(Value::as_array)
+        .expect("runtime matrix entries");
+
+    let node_failures: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("surface")
+                .and_then(Value::as_str)
+                .is_some_and(|surface| surface == "node")
+                && entry
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .is_none_or(|status| status != "pass")
+        })
+        .collect();
+
+    assert!(
+        node_failures.is_empty(),
+        "critical node API matrix entries should pass; failures: {node_failures:#?}"
+    );
+}
+
+#[test]
+fn generate_runtime_api_matrix_report() {
+    let report = build_runtime_api_matrix_report();
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output_dir = repo_root.join("tests/ext_conformance/reports/parity");
+    fs::create_dir_all(&output_dir).expect("create parity report dir");
+    let output_path = output_dir.join("runtime_api_matrix.json");
+    let json = serde_json::to_string_pretty(&report).expect("serialize runtime matrix");
+    fs::write(&output_path, format!("{json}\n")).expect("write runtime matrix report");
+
+    let summary = report.get("summary").expect("summary");
+    let total = summary
+        .get("total")
+        .and_then(Value::as_u64)
+        .expect("summary.total");
+    let pass = summary
+        .get("pass")
+        .and_then(Value::as_u64)
+        .expect("summary.pass");
+    let fail = summary
+        .get("fail")
+        .and_then(Value::as_u64)
+        .expect("summary.fail");
+    let bun_fail = summary
+        .get("bun")
+        .and_then(|bun| bun.get("fail"))
+        .and_then(Value::as_u64)
+        .expect("summary.bun.fail");
+
+    assert_eq!(pass + fail, total, "summary pass+fail should equal total");
+    assert!(pass > 0, "runtime matrix must contain passing entries");
+    assert!(
+        bun_fail > 0,
+        "runtime matrix should currently surface Bun API gaps explicitly"
+    );
+
+    eprintln!(
+        "Runtime API matrix report written to {} (pass={}, fail={})",
+        output_path.display(),
+        pass,
+        fail
     );
 }

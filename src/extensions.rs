@@ -6350,8 +6350,8 @@ pub async fn dispatch_host_call_shared(
         call.timeout_ms,
     );
 
-    // Policy check.
-    let policy_check = ctx.policy.evaluate(&capability);
+    // Policy check (per-extension overrides applied via extension_id).
+    let policy_check = ctx.policy.evaluate_for(&capability, ctx.extension_id);
     let (decision, reason) = match policy_check.decision {
         PolicyDecision::Allow => (PolicyDecision::Allow, policy_check.reason),
         PolicyDecision::Deny => (PolicyDecision::Deny, policy_check.reason),
@@ -14986,6 +14986,204 @@ mod tests {
                 "message should mention denial, got: {}",
                 err.message
             );
+        });
+    }
+
+    // ========================================================================
+    // Per-extension override tests at hostcall boundary (bd-k5q5.4.3)
+    // ========================================================================
+
+    #[test]
+    fn shared_dispatch_per_extension_deny_overrides_global_allow() {
+        // Global policy allows "read", but ext.test has a per-extension deny
+        // for "read". The dispatch boundary should deny the call.
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let mut policy = permissive_policy();
+        policy.per_extension.insert(
+            "ext.test".to_string(),
+            ExtensionOverride {
+                deny: vec!["read".to_string()],
+                ..Default::default()
+            },
+        );
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let call = HostCallPayload {
+            call_id: "call-ext-deny".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": { "path": "/tmp/test" } }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let result = dispatch_host_call_shared(&ctx, call).await;
+            assert!(result.is_error, "expected denial from per-extension override");
+            let err = result.error.expect("expected error payload");
+            assert_eq!(err.code, HostCallErrorCode::Denied);
+            assert!(
+                err.message.contains("denied"),
+                "message should mention denial, got: {}",
+                err.message
+            );
+        });
+    }
+
+    #[test]
+    fn shared_dispatch_per_extension_allow_overrides_global_deny() {
+        // Global policy denies "exec" (in deny_caps), but ext.trusted has a
+        // per-extension allow for "exec". The dispatch boundary should allow it.
+        // (It will fail downstream because no actual tool, but we check it's
+        // not denied by policy.)
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let mut policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Strict,
+            max_memory_mb: 256,
+            default_caps: vec!["read".to_string()],
+            deny_caps: vec!["exec".to_string()],
+            per_extension: HashMap::new(),
+        };
+        policy.per_extension.insert(
+            "ext.trusted".to_string(),
+            ExtensionOverride {
+                allow: vec!["exec".to_string()],
+                ..Default::default()
+            },
+        );
+        let ctx = HostCallContext {
+            runtime_name: "test",
+            extension_id: Some("ext.trusted"),
+            tools: &tools,
+            http: &http,
+            manager: None,
+            policy: &policy,
+            js_runtime: None,
+            interceptor: None,
+        };
+
+        let call = HostCallPayload {
+            call_id: "call-ext-allow".to_string(),
+            capability: "exec".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "exec", "input": { "command": "echo hi" } }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let result = dispatch_host_call_shared(&ctx, call).await;
+            // Not denied by policy — may fail downstream (no tool registered),
+            // but the error code should NOT be Denied.
+            if result.is_error {
+                let err = result.error.as_ref().expect("expected error payload");
+                assert_ne!(
+                    err.code,
+                    HostCallErrorCode::Denied,
+                    "per-extension allow should override global deny, got: {}",
+                    err.message
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn shared_dispatch_per_extension_deny_does_not_affect_other_extensions() {
+        // ext.restricted has "read" denied, but ext.normal (ctx extension_id)
+        // should still be allowed to read.
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let mut policy = permissive_policy();
+        policy.per_extension.insert(
+            "ext.restricted".to_string(),
+            ExtensionOverride {
+                deny: vec!["read".to_string()],
+                ..Default::default()
+            },
+        );
+        // ctx uses ext.test (not ext.restricted), so override should not apply
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let call = HostCallPayload {
+            call_id: "call-other-ext".to_string(),
+            capability: "read".to_string(),
+            method: "tool".to_string(),
+            params: json!({ "name": "read", "input": { "path": "/tmp/test" } }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let result = dispatch_host_call_shared(&ctx, call).await;
+            // Should NOT be denied — the deny override is for ext.restricted, not ext.test
+            if result.is_error {
+                let err = result.error.as_ref().expect("expected error payload");
+                assert_ne!(
+                    err.code,
+                    HostCallErrorCode::Denied,
+                    "deny for ext.restricted should not affect ext.test, got: {}",
+                    err.message
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn shared_dispatch_per_extension_mode_override_applies() {
+        // Global mode is Strict (fallback → Deny), but ext.test has mode
+        // overridden to Permissive. A capability not in any allow/deny list
+        // should fall through to the effective mode and be allowed.
+        let dir = tempdir().expect("tempdir");
+        let tools = ToolRegistry::new(&[], dir.path(), None);
+        let http = HttpConnector::with_defaults();
+        let mut policy = ExtensionPolicy {
+            mode: ExtensionPolicyMode::Strict,
+            max_memory_mb: 256,
+            default_caps: Vec::new(),
+            deny_caps: Vec::new(),
+            per_extension: HashMap::new(),
+        };
+        policy.per_extension.insert(
+            "ext.test".to_string(),
+            ExtensionOverride {
+                mode: Some(ExtensionPolicyMode::Permissive),
+                ..Default::default()
+            },
+        );
+        let ctx = test_host_call_context(&tools, &http, &policy);
+
+        let call = HostCallPayload {
+            call_id: "call-mode-override".to_string(),
+            capability: "log".to_string(),
+            method: "log".to_string(),
+            params: json!({ "level": "info", "message": "test" }),
+            timeout_ms: None,
+            cancel_token: None,
+            context: None,
+        };
+
+        run_async(async {
+            let result = dispatch_host_call_shared(&ctx, call).await;
+            // With Strict mode globally, "log" would be denied. But ext.test
+            // overrides to Permissive, so it should be allowed (may fail
+            // downstream for other reasons, but not denied).
+            if result.is_error {
+                let err = result.error.as_ref().expect("expected error payload");
+                assert_ne!(
+                    err.code,
+                    HostCallErrorCode::Denied,
+                    "per-extension mode override to Permissive should allow 'log', got: {}",
+                    err.message
+                );
+            }
         });
     }
 

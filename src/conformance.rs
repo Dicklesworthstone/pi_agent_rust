@@ -3535,9 +3535,10 @@ mod tests {
     }
 
     #[test]
-    fn compare_both_missing_registrations_passes() {
-        // When neither side has any registrations at all (no key), the
-        // comparison should pass since missing == missing.
+    fn compare_both_missing_registrations_reports_expected_object() {
+        // When neither side has a "registrations" key, both resolve to
+        // Null, and the function reports "expected an object" (the
+        // contract requires registrations to be present).
         let expected = json!({
             "extension_id": "ext",
             "name": "Ext",
@@ -3545,7 +3546,11 @@ mod tests {
             "hostcall_log": []
         });
         let actual = expected.clone();
-        compare_conformance_output(&expected, &actual).unwrap();
+        let err = compare_conformance_output(&expected, &actual).unwrap_err();
+        assert!(
+            err.contains("expected an object"),
+            "missing registrations should be flagged: {err}"
+        );
     }
 
     #[test]
