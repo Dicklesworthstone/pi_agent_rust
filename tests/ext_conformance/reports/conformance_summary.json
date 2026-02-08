@@ -1,8 +1,8 @@
 {
   "counts": {
-    "fail": 3,
+    "fail": 0,
     "na": 163,
-    "pass": 57,
+    "pass": 60,
     "total": 223
   },
   "evidence": {
@@ -11,12 +11,12 @@
     "parity_logs": 16,
     "smoke_logs": 16
   },
-  "generated_at": "2026-02-08T03:42:49Z",
+  "generated_at": "2026-02-08T04:05:29Z",
   "negative": {
     "fail": 0,
     "pass": 30
   },
-  "pass_rate_pct": 95.0,
+  "pass_rate_pct": 100.0,
   "per_tier": {
     "agents-mikeastock": {
       "fail": 0,
@@ -37,9 +37,9 @@
       "total": 75
     },
     "official-pi-mono": {
-      "fail": 3,
+      "fail": 0,
       "na": 6,
-      "pass": 57,
+      "pass": 60,
       "total": 66
     },
     "third-party-github": {

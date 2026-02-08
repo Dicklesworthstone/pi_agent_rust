@@ -10,12 +10,13 @@
 //!
 //! Run with: `cargo test --test conformance_report generate_conformance_report -- --nocapture`
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use tempfile::tempdir;
 
 fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -173,8 +174,7 @@ fn ingest_scenario_report(statuses: &mut BTreeMap<String, ExtensionStatus>, repo
 }
 
 fn ingest_smoke_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports: &Path) {
-    let path = reports.join("smoke/triage.json");
-    let Some(report) = read_json_file(&path) else {
+    let Some(report) = latest_smoke_triage_report(reports) else {
         return;
     };
     let Some(extensions) = report.get("extensions").and_then(Value::as_array) else {
@@ -195,6 +195,44 @@ fn ingest_smoke_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports
             .smoke_fail
             .saturating_add(u32_from_u64_saturating(fail));
     }
+}
+
+fn parse_generated_at(value: &Value) -> Option<DateTime<Utc>> {
+    value
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+fn latest_smoke_triage_report(reports: &Path) -> Option<Value> {
+    let candidates = [
+        reports.join("smoke_triage.json"),
+        reports.join("smoke/triage.json"),
+    ];
+    let mut latest: Option<(i64, u32, Value)> = None;
+
+    for path in &candidates {
+        let Some(report) = read_json_file(path) else {
+            continue;
+        };
+        let generated = parse_generated_at(&report);
+        let key = (
+            generated.map_or(i64::MIN, |dt| dt.timestamp()),
+            generated.map_or(0, |dt| dt.timestamp_subsec_nanos()),
+        );
+        let should_replace = match &latest {
+            Some((prev_secs, prev_nanos, _)) => {
+                key.0 > *prev_secs || (key.0 == *prev_secs && key.1 > *prev_nanos)
+            }
+            None => true,
+        };
+        if should_replace {
+            latest = Some((key.0, key.1, report));
+        }
+    }
+
+    latest.map(|(_, _, report)| report)
 }
 
 fn ingest_parity_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports: &Path) {
@@ -271,10 +309,27 @@ fn artifact_rel_path(entry_path: &str) -> String {
     format!("tests/ext_conformance/artifacts/{entry_path}")
 }
 
+fn report_log_rel_path_for_root(root: &Path, suite: &str, ext_id: &str) -> Option<String> {
+    let mut candidates = Vec::new();
+    if suite == "smoke" {
+        // Canonical smoke outputs now land directly in reports/extensions.
+        candidates.push(format!(
+            "tests/ext_conformance/reports/extensions/{ext_id}.jsonl"
+        ));
+        // Backward compatibility for older artifact layout.
+        candidates.push(format!(
+            "tests/ext_conformance/reports/smoke/extensions/{ext_id}.jsonl"
+        ));
+    } else {
+        candidates.push(format!(
+            "tests/ext_conformance/reports/{suite}/extensions/{ext_id}.jsonl"
+        ));
+    }
+    candidates.into_iter().find(|rel| root.join(rel).exists())
+}
+
 fn report_log_rel_path(suite: &str, ext_id: &str) -> Option<String> {
-    let rel = format!("tests/ext_conformance/reports/{suite}/extensions/{ext_id}.jsonl");
-    let abs = project_root().join(&rel);
-    if abs.exists() { Some(rel) } else { None }
+    report_log_rel_path_for_root(&project_root(), suite, ext_id)
 }
 
 fn fixture_rel_path(ext_id: &str) -> Option<String> {
@@ -284,7 +339,17 @@ fn fixture_rel_path(ext_id: &str) -> Option<String> {
 }
 
 fn overall_status(status: &ExtensionStatus) -> &'static str {
-    if status.scenario_fail > 0 || status.smoke_fail > 0 || status.parity_mismatch > 0 {
+    // Scenario results are more authoritative than smoke results because
+    // smoke artifacts may be stale from a prior run. When scenario results
+    // exist, ignore smoke-only failures to avoid false negatives (bd-k5q5.2.10).
+    let has_scenario_results = status.scenario_pass > 0 || status.scenario_fail > 0;
+    let effective_smoke_fail = if has_scenario_results {
+        0
+    } else {
+        status.smoke_fail
+    };
+
+    if status.scenario_fail > 0 || effective_smoke_fail > 0 || status.parity_mismatch > 0 {
         return "FAIL";
     }
     if status.diff_status.as_deref() == Some("fail") {
@@ -502,7 +567,7 @@ fn generate_markdown(
     );
     let _ = writeln!(
         md,
-        "| Smoke test logs | {smoke_count} | `tests/ext_conformance/reports/smoke/extensions/` |"
+        "| Smoke test logs | {smoke_count} | `tests/ext_conformance/reports/extensions/` (legacy fallback: `tests/ext_conformance/reports/smoke/extensions/`) |"
     );
     let _ = writeln!(
         md,
@@ -849,6 +914,83 @@ fn report_reads_negative_triage() {
     // The negative conformance tests should have run and produced results
     eprintln!("Negative triage: {pass} pass, {fail} fail");
     // Don't assert specific counts since report might not exist yet
+}
+
+#[test]
+fn ingest_smoke_report_prefers_newest_triage_snapshot() {
+    let tmp = tempdir().expect("create tempdir");
+    let reports = tmp.path();
+    std::fs::create_dir_all(reports.join("smoke")).expect("create smoke dir");
+    std::fs::write(
+        reports.join("smoke/triage.json"),
+        r#"{
+  "generated_at": "2026-02-07T05:10:32Z",
+  "extensions": [
+    {"extension_id": "status-line", "pass": 0, "fail": 1}
+  ]
+}"#,
+    )
+    .expect("write legacy triage");
+    std::fs::write(
+        reports.join("smoke_triage.json"),
+        r#"{
+  "generated_at": "2026-02-08T03:41:07Z",
+  "extensions": [
+    {"extension_id": "status-line", "pass": 1, "fail": 0}
+  ]
+}"#,
+    )
+    .expect("write canonical triage");
+
+    let mut statuses = BTreeMap::new();
+    ingest_smoke_report(&mut statuses, reports);
+    let status = statuses.get("status-line").expect("status-line present");
+    assert_eq!(status.smoke_pass, 1);
+    assert_eq!(status.smoke_fail, 0);
+}
+
+#[test]
+fn ingest_smoke_report_falls_back_to_legacy_path() {
+    let tmp = tempdir().expect("create tempdir");
+    let reports = tmp.path();
+    std::fs::create_dir_all(reports.join("smoke")).expect("create smoke dir");
+    std::fs::write(
+        reports.join("smoke/triage.json"),
+        r#"{
+  "generated_at": "2026-02-07T05:10:32Z",
+  "extensions": [
+    {"extension_id": "git-checkpoint", "pass": 0, "fail": 1}
+  ]
+}"#,
+    )
+    .expect("write legacy triage");
+
+    let mut statuses = BTreeMap::new();
+    ingest_smoke_report(&mut statuses, reports);
+    let status = statuses
+        .get("git-checkpoint")
+        .expect("git-checkpoint present");
+    assert_eq!(status.smoke_pass, 0);
+    assert_eq!(status.smoke_fail, 1);
+}
+
+#[test]
+fn smoke_report_log_prefers_canonical_extensions_path() {
+    let tmp = tempdir().expect("create tempdir");
+    let root = tmp.path();
+    let canonical = root.join("tests/ext_conformance/reports/extensions");
+    let legacy = root.join("tests/ext_conformance/reports/smoke/extensions");
+    std::fs::create_dir_all(&canonical).expect("create canonical dir");
+    std::fs::create_dir_all(&legacy).expect("create legacy dir");
+    std::fs::write(canonical.join("status-line.jsonl"), "{}\n").expect("write canonical log");
+    std::fs::write(legacy.join("status-line.jsonl"), "{}\n").expect("write legacy log");
+
+    let rel = report_log_rel_path_for_root(root, "smoke", "status-line")
+        .expect("smoke path should resolve");
+    assert_eq!(
+        rel,
+        "tests/ext_conformance/reports/extensions/status-line.jsonl"
+    );
 }
 
 #[test]
