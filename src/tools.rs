@@ -1235,6 +1235,20 @@ pub struct BashRunResult {
     pub truncation: Option<TruncationResult>,
 }
 
+fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+    status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt as _;
+            status.signal().map_or(-1, |signal| -signal)
+        }
+        #[cfg(not(unix))]
+        {
+            -1
+        }
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run_bash_command(
     cwd: &Path,
@@ -1319,7 +1333,7 @@ pub(crate) async fn run_bash_command(
 
         match guard.child.as_mut().unwrap().try_wait() {
             Ok(Some(status)) => {
-                exit_code = status.code();
+                exit_code = Some(exit_status_code(status));
                 break;
             }
             Ok(None) => {}
@@ -1332,7 +1346,7 @@ pub(crate) async fn run_bash_command(
                     .kill()
                     .map_err(|err| Error::tool("bash", format!("Failed to kill process: {err}")))?
                 {
-                    exit_code = status.code();
+                    exit_code = Some(exit_status_code(status));
                 }
                 break; // Guard now owns no child after kill()
             }
@@ -1441,7 +1455,7 @@ pub(crate) async fn run_bash_command(
         );
     }
 
-    let exit_code = exit_code.unwrap_or(if cancelled { -1 } else { 0 });
+    let exit_code = exit_code.unwrap_or(-1);
     if !cancelled && exit_code != 0 {
         let _ = write!(output_text, "\n\nCommand exited with code {exit_code}");
     }
@@ -4176,6 +4190,31 @@ mod tests {
             assert!(
                 msg.contains("42"),
                 "expected exit code 42 in error, got: {msg}"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_bash_signal_termination_is_error() {
+        asupersync::test_utils::run_test(|| async {
+            let tmp = tempfile::tempdir().unwrap();
+            let tool = BashTool::new(tmp.path());
+            let err = tool
+                .execute("t", serde_json::json!({ "command": "kill -KILL $$" }), None)
+                .await;
+            assert!(
+                err.is_err(),
+                "signal-terminated shell must be reported as error"
+            );
+            let msg = err.unwrap_err().to_string();
+            assert!(
+                msg.contains("Command exited with code"),
+                "expected explicit exit-code report, got: {msg}"
+            );
+            assert!(
+                !msg.contains("Command exited with code 0"),
+                "signal-terminated shell must not appear successful: {msg}"
             );
         });
     }

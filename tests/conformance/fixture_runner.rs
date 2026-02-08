@@ -291,6 +291,16 @@ fn command_value(command: Option<&Commands>) -> Value {
             "name": "info",
             "extension": name,
         }),
+        Some(Commands::Doctor {
+            path,
+            format,
+            policy,
+        }) => json!({
+            "name": "doctor",
+            "path": path,
+            "format": format,
+            "policy": policy,
+        }),
         None => Value::Null,
     }
 }

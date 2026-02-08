@@ -6977,6 +6977,20 @@ async fn dispatch_hostcall_exec(
         Ok(())
     }
 
+    fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+        status.code().unwrap_or_else(|| {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt as _;
+                status.signal().map_or(-1, |signal| -signal)
+            }
+            #[cfg(not(unix))]
+            {
+                -1
+            }
+        })
+    }
+
     let args_value = payload.get("args").cloned().unwrap_or(Value::Null);
     let args_array = match args_value {
         Value::Null => Vec::new(),
@@ -7094,7 +7108,7 @@ async fn dispatch_hostcall_exec(
                         return Err(format!("Read stderr: {err}"));
                     }
 
-                    let code = status.code().unwrap_or(0);
+                    let code = exit_status_code(status);
                     let _ = tx.send(ExecStreamFrame::Final { code, killed });
                     Ok(())
                 })();
@@ -7226,7 +7240,7 @@ async fn dispatch_hostcall_exec(
 
             let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
             let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-            let code = status.code().unwrap_or(0);
+            let code = exit_status_code(status);
 
             Ok(json!({
                 "stdout": stdout,
@@ -10253,6 +10267,98 @@ mod tests {
                     .read_global_json("finalErr")
                     .await
                     .expect("read finalErr"),
+                Value::Null
+            );
+        });
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn js_runtime_pump_once_exec_streaming_signal_termination_reports_nonzero_code() {
+        futures::executor::block_on(async {
+            let dir = tempdir().expect("tempdir");
+            let manager = ExtensionManager::new();
+            let host = JsRuntimeHost {
+                tools: Arc::new(ToolRegistry::new(&[], dir.path(), None)),
+                manager_ref: Arc::downgrade(&manager.inner),
+                http: Arc::new(HttpConnector::with_defaults()),
+                policy: ExtensionPolicy {
+                    mode: ExtensionPolicyMode::Permissive,
+                    max_memory_mb: 256,
+                    default_caps: Vec::new(),
+                    deny_caps: Vec::new(),
+                    ..Default::default()
+                },
+                interceptor: None,
+            };
+
+            let runtime = PiJsRuntime::new().await.expect("runtime");
+            runtime
+                .eval(
+                    r#"
+                    globalThis.sigChunks = [];
+                    globalThis.sigDone = false;
+                    globalThis.sigErr = null;
+                    (async () => {
+                        try {
+                            const stream = pi.exec("/bin/sh", ["-c", "kill -KILL $$"], { stream: true });
+                            for await (const chunk of stream) {
+                                globalThis.sigChunks.push(chunk);
+                            }
+                            globalThis.sigDone = true;
+                        } catch (e) {
+                            globalThis.sigErr = e.message || String(e);
+                        }
+                    })();
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            for _ in 0..256 {
+                let has_pending = pump_js_runtime_once(&runtime, &host)
+                    .await
+                    .expect("pump_once");
+                if !has_pending {
+                    break;
+                }
+            }
+            assert!(
+                !runtime.has_pending(),
+                "runtime should have no pending tasks after signal-terminated exec stream"
+            );
+
+            let signal_chunks = runtime
+                .read_global_json("sigChunks")
+                .await
+                .expect("read sigChunks");
+            let entries = signal_chunks.as_array().expect("sigChunks array");
+            assert!(
+                !entries.is_empty(),
+                "expected a final chunk for signal termination"
+            );
+            let final_chunk = entries.last().expect("final chunk");
+            let code = final_chunk
+                .get("code")
+                .and_then(Value::as_i64)
+                .expect("numeric final exit code");
+            assert_ne!(
+                code, 0,
+                "signal-terminated process must not report exit code 0"
+            );
+            assert_eq!(final_chunk.get("killed"), Some(&Value::Bool(false)));
+            assert_eq!(
+                runtime
+                    .read_global_json("sigDone")
+                    .await
+                    .expect("read sigDone"),
+                Value::Bool(true)
+            );
+            assert_eq!(
+                runtime
+                    .read_global_json("sigErr")
+                    .await
+                    .expect("read sigErr"),
                 Value::Null
             );
         });

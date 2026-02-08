@@ -419,6 +419,20 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             Ok(())
         }
 
+        fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+            status.code().unwrap_or_else(|| {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt as _;
+                    status.signal().map_or(-1, |signal| -signal)
+                }
+                #[cfg(not(unix))]
+                {
+                    -1
+                }
+            })
+        }
+
         let args_value = payload
             .get("args")
             .cloned()
@@ -537,7 +551,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         return Err(format!("Read stderr: {err}"));
                     }
 
-                    let code = status.code().unwrap_or(0);
+                    let code = exit_status_code(status);
                     let _ = tx.send(ExecStreamFrame::Final { code, killed });
                     Ok(())
                 })();
@@ -668,7 +682,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
                 let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
                 let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
-                let code = status.code().unwrap_or(0);
+                let code = exit_status_code(status);
 
                 Ok(serde_json::json!({
                     "stdout": stdout,
@@ -5637,6 +5651,56 @@ mod tests {
                 )
                 .await
                 .expect("verify nonzero exit code");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dispatcher_exec_signal_termination_reports_nonzero_code() {
+        futures::executor::block_on(async {
+            let runtime = Rc::new(
+                PiJsRuntime::with_clock(DeterministicClock::new(0))
+                    .await
+                    .expect("runtime"),
+            );
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.result = null;
+                    pi.exec("/bin/sh", ["-c", "kill -KILL $$"], {})
+                        .then((r) => { globalThis.result = r; })
+                        .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
+                "#,
+                )
+                .await
+                .expect("eval");
+
+            let requests = runtime.drain_hostcall_requests();
+            assert_eq!(requests.len(), 1);
+
+            let dispatcher = build_dispatcher(Rc::clone(&runtime));
+            for request in requests {
+                dispatcher.dispatch_and_complete(request).await;
+            }
+
+            while runtime.has_pending() {
+                runtime.tick().await.expect("tick");
+                runtime.drain_microtasks().await.expect("microtasks");
+            }
+
+            runtime
+                .eval(
+                    r#"
+                    if (!globalThis.result) throw new Error("exec not resolved");
+                    if (globalThis.result.error) throw new Error("exec errored: " + globalThis.result.error);
+                    if (globalThis.result.code === 0) {
+                        throw new Error("Expected non-zero exit code for signal termination, got: " + globalThis.result.code);
+                    }
+                "#,
+                )
+                .await
+                .expect("verify signal termination exit code");
         });
     }
 
