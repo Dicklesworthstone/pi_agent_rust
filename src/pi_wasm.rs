@@ -149,12 +149,16 @@ fn extract_bytes(ctx: &Ctx<'_>, value: &Value<'_>) -> rquickjs::Result<Vec<u8>> 
 /// Convert a WASM `Val` to an f64 for returning to JS.
 /// Note: i64 is intentionally excluded to avoid silent precision loss.
 #[allow(clippy::cast_precision_loss)]
-fn val_to_f64(val: &Val) -> f64 {
+fn val_to_f64(ctx: &Ctx<'_>, val: &Val) -> rquickjs::Result<f64> {
     match val {
-        Val::I32(v) => f64::from(*v),
-        Val::F32(bits) => f64::from(f32::from_bits(*bits)),
-        Val::F64(bits) => f64::from_bits(*bits),
-        _ => 0.0,
+        Val::I32(v) => Ok(f64::from(*v)),
+        Val::F32(bits) => Ok(f64::from(f32::from_bits(*bits))),
+        Val::F64(bits) => Ok(f64::from_bits(*bits)),
+        _ => Err(throw_wasm(
+            ctx,
+            "RuntimeError",
+            "Unsupported WASM return value type for PiJS bridge",
+        )),
     }
 }
 
@@ -206,6 +210,34 @@ fn js_to_val(ctx: &Ctx<'_>, value: &Value<'_>, ty: &ValType) -> rquickjs::Result
         }
         _ => Err(throw_wasm(ctx, "TypeError", "Unsupported WASM value type")),
     }
+}
+
+fn validate_call_result_types(ctx: &Ctx<'_>, result_types: &[ValType]) -> rquickjs::Result<()> {
+    if result_types.len() > 1 {
+        return Err(throw_wasm(
+            ctx,
+            "RuntimeError",
+            "Multi-value WASM results are not supported by PiJS WebAssembly bridge",
+        ));
+    }
+
+    if let Some(ty) = result_types.first() {
+        return match ty {
+            ValType::I32 | ValType::F32 | ValType::F64 => Ok(()),
+            ValType::I64 => Err(throw_wasm(
+                ctx,
+                "RuntimeError",
+                "i64 results are not supported by PiJS WebAssembly bridge",
+            )),
+            _ => Err(throw_wasm(
+                ctx,
+                "RuntimeError",
+                "Unsupported WASM return type for PiJS WebAssembly bridge",
+            )),
+        };
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -424,13 +456,7 @@ pub(crate) fn inject_wasm_globals(
 
                     // Allocate results
                     let result_types: Vec<ValType> = func_ty.results().collect();
-                    if result_types.iter().any(|ty| matches!(ty, ValType::I64)) {
-                        return Err(throw_wasm(
-                            &ctx,
-                            "RuntimeError",
-                            "i64 results are not supported by PiJS WebAssembly bridge",
-                        ));
-                    }
+                    validate_call_result_types(&ctx, &result_types)?;
                     let mut results: Vec<Val> = result_types
                         .iter()
                         .map(|ty| Val::default_for_ty(ty).unwrap_or(Val::I32(0)))
@@ -439,8 +465,8 @@ pub(crate) fn inject_wasm_globals(
                     func.call(&mut inst.store, &params, &mut results)
                         .map_err(|e| throw_wasm(&ctx, "RuntimeError", &e.to_string()))?;
 
-                    // Return first result as f64 (covers i32, i64, f32, f64)
-                    Ok(results.first().map_or(0.0, val_to_f64))
+                    // Return first result as f64 (supports i32/f32/f64 only).
+                    results.first().map_or(Ok(0.0), |val| val_to_f64(&ctx, val))
                 },
             ),
         )?;
@@ -1145,6 +1171,59 @@ mod tests {
                 var mid = __pi_wasm_compile_native(__test_bytes);
                 var iid = __pi_wasm_instantiate_native(mid);
                 __pi_wasm_call_export_native(iid, "ret64", []);
+            "#,
+            );
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn call_export_multivalue_result_is_rejected() {
+        let wasm_bytes = wat_to_wasm(
+            r#"(module
+              (func (export "pair") (result i32 i32)
+                i32.const 1
+                i32.const 2)
+            )"#,
+        );
+        run_wasm_test(|ctx, _state| {
+            let arr = rquickjs::Array::new(ctx.clone()).unwrap();
+            for (i, &b) in wasm_bytes.iter().enumerate() {
+                arr.set(i, i32::from(b)).unwrap();
+            }
+            ctx.globals().set("__test_bytes", arr).unwrap();
+
+            let result: rquickjs::Result<i32> = ctx.eval(
+                r#"
+                var mid = __pi_wasm_compile_native(__test_bytes);
+                var iid = __pi_wasm_instantiate_native(mid);
+                __pi_wasm_call_export_native(iid, "pair", []);
+            "#,
+            );
+            assert!(result.is_err());
+        });
+    }
+
+    #[test]
+    fn call_export_externref_result_is_rejected() {
+        let wasm_bytes = wat_to_wasm(
+            r#"(module
+              (func (export "retref") (result externref)
+                ref.null extern)
+            )"#,
+        );
+        run_wasm_test(|ctx, _state| {
+            let arr = rquickjs::Array::new(ctx.clone()).unwrap();
+            for (i, &b) in wasm_bytes.iter().enumerate() {
+                arr.set(i, i32::from(b)).unwrap();
+            }
+            ctx.globals().set("__test_bytes", arr).unwrap();
+
+            let result: rquickjs::Result<i32> = ctx.eval(
+                r#"
+                var mid = __pi_wasm_compile_native(__test_bytes);
+                var iid = __pi_wasm_instantiate_native(mid);
+                __pi_wasm_call_export_native(iid, "retref", []);
             "#,
             );
             assert!(result.is_err());
