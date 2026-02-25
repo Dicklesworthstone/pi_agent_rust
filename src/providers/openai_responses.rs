@@ -348,6 +348,14 @@ impl Provider for OpenAIResponsesProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient network hiccups (empty
+                            // frame from the API). Log and continue instead of killing
+                            // the agent turn. The E2E test harness already retries on
+                            // "write zero" — apply the same resilience in production.
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                eprintln!("Warning: transient SSE write-zero, continuing stream");
+                                continue;
+                            }
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
                         }

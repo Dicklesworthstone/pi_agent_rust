@@ -426,6 +426,12 @@ impl Provider for OpenAIProvider {
                             }
                         }
                         Some(Err(e)) => {
+                            // WriteZero errors are transient network hiccups (empty
+                            // frame from the API). Log and continue the stream.
+                            if e.kind() == std::io::ErrorKind::WriteZero {
+                                eprintln!("Warning: transient SSE write-zero, continuing stream");
+                                continue;
+                            }
                             state.done = true;
                             let err = Error::api(format!("SSE error: {e}"));
                             return Some((Err(err), state));
