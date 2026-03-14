@@ -93,12 +93,63 @@ const KIMI_SHARE_DIR_ENV_KEY: &str = "KIMI_SHARE_DIR";
 const KIMI_CODE_DEVICE_AUTHORIZATION_PATH: &str = "/api/oauth/device_authorization";
 const KIMI_CODE_TOKEN_PATH: &str = "/api/oauth/token";
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "String", into = "String")]
+pub enum ApiKeyValue {
+    EnvVar(String),
+    Command(String),
+    Raw(String),
+}
+
+impl From<String> for ApiKeyValue {
+    fn from(s: String) -> Self {
+        if s.starts_with("!") {
+            Self::Command(s[1..].to_string())
+        } else if std::env::var_os(&s).is_some() {
+            Self::EnvVar(s)
+        } else {
+            Self::Raw(s)
+        }
+    }
+}
+
+impl From<ApiKeyValue> for String {
+    fn from(val: ApiKeyValue) -> Self {
+        match val {
+            ApiKeyValue::Raw(s) => s,
+            ApiKeyValue::EnvVar(s) => s,
+            ApiKeyValue::Command(s) => format!("!{s}"),
+        }
+    }
+}
+
+impl From<&String> for ApiKeyValue {
+    fn from(s: &String) -> Self {
+        Self::from(s.clone())
+    }
+}
+
+impl PartialEq<str> for ApiKeyValue {
+    fn eq(&self, other: &str) -> bool {
+        match self {
+            Self::Raw(s) => s == other,
+            _ => false,
+        }
+    }
+}
+
+impl PartialEq<&str> for ApiKeyValue {
+    fn eq(&self, other: &&str) -> bool {
+        self.eq(*other)
+    }
+}
+
 /// Credentials stored in auth.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthCredential {
     ApiKey {
-        key: String,
+        key: ApiKeyValue,
     },
     OAuth {
         access_token: String,
@@ -797,7 +848,20 @@ impl AuthStorage {
 
 fn api_key_from_credential(credential: &AuthCredential) -> Option<String> {
     match credential {
-        AuthCredential::ApiKey { key } => Some(key.clone()),
+        AuthCredential::ApiKey { key } => match key {
+            ApiKeyValue::Raw(s) => Some(s.clone()),
+            ApiKeyValue::EnvVar(s) => std::env::var(s).ok(),
+            ApiKeyValue::Command(s) => std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg(s)
+                .output()
+                .and_then(|o| {
+                    Ok(String::from(
+                        std::str::from_utf8(o.stdout.as_slice()).unwrap().trim(),
+                    ))
+                })
+                .ok(),
+        },
         AuthCredential::OAuth {
             access_token,
             expires,
@@ -1280,7 +1344,12 @@ where
         Some(AuthCredential::ApiKey { key }) => {
             // Legacy: treat stored API key as bearer token for Bedrock
             Some(AwsResolvedCredentials::Bearer {
-                token: key.clone(),
+                token: match key {
+                    ApiKeyValue::Raw(s) => s.clone(),
+                    // Legacy: these should never be encountered :-(
+                    ApiKeyValue::EnvVar(s) => s.clone(),
+                    ApiKeyValue::Command(s) => s.clone(),
+                },
                 region,
             })
         }
@@ -1713,11 +1782,14 @@ pub fn start_oauth_callback_server_random_port() -> Result<(OAuthCallbackServer,
         ))
     })?;
 
-    let port = listener.local_addr().map_err(|e| {
-        Error::auth(format!(
-            "Failed to get local address of OAuth callback listener: {e}"
-        ))
-    })?.port();
+    let port = listener
+        .local_addr()
+        .map_err(|e| {
+            Error::auth(format!(
+                "Failed to get local address of OAuth callback listener: {e}"
+            ))
+        })?
+        .port();
 
     let redirect_uri = format!("http://localhost:{port}/callback");
 
@@ -3738,6 +3810,55 @@ mod tests {
     use std::net::TcpListener;
     use std::time::Duration;
 
+    #[test]
+    fn test_api_key_value_from_string() {
+        // Raw
+        let val: ApiKeyValue = (&"raw-key".to_string()).into();
+        assert_eq!(val, ApiKeyValue::Raw("raw-key".to_string()));
+
+        // EnvVar (using HOME which is always set)
+        let val: ApiKeyValue = (&"HOME".to_string()).into();
+        assert_eq!(val, ApiKeyValue::EnvVar("HOME".to_string()));
+
+        // Command
+        let val: ApiKeyValue = (&"!echo hello".to_string()).into();
+        assert_eq!(val, ApiKeyValue::Command("echo hello".to_string()));
+    }
+
+    #[test]
+    fn test_api_key_value_partial_eq() {
+        let val = ApiKeyValue::Raw("test".to_string());
+        assert_eq!(val, "test");
+
+        let val = ApiKeyValue::EnvVar("HOME".to_string());
+        assert!(val != "HOME");
+
+        let val = ApiKeyValue::Command("echo hi".to_string());
+        assert!(val != "echo hi");
+    }
+
+    #[test]
+    fn test_api_key_from_credential_resolution() {
+        // Raw
+        let cred = AuthCredential::ApiKey {
+            key: ApiKeyValue::Raw("raw".into()),
+        };
+        assert_eq!(api_key_from_credential(&cred), Some("raw".into()));
+
+        // EnvVar (using HOME)
+        let home_val = std::env::var("HOME").unwrap();
+        let cred = AuthCredential::ApiKey {
+            key: ApiKeyValue::EnvVar("HOME".into()),
+        };
+        assert_eq!(api_key_from_credential(&cred), Some(home_val));
+
+        // Command (this confirms the bug fix)
+        let cred = AuthCredential::ApiKey {
+            key: ApiKeyValue::Command("echo resolved".into()),
+        };
+        assert_eq!(api_key_from_credential(&cred), Some("resolved".into()));
+    }
+
     fn next_token() -> String {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3912,7 +4033,7 @@ mod tests {
             auth.set(
                 "openai",
                 AuthCredential::ApiKey {
-                    key: "stored-openai-key".to_string(),
+                    key: ApiKeyValue::Raw("stored-openai-key".to_string()),
                 },
             );
             auth.save().expect("save");
@@ -3970,7 +4091,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "openai-key-test".to_string(),
+                key: ApiKeyValue::Raw("openai-key-test".to_string()),
             },
         );
         auth.save().expect("save auth");
@@ -4045,7 +4166,7 @@ mod tests {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-key-test".to_string(),
+                key: ApiKeyValue::Raw("google-key-test".to_string()),
             },
         );
         auth.save().expect("save auth");
@@ -4088,7 +4209,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "stored-openai-key".to_string(),
+                key: ApiKeyValue::Raw("stored-openai-key".to_string()),
             },
         );
 
@@ -4873,7 +4994,7 @@ mod tests {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-key".to_string(),
+                key: ApiKeyValue::Raw("google-key".to_string()),
             },
         );
 
@@ -4912,7 +5033,7 @@ mod tests {
         auth.set(
             "gemini",
             AuthCredential::ApiKey {
-                key: "legacy-gemini-key".to_string(),
+                key: ApiKeyValue::Raw("legacy-gemini-key".to_string()),
             },
         );
 
@@ -4931,7 +5052,7 @@ mod tests {
         auth.set(
             "Google",
             AuthCredential::ApiKey {
-                key: "mixed-case-key".to_string(),
+                key: ApiKeyValue::Raw("mixed-case-key".to_string()),
             },
         );
 
@@ -4950,7 +5071,7 @@ mod tests {
         auth.set(
             "gemini",
             AuthCredential::ApiKey {
-                key: "legacy-gemini-key".to_string(),
+                key: ApiKeyValue::Raw("legacy-gemini-key".to_string()),
             },
         );
 
@@ -4968,13 +5089,13 @@ mod tests {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-key".to_string(),
+                key: ApiKeyValue::Raw("google-key".to_string()),
             },
         );
         auth.set(
             "gemini",
             AuthCredential::ApiKey {
-                key: "gemini-key".to_string(),
+                key: ApiKeyValue::Raw("gemini-key".to_string()),
             },
         );
 
@@ -4994,7 +5115,7 @@ mod tests {
         auth.set(
             "ext-provider",
             AuthCredential::ApiKey {
-                key: "key-123".to_string(),
+                key: ApiKeyValue::Raw("key-123".to_string()),
             },
         );
 
@@ -5106,7 +5227,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "stored-key".to_string(),
+                key: ApiKeyValue::Raw("stored-key".to_string()),
             },
         );
 
@@ -5127,7 +5248,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "stored-key".to_string(),
+                key: ApiKeyValue::Raw("stored-key".to_string()),
             },
         );
 
@@ -5151,7 +5272,7 @@ mod tests {
         auth.set(
             "groq",
             AuthCredential::ApiKey {
-                key: "stored-groq-key".to_string(),
+                key: ApiKeyValue::Raw("stored-groq-key".to_string()),
             },
         );
 
@@ -5171,7 +5292,7 @@ mod tests {
         auth.set(
             "openrouter",
             AuthCredential::ApiKey {
-                key: "stored-openrouter-key".to_string(),
+                key: ApiKeyValue::Raw("stored-openrouter-key".to_string()),
             },
         );
 
@@ -5193,7 +5314,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "stored-key".to_string(),
+                key: ApiKeyValue::Raw("stored-key".to_string()),
             },
         );
 
@@ -5218,7 +5339,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "stored-key".to_string(),
+                key: ApiKeyValue::Raw("stored-key".to_string()),
             },
         );
 
@@ -5287,7 +5408,7 @@ mod tests {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "stored-google-key".to_string(),
+                key: ApiKeyValue::Raw("stored-google-key".to_string()),
             },
         );
 
@@ -5311,7 +5432,7 @@ mod tests {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "stored-google-key".to_string(),
+                key: ApiKeyValue::Raw("stored-google-key".to_string()),
             },
         );
 
@@ -5330,7 +5451,7 @@ mod tests {
         auth.set(
             "gemini",
             AuthCredential::ApiKey {
-                key: "legacy-gemini-key".to_string(),
+                key: ApiKeyValue::Raw("legacy-gemini-key".to_string()),
             },
         );
 
@@ -5349,7 +5470,7 @@ mod tests {
         auth.set(
             "alibaba",
             AuthCredential::ApiKey {
-                key: "stored-dashscope-key".to_string(),
+                key: ApiKeyValue::Raw("stored-dashscope-key".to_string()),
             },
         );
 
@@ -5373,7 +5494,7 @@ mod tests {
         auth.set(
             "moonshotai",
             AuthCredential::ApiKey {
-                key: "stored-moonshot-key".to_string(),
+                key: ApiKeyValue::Raw("stored-moonshot-key".to_string()),
             },
         );
 
@@ -5418,7 +5539,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "sk-openai-test".to_string(),
+                key: ApiKeyValue::Raw("sk-openai-test".to_string()),
             },
         );
 
@@ -5437,13 +5558,13 @@ mod tests {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-key-old".to_string(),
+                key: ApiKeyValue::Raw("google-key-old".to_string()),
             },
         );
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-key-new".to_string(),
+                key: ApiKeyValue::Raw("google-key-new".to_string()),
             },
         );
         auth.save().expect("save");
@@ -5464,13 +5585,13 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "sk-ant".to_string(),
+                key: ApiKeyValue::Raw("sk-ant".to_string()),
             },
         );
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "sk-oai".to_string(),
+                key: ApiKeyValue::Raw("sk-oai".to_string()),
             },
         );
         let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
@@ -5506,7 +5627,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "nested-key".to_string(),
+                key: ApiKeyValue::Raw("nested-key".to_string()),
             },
         );
         auth.save().expect("save should create parents");
@@ -5531,7 +5652,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "secret".to_string(),
+                key: ApiKeyValue::Raw("secret".to_string()),
             },
         );
         auth.save().expect("save");
@@ -5553,7 +5674,7 @@ mod tests {
         original.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "old-key".to_string(),
+                key: ApiKeyValue::Raw("old-key".to_string()),
             },
         );
         original.save().expect("save original auth");
@@ -5568,7 +5689,7 @@ mod tests {
         replacement_entries.insert(
             "anthropic".to_string(),
             AuthCredential::ApiKey {
-                key: "new-key".to_string(),
+                key: ApiKeyValue::Raw("new-key".to_string()),
             },
         );
         let replacement_data = serde_json::to_string_pretty(&AuthFileRef {
@@ -5939,7 +6060,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "first-key".to_string(),
+                key: ApiKeyValue::Raw("first-key".to_string()),
             },
         );
         assert_eq!(auth.api_key("anthropic").as_deref(), Some("first-key"));
@@ -5947,7 +6068,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "second-key".to_string(),
+                key: ApiKeyValue::Raw("second-key".to_string()),
             },
         );
         assert_eq!(auth.api_key("anthropic").as_deref(), Some("second-key"));
@@ -5968,7 +6089,7 @@ mod tests {
             auth.set(
                 "anthropic",
                 AuthCredential::ApiKey {
-                    key: "old-key".to_string(),
+                    key: ApiKeyValue::Raw("old-key".to_string()),
                 },
             );
             auth.save().expect("save");
@@ -5980,7 +6101,7 @@ mod tests {
             auth.set(
                 "anthropic",
                 AuthCredential::ApiKey {
-                    key: "new-key".to_string(),
+                    key: ApiKeyValue::Raw("new-key".to_string()),
                 },
             );
             auth.save().expect("save");
@@ -6005,7 +6126,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "test-key".to_string(),
+                key: ApiKeyValue::Raw("test-key".to_string()),
             },
         );
         auth.save().expect("save");
@@ -7712,7 +7833,7 @@ mod tests {
         auth.entries.insert(
             "anthropic".to_string(),
             AuthCredential::ApiKey {
-                key: "sk-test".to_string(),
+                key: ApiKeyValue::Raw("sk-test".to_string()),
             },
         );
 

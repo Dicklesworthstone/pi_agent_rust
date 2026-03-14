@@ -1,6 +1,7 @@
 use super::share::{parse_gist_url_and_id, parse_share_is_public, share_gist_description};
 use super::*;
 use crate::agent::AgentConfig;
+use crate::auth::ApiKeyValue;
 use crate::extensions::{ExtensionManager, PROTOCOL_VERSION, RegisterPayload};
 use crate::model::StreamEvent;
 use crate::provider::{Context, Provider, StreamOptions};
@@ -1492,7 +1493,7 @@ fn format_login_provider_listing_includes_builtin_and_extension_status() {
     auth.set(
         "google",
         crate::auth::AuthCredential::ApiKey {
-            key: "google-api-key".to_string(),
+            key: ApiKeyValue::Raw("google-api-key".to_string()),
         },
     );
     auth.set(
@@ -1539,7 +1540,7 @@ fn save_provider_credential_persists_google_under_canonical_key() {
         &mut auth,
         "gemini",
         crate::auth::AuthCredential::ApiKey {
-            key: "gemini-test-key".to_string(),
+            key: ApiKeyValue::Raw("gemini-test-key".to_string()),
         },
     );
     auth.save().expect("save credential");
@@ -1557,13 +1558,13 @@ fn remove_provider_credentials_clears_google_and_gemini_aliases() {
     auth.set(
         "google",
         crate::auth::AuthCredential::ApiKey {
-            key: "google-key".to_string(),
+            key: ApiKeyValue::Raw("google-key".to_string()),
         },
     );
     auth.set(
         "gemini",
         crate::auth::AuthCredential::ApiKey {
-            key: "legacy-gemini-key".to_string(),
+            key: ApiKeyValue::Raw("legacy-gemini-key".to_string()),
         },
     );
     auth.save().expect("seed auth");

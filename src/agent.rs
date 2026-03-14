@@ -6872,7 +6872,7 @@ fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::AuthCredential;
+    use crate::auth::{ApiKeyValue, AuthCredential};
     use crate::provider::{InputType, Model, ModelCost};
     use async_trait::async_trait;
     use futures::Stream;
@@ -7394,13 +7394,13 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "anthropic-key".to_string(),
+                key: ApiKeyValue::Raw("anthropic-key".to_string()),
             },
         );
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "openai-key".to_string(),
+                key: ApiKeyValue::Raw("openai-key".to_string()),
             },
         );
 
@@ -7429,7 +7429,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "anthropic-key".to_string(),
+                key: ApiKeyValue::Raw("anthropic-key".to_string()),
             },
         );
 
@@ -7720,13 +7720,13 @@ mod tests {
             auth.set(
                 "anthropic",
                 AuthCredential::ApiKey {
-                    key: "anthropic-key".to_string(),
+                    key: ApiKeyValue::Raw("anthropic-key".to_string()),
                 },
             );
             auth.set(
                 "openai",
                 AuthCredential::ApiKey {
-                    key: "openai-key".to_string(),
+                    key: ApiKeyValue::Raw("openai-key".to_string()),
                 },
             );
 

@@ -2,6 +2,7 @@ use super::*;
 
 use crate::models::{ModelEntry, model_requires_configured_credential, normalize_api_key_opt};
 use crate::provider_metadata::{provider_ids_match, split_provider_model_spec};
+use crate::auth::ApiKeyValue;
 
 #[cfg(feature = "clipboard")]
 use arboard::Clipboard as ArboardClipboard;
@@ -897,7 +898,7 @@ impl PiApp {
 
             let credential = match kind {
                 PendingLoginKind::ApiKey => normalize_api_key_input(&code_input)
-                    .map(|key| crate::auth::AuthCredential::ApiKey { key })
+                    .map(|key| crate::auth::AuthCredential::ApiKey { key: ApiKeyValue::Raw(key) })
                     .map_err(crate::error::Error::auth),
                 PendingLoginKind::OAuth => {
                     if provider == "anthropic" {
@@ -2421,7 +2422,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 #[cfg(test)]
 mod tests {
     use super::{parse_bash_command, parse_extension_command, should_show_startup_oauth_hint};
-    use crate::auth::{AuthCredential, AuthStorage};
+    use crate::auth::{ApiKeyValue, AuthCredential, AuthStorage};
     use crate::models::ModelEntry;
     use crate::provider::{InputType, Model, ModelCost};
     use std::collections::{HashMap, HashSet};
@@ -2590,7 +2591,7 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "test-key".to_string(),
+                key: ApiKeyValue::Raw("test-key".to_string()),
             },
         );
         assert!(!should_show_startup_oauth_hint(&auth));
@@ -2602,7 +2603,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "test-openai-key".to_string(),
+                key: ApiKeyValue::Raw("test-openai-key".to_string()),
             },
         );
         assert!(!should_show_startup_oauth_hint(&auth));
@@ -2694,7 +2695,7 @@ mod tests {
             &mut auth,
             "gemini",
             AuthCredential::ApiKey {
-                key: "new-google-token".to_string(),
+                key: ApiKeyValue::Raw("new-google-token".to_string()),
             },
         );
 
@@ -2711,7 +2712,7 @@ mod tests {
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "stored-auth-token".to_string(),
+                key: ApiKeyValue::Raw("stored-auth-token".to_string()),
             },
         );
 
@@ -2742,13 +2743,13 @@ mod tests {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-key".to_string(),
+                key: ApiKeyValue::Raw("google-key".to_string()),
             },
         );
         auth.set(
             "gemini",
             AuthCredential::ApiKey {
-                key: "gemini-key".to_string(),
+                key: ApiKeyValue::Raw("gemini-key".to_string()),
             },
         );
 

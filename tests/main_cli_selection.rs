@@ -28,7 +28,7 @@ fn make_registry(harness: &TestHarness, creds: &[(&str, &str)]) -> ModelRegistry
         auth.set(
             (*provider).to_string(),
             AuthCredential::ApiKey {
-                key: (*key).to_string(),
+                key: pi::auth::ApiKeyValue::Raw((*key).to_string()),
             },
         );
     }
@@ -632,7 +632,7 @@ fn resolve_api_key_precedence_and_error_paths() {
     auth.set(
         "custom".to_string(),
         AuthCredential::ApiKey {
-            key: "auth-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("auth-key".to_string()),
         },
     );
 

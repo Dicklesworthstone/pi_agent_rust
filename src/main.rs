@@ -27,7 +27,7 @@ use pi::agent::{
     AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, PreWarmedExtensionRuntime,
 };
 use pi::app::StartupError;
-use pi::auth::{AuthCredential, AuthStorage};
+use pi::auth::{ApiKeyValue, AuthCredential, AuthStorage};
 use pi::cli;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
@@ -3615,7 +3615,7 @@ async fn run_first_time_setup(
             }
 
             AuthCredential::ApiKey {
-                key: key.to_string(),
+                key: ApiKeyValue::Raw(key.to_string()),
             }
         }
         SetupCredentialKind::OAuthPkce => {

@@ -354,7 +354,7 @@ fn auth_oauth_refresh_api_key_credentials_skip_refresh_vcr() {
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-api-key-test".to_string(),
+                key: pi::auth::ApiKeyValue::Raw("google-api-key-test".to_string()),
             },
         );
         auth.save().expect("save auth.json");

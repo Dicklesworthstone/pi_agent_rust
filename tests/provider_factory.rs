@@ -679,7 +679,7 @@ fn schema_metadata_drives_alias_provider_selection_end_to_end() {
     auth.set(
         "moonshotai",
         AuthCredential::ApiKey {
-            key: "moonshot-schema-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("moonshot-schema-key".to_string()),
         },
     );
     auth.save().expect("save auth storage");
@@ -739,7 +739,7 @@ fn schema_metadata_drives_native_anthropic_selection_end_to_end() {
     auth.set(
         "anthropic",
         AuthCredential::ApiKey {
-            key: "anthropic-schema-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("anthropic-schema-key".to_string()),
         },
     );
     auth.save().expect("save auth storage");
@@ -2162,7 +2162,7 @@ fn fireworks_ai_alias_migration_matches_fireworks_canonical_defaults() {
     auth.set(
         "fireworks",
         AuthCredential::ApiKey {
-            key: "fireworks-schema-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("fireworks-schema-key".to_string()),
         },
     );
     auth.save().expect("save auth storage");

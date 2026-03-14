@@ -47,7 +47,7 @@ fn auth_storage_save_reload_api_key() {
     storage.set(
         "anthropic",
         AuthCredential::ApiKey {
-            key: "sk-test-key-123".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("sk-test-key-123".to_string()),
         },
     );
     storage.save().expect("save should succeed");
@@ -234,7 +234,7 @@ fn resolve_api_key_override_wins() {
     storage.set(
         "provider",
         AuthCredential::ApiKey {
-            key: "stored-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("stored-key".to_string()),
         },
     );
 
@@ -250,7 +250,7 @@ fn resolve_api_key_stored_used() {
     storage.set(
         "provider",
         AuthCredential::ApiKey {
-            key: "stored-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("stored-key".to_string()),
         },
     );
 
@@ -391,7 +391,7 @@ fn prune_stale_preserves_non_oauth() {
     storage.set(
         "api-key-provider",
         AuthCredential::ApiKey {
-            key: "key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("key".to_string()),
         },
     );
     storage.set(
@@ -426,7 +426,7 @@ fn auth_storage_remove() {
     storage.set(
         "provider",
         AuthCredential::ApiKey {
-            key: "key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("key".to_string()),
         },
     );
     assert!(
@@ -506,7 +506,7 @@ fn resolve_aws_legacy_api_key_as_bearer() {
     storage.set(
         "amazon-bedrock",
         AuthCredential::ApiKey {
-            key: "legacy-bedrock-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("legacy-bedrock-key".to_string()),
         },
     );
 
@@ -718,7 +718,7 @@ fn auth_credential_serde_round_trip() {
         (
             "api_key",
             AuthCredential::ApiKey {
-                key: "test-key".to_string(),
+                key: pi::auth::ApiKeyValue::Raw("test-key".to_string()),
             },
         ),
         (
@@ -860,13 +860,13 @@ fn auth_storage_multiple_providers() {
     storage.set(
         "anthropic",
         AuthCredential::ApiKey {
-            key: "anthropic-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("anthropic-key".to_string()),
         },
     );
     storage.set(
         "openai",
         AuthCredential::ApiKey {
-            key: "openai-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("openai-key".to_string()),
         },
     );
     storage.set(
@@ -899,7 +899,7 @@ fn auth_storage_overwrite_provider() {
     storage.set(
         "provider",
         AuthCredential::ApiKey {
-            key: "old-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("old-key".to_string()),
         },
     );
     assert_eq!(storage.api_key("provider").as_deref(), Some("old-key"));
@@ -907,7 +907,7 @@ fn auth_storage_overwrite_provider() {
     storage.set(
         "provider",
         AuthCredential::ApiKey {
-            key: "new-key".to_string(),
+            key: pi::auth::ApiKeyValue::Raw("new-key".to_string()),
         },
     );
     assert_eq!(storage.api_key("provider").as_deref(), Some("new-key"));

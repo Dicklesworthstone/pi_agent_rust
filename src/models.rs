@@ -1745,7 +1745,7 @@ pub(crate) fn ad_hoc_model_entry(provider: &str, model_id: &str) -> Option<Model
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::{AuthCredential, AuthStorage};
+    use crate::auth::{ApiKeyValue, AuthCredential, AuthStorage};
     use tempfile::tempdir;
 
     fn test_auth_storage() -> (tempfile::TempDir, AuthStorage) {
@@ -1755,31 +1755,31 @@ mod tests {
         auth.set(
             "anthropic",
             AuthCredential::ApiKey {
-                key: "anthropic-auth-key".to_string(),
+                key: ApiKeyValue::Raw("anthropic-auth-key".to_string()),
             },
         );
         auth.set(
             "openai",
             AuthCredential::ApiKey {
-                key: "openai-auth-key".to_string(),
+                key: ApiKeyValue::Raw("openai-auth-key".to_string()),
             },
         );
         auth.set(
             "google",
             AuthCredential::ApiKey {
-                key: "google-auth-key".to_string(),
+                key: ApiKeyValue::Raw("google-auth-key".to_string()),
             },
         );
         auth.set(
             "openrouter",
             AuthCredential::ApiKey {
-                key: "openrouter-auth-key".to_string(),
+                key: ApiKeyValue::Raw("openrouter-auth-key".to_string()),
             },
         );
         auth.set(
             "acme",
             AuthCredential::ApiKey {
-                key: "acme-auth-key".to_string(),
+                key: ApiKeyValue::Raw("acme-auth-key".to_string()),
             },
         );
         (dir, auth)
@@ -2362,7 +2362,7 @@ mod tests {
         auth.set(
             "moonshotai",
             AuthCredential::ApiKey {
-                key: "moonshot-auth-key".to_string(),
+                key: ApiKeyValue::Raw("moonshot-auth-key".to_string()),
             },
         );
 

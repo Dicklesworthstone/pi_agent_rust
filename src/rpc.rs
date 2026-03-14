@@ -4728,7 +4728,7 @@ async fn cycle_model_for_rpc(
 mod tests {
     use super::*;
     use crate::agent::{Agent, AgentConfig};
-    use crate::auth::AuthCredential;
+    use crate::auth::{ApiKeyValue, AuthCredential};
     use crate::model::{
         AssistantMessage, ContentBlock, ImageContent, StopReason, TextContent, ThinkingLevel,
         Usage, UserContent, UserMessage,
@@ -5228,7 +5228,7 @@ export default function init(pi) {
         auth.set(
             "openai".to_string(),
             AuthCredential::ApiKey {
-                key: "stored-auth-key".to_string(),
+                key: ApiKeyValue::Raw("stored-auth-key".to_string()),
             },
         );
 
@@ -5253,7 +5253,7 @@ export default function init(pi) {
         auth.set(
             "openai".to_string(),
             AuthCredential::ApiKey {
-                key: "stored-auth-key".to_string(),
+                key: ApiKeyValue::Raw("stored-auth-key".to_string()),
             },
         );
 
