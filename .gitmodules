@@ -1,0 +1,3 @@
+[submodule "legacy_pi_mono_code/pi-mono"]
+	path = legacy_pi_mono_code/pi-mono
+	url = https://github.com/badlogic/pi-mono.git
