@@ -154,7 +154,10 @@ fn prepare_startup_changelog_skips_disk_write_when_persistence_disabled() {
             markdown: "## 1.0.0\n- Added startup changelog notices".to_string(),
         })
     );
-    assert!(!settings_path.exists(), "startup construction should not write settings");
+    assert!(
+        !settings_path.exists(),
+        "startup construction should not write settings"
+    );
     assert_eq!(config.last_changelog_version.as_deref(), Some("1.0.0"));
 }
 
@@ -181,10 +184,9 @@ fn prepare_startup_changelog_writes_when_persistence_enabled() {
     );
 
     assert!(matches!(startup, Some(StartupChangelog::Full { .. })));
-    let saved: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&settings_path).expect("read settings"),
-    )
-    .expect("parse settings");
+    let saved: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&settings_path).expect("read settings"))
+            .expect("parse settings");
     assert_eq!(saved["lastChangelogVersion"].as_str(), Some("1.0.0"));
 }
 

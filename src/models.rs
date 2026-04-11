@@ -538,6 +538,16 @@ impl ModelRegistry {
         &self.models
     }
 
+    /// Create a registry containing only the given entries (no built-ins).
+    /// Intended for tests that need a controlled set of models.
+    #[cfg(test)]
+    pub fn from_entries(entries: Vec<ModelEntry>) -> Self {
+        Self {
+            models: entries,
+            error: None,
+        }
+    }
+
     pub fn error(&self) -> Option<&str> {
         self.error.as_deref()
     }
@@ -954,6 +964,7 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
     let mut seen = HashSet::new();
     let mut canonical_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
     let mut provider_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
+    let mut preferred_names: HashMap<String, String> = HashMap::new();
 
     for legacy in legacy_generated_models() {
         let provider = legacy.provider.trim();
@@ -971,7 +982,19 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             provider.to_ascii_lowercase(),
             normalized_model_id.to_ascii_lowercase()
         );
-        if !seen.insert(dedupe_key) {
+        if !seen.insert(dedupe_key.clone()) {
+            // Duplicate — track the longer (more descriptive) display name
+            // so we can patch it after the loop.
+            if !legacy.name.trim().is_empty() {
+                preferred_names
+                    .entry(dedupe_key)
+                    .and_modify(|existing: &mut String| {
+                        if legacy.name.len() > existing.len() {
+                            existing.clone_from(&legacy.name);
+                        }
+                    })
+                    .or_insert_with(|| legacy.name.clone());
+            }
             continue;
         }
 
@@ -1079,6 +1102,21 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             },
             oauth_config: None,
         });
+    }
+
+    // Patch display names: when a duplicate legacy entry had a more descriptive
+    // name than the first occurrence, apply it now.
+    for model in &mut models {
+        let key = format!(
+            "{}::{}",
+            model.model.provider.to_ascii_lowercase(),
+            model.model.id.to_ascii_lowercase()
+        );
+        if let Some(better_name) = preferred_names.get(&key) {
+            if better_name.len() > model.model.name.len() {
+                model.model.name.clone_from(better_name);
+            }
+        }
     }
 
     append_upstream_nonlegacy_models(
@@ -2098,23 +2136,37 @@ mod tests {
             })
             .collect();
 
-        let mut mismatches = Vec::new();
+        // Deduplicate legacy entries by canonical key, preferring the longer
+        // (more descriptive) display name — matches the builder's logic.
+        let mut legacy_names: HashMap<(String, String), String> = HashMap::new();
         for legacy in legacy_generated_models() {
             let normalized_id = canonicalize_model_id_for_provider(&legacy.provider, &legacy.id);
-            if normalized_id.is_empty() {
+            if normalized_id.is_empty() || legacy.name.trim().is_empty() {
                 continue;
             }
             let key = (
                 legacy.provider.to_ascii_lowercase(),
                 normalized_id.to_ascii_lowercase(),
             );
-            let Some(built_name) = name_by_key.get(&key) else {
+            legacy_names
+                .entry(key)
+                .and_modify(|existing| {
+                    if legacy.name.len() > existing.len() {
+                        *existing = legacy.name.clone();
+                    }
+                })
+                .or_insert_with(|| legacy.name.clone());
+        }
+
+        let mut mismatches = Vec::new();
+        for (key, expected_name) in &legacy_names {
+            let Some(built_name) = name_by_key.get(key) else {
                 continue;
             };
-            if !legacy.name.trim().is_empty() && built_name != &legacy.name {
+            if built_name != expected_name {
                 mismatches.push(format!(
                     "{}/{} => expected {:?}, got {:?}",
-                    legacy.provider, legacy.id, legacy.name, built_name
+                    key.0, key.1, expected_name, built_name
                 ));
             }
         }

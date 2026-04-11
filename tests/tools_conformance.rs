@@ -988,7 +988,10 @@ mod ls_tool {
             let mut baseline: Option<String> = None;
             for order in orders {
                 let (text, details) = listing_for(&order).await;
-                assert!(details.is_none(), "unexpected ls details for stable listing: {details:?}");
+                assert!(
+                    details.is_none(),
+                    "unexpected ls details for stable listing: {details:?}"
+                );
                 if let Some(expected) = &baseline {
                     assert_eq!(
                         text.as_str(),
@@ -1448,7 +1451,10 @@ fn normalize_tool_diagnostic_snapshot_is_invariant_to_noise() {
     let normalized_variant = normalize_tool_diagnostic_for_snapshot(noisy_variant);
 
     assert_eq!(normalized_baseline, normalized_variant);
-    assert_eq!(normalized_baseline["captured_epoch_ms"], serde_json::json!(0));
+    assert_eq!(
+        normalized_baseline["captured_epoch_ms"],
+        serde_json::json!(0)
+    );
     assert_eq!(
         normalized_baseline["allowlisted_env"],
         serde_json::json!({"_normalized": "environment-dependent"})

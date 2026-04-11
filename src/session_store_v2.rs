@@ -1005,8 +1005,12 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         let content = fs::read_to_string(&path)?;
-        let manifest: Manifest = serde_json::from_str(&content)
-            .map_err(|err| Error::session(format!("Failed to parse manifest {}: {err}", path.display())))?;
+        let manifest: Manifest = serde_json::from_str(&content).map_err(|err| {
+            Error::session(format!(
+                "Failed to parse manifest {}: {err}",
+                path.display()
+            ))
+        })?;
         Ok(Some(manifest))
     }
 

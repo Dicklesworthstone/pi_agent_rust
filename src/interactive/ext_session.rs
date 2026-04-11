@@ -1337,11 +1337,14 @@ mod tests {
             let (provider, model_id) = ext_session.get_model().await;
             let thinking_level = ext_session.get_thinking_level().await;
 
-            assert!(provider.is_none());
-            assert!(model_id.is_none());
-            assert!(thinking_level.is_none());
-            assert!(state["model"].is_null());
-            assert_eq!(state["thinkingLevel"], "off");
+            // Branch-aware state: navigating to a branch without its own
+            // model/thinking overrides inherits the session-level defaults.
+            assert_eq!(provider.as_deref(), Some("anthropic"));
+            assert_eq!(model_id.as_deref(), Some("claude-sonnet-4-5"));
+            assert_eq!(thinking_level.as_deref(), Some("high"));
+            assert_eq!(state["model"]["provider"], "anthropic");
+            assert_eq!(state["model"]["id"], "claude-sonnet-4-5");
+            assert_eq!(state["thinkingLevel"], "high");
         });
     }
 

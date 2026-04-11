@@ -42,8 +42,8 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 // ============================================================================
 // JSON-RPC 2.0 types
@@ -165,13 +165,9 @@ struct AcpMode {
 #[serde(tag = "type", rename_all = "camelCase")]
 enum AcpContentItem {
     #[serde(rename = "text")]
-    Text {
-        text: String,
-    },
+    Text { text: String },
     #[serde(rename = "thinking")]
-    Thinking {
-        text: String,
-    },
+    Thinking { text: String },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -275,8 +271,7 @@ async fn run(
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
-    let sessions: AcpSessionsMap =
-        Arc::new(Mutex::new(HashMap::new()));
+    let sessions: AcpSessionsMap = Arc::new(Mutex::new(HashMap::new()));
     let prompt_counter = Arc::new(AtomicU64::new(0));
     let active_prompts: Arc<Mutex<HashMap<String, AbortHandle>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -432,7 +427,10 @@ async fn run(
                 };
 
                 let session_state = {
-                    sessions.lock(&cx).await.map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
+                    sessions
+                        .lock(&cx)
+                        .await
+                        .map_or_else(|_| None, |guard| guard.get(&session_id).cloned())
                 };
 
                 let Some(session_state) = session_state else {
@@ -446,7 +444,11 @@ async fn run(
 
                 // Check if this session already has an active prompt.
                 {
-                    let has_active = active_prompts.lock(&cx).await.is_ok_and(|guard| guard.keys().any(|k| k.starts_with(&format!("{session_id}:"))));
+                    let has_active = active_prompts.lock(&cx).await.is_ok_and(|guard| {
+                        guard
+                            .keys()
+                            .any(|k| k.starts_with(&format!("{session_id}:")))
+                    });
                     if has_active {
                         let _ = out_tx.send(json_rpc_error(
                             id,
@@ -517,10 +519,12 @@ async fn run(
                     continue;
                 };
 
-                let aborted = active_prompts.lock(&cx).await.is_ok_and(|guard| guard.get(&prompt_id).is_some_and(|handle| {
-                    handle.abort();
-                    true
-                }));
+                let aborted = active_prompts.lock(&cx).await.is_ok_and(|guard| {
+                    guard.get(&prompt_id).is_some_and(|handle| {
+                        handle.abort();
+                        true
+                    })
+                });
 
                 if aborted {
                     let _ = out_tx.send(json_rpc_ok(id, json!({ "cancelled": true })));
@@ -534,10 +538,15 @@ async fn run(
             }
 
             "session/list" => {
-                let session_list: Vec<Value> = sessions.lock(&cx).await.map_or_else(|_| Vec::new(), |guard| guard
-                    .keys()
-                    .map(|sid| json!({ "sessionId": sid }))
-                    .collect());
+                let session_list: Vec<Value> = sessions.lock(&cx).await.map_or_else(
+                    |_| Vec::new(),
+                    |guard| {
+                        guard
+                            .keys()
+                            .map(|sid| json!({ "sessionId": sid }))
+                            .collect()
+                    },
+                );
 
                 let _ = out_tx.send(json_rpc_ok(id, json!({ "sessions": session_list })));
             }
@@ -558,7 +567,10 @@ async fn run(
                     continue;
                 };
 
-                let exists = sessions.lock(&cx).await.is_ok_and(|guard| guard.contains_key(&session_id));
+                let exists = sessions
+                    .lock(&cx)
+                    .await
+                    .is_ok_and(|guard| guard.contains_key(&session_id));
 
                 if exists {
                     let models: Vec<AcpModel> = options
@@ -603,7 +615,10 @@ async fn run(
                     continue;
                 };
 
-                let exists = sessions.lock(&cx).await.is_ok_and(|guard| guard.contains_key(&session_id));
+                let exists = sessions
+                    .lock(&cx)
+                    .await
+                    .is_ok_and(|guard| guard.contains_key(&session_id));
 
                 if exists {
                     let _ = out_tx.send(json_rpc_ok(
@@ -649,7 +664,11 @@ async fn run(
                         let _ = out_tx.send(json_rpc_error(
                             id,
                             INTERNAL_ERROR,
-                            format!("File too large ({} bytes). Maximum allowed via ACP is {} bytes.", meta.len(), max_bytes),
+                            format!(
+                                "File too large ({} bytes). Maximum allowed via ACP is {} bytes.",
+                                meta.len(),
+                                max_bytes
+                            ),
                         ));
                         continue;
                     }
@@ -659,10 +678,7 @@ async fn run(
                 match asupersync::fs::read(path_str).await {
                     Ok(bytes) => {
                         let contents = String::from_utf8_lossy(&bytes).into_owned();
-                        let _ = out_tx.send(json_rpc_ok(
-                            id,
-                            json!({ "contents": contents }),
-                        ));
+                        let _ = out_tx.send(json_rpc_ok(id, json!({ "contents": contents })));
                     }
                     Err(err) => {
                         let _ = out_tx.send(json_rpc_error(
@@ -754,11 +770,18 @@ async fn validate_file_path(
                     .file_name()
                     .unwrap_or_default(),
             ),
-            None => return Err(format!("Path does not exist and parent is invalid: {path_str}")),
+            None => {
+                return Err(format!(
+                    "Path does not exist and parent is invalid: {path_str}"
+                ));
+            }
         }
     };
 
-    let guard = sessions.lock(cx).await.map_err(|e| format!("Lock failed: {e}"))?;
+    let guard = sessions
+        .lock(cx)
+        .await
+        .map_err(|e| format!("Lock failed: {e}"))?;
 
     if guard.is_empty() {
         return Err("No active sessions — cannot validate file path".to_string());
@@ -908,7 +931,9 @@ fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> Str
         }
     }
 
-    let date_time = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC").to_string();
+    let date_time = chrono::Utc::now()
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
     let _ = write!(prompt, "\nCurrent date and time: {date_time}");
     let _ = write!(prompt, "\nCurrent working directory: {}", cwd.display());
 
@@ -920,10 +945,10 @@ async fn handle_session_new(
     options: &AcpOptions,
     _cx: &AgentCx,
 ) -> Result<(String, AcpSessionState)> {
-    let cwd = params
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")), PathBuf::from);
+    let cwd = params.get("cwd").and_then(Value::as_str).map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        PathBuf::from,
+    );
 
     // Create a new in-memory session.
     let mut session = Session::in_memory();
@@ -1010,11 +1035,7 @@ async fn run_prompt(
     let session_id_events = session_id.clone();
 
     // Build the event handler that translates AgentEvents into ACP notifications.
-    let event_handler = build_acp_event_handler(
-        out_tx_events,
-        prompt_id_events,
-        session_id_events,
-    );
+    let event_handler = build_acp_event_handler(out_tx_events, prompt_id_events, session_id_events);
 
     // Take the agent_session out of the lock, run the prompt, then put it back.
     // This avoids holding the session mutex across the entire prompt execution,
@@ -1123,20 +1144,18 @@ fn build_acp_event_handler(
                         }],
                     }),
                 )),
-                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                    Some(json_rpc_notification(
-                        "prompt/progress",
-                        json!({
-                            "promptId": prompt_id,
-                            "sessionId": session_id,
-                            "kind": "thinkingDelta",
-                            "content": [{
-                                "type": "thinking",
-                                "text": delta,
-                            }],
-                        }),
-                    ))
-                }
+                AssistantMessageEvent::ThinkingDelta { delta, .. } => Some(json_rpc_notification(
+                    "prompt/progress",
+                    json!({
+                        "promptId": prompt_id,
+                        "sessionId": session_id,
+                        "kind": "thinkingDelta",
+                        "content": [{
+                            "type": "thinking",
+                            "text": delta,
+                        }],
+                    }),
+                )),
                 AssistantMessageEvent::ToolCallEnd { tool_call, .. } => {
                     Some(json_rpc_notification(
                         "prompt/progress",

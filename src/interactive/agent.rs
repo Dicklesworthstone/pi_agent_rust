@@ -2545,17 +2545,19 @@ mod stream_delta_batcher_tests {
                 content: crate::model::UserContent::Text("root".to_string()),
                 timestamp: Some(0),
             });
-            let current_leaf_id = session_guard.append_message(crate::session::SessionMessage::User {
-                content: crate::model::UserContent::Text("current".to_string()),
-                timestamp: Some(0),
-            });
+            let current_leaf_id =
+                session_guard.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text("current".to_string()),
+                    timestamp: Some(0),
+                });
             assert!(session_guard.create_branch_from(&root_id));
             session_guard.append_model_change(next.model.provider.clone(), next.model.id.clone());
             session_guard.append_thinking_level_change("high".to_string());
-            let target_leaf_id = session_guard.append_message(crate::session::SessionMessage::User {
-                content: crate::model::UserContent::Text("target".to_string()),
-                timestamp: Some(0),
-            });
+            let target_leaf_id =
+                session_guard.append_message(crate::session::SessionMessage::User {
+                    content: crate::model::UserContent::Text("target".to_string()),
+                    timestamp: Some(0),
+                });
             assert!(session_guard.navigate_to(&current_leaf_id));
             (
                 session_guard.header.id.clone(),

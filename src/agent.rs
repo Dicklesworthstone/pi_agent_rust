@@ -1734,8 +1734,7 @@ impl Agent {
             error_message: None,
             timestamp: Utc::now().timestamp_millis(),
         };
-        self.messages
-            .push(Message::Assistant(Arc::new(message)));
+        self.messages.push(Message::Assistant(Arc::new(message)));
         *added_partial = true;
     }
 

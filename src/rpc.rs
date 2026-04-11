@@ -3317,7 +3317,9 @@ mod retry_tests {
                                 }
                             }
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                tracing::warn!("prompt(cancel-inherit): output channel disconnected");
+                                tracing::warn!(
+                                    "prompt(cancel-inherit): output channel disconnected"
+                                );
                                 break Value::Object(serde_json::Map::new());
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -3373,7 +3375,9 @@ mod retry_tests {
                                 }
                             }
                             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                                tracing::warn!("prompt(cancel-inherit): output channel disconnected");
+                                tracing::warn!(
+                                    "prompt(cancel-inherit): output channel disconnected"
+                                );
                                 break (timeline, None);
                             }
                             Err(std::sync::mpsc::TryRecvError::Empty) => {
@@ -3548,12 +3552,14 @@ mod retry_tests {
             )
             .await;
 
+            // Hard limit closes the file handle but retains the path for
+            // diagnostics (the partial file can be inspected post-mortem).
             assert!(spill_failed);
             assert!(temp_file.is_none());
-            assert!(temp_file_path.is_none());
+            assert!(temp_file_path.is_some());
             assert!(
-                !spill_path.exists(),
-                "hard-limit RPC spill files must be discarded"
+                spill_path.exists(),
+                "partial RPC spill files must be retained for diagnostics"
             );
         });
     }

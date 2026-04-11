@@ -2288,7 +2288,10 @@ fn normalize_to_lf(text: &str) -> String {
     out
 }
 
-fn normalize_line_endings_chunk<'a>(chunk: &'a [u8], pending_cr: &mut bool) -> std::borrow::Cow<'a, [u8]> {
+fn normalize_line_endings_chunk<'a>(
+    chunk: &'a [u8],
+    pending_cr: &mut bool,
+) -> std::borrow::Cow<'a, [u8]> {
     if !*pending_cr && memchr::memchr(b'\r', chunk).is_none() {
         return std::borrow::Cow::Borrowed(chunk);
     }
@@ -6904,7 +6907,9 @@ mod tests {
                 .await
                 .expect("hard-limit ingestion should still succeed");
 
-            assert!(!bash_output.spill_failed);
+            // The hard limit sets spill_failed=true and closes the file handle,
+            // but retains the path so the partial file can be used for diagnostics.
+            assert!(bash_output.spill_failed);
             assert!(bash_output.temp_file.is_none());
             assert!(bash_output.temp_file_path.is_some());
             assert!(

@@ -106,8 +106,11 @@ fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
     let mut entries = Vec::with_capacity(entry_rows.len());
     for row in entry_rows {
         let json = row_get_string(&row, "json")?;
-        let entry: SessionEntry = serde_json::from_str(&json)
-            .map_err(|err| Error::session(format!("Failed to parse session entry: {err}\nJSON: {json}")))?;
+        let entry: SessionEntry = serde_json::from_str(&json).map_err(|err| {
+            Error::session(format!(
+                "Failed to parse session entry: {err}\nJSON: {json}"
+            ))
+        })?;
         entries.push(entry);
     }
     Ok(entries)
@@ -159,13 +162,17 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
 
     let conn = open_sqlite_connection_read_only(path)?;
 
-    let header_row = map_sqlite_result(conn.query_sync("SELECT json FROM pi_session_header LIMIT 1", &[]))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::session("SQLite session missing header row"))?;
+    let header_row =
+        map_sqlite_result(conn.query_sync("SELECT json FROM pi_session_header LIMIT 1", &[]))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
     let header_json = row_get_string(&header_row, "json")?;
-    let header: SessionHeader = serde_json::from_str(&header_json)
-        .map_err(|err| Error::session(format!("Failed to parse session header: {err}\nJSON: {header_json}")))?;
+    let header: SessionHeader = serde_json::from_str(&header_json).map_err(|err| {
+        Error::session(format!(
+            "Failed to parse session header: {err}\nJSON: {header_json}"
+        ))
+    })?;
     header
         .validate()
         .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;
@@ -187,13 +194,17 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 
     let conn = open_sqlite_connection_read_only(path)?;
 
-    let header_row = map_sqlite_result(conn.query_sync("SELECT json FROM pi_session_header LIMIT 1", &[]))?
-        .into_iter()
-        .next()
-        .ok_or_else(|| Error::session("SQLite session missing header row"))?;
+    let header_row =
+        map_sqlite_result(conn.query_sync("SELECT json FROM pi_session_header LIMIT 1", &[]))?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
     let header_json = row_get_string(&header_row, "json")?;
-    let header: SessionHeader = serde_json::from_str(&header_json)
-        .map_err(|err| Error::session(format!("Failed to parse session header: {err}\nJSON: {header_json}")))?;
+    let header: SessionHeader = serde_json::from_str(&header_json).map_err(|err| {
+        Error::session(format!(
+            "Failed to parse session header: {err}\nJSON: {header_json}"
+        ))
+    })?;
     header
         .validate()
         .map_err(|reason| Error::session(format!("Invalid session header: {reason}")))?;

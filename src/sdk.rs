@@ -1303,9 +1303,8 @@ impl AgentSessionHandle {
                 self.session
                     .clamp_thinking_level_for_model(&provider_id, &model_id, level);
             let level_string = effective_level.to_string();
-            let changed =
-                guard.effective_thinking_level_for_current_path().as_deref()
-                    != Some(level_string.as_str());
+            let changed = guard.effective_thinking_level_for_current_path().as_deref()
+                != Some(level_string.as_str());
             guard.set_model_header(None, None, Some(level_string.clone()));
             if changed {
                 guard.append_thinking_level_change(level_string);

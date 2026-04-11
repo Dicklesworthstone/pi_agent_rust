@@ -211,9 +211,8 @@ Paste your {label} API key to save it in auth.json under {provider}.\n"
         );
     }
 
-    prompt.push_str(
-        "\nYour input will be treated as sensitive and is not added to message history.",
-    );
+    prompt
+        .push_str("\nYour input will be treated as sensitive and is not added to message history.");
     prompt
 }
 
@@ -411,18 +410,19 @@ pub(super) fn format_login_provider_listing(
             )
         })
         .collect();
-    let mut api_key_rows: Vec<(String, String, String)> = crate::provider_metadata::PROVIDER_METADATA
-        .iter()
-        .filter(|meta| provider_supports_interactive_api_key_login(meta))
-        .map(|meta| {
-            let provider = meta.canonical_id.to_string();
-            (
-                provider.clone(),
-                "API key".to_string(),
-                format_provider_status(auth, &provider),
-            )
-        })
-        .collect();
+    let mut api_key_rows: Vec<(String, String, String)> =
+        crate::provider_metadata::PROVIDER_METADATA
+            .iter()
+            .filter(|meta| provider_supports_interactive_api_key_login(meta))
+            .map(|meta| {
+                let provider = meta.canonical_id.to_string();
+                (
+                    provider.clone(),
+                    "API key".to_string(),
+                    format_provider_status(auth, &provider),
+                )
+            })
+            .collect();
     api_key_rows.sort_by(|left, right| left.0.cmp(&right.0));
     built_in_rows.extend(api_key_rows);
     append_provider_rows(&mut output, "Built-in", &built_in_rows);

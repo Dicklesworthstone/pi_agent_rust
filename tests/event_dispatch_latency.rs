@@ -184,7 +184,11 @@ fn load_synthetic_extensions(sources: &[(String, String)]) -> LoadedExtensions {
         }
     });
 
-    LoadedExtensions { manager, count, _harness: harness }
+    LoadedExtensions {
+        manager,
+        count,
+        _harness: harness,
+    }
 }
 
 // ─── Benchmark Runner ───────────────────────────────────────────────────────

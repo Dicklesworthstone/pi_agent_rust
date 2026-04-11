@@ -22678,26 +22678,22 @@ async fn dispatch_hostcall_exec_ref_with_limit(
             let (tx_stream, rx_stream) = mpsc::sync_channel::<ExecStreamFrame>(1024);
             let stdout_tx = tx_stream.clone();
 
-            let _stdout_handle =
-                thread::spawn(move || pump_stream(stdout, &stdout_tx, true));
-            let _stderr_handle =
-                thread::spawn(move || pump_stream(stderr, &tx_stream, false));
+            let _stdout_handle = thread::spawn(move || pump_stream(stdout, &stdout_tx, true));
+            let _stderr_handle = thread::spawn(move || pump_stream(stderr, &tx_stream, false));
 
             let start = Instant::now();
             let mut killed = false;
             let mut stdout_acc = String::new();
             let mut stderr_acc = String::new();
 
-            let mut ingest_frame = |frame: ExecStreamFrame| {
-                match frame {
-                    ExecStreamFrame::Stdout(s) if (stdout_acc.len() as u64) < max_capture_bytes => {
-                        stdout_acc.push_str(&s);
-                    }
-                    ExecStreamFrame::Stderr(s) if (stderr_acc.len() as u64) < max_capture_bytes => {
-                        stderr_acc.push_str(&s);
-                    }
-                    _ => {}
+            let mut ingest_frame = |frame: ExecStreamFrame| match frame {
+                ExecStreamFrame::Stdout(s) if (stdout_acc.len() as u64) < max_capture_bytes => {
+                    stdout_acc.push_str(&s);
                 }
+                ExecStreamFrame::Stderr(s) if (stderr_acc.len() as u64) < max_capture_bytes => {
+                    stderr_acc.push_str(&s);
+                }
+                _ => {}
             };
 
             let status = loop {

@@ -1171,9 +1171,7 @@ async fn run(
     {
         let allow_unresolved_scope = has_extensions && !scoped_patterns.is_empty();
         if scoped_models.is_empty() && !allow_unresolved_scope {
-            bail!(
-                "--api-key requires a model to be specified via --provider/--model or --models"
-            );
+            bail!("--api-key requires a model to be specified via --provider/--model or --models");
         }
     }
 

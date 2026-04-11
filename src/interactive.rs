@@ -2148,10 +2148,9 @@ mod startup_changelog_tests {
         assert!(!markdown.contains("Unreleased"));
         assert_eq!(config.last_changelog_version.as_deref(), Some("0.1.9"));
 
-        let persisted: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(&config_path).expect("settings file"),
-        )
-        .expect("valid settings json");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("settings file"))
+                .expect("valid settings json");
         assert_eq!(persisted["lastChangelogVersion"], "0.1.9");
     }
 }

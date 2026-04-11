@@ -361,31 +361,28 @@ pub fn validate_expected_with_goldens(
     Ok(())
 }
 
-fn match_json_subset(actual: &serde_json::Value, expected: &serde_json::Value) -> Result<(), String> {
+fn match_json_subset(
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+) -> Result<(), String> {
     match expected {
         serde_json::Value::Object(expected_map) => {
-            let actual_map = actual.as_object().ok_or_else(|| {
-                format!(
-                    "expected object, found {}",
-                    json_type_name(actual)
-                )
-            })?;
+            let actual_map = actual
+                .as_object()
+                .ok_or_else(|| format!("expected object, found {}", json_type_name(actual)))?;
             for (key, expected_child) in expected_map {
-                let actual_child = actual_map.get(key).ok_or_else(|| {
-                    format!("missing nested key '{key}'")
-                })?;
+                let actual_child = actual_map
+                    .get(key)
+                    .ok_or_else(|| format!("missing nested key '{key}'"))?;
                 match_json_subset(actual_child, expected_child)
                     .map_err(|reason| format!("at nested key '{key}': {reason}"))?;
             }
             Ok(())
         }
         serde_json::Value::Array(expected_items) => {
-            let actual_items = actual.as_array().ok_or_else(|| {
-                format!(
-                    "expected array, found {}",
-                    json_type_name(actual)
-                )
-            })?;
+            let actual_items = actual
+                .as_array()
+                .ok_or_else(|| format!("expected array, found {}", json_type_name(actual)))?;
             if actual_items.len() != expected_items.len() {
                 return Err(format!(
                     "expected array length {}, found {}",

@@ -623,8 +623,7 @@ impl PiApp {
         let prev_model_key =
             self.header_binding_hint(AppAction::CycleModelBackward, "ctrl+shift+p");
         let tools_key = self.header_binding_hint(AppAction::ExpandTools, "ctrl+o");
-        let thinking_key =
-            self.header_binding_hint(AppAction::CycleThinkingLevel, "shift+tab");
+        let thinking_key = self.header_binding_hint(AppAction::CycleThinkingLevel, "shift+tab");
         let max_width = self.term_width.saturating_sub(2);
 
         let hints_line = truncate(
