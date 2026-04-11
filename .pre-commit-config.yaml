@@ -1,9 +1,10 @@
-# Pre-commit hooks (Feature f0010).
+# Pre-commit hooks for pi_agent_rust.
 # Install: prek install --install-hooks
 # Run manually: prek run --all-files
 # See https://prek.j178.dev for prek installation.
 
 repos:
+  # ── Rust code quality ──────────────────────────────────────────────
   - repo: https://github.com/doublify/pre-commit-rust
     rev: v1.0
     hooks:
@@ -15,6 +16,17 @@ repos:
         name: cargo clippy
         args: ["--", "-D", "warnings"]
 
+  # ── Unit tests (fast gate — lib tests only, ~80s) ──────────────────
+  - repo: local
+    hooks:
+      - id: cargo-test-lib
+        name: cargo test --lib
+        entry: cargo test --lib
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]
+
+  # ── General hygiene ─────────────────────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
     hooks:
@@ -28,3 +40,17 @@ repos:
       - id: check-toml
 
       - id: check-merge-conflict
+
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+        name: block large files (>500KB)
+
+      - id: detect-private-key
+        name: detect private keys
+
+  # ── Secret detection ────────────────────────────────────────────────
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.24.3
+    hooks:
+      - id: gitleaks
+        name: gitleaks (secret scanner)
