@@ -198,3 +198,8 @@ storage.sqlite3-wal.corrupt-*
 .beads/*.pre_repair_*
 .beads/*.repair_candidate_*
 .beads/*.bak-corrupt
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key
