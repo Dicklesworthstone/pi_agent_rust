@@ -1,0 +1,30 @@
+# Pre-commit hooks (Feature f0010).
+# Install: prek install --install-hooks
+# Run manually: prek run --all-files
+# See https://prek.j178.dev for prek installation.
+
+repos:
+  - repo: https://github.com/doublify/pre-commit-rust
+    rev: v1.0
+    hooks:
+      - id: fmt
+        name: cargo fmt
+        args: ["--", "--check"]
+
+      - id: clippy
+        name: cargo clippy
+        args: ["--", "-D", "warnings"]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '\.md$'
+
+      - id: end-of-file-fixer
+
+      - id: check-yaml
+
+      - id: check-toml
+
+      - id: check-merge-conflict
