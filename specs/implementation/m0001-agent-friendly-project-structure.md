@@ -1,4 +1,4 @@
-# M011: Agent-Friendly Project Structure
+# M0001: Agent-Friendly Project Structure
 
 **Related Research:** [R044: Project Reorganization](../research/r044-project-reorganization.md)
 **Related Feature:** [F083: Compile Optimization and Module Structure](../features/f083-compile-optimization.md)

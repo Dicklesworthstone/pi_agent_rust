@@ -1,4 +1,4 @@
-# Epic: Rust Port Investment Roadmap
+# Epic e0001: Rust Port Investment Roadmap
 
 > Strategic areas where investment in the Rust codebase yields the greatest
 > advantage over the TypeScript original.

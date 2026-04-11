@@ -1,4 +1,4 @@
-# Feature Parity: TypeScript (pi-mono) vs Rust Port
+# r0001 Feature Parity: TypeScript (pi-mono) vs Rust Port
 
 > Research document comparing the original TypeScript coding agent
 > (`legacy_pi_mono_code/pi-mono/packages/coding-agent/`) with the current
