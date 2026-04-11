@@ -17,11 +17,8 @@ cargo test           # run all tests (~6160 tests, ~80s)
 
 - **Rust nightly** (edition 2024, rust-version 1.85+) — see `rust-toolchain.toml`
 - **ripgrep (`rg`)** — required at runtime and for ~14 grep-related tests
-- No other package manager; Cargo only
-
-### Requirements
-
 - **fd (`fd-find`)** — required at runtime for the `find` tool and related tests
+- No other package manager; Cargo only
 
 ## TypeScript Reference Rule
 
