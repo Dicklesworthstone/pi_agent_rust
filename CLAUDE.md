@@ -19,17 +19,31 @@ cargo test           # run all tests (~6160 tests, ~80s)
 - **ripgrep (`rg`)** — required at runtime and for ~14 grep-related tests
 - No other package manager; Cargo only
 
-### Known Failing Tests (as of 2026-04-11)
+### Requirements
 
-7 pre-existing test failures unrelated to recent changes:
+- **fd (`fd-find`)** — required at runtime for the `find` tool and related tests
 
-- `built_in_models_preserve_legacy_model_display_names` — display name mismatch for `openrouter/openrouter/auto`
-- `rpc_spill_file_hard_limit_abandons_partial_spill_file` — spill file cleanup assertion
-- `test_bash_hard_limit_retains_partial_spill_file` — same spill file issue
-- `select_model_and_thinking_preserves_restore_warning_when_defaulting_for_setup`
-- `select_model_and_thinking_preserves_restore_warning_when_using_config_default`
-- `suggest_slash_alone_returns_all_builtins` — autocomplete test
-- `dispatcher_tool_find_discovers_files` — extension dispatcher
+## TypeScript Reference Rule
+
+**When a design question, naming convention, or behavioral intent is unclear in the Rust code, always consult the original TypeScript source in the submodule before guessing.**
+
+The TypeScript codebase is the canonical reference for how features should work:
+
+```
+legacy_pi_mono_code/pi-mono/packages/coding-agent/src/
+```
+
+Key areas to cross-reference:
+- `core/tools/*.ts` — tool behavior (bash, read, write, edit, grep, find, ls)
+- `core/session-manager.ts` — session format, branching, persistence
+- `core/extensions/` — extension loading, types, runner
+- `core/model-registry.ts` — provider/model resolution and display names
+- `core/compaction/` — context compaction strategy
+- `modes/rpc/` — RPC protocol behavior
+- `modes/interactive/` — TUI component behavior
+- `core/system-prompt.ts` — system prompt construction
+
+Use `rg` or `grep` inside the submodule to find the TypeScript equivalent of whatever you're working on in Rust. The TS code often has comments and naming that clarify the original design intent.
 
 ## Repository Structure
 
