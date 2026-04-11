@@ -42,8 +42,8 @@ repos:
       - id: check-merge-conflict
 
       - id: check-added-large-files
-        args: ["--maxkb=500"]
-        name: block large files (>500KB)
+        args: ["--maxkb=100"]
+        name: block large files (>100KB)
 
       - id: detect-private-key
         name: detect private keys

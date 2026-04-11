@@ -30,7 +30,7 @@ Managed via [prek](https://prek.j178.dev) (pre-commit compatible).
 | `check-yaml` | pre-commit-hooks | YAML syntax |
 | `check-toml` | pre-commit-hooks | TOML syntax |
 | `check-merge-conflict` | pre-commit-hooks | Leftover conflict markers |
-| `check-added-large-files` | pre-commit-hooks | Files >500KB |
+| `check-added-large-files` | pre-commit-hooks | Files >100KB (~25k tokens, 2.5% of agent context) |
 | `detect-private-key` | pre-commit-hooks | SSH/PGP private keys |
 | `gitleaks` | gitleaks/gitleaks | Secrets, tokens, API keys |
 
