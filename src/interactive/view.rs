@@ -478,14 +478,22 @@ impl PiApp {
         self.render_buffers
             .return_conversation_buffer(conversation_content);
 
-        // Tool status
+        // Tool status — always show elapsed time so the user can see progress,
+        // even if no ToolUpdate messages have arrived yet.
         if let Some(tool) = &self.current_tool {
             let progress_str = self.tool_progress.as_ref().map_or_else(String::new, |p| {
-                let secs = p.elapsed_ms / 1000;
-                if secs < 1 {
-                    return String::new();
-                }
-                let mut parts = vec![format!("{secs}s")];
+                // Use wall-clock elapsed from started_at so the counter updates
+                // even between ToolUpdate messages.
+                let elapsed_ms = p.started_at.elapsed().as_millis();
+                let secs = elapsed_ms / 1000;
+                let sub_ms = (elapsed_ms % 1000) / 100;
+                let elapsed_str = if secs < 1 {
+                    // Show sub-second precision for the first second
+                    format!("0.{sub_ms}s")
+                } else {
+                    format!("{secs}s")
+                };
+                let mut parts = vec![elapsed_str];
                 if p.line_count > 0 {
                     parts.push(format!("{} lines", format_count(p.line_count)));
                 } else if p.byte_count > 0 {
