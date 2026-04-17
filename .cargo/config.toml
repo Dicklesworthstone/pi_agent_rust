@@ -1,0 +1,16 @@
+# ---------------------------------------------------------------------------
+# Platform-specific build configuration
+# ---------------------------------------------------------------------------
+
+# FreeBSD: third-party libraries (clang, openssl, etc.) are installed under
+# /usr/local by pkg(8). Cargo/rustc don't search there by default, so we
+# add it to the native library and pkg-config search paths.
+#
+# This is a no-op on Linux/macOS/Windows where these dirs don't exist.
+[target.'cfg(target_os = "freebsd")']
+rustflags = ["-L", "/usr/local/lib"]
+
+[env]
+# Point pkg-config at the FreeBSD third-party prefix when on FreeBSD.
+# Harmless on other platforms (the directory simply won't exist).
+PKG_CONFIG_PATH = { value = "/usr/local/libdata/pkgconfig", force = false }
