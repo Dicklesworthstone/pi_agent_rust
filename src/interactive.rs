@@ -1897,6 +1897,58 @@ fn read_git_branch(cwd: &Path) -> Option<String> {
     )
 }
 
+/// Detect if `cwd` (or any ancestor) is inside a jj repo by looking for a `.jj` directory.
+/// Returns the repo root if found.
+fn find_jj_root(cwd: &Path) -> Option<PathBuf> {
+    let mut current = cwd.to_path_buf();
+    loop {
+        if current.join(".jj").is_dir() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+/// Read the current jj working-copy change from `jj log`.
+///
+/// Returns `Some("jj:abc12345 description")` when inside a jj repo and `jj` is in PATH,
+/// or `None` otherwise.
+fn read_jj_change(cwd: &Path) -> Option<String> {
+    find_jj_root(cwd)?; // early-exit if not in a jj repo
+
+    let output = std::process::Command::new("jj")
+        .args([
+            "log",
+            "-r",
+            "@",
+            "--no-graph",
+            "--template",
+            r#"change_id.short(8) ++ " " ++ description.first_line()"#,
+        ])
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8(output.stdout).ok()?;
+    let line = text.trim();
+    if line.is_empty() {
+        return None;
+    }
+    Some(format!("jj:{line}"))
+}
+
+/// Read VCS info for the status bar: tries jj first (preferred in colocated repos),
+/// falls back to git branch.
+fn read_vcs_info(cwd: &Path) -> Option<String> {
+    read_jj_change(cwd).or_else(|| read_git_branch(cwd))
+}
+
 fn find_git_head_path(cwd: &Path) -> Option<PathBuf> {
     let mut current = cwd.to_path_buf();
     loop {
@@ -2289,8 +2341,9 @@ pub struct PiApp {
     // Pre-allocated reusable buffers for view() hot path (PERF-7)
     render_buffers: RenderBuffers,
 
-    // Current git branch name (refreshed on startup + after each agent turn)
-    git_branch: Option<String>,
+    // Current VCS info string (refreshed on startup + after each agent turn).
+    // Shows jj change id + description in jj repos; git branch name otherwise.
+    vcs_info: Option<String>,
     // Startup banner shown in an empty conversation.
     startup_welcome: String,
     // Startup changelog notice shown for first launch after an upgrade.
@@ -2472,7 +2525,7 @@ impl PiApp {
             autocomplete.provider.refresh_background();
         }
 
-        let git_branch = read_git_branch(&cwd);
+        let vcs_info = read_vcs_info(&cwd);
         let startup_welcome = build_startup_welcome_message(&config);
         let config_override = Config::config_path_override_from_env(&cwd);
         let startup_changelog = prepare_startup_changelog_with_roots(
@@ -2553,7 +2606,7 @@ impl PiApp {
             memory_monitor: MemoryMonitor::new_default(),
             message_render_cache: MessageRenderCache::new(),
             render_buffers: RenderBuffers::new(),
-            git_branch,
+            vcs_info,
             startup_welcome,
             startup_changelog,
             tmux_wheel_guard: TmuxWheelGuard::install(),

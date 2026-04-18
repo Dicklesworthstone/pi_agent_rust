@@ -787,7 +787,7 @@ impl PiApp {
             },
         );
         let branch_str = self
-            .git_branch
+            .vcs_info
             .as_ref()
             .map_or_else(String::new, |b| format!("  |  {b}"));
         let mode_hint = match self.input_mode {
