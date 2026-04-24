@@ -297,6 +297,15 @@ pub struct SessionOptions {
     pub include_cwd_in_prompt: bool,
     pub max_tool_iterations: usize,
 
+    /// Optional factory for producing the session's [`ToolRegistry`].
+    ///
+    /// When `None`, `create_agent_session` builds the default built-in
+    /// tool set from [`SessionOptions::enabled_tools`] (the existing
+    /// behaviour). Setting it lets a consumer register custom tools,
+    /// wrap the built-ins (e.g. with approval gates), or replace the
+    /// set entirely — see [`ToolFactory`] and [`default_tool_registry`].
+    pub tool_factory: Option<Arc<dyn ToolFactory>>,
+
     /// Session-level event listener invoked for every [`AgentEvent`].
     ///
     /// Unlike the per-prompt callback passed to [`AgentSessionHandle::prompt`],
@@ -332,12 +341,37 @@ impl Default for SessionOptions {
             repair_policy: None,
             include_cwd_in_prompt: true,
             max_tool_iterations: 50,
+            tool_factory: None,
             on_event: None,
             on_tool_start: None,
             on_tool_end: None,
             on_stream_event: None,
         }
     }
+}
+
+/// Factory for producing the session's [`ToolRegistry`].
+///
+/// Implement this on a `Send + Sync` type and attach it to
+/// [`SessionOptions::tool_factory`] to register custom tools or wrap the
+/// built-in ones. See [`default_tool_registry`] for the current default.
+pub trait ToolFactory: Send + Sync {
+    /// Build the registry.
+    ///
+    /// - `enabled` is the resolved tool-name allowlist derived from
+    ///   [`SessionOptions::enabled_tools`] (and CLI defaults).
+    /// - `cwd` is the working directory the session was created in.
+    /// - `config` is pi's loaded [`Config`] — passed through so custom
+    ///   tools can consult settings like `block_images`.
+    fn build(&self, enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry;
+}
+
+/// The default factory behaviour: delegates to [`ToolRegistry::new`].
+///
+/// Call this from your own [`ToolFactory`] impl to layer on top of the
+/// built-in tool set without re-implementing the resolution rules.
+pub fn default_tool_registry(enabled: &[&str], cwd: &Path, config: &Config) -> ToolRegistry {
+    ToolRegistry::new(enabled, cwd, Some(config))
 }
 
 /// Lightweight handle for programmatic embedding.
@@ -1652,7 +1686,10 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         fail_closed_hooks: config.fail_closed_hooks(),
     };
 
-    let tools = ToolRegistry::new(&enabled_tools, &cwd, Some(&config));
+    let tools = match &options.tool_factory {
+        Some(factory) => factory.build(&enabled_tools, &cwd, &config),
+        None => ToolRegistry::new(&enabled_tools, &cwd, Some(&config)),
+    };
     let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
 
     let context_window_tokens = if selection.model_entry.model.context_window == 0 {
