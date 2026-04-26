@@ -75,6 +75,28 @@ fn invalid_request(call_id: &str, message: impl Into<String>) -> HostResultPaylo
     host_result_err(call_id, HostCallErrorCode::InvalidRequest, message, None)
 }
 
+/// Developer opt-in: when set to "1", plain http:// is permitted for
+/// loopback hosts only. Default behavior (require TLS) is unchanged.
+fn allow_loopback_http_env() -> bool {
+    std::env::var("PI_HTTP_ALLOW_LOOPBACK")
+        .ok()
+        .as_deref()
+        == Some("1")
+}
+
+/// True when host is a loopback address. Matches 127.0.0.0/8, ::1,
+/// localhost, and bracketed forms used in URL parsing.
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if h.eq_ignore_ascii_case("localhost") || h == "::1" {
+        return true;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
 fn io_error(call_id: &str, message: impl Into<String>) -> HostResultPayload {
     host_result_err(call_id, HostCallErrorCode::Io, message, None)
 }
@@ -294,12 +316,18 @@ impl HttpConnector {
 
         match parsed.scheme {
             Scheme::Http if self.config.require_tls => {
-                return Err(Box::new(host_result_err(
-                    &call.call_id,
-                    HostCallErrorCode::Denied,
-                    "TLS required: use https:// URLs",
-                    None,
-                )));
+                // Explicit developer opt-in: PI_HTTP_ALLOW_LOOPBACK=1 lets
+                // plain http through ONLY for loopback hosts. Everything
+                // else still requires TLS by default. Intended for local-
+                // worker development where setting up a cert is friction.
+                if !(allow_loopback_http_env() && is_loopback_host(&parsed.host)) {
+                    return Err(Box::new(host_result_err(
+                        &call.call_id,
+                        HostCallErrorCode::Denied,
+                        "TLS required: use https:// URLs (set PI_HTTP_ALLOW_LOOPBACK=1 for local development)",
+                        None,
+                    )));
+                }
             }
             Scheme::Http | Scheme::Https => {}
         }
