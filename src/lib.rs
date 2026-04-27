@@ -47,7 +47,20 @@ extern crate self as pi;
 
 // Gap H: jemalloc allocator for allocation-heavy paths.
 // Declared in the library so all project binaries/tests share allocator behavior.
-#[cfg(all(feature = "jemalloc", not(target_env = "msvc")))]
+//
+// Excluded on FreeBSD: FreeBSD's libc malloc is itself jemalloc-derived,
+// so installing tikv-jemallocator via #[global_allocator] puts a second
+// jemalloc instance into the same process. The two allocators' metadata
+// regions interfere and cause silent heap corruption that manifests at
+// the next allocator touch (often pthread_attr_init during a fresh thread
+// spawn — see pi#57 for the lldb backtrace). Use the system allocator on
+// FreeBSD; tikv-jemallocator stays in the dep graph so build behavior is
+// symmetric across targets, but is not registered as global on FreeBSD.
+#[cfg(all(
+    feature = "jemalloc",
+    not(target_env = "msvc"),
+    not(target_os = "freebsd")
+))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 

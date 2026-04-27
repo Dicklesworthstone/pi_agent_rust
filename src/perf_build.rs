@@ -55,9 +55,17 @@ enum RequestedAllocator {
 }
 
 /// Returns the allocator compiled into the current binary.
+///
+/// Note: jemalloc is suppressed on FreeBSD even when the feature is on,
+/// because FreeBSD's libc malloc is itself jemalloc-derived and a second
+/// instance corrupts heap state. See the cfg in `lib.rs` for details.
 #[must_use]
 pub const fn compiled_allocator() -> AllocatorKind {
-    if cfg!(all(feature = "jemalloc", not(target_env = "msvc"))) {
+    if cfg!(all(
+        feature = "jemalloc",
+        not(target_env = "msvc"),
+        not(target_os = "freebsd")
+    )) {
         AllocatorKind::Jemalloc
     } else {
         AllocatorKind::System
