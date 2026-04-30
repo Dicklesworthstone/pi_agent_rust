@@ -159,6 +159,7 @@ url = "2"
 
 # Signals
 ctrlc = "3.5.2"
+libc = "0.2"
 
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
@@ -313,7 +314,7 @@ debug = 1
 strip = false
 
 [lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

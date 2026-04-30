@@ -5175,11 +5175,31 @@ fn collect_process_tree(
     }
 }
 
+#[allow(unsafe_code)]
 pub(crate) fn isolate_command_process_group(command: &mut Command) {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
         command.process_group(0);
+
+        // Reset SIGPIPE to default in the child. Pi's async runtime
+        // (asupersync, like tokio) sets SIGPIPE=SIG_IGN at startup so
+        // internal pipe-write failures don't kill the agent. That signal
+        // disposition is inherited across exec, so spawned children
+        // inherit SIG_IGN — meaning when pi closes its read end of the
+        // child's stdout (e.g. because output exceeded a limit), the
+        // child gets endless EPIPE on writes instead of being terminated
+        // by SIGPIPE. The child loops forever and pi blocks on wait4.
+        //
+        // SAFETY: pre_exec runs in the child between fork and exec.
+        // Only async-signal-safe calls are permitted. signal(2) is on
+        // the POSIX async-signal-safe list.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                Ok(())
+            });
+        }
     }
 
     #[cfg(not(unix))]
