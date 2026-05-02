@@ -4216,12 +4216,32 @@ fn classify_reverse_shell(lower: &str) -> bool {
 fn classify_pipe_to_shell(lower: &str) -> bool {
     // curl/wget piped to sh/bash
     let has_download = lower.contains("curl ") || lower.contains("wget ");
+    // Match pipe-to-shell across common absolute install paths.
+    //
+    //   /bin/{sh,bash}            — linux base layout, FreeBSD /bin/sh
+    //   /usr/bin/{sh,bash}        — /usr-merge distros (Arch, Fedora, modern Debian/Ubuntu)
+    //   /usr/local/bin/{sh,bash}  — FreeBSD `pkg install bash`, some custom installs
+    //
+    // The bare "| sh" / "|sh" / "| bash" / "|bash" patterns above already
+    // cover the relative-name cases. The absolute-path additions close the
+    // gap on systems where the user writes the full path (notably FreeBSD,
+    // where bash isn't at /bin/bash).
     let has_pipe_to_shell = lower.contains("| sh")
         || lower.contains("| bash")
         || lower.contains("|sh")
         || lower.contains("|bash")
         || lower.contains("| /bin/sh")
-        || lower.contains("| /bin/bash");
+        || lower.contains("| /bin/bash")
+        || lower.contains("| /usr/bin/sh")
+        || lower.contains("| /usr/bin/bash")
+        || lower.contains("| /usr/local/bin/sh")
+        || lower.contains("| /usr/local/bin/bash")
+        || lower.contains("|/bin/sh")
+        || lower.contains("|/bin/bash")
+        || lower.contains("|/usr/bin/sh")
+        || lower.contains("|/usr/bin/bash")
+        || lower.contains("|/usr/local/bin/sh")
+        || lower.contains("|/usr/local/bin/bash");
     let download_exec_patterns = [
         "eval \"$(curl ",
         "eval \"$(wget ",
