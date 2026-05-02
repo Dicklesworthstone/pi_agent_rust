@@ -6211,15 +6211,37 @@ mod tests {
         assert_eq!(result.truncated_by, Some(TruncatedBy::Bytes));
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
     #[test]
     fn test_command_with_default_sigpipe_restores_pipe_disposition() {
+        // Linux-format /proc/<pid>/status exposes a SigIgn: hex mask we can
+        // parse to verify the child no longer inherits the parent's
+        // SIGPIPE=SIG_IGN. FreeBSD's native procfs uses a different format,
+        // so on FreeBSD we read the same file via linprocfs at
+        // /compat/linux/proc when available; gracefully skip if not mounted.
+        #[cfg(target_os = "freebsd")]
+        let status_path: &str = {
+            let probe = format!("/compat/linux/proc/{}/status", std::process::id());
+            if !std::path::Path::new(&probe).exists() {
+                eprintln!(
+                    "skipping sigpipe disposition test: linprocfs not mounted \
+                     at /compat/linux/proc — mount it via /etc/fstab to enable"
+                );
+                return;
+            }
+            "/compat/linux/proc/$$/status"
+        };
+        #[cfg(not(target_os = "freebsd"))]
+        let status_path: &str = "/proc/$$/status";
+
+        let probe_cmd = format!(
+            "while read name value _; do [ \"$name\" = SigIgn: ] && \
+             {{ printf '%s' \"$value\"; exit 0; }}; done < {status_path}"
+        );
+
         let output = command_with_default_sigpipe("sh")
             .expect("prepare sigpipe disposition probe")
-            .args([
-                "-c",
-                "while read name value _; do [ \"$name\" = SigIgn: ] && { printf '%s' \"$value\"; exit 0; }; done < /proc/$$/status",
-            ])
+            .args(["-c", &probe_cmd])
             .stdout(std::process::Stdio::piped())
             .output()
             .expect("spawn sigpipe disposition probe");
