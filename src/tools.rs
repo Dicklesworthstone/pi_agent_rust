@@ -737,6 +737,50 @@ fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
     Ok(canonical_path)
 }
 
+/// Same as `enforce_cwd_scope` but also permits paths under the supplied
+/// agent directory (typically `~/.pi/agent/`, overridable via
+/// PI_CODING_AGENT_DIR).
+///
+/// Used for the `read` tool so the agent can load its own resource files
+/// (skills, prompt templates, themes) which live under the agent dir, not
+/// under the user's project cwd. Symlink escapes are still blocked because
+/// `safe_canonicalize` resolves symlinks before the prefix check.
+///
+/// Other tools (write, edit, grep, find, ls, hashline_edit) keep using
+/// `enforce_cwd_scope` and remain strictly cwd-only — broadening write
+/// access would let a misbehaving model persist instructions into the
+/// agent dir, which is more risk than the read case warrants.
+fn enforce_read_scope_with_agent_dir(
+    path: &Path,
+    cwd: &Path,
+    agent_dir: &Path,
+) -> Result<PathBuf> {
+    let canonical_path = crate::extensions::safe_canonicalize(path);
+    let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
+    if canonical_path.starts_with(&canonical_cwd) {
+        return Ok(canonical_path);
+    }
+
+    let canonical_agent_dir = crate::extensions::safe_canonicalize(agent_dir);
+    if canonical_path.starts_with(&canonical_agent_dir) {
+        return Ok(canonical_path);
+    }
+
+    Err(Error::validation(format!(
+        "Cannot read outside the working directory or agent dir \
+         (resolved: {}, cwd: {}, agent dir: {})",
+        canonical_path.display(),
+        canonical_cwd.display(),
+        canonical_agent_dir.display()
+    )))
+}
+
+/// Convenience wrapper that pulls the agent dir from the active config.
+fn enforce_read_scope(path: &Path, cwd: &Path) -> Result<PathBuf> {
+    let agent_dir = crate::config::Config::global_dir();
+    enforce_read_scope_with_agent_dir(path, cwd, &agent_dir)
+}
+
 // ============================================================================
 // CLI @file Processor (used by src/main.rs)
 // ============================================================================
@@ -954,7 +998,7 @@ pub fn process_file_arguments(
     for file_arg in file_args {
         let resolved = resolve_read_path(file_arg, cwd);
         let absolute_path = normalize_dot_segments(&resolved);
-        let absolute_path = enforce_cwd_scope(&absolute_path, cwd, "read")?;
+        let absolute_path = enforce_read_scope(&absolute_path, cwd)?;
 
         let meta = std::fs::metadata(&absolute_path).map_err(|e| {
             Error::tool(
@@ -1473,7 +1517,7 @@ impl Tool for ReadTool {
         }
 
         let path = resolve_read_path(&input.path, &self.cwd);
-        let path = enforce_cwd_scope(&path, &self.cwd, "read")?;
+        let path = enforce_read_scope(&path, &self.cwd)?;
 
         let meta = asupersync::fs::metadata(&path).await.ok();
         if let Some(meta) = &meta {
@@ -6460,6 +6504,45 @@ mod tests {
                 .unwrap_err();
             assert!(err.to_string().contains("outside the working directory"));
         });
+    }
+
+    #[test]
+    fn test_enforce_read_scope_allows_agent_dir_outside_cwd() {
+        // Skills, prompt templates, and themes live under the agent dir
+        // (`~/.pi/agent/` by default). The agent legitimately needs to read
+        // these even when cwd is a user project directory on a different
+        // path. Verify enforce_read_scope_with_agent_dir accepts a file
+        // under the agent dir even when it is NOT a descendant of cwd.
+        let cwd = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        let skill_dir = agent_dir.path().join("skills").join("example");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let skill_path = skill_dir.join("SKILL.md");
+        std::fs::write(&skill_path, "---\nname: example\n---\nhi\n").unwrap();
+
+        let result = enforce_read_scope_with_agent_dir(&skill_path, cwd.path(), agent_dir.path());
+        assert!(
+            result.is_ok(),
+            "expected read scope to allow file under agent dir, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_enforce_read_scope_still_rejects_unrelated_paths() {
+        // Sanity check: the new agent-dir allowance is additive. Paths
+        // outside BOTH cwd and agent_dir must still be rejected.
+        let cwd = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        let unrelated = tempfile::tempdir().unwrap();
+        std::fs::write(unrelated.path().join("secret.txt"), "secret").unwrap();
+        let secret_path = unrelated.path().join("secret.txt");
+
+        let err = enforce_read_scope_with_agent_dir(&secret_path, cwd.path(), agent_dir.path())
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("outside the working directory"),
+            "expected validation error, got: {err}"
+        );
     }
 
     #[test]
