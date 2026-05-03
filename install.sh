@@ -40,6 +40,7 @@ AGENT_SKILLS_ENABLED="${AGENT_SKILLS_ENABLED:-1}"
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
+SOURCE_DIR="${SOURCE_DIR:-}"
 SIGSTORE_BUNDLE_URL="${SIGSTORE_BUNDLE_URL:-}"
 COSIGN_IDENTITY_RE="${COSIGN_IDENTITY_RE:-^https://github.com/${OWNER}/${REPO}/.github/workflows/release.yml@refs/tags/.*$}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
@@ -649,6 +650,10 @@ Options:
   --sigstore-bundle-url URL
                           URL to Sigstore bundle (.sigstore.json)
   --from-source          Build from source instead of downloading release binary
+  --source-dir DIR       Build from a local pi_agent_rust checkout instead of cloning;
+                          implies --from-source. Useful when iterating locally,
+                          when the desired commit isn't tagged, or on platforms
+                          without prebuilt binaries (e.g. FreeBSD).
   --verify               Run `pi --version` after install
   --no-verify            Skip checksum + signature verification
   --offline [TARBALL]    Offline mode; optional local artifact path
@@ -736,6 +741,16 @@ while [ $# -gt 0 ]; do
     --from-source)
       FROM_SOURCE=1
       shift
+      ;;
+    --source-dir)
+      if [ $# -lt 2 ]; then
+        err "Option --source-dir requires a value"
+        usage
+        exit 1
+      fi
+      SOURCE_DIR="$2"
+      FROM_SOURCE=1
+      shift 2
       ;;
     --verify)
       VERIFY=1
@@ -1195,8 +1210,8 @@ validate_options() {
     exit 1
   fi
 
-  if [ "$OFFLINE" -eq 1 ] && [ "$FROM_SOURCE" -eq 1 ]; then
-    err "--offline cannot be combined with --from-source (source build needs network access)"
+  if [ "$OFFLINE" -eq 1 ] && [ "$FROM_SOURCE" -eq 1 ] && [ -z "$SOURCE_DIR" ]; then
+    err "--offline cannot be combined with --from-source unless --source-dir is also set (the clone step needs network access)"
     exit 1
   fi
 
@@ -1760,13 +1775,35 @@ download_release_binary() {
 }
 
 build_from_source() {
-  if [ "$OFFLINE" -eq 1 ]; then
-    err "Offline mode cannot build from source (network access required)"
-    return 1
+  local src_dir
+
+  if [ -n "$SOURCE_DIR" ]; then
+    # Local-source build path: skip the clone, validate the directory, build in place.
+    if [ ! -d "$SOURCE_DIR" ]; then
+      err "--source-dir path does not exist or is not a directory: $SOURCE_DIR"
+      return 1
+    fi
+    src_dir=$(cd "$SOURCE_DIR" && pwd) || {
+      err "Could not resolve --source-dir path: $SOURCE_DIR"
+      return 1
+    }
+    if [ ! -f "$src_dir/Cargo.toml" ]; then
+      err "--source-dir does not contain Cargo.toml: $src_dir"
+      return 1
+    fi
+    if ! grep -q '^name *= *"pi_agent_rust"' "$src_dir/Cargo.toml"; then
+      err "--source-dir does not look like a pi_agent_rust checkout (Cargo.toml package name mismatch): $src_dir"
+      return 1
+    fi
+  else
+    if [ "$OFFLINE" -eq 1 ]; then
+      err "Offline mode cannot build from source (network access required)"
+      return 1
+    fi
+    src_dir="$TMP/src"
+    git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir" >&2
   fi
 
-  local src_dir="$TMP/src"
-  git clone --depth 1 --branch "$VERSION" "https://github.com/${OWNER}/${REPO}.git" "$src_dir" >&2
   (cd "$src_dir" && cargo build --release --locked --bin pi >&2)
 
   local built_bin="$src_dir/target/release/pi${EXE_EXT}"
