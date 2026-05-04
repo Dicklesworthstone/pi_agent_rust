@@ -440,6 +440,15 @@ pub struct Cli {
     #[arg(long, env = "PI_HIDE_CWD_IN_PROMPT")]
     pub hide_cwd_in_prompt: bool,
 
+    // === Agent execution ===
+    /// Maximum tool-call iterations per turn before the agent stops.
+    ///
+    /// When unset, falls back to PI_MAX_TOOL_ITERATIONS env var, then to 50.
+    /// Higher values let long, multi-step tasks complete; lower values cap
+    /// runaway loops. Clamped to [1, 1000].
+    #[arg(long)]
+    pub max_tool_iterations: Option<usize>,
+
     // === Export & Listing ===
     /// Export session file to HTML
     #[arg(long)]

@@ -12,6 +12,26 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ---
 
+## [Unreleased]
+
+### Features
+
+- **Tool-iteration cap is now configurable** — added `--max-tool-iterations <N>`
+  CLI flag and `PI_MAX_TOOL_ITERATIONS` env var. Both override the historical
+  hardcoded default of 50. Clamped to `[1, 1000]`; invalid or zero values fall
+  back to 50 with a warning. Without this, long multi-step agentic tasks (e.g.,
+  multi-file refactors, multi-phase spec implementations) were forcibly stopped
+  with no graceful handoff.
+- **Soft handoff warning at 80% of the iteration cap** — when an agent crosses
+  `(max * 4) / 5` tool iterations, the runtime injects a one-shot steering
+  message ("Tool-iteration budget at ≥80%; begin graceful handoff per spec…")
+  so the agent can self-pace into an `incomplete-handoff` envelope rather than
+  being silently killed at the cap. Skipped for caps below 5 to avoid noise on
+  tiny ceilings. Pairs with `--max-tool-iterations` to make spec-first
+  iteration-aware-handoff protocols actually self-enforceable.
+
+---
+
 ## [v0.1.15] — 2026-05-02 — Release
 
 ### Bug Fixes

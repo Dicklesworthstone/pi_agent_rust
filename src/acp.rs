@@ -989,7 +989,7 @@ async fn handle_session_new(
 
     let agent_config = crate::agent::AgentConfig {
         system_prompt: Some(system_prompt),
-        max_tool_iterations: 50,
+        max_tool_iterations: crate::agent::max_tool_iterations_default(),
         stream_options,
         block_images: options.config.image_block_images(),
         fail_closed_hooks: options.config.fail_closed_hooks(),

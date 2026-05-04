@@ -350,7 +350,7 @@ impl Default for SessionOptions {
             extension_policy: None,
             repair_policy: None,
             include_cwd_in_prompt: true,
-            max_tool_iterations: 50,
+            max_tool_iterations: crate::agent::max_tool_iterations_default(),
             tool_factory: None,
             on_event: None,
             on_tool_start: None,

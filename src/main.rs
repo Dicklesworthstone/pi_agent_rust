@@ -1305,7 +1305,9 @@ async fn run(
         pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
     let agent_config = AgentConfig {
         system_prompt: Some(system_prompt),
-        max_tool_iterations: 50,
+        max_tool_iterations: cli
+            .max_tool_iterations
+            .unwrap_or_else(pi::agent::max_tool_iterations_default),
         stream_options,
         block_images: config.image_block_images(),
         fail_closed_hooks: config.fail_closed_hooks(),
