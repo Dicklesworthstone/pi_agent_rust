@@ -995,7 +995,12 @@ async fn handle_session_new(
         fail_closed_hooks: options.config.fail_closed_hooks(),
     };
 
-    let agent = crate::agent::Agent::new(provider, tools, agent_config);
+    let mut agent = crate::agent::Agent::new(provider, tools, agent_config);
+    if let Some(client) =
+        crate::c137_blink::start_session(&cwd, options.runtime_handle.clone())
+    {
+        agent.set_blink_client(client);
+    }
     let session_arc = Arc::new(Mutex::new(session));
     let compaction_settings = ResolvedCompactionSettings {
         enabled: options.config.compaction_enabled(),

@@ -1321,8 +1321,12 @@ async fn run(
         keep_recent_tokens: config.compaction_keep_recent_tokens(),
         context_window_tokens: context_window_tokens_for_entry(&selection.model_entry),
     };
+    let mut agent = Agent::new(provider, tools, agent_config);
+    if let Some(client) = pi::c137_blink::start_session(&cwd, runtime_handle.clone()) {
+        agent.set_blink_client(client);
+    }
     let mut agent_session = AgentSession::new(
-        Agent::new(provider, tools, agent_config),
+        agent,
         session_arc,
         !cli.no_session,
         compaction_settings,

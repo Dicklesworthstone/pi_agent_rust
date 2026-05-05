@@ -1765,8 +1765,14 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         context_window_tokens,
     };
 
+    let mut agent = Agent::new(provider, tools, agent_config);
+    if let Some(runtime_handle) = asupersync::runtime::Runtime::current_handle() {
+        if let Some(client) = crate::c137_blink::start_session(&cwd, runtime_handle) {
+            agent.set_blink_client(client);
+        }
+    }
     let mut agent_session = AgentSession::new(
-        Agent::new(provider, tools, agent_config),
+        agent,
         Arc::clone(&session_arc),
         !cli.no_session,
         compaction_settings,

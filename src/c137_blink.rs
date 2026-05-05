@@ -4,7 +4,7 @@
 //! unreachable, or restarted, Pi continues normally and blink events may be
 //! dropped. The broker wire protocol is newline-delimited JSON.
 
-use crate::model::{Message, UserContent, UserMessage};
+use crate::model::{AssistantMessage, ContentBlock, Message, UserContent, UserMessage};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::net::unix::UnixStream;
 use asupersync::runtime::RuntimeHandle;
@@ -161,6 +161,18 @@ impl BlinkClient {
     }
 }
 
+/// One-shot wire-up helper: build hello fields, start the broker client,
+/// emit `SessionStart`, and return the client ready to hand to
+/// `Agent::set_blink_client`. Returns `None` when `C137_BLINK_BROKER` is
+/// unset (the no-broker case is silent by design).
+pub fn start_session(cwd: &Path, runtime_handle: RuntimeHandle) -> Option<Arc<BlinkClient>> {
+    let hello = make_hello_fields(cwd);
+    let cwd_str = hello.cwd.clone();
+    let client = BlinkClient::start(hello, runtime_handle)?;
+    client.emit(BlinkEvent::SessionStart { cwd: cwd_str });
+    Some(Arc::new(client))
+}
+
 pub fn make_hello_fields(cwd: &Path) -> HelloFields {
     let project = derive_project_name(cwd);
     let ts = now_ms();
@@ -179,6 +191,39 @@ pub fn derive_project_name(cwd: &Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("unknown")
         .to_string()
+}
+
+/// Bytes of the most recent user message's text content. Returns 0 if no user
+/// message is present. Per c137-blink spec: `prompt_size` on `agent_start`.
+pub fn prompt_size_bytes(messages: &[Message]) -> usize {
+    for msg in messages.iter().rev() {
+        if let Message::User(UserMessage { content, .. }) = msg {
+            return match content {
+                UserContent::Text(text) => text.len(),
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|block| match block {
+                        ContentBlock::Text(t) => t.text.len(),
+                        _ => 0,
+                    })
+                    .sum(),
+            };
+        }
+    }
+    0
+}
+
+/// Bytes of an assistant message's text content (sum of all text blocks).
+/// Per c137-blink spec: `last_assistant_size` on `agent_end`.
+pub fn assistant_text_size(message: &AssistantMessage) -> usize {
+    message
+        .content
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text(t) => t.text.len(),
+            _ => 0,
+        })
+        .sum()
 }
 
 pub fn hint_to_steering_message(hint: &Hint) -> Message {
@@ -458,10 +503,11 @@ not-json
             let queue = Arc::new(ArrayQueue::new(4));
             queue.push(BlinkEvent::SessionStart { cwd: "/tmp/demo".to_string() }).expect("queue event");
             let (hint_tx, _hint_rx) = mpsc::sync_channel(4);
-            let shutdown = AtomicBool::new(false);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let task_shutdown = Arc::clone(&shutdown);
 
             let join = runtime.handle().spawn(async move {
-                run_connected(client, &fields, &queue, &hint_tx, &shutdown).await
+                run_connected(client, &fields, &queue, &hint_tx, &task_shutdown).await
             });
 
             let mut buf = [0u8; 512];

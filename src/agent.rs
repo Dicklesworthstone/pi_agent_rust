@@ -13,7 +13,9 @@
 //! 5. If done: return final message
 
 use crate::auth::AuthStorage;
-use crate::c137_blink::{BlinkClient, BlinkEvent, hint_to_steering_message};
+use crate::c137_blink::{
+    BlinkClient, BlinkEvent, assistant_text_size, hint_to_steering_message, prompt_size_bytes,
+};
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
 use crate::error::{Error, Result};
