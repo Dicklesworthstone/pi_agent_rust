@@ -13,6 +13,7 @@
 //! 5. If done: return final message
 
 use crate::auth::AuthStorage;
+use crate::c137_blink::{BlinkClient, BlinkEvent, hint_to_steering_message};
 use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{CompactionQuota, CompactionWorkerState};
 use crate::error::{Error, Result};
@@ -54,6 +55,7 @@ use serde_json::{Value, json};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -573,6 +575,9 @@ pub struct Agent {
     /// Internal queue for steering/follow-up messages.
     message_queue: MessageQueue,
 
+    /// Optional c137-blink client for lifecycle events and inbound hints.
+    blink_client: Option<Arc<BlinkClient>>,
+
     /// Cached tool definitions. Invalidated when tools change via `extend_tools`.
     cached_tool_defs: Option<Vec<ToolDef>>,
 }
@@ -589,6 +594,7 @@ impl Agent {
             steering_fetchers: Vec::new(),
             follow_up_fetchers: Vec::new(),
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
+            blink_client: None,
             cached_tool_defs: None,
         }
     }
@@ -641,6 +647,22 @@ impl Agent {
         if let Some(fetcher) = follow_up {
             self.follow_up_fetchers.push(fetcher);
         }
+    }
+
+    /// Attach a c137-blink client and register its inbound hints as steering messages.
+    pub fn set_blink_client(&mut self, client: Arc<BlinkClient>) {
+        let hint_client = Arc::clone(&client);
+        self.blink_client = Some(client);
+        self.steering_fetchers.push(Arc::new(move || {
+            let hint_client = Arc::clone(&hint_client);
+            Box::pin(async move {
+                hint_client
+                    .drain_hints()
+                    .into_iter()
+                    .map(|hint| hint_to_steering_message(&hint))
+                    .collect()
+            })
+        }));
     }
 
     /// Extend the tool registry with additional tools (e.g. extension-registered tools).
@@ -894,6 +916,14 @@ impl Agent {
         on_event: AgentEventHandler,
         abort: Option<AbortSignal>,
     ) -> Result<AssistantMessage> {
+        let turn_started_at = Instant::now();
+        let blink_prompt_size = prompt_size_bytes(&prompts);
+        let blink_client = self.blink_client.clone();
+        if let Some(client) = &blink_client {
+            client.emit(BlinkEvent::AgentStart {
+                prompt_size: blink_prompt_size,
+            });
+        }
         let loop_cx = crate::agent_cx::AgentCx::for_current_or_request();
         let session_id: Arc<str> = self
             .config
@@ -990,6 +1020,12 @@ impl Agent {
                     self.dispatch_extension_lifecycle_event(&agent_end_event)
                         .await;
                     on_event(agent_end_event);
+                    if let Some(client) = &blink_client {
+                        client.emit(BlinkEvent::AgentEnd {
+                            duration_ms: turn_started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                            last_assistant_size: assistant_text_size(&abort_message),
+                        });
+                    }
                     return Ok(abort_message);
                 }
 
@@ -1278,6 +1314,12 @@ impl Agent {
         self.dispatch_extension_lifecycle_event(&agent_end_event)
             .await;
         on_event(agent_end_event);
+        if let Some(client) = &blink_client {
+            client.emit(BlinkEvent::AgentEnd {
+                duration_ms: turn_started_at.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                last_assistant_size: assistant_text_size(&final_arc),
+            });
+        }
         Ok(Arc::unwrap_or_clone(final_arc))
     }
 
@@ -2129,6 +2171,13 @@ impl Agent {
 
         // Phase 1: Emit start events for ALL tools up front.
         for tool_call in tool_calls {
+            if let Some(client) = &self.blink_client {
+                client.emit(BlinkEvent::ToolExecutionStart {
+                    tool: tool_call.name.clone(),
+                    tool_call_id: Some(tool_call.id.clone()),
+                    input_size: serde_json::to_vec(&tool_call.arguments).map_or(0, |bytes| bytes.len()),
+                });
+            }
             on_event(AgentEvent::ToolExecutionStart {
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
@@ -2364,6 +2413,15 @@ impl Agent {
             is_error,
             timestamp: Utc::now().timestamp_millis(),
         });
+
+        if let Some(client) = &self.blink_client {
+            client.emit(BlinkEvent::ToolResult {
+                tool: tool_call.name.clone(),
+                tool_call_id: Some(tool_call.id.clone()),
+                input_size: serde_json::to_vec(&tool_call.arguments).map_or(0, |bytes| bytes.len()),
+                response_size: serde_json::to_vec(&*tool_result).map_or(0, |bytes| bytes.len()),
+            });
+        }
 
         on_event(AgentEvent::ToolExecutionEnd {
             tool_call_id: tool_result.tool_call_id.clone(),

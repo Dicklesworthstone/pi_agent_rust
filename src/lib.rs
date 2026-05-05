@@ -70,6 +70,8 @@ pub mod buffer_shim;
 #[doc(hidden)]
 pub mod cli;
 #[doc(hidden)]
+pub mod c137_blink;
+#[doc(hidden)]
 pub mod compaction;
 #[doc(hidden)]
 pub mod compaction_worker;
