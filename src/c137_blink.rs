@@ -5,7 +5,7 @@
 //! dropped. The broker wire protocol is newline-delimited JSON.
 
 use crate::model::{AssistantMessage, ContentBlock, Message, UserContent, UserMessage};
-use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use asupersync::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use asupersync::net::unix::UnixStream;
 use asupersync::runtime::RuntimeHandle;
 use chrono::Utc;
@@ -328,35 +328,25 @@ async fn run_connection_task(
     hint_tx: mpsc::SyncSender<Hint>,
     shutdown: Arc<AtomicBool>,
 ) {
-    let mut state = ConnectionState::Disconnected;
     let mut backoff_index = 0usize;
     while !shutdown.load(Ordering::Relaxed) {
-        state = match state {
-            ConnectionState::Disconnected | ConnectionState::Reconnecting => ConnectionState::Connecting,
-            other => other,
-        };
-        let stream = UnixStream::connect(&broker).await;
-        match stream {
+        let should_backoff = match UnixStream::connect(&broker).await {
             Ok(stream) => {
-                state = ConnectionState::Connected;
                 backoff_index = 0;
-                if run_connected(stream, &hello, &event_queue, &hint_tx, &shutdown)
+                run_connected(stream, &hello, &event_queue, &hint_tx, &shutdown)
                     .await
                     .is_err()
-                {
-                    state = ConnectionState::Reconnecting;
-                }
             }
-            Err(_) => {
-                state = ConnectionState::Reconnecting;
-            }
-        }
-        if matches!(state, ConnectionState::Reconnecting | ConnectionState::Connecting)
-            && !shutdown.load(Ordering::Relaxed)
-        {
+            Err(_) => true,
+        };
+        if should_backoff && !shutdown.load(Ordering::Relaxed) {
             let delay_ms = BACKOFF_MS[backoff_index.min(BACKOFF_MS.len() - 1)];
             backoff_index = backoff_index.saturating_add(1);
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(delay_ms)).await;
+            asupersync::time::sleep(
+                asupersync::time::wall_now(),
+                Duration::from_millis(delay_ms),
+            )
+            .await;
         }
     }
 }
@@ -385,17 +375,29 @@ async fn run_connected(
             write_ndjson(&mut writer, &encode_event(hello, &event, now_ms())).await?;
         }
 
-        match reader.read(&mut read_buf).await {
-            Ok(0) => return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "blink broker closed")),
-            Ok(n) => {
+        use futures::future::{Either, FutureExt, select};
+
+        let read_fut = reader.read(&mut read_buf).fuse();
+        let tick_fut =
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).fuse();
+        futures::pin_mut!(read_fut, tick_fut);
+
+        match select(read_fut, tick_fut).await {
+            Either::Left((Ok(0), _)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "blink broker closed",
+                ));
+            }
+            Either::Left((Ok(n), _)) => {
                 for hint in decoder.push(&read_buf[..n]) {
                     let _ = hint_tx.try_send(hint);
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(err) => return Err(err),
+            Either::Left((Err(err), _)) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+            Either::Left((Err(err), _)) => return Err(err),
+            Either::Right(((), _)) => {}
         }
-        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(25)).await;
     }
 }
 
