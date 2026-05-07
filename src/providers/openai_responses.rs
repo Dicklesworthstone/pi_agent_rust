@@ -1142,7 +1142,7 @@ where
                 ContentBlock::ToolCall(_) => {
                     Some(TerminalContentSnapshot::ToolCall { content_index })
                 }
-                ContentBlock::Image(_) => None,
+                ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
             })
             .collect()
     }

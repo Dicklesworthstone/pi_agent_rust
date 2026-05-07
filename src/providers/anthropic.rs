@@ -7,8 +7,8 @@ use crate::auth::unmark_anthropic_oauth_bearer_token;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, StopReason, StreamEvent, TextContent, ThinkingContent,
-    ThinkingLevel, ToolCall, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopReason, StreamEvent,
+    TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
@@ -791,6 +791,12 @@ where
                 }));
                 StreamEvent::ToolCallStart { content_index }
             }
+            AnthropicContentBlock::RedactedThinking { data } => {
+                self.partial
+                    .content
+                    .push(ContentBlock::RedactedThinking(RedactedThinkingContent { data }));
+                StreamEvent::ThinkingStart { content_index }
+            }
         }
     }
 
@@ -906,6 +912,10 @@ where
                     None
                 }
             }
+            Some(ContentBlock::RedactedThinking(_)) => Some(StreamEvent::ThinkingEnd {
+                content_index: idx,
+                content: String::new(),
+            }),
             _ => None,
         }
     }
@@ -1083,6 +1093,10 @@ enum AnthropicContentBlock {
         #[serde(default)]
         name: Option<String>,
     },
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
 }
 
 /// Per-token delta from the Anthropic streaming API.
@@ -1225,7 +1239,7 @@ fn convert_content_block_to_anthropic(block: &ContentBlock) -> Option<AnthropicC
                     signature: sig,
                 })
         }
-        ContentBlock::Image(_) => None,
+        ContentBlock::Image(_) | ContentBlock::RedactedThinking(_) => None,
     }
 }
 

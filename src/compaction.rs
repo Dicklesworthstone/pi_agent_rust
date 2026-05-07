@@ -427,6 +427,7 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
                             chars = chars.saturating_add(call.name.len());
                             chars = chars.saturating_add(json_byte_len(&call.arguments));
                         }
+                        ContentBlock::RedactedThinking(_) => {}
                     }
                 }
             }
@@ -447,6 +448,7 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
                         chars = chars.saturating_add(call.name.len());
                         chars = chars.saturating_add(json_byte_len(&call.arguments));
                     }
+                    ContentBlock::RedactedThinking(_) => {}
                 }
             }
         }
@@ -466,6 +468,7 @@ fn estimate_tokens(message: &SessionMessage) -> u64 {
                         chars = chars.saturating_add(call.name.len());
                         chars = chars.saturating_add(json_byte_len(&call.arguments));
                     }
+                    ContentBlock::RedactedThinking(_) => {}
                 }
             }
         }
@@ -704,6 +707,7 @@ fn assistant_content_flags(assistant: &AssistantMessage) -> (bool, bool, bool) {
             ContentBlock::Text(_) => has_text = true,
             ContentBlock::ToolCall(_) => has_tools = true,
             ContentBlock::Image(_) => {}
+            ContentBlock::RedactedThinking(_) => {}
         }
     }
     (has_thinking, has_text, has_tools)

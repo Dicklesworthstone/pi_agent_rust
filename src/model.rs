@@ -139,6 +139,9 @@ pub enum ContentBlock {
     Text(TextContent),
     /// Provider “thinking” / reasoning (if enabled).
     Thinking(ThinkingContent),
+    /// Provider-redacted thinking marker with opaque data.
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking(RedactedThinkingContent),
     /// An inline image (base64 + MIME type).
     Image(ImageContent),
     /// A request to call a tool with JSON arguments.
@@ -170,6 +173,13 @@ pub struct ThinkingContent {
     pub thinking: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_signature: Option<String>,
+}
+
+/// Redacted thinking marker content block.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactedThinkingContent {
+    pub data: String,
 }
 
 /// Image content block.
@@ -876,6 +886,61 @@ mod tests {
         let json = serde_json::to_string(&block).expect("serialize");
         let parsed: ContentBlock = serde_json::from_str(&json).expect("deserialize");
         assert!(matches!(parsed, ContentBlock::Thinking(t) if t.thinking == "reasoning..."));
+    }
+
+    #[test]
+    fn content_block_redacted_thinking_roundtrip() {
+        // OpenRouter (and Anthropic for safety-redacted thinking) emit
+        // {"type":"redacted_thinking","data":"<opaque>"} blocks. pi must
+        // accept them without crashing the deserializer.
+        let json_in = json!({"type": "redacted_thinking", "data": "OPAQUE_REDACTION_BLOB"});
+        let parsed: ContentBlock = serde_json::from_value(json_in).expect("deserialize");
+        match &parsed {
+            ContentBlock::RedactedThinking(rt) => {
+                assert_eq!(rt.data, "OPAQUE_REDACTION_BLOB");
+            }
+            _ => panic!("expected RedactedThinking variant, got {parsed:?}"),
+        }
+        // Round-trip preserves the data field on re-serialization.
+        let reserialized = serde_json::to_value(&parsed).expect("re-serialize");
+        assert_eq!(reserialized["type"], "redacted_thinking");
+        assert_eq!(reserialized["data"], "OPAQUE_REDACTION_BLOB");
+    }
+
+    #[test]
+    fn content_block_redacted_thinking_in_assistant_message() {
+        // Mixed content: text + redacted_thinking + text. Round-trip through
+        // serde to exercise the deserializer on a realistic message shape —
+        // the kind OpenRouter sends back when its upstream produced redacted reasoning.
+        let original = AssistantMessage {
+            content: vec![
+                ContentBlock::Text(TextContent::new("Before.")),
+                ContentBlock::RedactedThinking(RedactedThinkingContent {
+                    data: "REDACTED".to_string(),
+                }),
+                ContentBlock::Text(TextContent::new("After.")),
+            ],
+            ..AssistantMessage::default()
+        };
+        let serialized = serde_json::to_value(&original).expect("serialize");
+        let parsed: AssistantMessage = serde_json::from_value(serialized).expect("deserialize");
+        assert_eq!(parsed.content.len(), 3);
+        assert!(matches!(parsed.content[0], ContentBlock::Text(_)));
+        assert!(matches!(parsed.content[1], ContentBlock::RedactedThinking(_)));
+        assert!(matches!(parsed.content[2], ContentBlock::Text(_)));
+    }
+
+    #[test]
+    fn content_block_redacted_thinking_unknown_field_tolerated() {
+        // Forward compatibility: if Anthropic ever adds a sibling field
+        // (e.g. a marker_id) we should still deserialize the block, not panic.
+        let json = json!({
+            "type": "redacted_thinking",
+            "data": "OPAQUE",
+            "futureFieldFromUpstream": "ignore me"
+        });
+        let parsed: ContentBlock = serde_json::from_value(json).expect("deserialize");
+        assert!(matches!(parsed, ContentBlock::RedactedThinking(_)));
     }
 
     #[test]

@@ -52,6 +52,7 @@ pub(super) fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::ToolCall(call) => {
                 push_line(&mut output, &format!("[tool call: {}]", call.name));
             }
+            ContentBlock::RedactedThinking(_) => {}
         }
     }
     output
@@ -108,6 +109,7 @@ pub(super) fn tool_content_blocks_to_text(blocks: &[ContentBlock], show_images: 
             ContentBlock::ToolCall(call) => {
                 push_line(&mut output, &format!("[tool call: {}]", call.name));
             }
+            ContentBlock::RedactedThinking(_) => {}
         }
     }
 

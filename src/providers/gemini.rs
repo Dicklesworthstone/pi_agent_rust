@@ -986,7 +986,9 @@ pub(crate) fn convert_message_to_gemini(message: &Message) -> Vec<GeminiContent>
                             },
                         });
                     }
-                    ContentBlock::Thinking(_) | ContentBlock::Image(_) => {
+                    ContentBlock::Thinking(_)
+                    | ContentBlock::Image(_)
+                    | ContentBlock::RedactedThinking(_) => {
                         // Skip thinking blocks and images in assistant output
                     }
                 }

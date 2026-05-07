@@ -4162,6 +4162,7 @@ fn render_blocks(blocks: &[ContentBlock]) -> String {
                     escape_html(&args)
                 );
             }
+            ContentBlock::RedactedThinking(_) => {}
         }
     }
     html
@@ -4203,6 +4204,7 @@ fn content_blocks_to_text(blocks: &[ContentBlock]) -> String {
             ContentBlock::ToolCall(call) => {
                 push_line(&mut output, &format!("[tool call: {}]", call.name));
             }
+            ContentBlock::RedactedThinking(_) => {}
         }
     }
     output
