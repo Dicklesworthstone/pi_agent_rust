@@ -870,6 +870,13 @@ where
     fn handle_content_block_stop(&mut self, index: u32) -> Option<StreamEvent> {
         let idx = index as usize;
 
+        // ToolCall finalization needs to potentially mutate self.partial.{stop_reason,
+        // error_message} and mem::take the partial on truncation, which conflicts with
+        // a &mut borrow on self.partial.content held by a match arm. Dispatch first.
+        if matches!(self.partial.content.get(idx), Some(ContentBlock::ToolCall(_))) {
+            return self.finalize_tool_call_block(index, idx);
+        }
+
         match self.partial.content.get_mut(idx) {
             Some(ContentBlock::Text(t)) => {
                 // Clone the accumulated text from the partial for the TextEnd event.
@@ -889,40 +896,74 @@ where
                     content,
                 })
             }
-            Some(ContentBlock::ToolCall(tc)) => {
-                if let Some(accum) = self.tool_accums.remove(&index) {
-                    let arguments: serde_json::Value = match serde_json::from_str(&accum.json) {
-                        Ok(args) => args,
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                raw = %accum.json,
-                                "Failed to parse tool arguments as JSON"
-                            );
-                            serde_json::Value::Null
-                        }
-                    };
-                    let tool_call = ToolCall {
-                        id: accum.id,
-                        name: accum.name,
-                        arguments: arguments.clone(),
-                        thought_signature: None,
-                    };
-                    tc.arguments = arguments;
-
-                    Some(StreamEvent::ToolCallEnd {
-                        content_index: idx,
-                        tool_call,
-                    })
-                } else {
-                    None
-                }
-            }
             Some(ContentBlock::RedactedThinking(_)) => Some(StreamEvent::ThinkingEnd {
                 content_index: idx,
                 content: String::new(),
             }),
             _ => None,
+        }
+    }
+
+    fn finalize_tool_call_block(&mut self, index: u32, idx: usize) -> Option<StreamEvent> {
+        let accum = self.tool_accums.remove(&index)?;
+
+        // Empty accum means no input_json_delta arrived — this is a legitimate
+        // tool call with no arguments. Anthropic's validator requires `input` to
+        // be an object, so normalize to {} rather than null.
+        let parsed = if accum.json.trim().is_empty() {
+            Ok(serde_json::Value::Object(serde_json::Map::new()))
+        } else {
+            serde_json::from_str::<serde_json::Value>(&accum.json)
+        };
+
+        match parsed {
+            Ok(args) => {
+                if let Some(ContentBlock::ToolCall(tc)) = self.partial.content.get_mut(idx) {
+                    tc.arguments = args.clone();
+                }
+                let tool_call = ToolCall {
+                    id: accum.id,
+                    name: accum.name,
+                    arguments: args,
+                    thought_signature: None,
+                };
+                Some(StreamEvent::ToolCallEnd {
+                    content_index: idx,
+                    tool_call,
+                })
+            }
+            Err(e) => {
+                // The accumulator collected a non-empty but unparseable string —
+                // the SSE stream cut off mid-tool-call (typically max_tokens or
+                // thinking-budget exhaustion mid-`partial_json`). Falling back to
+                // Value::Null here historically caused HTTP 400s on the next turn
+                // because Anthropic rejects `tool_use.input: null` in message
+                // history. Replace the malformed args with `{}` so the partial is
+                // structurally valid even if a consumer commits it, and surface a
+                // StreamEvent::Error so the agent loop can stop the turn cleanly.
+                tracing::error!(
+                    error = %e,
+                    raw = %accum.json,
+                    tool_name = %accum.name,
+                    tool_id = %accum.id,
+                    "tool_use stream truncated mid-input; aborting assistant turn"
+                );
+                if let Some(ContentBlock::ToolCall(tc)) = self.partial.content.get_mut(idx) {
+                    tc.arguments = serde_json::Value::Object(serde_json::Map::new());
+                }
+                let msg = format!(
+                    "tool_use input for `{}` (id `{}`) was truncated mid-stream; \
+                     aborting turn to avoid sending malformed tool_use to the API on retry. \
+                     Underlying parse error: {e}. Raw partial accumulator: {}",
+                    accum.name, accum.id, accum.json
+                );
+                self.partial.stop_reason = StopReason::Error;
+                self.partial.error_message = Some(msg);
+                Some(StreamEvent::Error {
+                    reason: StopReason::Error,
+                    error: std::mem::take(&mut self.partial),
+                })
+            }
         }
     }
 
@@ -1569,6 +1610,131 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn test_truncated_tool_input_emits_error_with_empty_object_arguments() {
+        // Simulates max_tokens cutting the stream off in the middle of a tool_use
+        // input_json_delta sequence: the partial accumulator collects only the
+        // opening of the JSON object before content_block_stop arrives.
+        // Pre-fix: pi-rust silently substituted Value::Null, then on the next
+        // turn Anthropic returned HTTP 400 for `tool_use.input: null`.
+        // Post-fix: a StreamEvent::Error is emitted, partial.arguments is {}.
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 3 } }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "tool_use", "id": "tool_trunc", "name": "write" }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "input_json_delta", "partial_json": "{\"path\": \"/tmp/x\"" }
+            }),
+            json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+        ];
+
+        let out = collect_events(&events);
+
+        let err_event = out
+            .iter()
+            .find(|e| matches!(e, StreamEvent::Error { .. }))
+            .expect("expected StreamEvent::Error after truncated tool_use");
+        if let StreamEvent::Error { reason, error } = err_event {
+            assert_eq!(*reason, StopReason::Error);
+            assert_eq!(error.stop_reason, StopReason::Error);
+            let err_msg = error
+                .error_message
+                .as_deref()
+                .expect("error_message populated");
+            assert!(
+                err_msg.contains("truncated") && err_msg.contains("write"),
+                "error_message should mention truncation and tool name, got: {err_msg}"
+            );
+            // The partial committed in the Error event must have a structurally
+            // valid (object) input even after truncation, so any consumer that
+            // persists it does not produce a body Anthropic will reject.
+            let tool_block = error
+                .content
+                .iter()
+                .find(|c| matches!(c, ContentBlock::ToolCall(_)))
+                .expect("ToolCall block present in error partial");
+            if let ContentBlock::ToolCall(tc) = tool_block {
+                assert!(
+                    tc.arguments.is_object(),
+                    "truncated tool_use arguments must be an object, got: {:?}",
+                    tc.arguments
+                );
+                assert_eq!(
+                    tc.arguments,
+                    json!({}),
+                    "truncated tool_use arguments must be an empty object"
+                );
+            }
+        }
+
+        // No ToolCallEnd should be emitted for a truncated block — the agent
+        // loop must see Error, not a half-baked ToolCallEnd it might dispatch.
+        assert!(
+            !out.iter().any(|e| matches!(e, StreamEvent::ToolCallEnd { .. })),
+            "no ToolCallEnd should be emitted for truncated input"
+        );
+    }
+
+    #[test]
+    fn test_empty_tool_input_normalizes_to_empty_object() {
+        // A tool call with zero input_json_delta events (e.g. a no-arg tool)
+        // should finalize with `arguments: {}`, not null. Same Anthropic
+        // validator concern: `input` must be an object.
+        let events = vec![
+            json!({
+                "type": "message_start",
+                "message": { "usage": { "input_tokens": 3 } }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": { "type": "tool_use", "id": "tool_noargs", "name": "ping" }
+            }),
+            json!({
+                "type": "content_block_stop",
+                "index": 0
+            }),
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "tool_use" },
+                "usage": { "output_tokens": 1 }
+            }),
+            json!({
+                "type": "message_stop"
+            }),
+        ];
+
+        let out = collect_events(&events);
+
+        let end = out
+            .iter()
+            .find_map(|e| {
+                if let StreamEvent::ToolCallEnd { tool_call, .. } = e {
+                    Some(tool_call)
+                } else {
+                    None
+                }
+            })
+            .expect("ToolCallEnd emitted for no-args tool");
+        assert_eq!(end.name, "ping");
+        assert_eq!(end.arguments, json!({}));
+        assert!(
+            !out.iter().any(|e| matches!(e, StreamEvent::Error { .. })),
+            "no Error event should be emitted for legitimate no-args tool"
+        );
     }
 
     #[test]
