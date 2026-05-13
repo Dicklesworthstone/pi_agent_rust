@@ -131,6 +131,8 @@ pub struct StreamOptions {
     pub headers: HashMap<String, String>,
     pub thinking_level: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// HTTP request timeout in seconds. If None, uses model/provider/global/env/default hierarchy.
+    pub http_timeout_secs: Option<u64>,
 }
 
 /// Cache retention policy.

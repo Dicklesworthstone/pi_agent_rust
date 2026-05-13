@@ -41,6 +41,48 @@ const WRITE_ZERO_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 #[cfg(not(test))]
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
 
+/// Compute effective HTTP timeout from configuration hierarchy.
+///
+/// Priority (highest to lowest):
+/// 1. model_timeout_secs (from models.json per-model config)
+/// 2. provider_timeout_secs (from models.json per-provider config)
+/// 3. global_timeout_secs (from settings.json)
+/// 4. Environment variable PI_HTTP_REQUEST_TIMEOUT_SECS
+/// 5. DEFAULT_REQUEST_TIMEOUT_SECS (60 seconds)
+///
+/// A timeout of 0 disables timeout entirely (returns None).
+pub fn effective_http_timeout(
+    model_timeout_secs: Option<u64>,
+    provider_timeout_secs: Option<u64>,
+    global_timeout_secs: Option<u64>,
+) -> Option<std::time::Duration> {
+    #[cfg(test)]
+    {
+        // Disable timeouts in unit tests
+        let _ = (model_timeout_secs, provider_timeout_secs, global_timeout_secs);
+        return None;
+    }
+
+    #[cfg(not(test))]
+    {
+        let timeout_secs = model_timeout_secs
+            .or(provider_timeout_secs)
+            .or(global_timeout_secs)
+            .or_else(|| {
+                std::env::var("PI_HTTP_REQUEST_TIMEOUT_SECS")
+                    .ok()
+                    .and_then(|raw| raw.trim().parse::<u64>().ok())
+            })
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+
+        if timeout_secs == 0 {
+            None
+        } else {
+            Some(std::time::Duration::from_secs(timeout_secs))
+        }
+    }
+}
+
 fn default_request_timeout_from_env() -> Option<std::time::Duration> {
     #[cfg(test)]
     {

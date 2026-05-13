@@ -65,6 +65,11 @@ const GOOGLE_ANTIGRAVITY_PROJECT_DISCOVERY_ENDPOINTS: [&str; 2] = [
 const ANTHROPIC_OAUTH_BEARER_MARKER: &str = "__pi_anthropic_oauth_bearer__:";
 
 // ── GitHub / Copilot OAuth constants ──────────────────────────────
+/// Official VS Code / Copilot CLI OAuth client ID (legacy OAuth App).
+/// This client ID is required for successful token exchange at copilot_internal/v2/token.
+/// Source: https://github.com/microsoft/vscode (official Copilot integration)
+// ubs:ignore public OAuth client ID, not a secret.
+const GITHUB_COPILOT_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
 const GITHUB_OAUTH_AUTHORIZE_URL: &str = "https://github.com/login/oauth/authorize";
 // ubs:ignore public OAuth endpoint metadata, not credential material.
 const GITHUB_OAUTH_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
@@ -2884,7 +2889,7 @@ pub struct CopilotOAuthConfig {
 impl Default for CopilotOAuthConfig {
     fn default() -> Self {
         Self {
-            client_id: String::new(),
+            client_id: GITHUB_COPILOT_CLIENT_ID.to_string(),
             github_base_url: "https://github.com".to_string(),
             scopes: GITHUB_COPILOT_SCOPES.to_string(),
         }
@@ -7891,7 +7896,7 @@ mod tests {
     #[test]
     fn test_copilot_config_default() {
         let config = CopilotOAuthConfig::default();
-        assert!(config.client_id.is_empty());
+        assert_eq!(config.client_id, GITHUB_COPILOT_CLIENT_ID);
         assert_eq!(config.github_base_url, "https://github.com");
         assert_eq!(config.scopes, GITHUB_COPILOT_SCOPES);
     }

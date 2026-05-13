@@ -364,3 +364,4 @@ module_name_repetitions = "allow"
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
 # sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
 # sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }
+[workspace]

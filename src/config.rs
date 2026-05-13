@@ -91,6 +91,13 @@ pub struct Config {
     // Retry Configuration
     pub retry: Option<RetrySettings>,
 
+    // HTTP Configuration
+    /// Global HTTP request timeout in seconds. Overrides the default 60-second timeout.
+    /// Can be overridden per-provider or per-model in models.json.
+    /// Setting to 0 disables timeout entirely.
+    #[serde(alias = "httpTimeout", alias = "httpTimeoutSecs")]
+    pub http_timeout_secs: Option<u64>,
+
     // Shell
     #[serde(alias = "shellPath")]
     pub shell_path: Option<String>,
@@ -524,6 +531,9 @@ impl Config {
 
             // Retry Configuration
             retry: merge_retry(base.retry, other.retry),
+
+            // HTTP Configuration
+            http_timeout_secs: other.http_timeout_secs.or(base.http_timeout_secs),
 
             // Shell
             shell_path: other.shell_path.or(base.shell_path),

@@ -28900,6 +28900,7 @@ impl ExtensionManager {
                     auth_header: true,
                     compat: None,
                     oauth_config: oauth_config.clone(),
+                    http_timeout_secs: None,
                 });
             }
         }

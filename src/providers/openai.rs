@@ -104,6 +104,7 @@ pub struct OpenAIProvider {
     base_url: String,
     provider: String,
     compat: Option<CompatConfig>,
+    http_timeout_secs: Option<u64>,
 }
 
 impl OpenAIProvider {
@@ -115,6 +116,7 @@ impl OpenAIProvider {
             base_url: OPENAI_API_URL.to_string(),
             provider: "openai".to_string(),
             compat: None,
+            http_timeout_secs: None,
         }
     }
 
@@ -149,6 +151,13 @@ impl OpenAIProvider {
     #[must_use]
     pub fn with_compat(mut self, compat: Option<CompatConfig>) -> Self {
         self.compat = compat;
+        self
+    }
+
+    /// Set HTTP request timeout in seconds for this provider.
+    #[must_use]
+    pub fn with_http_timeout_secs(mut self, timeout_secs: Option<u64>) -> Self {
+        self.http_timeout_secs = timeout_secs;
         self
     }
 
@@ -368,6 +377,15 @@ impl Provider for OpenAIProvider {
             &options.headers,
             &["authorization"],
         );
+
+        // Apply HTTP timeout from configuration hierarchy
+        if let Some(timeout) = crate::http::effective_http_timeout(
+            options.http_timeout_secs,
+            self.http_timeout_secs,
+            None, // Global timeout will be passed from provider factory
+        ) {
+            request = request.timeout(timeout);
+        }
 
         let request = request.json(&request_body)?;
 
