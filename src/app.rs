@@ -409,29 +409,39 @@ pub fn select_model_and_thinking(
             .cloned()
             .collect();
         if candidates.is_empty() {
-            bail!("No models available for provider {provider}");
-        }
-        let ready_candidates: Vec<ModelEntry> = candidates
-            .iter()
-            .filter(|entry| model_entry_is_ready(entry))
-            .cloned()
-            .collect();
-        let preferred_pool = if ready_candidates.is_empty() {
-            candidates.as_slice()
+            if let Some(default_model) = config
+                .default_model
+                .as_deref()
+                .or_else(|| default_model_from_provider_list(provider))
+            {
+                selected_model = crate::models::ad_hoc_model_entry(provider, default_model);
+            }
+            if selected_model.is_none() {
+                bail!("No models available for provider {provider}");
+            }
         } else {
-            ready_candidates.as_slice()
-        };
-        selected_model = config
-            .default_model
-            .as_deref()
-            .and_then(|default_model| registry.find(provider, default_model))
-            .filter(|found| {
-                preferred_pool.iter().any(|candidate| {
-                    candidate.model.id.eq_ignore_ascii_case(&found.model.id)
-                        && provider_ids_match(&candidate.model.provider, &found.model.provider)
+            let ready_candidates: Vec<ModelEntry> = candidates
+                .iter()
+                .filter(|entry| model_entry_is_ready(entry))
+                .cloned()
+                .collect();
+            let preferred_pool = if ready_candidates.is_empty() {
+                candidates.as_slice()
+            } else {
+                ready_candidates.as_slice()
+            };
+            selected_model = config
+                .default_model
+                .as_deref()
+                .and_then(|default_model| registry.find(provider, default_model))
+                .filter(|found| {
+                    preferred_pool.iter().any(|candidate| {
+                        candidate.model.id.eq_ignore_ascii_case(&found.model.id)
+                            && provider_ids_match(&candidate.model.provider, &found.model.provider)
+                    })
                 })
-            })
-            .or_else(|| Some(default_model_from_candidates(preferred_pool)));
+                .or_else(|| Some(default_model_from_candidates(preferred_pool)));
+        }
     } else if let Some(model_id) = cli.model.as_deref() {
         if let Some((provider, scoped_model_id)) = split_provider_model_spec(model_id) {
             selected_model = registry
@@ -801,13 +811,15 @@ fn default_model_from_candidates(candidates: &[ModelEntry]) -> ModelEntry {
         ("xai", "grok-4-fast-non-reasoning"),
         ("groq", "openai/gpt-oss-120b"),
         ("cerebras", "zai-glm-4.6"),
-        ("zai", "glm-4.6"),
+        ("zai", "glm-4.7"),
+        ("zai-coding-plan", "glm-4.7"),
         ("mistral", "devstral-medium-latest"),
-        ("minimax", "MiniMax-M2.5"),
-        ("minimax-cn", "MiniMax-M2.5"),
+        ("minimax", "MiniMax-M2.7"),
+        ("minimax-cn", "MiniMax-M2.7"),
+        ("minimax-coding-plan", "MiniMax-M2.7"),
         ("huggingface", "moonshotai/Kimi-K2.5"),
         ("opencode", "claude-opus-4-6"),
-        ("kimi-coding", "kimi-k2-thinking"),
+        ("kimi-for-coding", "kimi-for-coding"),
     ];
 
     let canonical = |provider: &str| {
@@ -826,6 +838,54 @@ fn default_model_from_candidates(candidates: &[ModelEntry]) -> ModelEntry {
     }
 
     candidates[0].clone()
+}
+
+fn default_model_from_provider_list(provider: &str) -> Option<&'static str> {
+    let defaults = [
+        ("openai-codex", "gpt-5.5"),
+        ("openai-codex", "gpt-5.4"),
+        ("openai-codex", "gpt-5.3-codex"),
+        ("openai-codex", "gpt-5.2-codex"),
+        ("openai-codex", "gpt-5.1-codex-max"),
+        ("openai", "gpt-5.5"),
+        ("openai", "gpt-5.4"),
+        ("openai", "gpt-5.3-codex"),
+        ("openai", "gpt-5.2-codex"),
+        ("openai", "gpt-5.1-codex"),
+        ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
+        ("anthropic", "claude-opus-4-5"),
+        ("azure-openai-responses", "gpt-5.2"),
+        ("google", "gemini-2.5-pro"),
+        ("google-gemini-cli", "gemini-2.5-pro"),
+        ("google-antigravity", "gemini-3-pro-high"),
+        ("google-vertex", "gemini-3-pro-preview"),
+        ("github-copilot", "gpt-4o"),
+        ("openrouter", "openai/gpt-5.1-codex"),
+        ("vercel-ai-gateway", "anthropic/claude-opus-4.5"),
+        ("xai", "grok-4-fast-non-reasoning"),
+        ("groq", "openai/gpt-oss-120b"),
+        ("cerebras", "zai-glm-4.6"),
+        ("zai", "glm-4.7"),
+        ("zai-coding-plan", "glm-4.7"),
+        ("mistral", "devstral-medium-latest"),
+        ("minimax", "MiniMax-M2.7"),
+        ("minimax-cn", "MiniMax-M2.7"),
+        ("minimax-coding-plan", "MiniMax-M2.7"),
+        ("huggingface", "moonshotai/Kimi-K2.5"),
+        ("opencode", "claude-opus-4-6"),
+        ("kimi-for-coding", "kimi-for-coding"),
+    ];
+
+    let canonical = |p: &str| {
+        canonical_provider_id(p)
+            .unwrap_or(p)
+            .to_ascii_lowercase()
+    };
+
+    defaults
+        .iter()
+        .find(|(p, _)| canonical(p) == canonical(provider))
+        .map(|(_, model_id)| *model_id)
 }
 
 pub fn resolve_api_key(

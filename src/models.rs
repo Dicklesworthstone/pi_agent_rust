@@ -2234,6 +2234,13 @@ pub(crate) fn ad_hoc_model_entry(provider: &str, model_id: &str) -> Option<Model
     ad_hoc_model_entry_with_sap_resolver(provider, model_id, || {
         let auth = AuthStorage::load(crate::config::Config::auth_path()).ok()?;
         resolve_sap_credentials(&auth)
+    }).map(|mut entry| {
+        if entry.api_key.is_none() {
+            if let Ok(auth) = AuthStorage::load(crate::config::Config::auth_path()) {
+                entry.api_key = auth.resolve_api_key(provider, None);
+            }
+        }
+        entry
     })
 }
 
