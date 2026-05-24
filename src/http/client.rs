@@ -16,6 +16,7 @@ use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::stream::{self, BoxStream};
+use std::net::ToSocketAddrs;
 use std::pin::Pin;
 #[cfg(not(test))]
 use std::sync::OnceLock;
@@ -76,9 +77,12 @@ pub struct Client {
 impl Client {
     #[must_use]
     pub fn new() -> Self {
+        // Use WebPKI roots for cross-platform compatibility (fixes Windows TLS issues)
+        // Native roots can fail on Windows due to rustls-native-certs limitations
+        // Disable ALPN to avoid potential Windows compatibility issues
         let tls = TlsConnectorBuilder::new()
-            .with_native_roots()
-            .and_then(|builder| builder.alpn_protocols(vec![b"http/1.1".to_vec()]).build())
+            .with_webpki_roots()
+            .build()
             .map_err(|e| e.to_string());
 
         let user_agent = std::env::var(ANTIGRAVITY_VERSION_ENV).map_or_else(
@@ -526,20 +530,139 @@ impl Response {
 }
 
 async fn connect_transport(parsed: &ParsedUrl, client: &Client) -> Result<Transport> {
-    let addr = (parsed.host.clone(), parsed.port);
-    let tcp = TcpStream::connect(addr).await?;
+    // Resolve DNS synchronously to get concrete SocketAddr(s)
+    // This avoids asupersync's async DNS resolution which can have issues on Windows
+    let host = parsed.host.clone();
+    let port = parsed.port;
+    let mut addrs: Vec<std::net::SocketAddr> = match (host.as_str(), port).to_socket_addrs() {
+        Ok(addrs) => addrs.collect(),
+        Err(e) => return Err(Error::api(format!("Failed to resolve address: {e}"))),
+    };
+    
+    if addrs.is_empty() {
+        return Err(Error::api(format!("No addresses found for {host}:{port}")));
+    }
+    
+    // On Windows, prefer IPv4 addresses to avoid IPv6 connectivity issues
+    // Sort IPv4 addresses first, and filter out IPv6 if there are IPv4 addresses available
+    addrs.sort_by(|a, b| {
+        let a_is_ipv4 = a.is_ipv4();
+        let b_is_ipv4 = b.is_ipv4();
+        // IPv4 comes first (true > false in descending order)
+        b_is_ipv4.cmp(&a_is_ipv4)
+    });
+    
+    // On Windows, try IPv4 first, and only try IPv6 if no IPv4 addresses exist
+    #[cfg(windows)]
+    {
+        if addrs.iter().any(|a| a.is_ipv4()) {
+            addrs.retain(|a| a.is_ipv4());
+        }
+    }
+    
+    // Try each resolved address until one connects successfully
+    let mut last_err = None;
+    for addr in addrs {
+        // Retry loop for Windows WSAENOTCONN issue
+        // On Windows, connect() can return Ok while the connection is still pending,
+        // causing the first TLS write to fail with WSAENOTCONN (os error 10057)
+        let max_retries = 3;
+        for attempt in 0..=max_retries {
+            match try_connect_transport_addr(parsed, client, addr).await {
+                Ok(transport) => return Ok(transport),
+                Err(err) => {
+                    // Check if this is a Windows WSAENOTCONN error that might succeed on retry
+                    if attempt < max_retries && is_windows_not_connected_error(&err) {
+                        // Wait a bit before retrying
+                        use asupersync::time::{sleep, wall_now};
+                        let now = asupersync::Cx::current()
+                            .and_then(|cx| cx.timer_driver())
+                            .map_or_else(wall_now, |timer| timer.now());
+                        sleep(now, std::time::Duration::from_millis(100 * (attempt + 1))).await;
+                        last_err = Some(err);
+                        continue;
+                    }
+                    last_err = Some(err);
+                    break;
+                }
+            }
+        }
+    }
+    
+    Err(Error::api(format!("Failed to connect to any address: {}", last_err.as_ref().map(|e| format_error(e)).unwrap_or_else(|| "unknown error".to_string()))))
+}
+
+/// Check if an error is a Windows socket error that might succeed on retry
+fn is_windows_not_connected_error(err: &std::io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        let os_err = err.raw_os_error();
+        let err_str = err.to_string().to_lowercase();
+        // WSAENOTCONN (10057): Socket is not connected
+        // WSAEINPROGRESS (10036): Blocking operation in progress
+        // WSAEWOULDBLOCK (10035): Resource temporarily unavailable
+        // WSAENETUNREACH (10051): Network is unreachable (often IPv6 on Windows)
+        // WSAETIMEDOUT (10060): Connection timed out
+        os_err == Some(10057)
+            || os_err == Some(10036)
+            || os_err == Some(10035)
+            || os_err == Some(10051)
+            || os_err == Some(10060)
+            || err_str.contains("10057")
+            || err_str.contains("10051")
+            || err_str.contains("10036")
+            || err_str.contains("10035")
+            || err_str.contains("wsaenotconn")
+            || err_str.contains("not connected")
+            || err_str.contains("network unreachable")
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Format an io::Error for display
+fn format_error(err: &std::io::Error) -> String {
+    if let Some(os_err) = err.raw_os_error() {
+        format!("{}: os error {}", err.kind(), os_err)
+    } else {
+        err.to_string()
+    }
+}
+
+/// Try to connect to a single address, returning the raw io::Error if it fails
+async fn try_connect_transport_addr(
+    parsed: &ParsedUrl,
+    client: &Client,
+    addr: std::net::SocketAddr,
+) -> std::io::Result<Transport> {
+    use asupersync::time::{sleep, wall_now};
+    
+    let tcp = TcpStream::connect_timeout(addr, std::time::Duration::from_secs(30)).await?;
+    
+    // On Windows, add a small delay after connect to allow the kernel to complete
+    // the connection before we start TLS handshake
+    #[cfg(windows)]
+    {
+        let now = asupersync::Cx::current()
+            .and_then(|cx| cx.timer_driver())
+            .map_or_else(wall_now, |timer| timer.now());
+        sleep(now, std::time::Duration::from_millis(50)).await;
+    }
+    
     match parsed.scheme {
         Scheme::Http => Ok(Transport::Tcp(tcp)),
         Scheme::Https => {
             let tls = client
                 .tls
                 .as_ref()
-                .map_err(|e| Error::api(format!("TLS configuration error: {e}")))?;
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS configuration error: {e}")))?;
             let tls_stream = tls
                 .clone()
                 .connect(&parsed.host, tcp)
                 .await
-                .map_err(|e| Error::api(format!("TLS connect failed: {e}")))?;
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("TLS connect failed: {e}")))?;
             Ok(Transport::Tls(Box::new(tls_stream)))
         }
     }
