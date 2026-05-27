@@ -44,6 +44,38 @@ pub struct OpenAIResponsesProvider {
     compat: Option<CompatConfig>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesStreamFormat {
+    Sse,
+    Ndjson,
+}
+
+fn responses_stream_format(
+    status: u16,
+    content_type: Option<&str>,
+    codex_mode: bool,
+) -> Result<ResponsesStreamFormat> {
+    let Some(ct) = content_type else {
+        if codex_mode {
+            return Ok(ResponsesStreamFormat::Sse);
+        }
+        return Err(Error::api(format!(
+            "OpenAI API protocol error (HTTP {status}): missing content-type header (expected text/event-stream or application/x-ndjson)"
+        )));
+    };
+
+    if ct.contains("application/x-ndjson") || ct.contains("application/ndjson") {
+        return Ok(ResponsesStreamFormat::Ndjson);
+    }
+    if ct.contains("text/event-stream") || codex_mode {
+        return Ok(ResponsesStreamFormat::Sse);
+    }
+
+    Err(Error::api(format!(
+        "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {ct} (expected text/event-stream or application/x-ndjson)"
+    )))
+}
+
 impl OpenAIResponsesProvider {
     /// Create a new OpenAI Responses provider.
     pub fn new(model: impl Into<String>) -> Self {
@@ -312,33 +344,22 @@ impl Provider for OpenAIResponsesProvider {
         // endpoints we fail closed if the header is missing; for Codex we allow
         // it because some endpoints omit the header while still streaming SSE.
         // If the header IS present and indicates a non-SSE type, reject early
-        // so we fail closed instead of silently dropping events in the SSE parser.
+        // for standard providers. In Codex mode, proxies can mislabel an SSE
+        // response as text/plain, so fall through and let the SSE parser decide.
         let content_type = response
             .headers()
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
             .map(|(_, value)| value.to_ascii_lowercase());
-        if content_type.is_none() && !self.codex_mode {
-            return Err(Error::api(format!(
-                "OpenAI API protocol error (HTTP {status}): missing content-type header (expected text/event-stream or application/x-ndjson)"
-            )));
-        }
-        let mut use_ndjson = false;
-        if let Some(ref ct) = content_type {
-            if ct.contains("application/x-ndjson") || ct.contains("application/ndjson") {
-                use_ndjson = true;
-            } else if !ct.contains("text/event-stream") {
-                return Err(Error::api(format!(
-                    "OpenAI API protocol error (HTTP {status}): unexpected Content-Type {ct} (expected text/event-stream or application/x-ndjson)"
-                )));
-            }
-        }
+        let stream_format =
+            responses_stream_format(status, content_type.as_deref(), self.codex_mode)?;
 
         let byte_stream = response.bytes_stream();
-        let event_source = if use_ndjson {
-            ResponsesEventStream::Ndjson(NdjsonStream::new(byte_stream))
-        } else {
-            ResponsesEventStream::Sse(SseStream::new(byte_stream))
+        let event_source = match stream_format {
+            ResponsesStreamFormat::Ndjson => {
+                ResponsesEventStream::Ndjson(NdjsonStream::new(byte_stream))
+            }
+            ResponsesStreamFormat::Sse => ResponsesEventStream::Sse(SseStream::new(byte_stream)),
         };
 
         let model = self.model.clone();
@@ -2632,6 +2653,23 @@ mod tests {
                 .get("chatgpt-account-id")
                 .map(String::as_str),
             Some("acct_compat_456")
+        );
+    }
+
+    #[test]
+    fn test_codex_mode_accepts_text_plain_sse_proxy_response() {
+        let format =
+            responses_stream_format(200, Some("text/plain; charset=utf-8"), true).expect("format");
+        assert_eq!(format, ResponsesStreamFormat::Sse);
+    }
+
+    #[test]
+    fn test_standard_responses_rejects_text_plain_proxy_response() {
+        let err = responses_stream_format(200, Some("text/plain; charset=utf-8"), false)
+            .expect_err("standard responses should reject text/plain");
+        assert!(
+            err.to_string().contains("unexpected Content-Type"),
+            "unexpected error: {err}"
         );
     }
 

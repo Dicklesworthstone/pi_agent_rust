@@ -16,6 +16,10 @@ use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
 use async_trait::async_trait;
+use bubbles::cursor::{
+    BlinkCanceledMsg as CursorBlinkCanceledMsg, BlinkMsg as CursorBlinkMsg,
+    InitialBlinkMsg as CursorInitialBlinkMsg,
+};
 use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
@@ -2787,14 +2791,10 @@ impl PiApp {
 
     /// Initialize the application.
     fn init(&self) -> Option<Cmd> {
-        // Start text input cursor blink.
-        // Spinner ticks are started lazily when we transition idle -> busy.
-        let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
-        let input_cmd = if test_mode {
-            None
-        } else {
-            BubbleteaModel::init(&self.input)
-        };
+        // Avoid starting the textarea software cursor blink. Each blink tick
+        // repaints the whole alternate-screen TUI, which is idle output churn
+        // for terminal hosts. Spinner ticks still start lazily when busy.
+        let input_cmd = None;
         let pending_cmd = if self.pending_inputs.is_empty() {
             None
         } else {
@@ -2854,6 +2854,13 @@ impl PiApp {
 
         if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
             self.set_terminal_size(size.width as usize, size.height as usize);
+            return None;
+        }
+
+        if msg.is::<CursorInitialBlinkMsg>()
+            || msg.is::<CursorBlinkMsg>()
+            || msg.is::<CursorBlinkCanceledMsg>()
+        {
             return None;
         }
 

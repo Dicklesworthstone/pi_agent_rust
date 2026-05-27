@@ -572,7 +572,6 @@ fn main_impl() -> Result<()> {
     let reactor = create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
         .blocking_threads(1, 2)
-        .enable_parking(false)
         .with_reactor(reactor)
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
