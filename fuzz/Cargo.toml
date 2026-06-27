@@ -21,10 +21,6 @@ serde = { version = "1", features = ["derive"] }
 [workspace]
 members = ["."]
 
-# Pin asupersync to the same git revision used by the main workspace
-[patch.crates-io]
-asupersync = { git = "https://github.com/Dicklesworthstone/asupersync.git", rev = "673cf66" }
-
 [build-dependencies]
 vergen-gix = { version = "=9.1.0" }
 vergen = { version = "=9.1.0" }
