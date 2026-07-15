@@ -5883,6 +5883,13 @@ fn compile_module_source(
     Ok(prefix_import_meta_url(name, &compiled))
 }
 
+/// Bump when any transform applied by `compile_module_source` changes.
+///
+/// The source file itself may be unchanged while its compiled output changes.
+/// Including this schema version prevents a newer host from reusing stale
+/// transformed modules from a previous binary.
+const COMPILED_MODULE_CACHE_VERSION: u8 = 3;
+
 fn module_cache_key(
     static_virtual_modules: &HashMap<String, String>,
     dynamic_virtual_modules: &HashMap<String, String>,
@@ -5897,7 +5904,10 @@ fn module_cache_key(
         hasher.update(name.as_bytes());
         hasher.update(b"\0");
         hasher.update(source.as_bytes());
-        return Some(format!("v:{:x}", hasher.finalize()));
+        return Some(format!(
+            "v{COMPILED_MODULE_CACHE_VERSION}:v:{:x}",
+            hasher.finalize()
+        ));
     }
 
     let path = Path::new(name);
@@ -5912,7 +5922,10 @@ fn module_cache_key(
         .and_then(|ts| ts.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |duration| duration.as_nanos());
 
-    Some(format!("f:{name}:{}:{modified_nanos}", metadata.len()))
+    Some(format!(
+        "v{COMPILED_MODULE_CACHE_VERSION}:f:{name}:{}:{modified_nanos}",
+        metadata.len()
+    ))
 }
 
 // ============================================================================
@@ -6939,6 +6952,15 @@ fn extract_static_require_specifiers(source: &str) -> Vec<String> {
     out
 }
 
+/// Native Node addons are commonly loaded behind platform guards and `try/catch`
+/// fallbacks. Hoisting them into ESM imports eagerly resolves every platform
+/// branch, bypassing those guards before the module can execute.
+fn is_native_addon_require(specifier: &str) -> bool {
+    specifier.ends_with(".node")
+        || specifier.ends_with(".wasi.cjs")
+        || specifier.starts_with("@napi-rs/")
+}
+
 /// Detect if a JavaScript source uses CommonJS patterns (`require(...)` or
 /// `module.exports`) and transform it into an ESM-compatible wrapper.
 ///
@@ -6974,7 +6996,10 @@ fn maybe_cjs_to_esm(source: &str) -> String {
     let has_export_default = source.contains("export default");
 
     // Extract all require() specifiers
-    let specifiers = extract_static_require_specifiers(source);
+    let specifiers = extract_static_require_specifiers(source)
+        .into_iter()
+        .filter(|specifier| !is_native_addon_require(specifier))
+        .collect::<Vec<_>>();
 
     if specifiers.is_empty()
         && !has_module_exports
@@ -7495,59 +7520,64 @@ fn transpile_typescript_module(source: &str, name: &str) -> std::result::Result<
 /// per-call hostcalls are needed.
 #[allow(clippy::too_many_lines)]
 fn build_node_os_module() -> String {
+    fn js_string(value: &str) -> String {
+        serde_json::to_string(value).expect("serialize node:os string")
+    }
+
     // Map Rust target constants to Node.js conventions.
-    let node_platform = match std::env::consts::OS {
+    let node_platform = js_string(match std::env::consts::OS {
         "macos" => "darwin",
         "windows" => "win32",
         other => other, // "linux", "freebsd", etc.
-    };
-    let node_arch = match std::env::consts::ARCH {
+    });
+    let node_arch = js_string(match std::env::consts::ARCH {
         "x86_64" => "x64",
         "aarch64" => "arm64",
         "x86" => "ia32",
         "arm" => "arm",
         other => other,
-    };
-    let node_type = match std::env::consts::OS {
+    });
+    let node_type = js_string(match std::env::consts::OS {
         "linux" => "Linux",
         "macos" => "Darwin",
         "windows" => "Windows_NT",
         other => other,
-    };
-    // Escape backslashes for safe JS string interpolation (Windows paths).
-    let tmpdir = std::env::temp_dir()
-        .display()
-        .to_string()
-        .replace('\\', "\\\\");
-    let homedir = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| "/home/unknown".to_string())
-        .replace('\\', "\\\\");
+    });
+    let tmpdir = js_string(&std::env::temp_dir().display().to_string());
+    let homedir = js_string(
+        &std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| "/home/unknown".to_string()),
+    );
     // Read hostname from /etc/hostname (Linux) or fall back to env/default.
-    let hostname = std::fs::read_to_string("/etc/hostname")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("HOSTNAME").ok())
-        .or_else(|| std::env::var("COMPUTERNAME").ok())
-        .unwrap_or_else(|| "localhost".to_string());
+    let hostname = js_string(
+        &std::fs::read_to_string("/etc/hostname")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var("HOSTNAME").ok())
+            .or_else(|| std::env::var("COMPUTERNAME").ok())
+            .unwrap_or_else(|| "localhost".to_string()),
+    );
     let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    let eol = if cfg!(windows) { "\\r\\n" } else { "\\n" };
-    let dev_null = if cfg!(windows) {
-        "\\\\\\\\.\\\\NUL"
+    let eol = js_string(if cfg!(windows) { "\r\n" } else { "\n" });
+    let dev_null = js_string(if cfg!(windows) {
+        r"\\.\NUL"
     } else {
         "/dev/null"
-    };
-    let username = std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string());
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| {
+    });
+    let username = js_string(
+        &std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string()),
+    );
+    let shell = js_string(&std::env::var("SHELL").unwrap_or_else(|_| {
         if cfg!(windows) {
             "cmd.exe".to_string()
         } else {
             "/bin/sh".to_string()
         }
-    });
+    }));
     // Read uid/gid from /proc/self/status on Linux, fall back to defaults.
     let (uid, gid) = read_proc_uid_gid().unwrap_or((1000, 1000));
 
@@ -7556,18 +7586,18 @@ fn build_node_os_module() -> String {
 
     format!(
         r#"
-const _platform = "{node_platform}";
-const _arch = "{node_arch}";
-const _type = "{node_type}";
-const _tmpdir = "{tmpdir}";
-const _homedir = "{homedir}";
-const _hostname = "{hostname}";
-const _eol = "{eol}";
-const _devNull = "{dev_null}";
+const _platform = {node_platform};
+const _arch = {node_arch};
+const _type = {node_type};
+const _tmpdir = {tmpdir};
+const _homedir = {homedir};
+const _hostname = {hostname};
+const _eol = {eol};
+const _devNull = {dev_null};
 const _uid = {uid};
 const _gid = {gid};
-const _username = "{username}";
-const _shell = "{shell}";
+const _username = {username};
+const _shell = {shell};
 const _numCpus = {num_cpus};
 const _cpus = [];
 for (let i = 0; i < _numCpus; i++) _cpus.push({{ model: "cpu", speed: 2400, times: {{ user: 0, nice: 0, sys: 0, idle: 0, irq: 0 }} }});
@@ -8205,6 +8235,101 @@ export class Spacer {
 
 export function visibleWidth(str) {
   return String(str ?? "").length;
+}
+
+let _cellDimensions = { widthPx: 9, heightPx: 18 };
+let _terminalCapabilities = { images: null, trueColor: false, hyperlinks: false };
+let _nextImageId = 1;
+
+export function getCellDimensions() {
+  return { ..._cellDimensions };
+}
+
+export function setCellDimensions(dimensions) {
+  const widthPx = Number(dimensions?.widthPx);
+  const heightPx = Number(dimensions?.heightPx);
+  if (Number.isFinite(widthPx) && widthPx > 0 && Number.isFinite(heightPx) && heightPx > 0) {
+    _cellDimensions = { widthPx, heightPx };
+  }
+}
+
+export function detectCapabilities() {
+  return { ..._terminalCapabilities };
+}
+
+export function getCapabilities() {
+  return { ..._terminalCapabilities };
+}
+
+export function setCapabilities(capabilities) {
+  _terminalCapabilities = {
+    images: capabilities?.images ?? null,
+    trueColor: Boolean(capabilities?.trueColor),
+    hyperlinks: Boolean(capabilities?.hyperlinks),
+  };
+}
+
+export function resetCapabilitiesCache() {}
+
+export function allocateImageId() {
+  const imageId = _nextImageId;
+  _nextImageId += 1;
+  return imageId;
+}
+
+export function calculateImageRows(imageDimensions, targetWidthCells, cellDimensions = getCellDimensions()) {
+  const imageWidth = Number(imageDimensions?.widthPx);
+  const imageHeight = Number(imageDimensions?.heightPx);
+  const widthCells = Math.max(1, Number(targetWidthCells) || 1);
+  const cellWidth = Math.max(1, Number(cellDimensions?.widthPx) || 9);
+  const cellHeight = Math.max(1, Number(cellDimensions?.heightPx) || 18);
+  if (!Number.isFinite(imageWidth) || imageWidth <= 0 || !Number.isFinite(imageHeight) || imageHeight <= 0) return 1;
+  return Math.max(1, Math.ceil((imageHeight * widthCells * cellWidth) / (imageWidth * cellHeight)));
+}
+
+export function getPngDimensions(_base64Data) { return null; }
+export function getJpegDimensions(_base64Data) { return null; }
+export function getGifDimensions(_base64Data) { return null; }
+export function getWebpDimensions(_base64Data) { return null; }
+
+export function getImageDimensions(base64Data, mimeType) {
+  if (mimeType === "image/png") return getPngDimensions(base64Data);
+  if (mimeType === "image/jpeg") return getJpegDimensions(base64Data);
+  if (mimeType === "image/gif") return getGifDimensions(base64Data);
+  if (mimeType === "image/webp") return getWebpDimensions(base64Data);
+  return null;
+}
+
+export function encodeKitty(base64Data, _options = {}) {
+  return `\\x1b_Ga=T,f=100,q=2;${String(base64Data ?? "")}\\x1b\\\\`;
+}
+
+export function encodeITerm2(base64Data, _options = {}) {
+  return `\\x1b]1337;File=inline=1:${String(base64Data ?? "")}\\x07`;
+}
+
+export function deleteKittyImage(imageId) {
+  return `\\x1b_Ga=d,d=I,i=${Number(imageId) || 0},q=2\\x1b\\\\`;
+}
+
+export function deleteAllKittyImages() {
+  return "\\x1b_Ga=d,d=A,q=2\\x1b\\\\";
+}
+
+export function renderImage(_base64Data, _imageDimensions, _options = {}) {
+  return null;
+}
+
+export function hyperlink(text, url) {
+  return `\\x1b]8;;${String(url ?? "")}\\x1b\\\\${String(text ?? "")}\\x1b]8;;\\x1b\\\\`;
+}
+
+export function imageFallback(mimeType, dimensions, filename) {
+  const parts = [];
+  if (filename) parts.push(String(filename));
+  parts.push(`[${String(mimeType ?? "image")}]`);
+  if (dimensions?.widthPx && dimensions?.heightPx) parts.push(`${dimensions.widthPx}x${dimensions.heightPx}`);
+  return `[Image: ${parts.join(" ")}]`;
 }
 
 export function wrapTextWithAnsi(text, _width) {
@@ -15406,6 +15531,24 @@ export default { PythonIndexer };
         .trim()
         .to_string(),
     );
+
+    // The current Pi package names are @earendil-works/*, while the
+    // compatibility modules historically used @mariozechner/*. Keep one
+    // implementation and expose both names to legacy and current extensions.
+    for (alias, target) in [
+        (
+            "@earendil-works/pi-coding-agent",
+            "@mariozechner/pi-coding-agent",
+        ),
+        ("@earendil-works/pi-tui", "@mariozechner/pi-tui"),
+        ("@earendil-works/pi-ai", "@mariozechner/pi-ai"),
+        ("@earendil-works/pi-ai/compat", "@mariozechner/pi-ai"),
+        ("typebox", "@sinclair/typebox"),
+    ] {
+        if let Some(source) = modules.get(target).cloned() {
+            modules.insert(alias.to_string(), source);
+        }
+    }
 
     modules
 }
@@ -22729,6 +22872,28 @@ module.exports = { fs, generated };
     }
 
     #[test]
+    fn maybe_cjs_to_esm_keeps_native_addon_requires_lazy() {
+        let source = r#"
+try {
+  module.exports = require("./image.android-arm64.node");
+} catch (_) {}
+try {
+  module.exports = require("@napi-rs/image-android-arm64");
+} catch (_) {}
+try {
+  module.exports = require("./image.wasi.cjs");
+} catch (_) {}
+module.exports = require("path");
+"#;
+
+        let rewritten = maybe_cjs_to_esm(source);
+        assert!(rewritten.contains(r#"from "path";"#));
+        assert!(!rewritten.contains(r#"from "./image.android-arm64.node";"#));
+        assert!(!rewritten.contains(r#"from "@napi-rs/image-android-arm64";"#));
+        assert!(!rewritten.contains(r#"from "./image.wasi.cjs";"#));
+    }
+
+    #[test]
     fn maybe_cjs_to_esm_synthesizes_named_exports_from_module_exports_object() {
         let source = r"
 function buildListItemContentBlock() {}
@@ -23305,6 +23470,25 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         assert_eq!(second_state.module_cache_counters.misses, 0);
         assert_eq!(second_state.module_cache_counters.hits, 0);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn module_cache_key_includes_compiler_schema_version() {
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module_path = temp_dir.path().join("module.js");
+        std::fs::write(&module_path, "export const x = 1;\n").expect("write module");
+
+        let key = module_cache_key(
+            &HashMap::new(),
+            &HashMap::new(),
+            module_path.to_string_lossy().as_ref(),
+        )
+        .expect("file cache key");
+
+        assert!(
+            key.starts_with(&format!("v{COMPILED_MODULE_CACHE_VERSION}:f:")),
+            "cache key must change when the compiler schema changes: {key}"
+        );
     }
 
     #[test]
@@ -26667,6 +26851,53 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 get_global_json(&runtime, "bare_events_ok").await,
                 serde_json::json!(true)
             );
+        });
+    }
+
+    #[test]
+    fn pijs_current_pi_package_aliases_support_ember_ui_patches() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r"
+                    globalThis.emberPiAliases = {};
+                    Promise.all([
+                        import('@earendil-works/pi-coding-agent'),
+                        import('@earendil-works/pi-tui'),
+                    ]).then(([agent, tui]) => {
+                        tui.Editor.prototype.render = function render() { return []; };
+                        tui.setCellDimensions({ widthPx: 10, heightPx: 20 });
+                        globalThis.emberPiAliases = {
+                            assistantMessage: typeof agent.AssistantMessageComponent,
+                            editorRender: typeof tui.Editor.prototype.render,
+                            cellDimensions: tui.getCellDimensions(),
+                            imageApi: [
+                                'allocateImageId', 'calculateImageRows', 'deleteAllKittyImages',
+                                'deleteKittyImage', 'detectCapabilities', 'encodeITerm2', 'encodeKitty',
+                                'getCapabilities', 'getImageDimensions', 'getJpegDimensions',
+                                'getPngDimensions', 'getGifDimensions', 'getWebpDimensions', 'hyperlink',
+                                'imageFallback', 'renderImage', 'resetCapabilitiesCache', 'setCapabilities',
+                            ].every((name) => typeof tui[name] === 'function'),
+                        };
+                    });
+                    ",
+                )
+                .await
+                .expect("load current Pi package aliases");
+
+            let aliases = get_global_json(&runtime, "emberPiAliases").await;
+            assert_eq!(aliases["assistantMessage"], serde_json::json!("function"));
+            assert_eq!(aliases["editorRender"], serde_json::json!("function"));
+            assert_eq!(
+                aliases["cellDimensions"],
+                serde_json::json!({ "widthPx": 10, "heightPx": 20 })
+            );
+            assert_eq!(aliases["imageApi"], serde_json::json!(true));
         });
     }
 
