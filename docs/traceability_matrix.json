@@ -928,6 +928,10 @@
           "justification": "Classified e2e suite included in the bd-8t27h.3 traceability backfill so CI governance covers all registered tests."
         },
         {
+          "path": "tests/e2e_transient_retry_resume.rs",
+          "justification": "Verifies that transient provider failures resume the incomplete turn without replaying completed tool calls."
+        },
+        {
           "path": "tests/e2e_provider_failure_injection.rs",
           "justification": "Classified e2e suite included in the bd-8t27h.3 traceability backfill so CI governance covers all registered tests."
         },

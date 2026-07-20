@@ -2243,3 +2243,42 @@ jobs:
           # integration tests/benches require the `tui` feature, so they are
           # expected to be skipped here — only the library contract is locked in.
           cargo check --no-default-features --lib
+
+  linux_release_binary:
+    name: Linux release binary
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout pi_agent_rust
+        uses: actions/checkout@v4
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+
+      - name: Install system dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build Linux release binary
+        run: cargo build --release --locked --bin pi
+
+      - name: Upload Linux release binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: pi-linux-x86_64-${{ github.sha }}
+          path: pi_agent_rust/target/release/pi

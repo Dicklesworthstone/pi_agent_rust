@@ -33,6 +33,9 @@ impl ModelEntry {
             "gpt-5.1-codex-max"
                 | "gpt-5.2"
                 | "gpt-5.5"
+                | "gpt-5.6-sol"
+                | "gpt-5.6-terra"
+                | "gpt-5.6-luna"
                 | "gpt-5.4"
                 | "gpt-5.2-codex"
                 | "gpt-5.3-codex"
@@ -618,6 +621,18 @@ pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] 
                 slug: "openai/gpt-5.4".to_string(),
                 description: Some("GPT-5.4".to_string()),
             });
+            for (id, name) in [
+                ("gpt-5.6-sol", "GPT-5.6 Sol"),
+                ("gpt-5.6-terra", "GPT-5.6 Terra"),
+                ("gpt-5.6-luna", "GPT-5.6 Luna"),
+            ] {
+                for provider in ["openai", "openai-codex"] {
+                    candidates.push(ModelAutocompleteCandidate {
+                        slug: format!("{provider}/{id}"),
+                        description: Some(name.to_string()),
+                    });
+                }
+            }
             candidates.push(ModelAutocompleteCandidate {
                 slug: "openai-codex/gpt-5.5".to_string(),
                 description: Some("GPT-5.5 Codex".to_string()),
@@ -1476,6 +1491,83 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             compat: None,
             oauth_config: None,
         });
+    }
+
+    // Keep the GPT-5.6 variants aligned with the current upstream catalog for
+    // direct OpenAI API-key and ChatGPT/Codex OAuth routing.
+    for (id, name, input, output, cache_read, cache_write) in [
+        ("gpt-5.6-sol", "GPT-5.6 Sol", 5.0, 30.0, 0.5, 6.25),
+        ("gpt-5.6-terra", "GPT-5.6 Terra", 2.5, 15.0, 0.25, 3.125),
+        ("gpt-5.6-luna", "GPT-5.6 Luna", 1.0, 6.0, 0.1, 1.25),
+    ] {
+        for provider in ["openai", "openai-codex"] {
+            if models
+                .iter()
+                .any(|entry| entry.model.provider == provider && entry.model.id == id)
+            {
+                continue;
+            }
+
+            let (api, base_url) = if provider == "openai" {
+                (
+                    if mode == ModelRegistryLoadMode::Full {
+                        Api::OpenAIResponses.to_string()
+                    } else {
+                        "openai-responses".to_string()
+                    },
+                    if mode == ModelRegistryLoadMode::Full {
+                        "https://api.openai.com/v1".to_string()
+                    } else {
+                        String::new()
+                    },
+                )
+            } else {
+                (
+                    if mode == ModelRegistryLoadMode::Full {
+                        Api::OpenAICodexResponses.to_string()
+                    } else {
+                        "openai-codex-responses".to_string()
+                    },
+                    if mode == ModelRegistryLoadMode::Full {
+                        "https://chatgpt.com/backend-api".to_string()
+                    } else {
+                        String::new()
+                    },
+                )
+            };
+
+            models.push(ModelEntry {
+                model: Model {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    api,
+                    provider: provider.to_string(),
+                    base_url,
+                    reasoning: true,
+                    input: vec![InputType::Text, InputType::Image],
+                    cost: ModelCost {
+                        input,
+                        output,
+                        cache_read,
+                        cache_write,
+                    },
+                    context_window: 272_000,
+                    max_tokens: 128_000,
+                    headers: HashMap::new(),
+                },
+                api_key: resolve_provider_api_key_cached(
+                    auth,
+                    provider,
+                    provider,
+                    &mut canonical_api_key_cache,
+                    &mut provider_api_key_cache,
+                ),
+                headers: HashMap::new(),
+                auth_header: true,
+                compat: None,
+                oauth_config: None,
+            });
+        }
     }
 
     // Ensure the latest Codex default exists for OpenAI Codex (ChatGPT) routing.
@@ -2614,6 +2706,109 @@ mod tests {
     }
 
     #[test]
+    fn gpt_5_6_variants_match_upstream_catalog() {
+        let (_dir, auth) = test_auth_storage();
+        let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
+
+        for (provider, id, name, api, base_url, input, output, cache_read, cache_write) in [
+            (
+                "openai",
+                "gpt-5.6-sol",
+                "GPT-5.6 Sol",
+                "openai-responses",
+                "https://api.openai.com/v1",
+                5.0,
+                30.0,
+                0.5,
+                6.25,
+            ),
+            (
+                "openai",
+                "gpt-5.6-terra",
+                "GPT-5.6 Terra",
+                "openai-responses",
+                "https://api.openai.com/v1",
+                2.5,
+                15.0,
+                0.25,
+                3.125,
+            ),
+            (
+                "openai",
+                "gpt-5.6-luna",
+                "GPT-5.6 Luna",
+                "openai-responses",
+                "https://api.openai.com/v1",
+                1.0,
+                6.0,
+                0.1,
+                1.25,
+            ),
+            (
+                "openai-codex",
+                "gpt-5.6-sol",
+                "GPT-5.6 Sol",
+                "openai-codex-responses",
+                "https://chatgpt.com/backend-api",
+                5.0,
+                30.0,
+                0.5,
+                6.25,
+            ),
+            (
+                "openai-codex",
+                "gpt-5.6-terra",
+                "GPT-5.6 Terra",
+                "openai-codex-responses",
+                "https://chatgpt.com/backend-api",
+                2.5,
+                15.0,
+                0.25,
+                3.125,
+            ),
+            (
+                "openai-codex",
+                "gpt-5.6-luna",
+                "GPT-5.6 Luna",
+                "openai-codex-responses",
+                "https://chatgpt.com/backend-api",
+                1.0,
+                6.0,
+                0.1,
+                1.25,
+            ),
+        ] {
+            let entry = models
+                .iter()
+                .find(|entry| entry.model.provider == provider && entry.model.id == id)
+                .unwrap_or_else(|| panic!("missing {provider}/{id}"));
+            assert_eq!(entry.model.name, name);
+            assert_eq!(entry.model.api, api);
+            assert_eq!(entry.model.base_url, base_url);
+            assert!(entry.model.reasoning);
+            assert_eq!(entry.model.input, vec![InputType::Text, InputType::Image]);
+            assert_eq!(entry.model.context_window, 272_000);
+            assert_eq!(entry.model.max_tokens, 128_000);
+            assert_eq!(entry.model.cost.input, input);
+            assert_eq!(entry.model.cost.output, output);
+            assert_eq!(entry.model.cost.cache_read, cache_read);
+            assert_eq!(entry.model.cost.cache_write, cache_write);
+        }
+
+        let candidates = model_autocomplete_candidates();
+        for provider in ["openai", "openai-codex"] {
+            for id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+                assert!(
+                    candidates
+                        .iter()
+                        .any(|candidate| candidate.slug == format!("{provider}/{id}")),
+                    "missing autocomplete candidate {provider}/{id}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn built_in_models_include_oauth_provider_entries() {
         let (_dir, auth) = test_auth_storage();
         let models = built_in_models(&auth, ModelRegistryLoadMode::Full);
@@ -3699,6 +3894,9 @@ mod tests {
         assert!(make_model_entry("gpt-5.1-codex-max", true).supports_xhigh());
         assert!(make_model_entry("gpt-5.2", true).supports_xhigh());
         assert!(make_model_entry("gpt-5.4", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.6-sol", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.6-terra", true).supports_xhigh());
+        assert!(make_model_entry("gpt-5.6-luna", true).supports_xhigh());
         assert!(make_model_entry("gpt-5.2-codex", true).supports_xhigh());
         assert!(make_model_entry("gpt-5.3-codex", true).supports_xhigh());
         assert!(make_model_entry("gpt-5.3-codex-spark", true).supports_xhigh());
@@ -5276,6 +5474,9 @@ mod tests {
                     "gpt-5.1-codex-max"
                         | "gpt-5.2"
                         | "gpt-5.4"
+                        | "gpt-5.6-sol"
+                        | "gpt-5.6-terra"
+                        | "gpt-5.6-luna"
                         | "gpt-5.2-codex"
                         | "gpt-5.3-codex"
                         | "gpt-5.3-codex-spark"

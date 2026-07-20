@@ -199,11 +199,13 @@
       ],
       "suite_ids": [
         "e2e_message_session_control",
-        "e2e_session_persistence"
+        "e2e_session_persistence",
+        "e2e_transient_retry_resume"
       ],
       "test_paths": [
         "tests/e2e_message_session_control.rs",
-        "tests/e2e_session_persistence.rs"
+        "tests/e2e_session_persistence.rs",
+        "tests/e2e_transient_retry_resume.rs"
       ],
       "sli_ids": [
         "sli.session.resume_ready_ms",
@@ -218,7 +220,7 @@
         "environment.json",
         "evidence_contract.json"
       ],
-      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_message_session_control --suite e2e_session_persistence"
+      "replay_command": "./scripts/e2e/run_all.sh --profile ci --suite e2e_message_session_control --suite e2e_session_persistence --suite e2e_transient_retry_resume"
     },
     {
       "workflow_id": "wf-rpc-endpoint-integration",

@@ -311,6 +311,7 @@ files = [
     "e2e_swarm_flight_recorder",
     "e2e_tools",
     "e2e_ts_extension_loading",
+    "e2e_transient_retry_resume",
     "e2e_tui",
     "e2e_tui_features",
     "e2e_tui_perf",
