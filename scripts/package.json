@@ -10,6 +10,6 @@
     "check": "node gen-model-catalog.mjs --check ../legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.80.6"
+    "@earendil-works/pi-ai": "0.80.10"
   }
 }
