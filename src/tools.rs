@@ -1144,7 +1144,7 @@ fn write_artifact_file_if_absent(path: &Path, bytes: &[u8]) -> std::io::Result<(
     {
         Ok(mut file) => {
             file.write_all(bytes)?;
-            file.sync_all()?;
+            tolerate_fsync_refusal(file.sync_all(), "artifact file", path)?;
             Ok(())
         }
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
@@ -2163,12 +2163,68 @@ pub fn fuzz_normalize_dot_segments(path: &Path) -> PathBuf {
     normalize_dot_segments(path)
 }
 
+/// Returns `true` when an `fsync`/`fdatasync` durability barrier was *refused*
+/// by the filesystem rather than reflecting a real write failure.
+///
+/// The bytes are already handed to the kernel by the preceding `write(2)`;
+/// `fsync` only asks the filesystem to make them durable. Some filesystems —
+/// notably virtiofs / FUSE bind mounts (Docker Desktop for macOS) and various
+/// network filesystems — do not implement `fsync` on a given descriptor and
+/// report it with `EBADF`, `EINVAL`, or an "unsupported" error even though the
+/// `write(2)` and the subsequent atomic `rename(2)` already landed the data
+/// correctly. Failing the whole write tool in that case is wrong: the file is
+/// complete and correct on disk. We downgrade these specific refusals to a
+/// warning. Genuine I/O failures (`EIO`, `ENOSPC`, `EDQUOT`, …) still
+/// propagate. See issue #136.
+fn is_fsync_refused(err: &std::io::Error) -> bool {
+    // EBADF = 9 and EINVAL = 22 on both Linux and macOS. `ErrorKind::Unsupported`
+    // captures ENOTSUP/EOPNOTSUPP/ENOSYS portably without a `libc` dependency
+    // (this crate is `#![forbid(unsafe_code)]`).
+    matches!(err.raw_os_error(), Some(9 | 22))
+        || err.kind() == std::io::ErrorKind::Unsupported
+}
+
+/// Runs a durability `fsync` (`result`), treating a filesystem *refusal* (see
+/// [`is_fsync_refused`]) as a non-fatal warning while still propagating real
+/// I/O errors. `what` and `path` are used only for the diagnostic log line.
+fn tolerate_fsync_refusal(
+    result: std::io::Result<()>,
+    what: &str,
+    path: &Path,
+) -> std::io::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) if is_fsync_refused(&err) => {
+            tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "{what} fsync refused by filesystem (non-POSIX durability semantics); \
+                 data already written, continuing without a durability barrier"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(unix)]
 fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
-    std::fs::File::open(parent)?.sync_all()
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    // Directory fsync is a pure durability nicety (it makes the rename durable);
+    // on filesystems that refuse it the rename is still visible, so tolerate a
+    // refusal rather than failing the write. See issue #136.
+    tolerate_fsync_refusal(
+        std::fs::File::open(parent).and_then(|dir| dir.sync_all()),
+        "parent directory",
+        parent,
+    )
 }
 
 #[cfg(not(unix))]
@@ -4671,7 +4727,11 @@ impl Tool for EditTool {
             let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
             temp_file.as_file_mut().write_all(&final_content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
+            tolerate_fsync_refusal(
+                temp_file.as_file_mut().sync_all(),
+                "temp file",
+                &absolute_path_clone,
+            )?;
 
             // Restore original file permissions (tempfile defaults to 0o600) before persisting.
             if let Some(perms) = original_perms {
@@ -4835,7 +4895,11 @@ impl Tool for WriteTool {
             let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
             temp_file.as_file_mut().write_all(&content_bytes)?;
-            temp_file.as_file_mut().sync_all()?;
+            tolerate_fsync_refusal(
+                temp_file.as_file_mut().sync_all(),
+                "temp file",
+                &path_clone,
+            )?;
 
             // Restore original file permissions (tempfile defaults to 0o600) before persisting.
             if let Some(perms) = original_perms {
@@ -7735,6 +7799,46 @@ mod tests {
     use proptest::prelude::*;
     #[cfg(target_os = "linux")]
     use std::time::Duration;
+
+    #[test]
+    fn fsync_refusal_classifies_non_posix_durability_errors() {
+        use std::io::{Error, ErrorKind};
+
+        // EBADF (the exact errno reported against virtiofs in issue #136) and
+        // EINVAL (common for directory fsync on FUSE/network mounts) are
+        // filesystem *refusals* of the durability barrier, not write failures.
+        assert!(is_fsync_refused(&Error::from_raw_os_error(9))); // EBADF
+        assert!(is_fsync_refused(&Error::from_raw_os_error(22))); // EINVAL
+        assert!(is_fsync_refused(&Error::new(ErrorKind::Unsupported, "nope")));
+
+        // Genuine I/O failures must still propagate so real corruption/space
+        // problems are never silently swallowed.
+        assert!(!is_fsync_refused(&Error::from_raw_os_error(5))); // EIO
+        assert!(!is_fsync_refused(&Error::from_raw_os_error(28))); // ENOSPC
+        assert!(!is_fsync_refused(&Error::new(ErrorKind::PermissionDenied, "no")));
+    }
+
+    #[test]
+    fn tolerate_fsync_refusal_downgrades_refusals_but_propagates_real_errors() {
+        use std::io::{Error, ErrorKind};
+        use std::path::Path;
+
+        let p = Path::new("/tmp/does-not-matter");
+        // Refusals are downgraded to Ok so an already-written file is not
+        // reported as a failed write.
+        assert!(tolerate_fsync_refusal(Ok(()), "x", p).is_ok());
+        assert!(
+            tolerate_fsync_refusal(Err(Error::from_raw_os_error(9)), "temp file", p).is_ok()
+        );
+        // Real I/O errors still surface to the caller.
+        assert!(
+            tolerate_fsync_refusal(Err(Error::from_raw_os_error(5)), "temp file", p).is_err()
+        );
+        assert!(
+            tolerate_fsync_refusal(Err(Error::new(ErrorKind::PermissionDenied, "no")), "x", p)
+                .is_err()
+        );
+    }
 
     #[test]
     fn test_truncate_head() {
