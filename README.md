@@ -261,6 +261,38 @@ pi "Explain this codebase structure"
 pi @src/main.rs "What does this do?"
 ```
 
+### Using a local model
+
+`ollama`, `llamacpp` (llama.cpp's `llama-server`), `mistralrs` (mistral.rs), and
+`lmstudio` are built-in **local** providers. The first three need **no API key** and
+work out of the box against their default ports:
+
+```bash
+pi --provider ollama    --model llama3        -p "hi"
+pi --provider llamacpp  --model <gguf-repo-id> -p "hi"
+pi --provider mistralrs --model default        -p "hi"
+```
+
+To point at any other OpenAI-compatible server (a custom host/port, vLLM, etc.),
+add it to `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "ollama": {
+      "api": "openai-completions",
+      "baseUrl": "http://127.0.0.1:11000/v1",
+      "apiKey": "ollama",
+      "models": [{ "id": "Qwen3.6-35B-A3B-4bit", "contextWindow": 32768 }]
+    }
+  }
+}
+```
+
+Then `pi --provider ollama --model Qwen3.6-35B-A3B-4bit`. See
+[docs/models.md](docs/models.md) for the full `models.json` schema, provider
+aliases, and secret resolution (env vars and `!command` shell lookups).
+
 ---
 
 ## Features
