@@ -1,3 +1,4 @@
+use asupersync::sync::OwnedMutexGuard;
 use chrono::Utc;
 use std::ffi::OsString;
 use std::path::Path;
@@ -369,7 +370,10 @@ impl PiApp {
             }
 
             let cx = asupersync::Cx::for_request();
-            let (html, session_name) = match session.lock(&cx).await {
+            // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9) and this
+            // future is handed to `RuntimeHandle::spawn`, which requires `Send`.
+            let (html, session_name) = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await
+            {
                 Ok(guard) => (guard.to_html(), guard.get_name()),
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(

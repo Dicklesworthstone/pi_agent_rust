@@ -183,6 +183,12 @@ fn session_model_state_value(shared_model: &ModelEntry, session: &Session) -> Va
     }
 }
 
+// Note on `OwnedMutexGuard` below: `asupersync::sync::MutexGuard` is `!Send` as
+// of asupersync 0.3.9, while `#[async_trait]` boxes every method here as
+// `dyn Future + Send`. The mutating methods hold the session lock across
+// `Session::save().await` — deliberately, so the mutation and its persist stay
+// one critical section — so they must take an *owned* guard, which is `Send`.
+// Read-only methods that never await under the lock keep the cheaper borrow.
 #[async_trait]
 impl ExtensionSession for InteractiveExtensionSession {
     async fn get_state(&self) -> Value {
@@ -337,10 +343,9 @@ impl ExtensionSession for InteractiveExtensionSession {
 
     async fn set_name(&self, name: String) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.set_name(&name);
         if self.save_enabled {
             guard.save().await?;
@@ -350,10 +355,9 @@ impl ExtensionSession for InteractiveExtensionSession {
 
     async fn append_message(&self, message: SessionMessage) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.append_message(message);
         if self.save_enabled {
             guard.save().await?;
@@ -372,10 +376,9 @@ impl ExtensionSession for InteractiveExtensionSession {
             ));
         }
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         guard.append_custom_entry(custom_type, data);
         if self.save_enabled {
             guard.save().await?;
@@ -385,10 +388,9 @@ impl ExtensionSession for InteractiveExtensionSession {
 
     async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         let normalized_provider = canonical_provider_id(&provider)
             .unwrap_or(&provider)
             .to_string();
@@ -422,10 +424,9 @@ impl ExtensionSession for InteractiveExtensionSession {
     async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
         let shared_model = self.model_entry.lock().map(|entry| entry.clone()).ok();
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         let effective_level = level.parse::<crate::model::ThinkingLevel>().map_or_else(
             |_| level.clone(),
             |parsed| match (shared_model.as_ref(), current_path_model_pair(&guard)) {
@@ -465,10 +466,9 @@ impl ExtensionSession for InteractiveExtensionSession {
         label: Option<String>,
     ) -> crate::error::Result<()> {
         let cx = Cx::current().unwrap_or_else(Cx::for_request);
-        let mut guard =
-            self.session.lock(&cx).await.map_err(|err| {
-                crate::error::Error::session(format!("session lock failed: {err}"))
-            })?;
+        let mut guard = OwnedMutexGuard::lock(Arc::clone(&self.session), &cx)
+            .await
+            .map_err(|err| crate::error::Error::session(format!("session lock failed: {err}")))?;
         if guard.add_label(&target_id, label).is_none() {
             return Err(crate::error::Error::validation(format!(
                 "target entry '{target_id}' not found in session"
@@ -1428,6 +1428,76 @@ mod tests {
             let state = ext_session.get_state().await;
             assert_eq!(state["steeringMode"], "all");
             assert_eq!(state["followUpMode"], "one-at-a-time");
+        });
+    }
+
+    /// Regression guard for pi_agent_rust#138 (asupersync 0.3.9).
+    ///
+    /// `asupersync::sync::MutexGuard` became `!Send` in 0.3.9, so any future
+    /// that holds one across an `.await` cannot be spawned. Every mutating
+    /// `ExtensionSession` method holds the session lock across
+    /// `Session::save().await`, which means the guard has to be an
+    /// `OwnedMutexGuard`. Driving those methods through
+    /// `RuntimeHandle::spawn` (`F: Future + Send + 'static`) on a
+    /// multi-threaded runtime pins that property: reverting to a borrowed
+    /// guard makes this test fail to compile, and running it end to end proves
+    /// the save path still persists through the owned guard.
+    #[test]
+    fn ext_session_mutations_stay_send_across_save_await() {
+        let runtime = RuntimeBuilder::multi_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("runtime build");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let session = Arc::new(Mutex::new(Session::create_with_dir(Some(
+                dir.path().to_path_buf(),
+            ))));
+            let ext_session = InteractiveExtensionSession {
+                session: Arc::clone(&session),
+                model_entry: Arc::new(StdMutex::new(dummy_model_entry())),
+                is_streaming: Arc::new(AtomicBool::new(false)),
+                is_compacting: Arc::new(AtomicBool::new(false)),
+                config: Config::default(),
+                // Saving is what forces the guard across an await point.
+                save_enabled: true,
+            };
+
+            handle
+                .spawn(async move {
+                    ext_session
+                        .set_name("spawned-session".to_string())
+                        .await
+                        .expect("set_name");
+                    ext_session
+                        .append_message(SessionMessage::User {
+                            content: crate::model::UserContent::Text("hello".to_string()),
+                            timestamp: Some(0),
+                        })
+                        .await
+                        .expect("append_message");
+                    ext_session
+                        .append_custom_entry("regression".to_string(), Some(json!({"n": 1})))
+                        .await
+                        .expect("append_custom_entry");
+                })
+                .await;
+
+            let cx = Cx::for_request();
+            let guard = session.lock(&cx).await.expect("lock session");
+            assert_eq!(guard.get_name().as_deref(), Some("spawned-session"));
+            assert!(
+                guard.path.is_some(),
+                "save() through the owned guard should have materialized a session file"
+            );
+            let custom_entries = guard
+                .entries
+                .iter()
+                .filter(|entry| matches!(entry, crate::session::SessionEntry::Custom(_)))
+                .count();
+            assert_eq!(custom_entries, 1);
         });
     }
 }

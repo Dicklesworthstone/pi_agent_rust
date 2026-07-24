@@ -1590,7 +1590,11 @@ fn session_branching() {
 
         let branched_from = {
             let cx = asupersync::Cx::for_testing();
-            let mut guard = session.lock(&cx).await.expect("lock session");
+            // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9) and this
+            // guard is held across `guard.save().await` below.
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock session");
             let user_ids = guard
                 .entries
                 .iter()

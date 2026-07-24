@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use asupersync::sync::OwnedMutexGuard;
+
 use crate::model::{ContentBlock, UserContent};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::theme::TuiStyles;
@@ -384,7 +386,7 @@ impl PiApp {
             }
 
             let (fork_plan, parent_path, session_dir) = {
-                let guard = match session.lock(&cx).await {
+                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -438,7 +440,7 @@ impl PiApp {
 
             let messages_for_agent = new_session.to_messages_for_current_path();
             {
-                let mut agent_guard = match agent.lock(&cx).await {
+                let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -454,7 +456,7 @@ impl PiApp {
             }
 
             {
-                let mut guard = match session.lock(&cx).await {
+                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -470,7 +472,7 @@ impl PiApp {
             }
 
             let (messages, usage) = {
-                let guard = match session.lock(&cx).await {
+                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(

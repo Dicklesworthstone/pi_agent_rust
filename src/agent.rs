@@ -47,7 +47,7 @@ use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
 use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
-use asupersync::sync::{Mutex, Notify};
+use asupersync::sync::{Mutex, Notify, OwnedMutexGuard};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::FutureExt;
@@ -8602,9 +8602,7 @@ impl AgentSession {
         from_extension: bool,
     ) -> Result<()> {
         let cx = crate::agent_cx::AgentCx::for_request();
-        let mut session = self
-            .session
-            .lock(cx.cx())
+        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
 
@@ -9117,9 +9115,7 @@ impl AgentSession {
     pub async fn save_and_index(&mut self) -> Result<()> {
         if self.save_enabled {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session
@@ -9134,9 +9130,7 @@ impl AgentSession {
             return Ok(());
         }
         let cx = crate::agent_cx::AgentCx::for_request();
-        let mut session = self
-            .session
-            .lock(cx.cx())
+        let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
             .await
             .map_err(|e| Error::session(e.to_string()))?;
         session
@@ -9690,9 +9684,7 @@ impl AgentSession {
 
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(prompt_message.clone());
@@ -9778,9 +9770,10 @@ impl AgentSession {
 
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9); this future
+            // is reachable from `RuntimeHandle::spawn` (the ACP prompt task in
+            // src/acp.rs), which requires the whole future to be `Send`.
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
@@ -9860,9 +9853,10 @@ impl AgentSession {
 
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            // Owned guard: `MutexGuard` is `!Send` (asupersync 0.3.9); this future
+            // is reachable from `RuntimeHandle::spawn` (the ACP prompt task in
+            // src/acp.rs), which requires the whole future to be `Send`.
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             session.append_model_message(user_message.clone());
@@ -9955,9 +9949,7 @@ impl AgentSession {
         let new_messages = self.agent.messages()[start_len..].to_vec();
         {
             let cx = crate::agent_cx::AgentCx::for_request();
-            let mut session = self
-                .session
-                .lock(cx.cx())
+            let mut session = OwnedMutexGuard::lock(Arc::clone(&self.session), cx.cx())
                 .await
                 .map_err(|e| Error::session(e.to_string()))?;
             for message in new_messages {

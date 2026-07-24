@@ -1,6 +1,7 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+use asupersync::sync::OwnedMutexGuard;
 use serde_json::{Value, json};
 
 use super::{AgentState, Cmd, EXTENSION_EVENT_TIMEOUT_MS, PiApp, PiMsg, conversation_from_session};
@@ -618,7 +619,7 @@ impl PiApp {
             let cx = asupersync::Cx::for_request();
 
             let path_entries = {
-                let mut guard = match session.lock(&cx).await {
+                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -739,7 +740,7 @@ impl PiApp {
                 };
 
             let (messages_for_agent, compaction_entry) = {
-                let mut guard = match session.lock(&cx).await {
+                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -772,7 +773,7 @@ impl PiApp {
             };
 
             {
-                let mut agent_guard = match agent.lock(&cx).await {
+                let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -789,7 +790,7 @@ impl PiApp {
             }
 
             let (messages, usage) = {
-                let guard = match session.lock(&cx).await {
+                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);

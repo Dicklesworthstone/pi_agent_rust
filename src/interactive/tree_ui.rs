@@ -449,7 +449,7 @@ impl PiApp {
             let mut summary_entry_id: Option<String> = None;
 
             let messages_for_agent = {
-                let mut guard = match session.lock(&cx).await {
+                let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -504,7 +504,7 @@ impl PiApp {
             };
 
             {
-                let mut agent_guard = match agent.lock(&cx).await {
+                let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -520,7 +520,7 @@ impl PiApp {
             }
 
             let (messages, usage) = {
-                let guard = match session.lock(&cx).await {
+                let guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(

@@ -797,7 +797,11 @@ fn cycle_run_abort_persist_reload_resume() {
         let session = Arc::clone(&session);
         async move {
             let cx = asupersync::Cx::for_testing();
-            let mut guard = session.lock(&cx).await.expect("lock");
+            // `MutexGuard` is `!Send` (asupersync 0.3.9) and `run_async` requires
+            // a `Send` future, so the guard held across `save().await` must be owned.
+            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &cx)
+                .await
+                .expect("lock");
             guard.save().await.expect("save after abort");
         }
     });
