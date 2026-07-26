@@ -1213,9 +1213,10 @@ fn e2e_cli_config_subcommand_json_output() {
 }
 
 #[cfg(unix)]
-#[test]
-fn e2e_cli_config_resolves_global_npm_root_once() {
-    let mut harness = CliTestHarness::new("e2e_cli_config_resolves_global_npm_root_once");
+fn configure_global_npm_packages(
+    harness: &mut CliTestHarness,
+    packages: &[(&str, &str)],
+) -> PathBuf {
     let npm_log = harness.harness.temp_path("npm.log");
     harness
         .env
@@ -1229,29 +1230,78 @@ fn e2e_cli_config_resolves_global_npm_root_once() {
     )
     .join("lib")
     .join("node_modules");
-    for package in ["first-package", "second-package"] {
-        let package_dir = global_node_modules.join(package);
+    for &(_, package_name) in packages {
+        let package_dir = global_node_modules.join(package_name);
         fs::create_dir_all(&package_dir).expect("create global npm package");
         fs::write(
             package_dir.join("package.json"),
             serde_json::to_vec(&json!({
-                "name": package,
+                "name": package_name,
                 "version": "1.0.0",
             }))
             .expect("serialize npm package"),
         )
         .expect("write npm package");
     }
+
+    let sources = packages
+        .iter()
+        .map(|&(source, _)| source)
+        .collect::<Vec<_>>();
     fs::write(
         harness.global_settings_path(),
-        serde_json::to_vec(&json!({
-            "packages": ["npm:first-package", "npm:second-package"],
-        }))
-        .expect("serialize settings"),
+        serde_json::to_vec(&json!({ "packages": sources })).expect("serialize settings"),
     )
     .expect("write settings");
 
+    npm_log
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_config_resolves_global_npm_root_once() {
+    let mut harness = CliTestHarness::new("e2e_cli_config_resolves_global_npm_root_once");
+    let npm_log = configure_global_npm_packages(
+        &mut harness,
+        &[
+            ("npm:first-package", "first-package"),
+            ("npm:second-package", "second-package"),
+        ],
+    );
+
     let result = harness.run(&["config", "--json"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    let npm_commands = fs::read_to_string(npm_log).expect("read npm command log");
+    assert_eq!(npm_commands, "root -g\n");
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_json_mode_resolves_global_npm_root_once() {
+    let mut harness = CliTestHarness::new("e2e_cli_json_mode_resolves_global_npm_root_once");
+    let npm_log = configure_global_npm_packages(
+        &mut harness,
+        &[
+            ("npm:first-package@1.0.0", "first-package"),
+            ("npm:second-package@1.0.0", "second-package"),
+        ],
+    );
+
+    let result = harness.run(&[
+        "--mode",
+        "json",
+        "--provider",
+        "anthropic",
+        "--model",
+        "claude-sonnet-4-5",
+        "--api-key",
+        "test-api-key",
+        "--no-tools",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+    ]);
 
     assert_exit_code(&harness.harness, &result, 0);
     let npm_commands = fs::read_to_string(npm_log).expect("read npm command log");

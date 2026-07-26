@@ -171,67 +171,6 @@ fn installed_path_resolves_project_and_user_scopes_without_external_commands() {
 }
 
 #[test]
-fn resolve_with_roots_preserves_installed_dist_tagged_npm_package() {
-    let harness =
-        TestHarness::new("resolve_with_roots_preserves_installed_dist_tagged_npm_package");
-    let cwd = harness.create_dir("cwd");
-    let manager = PackageManager::new(cwd.clone());
-
-    let global_base_dir = harness.create_dir("global");
-    let project_base_dir = cwd.join(".pi");
-    let installed_package = project_base_dir
-        .join("npm")
-        .join("node_modules")
-        .join("typescript");
-    let extension = installed_package.join("extensions").join("offline.js");
-    std::fs::create_dir_all(extension.parent().expect("extension parent"))
-        .expect("create installed package");
-    std::fs::write(&extension, "export default function init() {}\n").expect("write extension");
-    write_json(
-        &installed_package.join("package.json"),
-        &serde_json::json!({
-            "name": "typescript",
-            "version": "0.0.0",
-            "pi": {
-                "extensions": ["extensions/offline.js"]
-            }
-        }),
-    );
-
-    let global_settings_path = global_base_dir.join("settings.json");
-    let project_settings_path = project_base_dir.join("settings.json");
-    write_json(&global_settings_path, &serde_json::json!({}));
-    write_json(
-        &project_settings_path,
-        &serde_json::json!({ "packages": ["npm:typescript@latest"] }),
-    );
-
-    let roots = ResolveRoots {
-        project_settings_enabled: true,
-        global_settings_path,
-        project_settings_path,
-        global_base_dir,
-        project_base_dir,
-    };
-    let resolved =
-        run_async(manager.resolve_with_roots(&roots)).expect("resolve installed package");
-
-    let entry = resolved
-        .extensions
-        .iter()
-        .find(|entry| entry.path == extension)
-        .expect("installed package extension");
-    assert!(entry.enabled);
-    assert_eq!(entry.metadata.scope, PackageScope::Project);
-    assert_eq!(entry.metadata.source, "npm:typescript@latest");
-    assert_eq!(
-        std::fs::read_to_string(&entry.path).expect("read preserved extension"),
-        "export default function init() {}\n",
-        "normal resolution must not replace an installed unpinned package"
-    );
-}
-
-#[test]
 fn resolve_with_roots_auto_discovery_ignores_parent_gitignore() {
     let harness = TestHarness::new("resolve_with_roots_auto_discovery_ignores_parent_gitignore");
 

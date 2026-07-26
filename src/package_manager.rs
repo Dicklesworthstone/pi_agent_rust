@@ -422,7 +422,7 @@ impl PackageManager {
         let source = validate_non_empty_source(source, "Package source")?;
         let parsed = parse_source(source, &self.cwd);
         Ok(match parsed {
-            ParsedSource::Npm { name, .. } => self.npm_install_path(&name, scope)?,
+            ParsedSource::Npm { name, .. } => Some(self.npm_install_path(&name, scope)?),
             ParsedSource::Git { host, path, .. } => {
                 Some(self.checked_git_install_path(&host, &path, scope)?)
             }
@@ -538,9 +538,7 @@ impl PackageManager {
                         global_npm_root.as_deref(),
                     ) {
                         Some(path) => path,
-                        None => self
-                            .npm_install_path(&name, entry.scope)?
-                            .unwrap_or_else(|| self.cwd.join("node_modules").join(&name)),
+                        None => self.npm_install_path(&name, entry.scope)?,
                     };
 
                     if !installed_path.exists() {
@@ -1178,12 +1176,7 @@ impl PackageManager {
         let parsed = parse_source(source, &self.cwd);
         match parsed {
             ParsedSource::Npm { spec, name, pinned } => {
-                let installed_path = self.npm_install_path(&name, scope)?.ok_or_else(|| {
-                    Error::tool(
-                        "package_manager",
-                        "npm lock verification requires a concrete install path",
-                    )
-                })?;
+                let installed_path = self.npm_install_path(&name, scope)?;
                 if !installed_path.exists() {
                     return Err(Error::tool(
                         "package_manager",
@@ -1410,11 +1403,11 @@ impl PackageManager {
             .or_else(|| global_npm_root.map(|root| root.join(name)))
     }
 
-    fn npm_install_path(&self, name: &str, scope: PackageScope) -> Result<Option<PathBuf>> {
+    fn npm_install_path(&self, name: &str, scope: PackageScope) -> Result<PathBuf> {
         if let Some(path) = self.npm_install_path_with_root(name, scope, None) {
-            return Ok(Some(path));
+            return Ok(path);
         }
-        Ok(Some(Self::global_npm_root()?.join(name)))
+        Ok(Self::global_npm_root()?.join(name))
     }
 
     fn git_root(&self, scope: PackageScope) -> Option<PathBuf> {
@@ -1468,17 +1461,15 @@ impl PackageManager {
             run_command("npm", ["install", "-g", spec], None)?;
         }
 
-        // Basic sanity: installed path exists
-        if let Some(installed) = self.npm_install_path(&name, scope)? {
-            if !installed.exists() {
-                return Err(Error::tool(
-                    "npm",
-                    format!(
-                        "npm install succeeded but '{}' is missing",
-                        installed.display()
-                    ),
-                ));
-            }
+        let installed = self.npm_install_path(&name, scope)?;
+        if !installed.exists() {
+            return Err(Error::tool(
+                "npm",
+                format!(
+                    "npm install succeeded but '{}' is missing",
+                    installed.display()
+                ),
+            ));
         }
 
         Ok(())
@@ -6137,6 +6128,7 @@ mod tests {
         for (source, expected_name, expected_pinned) in [
             ("npm:@scope/pkg@1.0.0", "@scope/pkg", true),
             ("npm:@scope/pkg@v1.0.0", "@scope/pkg", true),
+            ("npm:@scope/pkg@1.0", "@scope/pkg", false),
             ("npm:express", "express", false),
             ("npm:express@latest", "express", false),
             ("npm:express@^4.0.0", "express", false),
