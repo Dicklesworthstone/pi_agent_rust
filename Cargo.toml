@@ -230,7 +230,7 @@ getrandom = "0.4.1"
 regex = "1.12.3"
 ring = "0.17.14"
 semver = "1.0.27"
-node-semver = "2.2.0"
+deno_semver = "0.10.1"
 crc32c = "0.6"
 ast-grep-core = "0.40"
 ast-grep-language = { version = "0.40", default-features = false, features = [

@@ -171,8 +171,9 @@ fn installed_path_resolves_project_and_user_scopes_without_external_commands() {
 }
 
 #[test]
-fn resolve_with_roots_uses_installed_unpinned_npm_package() {
-    let harness = TestHarness::new("resolve_with_roots_uses_installed_unpinned_npm_package");
+fn resolve_with_roots_preserves_installed_dist_tagged_npm_package() {
+    let harness =
+        TestHarness::new("resolve_with_roots_preserves_installed_dist_tagged_npm_package");
     let cwd = harness.create_dir("cwd");
     let manager = PackageManager::new(cwd.clone());
 
@@ -202,7 +203,7 @@ fn resolve_with_roots_uses_installed_unpinned_npm_package() {
     write_json(&global_settings_path, &serde_json::json!({}));
     write_json(
         &project_settings_path,
-        &serde_json::json!({ "packages": ["npm:typescript"] }),
+        &serde_json::json!({ "packages": ["npm:typescript@latest"] }),
     );
 
     let roots = ResolveRoots {
@@ -222,7 +223,7 @@ fn resolve_with_roots_uses_installed_unpinned_npm_package() {
         .expect("installed package extension");
     assert!(entry.enabled);
     assert_eq!(entry.metadata.scope, PackageScope::Project);
-    assert_eq!(entry.metadata.source, "npm:typescript");
+    assert_eq!(entry.metadata.source, "npm:typescript@latest");
     assert_eq!(
         std::fs::read_to_string(&entry.path).expect("read preserved extension"),
         "export default function init() {}\n",

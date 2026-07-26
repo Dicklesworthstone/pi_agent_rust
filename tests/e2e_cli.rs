@@ -37,6 +37,10 @@ const FAKE_NPM_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 
 cmd="${1:-}"
+if [ -n "${PI_TEST_NPM_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$PI_TEST_NPM_LOG"
+fi
+
 if [ "$cmd" = "root" ] && [ "${2:-}" = "-g" ]; then
     printf '%s\n' "${npm_config_prefix:-$PWD/.fake-npm-global}/lib/node_modules"
     exit 0
@@ -1206,6 +1210,52 @@ fn e2e_cli_config_subcommand_json_output() {
         payload.get("configValid").is_some(),
         "missing configValid flag"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn e2e_cli_config_resolves_global_npm_root_once() {
+    let mut harness = CliTestHarness::new("e2e_cli_config_resolves_global_npm_root_once");
+    let npm_log = harness.harness.temp_path("npm.log");
+    harness
+        .env
+        .insert("PI_TEST_NPM_LOG".to_string(), npm_log.display().to_string());
+
+    let global_node_modules = PathBuf::from(
+        harness
+            .env
+            .get("npm_config_prefix")
+            .expect("isolated npm prefix"),
+    )
+    .join("lib")
+    .join("node_modules");
+    for package in ["first-package", "second-package"] {
+        let package_dir = global_node_modules.join(package);
+        fs::create_dir_all(&package_dir).expect("create global npm package");
+        fs::write(
+            package_dir.join("package.json"),
+            serde_json::to_vec(&json!({
+                "name": package,
+                "version": "1.0.0",
+            }))
+            .expect("serialize npm package"),
+        )
+        .expect("write npm package");
+    }
+    fs::write(
+        harness.global_settings_path(),
+        serde_json::to_vec(&json!({
+            "packages": ["npm:first-package", "npm:second-package"],
+        }))
+        .expect("serialize settings"),
+    )
+    .expect("write settings");
+
+    let result = harness.run(&["config", "--json"]);
+
+    assert_exit_code(&harness.harness, &result, 0);
+    let npm_commands = fs::read_to_string(npm_log).expect("read npm command log");
+    assert_eq!(npm_commands, "root -g\n");
 }
 
 #[test]

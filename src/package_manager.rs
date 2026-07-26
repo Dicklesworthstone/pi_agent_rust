@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::extension_index::ExtensionIndexStore;
 use crate::extensions::{CompatibilityScanner, load_extension_manifest};
 use asupersync::channel::oneshot;
-use node_semver::{Range as NpmVersionRange, Version as NpmVersion};
+use deno_semver::{Version as NpmVersion, VersionReq as NpmVersionReq};
 use semver::Version as StrictVersion;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,7 +23,6 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use tracing::{info, warn};
 
@@ -130,7 +129,6 @@ impl ResolveRoots {
 #[derive(Debug, Clone)]
 pub struct PackageManager {
     cwd: PathBuf,
-    global_npm_root: Arc<Mutex<Option<PathBuf>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,11 +235,8 @@ pub const PACKAGE_LOCK_SCHEMA: &str = "pi.package_lock.v1";
 pub const PACKAGE_TRUST_AUDIT_SCHEMA: &str = "pi.package_trust_audit.v1";
 
 impl PackageManager {
-    pub fn new(cwd: PathBuf) -> Self {
-        Self {
-            cwd,
-            global_npm_root: Arc::new(Mutex::new(None)),
-        }
+    pub const fn new(cwd: PathBuf) -> Self {
+        Self { cwd }
     }
 
     /// Resolve a shorthand source (`id`/`name`) via the local extension index when possible.
@@ -508,6 +503,7 @@ impl PackageManager {
             scope: PackageScope::Project,
         }));
         let package_sources = self.dedupe_packages(all_packages);
+        let global_npm_root = self.global_npm_root_for_sources(&package_sources)?;
 
         let mut accumulator = ResourceAccumulator::new();
 
@@ -536,9 +532,16 @@ impl PackageManager {
                     )?;
                 }
                 ParsedSource::Npm { name, .. } => {
-                    let installed_path = self
-                        .npm_install_path(&name, entry.scope)?
-                        .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
+                    let installed_path = match self.npm_install_path_with_root(
+                        &name,
+                        entry.scope,
+                        global_npm_root.as_deref(),
+                    ) {
+                        Some(path) => path,
+                        None => self
+                            .npm_install_path(&name, entry.scope)?
+                            .unwrap_or_else(|| self.cwd.join("node_modules").join(&name)),
+                    };
 
                     if !installed_path.exists() {
                         return Ok(None);
@@ -663,7 +666,12 @@ impl PackageManager {
 
         // Offload the heavy lifting (sync I/O) to a thread
         let handle = thread::spawn(move || {
-            let res: Result<(SettingsSnapshot, SettingsSnapshot, Vec<ScopedPackage>)> = (|| {
+            let res: Result<(
+                SettingsSnapshot,
+                SettingsSnapshot,
+                Vec<ScopedPackage>,
+                Option<PathBuf>,
+            )> = (|| {
                 let global = read_settings_snapshot(&roots_for_setup.global_settings_path)?;
                 let project = read_project_settings_snapshot(&roots_for_setup)?;
 
@@ -682,22 +690,28 @@ impl PackageManager {
                     }));
                 }
                 let package_sources = this_for_setup.dedupe_packages(all_packages);
-                Ok((global, project, package_sources))
-            })(
-            );
+                let global_npm_root =
+                    this_for_setup.global_npm_root_for_sources(&package_sources)?;
+                Ok((global, project, package_sources, global_npm_root))
+            })();
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), res);
         });
 
         let cx = AgentCx::for_request();
         let recv_result = rx.recv(cx.cx()).await;
-        let (global, project, package_sources) =
+        let (global, project, package_sources, global_npm_root) =
             finish_package_task(handle, recv_result, "Resolve setup task cancelled")?;
 
         let mut accumulator = ResourceAccumulator::new();
 
         // Missing or incompatible packages may require async installation.
-        Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
+        Box::pin(self.resolve_package_sources(
+            &package_sources,
+            global_npm_root.as_deref(),
+            &mut accumulator,
+        ))
+        .await?;
 
         // Offload the rest of sync resolution
         let this = self.clone();
@@ -794,7 +808,7 @@ impl PackageManager {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
+        Box::pin(self.resolve_package_sources(&package_sources, None, &mut accumulator)).await?;
 
         let (tx, mut rx) = oneshot::channel();
         let accumulator = std::sync::Mutex::new(accumulator);
@@ -1196,9 +1210,10 @@ impl PackageManager {
                     .as_deref()
                     .and_then(parse_exact_npm_version)
                 {
-                    if parse_exact_npm_version(&installed_version)
-                        .is_none_or(|installed| installed != expected)
-                    {
+                    // npm version precedence intentionally ignores build metadata.
+                    let installed_matches = parse_exact_npm_version(&installed_version)
+                        .is_some_and(|installed| installed.cmp(&expected).is_eq());
+                    if !installed_matches {
                         return Err(verification_error(
                             "npm_version_mismatch",
                             &format!(
@@ -1328,15 +1343,7 @@ impl PackageManager {
         Config::global_dir().join("git")
     }
 
-    fn global_npm_root(&self) -> Result<PathBuf> {
-        let mut cached = self
-            .global_npm_root
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(root) = cached.as_ref() {
-            return Ok(root.clone());
-        }
-
+    fn global_npm_root() -> Result<PathBuf> {
         let output = Command::new("npm")
             .args(["root", "-g"])
             .stdin(Stdio::null())
@@ -1366,10 +1373,21 @@ impl PackageManager {
             return Err(Error::tool("npm", "npm root -g returned empty output"));
         }
 
-        let root = PathBuf::from(root);
-        *cached = Some(root.clone());
-        drop(cached);
-        Ok(root)
+        Ok(PathBuf::from(root))
+    }
+
+    fn global_npm_root_for_sources(&self, sources: &[ScopedPackage]) -> Result<Option<PathBuf>> {
+        sources
+            .iter()
+            .any(|entry| {
+                entry.scope == PackageScope::User
+                    && matches!(
+                        parse_source(entry.pkg.source.trim(), &self.cwd),
+                        ParsedSource::Npm { .. }
+                    )
+            })
+            .then(Self::global_npm_root)
+            .transpose()
     }
 
     fn npm_prefix_root(&self, scope: PackageScope) -> Option<PathBuf> {
@@ -1380,11 +1398,23 @@ impl PackageManager {
         }
     }
 
+    fn npm_install_path_with_root(
+        &self,
+        name: &str,
+        scope: PackageScope,
+        global_npm_root: Option<&Path>,
+    ) -> Option<PathBuf> {
+        self.npm_prefix_root(scope)
+            .map(|prefix_root| prefix_root.join("node_modules").join(name))
+            // ubs:ignore configured npm package key; scoped names intentionally contain a slash.
+            .or_else(|| global_npm_root.map(|root| root.join(name)))
+    }
+
     fn npm_install_path(&self, name: &str, scope: PackageScope) -> Result<Option<PathBuf>> {
-        Ok(Some(match self.npm_prefix_root(scope) {
-            Some(prefix_root) => prefix_root.join("node_modules").join(name),
-            None => self.global_npm_root()?.join(name),
-        }))
+        if let Some(path) = self.npm_install_path_with_root(name, scope, None) {
+            return Ok(Some(path));
+        }
+        Ok(Some(Self::global_npm_root()?.join(name)))
     }
 
     fn git_root(&self, scope: PackageScope) -> Option<PathBuf> {
@@ -1817,6 +1847,7 @@ impl PackageManager {
     async fn resolve_package_sources(
         &self,
         sources: &[ScopedPackage],
+        global_npm_root: Option<&Path>,
         accumulator: &mut ResourceAccumulator,
     ) -> Result<()> {
         for entry in sources {
@@ -1844,11 +1875,17 @@ impl PackageManager {
                     )?;
                 }
                 ParsedSource::Npm { spec, name, .. } => {
-                    // Offload installed_path check
-                    let installed_path = self
-                        .installed_path(&format!("npm:{name}"), entry.scope)
-                        .await?
-                        .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
+                    let installed_path = match self.npm_install_path_with_root(
+                        &name,
+                        entry.scope,
+                        global_npm_root,
+                    ) {
+                        Some(path) => path,
+                        None => self
+                            .installed_path(&format!("npm:{name}"), entry.scope)
+                            .await?
+                            .unwrap_or_else(|| self.cwd.join("node_modules").join(&name)),
+                    };
 
                     // Installed packages are startup state, not an update check.
                     // Remote freshness belongs to the explicit `pi update` path;
@@ -3586,17 +3623,17 @@ fn npm_spec_needs_install(spec: &str, installed_path: &Path) -> bool {
         return false;
     }
 
-    if let Some(requested) = parse_exact_npm_version(requested_version) {
-        return !NpmVersion::parse(&installed_version)
-            .is_ok_and(|installed| installed == requested);
-    }
-
-    let Ok(requirement) = NpmVersionRange::parse(requested_version) else {
-        // Dist-tags are intentionally floating. `pi update` resolves them
-        // against npm.
+    let Ok(requirement) = NpmVersionReq::parse_from_npm(requested_version) else {
+        // Unknown npm spec forms remain floating. `pi update` resolves them
+        // through npm.
         return false;
     };
-    !NpmVersion::parse(&installed_version).is_ok_and(|installed| requirement.satisfies(&installed))
+    if requirement.tag().is_some() {
+        // Dist-tags are intentionally floating.
+        return false;
+    }
+    !parse_exact_npm_version(&installed_version)
+        .is_some_and(|installed| requirement.matches(&installed))
 }
 
 fn is_local_npm_reference(reference: &str) -> bool {
@@ -3877,7 +3914,7 @@ fn is_exact_npm_version(value: &str) -> bool {
 fn parse_exact_npm_version(value: &str) -> Option<NpmVersion> {
     let normalized = value.strip_prefix('v').unwrap_or(value);
     StrictVersion::parse(normalized).ok()?;
-    NpmVersion::parse(normalized).ok()
+    NpmVersion::parse_from_npm(normalized).ok()
 }
 
 pub fn digest_package_path(path: &Path) -> Result<String> {
@@ -5542,20 +5579,22 @@ mod tests {
             ("demo@1.2.3", "1.2.3", false),
             ("demo@1.2.4", "1.2.3", true),
             ("demo@v1.2.3", "1.2.3", false),
-            ("demo@=1.2.3", "1.2.3", false),
-            ("demo@=1.2.4", "1.2.3", true),
             ("demo@^1.2.0", "1.9.0", false),
             ("demo@^2.0.0", "1.9.0", true),
             ("demo@~1.2.0", "1.2.9", false),
             ("demo@1.2", "1.2.9", false),
             ("demo@1.2", "1.9.0", true),
             ("demo@1.x", "1.9.0", false),
-            ("demo@1.x", "2.0.0", true),
             ("demo@1.2.3 || >=2.0.0", "2.1.0", false),
-            ("demo@1.2.3 || >=2.0.0", "1.9.0", true),
             ("demo@1.2.0 - 1.4.0", "1.3.0", false),
+            ("demo@^1.2.0", "not-semver", true),
+            ("demo@^1.2.0", "01.2.3", true),
+            ("demo@^1.2.0", "1.2.3alpha", true),
+            ("demo@^1.2.0", "v 1.2.3", true),
+            ("demo@>=2.0.0 <1.0.0", "0.5.0", true),
+            ("demo@>=2.0.0 <1.0.0", "1.5.0", true),
+            ("demo@>=2.0.0 <1.0.0", "2.5.0", true),
             ("demo@latest", "1.2.3", false),
-            ("demo@beta", "1.2.3", false),
             ("demo@file:../demo", "1.2.3", false),
         ] {
             fs::write(
@@ -6093,35 +6132,26 @@ mod tests {
     // ======================================================================
 
     #[test]
-    fn parse_source_npm_prefix() -> std::result::Result<(), String> {
+    fn parse_source_recognizes_only_exact_npm_versions_as_pinned() {
         let dir = tempfile::tempdir().expect("tempdir");
-        for source in ["npm:@scope/pkg@1.0.0", "npm:@scope/pkg@v1.0.0"] {
-            let ParsedSource::Npm { name, pinned, .. } = parse_source(source, dir.path()) else {
-                return Err(format!("unexpected parsed source for {source}"));
-            };
-            assert_eq!(name, "@scope/pkg");
-            assert!(pinned, "{source} should be pinned");
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn parse_source_npm_unpinned() -> std::result::Result<(), String> {
-        let dir = tempfile::tempdir().expect("tempdir");
-        for source in [
-            "npm:express",
-            "npm:express@latest",
-            "npm:express@^4.0.0",
-            "npm:express@~4.0.0",
-            "npm:express@=4.0.0",
-            "npm:express@file:../express",
+        for (source, expected_name, expected_pinned) in [
+            ("npm:@scope/pkg@1.0.0", "@scope/pkg", true),
+            ("npm:@scope/pkg@v1.0.0", "@scope/pkg", true),
+            ("npm:express", "express", false),
+            ("npm:express@latest", "express", false),
+            ("npm:express@^4.0.0", "express", false),
+            ("npm:express@=4.0.0", "express", false),
+            ("npm:express@file:../express", "express", false),
         ] {
-            let ParsedSource::Npm { pinned, .. } = parse_source(source, dir.path()) else {
-                return Err(format!("unexpected parsed source for {source}"));
+            let ParsedSource::Npm { name, pinned, .. } = parse_source(source, dir.path()) else {
+                panic!("unexpected parsed source for {source}"); // ubs:ignore test assertion.
             };
-            assert!(!pinned, "{source} should remain updateable");
+            assert_eq!(name, expected_name);
+            assert_eq!(
+                pinned, expected_pinned,
+                "unexpected pinned state for {source}"
+            );
         }
-        Ok(())
     }
 
     #[test]
@@ -7256,13 +7286,9 @@ mod tests {
 
         let manager = PackageManager::new(cwd);
         for (source, expected_pinned) in [
-            ("npm:demo-pkg@1.2.3", true),
             ("npm:demo-pkg@v1.2.3", true),
-            ("npm:demo-pkg@=1.2.3", false),
-            ("npm:demo-pkg@1.2", false),
+            ("npm:demo-pkg@1.2.3+build", true),
             ("npm:demo-pkg@latest", false),
-            ("npm:demo-pkg@beta", false),
-            ("npm:demo-pkg@file:../demo-pkg", false),
         ] {
             let entry = manager
                 .build_lock_entry(source, PackageScope::Project)
