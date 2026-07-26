@@ -531,7 +531,7 @@ impl PackageManager {
                         entry.scope == PackageScope::Temporary,
                     )?;
                 }
-                ParsedSource::Npm { name, .. } => {
+                ParsedSource::Npm { spec, name, .. } => {
                     let installed_path = match self.npm_install_path_with_root(
                         &name,
                         entry.scope,
@@ -541,7 +541,7 @@ impl PackageManager {
                         None => self.npm_install_path(&name, entry.scope)?,
                     };
 
-                    if !installed_path.exists() {
+                    if npm_spec_needs_install(&spec, &installed_path) {
                         return Ok(None);
                     }
 
@@ -3903,8 +3903,17 @@ fn is_exact_npm_version(value: &str) -> bool {
 }
 
 fn parse_exact_npm_version(value: &str) -> Option<NpmVersion> {
-    let normalized = value.strip_prefix('v').unwrap_or(value);
-    StrictVersion::parse(normalized).ok()?;
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+    let normalized = value.trim();
+    let normalized = normalized.strip_prefix('v').unwrap_or(normalized);
+    let strict = StrictVersion::parse(normalized).ok()?;
+    if [strict.major, strict.minor, strict.patch]
+        .into_iter()
+        .any(|component| component > MAX_SAFE_INTEGER)
+    {
+        return None;
+    }
     NpmVersion::parse_from_npm(normalized).ok()
 }
 
@@ -5628,6 +5637,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn blocking_resolution_defers_incompatible_npm_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_root = dir.path().join("project");
+        let project_base = project_root.join(".pi");
+        let project_settings = project_base.join("settings.json");
+        let installed = project_base.join("npm/node_modules/demo");
+        fs::create_dir_all(&installed).expect("create installed package");
+        fs::write(&project_settings, br#"{"packages":["npm:demo@^2.0.0"]}"#)
+            .expect("write project settings");
+        fs::write(
+            installed.join("package.json"),
+            br#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .expect("write package metadata");
+
+        let roots = ResolveRoots {
+            global_settings_path: dir.path().join("global-settings.json"),
+            project_settings_path: project_settings,
+            global_base_dir: dir.path().join("global"),
+            project_base_dir: project_base,
+            project_settings_enabled: true,
+        };
+        let manager = PackageManager::new(project_root);
+
+        assert!(
+            manager
+                .resolve_package_resources_with_roots_blocking(&roots)
+                .expect("resolve package resources")
+                .is_none(),
+            "the fast path must defer installation to canonical async resolution"
+        );
+    }
+
     // ======================================================================
     // ResourceList dedup
     // ======================================================================
@@ -6128,6 +6171,9 @@ mod tests {
         for (source, expected_name, expected_pinned) in [
             ("npm:@scope/pkg@1.0.0", "@scope/pkg", true),
             ("npm:@scope/pkg@v1.0.0", "@scope/pkg", true),
+            ("npm:@scope/pkg@ 1.0.0 ", "@scope/pkg", true),
+            ("npm:@scope/pkg@9007199254740991.0.0", "@scope/pkg", true),
+            ("npm:@scope/pkg@9007199254740992.0.0", "@scope/pkg", false),
             ("npm:@scope/pkg@1.0", "@scope/pkg", false),
             ("npm:express", "express", false),
             ("npm:express@latest", "express", false),

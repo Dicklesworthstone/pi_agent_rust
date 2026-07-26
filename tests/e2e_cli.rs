@@ -1264,8 +1264,8 @@ fn e2e_cli_config_resolves_global_npm_root_once() {
     let npm_log = configure_global_npm_packages(
         &mut harness,
         &[
-            ("npm:first-package", "first-package"),
-            ("npm:second-package", "second-package"),
+            ("npm:first-package@^1.0.0", "first-package"),
+            ("npm:second-package@~1.0.0", "second-package"),
         ],
     );
 
@@ -1283,8 +1283,8 @@ fn e2e_cli_json_mode_resolves_global_npm_root_once() {
     let npm_log = configure_global_npm_packages(
         &mut harness,
         &[
-            ("npm:first-package@1.0.0", "first-package"),
-            ("npm:second-package@1.0.0", "second-package"),
+            ("npm:first-package@latest", "first-package"),
+            ("npm:second-package@next", "second-package"),
         ],
     );
 
