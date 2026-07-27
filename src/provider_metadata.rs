@@ -240,6 +240,23 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        canonical_id: "atlascloud",
+        display_name: Some("Atlas Cloud"),
+        aliases: &["atlas-cloud", "atlas"],
+        auth_env_keys: &["ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.atlascloud.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 128_000,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "mistral",
         display_name: Some("Mistral AI"),
         aliases: &["mistralai"],
@@ -1747,6 +1764,11 @@ mod tests {
         let openrouter_alias =
             provider_metadata("open-router").expect("open-router alias metadata");
         assert_eq!(openrouter_alias.canonical_id, "openrouter");
+        let atlas_alias = provider_metadata("atlas").expect("atlas alias metadata");
+        assert_eq!(atlas_alias.canonical_id, "atlascloud");
+        let atlas_cloud_alias =
+            provider_metadata("atlas-cloud").expect("atlas-cloud alias metadata");
+        assert_eq!(atlas_cloud_alias.canonical_id, "atlascloud");
         let vercel_gateway_alias =
             provider_metadata("vercel-ai-gateway").expect("vercel alias metadata");
         assert_eq!(vercel_gateway_alias.canonical_id, "vercel");
@@ -1862,6 +1884,14 @@ mod tests {
         assert_eq!(
             provider_auth_env_keys("open-router"),
             &["OPENROUTER_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("atlascloud"),
+            &["ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY"]
+        );
+        assert_eq!(
+            provider_auth_env_keys("atlas-cloud"),
+            &["ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY"]
         );
         assert_eq!(
             provider_auth_env_keys("vercel-ai-gateway"),

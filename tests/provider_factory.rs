@@ -1371,6 +1371,82 @@ fn create_provider_cloudflare_ai_gateway_routes_via_openai_compat() {
 }
 
 #[test]
+fn atlascloud_preset_resolves_openai_compat_defaults_and_factory_route() {
+    let defaults = provider_routing_defaults("atlascloud").expect("atlascloud defaults");
+    assert_eq!(defaults.api, "openai-completions");
+    assert_eq!(defaults.base_url, "https://api.atlascloud.ai/v1");
+    assert!(defaults.auth_header);
+    assert_eq!(canonical_provider_id("atlas-cloud"), Some("atlascloud"));
+    assert_eq!(canonical_provider_id("atlas"), Some("atlascloud"));
+    assert_eq!(
+        provider_auth_env_keys("atlascloud"),
+        &["ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY"]
+    );
+
+    let mut entry = make_model_entry(
+        "atlascloud",
+        "deepseek-ai/deepseek-v4-pro",
+        defaults.base_url,
+    );
+    entry.model.api.clear();
+    let provider = create_provider(&entry, None).expect("atlascloud provider");
+    assert_eq!(provider.name(), "atlascloud");
+    assert_eq!(provider.api(), "openai-completions");
+    assert_eq!(provider.model_id(), "deepseek-ai/deepseek-v4-pro");
+}
+
+#[test]
+fn atlascloud_stream_uses_chat_completions_path_and_bearer_auth() {
+    let harness = TestHarness::new("atlascloud_stream_uses_chat_completions_path_and_bearer_auth");
+    let server = harness.start_mock_http_server();
+    server.add_route(
+        "POST",
+        "/v1/chat/completions",
+        text_event_stream_response(openai_chat_sse_body()),
+    );
+
+    let mut entry = make_model_entry(
+        "atlascloud",
+        "deepseek-ai/deepseek-v4-pro",
+        &format!("{}/v1", server.base_url()),
+    );
+    entry.model.api.clear();
+    let provider = create_provider(&entry, None).expect("atlascloud provider");
+    let context = Context {
+        system_prompt: Some("Be concise.".to_string().into()),
+        messages: vec![Message::User(UserMessage {
+            content: UserContent::Text("Ping".to_string()),
+            timestamp: 0,
+        })]
+        .into(),
+        tools: Vec::new().into(),
+    };
+    let options = StreamOptions {
+        api_key: Some("atlas-test-token".to_string()),
+        max_tokens: Some(512),
+        ..Default::default()
+    };
+    drive_provider_stream_to_done(provider, context, options);
+
+    let requests = server.requests();
+    assert_eq!(
+        requests.len(),
+        1,
+        "expected exactly one Atlas Cloud request"
+    );
+    let request = &requests[0];
+    assert_eq!(request.path, "/v1/chat/completions");
+    assert_eq!(
+        request_header(&request.headers, "authorization").as_deref(),
+        Some("Bearer atlas-test-token")
+    );
+    assert_eq!(
+        request_header(&request.headers, "content-type").as_deref(),
+        Some("application/json")
+    );
+}
+
+#[test]
 fn wave_a_presets_resolve_openai_compat_defaults_and_factory_route() {
     let harness =
         TestHarness::new("wave_a_presets_resolve_openai_compat_defaults_and_factory_route");

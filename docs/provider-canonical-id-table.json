@@ -91,6 +91,24 @@
       }
     },
     {
+      "aliases": [
+        "cursor-agent"
+      ],
+      "auth_env_keys": [
+        "CURSOR_API_KEY",
+        "CURSOR_ACCESS_TOKEN"
+      ],
+      "canonical_id": "cursor",
+      "onboarding_mode": "built-in-native",
+      "routing": {
+        "api": "cursor-agent",
+        "auth_header": true,
+        "base_url": "https://api2.cursor.sh/agent.v1.AgentService/Run",
+        "context_window": 200000,
+        "max_tokens": 64000
+      }
+    },
+    {
       "aliases": [],
       "auth_env_keys": [
         "GROQ_API_KEY"
@@ -150,6 +168,25 @@
         "api": "openai-completions",
         "auth_header": true,
         "base_url": "https://openrouter.ai/api/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
+      "aliases": [
+        "atlas-cloud",
+        "atlas"
+      ],
+      "auth_env_keys": [
+        "ATLASCLOUD_API_KEY",
+        "ATLAS_CLOUD_API_KEY"
+      ],
+      "canonical_id": "atlascloud",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://api.atlascloud.ai/v1",
         "context_window": 128000,
         "max_tokens": 16384
       }
@@ -833,6 +870,22 @@
       }
     },
     {
+      "aliases": [],
+      "auth_env_keys": [
+        "DASHSCOPE_API_KEY",
+        "QWEN_API_KEY"
+      ],
+      "canonical_id": "alibaba-us",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": true,
+        "base_url": "https://dashscope-us.aliyuncs.com/compatible-mode/v1",
+        "context_window": 128000,
+        "max_tokens": 16384
+      }
+    },
+    {
       "aliases": [
         "kimi-coding",
         "kimi-code"
@@ -1186,6 +1239,39 @@
       }
     },
     {
+      "aliases": [
+        "llama-cpp",
+        "llama.cpp",
+        "llama-server"
+      ],
+      "auth_env_keys": [],
+      "canonical_id": "llamacpp",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": false,
+        "base_url": "http://127.0.0.1:8080/v1",
+        "context_window": 131072,
+        "max_tokens": 32768
+      }
+    },
+    {
+      "aliases": [
+        "mistral.rs",
+        "mistral-rs"
+      ],
+      "auth_env_keys": [],
+      "canonical_id": "mistralrs",
+      "onboarding_mode": "oai-compatible-preset",
+      "routing": {
+        "api": "openai-completions",
+        "auth_header": false,
+        "base_url": "http://127.0.0.1:1234/v1",
+        "context_window": 131072,
+        "max_tokens": 32768
+      }
+    },
+    {
       "aliases": [],
       "auth_env_keys": [
         "OLLAMA_API_KEY"
@@ -1343,6 +1429,7 @@
     {
       "aliases": [
         "azure",
+        "azure_openai",
         "azure-cognitive-services",
         "azure-openai-responses"
       ],
@@ -1377,6 +1464,6 @@
     }
   ],
   "schema_version": "1.0",
-  "total_aliases": 42,
-  "total_providers": 90
+  "total_aliases": 51,
+  "total_providers": 95
 }
