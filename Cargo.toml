@@ -1,6 +1,6 @@
 [package]
 name = "pi_agent_rust"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2024"
 rust-version = "1.85"
 description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
