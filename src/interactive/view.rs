@@ -716,6 +716,11 @@ impl PiApp {
                 self.styles.error_bold.clone(),
                 self.styles.error_bold.clone(),
             ),
+            ThinkingLevel::Max => (
+                "max",
+                self.styles.error_bold.clone(),
+                self.styles.error_bold.clone(),
+            ),
         };
 
         let thinking_plain = format!("[thinking: {thinking_label}]");

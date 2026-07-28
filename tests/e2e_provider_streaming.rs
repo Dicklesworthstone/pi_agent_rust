@@ -487,6 +487,7 @@ async fn run_e2e_scenario(
         medium: 1024,
         high: 1024,
         xhigh: 1024,
+        max: 1024,
     });
     let max_tokens = thinking_budgets
         .as_ref()
@@ -498,6 +499,7 @@ async fn run_e2e_scenario(
                 ThinkingLevel::Medium => budgets.medium,
                 ThinkingLevel::High => budgets.high,
                 ThinkingLevel::XHigh => budgets.xhigh,
+                ThinkingLevel::Max => budgets.max,
             };
             scenario.max_tokens.max(budget.saturating_add(256))
         });

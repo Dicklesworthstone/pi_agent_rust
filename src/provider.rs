@@ -152,6 +152,7 @@ pub struct ThinkingBudgets {
     pub medium: u32,
     pub high: u32,
     pub xhigh: u32,
+    pub max: u32,
 }
 
 impl Default for ThinkingBudgets {
@@ -162,6 +163,7 @@ impl Default for ThinkingBudgets {
             medium: 8192,
             high: 16384,
             xhigh: 32768, // Default to double high, or model max? Let's pick a reasonable default.
+            max: 65536,
         }
     }
 }

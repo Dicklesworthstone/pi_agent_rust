@@ -720,7 +720,7 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         },
         BuiltinSlashCommand {
             name: "thinking",
-            description: "Set thinking level (off/minimal/low/medium/high/xhigh)",
+            description: "Set thinking level (off/minimal/low/medium/high/xhigh/max)",
         },
         BuiltinSlashCommand {
             name: "scoped-models",

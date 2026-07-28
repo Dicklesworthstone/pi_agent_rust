@@ -322,7 +322,7 @@ pub struct Cli {
 
     // === Thinking/Reasoning ===
     /// Extended thinking level
-    #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh"])]
+    #[arg(long, value_parser = ["off", "minimal", "low", "medium", "high", "xhigh", "max"])]
     pub thinking: Option<String>,
 
     // === System Prompt ===
@@ -715,7 +715,7 @@ mod tests {
 
     #[test]
     fn parse_all_thinking_levels() {
-        for level in &["off", "minimal", "low", "medium", "high", "xhigh"] {
+        for level in &["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let cli = Cli::parse_from(["pi", "--thinking", level]);
             assert_eq!(cli.thinking.as_deref(), Some(*level));
         }

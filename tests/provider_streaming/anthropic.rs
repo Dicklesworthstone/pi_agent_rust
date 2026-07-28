@@ -97,6 +97,7 @@ fn build_options(scenario: &Scenario, api_key: String) -> StreamOptions {
                 medium: MIN_THINKING_BUDGET_TOKENS,
                 high: MIN_THINKING_BUDGET_TOKENS,
                 xhigh: MIN_THINKING_BUDGET_TOKENS,
+                max: MIN_THINKING_BUDGET_TOKENS,
             })
         },
         |budgets| {
@@ -106,6 +107,7 @@ fn build_options(scenario: &Scenario, api_key: String) -> StreamOptions {
                 medium: budgets.medium.max(MIN_THINKING_BUDGET_TOKENS),
                 high: budgets.high.max(MIN_THINKING_BUDGET_TOKENS),
                 xhigh: budgets.xhigh.max(MIN_THINKING_BUDGET_TOKENS),
+                max: budgets.max.max(MIN_THINKING_BUDGET_TOKENS),
             })
         },
     );
@@ -792,6 +794,7 @@ fn scenario_thinking_budget_exceeded(model: &str) -> Scenario {
         medium: 64,
         high: 64,
         xhigh: 64,
+        max: 64,
     };
     Scenario {
         name: "anthropic_thinking_budget_exceeded",

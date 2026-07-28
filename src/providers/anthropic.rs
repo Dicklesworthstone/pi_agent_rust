@@ -342,8 +342,8 @@ fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
 /// keyed by the lowercase `ThinkingLevel` name.
 ///
 /// Default mapping: `minimal`/`low -> "low"`, `medium -> "medium"`,
-/// `high -> "high"`, `xhigh -> "xhigh"` (Anthropic has no `minimal` effort, and
-/// pi has no `max` level — both collapse to the nearest Anthropic tier). `off`
+/// `high -> "high"`, `xhigh -> "xhigh"`, `max -> "max"` (Anthropic has no
+/// `minimal` effort — it collapses to the nearest Anthropic tier). `off`
 /// yields `None` (no effort emitted; thinking is not enabled for `off`).
 fn anthropic_effort_for_level(
     level: ThinkingLevel,
@@ -360,6 +360,7 @@ fn anthropic_effort_for_level(
         ThinkingLevel::Medium => Some("medium".to_string()),
         ThinkingLevel::High => Some("high".to_string()),
         ThinkingLevel::XHigh => Some("xhigh".to_string()),
+        ThinkingLevel::Max => Some("max".to_string()),
     }
 }
 
@@ -474,6 +475,7 @@ impl AnthropicProvider {
                         ThinkingLevel::Medium => b.medium,
                         ThinkingLevel::High => b.high,
                         ThinkingLevel::XHigh => b.xhigh,
+                        ThinkingLevel::Max => b.max,
                     },
                 );
                 let thinking = AnthropicThinking {
@@ -1483,6 +1485,7 @@ mod tests {
                 medium: 9000,
                 high: 16384,
                 xhigh: 32768,
+                max: 65536,
             }),
             ..Default::default()
         };

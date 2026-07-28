@@ -322,6 +322,7 @@ pub struct ThinkingBudgets {
     pub medium: Option<u32>,
     pub high: Option<u32>,
     pub xhigh: Option<u32>,
+    pub max: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -683,6 +684,7 @@ impl Config {
             "medium" => budgets.and_then(|b| b.medium).unwrap_or(8192),
             "high" => budgets.and_then(|b| b.high).unwrap_or(16384),
             "xhigh" => budgets.and_then(|b| b.xhigh).unwrap_or(32768),
+            "max" => budgets.and_then(|b| b.max).unwrap_or(65536),
             _ => 0,
         }
     }
@@ -1209,6 +1211,7 @@ fn merge_thinking_budgets(
             medium: other.medium.or(base.medium),
             high: other.high.or(base.high),
             xhigh: other.xhigh.or(base.xhigh),
+            max: other.max.or(base.max),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1837,6 +1840,7 @@ mod tests {
         assert_eq!(config.thinking_budget("medium"), 8192);
         assert_eq!(config.thinking_budget("high"), 16384);
         assert_eq!(config.thinking_budget("xhigh"), 32768);
+        assert_eq!(config.thinking_budget("max"), 65536);
         assert_eq!(config.thinking_budget("unknown-level"), 0);
     }
 
@@ -1849,6 +1853,7 @@ mod tests {
                 medium: Some(300),
                 high: Some(400),
                 xhigh: Some(500),
+                max: Some(600),
             }),
             ..Config::default()
         };
@@ -1857,6 +1862,7 @@ mod tests {
         assert_eq!(config.thinking_budget("medium"), 300);
         assert_eq!(config.thinking_budget("high"), 400);
         assert_eq!(config.thinking_budget("xhigh"), 500);
+        assert_eq!(config.thinking_budget("max"), 600);
     }
 
     // ── enable_skill_commands ──────────────────────────────────────────
@@ -3245,8 +3251,8 @@ mod tests {
                 o_med in prop::option::of(1u32..65536),
                 o_high in prop::option::of(1u32..65536),
             ) {
-                let base = ThinkingBudgets { minimal: b_min, low: b_low, medium: None, high: None, xhigh: None };
-                let other = ThinkingBudgets { minimal: None, low: None, medium: o_med, high: o_high, xhigh: None };
+                let base = ThinkingBudgets { minimal: b_min, low: b_low, medium: None, high: None, xhigh: None, max: None };
+                let other = ThinkingBudgets { minimal: None, low: None, medium: o_med, high: o_high, xhigh: None, max: None };
                 let result = merge_thinking_budgets(Some(base), Some(other)).unwrap();
                 assert_eq!(result.minimal, b_min); // only in base
                 assert_eq!(result.low, b_low); // only in base

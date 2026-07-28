@@ -243,13 +243,17 @@ impl OpenAIProvider {
         // Forward the reasoning level for providers with a request-side reasoning
         // dialect. Only DeepSeek today; all other transports get `(None, None)`,
         // so their serialized body is unchanged. DeepSeek collapses `low`/`medium`
-        // into `high` and `xhigh` into `max` itself, so we only emit the values it
-        // documents and let `off` request the explicit non-thinking path.
+        // into `high` itself, so we only emit the values it documents and let
+        // `off` request the explicit non-thinking path. Both `xhigh` and `max`
+        // map to DeepSeek's top `"max"` tier (xhigh kept its historical mapping
+        // when the first-class `max` level was added; gh #139).
         let (thinking, reasoning_effort) = match self.reasoning_style() {
             Some(ReasoningStyle::DeepSeek) => match options.thinking_level.unwrap_or_default() {
                 ThinkingLevel::Off => (Some(OpenAIThinking { kind: "disabled" }), None),
                 ThinkingLevel::High => (Some(OpenAIThinking { kind: "enabled" }), Some("high")),
-                ThinkingLevel::XHigh => (Some(OpenAIThinking { kind: "enabled" }), Some("max")),
+                ThinkingLevel::XHigh | ThinkingLevel::Max => {
+                    (Some(OpenAIThinking { kind: "enabled" }), Some("max"))
+                }
                 ThinkingLevel::Minimal | ThinkingLevel::Low | ThinkingLevel::Medium => {
                     (Some(OpenAIThinking { kind: "enabled" }), None)
                 }

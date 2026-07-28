@@ -91,7 +91,7 @@ impl SlashCommand {
   /logout [provider] - Remove stored credentials
   /clear, /cls       - Clear conversation history
   /model, /m [id|provider/id] - Open model selector or switch directly
-  /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
+  /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh/max)
   /scoped-models [patterns|clear] - Show or set scoped models for cycling
   /history, /hist    - Show input history
   /export [path]     - Export conversation to HTML
@@ -516,7 +516,7 @@ pub fn strip_thinking_level_suffix(pattern: &str) -> &str {
         return pattern;
     };
     match suffix.to_ascii_lowercase().as_str() {
-        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" => prefix,
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" => prefix,
         _ => pattern,
     }
 }

@@ -5182,6 +5182,9 @@ fn available_thinking_levels(entry: &ModelEntry) -> Vec<crate::model::ThinkingLe
         if entry.supports_xhigh() {
             levels.push(ThinkingLevel::XHigh);
         }
+        if entry.supports_max() {
+            levels.push(ThinkingLevel::Max);
+        }
         levels
     } else {
         vec![ThinkingLevel::Off]
@@ -7688,6 +7691,8 @@ export default function init(pi) {
         assert_eq!(parse_thinking_level("3").unwrap(), ThinkingLevel::High);
         assert_eq!(parse_thinking_level("xhigh").unwrap(), ThinkingLevel::XHigh);
         assert_eq!(parse_thinking_level("4").unwrap(), ThinkingLevel::XHigh);
+        assert_eq!(parse_thinking_level("max").unwrap(), ThinkingLevel::Max);
+        assert_eq!(parse_thinking_level("5").unwrap(), ThinkingLevel::Max);
     }
 
     #[test]
@@ -7704,7 +7709,7 @@ export default function init(pi) {
     fn parse_thinking_level_invalid() {
         assert!(parse_thinking_level("invalid").is_err());
         assert!(parse_thinking_level("").is_err());
-        assert!(parse_thinking_level("5").is_err());
+        assert!(parse_thinking_level("6").is_err());
     }
 
     // -----------------------------------------------------------------------

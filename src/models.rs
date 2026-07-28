@@ -68,8 +68,51 @@ impl ModelEntry {
         let id = &id[pos..];
         id.starts_with("claude-opus-4-7")
             || id.starts_with("claude-opus-4-8")
+            || id.starts_with("claude-opus-5")
+            || id.starts_with("claude-sonnet-5")
             || id.starts_with("claude-fable-")
             || id.starts_with("claude-mythos-")
+    }
+
+    /// Whether this model supports the `max` thinking level (gh #139).
+    ///
+    /// `max` is the top effort tier, above `xhigh`:
+    /// - Anthropic adaptive-thinking models accept `output_config.effort:
+    ///   "max"` on every effort-capable family — including Opus 4.6 and
+    ///   Sonnet 4.6, which support `max` but NOT `xhigh` (the `xhigh` tier
+    ///   arrived with Opus 4.7).
+    ///   Ref: https://platform.claude.com/docs/en/build-with-claude/effort
+    /// - DeepSeek reasoning models document `reasoning_effort: "max"` as
+    ///   their top thinking tier (previously reachable only by pi's `xhigh`).
+    ///
+    /// OpenAI-family models are deliberately excluded: their transports have
+    /// no `max` wire value above what `xhigh` already emits, so `Max` clamps
+    /// down to `XHigh` there. A catalog `thinkingLevelMap` override can still
+    /// re-map levels per model.
+    pub fn supports_max(&self) -> bool {
+        self.is_deepseek_reasoning_model() || self.is_anthropic_max_effort_model()
+    }
+
+    /// Whether this is an Anthropic adaptive-thinking model whose
+    /// `output_config.effort` accepts the `max` tier.
+    ///
+    /// Same transport/id scoping rationale as
+    /// [`is_anthropic_xhigh_effort_model`](Self::is_anthropic_xhigh_effort_model),
+    /// plus the Opus 4.6 / Sonnet 4.6 families (which accept `max` without
+    /// `xhigh`).
+    fn is_anthropic_max_effort_model(&self) -> bool {
+        if self.is_anthropic_xhigh_effort_model() {
+            return true;
+        }
+        if !self.model.reasoning || self.model.api != "anthropic-messages" {
+            return false;
+        }
+        let id = self.model.id.to_ascii_lowercase();
+        let Some(pos) = id.find("claude-") else {
+            return false;
+        };
+        let id = &id[pos..];
+        id.starts_with("claude-opus-4-6") || id.starts_with("claude-sonnet-4-6")
     }
 
     /// Whether this is a DeepSeek reasoning model whose thinking-mode API accepts
@@ -121,19 +164,32 @@ impl ModelEntry {
         if self.supports_xhigh() {
             levels.push(ThinkingLevel::XHigh);
         }
+        if self.supports_max() {
+            levels.push(ThinkingLevel::Max);
+        }
         levels
     }
 
     /// Clamp a requested thinking level to the model's capabilities.
     ///
-    /// Non-reasoning models always return `Off`. Models without xhigh support
-    /// downgrade `XHigh` to `High`. All other levels pass through unchanged.
+    /// Non-reasoning models always return `Off`. Models without max support
+    /// downgrade `Max` to `XHigh` (or `High` if xhigh is also unsupported);
+    /// models without xhigh support downgrade `XHigh` to `High`. All other
+    /// levels pass through unchanged.
     pub fn clamp_thinking_level(
         &self,
         thinking: crate::model::ThinkingLevel,
     ) -> crate::model::ThinkingLevel {
         if !self.model.reasoning {
             return crate::model::ThinkingLevel::Off;
+        }
+        let mut thinking = thinking;
+        if thinking == crate::model::ThinkingLevel::Max && !self.supports_max() {
+            thinking = if self.supports_xhigh() {
+                crate::model::ThinkingLevel::XHigh
+            } else {
+                crate::model::ThinkingLevel::High
+            };
         }
         if thinking == crate::model::ThinkingLevel::XHigh && !self.supports_xhigh() {
             return crate::model::ThinkingLevel::High;
@@ -3858,6 +3914,7 @@ mod tests {
                 ThinkingLevel::Medium,
                 ThinkingLevel::High,
                 ThinkingLevel::XHigh,
+                ThinkingLevel::Max,
             ]
         );
     }
@@ -5197,6 +5254,120 @@ mod tests {
         assert_ne!(fp_v1, fp_v2, "fingerprint must change when content changes");
     }
 
+    mod max_thinking_level {
+        use super::*;
+        use crate::model::ThinkingLevel;
+
+        fn entry_with(id: &str, provider: &str, api: &str, reasoning: bool) -> ModelEntry {
+            ModelEntry {
+                model: Model {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    provider: provider.to_string(),
+                    api: api.to_string(),
+                    base_url: String::new(),
+                    reasoning,
+                    input: vec![InputType::Text],
+                    context_window: 128_000,
+                    max_tokens: 4096,
+                    cost: ModelCost {
+                        input: 0.0,
+                        output: 0.0,
+                        cache_read: 0.0,
+                        cache_write: 0.0,
+                    },
+                    headers: HashMap::new(),
+                },
+                api_key: None,
+                headers: HashMap::new(),
+                auth_header: false,
+                compat: None,
+                oauth_config: None,
+            }
+        }
+
+        #[test]
+        fn anthropic_xhigh_families_also_support_max() {
+            for id in [
+                "claude-opus-4-7",
+                "claude-opus-4-8",
+                "claude-opus-5",
+                "claude-sonnet-5",
+                "claude-fable-5",
+                "claude-mythos-5",
+            ] {
+                let entry = entry_with(id, "anthropic", "anthropic-messages", true);
+                assert!(entry.supports_xhigh(), "{id} should support xhigh");
+                assert!(entry.supports_max(), "{id} should support max");
+                assert_eq!(
+                    entry.clamp_thinking_level(ThinkingLevel::Max),
+                    ThinkingLevel::Max
+                );
+            }
+        }
+
+        #[test]
+        fn anthropic_4_6_family_supports_max_without_xhigh() {
+            for id in ["claude-opus-4-6", "claude-sonnet-4-6"] {
+                let entry = entry_with(id, "anthropic", "anthropic-messages", true);
+                assert!(!entry.supports_xhigh(), "{id} has no xhigh tier");
+                assert!(entry.supports_max(), "{id} should support max");
+                assert_eq!(
+                    entry.clamp_thinking_level(ThinkingLevel::Max),
+                    ThinkingLevel::Max
+                );
+                assert_eq!(
+                    entry.clamp_thinking_level(ThinkingLevel::XHigh),
+                    ThinkingLevel::High
+                );
+            }
+        }
+
+        #[test]
+        fn deepseek_reasoning_supports_max() {
+            let entry = entry_with("deepseek-reasoner", "deepseek", "openai-completions", true);
+            assert!(entry.supports_max());
+            assert_eq!(
+                entry.clamp_thinking_level(ThinkingLevel::Max),
+                ThinkingLevel::Max
+            );
+        }
+
+        #[test]
+        fn xhigh_only_models_clamp_max_to_xhigh() {
+            let entry = entry_with("gpt-5.2", "openai", "openai-completions", true);
+            assert!(entry.supports_xhigh());
+            assert!(!entry.supports_max());
+            assert_eq!(
+                entry.clamp_thinking_level(ThinkingLevel::Max),
+                ThinkingLevel::XHigh
+            );
+        }
+
+        #[test]
+        fn plain_models_clamp_max_to_high() {
+            let entry = entry_with("gpt-4o", "openai", "openai-completions", true);
+            assert!(!entry.supports_max());
+            assert_eq!(
+                entry.clamp_thinking_level(ThinkingLevel::Max),
+                ThinkingLevel::High
+            );
+        }
+
+        #[test]
+        fn available_levels_include_max_when_supported() {
+            let entry = entry_with("claude-opus-4-7", "anthropic", "anthropic-messages", true);
+            let levels = entry.available_thinking_levels();
+            assert!(levels.contains(&ThinkingLevel::XHigh));
+            assert!(levels.contains(&ThinkingLevel::Max));
+
+            let entry46 = entry_with("claude-opus-4-6", "anthropic", "anthropic-messages", true);
+            let levels46 = entry46.available_thinking_levels();
+            assert!(!levels46.contains(&ThinkingLevel::XHigh));
+            assert!(levels46.contains(&ThinkingLevel::Max));
+        }
+    }
+
     mod proptest_models {
         use super::*;
         use proptest::prelude::*;
@@ -5232,7 +5403,7 @@ mod tests {
         proptest! {
             /// Non-reasoning models always clamp to `Off`.
             #[test]
-            fn clamp_thinking_non_reasoning(level_idx in 0..6usize) {
+            fn clamp_thinking_non_reasoning(level_idx in 0..7usize) {
                 use crate::model::ThinkingLevel;
                 let levels = [
                     ThinkingLevel::Off,
@@ -5241,6 +5412,7 @@ mod tests {
                     ThinkingLevel::Medium,
                     ThinkingLevel::High,
                     ThinkingLevel::XHigh,
+                    ThinkingLevel::Max,
                 ];
                 let entry = dummy_model("non-reasoning-model", false);
                 assert_eq!(entry.clamp_thinking_level(levels[level_idx]), ThinkingLevel::Off);
@@ -5248,7 +5420,7 @@ mod tests {
 
             /// Reasoning models without xhigh downgrade `XHigh` to `High`.
             #[test]
-            fn clamp_thinking_reasoning_no_xhigh(level_idx in 0..6usize) {
+            fn clamp_thinking_reasoning_no_xhigh(level_idx in 0..7usize) {
                 use crate::model::ThinkingLevel;
                 let levels = [
                     ThinkingLevel::Off,
@@ -5257,10 +5429,13 @@ mod tests {
                     ThinkingLevel::Medium,
                     ThinkingLevel::High,
                     ThinkingLevel::XHigh,
+                    ThinkingLevel::Max,
                 ];
                 let entry = dummy_model("claude-sonnet-4-5", true);
                 let result = entry.clamp_thinking_level(levels[level_idx]);
-                if levels[level_idx] == ThinkingLevel::XHigh {
+                if levels[level_idx] == ThinkingLevel::XHigh
+                    || levels[level_idx] == ThinkingLevel::Max
+                {
                     assert_eq!(result, ThinkingLevel::High);
                 } else {
                     assert_eq!(result, levels[level_idx]);

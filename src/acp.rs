@@ -1428,7 +1428,7 @@ fn handle_session_new(
 //   * thinking level     — controls reasoning effort. Accepted option names:
 //                          `thought_level`, `thinking_level`, `thinking`,
 //                          `reasoning`, `effort`, `reasoning_effort`. Values:
-//                          off|none|minimal|low|medium|high|xhigh (the level is
+//                          off|none|minimal|low|medium|high|xhigh|max (the level is
 //                          clamped to what the active model supports — e.g. a
 //                          non-reasoning model is forced to `off`).
 //
@@ -1523,7 +1523,7 @@ fn parse_config_option(
             });
             let Some(raw) = raw else {
                 return Err(format!(
-                    "Invalid value for config option '{name}': expected a string or integer thinking level (off|minimal|low|medium|high|xhigh)"
+                    "Invalid value for config option '{name}': expected a string or integer thinking level (off|minimal|low|medium|high|xhigh|max)"
                 ));
             };
             raw.parse::<crate::model::ThinkingLevel>().map_or_else(

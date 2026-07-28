@@ -1142,6 +1142,7 @@ fn anthropic_custom_thinking_budgets_override_defaults() {
             medium: 5000,
             high: 10000,
             xhigh: 20000,
+            max: 40000,
         }),
         max_tokens: Some(100_000),
         ..Default::default()

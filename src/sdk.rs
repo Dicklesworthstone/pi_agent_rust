@@ -1631,6 +1631,7 @@ fn build_stream_options_with_optional_key(
             medium: budgets.medium.unwrap_or(defaults.medium),
             high: budgets.high.unwrap_or(defaults.high),
             xhigh: budgets.xhigh.unwrap_or(defaults.xhigh),
+            max: budgets.max.unwrap_or(defaults.max),
         });
     }
 
