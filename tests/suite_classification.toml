@@ -153,6 +153,7 @@ files = [
     "ci_full_suite_gate",
     "e2e_golden_transcript_diff",
     "e2e_replay_bundles",
+    "e2e_transient_retry_resume",
     "conformance_comparator",
     "conformance_regression_gate",
     "conformance_fixtures",

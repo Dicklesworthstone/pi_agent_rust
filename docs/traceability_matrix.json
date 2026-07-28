@@ -154,6 +154,10 @@
           "justification": "Agent-loop interruption/retry/resume reliability scenarios with timeline artifact coverage."
         },
         {
+          "path": "tests/e2e_transient_retry_resume.rs",
+          "justification": "Transient-failure auto-retry must resume the interrupted turn instead of replaying it (no duplicate tool execution or re-billed tokens)."
+        },
+        {
           "path": "tests/auth_oauth_refresh_vcr.rs",
           "justification": "OAuth refresh-path behavior and token lifecycle checks using deterministic VCR traces."
         },
