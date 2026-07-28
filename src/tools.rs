@@ -2180,8 +2180,7 @@ fn is_fsync_refused(err: &std::io::Error) -> bool {
     // EBADF = 9 and EINVAL = 22 on both Linux and macOS. `ErrorKind::Unsupported`
     // captures ENOTSUP/EOPNOTSUPP/ENOSYS portably without a `libc` dependency
     // (this crate is `#![forbid(unsafe_code)]`).
-    matches!(err.raw_os_error(), Some(9 | 22))
-        || err.kind() == std::io::ErrorKind::Unsupported
+    matches!(err.raw_os_error(), Some(9 | 22)) || err.kind() == std::io::ErrorKind::Unsupported
 }
 
 /// Runs a durability `fsync` (`result`), treating a filesystem *refusal* (see
@@ -4895,11 +4894,7 @@ impl Tool for WriteTool {
             let mut temp_file = tempfile::NamedTempFile::new_in(parent)?;
 
             temp_file.as_file_mut().write_all(&content_bytes)?;
-            tolerate_fsync_refusal(
-                temp_file.as_file_mut().sync_all(),
-                "temp file",
-                &path_clone,
-            )?;
+            tolerate_fsync_refusal(temp_file.as_file_mut().sync_all(), "temp file", &path_clone)?;
 
             // Restore original file permissions (tempfile defaults to 0o600) before persisting.
             if let Some(perms) = original_perms {
@@ -7809,13 +7804,19 @@ mod tests {
         // filesystem *refusals* of the durability barrier, not write failures.
         assert!(is_fsync_refused(&Error::from_raw_os_error(9))); // EBADF
         assert!(is_fsync_refused(&Error::from_raw_os_error(22))); // EINVAL
-        assert!(is_fsync_refused(&Error::new(ErrorKind::Unsupported, "nope")));
+        assert!(is_fsync_refused(&Error::new(
+            ErrorKind::Unsupported,
+            "nope"
+        )));
 
         // Genuine I/O failures must still propagate so real corruption/space
         // problems are never silently swallowed.
         assert!(!is_fsync_refused(&Error::from_raw_os_error(5))); // EIO
         assert!(!is_fsync_refused(&Error::from_raw_os_error(28))); // ENOSPC
-        assert!(!is_fsync_refused(&Error::new(ErrorKind::PermissionDenied, "no")));
+        assert!(!is_fsync_refused(&Error::new(
+            ErrorKind::PermissionDenied,
+            "no"
+        )));
     }
 
     #[test]
@@ -7827,13 +7828,9 @@ mod tests {
         // Refusals are downgraded to Ok so an already-written file is not
         // reported as a failed write.
         assert!(tolerate_fsync_refusal(Ok(()), "x", p).is_ok());
-        assert!(
-            tolerate_fsync_refusal(Err(Error::from_raw_os_error(9)), "temp file", p).is_ok()
-        );
+        assert!(tolerate_fsync_refusal(Err(Error::from_raw_os_error(9)), "temp file", p).is_ok());
         // Real I/O errors still surface to the caller.
-        assert!(
-            tolerate_fsync_refusal(Err(Error::from_raw_os_error(5)), "temp file", p).is_err()
-        );
+        assert!(tolerate_fsync_refusal(Err(Error::from_raw_os_error(5)), "temp file", p).is_err());
         assert!(
             tolerate_fsync_refusal(Err(Error::new(ErrorKind::PermissionDenied, "no")), "x", p)
                 .is_err()
