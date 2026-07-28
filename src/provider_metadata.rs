@@ -223,6 +223,25 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
+        // OpenAI-compatible GPU cloud (https://www.atlascloud.ai); serves
+        // open-weight chat/reasoning models via chat completions (gh #141).
+        canonical_id: "atlascloud",
+        display_name: Some("Atlas Cloud"),
+        aliases: &["atlas-cloud", "atlas"],
+        auth_env_keys: &["ATLASCLOUD_API_KEY", "ATLAS_CLOUD_API_KEY"],
+        onboarding: ProviderOnboardingMode::OpenAICompatiblePreset,
+        routing_defaults: Some(ProviderRoutingDefaults {
+            api: "openai-completions",
+            base_url: "https://api.atlascloud.ai/v1",
+            auth_header: true,
+            reasoning: true,
+            input: &INPUT_TEXT,
+            context_window: 131_072,
+            max_tokens: 16_384,
+        }),
+        test_obligations: TEST_REQUIRED,
+    },
+    ProviderMetadata {
         canonical_id: "openrouter",
         display_name: Some("OpenRouter"),
         aliases: &["open-router"],
