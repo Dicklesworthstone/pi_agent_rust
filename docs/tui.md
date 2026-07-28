@@ -72,7 +72,7 @@ command surface implemented in `src/interactive.rs`.
 | `/logout [provider]` | Remove stored OAuth credentials. |
 | `/clear` (`/cls`) | Clear conversation view/history. |
 | `/model [id|provider/id]` (`/m`) | Show or change the current model. |
-| `/thinking [level]` (`/think`, `/t`) | Set thinking level (`off|minimal|low|medium|high|xhigh`). |
+| `/thinking [level]` (`/think`, `/t`) | Set thinking level (`off|minimal|low|medium|high|xhigh|max`). |
 | `/scoped-models [patterns\|clear]` (`/scoped`) | Show or set model patterns used for Ctrl+P cycling. |
 | `/history` (`/hist`) | Show input history. |
 | `/export [path]` | Export conversation to HTML. |

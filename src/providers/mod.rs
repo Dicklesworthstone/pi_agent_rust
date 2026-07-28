@@ -574,6 +574,7 @@ impl ExtensionStreamSimpleProvider {
                     "medium": budgets.medium,
                     "high": budgets.high,
                     "xhigh": budgets.xhigh,
+                    "max": budgets.max,
                 }),
             );
         }

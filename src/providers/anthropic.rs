@@ -318,11 +318,13 @@ pub struct AnthropicProvider {
 /// `budget_tokens`.
 /// Ref: https://platform.claude.com/docs/en/build-with-claude/adaptive-thinking
 fn anthropic_model_uses_adaptive_thinking(model_id: &str) -> Option<bool> {
-    const ADAPTIVE_PREFIXES: [&str; 6] = [
+    const ADAPTIVE_PREFIXES: [&str; 8] = [
         "claude-opus-4-6",
         "claude-opus-4-7",
         "claude-opus-4-8",
+        "claude-opus-5",
         "claude-sonnet-4-6",
+        "claude-sonnet-5",
         "claude-fable-",
         "claude-mythos-",
     ];

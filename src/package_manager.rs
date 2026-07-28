@@ -4036,7 +4036,10 @@ pub fn evaluate_lock_transition(
         });
     }
 
-    if existing.resolved != candidate.resolved && !allow_mutation {
+    if existing.resolved != candidate.resolved
+        && !allow_mutation
+        && !resolved_differs_only_in_pinned(&existing.resolved, &candidate.resolved)
+    {
         return Err(PackageLockMismatch {
             code: "provenance_mismatch",
             reason: format!(
@@ -4080,6 +4083,61 @@ pub fn evaluate_lock_transition(
         from_state: trust_state_label(existing.trust_state).to_string(),
         to_state: "trusted".to_string(),
     })
+}
+
+/// Whether two resolved provenances are identical except for the `pinned`
+/// classification flag.
+///
+/// `pinned` is a derived property of the *spec* (exact version or local ref),
+/// not of what was installed. When its definition changes — as when range and
+/// dist-tag specs stopped counting as pinned — a pre-existing lock entry
+/// carries the old classification for the same installed artifact. Failing
+/// verification for that alone would hard-block startup until a manual
+/// remove/install cycle, so the flag-only delta is tolerated and the entry
+/// rotates to the new classification on the next lock write.
+fn resolved_differs_only_in_pinned(
+    existing: &PackageResolvedProvenance,
+    candidate: &PackageResolvedProvenance,
+) -> bool {
+    match (existing, candidate) {
+        (
+            PackageResolvedProvenance::Npm {
+                name: en,
+                requested_spec: es,
+                requested_version: ev,
+                installed_version: ei,
+                pinned: _,
+            },
+            PackageResolvedProvenance::Npm {
+                name: cn,
+                requested_spec: cs,
+                requested_version: cv,
+                installed_version: ci,
+                pinned: _,
+            },
+        ) => en == cn && es == cs && ev == cv && ei == ci,
+        (
+            PackageResolvedProvenance::Git {
+                repo: er,
+                host: eh,
+                path: ep,
+                requested_ref: erf,
+                resolved_commit: ec,
+                origin_url: eo,
+                pinned: _,
+            },
+            PackageResolvedProvenance::Git {
+                repo: cr,
+                host: ch,
+                path: cp,
+                requested_ref: crf,
+                resolved_commit: cc,
+                origin_url: co,
+                pinned: _,
+            },
+        ) => er == cr && eh == ch && ep == cp && erf == crf && ec == cc && eo == co,
+        _ => false,
+    }
 }
 
 const fn allow_lock_entry_update(candidate: &PackageLockEntry, action: PackageLockAction) -> bool {
@@ -7866,6 +7924,44 @@ mod tests {
             first, second,
             "same inputs should produce identical lockfile artifacts"
         );
+    }
+
+    #[test]
+    fn resolved_pinned_flag_only_delta_is_tolerated() {
+        // A pre-change lock entry recorded `pinned: true` for a range spec;
+        // the reclassification alone must not fail Install verification
+        // (it would hard-block startup until manual remove/install).
+        let existing = PackageResolvedProvenance::Npm {
+            name: "pkg".to_string(),
+            requested_spec: "npm:pkg@^1.2.0".to_string(),
+            requested_version: Some("^1.2.0".to_string()),
+            installed_version: "1.2.5".to_string(),
+            pinned: true,
+        };
+        let candidate = PackageResolvedProvenance::Npm {
+            name: "pkg".to_string(),
+            requested_spec: "npm:pkg@^1.2.0".to_string(),
+            requested_version: Some("^1.2.0".to_string()),
+            installed_version: "1.2.5".to_string(),
+            pinned: false,
+        };
+        assert!(resolved_differs_only_in_pinned(&existing, &candidate));
+
+        // Any substantive delta (here: installed version) still mismatches.
+        let drifted = PackageResolvedProvenance::Npm {
+            name: "pkg".to_string(),
+            requested_spec: "npm:pkg@^1.2.0".to_string(),
+            requested_version: Some("^1.2.0".to_string()),
+            installed_version: "1.3.0".to_string(),
+            pinned: false,
+        };
+        assert!(!resolved_differs_only_in_pinned(&existing, &drifted));
+
+        // Cross-kind comparison never matches.
+        let local = PackageResolvedProvenance::Local {
+            resolved_path: "/tmp/x".to_string(),
+        };
+        assert!(!resolved_differs_only_in_pinned(&existing, &local));
     }
 
     #[test]

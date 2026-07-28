@@ -438,6 +438,19 @@ const MAX_RPC_PENDING_MESSAGES: usize = 128;
 /// if a background task still holds an `out_tx` clone (gh #137).
 const RPC_WRITER_SHUTDOWN_SENTINEL: &str = "\u{0}__pi_rpc_writer_shutdown__";
 
+/// Clears an activity flag when dropped. Held by the turn/command/compaction
+/// tasks so a panic (isolated by the runtime) or task cancellation cannot
+/// leak `is_streaming`/`is_compacting` as stuck-true and pin the stdin-EOF
+/// drain loop forever (gh #137). Normal completion paths still clear the
+/// flags explicitly at their intended points; this is a safety net.
+struct ClearFlagOnDrop(Arc<AtomicBool>);
+
+impl Drop for ClearFlagOnDrop {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 impl RpcSharedState {
     fn new(config: &Config) -> Self {
         Self {
@@ -549,10 +562,18 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
     // `run` has drained any in-flight turn, so everything queued ahead of the
     // sentinel is the complete event stream. The sentinel (rather than a bare
     // join) makes writer shutdown deterministic even if a background task
-    // still holds an `out_tx` clone (gh #137).
-    let _ = out_tx_shutdown.send(RPC_WRITER_SHUTDOWN_SENTINEL.to_string());
-    drop(out_tx_shutdown);
-    let _ = writer_handle.join();
+    // still holds an `out_tx` clone (gh #137). try_send, not send: if the
+    // channel is full the client has stopped reading stdout, and a blocking
+    // send here would stall the runtime thread (blocking even Ctrl+C
+    // handling); in that case skip the join and let process exit tear the
+    // writer down.
+    if out_tx_shutdown
+        .try_send(RPC_WRITER_SHUTDOWN_SENTINEL.to_string())
+        .is_ok()
+    {
+        drop(out_tx_shutdown);
+        let _ = writer_handle.join();
+    }
 
     result
 }
@@ -2159,15 +2180,26 @@ pub async fn run(
         }
     }
 
-    // stdin has closed. Drain any in-flight turn before tearing down so a
-    // client that pipes a single prompt and closes stdin
+    // stdin has closed. Drain any in-flight work (streaming turn, extension
+    // command, auto-compaction, background bash) before tearing down so a
+    // client that pipes a single command and closes stdin
     // (`printf '{"type":"prompt",...}' | pi --mode rpc`) still receives the
     // full event stream through `agent_end` (gh #137). Without this the
-    // process shuts down while the spawned prompt task is still starting or
-    // streaming, and the whole turn is silently dropped. The Ctrl+C abort
-    // path in `run_rpc_mode` still provides an escape hatch if a provider
-    // never completes.
-    while is_streaming.load(Ordering::SeqCst) || is_compacting.load(Ordering::SeqCst) {
+    // process shuts down while the spawned task is still starting or
+    // streaming, and the work is silently dropped. The Ctrl+C abort path in
+    // `run_rpc_mode` still provides an escape hatch if a provider never
+    // completes; a client that stops reading stdout while work is in flight
+    // gets backpressure-blocked here by design.
+    loop {
+        let bash_running = OwnedMutexGuard::lock(Arc::clone(&bash_state), &cx)
+            .await
+            .is_ok_and(|running| running.is_some());
+        if !is_streaming.load(Ordering::SeqCst)
+            && !is_compacting.load(Ordering::SeqCst)
+            && !bash_running
+        {
+            break;
+        }
         // Extension UI requests can never be answered once stdin is closed;
         // cancel them (including any that arrive mid-drain) so an extension
         // command blocked on UI input finishes instead of pinning the drain.
@@ -2230,6 +2262,7 @@ async fn run_prompt_with_retry(
 ) {
     retry_abort.store(false, Ordering::SeqCst);
     is_streaming.store(true, Ordering::SeqCst);
+    let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
 
     let max_retries = options.config.retry_max_retries();
     let mut retry_count: u32 = 0;
@@ -2418,9 +2451,10 @@ async fn run_prompt_with_retry(
         }));
     }
 
-    is_streaming.store(false, Ordering::SeqCst);
-
     if !success {
+        // Emit the terminal event BEFORE clearing is_streaming: the stdin-EOF
+        // drain only guarantees flush-before-shutdown for events queued while
+        // a flag is still set (gh #137).
         if let Some(err) = final_error {
             let mut payload = json!({
                 "type": "agent_end",
@@ -2432,6 +2466,7 @@ async fn run_prompt_with_retry(
             }
             let _ = out_tx.send(event(&payload));
         }
+        is_streaming.store(false, Ordering::SeqCst);
         return;
     }
 
@@ -2439,7 +2474,17 @@ async fn run_prompt_with_retry(
         .await
         .is_ok_and(|state| state.auto_compaction_enabled);
     if auto_compaction_enabled {
-        maybe_auto_compact(session, options, is_compacting, out_tx).await;
+        // Pre-claim the compaction flag before releasing is_streaming so the
+        // stdin-EOF drain never samples both flags false during the handoff
+        // (maybe_auto_compact only claims it after several awaits).
+        is_compacting.store(true, Ordering::SeqCst);
+    }
+    is_streaming.store(false, Ordering::SeqCst);
+    if auto_compaction_enabled {
+        maybe_auto_compact(session, options, Arc::clone(&is_compacting), out_tx).await;
+        // maybe_auto_compact clears the flag on the paths where it claims it
+        // itself; this covers its early returns before that claim.
+        is_compacting.store(false, Ordering::SeqCst);
     }
 }
 
@@ -2454,6 +2499,7 @@ async fn run_extension_command(
     cx: AgentCx,
 ) {
     is_streaming.store(true, Ordering::SeqCst);
+    let _streaming_guard = ClearFlagOnDrop(Arc::clone(&is_streaming));
 
     let (abort_handle, abort_signal) = AbortHandle::new();
     if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
@@ -2498,8 +2544,9 @@ async fn run_extension_command(
     if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
         *guard = None;
     }
-    is_streaming.store(false, Ordering::SeqCst);
 
+    // Emit the terminal event BEFORE clearing is_streaming so the stdin-EOF
+    // drain flushes it before shutdown (gh #137).
     if let Err(err) = result {
         let mut payload = json!({
             "type": "agent_end",
@@ -2509,6 +2556,7 @@ async fn run_extension_command(
         payload["errorHints"] = error_hints_value(&err);
         let _ = out_tx.send(event(&payload));
     }
+    is_streaming.store(false, Ordering::SeqCst);
 }
 
 // =============================================================================
@@ -4016,6 +4064,11 @@ async fn maybe_auto_compact(
     is_compacting: Arc<AtomicBool>,
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) {
+    // Safety net for panics/cancellation: never leak is_compacting stuck-true
+    // (it would pin the stdin-EOF drain; gh #137). The caller may have
+    // pre-claimed the flag before handing off, so clearing on drop is the
+    // correct terminal state on every exit.
+    let _compacting_guard = ClearFlagOnDrop(Arc::clone(&is_compacting));
     let cx = AgentCx::for_current_or_request();
     let (path_entries, context_window, reserve_tokens, settings) = {
         let Ok(guard) = OwnedMutexGuard::lock(Arc::clone(&session), cx.cx()).await else {
@@ -4067,13 +4120,15 @@ async fn maybe_auto_compact(
     }));
     is_compacting.store(true, Ordering::SeqCst);
 
+    // No interior `is_compacting.store(false)` on the exit paths below: the
+    // ClearFlagOnDrop guard clears the flag at function exit, strictly AFTER
+    // every event send, so the stdin-EOF drain cannot shut the writer down
+    // between a clear and a trailing AutoCompactionEnd emission (gh #137).
     let (provider, key) = {
         let Ok(guard) = session.lock(cx.cx()).await else {
-            is_compacting.store(false, Ordering::SeqCst);
             return;
         };
         let Some(key) = guard.agent.stream_options().api_key.clone() else {
-            is_compacting.store(false, Ordering::SeqCst);
             let _ = out_tx.send(agent_event(AgentEvent::AutoCompactionEnd {
                 result: None,
                 aborted: false,
@@ -4086,7 +4141,6 @@ async fn maybe_auto_compact(
     };
 
     let result = compact(prep, provider, &key, None).await;
-    is_compacting.store(false, Ordering::SeqCst);
 
     match result {
         Ok(result) => {

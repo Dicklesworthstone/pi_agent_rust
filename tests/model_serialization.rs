@@ -608,6 +608,7 @@ fn test_thinking_level_serialization() {
         (ThinkingLevel::Medium, "\"medium\""),
         (ThinkingLevel::High, "\"high\""),
         (ThinkingLevel::XHigh, "\"xhigh\""),
+        (ThinkingLevel::Max, "\"max\""),
     ];
 
     for (level, expected) in test_cases {
@@ -639,6 +640,8 @@ fn test_thinking_level_from_str() {
         ("high", ThinkingLevel::High),
         ("xhigh", ThinkingLevel::XHigh),
         ("XHIGH", ThinkingLevel::XHigh),
+        ("max", ThinkingLevel::Max),
+        ("MAX", ThinkingLevel::Max),
     ];
 
     for (input, expected) in test_cases {
@@ -672,6 +675,7 @@ fn test_thinking_level_display() {
         (ThinkingLevel::Medium, "medium"),
         (ThinkingLevel::High, "high"),
         (ThinkingLevel::XHigh, "xhigh"),
+        (ThinkingLevel::Max, "max"),
     ];
 
     for (level, expected) in test_cases {
@@ -695,6 +699,7 @@ fn test_thinking_level_default_budget() {
         (ThinkingLevel::Medium, 8192),
         (ThinkingLevel::High, 16384),
         (ThinkingLevel::XHigh, 32768),
+        (ThinkingLevel::Max, 65536),
     ];
 
     for (level, expected) in test_cases {

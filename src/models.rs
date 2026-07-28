@@ -273,7 +273,8 @@ pub struct CompatConfig {
     // ── Reasoning / thinking controls (modern per-model capability data) ──
     /// Map pi's thinking levels onto the provider's native effort/thinking
     /// vocabulary, e.g. `{"xhigh": "max"}`. Keyed by the lowercase
-    /// `ThinkingLevel` name (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`).
+    /// `ThinkingLevel` name
+    /// (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`/`max`).
     /// Lets the catalog steer a transport's effort serialization without code
     /// changes (gh #117). When absent, transports apply their built-in mapping.
     pub thinking_level_map: Option<HashMap<String, String>>,

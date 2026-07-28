@@ -26,7 +26,7 @@ Generated: 2026-02-13
 
 This crosswalk maps every user-visible provider name (including upstream aliases from opencode and models.dev) to the Pi canonical ID, accepted aliases, auth env vars, and default endpoint. Use this when a user reports "missing provider" or confusion about which name to use.
 
-**Total**: 91 canonical providers, 43 aliases, 100% upstream coverage.
+**Total**: 95 canonical providers, 51 aliases, 100% upstream coverage.
 
 ### Native providers (dedicated adapter)
 
@@ -44,6 +44,7 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `azure-openai` | `azure`, `azure_openai`, `azure-cognitive-services`, `azure-openai-responses` | `AZURE_OPENAI_API_KEY` | _(per-resource URL)_ | native-azure |
 | `github-copilot` | `copilot`, `github-copilot-enterprise` | `GITHUB_COPILOT_API_KEY`, `GITHUB_TOKEN` | _(token exchange)_ | native-copilot |
 | `gitlab` | `gitlab-duo` | `GITLAB_TOKEN`, `GITLAB_API_KEY` | _(configurable instance)_ | native-gitlab |
+| `cursor` | `cursor-agent` | `CURSOR_API_KEY`, `CURSOR_ACCESS_TOKEN` | `https://api2.cursor.sh/agent.v1.AgentService/Run` | cursor-agent |
 | `sap-ai-core` | `sap` | `AICORE_SERVICE_KEY`, `SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET`, `SAP_AI_CORE_TOKEN_URL`, `SAP_AI_CORE_SERVICE_URL` | _(per-instance)_ | native-sap |
 | `v0` | — | `V0_API_KEY` | _(per-instance)_ | native-v0 |
 
@@ -53,6 +54,7 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 |---|---|---|---|
 | `groq` | — | `GROQ_API_KEY` | `https://api.groq.com/openai/v1` |
 | `cerebras` | — | `CEREBRAS_API_KEY` | `https://api.cerebras.ai/v1` |
+| `atlascloud` | `atlas-cloud`, `atlas` | `ATLASCLOUD_API_KEY`, `ATLAS_CLOUD_API_KEY` | `https://api.atlascloud.ai/v1` |
 | `openrouter` | `open-router` | `OPENROUTER_API_KEY` | `https://openrouter.ai/api/v1` |
 | `mistral` | `mistralai` | `MISTRAL_API_KEY` | `https://api.mistral.ai/v1` |
 | `deepseek` | `deep-seek` | `DEEPSEEK_API_KEY` | `https://api.deepseek.com` |
@@ -123,8 +125,10 @@ This crosswalk maps every user-visible provider name (including upstream aliases
 | `io-net` | — | `IOINTELLIGENCE_API_KEY` | `https://api.intelligence.io.solutions/api/v1` |
 | `jiekou` | — | `JIEKOU_API_KEY` | `https://api.jiekou.ai/openai` |
 | `llama` | — | `LLAMA_API_KEY` | `https://api.llama.com/compat/v1` |
+| `llamacpp` | `llama-cpp`, `llama.cpp`, `llama-server` | _(none; local llama-server)_ | `http://127.0.0.1:8080/v1` |
 | `lmstudio` | `lm-studio` | `LMSTUDIO_API_KEY` | `http://127.0.0.1:1234/v1` |
 | `lucidquery` | — | `LUCIDQUERY_API_KEY` | `https://lucidquery.com/api/v1` |
+| `mistralrs` | `mistral-rs`, `mistral.rs` | _(none; local mistral.rs server)_ | `http://127.0.0.1:1234/v1` |
 | `moark` | — | `MOARK_API_KEY` | `https://moark.com/v1` |
 | `morph` | — | `MORPH_API_KEY` | `https://api.morphllm.com/v1` |
 | `nano-gpt` | `nanogpt` | `NANO_GPT_API_KEY` | `https://nano-gpt.com/api/v1` |
@@ -179,6 +183,10 @@ If a user types any of these aliases (left), Pi resolves to the canonical ID (ri
 | `lm-studio` | `lmstudio` |
 | `kimi-coding`, `kimi-code` | `kimi-for-coding` |
 | `vercel-ai-gateway` | `vercel` |
+| `atlas`, `atlas-cloud` | `atlascloud` |
+| `cursor-agent` | `cursor` |
+| `llama-cpp`, `llama.cpp`, `llama-server` | `llamacpp` |
+| `mistral-rs`, `mistral.rs` | `mistralrs` |
 
 ### Shared env-key families
 

@@ -143,7 +143,7 @@ fn is_valid_thinking_level(args: &str) -> bool {
     }
     matches!(
         level.to_ascii_lowercase().as_str(),
-        "off" | "minimal" | "low" | "medium" | "high" | "xhigh"
+        "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
     )
 }
 

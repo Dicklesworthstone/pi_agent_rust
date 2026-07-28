@@ -418,7 +418,7 @@
         "thinking_level": {
           "type": "string",
           "description": "Current thinking level.",
-          "enum": ["off", "low", "medium", "high"],
+          "enum": ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
           "default": "off"
         },
         "available_models": {

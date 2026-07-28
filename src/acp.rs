@@ -1530,7 +1530,7 @@ fn parse_config_option(
             raw.parse::<crate::model::ThinkingLevel>().map_or_else(
                 |_| {
                     Err(format!(
-                        "Invalid value for config option '{name}': '{raw}' (expected off|minimal|low|medium|high|xhigh)"
+                        "Invalid value for config option '{name}': '{raw}' (expected off|minimal|low|medium|high|xhigh|max)"
                     ))
                 },
                 |level| Ok(RuntimeConfigOption::ThinkingLevel(level)),

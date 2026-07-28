@@ -185,6 +185,7 @@ Accessor defaults:
 - `thinking_budgets.medium`: default `8192`
 - `thinking_budgets.high`: default `16384`
 - `thinking_budgets.xhigh`: default `32768`
+- `thinking_budgets.max`: default `65536`
 
 ### Packages and resources
 

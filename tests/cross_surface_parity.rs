@@ -200,7 +200,7 @@ mod cli_combinations {
 
     #[test]
     fn thinking_levels_all_valid() {
-        for level in &["off", "minimal", "low", "medium", "high", "xhigh"] {
+        for level in &["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             let cli = Cli::parse_from(["pi", "--thinking", level]);
             assert_eq!(cli.thinking.as_deref(), Some(*level));
         }

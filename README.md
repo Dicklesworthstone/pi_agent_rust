@@ -353,7 +353,7 @@ Enable deep reasoning for complex problems:
 pi --thinking high "Design a distributed rate limiter"
 ```
 
-Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`
+Thinking levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`
 
 ### Customization (Skills & Prompt Templates)
 
@@ -688,7 +688,7 @@ Interactive file references:
 | `--mode text|json|rpc` | Output/protocol mode |
 | `--provider <NAME>` | Force provider for this run (aliases supported) |
 | `--model <MODEL>` | Model to use (auto-select fallback: `anthropic/claude-sonnet-4-6`, then `anthropic/claude-opus-4-7`, then `openai/gpt-5.1-codex`) |
-| `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh |
+| `--thinking <LEVEL>` | Thinking level: off/minimal/low/medium/high/xhigh/max |
 | `--tools <TOOLS>` | Comma-separated tool list |
 | `--api-key <KEY>` | API key (or use provider-specific env vars such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) |
 | `--extension-policy safe|balanced|permissive` | Extension capability profile |

@@ -188,6 +188,7 @@ fn strip_suffix_removes_known_levels() {
     assert_eq!(strip_thinking_level_suffix("model:low"), "model");
     assert_eq!(strip_thinking_level_suffix("model:medium"), "model");
     assert_eq!(strip_thinking_level_suffix("model:xhigh"), "model");
+    assert_eq!(strip_thinking_level_suffix("model:max"), "model");
 }
 
 #[test]

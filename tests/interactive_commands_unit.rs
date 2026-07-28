@@ -232,6 +232,7 @@ fn strip_thinking_level_known_suffixes() {
     assert_eq!(strip_thinking_level_suffix("claude:medium"), "claude");
     assert_eq!(strip_thinking_level_suffix("claude:high"), "claude");
     assert_eq!(strip_thinking_level_suffix("claude:xhigh"), "claude");
+    assert_eq!(strip_thinking_level_suffix("claude:max"), "claude");
 }
 
 #[test]
