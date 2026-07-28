@@ -37,6 +37,10 @@ const FAKE_NPM_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 
 cmd="${1:-}"
+if [ -n "${PI_E2E_FAKE_NPM_LEDGER:-}" ]; then
+    printf '%s\n' "$*" >> "$PI_E2E_FAKE_NPM_LEDGER"
+fi
+
 if [ "$cmd" = "root" ] && [ "${2:-}" = "-g" ]; then
     printf '%s\n' "${npm_config_prefix:-$PWD/.fake-npm-global}/lib/node_modules"
     exit 0
@@ -1205,6 +1209,70 @@ fn e2e_cli_config_subcommand_json_output() {
     assert!(
         payload.get("configValid").is_some(),
         "missing configValid flag"
+    );
+}
+
+/// Startup-style resolution of already-installed user-scoped npm packages
+/// must run `npm root -g` exactly once per pass and must not shell out to
+/// the installer at all (issue described in PR #140).
+#[cfg(unix)]
+#[test]
+fn e2e_cli_config_resolves_installed_user_packages_with_one_npm_root_lookup() {
+    let mut harness = CliTestHarness::new(
+        "e2e_cli_config_resolves_installed_user_packages_with_one_npm_root_lookup",
+    );
+    let ledger = harness.harness.temp_path("fake-npm-ledger.log");
+    harness.env.insert(
+        "PI_E2E_FAKE_NPM_LEDGER".to_string(),
+        ledger.display().to_string(),
+    );
+
+    // Pre-install two packages in the fake global npm prefix, matching their
+    // configured range/exact specs.
+    let global_node_modules = PathBuf::from(
+        harness
+            .env
+            .get("npm_config_prefix")
+            .expect("harness sets an isolated npm prefix"),
+    )
+    .join("lib")
+    .join("node_modules");
+    for (name, version) in [("first-user-pkg", "1.4.0"), ("second-user-pkg", "2.0.0")] {
+        let package_dir = global_node_modules.join(name);
+        fs::create_dir_all(&package_dir).expect("create fake global npm package");
+        fs::write(
+            package_dir.join("package.json"),
+            serde_json::to_vec(&json!({ "name": name, "version": version }))
+                .expect("serialize package.json"),
+        )
+        .expect("write package.json");
+    }
+    fs::write(
+        harness.global_settings_path(),
+        serde_json::to_vec(&json!({
+            "packages": ["npm:first-user-pkg@^1.2.0", "npm:second-user-pkg@2.0.0"]
+        }))
+        .expect("serialize global settings"),
+    )
+    .expect("write global settings");
+
+    let result = harness.run(&["config", "--json"]);
+    assert_exit_code(&harness.harness, &result, 0);
+
+    let invocations = fs::read_to_string(&ledger).expect("fake npm ledger should exist");
+    let root_lookups = invocations
+        .lines()
+        .filter(|line| *line == "root -g")
+        .count();
+    assert_eq!(
+        root_lookups, 1,
+        "expected exactly one `npm root -g` per resolution pass, got:\n{invocations}"
+    );
+    assert!(
+        !invocations
+            .lines()
+            .any(|line| line.starts_with("install") || line.starts_with("uninstall")),
+        "already-satisfied packages must not trigger install work:\n{invocations}"
     );
 }
 

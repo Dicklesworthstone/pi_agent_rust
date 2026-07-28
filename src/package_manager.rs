@@ -420,7 +420,7 @@ impl PackageManager {
         let source = validate_non_empty_source(source, "Package source")?;
         let parsed = parse_source(source, &self.cwd);
         Ok(match parsed {
-            ParsedSource::Npm { name, .. } => self.npm_install_path(&name, scope)?,
+            ParsedSource::Npm { name, .. } => Some(self.npm_install_path(&name, scope)?),
             ParsedSource::Git { host, path, .. } => {
                 Some(self.checked_git_install_path(&host, &path, scope)?)
             }
@@ -501,6 +501,7 @@ impl PackageManager {
             scope: PackageScope::Project,
         }));
         let package_sources = self.dedupe_packages(all_packages);
+        let global_npm_root = self.pass_global_npm_root_blocking(&package_sources)?;
 
         let mut accumulator = ResourceAccumulator::new();
 
@@ -529,9 +530,8 @@ impl PackageManager {
                     )?;
                 }
                 ParsedSource::Npm { name, .. } => {
-                    let installed_path = self
-                        .npm_install_path(&name, entry.scope)?
-                        .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
+                    let installed_path =
+                        self.npm_install_dir(&name, entry.scope, global_npm_root.as_deref())?;
 
                     if !installed_path.exists() {
                         return Ok(None);
@@ -687,10 +687,18 @@ impl PackageManager {
         let (global, project, package_sources) =
             finish_package_task(handle, recv_result, "Resolve setup task cancelled")?;
 
+        // One `npm root -g` subprocess per resolution pass, not one per package.
+        let global_npm_root = self.pass_global_npm_root(&package_sources).await?;
+
         let mut accumulator = ResourceAccumulator::new();
 
-        // This part is async (network calls for NPM)
-        Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
+        // This part may be async (install work for missing/outdated NPM packages)
+        Box::pin(self.resolve_package_sources(
+            &package_sources,
+            global_npm_root.as_deref(),
+            &mut accumulator,
+        ))
+        .await?;
 
         // Offload the rest of sync resolution
         let this = self.clone();
@@ -787,7 +795,13 @@ impl PackageManager {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
+        let global_npm_root = self.pass_global_npm_root(&package_sources).await?;
+        Box::pin(self.resolve_package_sources(
+            &package_sources,
+            global_npm_root.as_deref(),
+            &mut accumulator,
+        ))
+        .await?;
 
         let (tx, mut rx) = oneshot::channel();
         let accumulator = std::sync::Mutex::new(accumulator);
@@ -1157,12 +1171,7 @@ impl PackageManager {
         let parsed = parse_source(source, &self.cwd);
         match parsed {
             ParsedSource::Npm { spec, name, pinned } => {
-                let installed_path = self.npm_install_path(&name, scope)?.ok_or_else(|| {
-                    Error::tool(
-                        "package_manager",
-                        "npm lock verification requires a concrete install path",
-                    )
-                })?;
+                let installed_path = self.npm_install_path(&name, scope)?;
                 if !installed_path.exists() {
                     return Err(Error::tool(
                         "package_manager",
@@ -1185,11 +1194,13 @@ impl PackageManager {
                     )
                 })?;
 
-                if let Some(expected) = requested_version
-                    .as_deref()
-                    .filter(|value| is_exact_npm_version(value))
-                {
-                    if expected != installed_version {
+                if let Some(expected) = requested_version.as_deref().and_then(npm_exact_version) {
+                    // npm normalizes exact specs (`v1.2.3` installs as `1.2.3`)
+                    // and ignores build metadata, so compare parsed versions by
+                    // precedence rather than raw strings.
+                    let installed_matches = npm_exact_version(&installed_version)
+                        .is_some_and(|installed| installed.cmp_precedence(&expected).is_eq());
+                    if !installed_matches {
                         return Err(verification_error(
                             "npm_version_mismatch",
                             &format!(
@@ -1361,11 +1372,74 @@ impl PackageManager {
         }
     }
 
-    fn npm_install_path(&self, name: &str, scope: PackageScope) -> Result<Option<PathBuf>> {
-        Ok(Some(match self.npm_prefix_root(scope) {
-            Some(prefix_root) => prefix_root.join("node_modules").join(name),
-            None => self.global_npm_root()?.join(name),
-        }))
+    /// Whether resolving this source's install path requires the global npm
+    /// root (i.e. it is an npm source installed into npm's global prefix).
+    fn source_needs_global_npm_root(&self, entry: &ScopedPackage) -> bool {
+        self.npm_prefix_root(entry.scope).is_none()
+            && matches!(
+                parse_source(entry.pkg.source.trim(), &self.cwd),
+                ParsedSource::Npm { .. }
+            )
+    }
+
+    /// Resolve the global npm root once for a resolution pass.
+    ///
+    /// Returns `Ok(None)` without spawning any subprocess when no source in
+    /// the pass installs into npm's global prefix. Callers hand the result to
+    /// [`Self::npm_install_dir`] so a pass runs `npm root -g` at most once
+    /// instead of once per package.
+    fn pass_global_npm_root_blocking(&self, sources: &[ScopedPackage]) -> Result<Option<PathBuf>> {
+        if sources
+            .iter()
+            .any(|entry| self.source_needs_global_npm_root(entry))
+        {
+            self.global_npm_root().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Async variant of [`Self::pass_global_npm_root_blocking`] that offloads
+    /// the `npm root -g` subprocess (and source parsing I/O) to a thread.
+    async fn pass_global_npm_root(&self, sources: &[ScopedPackage]) -> Result<Option<PathBuf>> {
+        let this = self.clone();
+        let sources = sources.to_vec();
+        let (tx, mut rx) = oneshot::channel();
+
+        let handle = thread::spawn(move || {
+            let res = this.pass_global_npm_root_blocking(&sources);
+            let cx = AgentCx::for_request();
+            let _ = tx.send(cx.cx(), res);
+        });
+
+        let cx = AgentCx::for_request();
+        let recv_result = rx.recv(cx.cx()).await;
+        finish_package_task(handle, recv_result, "Global npm root task cancelled")
+    }
+
+    /// Install directory for an npm package.
+    ///
+    /// `global_npm_root` is a pre-resolved `npm root -g` result (see
+    /// [`Self::pass_global_npm_root_blocking`]); supplying it avoids spawning
+    /// the subprocess per package. When absent, the root is resolved on
+    /// demand.
+    fn npm_install_dir(
+        &self,
+        name: &str,
+        scope: PackageScope,
+        global_npm_root: Option<&Path>,
+    ) -> Result<PathBuf> {
+        if let Some(prefix_root) = self.npm_prefix_root(scope) {
+            return Ok(prefix_root.join("node_modules").join(name));
+        }
+        match global_npm_root {
+            Some(root) => Ok(root.join(name)),
+            None => Ok(self.global_npm_root()?.join(name)),
+        }
+    }
+
+    fn npm_install_path(&self, name: &str, scope: PackageScope) -> Result<PathBuf> {
+        self.npm_install_dir(name, scope, None)
     }
 
     fn git_root(&self, scope: PackageScope) -> Option<PathBuf> {
@@ -1420,16 +1494,15 @@ impl PackageManager {
         }
 
         // Basic sanity: installed path exists
-        if let Some(installed) = self.npm_install_path(&name, scope)? {
-            if !installed.exists() {
-                return Err(Error::tool(
-                    "npm",
-                    format!(
-                        "npm install succeeded but '{}' is missing",
-                        installed.display()
-                    ),
-                ));
-            }
+        let installed = self.npm_install_path(&name, scope)?;
+        if !installed.exists() {
+            return Err(Error::tool(
+                "npm",
+                format!(
+                    "npm install succeeded but '{}' is missing",
+                    installed.display()
+                ),
+            ));
         }
 
         Ok(())
@@ -1798,6 +1871,7 @@ impl PackageManager {
     async fn resolve_package_sources(
         &self,
         sources: &[ScopedPackage],
+        global_npm_root: Option<&Path>,
         accumulator: &mut ResourceAccumulator,
     ) -> Result<()> {
         for entry in sources {
@@ -1824,15 +1898,12 @@ impl PackageManager {
                         entry.scope == PackageScope::Temporary,
                     )?;
                 }
-                ParsedSource::Npm { spec, name, pinned } => {
-                    // Offload installed_path check
-                    let installed_path = self
-                        .installed_path(&format!("npm:{name}"), entry.scope)
-                        .await?
-                        .unwrap_or_else(|| self.cwd.join("node_modules").join(&name));
+                ParsedSource::Npm { spec, name, .. } => {
+                    let installed_path =
+                        self.npm_install_dir(&name, entry.scope, global_npm_root)?;
 
                     let needs_install = !installed_path.exists()
-                        || Box::pin(self.npm_needs_update(&spec, pinned, &installed_path)).await;
+                        || Box::pin(npm_needs_update(&spec, &installed_path)).await;
                     if needs_install {
                         self.install(source_str, entry.scope).await?;
                     }
@@ -1871,24 +1942,6 @@ impl PackageManager {
         }
 
         Ok(())
-    }
-
-    async fn npm_needs_update(&self, spec: &str, pinned: bool, installed_path: &Path) -> bool {
-        let installed_version = read_installed_npm_version(installed_path);
-        let Some(installed_version) = installed_version else {
-            return true;
-        };
-
-        let (_, pinned_version) = parse_npm_spec(spec);
-        if pinned {
-            return pinned_version
-                .as_deref()
-                .is_some_and(|pv| pinned_npm_version_needs_update(pv, &installed_version));
-        }
-
-        Box::pin(get_latest_npm_version(installed_path, spec))
-            .await
-            .is_ok_and(|latest| latest != installed_version)
     }
 
     fn resolve_local_extension_source(
@@ -3201,7 +3254,7 @@ fn parse_source(source: &str, cwd: &Path) -> ParsedSource {
         return ParsedSource::Npm {
             spec,
             name,
-            pinned: version.is_some(),
+            pinned: version.as_deref().is_some_and(npm_version_pins_source),
         };
     }
 
@@ -3620,6 +3673,182 @@ fn pinned_npm_version_needs_update(requested_version: &str, installed_version: &
     !is_local_npm_reference(requested_version) && requested_version != installed_version
 }
 
+/// Offline verdict on whether an installed npm package needs install work.
+#[derive(Debug, PartialEq, Eq)]
+enum NpmLocalDecision {
+    /// Installed metadata is missing/unreadable or the installed version
+    /// fails a locally decidable exact/range spec.
+    NeedsInstall,
+    /// The installed copy satisfies its spec; skip registry and installer.
+    Satisfied,
+    /// The spec form cannot be decided locally (bare spec); callers keep the
+    /// historical latest-version registry probe.
+    CheckRegistry { installed_version: String },
+}
+
+/// Decide, without any network or subprocess work, whether the package at
+/// `installed_path` needs install work for `spec`.
+///
+/// Exact versions and conventional ranges are settled here so startup does
+/// not pay registry latency for already-satisfied installs. Dist-tags, local
+/// file/link references, and unrecognized spec forms keep their historical
+/// behavior; bare specs defer to the registry probe.
+fn npm_local_update_decision(spec: &str, installed_path: &Path) -> NpmLocalDecision {
+    let Some(installed_version) = read_installed_npm_version(installed_path) else {
+        return NpmLocalDecision::NeedsInstall;
+    };
+
+    let (_, requested_version) = parse_npm_spec(spec);
+    let Some(requested) = requested_version else {
+        return NpmLocalDecision::CheckRegistry { installed_version };
+    };
+
+    if let Some(constraint) = NpmVersionConstraint::parse(&requested) {
+        if constraint.is_satisfied_by(&installed_version) {
+            NpmLocalDecision::Satisfied
+        } else {
+            NpmLocalDecision::NeedsInstall
+        }
+    } else if pinned_npm_version_needs_update(&requested, &installed_version) {
+        NpmLocalDecision::NeedsInstall
+    } else {
+        NpmLocalDecision::Satisfied
+    }
+}
+
+/// Whether the installed package at `installed_path` needs install/update
+/// work for `spec` during startup resolution.
+///
+/// Decided locally whenever possible (see [`npm_local_update_decision`]);
+/// only bare specs still consult the registry, preserving their historical
+/// latest-version probe.
+async fn npm_needs_update(spec: &str, installed_path: &Path) -> bool {
+    match npm_local_update_decision(spec, installed_path) {
+        NpmLocalDecision::NeedsInstall => true,
+        NpmLocalDecision::Satisfied => false,
+        NpmLocalDecision::CheckRegistry { installed_version } => {
+            Box::pin(get_latest_npm_version(installed_path, spec))
+                .await
+                .is_ok_and(|latest| latest != installed_version)
+        }
+    }
+}
+
+/// A conservatively parsed npm version constraint that can be evaluated
+/// without consulting npm or the registry.
+///
+/// Only single-token forms whose npm semantics the `semver` crate reproduces
+/// are recognized: exact versions (`1.2.3`, `v1.2.3`), x-ranges (`1`, `1.2`,
+/// `1.x`, `1.2.*`, `*`), and caret/tilde/comparator ranges (`^1.2`, `~0.4.1`,
+/// `>=2`, `=1.2.3`). Dist-tags, unions (`||`), space-separated intersections,
+/// hyphen ranges, and local references all yield `None` so callers fall back
+/// to their existing behavior.
+#[derive(Debug)]
+enum NpmVersionConstraint {
+    Exact(semver::Version),
+    Range(semver::VersionReq),
+}
+
+impl NpmVersionConstraint {
+    fn parse(raw: &str) -> Option<Self> {
+        let value = raw.trim();
+        if value.is_empty()
+            || value.contains(char::is_whitespace)
+            || value.contains("||")
+            || value.contains(',')
+        {
+            return None;
+        }
+
+        if let Some(version) = npm_exact_version(value) {
+            return Some(Self::Exact(version));
+        }
+
+        if let Some(canonical) = canonicalize_npm_x_range(value) {
+            return semver::VersionReq::parse(&canonical).ok().map(Self::Range);
+        }
+
+        // Single-comparator ranges. The `semver` crate treats missing or
+        // wildcard components the way npm does for these operators, but a
+        // bare partial like `1.2` would get Cargo's caret default, so
+        // operator-less values are only handled by the branches above.
+        if value.starts_with(['^', '~', '=', '>', '<']) {
+            return semver::VersionReq::parse(value).ok().map(Self::Range);
+        }
+
+        None
+    }
+
+    fn is_satisfied_by(&self, installed_version: &str) -> bool {
+        let Some(installed) = npm_exact_version(installed_version) else {
+            return false;
+        };
+        match self {
+            // npm ignores build metadata when comparing versions.
+            Self::Exact(expected) => installed.cmp_precedence(expected).is_eq(),
+            Self::Range(range) => range.matches(&installed),
+        }
+    }
+}
+
+/// Canonicalize npm x-range shorthand (`1`, `1.2`, `1.x`, `1.2.X`, `1.*`,
+/// `*`) into the wildcard form the `semver` crate parses with npm semantics.
+/// Returns `None` for anything that is not a pure x-range.
+fn canonicalize_npm_x_range(value: &str) -> Option<String> {
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() > 3 {
+        return None;
+    }
+
+    let mut numeric: Vec<u64> = Vec::new();
+    let mut saw_wildcard = false;
+    for part in parts {
+        if matches!(part, "x" | "X" | "*") {
+            saw_wildcard = true;
+            continue;
+        }
+        // A numeric component after a wildcard (`1.x.3`) has no conventional
+        // meaning; npm rejects leading zeros.
+        if saw_wildcard
+            || part.is_empty()
+            || (part.len() > 1 && part.starts_with('0'))
+            || !part.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        numeric.push(part.parse().ok()?);
+    }
+
+    match numeric.as_slice() {
+        [] => Some("*".to_string()),
+        [major] => Some(format!("{major}.*")),
+        [major, minor] => Some(format!("{major}.{minor}.*")),
+        // A fully numeric `X.Y.Z` is an exact version, not an x-range.
+        _ => None,
+    }
+}
+
+/// Parse a string as a single npm version, tolerating surrounding whitespace
+/// and npm's optional leading `v` (`v1.2.3` installs as `1.2.3`).
+///
+/// Used both to classify exact (pinning) spec fragments and to parse
+/// installed `package.json` versions.
+fn npm_exact_version(value: &str) -> Option<semver::Version> {
+    let value = value.trim();
+    let value = value.strip_prefix(['v', 'V']).unwrap_or(value);
+    semver::Version::parse(value).ok()
+}
+
+/// Whether an npm spec's version fragment pins the source.
+///
+/// Mirrors upstream pi's `isExactNpmVersion`: only exact versions pin, so
+/// `pi update` refreshes ranges and dist-tags while leaving pins alone.
+/// Local file/link/workspace references are additionally treated as pinned
+/// so update keeps leaving them untouched (unchanged behavior).
+fn npm_version_pins_source(version: &str) -> bool {
+    is_local_npm_reference(version) || npm_exact_version(version).is_some()
+}
+
 fn is_local_npm_reference(reference: &str) -> bool {
     let reference = reference.trim();
     reference.starts_with("file:")
@@ -3889,16 +4118,6 @@ pub fn read_package_lockfile(path: &Path) -> Result<PackageLockfile> {
 pub fn write_package_lockfile_atomic(path: &Path, lockfile: &PackageLockfile) -> Result<()> {
     let value = serde_json::to_value(lockfile)?;
     write_settings_json_atomic(path, &value)
-}
-
-fn is_exact_npm_version(value: &str) -> bool {
-    !value.is_empty()
-        && !value.contains(|ch: char| {
-            matches!(
-                ch,
-                '^' | '~' | '>' | '<' | '=' | '*' | 'x' | 'X' | '|' | ' ' | '\t'
-            )
-        })
 }
 
 pub fn digest_package_path(path: &Path) -> Result<String> {
@@ -6049,13 +6268,40 @@ mod tests {
     #[test]
     fn parse_source_npm_prefix() {
         let dir = tempfile::tempdir().expect("tempdir");
-        match parse_source("npm:@scope/pkg@1.0", dir.path()) {
+        match parse_source("npm:@scope/pkg@1.0.0", dir.path()) {
             ParsedSource::Npm { spec, name, pinned } => {
-                assert_eq!(spec, "@scope/pkg@1.0");
+                assert_eq!(spec, "@scope/pkg@1.0.0");
                 assert_eq!(name, "@scope/pkg");
                 assert!(pinned);
             }
             other => panic!("Unexpected parsed source: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_source_npm_pins_only_exact_versions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (source, expected_pinned) in [
+            // Exact versions pin (upstream `isExactNpmVersion` semantics).
+            ("npm:pkg@1.2.3", true),
+            ("npm:pkg@v1.2.3", true),
+            ("npm:@scope/pkg@2.0.0-beta.1", true),
+            // Local references stay pinned so `pi update` leaves them alone.
+            ("npm:pkg@file:../pkg", true),
+            ("npm:pkg@link:../pkg", true),
+            // Ranges, partial versions, and dist-tags float.
+            ("npm:pkg@^1.2.0", false),
+            ("npm:pkg@~1.2", false),
+            ("npm:@scope/pkg@1.0", false),
+            ("npm:pkg@1.x", false),
+            ("npm:pkg@>=2.0.0", false),
+            ("npm:pkg@latest", false),
+            ("npm:express", false),
+        ] {
+            let ParsedSource::Npm { pinned, .. } = parse_source(source, dir.path()) else {
+                panic!("Unexpected parsed source for {source}");
+            };
+            assert_eq!(pinned, expected_pinned, "pinned mismatch for {source}");
         }
     }
 
@@ -7027,6 +7273,329 @@ mod tests {
     fn read_installed_npm_version_no_package_json() {
         let dir = tempfile::tempdir().expect("tempdir");
         assert!(read_installed_npm_version(dir.path()).is_none());
+    }
+
+    // ======================================================================
+    // NpmVersionConstraint / npm_local_update_decision
+    // ======================================================================
+
+    #[test]
+    fn npm_version_constraint_recognizes_conventional_specs() {
+        for spec in [
+            "1.2.3",
+            "v1.2.3",
+            " 1.2.3 ",
+            "1.2.3-beta.1",
+            "1.2.3+build.5",
+            "1",
+            "1.2",
+            "1.x",
+            "1.X",
+            "1.2.*",
+            "*",
+            "x",
+            "^1.2.0",
+            "~1.2",
+            ">=2",
+            ">1.2.3",
+            "<=2.4.0",
+            "<2",
+            "=1.2.3",
+        ] {
+            assert!(
+                NpmVersionConstraint::parse(spec).is_some(),
+                "{spec} should be locally decidable"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_version_constraint_rejects_unconventional_specs() {
+        for spec in [
+            // Dist-tags and garbage.
+            "latest",
+            "beta",
+            "next",
+            "1.2.3alpha",
+            "01.2.3",
+            "01.x",
+            "",
+            "^",
+            // Local references.
+            "file:../demo",
+            "link:../demo",
+            "workspace:*",
+            // Multi-token range language we deliberately leave to npm.
+            ">=1.0.0 <2.0.0",
+            "1.2.3 || >=2",
+            "1.2.0 - 1.4.0",
+            ">=1.0.0, <2.0.0",
+            "1.x.3",
+        ] {
+            assert!(
+                NpmVersionConstraint::parse(spec).is_none(),
+                "{spec} should fall back to historical behavior"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_version_constraint_satisfaction_follows_npm_semantics() {
+        for (spec, installed, expected) in [
+            // Exact versions: normalized, build metadata ignored.
+            ("1.2.3", "1.2.3", true),
+            ("v1.2.3", "1.2.3", true),
+            ("1.2.3", "v1.2.3", true),
+            ("1.2.3+build.5", "1.2.3", true),
+            ("1.2.3", "1.2.4", false),
+            ("1.2.3-beta.1", "1.2.3-beta.1", true),
+            ("1.2.3-beta.1", "1.2.3", false),
+            // Caret.
+            ("^1.2.0", "1.9.9", true),
+            ("^1.2.0", "1.1.0", false),
+            ("^1.2.0", "2.0.0", false),
+            ("^0.2.3", "0.2.9", true),
+            ("^0.2.3", "0.3.0", false),
+            // Tilde (npm: `~1.2` pins the minor, unlike Cargo's bare `1.2`).
+            ("~1.2.3", "1.2.9", true),
+            ("~1.2.3", "1.3.0", false),
+            ("~1.2", "1.2.9", true),
+            ("~1.2", "1.3.0", false),
+            // X-ranges and partial versions (npm: `1.2` means `1.2.x`).
+            ("1", "1.9.9", true),
+            ("1", "2.0.0", false),
+            ("1.2", "1.2.9", true),
+            ("1.2", "1.3.0", false),
+            ("1.x", "1.9.9", true),
+            ("1.x", "2.0.0", false),
+            ("1.2.*", "1.2.9", true),
+            ("1.2.*", "1.3.0", false),
+            ("*", "0.0.1", true),
+            // Comparators, including partial-version forms.
+            (">=2", "2.0.0", true),
+            (">=2", "1.9.9", false),
+            (">1.2", "1.3.0", true),
+            (">1.2", "1.2.9", false),
+            ("<=1.2", "1.2.9", true),
+            ("<=1.2", "1.3.0", false),
+            ("=1.2.3", "1.2.3", true),
+            ("=1.2.3", "1.2.4", false),
+            // Pre-release installs never satisfy plain ranges.
+            ("^1.2.0", "1.3.0-beta.1", false),
+            // Unparseable installed versions never satisfy.
+            ("^1.2.0", "not-a-version", false),
+        ] {
+            let constraint = NpmVersionConstraint::parse(spec)
+                .unwrap_or_else(|| panic!("{spec} should parse as a local constraint"));
+            assert_eq!(
+                constraint.is_satisfied_by(installed),
+                expected,
+                "satisfaction mismatch for spec {spec} with installed {installed}"
+            );
+        }
+    }
+
+    #[test]
+    fn npm_local_update_decision_skips_satisfied_installs_offline() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let installed = dir.path().join("demo");
+        fs::create_dir_all(&installed).expect("create installed package");
+
+        let write_version = |version: &str| {
+            fs::write(
+                installed.join("package.json"),
+                format!(r#"{{"name":"demo","version":"{version}"}}"#),
+            )
+            .expect("write package.json");
+        };
+
+        // Missing metadata always installs.
+        assert_eq!(
+            npm_local_update_decision("demo@^1.0.0", &dir.path().join("missing")),
+            NpmLocalDecision::NeedsInstall
+        );
+
+        write_version("1.2.3");
+        // Exact and range specs are decided locally.
+        assert_eq!(
+            npm_local_update_decision("demo@1.2.3", &installed),
+            NpmLocalDecision::Satisfied
+        );
+        assert_eq!(
+            npm_local_update_decision("demo@v1.2.3", &installed),
+            NpmLocalDecision::Satisfied
+        );
+        assert_eq!(
+            npm_local_update_decision("demo@1.2.4", &installed),
+            NpmLocalDecision::NeedsInstall
+        );
+        assert_eq!(
+            npm_local_update_decision("demo@^1.0.0", &installed),
+            NpmLocalDecision::Satisfied
+        );
+        assert_eq!(
+            npm_local_update_decision("demo@^2.0.0", &installed),
+            NpmLocalDecision::NeedsInstall
+        );
+        assert_eq!(
+            npm_local_update_decision("demo@1.x", &installed),
+            NpmLocalDecision::Satisfied
+        );
+        // Bare specs keep the historical registry probe.
+        assert_eq!(
+            npm_local_update_decision("demo", &installed),
+            NpmLocalDecision::CheckRegistry {
+                installed_version: "1.2.3".to_string()
+            }
+        );
+        // Dist-tags keep the historical string comparison (always reinstall).
+        assert_eq!(
+            npm_local_update_decision("demo@latest", &installed),
+            NpmLocalDecision::NeedsInstall
+        );
+        // Local references are never reinstalled at startup.
+        assert_eq!(
+            npm_local_update_decision("demo@file:../demo", &installed),
+            NpmLocalDecision::Satisfied
+        );
+        // Multi-token ranges fall back to the historical string comparison.
+        assert_eq!(
+            npm_local_update_decision("demo@>=1.0.0 <2.0.0", &installed),
+            NpmLocalDecision::NeedsInstall
+        );
+
+        write_version("");
+        assert_eq!(
+            npm_local_update_decision("demo@^1.0.0", &installed),
+            NpmLocalDecision::NeedsInstall
+        );
+    }
+
+    #[test]
+    fn npm_version_pins_source_matches_upstream_exactness() {
+        for (version, expected) in [
+            ("1.2.3", true),
+            ("v1.2.3", true),
+            ("1.2.3-rc.1", true),
+            ("file:../demo", true),
+            ("link:../demo", true),
+            ("workspace:*", true),
+            ("^1.2.3", false),
+            ("~1.2", false),
+            ("1.2", false),
+            ("1.x", false),
+            ("latest", false),
+        ] {
+            assert_eq!(
+                npm_version_pins_source(version),
+                expected,
+                "pin mismatch for {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_needs_global_npm_root_only_for_user_scoped_npm() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manager = PackageManager::new(dir.path().to_path_buf());
+
+        let scoped = |source: &str, scope: PackageScope| ScopedPackage {
+            pkg: PackageSpec {
+                source: source.to_string(),
+                filter: None,
+            },
+            scope,
+        };
+
+        assert!(
+            manager.source_needs_global_npm_root(&scoped("npm:demo@^1.0.0", PackageScope::User))
+        );
+        assert!(
+            !manager
+                .source_needs_global_npm_root(&scoped("npm:demo@^1.0.0", PackageScope::Project))
+        );
+        assert!(
+            !manager
+                .source_needs_global_npm_root(&scoped("npm:demo@^1.0.0", PackageScope::Temporary))
+        );
+        assert!(
+            !manager.source_needs_global_npm_root(&scoped(
+                "git:github.com/user/repo",
+                PackageScope::User
+            ))
+        );
+        assert!(!manager.source_needs_global_npm_root(&scoped("./local-pkg", PackageScope::User)));
+
+        // No user-scoped npm sources means no `npm root -g` subprocess at all.
+        let sources = vec![
+            scoped("npm:demo@^1.0.0", PackageScope::Project),
+            scoped("./local-pkg", PackageScope::User),
+        ];
+        assert_eq!(
+            manager
+                .pass_global_npm_root_blocking(&sources)
+                .expect("no npm subprocess should be needed"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_with_roots_skips_install_for_satisfied_npm_ranges() {
+        run_async(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let project_root = temp_dir.path().join("project");
+            fs::create_dir_all(project_root.join(".pi")).expect("create project settings dir");
+
+            // Pre-install a project-scoped npm package satisfying its range.
+            let installed = project_root
+                .join(".pi")
+                .join("npm")
+                .join("node_modules")
+                .join("pi-test-preinstalled-pkg");
+            fs::create_dir_all(installed.join("extensions")).expect("create installed package");
+            fs::write(
+                installed.join("package.json"),
+                r#"{"name":"pi-test-preinstalled-pkg","version":"1.4.2"}"#,
+            )
+            .expect("write package.json");
+            fs::write(installed.join("extensions/a.native.json"), "{}").expect("write extension");
+
+            let project_settings_path = project_root.join(".pi/settings.json");
+            fs::write(
+                &project_settings_path,
+                serde_json::to_string_pretty(&json!({
+                    "packages": ["npm:pi-test-preinstalled-pkg@^1.2.0"]
+                }))
+                .expect("serialize project settings"),
+            )
+            .expect("write project settings");
+
+            let roots = ResolveRoots {
+                global_settings_path: temp_dir.path().join("global-settings.json"),
+                project_settings_path,
+                global_base_dir: temp_dir.path().join("global-base"),
+                project_base_dir: project_root.join(".pi"),
+                project_settings_enabled: true,
+            };
+            fs::create_dir_all(&roots.global_base_dir).expect("create global base dir");
+
+            // If resolution wrongly decided the satisfied range needed
+            // install/update work, it would shell out to npm (and fail for
+            // this nonexistent package name) instead of resolving locally.
+            let manager = PackageManager::new(project_root);
+            let resolved = manager
+                .resolve_with_roots(&roots)
+                .await
+                .expect("satisfied installed range must resolve without npm work");
+
+            assert!(
+                resolved
+                    .extensions
+                    .iter()
+                    .any(|entry| entry.path == installed.join("extensions/a.native.json")),
+                "installed package resources should be resolved"
+            );
+        });
     }
 
     // ======================================================================
