@@ -45,7 +45,7 @@ use crate::session::{Session, SessionStoreKind};
 use crate::tools::ToolRegistry;
 use asupersync::channel::oneshot;
 use asupersync::runtime::RuntimeHandle;
-use asupersync::sync::Mutex;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use asupersync::time::{timeout, wall_now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1118,8 +1118,9 @@ async fn validate_file_path(
         }
     };
 
-    let guard = sessions
-        .lock(cx)
+    // OwnedMutexGuard: the sessions guard is held across the per-session
+    // lock awaits below, and the borrowed guard is !Send (future_not_send).
+    let guard = OwnedMutexGuard::lock(Arc::clone(sessions), cx)
         .await
         .map_err(|e| format!("Lock failed: {e}"))?;
 
@@ -1130,7 +1131,7 @@ async fn validate_file_path(
     let allowed_cwds: Vec<PathBuf> = if let Some(sid) = session_id {
         match guard.get(sid) {
             Some(state) => {
-                if let Ok(s) = state.lock(cx).await {
+                if let Ok(s) = OwnedMutexGuard::lock(Arc::clone(state), cx).await {
                     vec![s.cwd.clone()]
                 } else {
                     return Err("Session lock failed".to_string());
@@ -1141,7 +1142,7 @@ async fn validate_file_path(
     } else {
         let mut cwds = Vec::new();
         for state in guard.values() {
-            if let Ok(s) = state.lock(cx).await {
+            if let Ok(s) = OwnedMutexGuard::lock(Arc::clone(state), cx).await {
                 cwds.push(s.cwd.clone());
             }
         }
@@ -1552,7 +1553,9 @@ async fn apply_set_model(
     model: &str,
     cx: &AgentCx,
 ) -> std::result::Result<(String, String), String> {
-    let Ok(mut guard) = session_state.lock(cx).await else {
+    // OwnedMutexGuard: the guard is held across the awaits below, and the
+    // borrowed MutexGuard is !Send (clippy::future_not_send).
+    let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(session_state), cx).await else {
         return Err("session state lock unavailable".to_string());
     };
     let Some(agent_session) = guard.agent_session.as_mut() else {
@@ -1571,7 +1574,8 @@ async fn apply_set_config_option(
     option: RuntimeConfigOption,
     cx: &AgentCx,
 ) -> std::result::Result<(), String> {
-    let Ok(mut guard) = session_state.lock(cx).await else {
+    // OwnedMutexGuard: held across the set_* awaits below (future_not_send).
+    let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(session_state), cx).await else {
         return Err("session state lock unavailable".to_string());
     };
     let Some(agent_session) = guard.agent_session.as_mut() else {

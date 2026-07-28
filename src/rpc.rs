@@ -2172,15 +2172,15 @@ pub async fn run(
         // cancel them (including any that arrive mid-drain) so an extension
         // command blocked on UI input finishes instead of pinning the drain.
         if let (Some(ui_state), Some(manager)) = (&rpc_ui_state, &rpc_extension_manager) {
-            let pending = match ui_state.lock(&cx).await {
-                Ok(mut guard) => {
+            let pending = ui_state.lock(&cx).await.map_or_else(
+                |_| Vec::new(),
+                |mut guard| {
                     let mut pending: Vec<ExtensionUiRequest> =
                         guard.active.take().into_iter().collect();
                     pending.extend(std::mem::take(&mut guard.queue));
                     pending
-                }
-                Err(_) => Vec::new(),
-            };
+                },
+            );
             for request in pending {
                 let _ = manager.respond_ui(ExtensionUiResponse {
                     id: request.id,

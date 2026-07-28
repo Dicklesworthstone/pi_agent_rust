@@ -3703,17 +3703,22 @@ fn npm_local_update_decision(spec: &str, installed_path: &Path) -> NpmLocalDecis
         return NpmLocalDecision::CheckRegistry { installed_version };
     };
 
-    if let Some(constraint) = NpmVersionConstraint::parse(&requested) {
-        if constraint.is_satisfied_by(&installed_version) {
-            NpmLocalDecision::Satisfied
-        } else {
-            NpmLocalDecision::NeedsInstall
-        }
-    } else if pinned_npm_version_needs_update(&requested, &installed_version) {
-        NpmLocalDecision::NeedsInstall
-    } else {
-        NpmLocalDecision::Satisfied
-    }
+    NpmVersionConstraint::parse(&requested).map_or_else(
+        || {
+            if pinned_npm_version_needs_update(&requested, &installed_version) {
+                NpmLocalDecision::NeedsInstall
+            } else {
+                NpmLocalDecision::Satisfied
+            }
+        },
+        |constraint| {
+            if constraint.is_satisfied_by(&installed_version) {
+                NpmLocalDecision::Satisfied
+            } else {
+                NpmLocalDecision::NeedsInstall
+            }
+        },
+    )
 }
 
 /// Whether the installed package at `installed_path` needs install/update

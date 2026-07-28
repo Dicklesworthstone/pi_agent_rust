@@ -126,6 +126,7 @@ fn build_options(scenario: &Scenario, api_key: String) -> StreamOptions {
             ThinkingLevel::Medium => budgets.medium,
             ThinkingLevel::High => budgets.high,
             ThinkingLevel::XHigh => budgets.xhigh,
+            ThinkingLevel::Max => budgets.max,
         };
         scenario
             .options

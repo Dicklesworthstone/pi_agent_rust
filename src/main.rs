@@ -19,7 +19,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use asupersync::runtime::reactor::create_reactor;
 use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
-use asupersync::sync::Mutex;
+use asupersync::sync::{Mutex, OwnedMutexGuard};
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
 use pi::agent::{
@@ -1754,10 +1754,12 @@ async fn run(
         result
     };
 
-    // Best-effort autosave flush on shutdown.
+    // Best-effort autosave flush on shutdown. OwnedMutexGuard: the guard is
+    // held across the flush await, and the borrowed MutexGuard is !Send
+    // (clippy::future_not_send).
     if !cli.no_session {
         let cx = pi::agent_cx::AgentCx::for_request();
-        if let Ok(mut guard) = session_handle.lock(cx.cx()).await {
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await {
             if let Err(e) = guard.flush_autosave_on_shutdown().await {
                 eprintln!("Warning: Failed to flush session autosave: {e}");
             }
