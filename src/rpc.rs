@@ -432,6 +432,12 @@ struct RpcSharedState {
 
 const MAX_RPC_PENDING_MESSAGES: usize = 128;
 
+/// In-band shutdown marker for the stdout writer thread. Never a valid JSON
+/// event line (leading NUL), so it cannot collide with real output. Sent by
+/// `run_stdio` after `run` returns so the writer exits deterministically even
+/// if a background task still holds an `out_tx` clone (gh #137).
+const RPC_WRITER_SHUTDOWN_SENTINEL: &str = "\u{0}__pi_rpc_writer_shutdown__";
+
 impl RpcSharedState {
     fn new(config: &Config) -> Self {
         Self {
@@ -518,10 +524,13 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
         }
     });
 
-    std::thread::spawn(move || {
+    let writer_handle = std::thread::spawn(move || {
         let stdout = io::stdout();
         let mut writer = io::BufWriter::new(stdout.lock());
         for line in out_rx {
+            if line == RPC_WRITER_SHUTDOWN_SENTINEL {
+                break;
+            }
             if writer.write_all(line.as_bytes()).is_err() {
                 break;
             }
@@ -534,7 +543,18 @@ pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result
         }
     });
 
-    run(session, options, in_rx, out_tx).await
+    let out_tx_shutdown = out_tx.clone();
+    let result = run(session, options, in_rx, out_tx).await;
+
+    // `run` has drained any in-flight turn, so everything queued ahead of the
+    // sentinel is the complete event stream. The sentinel (rather than a bare
+    // join) makes writer shutdown deterministic even if a background task
+    // still holds an `out_tx` clone (gh #137).
+    let _ = out_tx_shutdown.send(RPC_WRITER_SHUTDOWN_SENTINEL.to_string());
+    drop(out_tx_shutdown);
+    let _ = writer_handle.join();
+
+    result
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2137,6 +2157,43 @@ pub async fn run(
                 ));
             }
         }
+    }
+
+    // stdin has closed. Drain any in-flight turn before tearing down so a
+    // client that pipes a single prompt and closes stdin
+    // (`printf '{"type":"prompt",...}' | pi --mode rpc`) still receives the
+    // full event stream through `agent_end` (gh #137). Without this the
+    // process shuts down while the spawned prompt task is still starting or
+    // streaming, and the whole turn is silently dropped. The Ctrl+C abort
+    // path in `run_rpc_mode` still provides an escape hatch if a provider
+    // never completes.
+    while is_streaming.load(Ordering::SeqCst) || is_compacting.load(Ordering::SeqCst) {
+        // Extension UI requests can never be answered once stdin is closed;
+        // cancel them (including any that arrive mid-drain) so an extension
+        // command blocked on UI input finishes instead of pinning the drain.
+        if let (Some(ui_state), Some(manager)) = (&rpc_ui_state, &rpc_extension_manager) {
+            let pending = match ui_state.lock(&cx).await {
+                Ok(mut guard) => {
+                    let mut pending: Vec<ExtensionUiRequest> =
+                        guard.active.take().into_iter().collect();
+                    pending.extend(std::mem::take(&mut guard.queue));
+                    pending
+                }
+                Err(_) => Vec::new(),
+            };
+            for request in pending {
+                let _ = manager.respond_ui(ExtensionUiResponse {
+                    id: request.id,
+                    value: None,
+                    cancelled: true,
+                });
+            }
+        }
+        let now = cx
+            .cx()
+            .timer_driver()
+            .map_or_else(wall_now, |timer| timer.now());
+        sleep(now, Duration::from_millis(25)).await;
     }
 
     // Explicitly shut down extension runtimes before the session drops.
@@ -5962,6 +6019,34 @@ export default function init(pi) {
 }
 "#;
 
+    /// Like `wait-confirm`, but reports the UI outcome through a custom
+    /// message event so tests can observe completion on the output stream
+    /// even after stdin has closed (gh #137).
+    const RPC_EOF_DRAIN_EXTENSION_EXT: &str = r#"
+export default function init(pi) {
+    pi.registerCommand("wait-confirm-report", {
+        description: "Block until UI resolves, then report the outcome",
+        handler: async () => {
+            const confirmed = await pi.ui("confirm", {
+                title: "Wait",
+                message: "Hold the command open"
+            });
+            await pi.events("sendMessage", {
+                message: {
+                    customType: "eof-drain-outcome",
+                    content: confirmed ? "confirmed" : "cancelled",
+                    display: false
+                },
+                options: {
+                    triggerTurn: false
+                }
+            });
+            return "reported";
+        }
+    });
+}
+"#;
+
     const RPC_QUEUE_STATE_EXTENSION_EXT: &str = r#"
 export default function init(pi) {
     pi.registerCommand("report-queue-state", {
@@ -6431,6 +6516,90 @@ export default function init(pi) {
             drop(in_tx);
             let result = server.await;
             assert!(result.is_ok(), "rpc server error: {result:?}");
+        });
+    }
+
+    /// Closing stdin while a turn is in flight must drain the turn instead of
+    /// tearing down and silently dropping it (gh #137: `printf '...' | pi
+    /// --mode rpc` lost the entire event stream after the prompt ack). An
+    /// extension command blocked on a UI request is the hardest variant: the
+    /// UI answer can never arrive once stdin is closed, so the drain has to
+    /// cancel the pending request for the command to complete at all.
+    #[test]
+    fn rpc_stdin_eof_drains_in_flight_turn_and_cancels_pending_ui() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let handle = runtime.handle();
+
+        runtime.block_on(async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let cwd = temp.path().to_path_buf();
+            let ext_entry_path = cwd.join("eof-drain-ext.mjs");
+            std::fs::write(&ext_entry_path, RPC_EOF_DRAIN_EXTENSION_EXT)
+                .expect("write extension source");
+
+            let mut agent_session = build_test_agent_session(Session::in_memory());
+            agent_session
+                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
+                .await
+                .expect("enable extensions");
+            let session_handle = Arc::clone(&agent_session.session);
+
+            let options = build_test_rpc_options(&handle, cwd.join("auth.json"));
+            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
+            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
+            let out_rx = Arc::new(Mutex::new(out_rx));
+
+            let server =
+                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
+
+            let ack = send_recv(
+                &in_tx,
+                &out_rx,
+                r#"{"id":"1","type":"prompt","message":"/wait-confirm-report"}"#,
+                "prompt(wait-confirm-report:eof)",
+            )
+            .await;
+            assert_ok(&ack, "prompt");
+
+            // The command is now mid-flight, blocked on the UI confirm.
+            let ui_event = recv_ui_request(&out_rx, "wait-confirm-report ui before eof").await;
+            assert_eq!(ui_event["method"], "confirm");
+
+            // Simulate `printf ... | pi --mode rpc`: stdin closes immediately.
+            drop(in_tx);
+
+            // The server must drain the in-flight command (cancelling the
+            // unanswerable UI request) rather than dropping the turn.
+            let result = server.await;
+            assert!(result.is_ok(), "rpc server error: {result:?}");
+
+            // The handler resumed after the UI cancel and committed its
+            // outcome report via `sendMessage` before returning, so the drain
+            // guarantees the message is in the session by the time `run`
+            // returns. Before the fix the command was dropped mid-flight and
+            // no such message exists.
+            let cx = AgentCx::for_request();
+            let inner = OwnedMutexGuard::lock(session_handle, &cx)
+                .await
+                .expect("session lock");
+            let saw_completion = inner.entries_for_current_path().iter().any(|entry| {
+                matches!(
+                    entry,
+                    crate::session::SessionEntry::Message(msg)
+                        if matches!(
+                            &msg.message,
+                            SessionMessage::Custom { custom_type, content, .. }
+                                if custom_type.as_str() == "eof-drain-outcome"
+                                    && content.as_str() == "cancelled"
+                        )
+                )
+            });
+            assert!(
+                saw_completion,
+                "extension command completion report should be committed before shutdown"
+            );
         });
     }
 
