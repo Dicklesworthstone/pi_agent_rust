@@ -3063,10 +3063,6 @@ impl Agent {
         // more specific terminal status (for example `TimedOut` or `Cancelled`)
         // that the tool itself already recorded, nor reopens a denial.
         if let Some(policy) = &self.tool_policy {
-            // The audit log bounds record count, not record size, so a tool that
-            // fails with a large stdout dump must not stay resident in full.
-            const MAX_AUDIT_ERROR_CHARS: usize = 2048;
-
             let status = if policy_denied {
                 AuditStatus::Denied
             } else if is_error {
@@ -3074,26 +3070,35 @@ impl Agent {
             } else {
                 AuditStatus::Succeeded
             };
-            let error_text = is_error.then(|| {
-                let mut joined = output
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                if let Some((cut, _)) = joined.char_indices().nth(MAX_AUDIT_ERROR_CHARS) {
-                    joined.truncate(cut);
-                    joined.push_str("… [truncated]");
-                }
-                joined
-            });
+            let error_text = is_error.then(|| Self::audit_error_text(&output));
             policy.record_outcome(&tool_call.id, status, error_text.as_deref());
         }
 
         (output, is_error)
+    }
+
+    /// Join the text blocks of a failed tool output for the audit trail.
+    ///
+    /// The audit log bounds record count, not record size, so a tool that fails
+    /// with a large stdout dump must not stay resident in full. Large output
+    /// belongs in `AuditRecord::artifact_refs` instead.
+    fn audit_error_text(output: &ToolOutput) -> String {
+        const MAX_AUDIT_ERROR_CHARS: usize = 2048;
+
+        let mut joined = output
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text(text) => Some(text.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if let Some((cut, _)) = joined.char_indices().nth(MAX_AUDIT_ERROR_CHARS) {
+            joined.truncate(cut);
+            joined.push_str("… [truncated]");
+        }
+        joined
     }
 
     async fn request_tool_approval(
