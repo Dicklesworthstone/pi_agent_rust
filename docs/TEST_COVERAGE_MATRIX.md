@@ -52,6 +52,12 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/connectors/http.rs` | HTTP connector | `tests/pi_connector_shims.rs`; connector coverage still needs machine-readable trace expansion under `bd-8t27h.3`. |
 | `src/connectors/mod.rs` | Connector registry | Unit; `tests/rpc_session_connector.rs`, `tests/pi_connector_shims.rs`. |
 | `src/crypto_shim.rs` | Node crypto shim | Unit; `tests/node_crypto_shim.rs`. |
+| `src/devin/audit.rs` | Devin tool-call audit log | Unit; in-module tests plus `tests/devin_process_supervisor.rs`. |
+| `src/devin/mod.rs` | Devin module surface | Unit; `tests/devin_contract.rs`. |
+| `src/devin/policy.rs` | Devin allow/ask/deny/sandbox policy | Unit; in-module tests plus `tests/devin_process_supervisor.rs`, `tests/devin_contract.rs`. |
+| `src/devin/process.rs` | Devin process supervisor | Unit; `tests/devin_process_supervisor.rs`. |
+| `src/devin/process_tools.rs` | Devin process tool registrations | Unit; `tests/devin_process_supervisor.rs`, `tests/devin_contract.rs`. |
+| `src/devin/state.rs` | Devin session modes and scopes | Unit; `tests/devin_session_state.rs`. |
 | `src/doctor.rs` | Doctor and diagnostics | Unit; `tests/doctor_swarm_temp_dir_json.rs`, `tests/franken_node_compatibility_doctor_contract.rs`. |
 | `src/error.rs` | Error types | Unit; `tests/error_types.rs`, `tests/error_handling.rs`. |
 | `src/error_hints.rs` | Error remediation hints | Unit; `tests/error_handling.rs`. |
