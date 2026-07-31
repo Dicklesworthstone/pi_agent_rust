@@ -892,6 +892,18 @@
         {
           "path": "tests/validation_broker_store.rs",
           "justification": "Classified traceability repair suite included so CI governance covers validation broker slot-store and normalization behavior."
+        },
+        {
+          "path": "tests/devin_contract.rs",
+          "justification": "Pinned Devin CLI tool contract verified against the extracted transcript fixtures."
+        },
+        {
+          "path": "tests/devin_process_supervisor.rs",
+          "justification": "Session-owned Devin process supervisor behavior across policy gating, audit lifecycle, and process registry."
+        },
+        {
+          "path": "tests/devin_session_state.rs",
+          "justification": "Devin agent/permission mode and scope persistence across versioned session entries and branches."
         }
       ],
       "e2e_scripts": [
