@@ -2874,9 +2874,10 @@ impl Session {
             if custom.custom_type != crate::devin::DEVIN_SESSION_STATE_CUSTOM_TYPE {
                 continue;
             }
-            let Some(data) = custom.data.clone() else {
-                return Ok(None);
-            };
+            let data = custom
+                .data
+                .clone()
+                .ok_or_else(|| Error::session("Failed to parse Devin state: missing data"))?;
             let state = serde_json::from_value(data)
                 .map_err(|err| Error::session(format!("Failed to parse Devin state: {err}")))?;
             return Ok(Some(state));

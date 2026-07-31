@@ -438,7 +438,11 @@ fn resolve_scoped_path(
     }
 
     for scope in &state.scopes {
-        let scope_root = canonicalize_allow_missing(&scope.root)?;
+        // A scope root that was deleted or became unreadable must not deny a
+        // path that a later scope still grants.
+        let Ok(scope_root) = canonicalize_allow_missing(&scope.root) else {
+            continue;
+        };
         if resolved.starts_with(scope_root) && scope.access.permits(access) {
             return Ok(resolved);
         }
@@ -540,7 +544,6 @@ mod tests {
     #[test]
     fn traversal_and_symlink_escape_are_denied() {
         let workspace = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
         let policy = engine(
             workspace.path(),
             AgentMode::Normal,
@@ -556,6 +559,7 @@ mod tests {
 
         #[cfg(unix)]
         {
+            let outside = tempfile::tempdir().unwrap();
             std::os::unix::fs::symlink(outside.path(), workspace.path().join("link")).unwrap();
             assert_eq!(
                 policy

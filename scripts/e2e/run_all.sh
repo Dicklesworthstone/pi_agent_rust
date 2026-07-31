@@ -483,7 +483,9 @@ export CI_CORRELATION_ID="$CORRELATION_ID"
 # instead of skipping the way `--all-targets` does. Drop them from the selection
 # so a feature-gated target (e.g. the loom model checker) does not fail the
 # shard it is classified into.
-mapfile -t FEATURE_GATED_TARGETS < <(python3 - "$PROJECT_ROOT/Cargo.toml" <<'PY' 2>/dev/null || true
+# The parse must fail closed: silently treating the list as empty would let a
+# feature-gated target reach `cargo test --test` and hard-error the shard.
+if ! FEATURE_GATED_TARGETS_RAW=$(python3 - "$PROJECT_ROOT/Cargo.toml" <<'PY'
 import sys, tomllib
 
 with open(sys.argv[1], "rb") as handle:
@@ -492,7 +494,12 @@ for entry in manifest.get("test", []):
     if entry.get("required-features") and entry.get("name"):
         print(entry["name"])
 PY
-)
+); then
+    echo "failed to read feature-gated cargo test targets from $PROJECT_ROOT/Cargo.toml" >&2
+    echo "python3 with tomllib (>= 3.11) is required to select unit test targets" >&2
+    exit 1
+fi
+mapfile -t FEATURE_GATED_TARGETS < <(printf '%s' "$FEATURE_GATED_TARGETS_RAW")
 
 is_feature_gated_target() {
     local candidate="$1"

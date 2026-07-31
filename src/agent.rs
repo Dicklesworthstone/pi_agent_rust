@@ -2854,7 +2854,14 @@ impl Agent {
                 // Skipped due to steering.
                 results.push(self.skip_tool_call(tool_call, &on_event, new_messages));
             } else {
-                // Aborted or otherwise failed to run (e.g. abort signal).
+                // Aborted or otherwise failed to run (e.g. abort signal). An
+                // in-flight future dropped by the abort branch already pushed a
+                // pending audit record, so close it as cancelled here; calls that
+                // never reached policy evaluation have no record to close.
+                if let Some(policy) = &self.tool_policy {
+                    policy.record_outcome(&tool_call.id, AuditStatus::Cancelled, None);
+                }
+
                 let output = ToolOutput {
                     content: vec![ContentBlock::Text(TextContent::new(
                         "Tool execution aborted",
@@ -3056,6 +3063,10 @@ impl Agent {
         // more specific terminal status (for example `TimedOut` or `Cancelled`)
         // that the tool itself already recorded, nor reopens a denial.
         if let Some(policy) = &self.tool_policy {
+            // The audit log bounds record count, not record size, so a tool that
+            // fails with a large stdout dump must not stay resident in full.
+            const MAX_AUDIT_ERROR_CHARS: usize = 2048;
+
             let status = if policy_denied {
                 AuditStatus::Denied
             } else if is_error {
@@ -3064,7 +3075,7 @@ impl Agent {
                 AuditStatus::Succeeded
             };
             let error_text = is_error.then(|| {
-                output
+                let mut joined = output
                     .content
                     .iter()
                     .filter_map(|block| match block {
@@ -3072,7 +3083,12 @@ impl Agent {
                         _ => None,
                     })
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(" ");
+                if let Some((cut, _)) = joined.char_indices().nth(MAX_AUDIT_ERROR_CHARS) {
+                    joined.truncate(cut);
+                    joined.push_str("… [truncated]");
+                }
+                joined
             });
             policy.record_outcome(&tool_call.id, status, error_text.as_deref());
         }

@@ -197,6 +197,13 @@ impl AuditLog {
     }
 
     fn update(&self, call_id: &str, apply: impl FnOnce(&mut AuditRecord)) -> bool {
+        if call_id.is_empty() {
+            // Several pending records can share an empty id, so matching one
+            // would mis-attribute the outcome to an unrelated call. Drop the
+            // update, but make the lost outcome visible.
+            tracing::warn!("dropping audit update for empty tool call id");
+            return false;
+        }
         let mut records = self
             .records
             .lock()
@@ -288,6 +295,30 @@ fn canonical_json(value: &Value) -> String {
     }
 }
 
+/// Credential key names that must never keep their value in an audit record.
+const SECRET_KEY_NAMES: [&str; 9] = [
+    "token",
+    "password",
+    "passwd",
+    "secret",
+    "api_key",
+    "apikey",
+    "access_key",
+    "private_key",
+    "credential",
+];
+
+/// Detect `<key><separator>` inside an already lowercased token, accepting the
+/// `=`, `:`, and JSON `":` shapes that provider and HTTP errors use.
+fn names_secret(lower: &str) -> bool {
+    SECRET_KEY_NAMES.iter().any(|key| {
+        lower.split(*key).skip(1).any(|rest| {
+            let rest = rest.trim_start_matches(['"', '\'']);
+            rest.starts_with('=') || rest.starts_with(':')
+        })
+    })
+}
+
 /// Redact common credential shapes before an error reaches an audit sink.
 #[must_use]
 pub fn redact_error(message: &str) -> String {
@@ -296,18 +327,18 @@ pub fn redact_error(message: &str) -> String {
         .split_whitespace()
         .map(|token| {
             if redact_next {
-                redact_next = false;
+                // `authorization: bearer <token>` keeps the value one token
+                // further along, so the scheme does not consume the redaction.
+                redact_next = token.eq_ignore_ascii_case("bearer");
                 return "[REDACTED]";
             }
             let lower = token.to_ascii_lowercase();
-            if lower.contains("token=")
-                || lower.contains("password=")
-                || lower.contains("secret=")
-                || lower.contains("api_key=")
-                || lower.contains("apikey=")
-                || lower.starts_with("authorization:")
+            if names_secret(&lower)
+                || lower.starts_with("authorization")
                 || lower.starts_with("sk-")
             {
+                // `token:` / `api_key =` put the value in the next token.
+                redact_next = lower.ends_with('=') || lower.ends_with(':');
                 "[REDACTED]"
             } else if lower == "bearer" {
                 redact_next = true;
@@ -408,5 +439,52 @@ mod tests {
             redacted,
             "failed [REDACTED] [REDACTED] [REDACTED] [REDACTED] [REDACTED]"
         );
+    }
+
+    #[test]
+    fn redacts_colon_and_json_delimited_secrets() {
+        assert_eq!(
+            redact_error("failed token: abc123"),
+            "failed [REDACTED] [REDACTED]"
+        );
+        assert_eq!(
+            redact_error("provider said {\"api_key\":\"abc123\"}"),
+            "provider said [REDACTED]"
+        );
+        assert_eq!(
+            redact_error("env AWS_SECRET_ACCESS_KEY=abc123 rejected"),
+            "env [REDACTED] rejected"
+        );
+        assert_eq!(
+            redact_error("Authorization: Bearer abc123 rejected"),
+            "[REDACTED] [REDACTED] [REDACTED] rejected"
+        );
+    }
+
+    #[test]
+    fn push_evicts_oldest_records_beyond_capacity() {
+        let audit = AuditLog::new(3);
+        for index in 0..4 {
+            audit.push(pending_record(&format!("call-{index}")));
+        }
+
+        let call_ids = audit
+            .snapshot()
+            .into_iter()
+            .map(|record| record.call_id)
+            .collect::<Vec<_>>();
+        assert_eq!(call_ids, ["call-1", "call-2", "call-3"]);
+    }
+
+    #[test]
+    fn updates_for_an_empty_call_id_are_dropped() {
+        let audit = AuditLog::new(4);
+        audit.push(pending_record(""));
+        assert!(!audit.complete("", AuditStatus::Failed, &[], None));
+        assert!(!audit.mark_allowed("", None));
+
+        let records = audit.snapshot();
+        assert_eq!(records[0].status, AuditStatus::Pending);
+        assert!(records[0].ended_at.is_none());
     }
 }
