@@ -1,0 +1,66 @@
+name: devin-ci
+
+on:
+  push:
+    branches:
+      - devin-rust-core
+      - "devin-*"
+  pull_request:
+    paths:
+      - ".github/workflows/devin-ci.yml"
+      - "src/agent.rs"
+      - "src/devin/**"
+      - "src/lib.rs"
+      - "src/session.rs"
+      - "tests/devin_*.rs"
+      - "tests/fixtures/devin_cli/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      VCR_MODE: "playback"
+      RUST_BACKTRACE: "1"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "line-tables-only"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fd-find \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            ripgrep
+          sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Lint default features
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test Devin contract and session policy
+        run: |
+          cargo test --test devin_contract --test devin_session_state
+          cargo test devin::
+
+      - name: Build release binary
+        run: cargo build --release
