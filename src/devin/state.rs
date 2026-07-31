@@ -131,14 +131,18 @@ mod tests {
     #[test]
     fn autonomous_mode_requires_active_sandbox() {
         let mut state = DevinSessionState::new("session", "/workspace");
-        assert!(state
-            .set_permission_mode(PermissionMode::Autonomous)
-            .is_err());
+        assert!(
+            state
+                .set_permission_mode(PermissionMode::Autonomous)
+                .is_err()
+        );
 
         state.sandbox_status = SandboxStatus::Active;
-        assert!(state
-            .set_permission_mode(PermissionMode::Autonomous)
-            .is_ok());
+        assert!(
+            state
+                .set_permission_mode(PermissionMode::Autonomous)
+                .is_ok()
+        );
     }
 
     #[test]

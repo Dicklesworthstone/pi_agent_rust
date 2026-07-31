@@ -1,8 +1,6 @@
 //! Session persistence coverage for Devin modes and scopes.
 
-use pi::devin::{
-    AgentMode, DevinSessionState, PermissionMode, SandboxStatus, ScopeAccess,
-};
+use pi::devin::{AgentMode, DevinSessionState, PermissionMode, SandboxStatus, ScopeAccess};
 use pi::session::Session;
 
 #[test]

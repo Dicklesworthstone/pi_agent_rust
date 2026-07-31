@@ -8,9 +8,7 @@ pub mod audit;
 pub mod policy;
 pub mod state;
 
-pub use audit::{
-    AuditLog, AuditRecord, AuditStatus, ToolEffect, argument_hash, redact_error,
-};
+pub use audit::{AuditLog, AuditRecord, AuditStatus, ToolEffect, argument_hash, redact_error};
 pub use policy::{
     PolicyAction, PolicyDecision, RiskClass, ToolCategory, ToolPolicyEngine, ToolRequest,
     ToolRequestOrigin,

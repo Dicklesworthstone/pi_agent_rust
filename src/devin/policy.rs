@@ -188,19 +188,15 @@ impl ToolPolicyEngine {
 #[must_use]
 pub fn classify_tool(name: &str) -> ToolCategory {
     match name {
-        "read" | "grep" | "find" | "find_file_by_name" | "ls" | "notebook_read"
-        | "get_output" | "read_subagent" | "mcp_list_servers" | "mcp_list_tools" => {
-            ToolCategory::Read
-        }
+        "read" | "grep" | "find" | "find_file_by_name" | "ls" | "notebook_read" | "get_output"
+        | "read_subagent" | "mcp_list_servers" | "mcp_list_tools" => ToolCategory::Read,
         "write" | "edit" | "apply_patch" | "hashline_edit" | "notebook_edit" => {
             ToolCategory::FileMutation
         }
         "bash" | "exec" | "shell_command" | "kill_shell" | "write_to_process" => {
             ToolCategory::Process
         }
-        "web_search" | "webfetch" | "mcp_call_tool" | "mcp_read_resource" => {
-            ToolCategory::Network
-        }
+        "web_search" | "webfetch" | "mcp_call_tool" | "mcp_read_resource" => ToolCategory::Network,
         "update_plan" | "todo_write" | "exit_plan_mode" => ToolCategory::Planning,
         "ask_user_question" | "request_scope" => ToolCategory::SessionState,
         "run_subagent" | "skill" | "cloud_handoff" => ToolCategory::External,
@@ -240,8 +236,7 @@ fn agent_mode_allows(mode: AgentMode, name: &str, category: ToolCategory) -> boo
                 | "exit_plan_mode"
         ),
         AgentMode::Ask => {
-            category == ToolCategory::Read
-                || matches!(name, "todo_write" | "ask_user_question")
+            category == ToolCategory::Read || matches!(name, "todo_write" | "ask_user_question")
         }
     }
 }
@@ -454,11 +449,7 @@ mod tests {
     #[test]
     fn plan_mode_blocks_writes_and_processes() {
         let workspace = tempfile::tempdir().unwrap();
-        let policy = engine(
-            workspace.path(),
-            AgentMode::Plan,
-            PermissionMode::Bypass,
-        );
+        let policy = engine(workspace.path(), AgentMode::Plan, PermissionMode::Bypass);
         assert_eq!(
             policy
                 .evaluate(&request(
@@ -566,6 +557,10 @@ mod tests {
         let records = audit.snapshot();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].argument_hash.len(), 64);
-        assert!(!serde_json::to_string(&records[0]).unwrap().contains("file_path"));
+        assert!(
+            !serde_json::to_string(&records[0])
+                .unwrap()
+                .contains("file_path")
+        );
     }
 }

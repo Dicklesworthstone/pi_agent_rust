@@ -14,10 +14,9 @@ struct ToolSchemaManifest {
 
 #[test]
 fn local_devin_tool_surface_is_pinned() {
-    let manifest: ToolSchemaManifest = serde_json::from_str(include_str!(
-        "fixtures/devin_cli/tool_schema_manifest.json"
-    ))
-    .expect("valid Devin tool schema manifest");
+    let manifest: ToolSchemaManifest =
+        serde_json::from_str(include_str!("fixtures/devin_cli/tool_schema_manifest.json"))
+            .expect("valid Devin tool schema manifest");
 
     let expected = [
         "apply_patch",
@@ -49,7 +48,11 @@ fn local_devin_tool_surface_is_pinned() {
         "write",
         "write_to_process",
     ];
-    let actual = manifest.tools.keys().map(String::as_str).collect::<Vec<_>>();
+    let actual = manifest
+        .tools
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
 
     assert_eq!(manifest.schema_version, 1);
     assert_eq!(
