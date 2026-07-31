@@ -26,6 +26,11 @@ fn assert_no_curdir(path: &Path) {
     );
 }
 
+fn has_parent_dir(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::ParentDir))
+}
+
 fuzz_target!(|data: &[u8]| {
     if data.is_empty() || data.len() > MAX_INPUT_BYTES {
         return;
@@ -48,7 +53,19 @@ fuzz_target!(|data: &[u8]| {
         assert!(resolved.is_absolute());
         assert!(normalized_once.is_absolute());
     } else if !is_tilde {
-        assert!(resolved.starts_with(&cwd));
+        // Resolution is purely lexical: the input is joined onto `cwd` and its
+        // dot segments are collapsed, so `..` segments legitimately climb above
+        // `cwd` (`".."` resolves to `/tmp`). Keeping reads and writes inside the
+        // working directory is a scope-enforcement concern handled separately by
+        // `enforce_read_scope`, not a normalization invariant. What resolution
+        // must guarantee is that joining onto an absolute `cwd` always yields an
+        // absolute, traversal-free path, and that inputs which never climb stay
+        // under `cwd`.
+        assert!(resolved.is_absolute());
+        assert!(!has_parent_dir(&resolved));
+        if !has_parent_dir(Path::new(&raw)) {
+            assert!(resolved.starts_with(&cwd));
+        }
     }
 
     // Also exercise prefixed relative wrapping commonly used by tools.
