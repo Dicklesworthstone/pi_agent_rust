@@ -16,7 +16,7 @@ use pi::devin::{
     ToolPolicyEngine, ToolRequest, ToolRequestOrigin,
 };
 use pi::model::ContentBlock;
-use pi::tools::{Tool, ToolOutput, ToolRegistry};
+use pi::tools::{ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
 
 struct Harness {

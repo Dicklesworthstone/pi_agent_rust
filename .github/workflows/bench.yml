@@ -50,11 +50,13 @@ jobs:
           # Disk is plentiful after the cleanup above (>100GB free), so back
           # the compile with swap. Swap only absorbs build-time pressure; the
           # benchmarks themselves stay resident and unaffected.
+          # The runner image already ships an active 3GB /swapfile, so
+          # allocating there fails with "Text file busy"; use a separate file.
           free -h
-          if sudo fallocate -l 16G /swapfile \
-            && sudo chmod 600 /swapfile \
-            && sudo mkswap /swapfile \
-            && sudo swapon /swapfile; then
+          if sudo fallocate -l 16G /bench-swapfile \
+            && sudo chmod 600 /bench-swapfile \
+            && sudo mkswap /bench-swapfile \
+            && sudo swapon /bench-swapfile; then
             echo "Swap headroom enabled"
           else
             echo "::warning::Could not enable extra swap; continuing without it"
