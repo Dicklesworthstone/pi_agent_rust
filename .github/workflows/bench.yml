@@ -36,6 +36,31 @@ jobs:
           sudo apt-get clean || true
           df -h /
 
+      - name: Add swap headroom for bench-profile builds
+        working-directory: /
+        run: |
+          set -euxo pipefail
+          # Cargo ignores `panic = "abort"` for bench targets, so `cargo bench`
+          # recompiles the whole crate a second time with unwind landing pads
+          # while still inheriting the release profile (opt-level=z, fat LTO,
+          # codegen-units=1). That single rustc invocation peaks above the
+          # 16GB hosted runner, the kernel OOM killer takes down the runner
+          # service itself, and the job dies with "The runner has received a
+          # shutdown signal" / exit 143 part-way through `cargo bench`.
+          # Disk is plentiful after the cleanup above (>100GB free), so back
+          # the compile with swap. Swap only absorbs build-time pressure; the
+          # benchmarks themselves stay resident and unaffected.
+          free -h
+          if sudo fallocate -l 16G /swapfile \
+            && sudo chmod 600 /swapfile \
+            && sudo mkswap /swapfile \
+            && sudo swapon /swapfile; then
+            echo "Swap headroom enabled"
+          else
+            echo "::warning::Could not enable extra swap; continuing without it"
+          fi
+          free -h
+
       - name: Checkout pi_agent_rust
         uses: actions/checkout@v4
         with:
