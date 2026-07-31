@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use super::policy::{PolicyAction, RiskClass};
@@ -77,7 +78,10 @@ impl AuditLog {
     }
 
     pub fn push(&self, record: AuditRecord) {
-        let mut records = self.records.lock().unwrap_or_else(|err| err.into_inner());
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if records.len() == self.capacity {
             records.pop_front();
         }
@@ -88,7 +92,7 @@ impl AuditLog {
     pub fn snapshot(&self) -> Vec<AuditRecord> {
         self.records
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .cloned()
             .collect()
@@ -107,18 +111,19 @@ fn argument_hash(arguments: &Value, salt: &[u8; 32]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(salt);
     hasher.update(canonical.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = hasher.finalize();
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 fn canonical_json(value: &Value) -> String {
     match value {
         Value::Object(map) => {
             let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(left, _)| *left);
             let body = entries
                 .into_iter()
                 .map(|(key, value)| {

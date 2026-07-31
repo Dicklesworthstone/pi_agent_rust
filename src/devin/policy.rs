@@ -20,7 +20,7 @@ pub enum ToolRequestOrigin {
     CloudXml,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequest {
     pub call_id: String,
     pub tool_name: String,
@@ -89,7 +89,7 @@ pub struct ToolPolicyEngine {
 
 impl ToolPolicyEngine {
     #[must_use]
-    pub fn new(state: SharedDevinSessionState) -> Self {
+    pub const fn new(state: SharedDevinSessionState) -> Self {
         Self { state, audit: None }
     }
 
@@ -100,13 +100,18 @@ impl ToolPolicyEngine {
     }
 
     #[must_use]
-    pub fn state(&self) -> &SharedDevinSessionState {
+    pub const fn state(&self) -> &SharedDevinSessionState {
         &self.state
     }
 
     #[must_use]
     pub fn evaluate(&self, request: &ToolRequest) -> PolicyDecision {
-        let state = self.state.read().unwrap_or_else(|err| err.into_inner());
+        let state_guard = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = state_guard.clone();
+        drop(state_guard);
         let category = classify_tool(&request.tool_name);
         let risk = classify_risk(category, &request.tool_name);
 
@@ -568,10 +573,11 @@ mod tests {
         )));
         let audit = Arc::new(AuditLog::new(8));
         let policy = ToolPolicyEngine::new(state).with_audit(Arc::clone(&audit));
-        policy.evaluate(&request(
+        let decision = policy.evaluate(&request(
             "read",
             json!({"file_path": workspace.path().join("file").display().to_string()}),
         ));
+        assert_eq!(decision.action, PolicyAction::Allow);
 
         let records = audit.snapshot();
         assert_eq!(records.len(), 1);
