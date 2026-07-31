@@ -107,6 +107,9 @@ jobs:
     steps:
       - name: Skip unmatched profile
         if: env.SHOULD_RUN != 'true'
+        # The default working-directory is the not-yet-checked-out repo path, so
+        # this step must run from the workspace root to avoid a shell failure.
+        working-directory: ${{ github.workspace }}
         run: echo "Skipping ${{ matrix.name }} for event/profile selection"
 
       - name: Free disk space
