@@ -31,7 +31,9 @@ pub enum PermissionMode {
     AcceptEdits,
     /// Risk-sensitive approval mode.
     Smart,
-    /// Auto-approve calls that remain inside enforced scopes.
+    /// Auto-approve without prompting. Path scopes still bound tools that name a
+    /// path; process and network tools have no path to enforce and run
+    /// uncontained.
     #[serde(alias = "dangerous", alias = "yolo")]
     Bypass,
     /// Execute process and network calls only through an active OS sandbox.

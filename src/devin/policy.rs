@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use super::audit::{AuditLog, AuditRecord, AuditStatus, ToolEffect};
+use super::audit::{AuditLog, AuditRecord, AuditStatus, ToolEffect, redact_error};
 use super::state::{
     AgentMode, PermissionMode, SandboxStatus, ScopeAccess, SharedDevinSessionState,
 };
@@ -157,6 +157,19 @@ impl ToolPolicyEngine {
         decision
     }
 
+    /// Write the real outcome of `call_id` back to the audit trail.
+    ///
+    /// [`Self::evaluate`] can only record the policy decision, so a later
+    /// approval rejection, extension-hook block, or tool failure would
+    /// otherwise leave the record stuck at [`AuditStatus::Pending`] and
+    /// disagree with what actually happened.
+    pub fn record_outcome(&self, call_id: &str, status: AuditStatus, error: Option<&str>) {
+        let Some(audit) = &self.audit else {
+            return;
+        };
+        audit.complete(call_id, status, error.map(redact_error));
+    }
+
     fn audit_decision(
         &self,
         state: &super::state::DevinSessionState,
@@ -262,10 +275,7 @@ fn permission_decision(
     name: &str,
 ) -> (PolicyAction, String) {
     if mode == PermissionMode::Bypass {
-        return (
-            PolicyAction::Allow,
-            "bypass mode allows calls inside enforced scopes".to_string(),
-        );
+        return (PolicyAction::Allow, bypass_reason(category));
     }
     if category == ToolCategory::Unknown {
         return (
@@ -306,10 +316,7 @@ fn permission_decision(
             PolicyAction::Ask,
             "smart mode requires a risk-aware approval".to_string(),
         ),
-        PermissionMode::Bypass => (
-            PolicyAction::Allow,
-            "bypass mode allows calls inside enforced scopes".to_string(),
-        ),
+        PermissionMode::Bypass => (PolicyAction::Allow, bypass_reason(category)),
         PermissionMode::Autonomous if sandbox != SandboxStatus::Active => (
             PolicyAction::Deny,
             "autonomous mode requires an active OS sandbox".to_string(),
@@ -330,6 +337,17 @@ fn permission_decision(
             PolicyAction::Ask,
             format!("autonomous mode requires approval for `{name}`"),
         ),
+    }
+}
+
+/// Bypass skips approval prompts. Path scopes are still enforced for tools that
+/// name a path, but process and network tools carry no path to check, so their
+/// effects are uncontained. Say so instead of implying a scope guarantee.
+fn bypass_reason(category: ToolCategory) -> String {
+    if matches!(category, ToolCategory::Process | ToolCategory::Network) {
+        "bypass mode skips approval; this call is not contained by workspace scopes".to_string()
+    } else {
+        "bypass mode skips approval for calls inside enforced scopes".to_string()
     }
 }
 
@@ -587,5 +605,58 @@ mod tests {
                 .unwrap()
                 .contains("file_path")
         );
+    }
+
+    #[test]
+    fn recorded_outcome_replaces_pending_status() {
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(workspace.path().join("file"), "ok").unwrap();
+        let state = Arc::new(RwLock::new(DevinSessionState::new(
+            "session",
+            workspace.path(),
+        )));
+        let audit = Arc::new(AuditLog::new(8));
+        let policy = ToolPolicyEngine::new(state).with_audit(Arc::clone(&audit));
+        let decision = policy.evaluate(&request(
+            "read",
+            json!({"file_path": workspace.path().join("file").display().to_string()}),
+        ));
+        assert_eq!(decision.action, PolicyAction::Allow);
+        assert_eq!(audit.snapshot()[0].status, AuditStatus::Pending);
+
+        policy.record_outcome("call-1", AuditStatus::Failed, Some("failed token=abc"));
+
+        let records = audit.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, AuditStatus::Failed);
+        assert!(records[0].ended_at.is_some());
+        assert_eq!(
+            records[0].redacted_error.as_deref(),
+            Some("failed [REDACTED]")
+        );
+    }
+
+    #[test]
+    fn recorded_outcome_leaves_closed_denials_untouched() {
+        let workspace = tempfile::tempdir().unwrap();
+        let audit = Arc::new(AuditLog::new(8));
+        let policy = engine(
+            workspace.path(),
+            AgentMode::Plan,
+            PermissionMode::AcceptEdits,
+        )
+        .with_audit(Arc::clone(&audit));
+        assert_eq!(
+            policy
+                .evaluate(&request("exec", json!({"command": "true"})))
+                .action,
+            PolicyAction::Deny
+        );
+
+        policy.record_outcome("call-1", AuditStatus::Succeeded, None);
+
+        let records = audit.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, AuditStatus::Denied);
     }
 }

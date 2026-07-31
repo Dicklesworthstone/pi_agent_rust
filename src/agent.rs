@@ -17,7 +17,7 @@ use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{
     CompactionAdmissionSignals, CompactionQuota, CompactionWorkerState,
 };
-use crate::devin::{PolicyAction, ToolPolicyEngine, ToolRequest, ToolRequestOrigin};
+use crate::devin::{AuditStatus, PolicyAction, ToolPolicyEngine, ToolRequest, ToolRequestOrigin};
 use crate::error::{Error, Result};
 use crate::extension_events::{
     BeforeAgentStartOutcome, InputEventOutcome, SessionBeforeCompactOutcome,
@@ -2997,6 +2997,7 @@ impl Agent {
                 .await
         };
 
+        let policy_denied = approval_denied_output.is_some();
         let (mut output, is_error) = if let Some(output) = approval_denied_output {
             (output, true)
         } else if let Some(extensions) = &extensions {
@@ -3032,6 +3033,28 @@ impl Agent {
             let hook_started_at = Instant::now();
             Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
             record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
+        }
+
+        if let Some(policy) = &self.tool_policy {
+            let status = if policy_denied {
+                AuditStatus::Denied
+            } else if is_error {
+                AuditStatus::Failed
+            } else {
+                AuditStatus::Succeeded
+            };
+            let error_text = is_error.then(|| {
+                output
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::Text(text) => Some(text.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            });
+            policy.record_outcome(&tool_call.id, status, error_text.as_deref());
         }
 
         (output, is_error)

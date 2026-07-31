@@ -88,6 +88,27 @@ impl AuditLog {
         records.push_back(record);
     }
 
+    /// Finalize the newest open record for `call_id` once execution resolves.
+    ///
+    /// Policy evaluation can only record the decision it made, so approval
+    /// rejections, extension-hook blocks, and tool failures must be written
+    /// back here. Records already closed by policy (a denial) are left alone.
+    pub fn complete(&self, call_id: &str, status: AuditStatus, redacted_error: Option<String>) {
+        let mut records = self
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(record) = records
+            .iter_mut()
+            .rev()
+            .find(|record| record.call_id == call_id && record.ended_at.is_none())
+        {
+            record.ended_at = Some(Utc::now());
+            record.status = status;
+            record.redacted_error = redacted_error;
+        }
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> Vec<AuditRecord> {
         self.records
