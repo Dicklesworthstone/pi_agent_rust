@@ -181,8 +181,11 @@ fn interrupt_budget_preserves_state_after_trip() {
 fn memory_limit_prevents_large_allocation() {
     futures::executor::block_on(async {
         let config = config_with_limits(PiJsRuntimeLimits {
-            // 1MB memory limit
-            memory_limit_bytes: Some(1024 * 1024),
+            // 4MB memory limit — bridge JS init alone now needs >1MB, so a
+            // tighter cap OOMs during runtime construction instead of during
+            // the allocation under test. This is still ~250x below the ~1GB
+            // the eval below attempts.
+            memory_limit_bytes: Some(4 * 1024 * 1024),
             ..Default::default()
         });
 
