@@ -218,8 +218,11 @@ src/bin/test_time.rs
 /fix_tools_write.rs
 
 # ACFS ephemeral patterns (auto-generated agent artifacts)
-core
-core.*
+# Anchored: an unanchored `core` also excluded every nested directory named
+# `core`, which silently dropped the vendored pi-mono
+# packages/coding-agent/src/core/** tree the TS conformance oracle imports.
+/core
+/core.*
 cline.mcp.json
 codex.mcp.json
 cursor.mcp.json
