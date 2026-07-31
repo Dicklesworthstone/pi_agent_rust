@@ -1,6 +1,7 @@
 name: devin-ci
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - devin-rust-core
