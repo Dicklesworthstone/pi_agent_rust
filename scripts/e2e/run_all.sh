@@ -10867,7 +10867,6 @@ if isinstance(franken_node_mission_contract, dict):
     franken_node_kernel_boundary_drift_report_payload = {
         "schema": "pi.franken_node.kernel_boundary_drift_report.v1",
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "run_id": run_id,
         "correlation_id": expected_claim_correlation_id,
         "manifest": {
             "path": str(kernel_boundary_manifest_path),

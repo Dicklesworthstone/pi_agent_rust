@@ -221,20 +221,25 @@ jobs:
             exit 0
           fi
 
-          # Split allowlist into global (*:Ident) and per-file (path:Ident) sets.
-          global_allow="$(grep -E '^\*:' "$allowlist" | sed 's/^\*://' | sort -u)"
-          file_allow="$(grep -Ev '^\s*(#|$|\*:)' "$allowlist" | sort -u)"
-
           # rg output: file:line:col:identifier (4 colon-separated fields).
-          violations="$(printf '%s\n' "$matches" | awk -F: \
-            -v global_allow="$global_allow" \
-            -v file_allow="$file_allow" \
+          # Windows rg prints "tests\foo.rs", so separators are normalized
+          # before the allowlist comparison. The allowlist is read as awk's
+          # first input file rather than passed via -v because BSD awk (macOS)
+          # rejects embedded newlines in -v assignments.
+          violations="$(printf '%s\n' "$matches" | tr '\\' '/' | awk -F: \
+            -v allowfile="$allowlist" \
             '
-            BEGIN {
-              n = split(global_allow, ga, "\n")
-              for (i = 1; i <= n; i++) if (ga[i] != "") g[ga[i]] = 1
-              n = split(file_allow, fa, "\n")
-              for (i = 1; i <= n; i++) if (fa[i] != "") f[fa[i]] = 1
+            FILENAME == allowfile {
+              line = $0
+              sub(/[[:space:]]+$/, "", line)
+              if (line ~ /^[[:space:]]*#/ || line ~ /^[[:space:]]*$/) next
+              if (line ~ /^\*:/) {
+                sub(/^\*:/, "", line)
+                g[line] = 1
+              } else {
+                f[line] = 1
+              }
+              next
             }
             {
               ident = $4
@@ -243,7 +248,7 @@ jobs:
               key = file ":" ident
               if (key in f) next
               print
-            }')"
+            }' "$allowlist" -)"
 
           if [ -n "$violations" ]; then
             printf '%s\n' "$violations"

@@ -52,13 +52,19 @@ RESULT_RE = re.compile(
 #   Running tests/json_mode_parity.rs (target/debug/deps/json_mode_parity-abc123)
 RUNNING_RE = re.compile(r"Running (?:tests/)?(\S+?)(?:\.rs)?\s")
 
+# CI sets CARGO_TERM_COLOR=always, so the captured log carries SGR sequences
+# (for example "Running\x1b[0m tests/json_mode_parity.rs"). Strip them before
+# matching or the suite markers never line up.
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
 
 def parse_log(log_text: str) -> dict:
     """Parse cargo test output and return per-suite results."""
     suites = {}
     current_suite = None
 
-    for line in log_text.splitlines():
+    for raw_line in log_text.splitlines():
+        line = ANSI_RE.sub("", raw_line)
         running_match = RUNNING_RE.search(line)
         if running_match:
             raw = running_match.group(1)
@@ -390,6 +396,7 @@ def build_evidence(suites: dict, project_root: Path) -> dict:
 def synthetic_parity_log(
     failed_suite: str | None = None,
     omit_suite: str | None = None,
+    colorized: bool = False,
 ) -> str:
     lines = []
     for suite in PARITY_SUITES:
@@ -398,7 +405,13 @@ def synthetic_parity_log(
         status = "FAILED" if suite == failed_suite else "ok"
         failed = 1 if suite == failed_suite else 0
         passed = 2 if suite == failed_suite else 3
-        lines.append(f"Running tests/{suite}.rs (target/debug/deps/{suite}-abcdef)")
+        if colorized:
+            lines.append(
+                f"\x1b[1m\x1b[92m     Running\x1b[0m tests/{suite}.rs "
+                f"(target/debug/deps/{suite}-abcdef)"
+            )
+        else:
+            lines.append(f"Running tests/{suite}.rs (target/debug/deps/{suite}-abcdef)")
         lines.append(
             f"test result: {status}. {passed} passed; {failed} failed; "
             "0 ignored; 0 measured; 0 filtered out; finished in 0.01s"
@@ -419,6 +432,16 @@ def run_self_test() -> int:
     require(
         all(suite["status"] == "pass" for suite in all_pass_suites.values()),
         "all-pass synthetic log should parse as pass",
+    )
+
+    colorized_suites = parse_log(synthetic_parity_log(colorized=True))
+    require(
+        set(colorized_suites) == set(PARITY_SUITES),
+        "parser missed parity suites in a colorized cargo log",
+    )
+    require(
+        all(suite["status"] == "pass" for suite in colorized_suites.values()),
+        "colorized synthetic log should parse as pass",
     )
 
     all_pass_evidence = build_evidence(all_pass_suites, project_root)
