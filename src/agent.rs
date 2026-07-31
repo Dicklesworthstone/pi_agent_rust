@@ -2981,11 +2981,28 @@ impl Agent {
                 arguments: tool_call.arguments.clone(),
                 origin: ToolRequestOrigin::Native,
             });
+            // Policy evaluation opened (or refreshed) the audit record for this
+            // call id. The branches below only note *who* admitted the call;
+            // the single `record_outcome` after execution closes that same
+            // record, so denials are never written twice.
+            let audit = policy.audit();
             match decision.action {
-                PolicyAction::Allow => None,
+                PolicyAction::Allow => {
+                    if let Some(audit) = audit {
+                        audit.mark_allowed(&tool_call.id, Some("policy"));
+                    }
+                    None
+                }
                 PolicyAction::Ask => {
-                    self.request_tool_approval(&tool_call, Arc::clone(&on_event), true)
-                        .await
+                    let denied = self
+                        .request_tool_approval(&tool_call, Arc::clone(&on_event), true)
+                        .await;
+                    if denied.is_none() {
+                        if let Some(audit) = audit {
+                            audit.mark_allowed(&tool_call.id, Some("approval"));
+                        }
+                    }
+                    denied
                 }
                 PolicyAction::Deny => Some(Self::tool_approval_denied_output(&decision.reason)),
                 PolicyAction::Sandbox => Some(Self::tool_approval_denied_output(
@@ -3035,6 +3052,9 @@ impl Agent {
             record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
         }
 
+        // Close the record policy opened. `record_outcome` never overwrites a
+        // more specific terminal status (for example `TimedOut` or `Cancelled`)
+        // that the tool itself already recorded, nor reopens a denial.
         if let Some(policy) = &self.tool_policy {
             let status = if policy_denied {
                 AuditStatus::Denied

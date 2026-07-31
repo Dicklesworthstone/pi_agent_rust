@@ -1,7 +1,13 @@
 //! Regression contract extracted from the installed Devin CLI transcripts.
 
+use pi::devin::{
+    AuditLog, DEVIN_PROCESS_TOOL_NAMES, DevinSessionState, ProcessSupervisor, ToolPolicyEngine,
+};
+use pi::tools::ToolRegistry;
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
 
 #[derive(Debug, Deserialize)]
 struct ToolSchemaManifest {
@@ -102,4 +108,137 @@ fn local_devin_tool_surface_is_pinned() {
         ]
     );
     assert_eq!(manifest.tools, expected);
+}
+
+// ---------------------------------------------------------------------------
+// Full parameter schemas
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct ParameterSchemaFixture {
+    schema_version: u32,
+    provenance: FixtureProvenance,
+    tools: BTreeMap<String, PinnedToolSchema>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FixtureProvenance {
+    upstream_devin_version: String,
+    reproduces_upstream_parameter_schemas: bool,
+    current_version_transcript_search: TranscriptSearch,
+}
+
+#[derive(Debug, Deserialize)]
+struct TranscriptSearch {
+    accepted: bool,
+    reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PinnedToolSchema {
+    upstream_parameters_sha256_prefix12: String,
+    upstream_prefix_reproduced: bool,
+    parameters: Value,
+}
+
+fn parameter_schema_fixture() -> ParameterSchemaFixture {
+    serde_json::from_str(include_str!(
+        "fixtures/devin_cli/process_tool_parameter_schemas.json"
+    ))
+    .expect("valid Devin process parameter schema fixture")
+}
+
+fn process_tool_registry() -> ToolRegistry {
+    let workspace = std::env::temp_dir();
+    let state = DevinSessionState::new("contract", workspace);
+    let policy = Arc::new(ToolPolicyEngine::new(Arc::new(RwLock::new(state))));
+    let mut registry = ToolRegistry::from_tools(Vec::new());
+    pi::devin::register_process_tools(
+        &mut registry,
+        ProcessSupervisor::shared("contract"),
+        policy,
+        Some(Arc::new(AuditLog::new(8))),
+    );
+    registry
+}
+
+/// Hashes alone cannot catch schema drift, so the registered process tools are
+/// compared against whole pinned JSON Schemas.
+#[test]
+fn registered_process_tool_schemas_match_the_pinned_fixture() {
+    let fixture = parameter_schema_fixture();
+    assert_eq!(fixture.schema_version, 1);
+    let registry = process_tool_registry();
+
+    for name in DEVIN_PROCESS_TOOL_NAMES {
+        let pinned = fixture
+            .tools
+            .get(name)
+            .unwrap_or_else(|| panic!("`{name}` must have a pinned parameter schema"));
+        let tool = registry
+            .get(name)
+            .unwrap_or_else(|| panic!("`{name}` must be registered"));
+        assert_eq!(
+            tool.parameters(),
+            pinned.parameters,
+            "`{name}` parameter schema drifted from the pinned fixture"
+        );
+    }
+
+    assert_eq!(
+        fixture.tools.len(),
+        DEVIN_PROCESS_TOOL_NAMES.len(),
+        "the fixture must pin exactly the implemented process tools"
+    );
+}
+
+/// The fixture records the upstream digest for each tool, but never claims to
+/// reproduce it. Flipping that claim requires real, verifiable evidence.
+#[test]
+fn parameter_schema_fixture_records_upstream_digests_without_claiming_parity() {
+    let fixture = parameter_schema_fixture();
+    let manifest: ToolSchemaManifest =
+        serde_json::from_str(include_str!("fixtures/devin_cli/tool_schema_manifest.json"))
+            .expect("valid Devin tool schema manifest");
+
+    assert_eq!(fixture.provenance.upstream_devin_version, "3000.2.17");
+    assert_eq!(
+        fixture.provenance.upstream_devin_version, manifest.devin_version,
+        "the fixture must attribute its digests to the transcripts that produced them"
+    );
+    assert!(
+        !fixture.provenance.reproduces_upstream_parameter_schemas,
+        "these schemas are Pi Rust's own contract; claiming upstream parity needs recovered preimages"
+    );
+
+    for (name, pinned) in &fixture.tools {
+        let upstream = manifest
+            .tools
+            .get(name)
+            .unwrap_or_else(|| panic!("`{name}` must exist in the pinned upstream manifest"));
+        assert_eq!(
+            &pinned.upstream_parameters_sha256_prefix12, upstream,
+            "`{name}` records an upstream digest the manifest does not pin"
+        );
+        assert!(
+            !pinned.upstream_prefix_reproduced,
+            "`{name}` must not claim to reproduce the upstream digest"
+        );
+    }
+}
+
+/// No transcript from the installed `3000.3.22` binary was accepted, and the
+/// contract records why rather than silently implying parity with it.
+#[test]
+fn no_unverifiable_current_version_transcript_was_accepted() {
+    let fixture = parameter_schema_fixture();
+    let search = &fixture.provenance.current_version_transcript_search;
+    assert!(
+        !search.accepted,
+        "a 3000.3.22 transcript may only be accepted with recorded provenance and a pinned digest"
+    );
+    assert!(
+        search.reason.contains("provenance"),
+        "the rejection must state why the evidence was not accepted"
+    );
 }

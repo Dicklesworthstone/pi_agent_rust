@@ -7,9 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use super::audit::{AuditLog, AuditRecord, AuditStatus, ToolEffect, redact_error};
-use super::state::{
-    AgentMode, PermissionMode, SandboxStatus, ScopeAccess, SharedDevinSessionState,
-};
+use super::state::{AgentMode, PermissionMode, ScopeAccess, SharedDevinSessionState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +102,15 @@ impl ToolPolicyEngine {
         &self.state
     }
 
+    /// The audit sink this engine opens records on, if one is installed.
+    ///
+    /// Executors need it so they can close the *same* record they opened here
+    /// instead of appending a second row for one call.
+    #[must_use]
+    pub const fn audit(&self) -> Option<&Arc<AuditLog>> {
+        self.audit.as_ref()
+    }
+
     #[must_use]
     pub fn evaluate(&self, request: &ToolRequest) -> PolicyDecision {
         let state_guard = self
@@ -134,7 +141,7 @@ impl ToolPolicyEngine {
                 Ok(scoped_paths) => {
                     let (action, reason) = permission_decision(
                         state.permission_mode,
-                        state.sandbox_status,
+                        state.sandbox_is_active(),
                         category,
                         &request.tool_name,
                     );
@@ -163,11 +170,16 @@ impl ToolPolicyEngine {
     /// approval rejection, extension-hook block, or tool failure would
     /// otherwise leave the record stuck at [`AuditStatus::Pending`] and
     /// disagree with what actually happened.
+    ///
+    /// Records already closed are left alone, so a policy denial is never
+    /// reopened and a tool that reported its own `TimedOut` or `Cancelled`
+    /// outcome is not overwritten by the agent loop's generic result.
     pub fn record_outcome(&self, call_id: &str, status: AuditStatus, error: Option<&str>) {
         let Some(audit) = &self.audit else {
             return;
         };
-        audit.complete(call_id, status, error.map(redact_error));
+        let redacted = error.map(redact_error);
+        audit.complete_if_open(call_id, status, redacted.as_deref());
     }
 
     fn audit_decision(
@@ -249,6 +261,7 @@ fn agent_mode_allows(mode: AgentMode, name: &str, category: ToolCategory) -> boo
                 | "find_file_by_name"
                 | "ls"
                 | "notebook_read"
+                | "get_output"
                 | "update_plan"
                 | "todo_write"
                 | "ask_user_question"
@@ -270,11 +283,14 @@ const fn agent_mode_name(mode: AgentMode) -> &'static str {
 
 fn permission_decision(
     mode: PermissionMode,
-    sandbox: SandboxStatus,
+    sandbox_active: bool,
     category: ToolCategory,
     name: &str,
 ) -> (PolicyAction, String) {
     if mode == PermissionMode::Bypass {
+        // Reached only after `validate_paths` confirmed every path and process
+        // working directory resolves inside the workspace or a granted scope,
+        // so bypass skips the prompt without ever skipping path containment.
         return (PolicyAction::Allow, bypass_reason(category));
     }
     if category == ToolCategory::Unknown {
@@ -317,7 +333,7 @@ fn permission_decision(
             "smart mode requires a risk-aware approval".to_string(),
         ),
         PermissionMode::Bypass => (PolicyAction::Allow, bypass_reason(category)),
-        PermissionMode::Autonomous if sandbox != SandboxStatus::Active => (
+        PermissionMode::Autonomous if !sandbox_active => (
             PolicyAction::Deny,
             "autonomous mode requires an active OS sandbox".to_string(),
         ),
@@ -340,14 +356,26 @@ fn permission_decision(
     }
 }
 
-/// Bypass skips approval prompts. Path scopes are still enforced for tools that
-/// name a path, but process and network tools carry no path to check, so their
-/// effects are uncontained. Say so instead of implying a scope guarantee.
+/// Bypass skips approval prompts, not path containment. Report exactly how much
+/// containment the category actually has instead of implying a blanket scope
+/// guarantee.
+///
+/// - Network calls name no path at all, so nothing bounds them.
+/// - Process calls have their working directory validated against the scopes,
+///   but a spawned process can still touch anything its own permissions allow,
+///   so the cwd check is not a sandbox.
+/// - Everything else names the paths it touches, and those are enforced.
 fn bypass_reason(category: ToolCategory) -> String {
-    if matches!(category, ToolCategory::Process | ToolCategory::Network) {
-        "bypass mode skips approval; this call is not contained by workspace scopes".to_string()
-    } else {
-        "bypass mode skips approval for calls inside enforced scopes".to_string()
+    match category {
+        ToolCategory::Network => {
+            "bypass mode skips approval; this call is not contained by workspace scopes".to_string()
+        }
+        ToolCategory::Process => {
+            "bypass mode skips approval; the working directory is scope-checked but the \
+             process itself is not contained"
+                .to_string()
+        }
+        _ => "bypass mode skips approval for calls inside enforced scopes".to_string(),
     }
 }
 
@@ -359,9 +387,12 @@ fn validate_paths(
     if request.tool_name == "request_scope" {
         return Ok(Vec::new());
     }
-    let access = match category {
-        ToolCategory::FileMutation => ScopeAccess::Write,
-        ToolCategory::Read => ScopeAccess::Read,
+    // A process can write anywhere it is started, so its working directory is
+    // validated at write strength. This is what keeps bypass mode contained.
+    let (access, keys): (ScopeAccess, &[&str]) = match category {
+        ToolCategory::FileMutation => (ScopeAccess::Write, &["file_path", "path", "notebook_path"]),
+        ToolCategory::Read => (ScopeAccess::Read, &["file_path", "path", "notebook_path"]),
+        ToolCategory::Process => (ScopeAccess::Write, PROCESS_WORKING_DIRECTORY_KEYS),
         _ => return Ok(Vec::new()),
     };
     let Some(arguments) = request.arguments.as_object() else {
@@ -369,8 +400,8 @@ fn validate_paths(
     };
 
     let mut scoped = Vec::new();
-    for key in ["file_path", "path", "notebook_path"] {
-        let Some(raw_path) = arguments.get(key).and_then(Value::as_str) else {
+    for key in keys {
+        let Some(raw_path) = arguments.get(*key).and_then(Value::as_str) else {
             continue;
         };
         let path = resolve_scoped_path(state, raw_path, access)?;
@@ -378,6 +409,9 @@ fn validate_paths(
     }
     Ok(scoped)
 }
+
+/// Argument names that select the working directory of a spawned process.
+pub const PROCESS_WORKING_DIRECTORY_KEYS: &[&str] = &["cwd", "working_dir", "workingDir"];
 
 fn resolve_scoped_path(
     state: &super::state::DevinSessionState,

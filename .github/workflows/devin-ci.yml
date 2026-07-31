@@ -58,9 +58,10 @@ jobs:
       - name: Lint default features
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test Devin contract and session policy
+      - name: Test Devin contract, session policy, and process supervisor
         run: |
           cargo test --test devin_contract --test devin_session_state
+          cargo test --test devin_process_supervisor
           cargo test devin::
 
       - name: Build release binary

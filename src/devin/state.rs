@@ -84,6 +84,13 @@ pub struct DevinSessionState {
     pub agent_mode: AgentMode,
     pub permission_mode: PermissionMode,
     pub sandbox_status: SandboxStatus,
+    /// Identifier of the backend that actually activated the sandbox.
+    ///
+    /// `SandboxStatus::Active` on its own is only a claim. Autonomous execution
+    /// additionally requires a named backend so a mislabelled or defaulted
+    /// status cannot be mistaken for real containment.
+    #[serde(default)]
+    pub sandbox_backend: Option<String>,
     pub scopes: Vec<ScopeGrant>,
 }
 
@@ -97,14 +104,34 @@ impl DevinSessionState {
             agent_mode: AgentMode::Normal,
             permission_mode: PermissionMode::Normal,
             sandbox_status: SandboxStatus::Unavailable,
+            sandbox_backend: None,
             scopes: Vec::new(),
         }
     }
 
+    /// Whether a real sandbox backend reports itself as active.
+    ///
+    /// Both the status *and* the backend identity must be present, so a state
+    /// blob that merely claims `Active` cannot unlock autonomous execution.
+    #[must_use]
+    pub fn sandbox_is_active(&self) -> bool {
+        self.sandbox_status == SandboxStatus::Active
+            && self
+                .sandbox_backend
+                .as_ref()
+                .is_some_and(|backend| !backend.trim().is_empty())
+    }
+
+    /// Record that a named sandbox backend activated containment.
+    pub fn activate_sandbox(&mut self, backend: impl Into<String>) {
+        self.sandbox_status = SandboxStatus::Active;
+        self.sandbox_backend = Some(backend.into());
+    }
+
     /// Select a permission mode, rejecting autonomous mode unless the sandbox
-    /// is already active. This keeps the transition fail-closed.
+    /// is genuinely active. This keeps the transition fail-closed.
     pub fn set_permission_mode(&mut self, mode: PermissionMode) -> Result<(), String> {
-        if mode == PermissionMode::Autonomous && self.sandbox_status != SandboxStatus::Active {
+        if mode == PermissionMode::Autonomous && !self.sandbox_is_active() {
             return Err("autonomous mode requires an active OS sandbox".to_string());
         }
         self.permission_mode = mode;
@@ -141,7 +168,15 @@ mod tests {
                 .is_err()
         );
 
+        // A bare `Active` claim without a named backend is still refused.
         state.sandbox_status = SandboxStatus::Active;
+        assert!(
+            state
+                .set_permission_mode(PermissionMode::Autonomous)
+                .is_err()
+        );
+
+        state.activate_sandbox("landlock");
         assert!(
             state
                 .set_permission_mode(PermissionMode::Autonomous)

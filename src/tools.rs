@@ -3372,7 +3372,7 @@ enum BashPipeFrame {
 }
 
 #[allow(clippy::unnecessary_lazy_evaluations)] // lazy eval needed on unix for signal()
-fn exit_status_code(status: std::process::ExitStatus) -> i32 {
+pub(crate) fn exit_status_code(status: std::process::ExitStatus) -> i32 {
     status.code().unwrap_or_else(|| {
         #[cfg(unix)]
         {
@@ -6255,8 +6255,11 @@ pub fn cleanup_temp_files() {
                 continue;
             };
 
-            // Match "pi-bash-" or "pi-rpc-bash-" prefix and ".log" suffix.
-            if (file_name.starts_with("pi-bash-") || file_name.starts_with("pi-rpc-bash-"))
+            // Match "pi-bash-", "pi-rpc-bash-", or "pi-devin-proc-" prefix and
+            // ".log" suffix.
+            if (file_name.starts_with("pi-bash-")
+                || file_name.starts_with("pi-rpc-bash-")
+                || file_name.starts_with(crate::devin::PROCESS_ARTIFACT_FILE_PREFIX))
                 && std::path::Path::new(file_name)
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
@@ -6771,7 +6774,7 @@ pub(crate) fn kill_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Kill, true);
 }
 
-fn terminate_process_group_tree(pid: Option<u32>) {
+pub(crate) fn terminate_process_group_tree(pid: Option<u32>) {
     kill_process_tree_with(pid, sysinfo::Signal::Term, true);
 }
 

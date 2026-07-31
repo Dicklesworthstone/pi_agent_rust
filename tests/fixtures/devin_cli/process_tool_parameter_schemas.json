@@ -1,0 +1,157 @@
+{
+  "schema_version": 1,
+  "purpose": "Full parameter schemas for the five pinned Devin process tools, so the contract test compares whole JSON Schemas instead of only the opaque hashes in tool_schema_manifest.json.",
+  "provenance": {
+    "upstream_manifest": "tests/fixtures/devin_cli/tool_schema_manifest.json",
+    "upstream_devin_version": "3000.2.17",
+    "upstream_hash_scope": "function.parameters",
+    "upstream_canonicalization": "python_json_dumps_sort_keys_compact_ascii_sha256_prefix_12",
+    "reproduces_upstream_parameter_schemas": false,
+    "why_not": "The four pinned ATIF-v1.7 transcripts recorded only a 12-hex-character SHA-256 prefix of each tool's function.parameters object, never the object itself. A digest prefix has no recoverable preimage, the Devin CLI is not installed in this repository or in CI, and no transcript exposing full parameter schemas was obtainable with verifiable provenance. These schemas are therefore Pi Rust's own native contract for the pinned Devin tool names. They are pinned here so any drift in the registered tool surface fails the contract test; they are not, and must not be presented as, a reconstruction of Devin's schemas.",
+    "current_version_transcript_search": {
+      "searched_for": "an ATIF transcript exported by Devin 3000.3.22, the version installed at extraction time",
+      "accepted": false,
+      "reason": "No candidate carried both a recordable provenance chain (origin, exporting binary version, export time) and a digest that could be pinned in this repository. Recording unverifiable evidence would be worse than an acknowledged gap, so no 3000.3.22 transcript was accepted and the four 3000.2.17 transcripts remain the only pinned historical evidence."
+    }
+  },
+  "tools": {
+    "exec": {
+      "upstream_parameters_sha256_prefix12": "75d325f0ee6e",
+      "upstream_prefix_reproduced": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Command line to execute."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Working directory. Must resolve inside the session workspace or a granted scope. Defaults to the workspace root."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Foreground timeout in milliseconds. 0 disables the timeout. Ignored for background processes. Defaults to 120000."
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Return immediately with a process id instead of waiting. Read output with get_output."
+          },
+          "detached": {
+            "type": "boolean",
+            "description": "Exempt this process from session cleanup. Explicit opt-in; recorded on the process registry entry."
+          },
+          "interactive": {
+            "type": "boolean",
+            "description": "Keep stdin open so write_to_process can write to it. When false stdin is closed immediately after spawn. Defaults to true for background processes and false in the foreground."
+          }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      }
+    },
+    "shell_command": {
+      "upstream_parameters_sha256_prefix12": "bbe0da554d85",
+      "upstream_prefix_reproduced": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Command line to execute."
+          },
+          "cwd": {
+            "type": "string",
+            "description": "Working directory. Must resolve inside the session workspace or a granted scope. Defaults to the workspace root."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Foreground timeout in milliseconds. 0 disables the timeout. Ignored for background processes. Defaults to 120000."
+          },
+          "background": {
+            "type": "boolean",
+            "description": "Return immediately with a process id instead of waiting. Read output with get_output."
+          },
+          "detached": {
+            "type": "boolean",
+            "description": "Exempt this process from session cleanup. Explicit opt-in; recorded on the process registry entry."
+          },
+          "interactive": {
+            "type": "boolean",
+            "description": "Keep stdin open so write_to_process can write to it. When false stdin is closed immediately after spawn. Defaults to true for background processes and false in the foreground."
+          },
+          "shell": {
+            "type": "string",
+            "description": "Absolute path to the shell used to interpret the command. Defaults to bash, falling back to sh."
+          }
+        },
+        "required": ["command"],
+        "additionalProperties": false
+      }
+    },
+    "get_output": {
+      "upstream_parameters_sha256_prefix12": "ba9743b81207",
+      "upstream_prefix_reproduced": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "process_id": {
+            "type": "string",
+            "description": "Process id returned by exec or shell_command."
+          }
+        },
+        "required": ["process_id"],
+        "additionalProperties": false
+      }
+    },
+    "write_to_process": {
+      "upstream_parameters_sha256_prefix12": "10c1bd8e64f0",
+      "upstream_prefix_reproduced": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "process_id": {
+            "type": "string",
+            "description": "Process id returned by exec or shell_command."
+          },
+          "data": {
+            "type": "string",
+            "description": "Bytes to write to stdin."
+          },
+          "append_newline": {
+            "type": "boolean",
+            "description": "Append a trailing newline, which most line-oriented programs require before they act."
+          },
+          "close_stdin": {
+            "type": "boolean",
+            "description": "Close stdin after writing so the process observes EOF."
+          }
+        },
+        "required": ["process_id", "data"],
+        "additionalProperties": false
+      }
+    },
+    "kill_shell": {
+      "upstream_parameters_sha256_prefix12": "badcd1021e24",
+      "upstream_prefix_reproduced": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "process_id": {
+            "type": "string",
+            "description": "Process id returned by exec or shell_command."
+          },
+          "grace_ms": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Milliseconds to wait after SIGTERM before SIGKILL. Defaults to 1500."
+          }
+        },
+        "required": ["process_id"],
+        "additionalProperties": false
+      }
+    }
+  }
+}

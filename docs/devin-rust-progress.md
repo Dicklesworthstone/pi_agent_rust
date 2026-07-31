@@ -17,6 +17,100 @@ changed to CI-only Rust validation.
 No further Cargo, rustc, clippy, rustfmt, or release builds run on the local
 workstation. Rust verification is performed by GitHub Actions.
 
+## Contract evidence
+
+`tests/fixtures/devin_cli/tool_schema_manifest.json` stays the pinned contract
+source. It is historical evidence from four ATIF-v1.7 transcripts exported by
+Devin `3000.2.17`, not a parity claim against the `3000.3.22` binary that was
+installed when the transcripts were extracted.
+
+That manifest records only a 12-hex-character SHA-256 prefix per tool, which is
+not enough to detect schema drift: a digest has no recoverable preimage, so it
+can neither be compared field by field nor regenerated from the registered
+tools. `tests/fixtures/devin_cli/process_tool_parameter_schemas.json` therefore
+pins the **full** JSON Schema for each of the five process tools, and
+`tests/devin_contract.rs` asserts the registered `ToolRegistry` entries match
+those schemas exactly.
+
+Those full schemas are Pi Rust's own native contract for the pinned Devin tool
+names. The fixture states this explicitly
+(`reproduces_upstream_parameter_schemas: false`, and
+`upstream_prefix_reproduced: false` per tool), records the upstream digest
+alongside each schema, and is guarded by a test that fails if either claim is
+ever flipped without recovered preimages.
+
+A transcript exported by the installed `3000.3.22` binary was searched for and
+**not** accepted: no candidate carried both a recordable provenance chain
+(origin, exporting binary version, export time) and a digest that could be
+pinned here. Recording unverifiable evidence is worse than an acknowledged gap,
+so the four `3000.2.17` transcripts remain the only pinned evidence and the
+gap is stated in the fixture rather than papered over.
+
+## Process supervisor
+
+One session-owned supervisor (`src/devin/process.rs`) backs all five pinned
+Devin process tools (`src/devin/process_tools.rs`): `exec`, `shell_command`,
+`get_output`, `write_to_process`, `kill_shell`. It reuses the primitives the
+native `bash` tool already relies on rather than adding a second subprocess
+stack: `command_with_default_sigpipe_in_dir`, process-group isolation, the
+`sysinfo` group/tree termination helpers, `AgentCx` cancellation, `truncate_tail`,
+and the shared temp-artifact cleanup in `crate::tools::cleanup_temp_files`.
+
+- Registry entries carry a unique process id, command, cwd, start/end time,
+  status, exit code, pid and process-group id, stdin state, and bounded
+  stdout/stderr buffers with byte and drop counters.
+- Foreground runs stream through the existing `ToolUpdate` route; background
+  runs return a process id immediately and stay observable through
+  `get_output`, which is incremental and reports bytes evicted from the ring.
+- `write_to_process` writes stdin and fails with a specific reason for unknown
+  ids, exited processes, and closed stdin.
+- `kill_shell` SIGTERMs the whole process group, then SIGKILLs the group and
+  descendant tree after a short grace period.
+- Session cancellation, timeouts, and `ProcessSupervisor::shutdown` all
+  terminate owned process groups. Detachment is opt-in per call and recorded on
+  the registry entry, so an exemption from cleanup is always auditable.
+- Output above the in-memory budget spills to a `pi-devin-proc-*.log` artifact;
+  audit records reference the artifact instead of carrying the output.
+
+## Policy integration
+
+- The five tools register on the existing `ToolRegistry` and each calls
+  `ToolPolicyEngine::evaluate` itself, because ACP and RPC drive the registry
+  directly and must not bypass the gate. Re-evaluation is safe: audit records
+  are keyed by `call_id` and upserted.
+- Plan mode denies `exec`, `shell_command`, `write_to_process`, and
+  `kill_shell` (`get_output` stays available as a read-only tool).
+- Normal and Smart return `Ask`. A tool reached with an unresolved `Ask` fails
+  closed rather than executing.
+- Bypass auto-allows only after path containment passed: `validate_paths` now
+  resolves the process working directory (`cwd`, `working_dir`, `workingDir`)
+  at write strength, so bypass skips the prompt without skipping path
+  containment. The reason string stays honest about how much that buys: a
+  spawned process can still touch anything its own OS permissions allow, so a
+  scope-checked `cwd` is not a sandbox, and network calls name no path at all.
+- Autonomous process execution requires a genuinely active sandbox.
+  `SandboxStatus::Active` alone is only a claim, so `DevinSessionState` now also
+  records `sandbox_backend`; without a named backend the decision is `Deny`,
+  never `Ask` or `Allow`.
+
+## Audit lifecycle
+
+- Policy evaluation opens at most one record per `call_id`. `AuditLog::push`
+  upserts by `call_id` and refuses to reopen a closed record, so a call can
+  never produce two rows.
+- Execution closes that same record through `mark_allowed`, `complete`, or
+  `complete_if_open`, reaching `allowed`, `denied`, `succeeded`, `failed`,
+  `cancelled`, or the newly added `timed_out`.
+- `complete_if_open` lets the agent loop record a generic outcome without
+  overwriting a more specific status the tool already reported.
+- Records store salted argument hashes, redacted errors, and artifact
+  references. Raw arguments, secret-bearing commands, and unbounded stdout are
+  never retained.
+- The hash salt is generated per `AuditLog` and never persisted. Argument
+  hashes are therefore comparable only **inside one log**: they correlate
+  repeated calls within a session and are useless as cross-session
+  fingerprints.
+
 ## Implemented evidence
 
 - Four ATIF-v1.7 transcripts exported by Devin `3000.2.17` expose the same 28
@@ -39,8 +133,11 @@ workstation. Rust verification is performed by GitHub Actions.
 
 1. Expose persisted Devin state through TUI, ACP, and RPC.
 2. Register full transcript-derived schemas and migrate the existing eight
-   tools behind the same canonical registry.
-3. Implement process supervision and persistent plan/todo tools.
+   tools behind the same canonical registry. The five process tools now pin
+   full schemas; the remaining tools still pin hashes only.
+3. Implement persistent plan/todo tools. Process supervision is done; a
+   sandbox execution adapter for `PolicyAction::Sandbox` is not, so autonomous
+   mode still fails closed at the executor.
 4. Implement managed subagents, MCP, skills, hooks, and web/browser adapters.
 5. Add disabled-by-default cloud XML parsing with no direct execution path.
 6. Complete file mutation hashes/diffs and persistent audit/recovery sinks.
@@ -52,7 +149,8 @@ workstation. Rust verification is performed by GitHub Actions.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
-cargo test --test devin_contract
+cargo test --test devin_contract --test devin_session_state
+cargo test --test devin_process_supervisor
 cargo test devin::
 cargo test --all-targets
 cargo build --release
