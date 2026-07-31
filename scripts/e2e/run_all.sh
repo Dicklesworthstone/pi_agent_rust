@@ -478,8 +478,48 @@ if [[ -z "$CORRELATION_ID" ]]; then
 fi
 export CI_CORRELATION_ID="$CORRELATION_ID"
 
+# Cargo test targets declared with `required-features` cannot be built by name
+# unless those features are enabled: `cargo test --test <name>` hard-errors
+# instead of skipping the way `--all-targets` does. Drop them from the selection
+# so a feature-gated target (e.g. the loom model checker) does not fail the
+# shard it is classified into.
+mapfile -t FEATURE_GATED_TARGETS < <(python3 - "$PROJECT_ROOT/Cargo.toml" <<'PY' 2>/dev/null || true
+import sys, tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    manifest = tomllib.load(handle)
+for entry in manifest.get("test", []):
+    if entry.get("required-features") and entry.get("name"):
+        print(entry["name"])
+PY
+)
+
+is_feature_gated_target() {
+    local candidate="$1"
+    local gated
+    for gated in "${FEATURE_GATED_TARGETS[@]:-}"; do
+        [[ "$candidate" == "$gated" ]] && return 0
+    done
+    return 1
+}
+
 if (( ${#SELECTED_UNIT_TARGETS[@]} > 0 )); then
     mapfile -t SELECTED_UNIT_TARGETS < <(printf '%s\n' "${SELECTED_UNIT_TARGETS[@]}" | awk 'NF' | LC_ALL=C sort -u)
+fi
+if (( ${#SELECTED_UNIT_TARGETS[@]} > 0 && ${#FEATURE_GATED_TARGETS[@]} > 0 )); then
+    RETAINED_UNIT_TARGETS=()
+    for target in "${SELECTED_UNIT_TARGETS[@]}"; do
+        if is_feature_gated_target "$target"; then
+            echo "[select] unit:$target requires opt-in cargo features, skipping"
+            continue
+        fi
+        RETAINED_UNIT_TARGETS+=("$target")
+    done
+    if (( ${#RETAINED_UNIT_TARGETS[@]} > 0 )); then
+        SELECTED_UNIT_TARGETS=("${RETAINED_UNIT_TARGETS[@]}")
+    else
+        SELECTED_UNIT_TARGETS=()
+    fi
 fi
 if (( ${#SELECTED_SUITES[@]} > 0 )); then
     mapfile -t SELECTED_SUITES < <(printf '%s\n' "${SELECTED_SUITES[@]}" | awk 'NF' | LC_ALL=C sort -u)
