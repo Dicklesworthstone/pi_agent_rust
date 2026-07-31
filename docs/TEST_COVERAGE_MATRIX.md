@@ -7,17 +7,17 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 111 current source files.
+- `rg --files src -g '*.rs' | sort` -> 117 current source files.
 - `rg --files tests -g '*.rs' | wc -l` -> 304 Rust test files under `tests/`.
 - `rg -n '#\\[cfg\\(test\\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
 - `python3 scripts/check_traceability_matrix.py` passes with 100.00% classified trace coverage and 100.00% E2E scenario coverage after the `e2e_swarm_flight_recorder` and `rch_artifact_sync_preflight` inventory refresh. Broader semantic traceability expansion remains tracked by `bd-8t27h.3`.
-- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory now reflects the 111-file current tree.
+- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory now reflects the 117-file current tree.
 - Drift guard: `cargo test --test traceability_staleness source_coverage_matrix_matches_current_src_inventory`.
 
 ### Current Drift Check
 
-- Current `src/` inventory: 111 files.
-- Source-file rows below: 111.
+- Current `src/` inventory: 117 files.
+- Source-file rows below: 117.
 - Source files omitted from this document: 0.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -161,7 +161,7 @@ The full Rust test inventory is too large for this markdown table to remain the 
 
 | Inventory | Count | Source of truth |
 |---|---:|---|
-| Source files | 111 | `rg --files src -g '*.rs' | sort` |
+| Source files | 117 | `rg --files src -g '*.rs' | sort` |
 | Rust test files | 304 | `rg --files tests -g '*.rs' | sort` |
 | Classified top-level test files | 280 | `tests/suite_classification.toml` |
 | Traceability-matrix referenced classified tests | 280 | `docs/traceability_matrix.json` via `scripts/check_traceability_matrix.py` |

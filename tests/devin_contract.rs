@@ -158,7 +158,8 @@ fn process_tool_registry() -> ToolRegistry {
         ProcessSupervisor::shared("contract"),
         policy,
         Some(Arc::new(AuditLog::new(8))),
-    );
+    )
+    .expect("process tools register on an empty registry");
     registry
 }
 

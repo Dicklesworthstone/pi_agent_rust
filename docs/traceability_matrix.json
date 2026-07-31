@@ -895,7 +895,7 @@
         },
         {
           "path": "tests/devin_contract.rs",
-          "justification": "Pinned Devin CLI tool contract verified against the extracted transcript fixtures."
+          "justification": "Pinned Devin CLI tool contract verified against committed parameter-schema fixtures and recorded upstream digests; source transcripts are not committed."
         },
         {
           "path": "tests/devin_process_supervisor.rs",

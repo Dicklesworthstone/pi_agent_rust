@@ -54,6 +54,11 @@ pub const PROCESS_DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 const POLL_TICK: Duration = Duration::from_millis(10);
 
+/// Minimum spacing between streaming updates. Each update re-reads and
+/// re-truncates the retained buffer, so a chatty process would otherwise pay
+/// that cost every `POLL_TICK` regardless of how few bytes it produced.
+const UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Upper bound on retained registry entries. Finished, non-detached entries are
 /// evicted oldest-first once the registry grows past this.
 const MAX_REGISTRY_ENTRIES: usize = 256;
@@ -178,11 +183,18 @@ impl ProcessOutcome {
     /// Artifact references suitable for an audit record. Never the output.
     #[must_use]
     pub fn artifact_refs(&self) -> Vec<String> {
-        self.record
-            .artifact_path
-            .as_ref()
-            .map_or_else(Vec::new, |path| vec![format!("file://{}", path.display())])
+        artifact_refs_for(self.record.artifact_path.as_deref())
     }
+}
+
+/// Audit artifact references for a spill artifact path.
+///
+/// The `file://` shape is part of the audit contract, so every producer of
+/// artifact references goes through this one helper rather than formatting the
+/// URI again at each call site.
+#[must_use]
+pub fn artifact_refs_for(path: Option<&Path>) -> Vec<String> {
+    path.map_or_else(Vec::new, |path| vec![format!("file://{}", path.display())])
 }
 
 /// Bounded ring of one stream's output plus absolute offsets so `get_output`
@@ -264,6 +276,9 @@ struct ProcessLifecycle {
 #[derive(Debug)]
 struct ProcessEntry {
     id: String,
+    /// Session that owns this process. Part of the artifact file name because
+    /// process ids restart at `proc-1` in every supervisor.
+    session_id: String,
     command: String,
     cwd: PathBuf,
     tool_name: String,
@@ -300,7 +315,13 @@ impl ProcessEntry {
             && !output.artifact_failed
             && produced.saturating_add(chunk.len()) > PROCESS_ARTIFACT_THRESHOLD_BYTES
         {
+            // `open_artifact` seeds the file from the retained buffers, which
+            // already hold `chunk` because it was pushed above. Writing the
+            // incremental chunk again here would duplicate it at the spill
+            // boundary, so the tick that creates the artifact writes nothing
+            // more.
             self.open_artifact(&mut output);
+            return;
         }
         if let Some(file) = output.artifact.as_mut()
             && file.write_all(chunk).is_err()
@@ -313,9 +334,13 @@ impl ProcessEntry {
     /// Create the spill artifact with owner-only permissions and seed it with
     /// whatever is still retained in memory.
     fn open_artifact(&self, output: &mut ProcessOutputState) {
+        // Process ids are per-supervisor counters that restart at `proc-1`, so
+        // the session id is what keeps two concurrent sessions from truncating
+        // each other's artifact.
         let path = std::env::temp_dir().join(format!(
-            "{PROCESS_ARTIFACT_FILE_PREFIX}{}.log",
-            self.id.replace(['/', '\\'], "-")
+            "{PROCESS_ARTIFACT_FILE_PREFIX}{}-{}.log",
+            sanitize_file_component(&self.session_id),
+            sanitize_file_component(&self.id)
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
@@ -560,6 +585,7 @@ impl ProcessSupervisor {
         let id = format!("proc-{}", self.next_id.fetch_add(1, Ordering::Relaxed));
         let entry = Arc::new(ProcessEntry {
             id: id.clone(),
+            session_id: self.session_id.clone(),
             command: request.command.clone(),
             cwd: request.cwd.clone(),
             tool_name: request.tool_name.clone(),
@@ -615,6 +641,7 @@ impl ProcessSupervisor {
         let cx = AgentCx::for_current_or_request();
         let started = std::time::Instant::now();
         let mut emitted = 0_usize;
+        let mut last_update = started;
         // Why the cause is tracked locally rather than written straight onto
         // the entry: closing the entry early would make `poll_exit` report a
         // terminal status on the next tick and short-circuit the grace period,
@@ -628,8 +655,9 @@ impl ProcessSupervisor {
             }
 
             let produced = entry.produced_bytes();
-            if produced != emitted {
+            if produced != emitted && last_update.elapsed() >= UPDATE_INTERVAL {
                 emitted = produced;
+                last_update = std::time::Instant::now();
                 emit_update(&entry, started, request.timeout, on_update);
             }
 
@@ -742,7 +770,7 @@ impl ProcessSupervisor {
                 ),
             ));
         }
-        let Some(stdin) = lifecycle.stdin.as_mut() else {
+        let Some(mut stdin) = lifecycle.stdin.take() else {
             drop(lifecycle);
             return Err(Error::tool(
                 "write_to_process",
@@ -751,19 +779,33 @@ impl ProcessSupervisor {
                 ),
             ));
         };
-        stdin
-            .write_all(data.as_bytes())
-            .and_then(|()| stdin.flush())
-            .map_err(|err| {
-                Error::tool(
-                    "write_to_process",
-                    format!("failed to write to process `{process_id}` stdin: {err}"),
-                )
-            })?;
-        if close_stdin {
-            lifecycle.stdin = None;
+        // The handle is taken out of the guard before the write: `write_all`
+        // blocks whenever the child stops draining its stdin pipe, and holding
+        // the lifecycle lock across that would wedge `poll_exit`,
+        // `mark_terminated`, `kill`, and session shutdown for as long as the
+        // child misbehaves.
+        drop(lifecycle);
+
+        let mut written = stdin.write_all(data.as_bytes());
+        if written.is_ok() {
+            written = stdin.flush();
+        }
+
+        let mut lifecycle = entry.lock_lifecycle();
+        // Put the handle back only when it is still usable: a failed write
+        // means the pipe is broken, `close_stdin` asked for EOF, and a process
+        // that ended while the lock was released must not look interactive.
+        if written.is_ok() && !close_stdin && !lifecycle.status.is_terminal() {
+            lifecycle.stdin = Some(stdin);
         }
         drop(lifecycle);
+
+        written.map_err(|err| {
+            Error::tool(
+                "write_to_process",
+                format!("failed to write to process `{process_id}` stdin: {err}"),
+            )
+        })?;
         Ok(entry.record())
     }
 
@@ -789,14 +831,32 @@ impl ProcessSupervisor {
             .map(Arc::clone)
             .collect();
 
-        let mut terminated = Vec::with_capacity(entries.len());
-        for entry in entries {
-            if entry.poll_exit().is_some() {
-                terminated.push(entry.record());
-                continue;
+        // One shared grace period for the whole session: signal every group
+        // first, then wait once. Terminating entries one at a time would make
+        // session stop cost up to `entries.len() * PROCESS_TERMINATE_GRACE`.
+        let cx = AgentCx::for_current_or_request();
+        let mut pending: Vec<&Arc<ProcessEntry>> = Vec::new();
+        for entry in &entries {
+            if entry.poll_exit().is_none() {
+                terminate_process_group_tree(entry.pid);
+                pending.push(entry);
             }
-            terminated.push(terminate_entry(&entry, PROCESS_TERMINATE_GRACE).await);
         }
+        if !pending.is_empty() {
+            let deadline = std::time::Instant::now() + PROCESS_TERMINATE_GRACE;
+            while std::time::Instant::now() < deadline {
+                pending.retain(|entry| entry.poll_exit().is_none());
+                if pending.is_empty() {
+                    break;
+                }
+                cx.time().sleep(POLL_TICK).await;
+            }
+            for entry in pending {
+                kill_process_group_tree(entry.pid);
+                entry.mark_terminated(ProcessStatus::Killed, Some(-1));
+            }
+        }
+        let terminated: Vec<ProcessRecord> = entries.iter().map(|entry| entry.record()).collect();
         self.lock_entries()
             .retain(|_, entry| entry.detached || !entry.record().status.is_terminal());
         terminated
@@ -1004,6 +1064,25 @@ fn pump<R: Read>(mut reader: R, entry: &Arc<ProcessEntry>, stream: ProcessStream
                 break;
             }
         }
+    }
+}
+
+/// Reduce an identifier to characters that are safe in a temp file name.
+fn sanitize_file_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized
     }
 }
 

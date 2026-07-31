@@ -16,10 +16,13 @@ pub use policy::{
     ToolPolicyEngine, ToolRequest, ToolRequestOrigin,
 };
 pub use process::{
-    PROCESS_ARTIFACT_FILE_PREFIX, PROCESS_DEFAULT_TIMEOUT, PROCESS_TERMINATE_GRACE, ProcessOutcome,
-    ProcessRecord, ProcessStatus, ProcessSupervisor, SharedProcessSupervisor, SpawnRequest,
+    PROCESS_ARTIFACT_FILE_PREFIX, PROCESS_DEFAULT_TIMEOUT, PROCESS_TERMINATE_GRACE,
+    PROCESS_UPDATE_SCHEMA_V1, ProcessOutcome, ProcessRecord, ProcessStatus, ProcessSupervisor,
+    SharedProcessSupervisor, SpawnRequest, artifact_refs_for,
 };
-pub use process_tools::{DEVIN_PROCESS_TOOL_NAMES, process_tools, register_process_tools};
+pub use process_tools::{
+    DEVIN_PROCESS_TOOL_NAMES, PROCESS_TOOL_DETAILS_SCHEMA_V1, process_tools, register_process_tools,
+};
 pub use state::{
     AgentMode, DEVIN_SESSION_STATE_CUSTOM_TYPE, DevinSessionState, PermissionMode, SandboxStatus,
     ScopeAccess, ScopeGrant, SharedDevinSessionState,

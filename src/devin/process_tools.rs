@@ -8,7 +8,9 @@
 //! Every adapter calls [`ToolPolicyEngine::evaluate`] itself rather than
 //! relying on the agent loop, because the tool registry is also driven by the
 //! ACP and RPC surfaces. Re-evaluating an in-flight call is safe: the audit log
-//! keys records by `call_id` and upserts, so a call never produces two rows.
+//! keys records by `call_id` and upserts, so a call never produces two rows,
+//! and an approval that a surface already recorded for the call id is carried
+//! through the re-evaluation instead of being re-asked.
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -24,6 +26,7 @@ use super::policy::{
 };
 use super::process::{
     PROCESS_DEFAULT_TIMEOUT, ProcessOutcome, ProcessStatus, SharedProcessSupervisor, SpawnRequest,
+    artifact_refs_for,
 };
 use crate::error::{Error, Result};
 use crate::model::{ContentBlock, TextContent};
@@ -59,6 +62,11 @@ impl ProcessToolContext {
         call_id: &str,
         arguments: &Value,
     ) -> std::result::Result<PolicyDecision, ToolOutput> {
+        // Read the approval *before* evaluating: `evaluate` upserts the record
+        // for this call id, which resets a recorded `Allowed` status back to
+        // `Pending`.
+        let approval = self.recorded_approval(call_id);
+
         let decision = self.policy.evaluate(&ToolRequest {
             call_id: call_id.to_string(),
             tool_name: tool_name.to_string(),
@@ -69,26 +77,53 @@ impl ProcessToolContext {
         match decision.action {
             PolicyAction::Allow => {
                 if let Some(audit) = &self.audit {
-                    audit.mark_allowed(call_id, Some("policy"));
+                    // Keep the original approver when one already admitted this
+                    // call; policy is only the fallback source.
+                    audit.mark_allowed(call_id, Some(approval.as_deref().unwrap_or("policy")));
                 }
                 Ok(decision)
             }
             PolicyAction::Deny => Err(self.close_denied(call_id, &decision.reason)),
-            // The agent loop resolves `Ask` before dispatch. Reaching a tool
-            // with an unresolved `Ask` means no approval surface answered, so
-            // the call fails closed instead of silently executing.
-            PolicyAction::Ask => Err(self.close_denied(
-                call_id,
-                &format!(
-                    "`{tool_name}` requires approval and no approval was recorded: {}",
-                    decision.reason
-                ),
-            )),
+            // `evaluate` only sees session mode, so it returns `Ask` again for
+            // a call an approval surface already admitted. Re-asking here would
+            // turn an approved call into a denial, so a recorded approval for
+            // this call id is honoured. Without one, no approval surface
+            // answered and the call fails closed instead of silently executing.
+            PolicyAction::Ask => match approval {
+                Some(source) => {
+                    if let Some(audit) = &self.audit {
+                        audit.mark_allowed(call_id, Some(source.as_str()));
+                    }
+                    Ok(decision)
+                }
+                None => Err(self.close_denied(
+                    call_id,
+                    &format!(
+                        "`{tool_name}` requires approval and no approval was recorded: {}",
+                        decision.reason
+                    ),
+                )),
+            },
             PolicyAction::Sandbox => Err(self.close_denied(
                 call_id,
                 "no sandbox execution adapter is configured; refusing to run unsandboxed",
             )),
         }
+    }
+
+    /// Who already admitted `call_id`, if an approval surface answered before
+    /// this adapter ran.
+    ///
+    /// The agent loop resolves `Ask` and records the approval with
+    /// [`AuditLog::mark_allowed`] before it dispatches the tool, so the audit
+    /// record is where a resolved approval is visible to a second evaluation.
+    fn recorded_approval(&self, call_id: &str) -> Option<String> {
+        let record = self.audit.as_ref()?.record_for(call_id)?;
+        (record.status == AuditStatus::Allowed).then(|| {
+            record
+                .approval_source
+                .unwrap_or_else(|| "approval".to_string())
+        })
     }
 
     fn close_denied(&self, call_id: &str, reason: &str) -> ToolOutput {
@@ -101,6 +136,35 @@ impl ProcessToolContext {
             );
         }
         error_output(reason)
+    }
+
+    /// Close a call that was rejected before [`Self::admit`] ever ran.
+    ///
+    /// Argument validation happens before policy evaluation, and
+    /// [`AuditLog::complete`] only *updates* an existing row: with no row for
+    /// `call_id` a malformed call would leave no trace at all. Policy
+    /// evaluation is the single place that opens rows, so one is opened here
+    /// before the call is closed as failed.
+    fn close_invalid_arguments(
+        &self,
+        tool_name: &str,
+        call_id: &str,
+        arguments: &Value,
+        error: &Error,
+    ) -> ToolOutput {
+        let missing = self
+            .audit
+            .as_ref()
+            .is_some_and(|audit| audit.record_for(call_id).is_none());
+        if missing {
+            let _ = self.policy.evaluate(&ToolRequest {
+                call_id: call_id.to_string(),
+                tool_name: tool_name.to_string(),
+                arguments: arguments.clone(),
+                origin: ToolRequestOrigin::Native,
+            });
+        }
+        self.close_failed(call_id, error)
     }
 
     fn close_failed(&self, call_id: &str, error: &Error) -> ToolOutput {
@@ -360,7 +424,14 @@ impl Tool for RunProcessTool {
         let arguments = input.clone();
         let (parsed, request) = match self.parse(input) {
             Ok(parsed) => parsed,
-            Err(err) => return Ok(self.context.close_failed(tool_call_id, &err)),
+            Err(err) => {
+                return Ok(self.context.close_invalid_arguments(
+                    self.name,
+                    tool_call_id,
+                    &arguments,
+                    &err,
+                ));
+            }
         };
 
         // Policy sees the resolved working directory so containment is checked
@@ -379,7 +450,12 @@ impl Tool for RunProcessTool {
             Ok(decision) => decision,
             Err(output) => return Ok(output),
         };
-        debug_assert_eq!(decision.action, PolicyAction::Allow);
+        // `Ask` survives `admit` only when an approval surface already admitted
+        // this call id; every other action is rejected there.
+        debug_assert!(matches!(
+            decision.action,
+            PolicyAction::Allow | PolicyAction::Ask
+        ));
 
         let outcome = if parsed.background {
             match self.context.supervisor.start_background(request) {
@@ -454,9 +530,12 @@ impl Tool for GetOutputTool {
         let parsed: GetOutputInput = match serde_json::from_value(input) {
             Ok(parsed) => parsed,
             Err(err) => {
-                return Ok(self
-                    .context
-                    .close_failed(tool_call_id, &Error::validation(err.to_string())));
+                return Ok(self.context.close_invalid_arguments(
+                    "get_output",
+                    tool_call_id,
+                    &arguments,
+                    &Error::validation(err.to_string()),
+                ));
             }
         };
         if let Err(output) = self.context.admit("get_output", tool_call_id, &arguments) {
@@ -484,10 +563,7 @@ impl Tool for GetOutputTool {
             );
         }
 
-        let artifact_refs = record
-            .artifact_path
-            .as_ref()
-            .map_or_else(Vec::new, |path| vec![format!("file://{}", path.display())]);
+        let artifact_refs = artifact_refs_for(record.artifact_path.as_deref());
         self.context.close_succeeded(tool_call_id, &artifact_refs);
 
         Ok(ToolOutput {
@@ -565,9 +641,12 @@ impl Tool for WriteToProcessTool {
         let parsed: WriteToProcessInput = match serde_json::from_value(input) {
             Ok(parsed) => parsed,
             Err(err) => {
-                return Ok(self
-                    .context
-                    .close_failed(tool_call_id, &Error::validation(err.to_string())));
+                return Ok(self.context.close_invalid_arguments(
+                    "write_to_process",
+                    tool_call_id,
+                    &arguments,
+                    &Error::validation(err.to_string()),
+                ));
             }
         };
         if let Err(output) = self
@@ -669,9 +748,12 @@ impl Tool for KillShellTool {
         let parsed: KillShellInput = match serde_json::from_value(input) {
             Ok(parsed) => parsed,
             Err(err) => {
-                return Ok(self
-                    .context
-                    .close_failed(tool_call_id, &Error::validation(err.to_string())));
+                return Ok(self.context.close_invalid_arguments(
+                    "kill_shell",
+                    tool_call_id,
+                    &arguments,
+                    &Error::validation(err.to_string()),
+                ));
             }
         };
         if let Err(output) = self.context.admit("kill_shell", tool_call_id, &arguments) {
@@ -750,11 +832,31 @@ pub fn process_tools(
 }
 
 /// Register the five pinned Devin process tools on an existing registry.
+///
+/// # Errors
+///
+/// Returns an error when any of the five names is already present.
+/// [`ToolRegistry::extend`] appends and [`ToolRegistry::get`] returns the first
+/// match, so registering twice — or over a tool another surface already owns —
+/// would leave a shadowed duplicate whose pinned schema no longer describes
+/// what actually executes.
 pub fn register_process_tools(
     registry: &mut ToolRegistry,
     supervisor: SharedProcessSupervisor,
     policy: Arc<ToolPolicyEngine>,
     audit: Option<Arc<AuditLog>>,
-) {
+) -> Result<()> {
+    if let Some(existing) = DEVIN_PROCESS_TOOL_NAMES
+        .into_iter()
+        .find(|name| registry.get(name).is_some())
+    {
+        return Err(Error::tool(
+            "register_process_tools",
+            format!(
+                "`{existing}` is already registered; refusing to shadow it with a second process tool"
+            ),
+        ));
+    }
     registry.extend(process_tools(supervisor, policy, audit));
+    Ok(())
 }

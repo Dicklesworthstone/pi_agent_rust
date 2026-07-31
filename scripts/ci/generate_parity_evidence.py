@@ -396,6 +396,7 @@ def build_evidence(suites: dict, project_root: Path) -> dict:
 def synthetic_parity_log(
     failed_suite: str | None = None,
     omit_suite: str | None = None,
+    *,
     colorized: bool = False,
 ) -> str:
     lines = []

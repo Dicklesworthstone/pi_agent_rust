@@ -24,10 +24,11 @@ source. It is historical evidence from four ATIF-v1.7 transcripts exported by
 Devin `3000.2.17`, not a parity claim against the `3000.3.22` binary that was
 installed when the transcripts were extracted.
 
-That manifest records only a 12-hex-character SHA-256 prefix per tool, which is
-not enough to detect schema drift: a digest has no recoverable preimage, so it
-can neither be compared field by field nor regenerated from the registered
-tools. `tests/fixtures/devin_cli/process_tool_parameter_schemas.json` therefore
+That manifest records only a 12-hex-character SHA-256 prefix per tool. Hashing
+the same canonical schema does detect most drift, but a prefix is not enough
+for exact validation: a digest has no recoverable preimage, so the schema can
+neither be reconstructed from it nor compared field by field.
+`tests/fixtures/devin_cli/process_tool_parameter_schemas.json` therefore
 pins the **full** JSON Schema for each of the five process tools, and
 `tests/devin_contract.rs` asserts the registered `ToolRegistry` entries match
 those schemas exactly.
@@ -82,12 +83,16 @@ and the shared temp-artifact cleanup in `crate::tools::cleanup_temp_files`.
   `kill_shell` (`get_output` stays available as a read-only tool).
 - Normal and Smart return `Ask`. A tool reached with an unresolved `Ask` fails
   closed rather than executing.
-- Bypass auto-allows only after path containment passed: `validate_paths` now
+- Bypass runs the path checks before it auto-allows: `validate_paths` now
   resolves the process working directory (`cwd`, `working_dir`, `workingDir`)
-  at write strength, so bypass skips the prompt without skipping path
-  containment. The reason string stays honest about how much that buys: a
-  spawned process can still touch anything its own OS permissions allow, so a
-  scope-checked `cwd` is not a sandbox, and network calls name no path at all.
+  at write strength, so bypass skips the prompt without skipping the path
+  argument check. **Bypass is not a contained mode.** A resolved `cwd` is a
+  check on one argument, not containment of the spawned process: the child
+  keeps every filesystem, process, and network capability the host OS grants
+  the agent, and network calls name no path at all. Enforced OS-level process
+  and network restrictions for Bypass are a blocking gap, tracked as gap 8
+  below; until they exist, Bypass must be treated as an explicitly
+  uncontained, operator-selected mode.
 - Autonomous process execution requires a genuinely active sandbox.
   `SandboxStatus::Active` alone is only a claim, so `DevinSessionState` now also
   records `sandbox_backend`; without a named backend the decision is `Deny`,
@@ -143,6 +148,12 @@ and the shared temp-artifact cleanup in `crate::tools::cleanup_temp_files`.
 6. Complete file mutation hashes/diffs and persistent audit/recovery sinks.
 7. Run the end-to-end repository, plan, edit, background process, subagent,
    and MCP smoke test in CI.
+8. **Blocking:** Bypass has no OS-level containment. Path checks constrain the
+   arguments a tool is called with; they do not restrict what a spawned process
+   may then read, write, execute, or reach over the network. Bypass cannot be
+   described as contained until a process/network sandbox backend enforces
+   those limits, which is the same adapter gap that keeps `PolicyAction::Sandbox`
+   failing closed in gap 3.
 
 ## CI reproduction
 

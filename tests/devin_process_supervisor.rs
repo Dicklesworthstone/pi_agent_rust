@@ -11,16 +11,18 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use pi::devin::{
-    AgentMode, AuditLog, AuditStatus, DevinSessionState, PermissionMode, ProcessStatus,
-    ProcessSupervisor, ScopeAccess, SharedProcessSupervisor, SpawnRequest, ToolPolicyEngine,
+    AgentMode, AuditLog, AuditStatus, DevinSessionState, PermissionMode, PolicyAction,
+    ProcessStatus, ProcessSupervisor, ScopeAccess, SharedProcessSupervisor, SpawnRequest,
+    ToolPolicyEngine, ToolRequest, ToolRequestOrigin,
 };
 use pi::model::ContentBlock;
-use pi::tools::{ToolOutput, ToolRegistry};
+use pi::tools::{Tool, ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
 
 struct Harness {
     supervisor: SharedProcessSupervisor,
     audit: Arc<AuditLog>,
+    policy: Arc<ToolPolicyEngine>,
     registry: ToolRegistry,
 }
 
@@ -47,12 +49,14 @@ impl Harness {
         pi::devin::register_process_tools(
             &mut registry,
             Arc::clone(&supervisor),
-            policy,
+            Arc::clone(&policy),
             Some(Arc::clone(&audit)),
-        );
+        )
+        .expect("process tools register on an empty registry");
         Self {
             supervisor,
             audit,
+            policy,
             registry,
         }
     }
@@ -132,6 +136,35 @@ fn all_five_pinned_process_tools_register_on_the_shared_registry() {
             "`{name}` must be registered on the shared tool registry"
         );
     }
+}
+
+#[test]
+fn registering_the_process_tools_twice_is_rejected_instead_of_shadowing() {
+    let workspace = tempfile::tempdir().unwrap();
+    let mut harness = Harness::new(workspace.path(), AgentMode::Normal, PermissionMode::Bypass);
+
+    // `ToolRegistry::get` returns the first match, so a second registration
+    // would leave shadowed duplicates whose pinned schema is never executed.
+    let error = pi::devin::register_process_tools(
+        &mut harness.registry,
+        Arc::clone(&harness.supervisor),
+        Arc::clone(&harness.policy),
+        Some(Arc::clone(&harness.audit)),
+    )
+    .expect_err("a duplicate registration must be rejected");
+    assert!(
+        error.to_string().contains("already registered"),
+        "message was: {error}"
+    );
+    assert_eq!(
+        harness
+            .registry
+            .tools()
+            .iter()
+            .filter(|tool| tool.name() == "exec")
+            .count(),
+        1
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +247,10 @@ fn background_process_returns_immediately_and_streams_incremental_output() {
             if collected.contains("chunk-3") {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            // Ambient timer, not `std::thread::sleep`: this loop runs inside a
+            // `run_test` future and must not block the executor thread the
+            // supervisor's own `cx.time().sleep` depends on.
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(100)).await;
         }
 
         assert!(
@@ -272,7 +308,7 @@ fn write_to_process_feeds_stdin_of_an_interactive_process() {
             if seen.contains("echoed:ping") {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(100));
+            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(100)).await;
         }
         assert!(seen.contains("echoed:ping"), "collected: {seen}");
     });
@@ -507,7 +543,27 @@ fn output_beyond_the_in_memory_budget_is_truncated_and_reported() {
             Some(true)
         );
         // Large output is referenced through an artifact, never inlined whole.
-        assert_ne!(process_field(&output, "artifactPath"), Value::Null);
+        let artifact = process_field(&output, "artifactPath");
+        assert_ne!(artifact, Value::Null);
+
+        // The artifact is the full record of what the process produced, so it
+        // must hold exactly the produced byte count: seeding it from the
+        // retained buffers and then also appending the triggering chunk would
+        // duplicate a segment at the spill boundary.
+        let artifact_path = artifact.as_str().expect("artifactPath must be a string");
+        let written = std::fs::metadata(artifact_path)
+            .expect("spill artifact must exist")
+            .len();
+        let produced = process_field(&output, "stdoutBytes")
+            .as_u64()
+            .expect("stdoutBytes must be reported")
+            + process_field(&output, "stderrBytes")
+                .as_u64()
+                .expect("stderrBytes must be reported");
+        assert_eq!(
+            written, produced,
+            "artifact must contain exactly the produced bytes, with nothing duplicated"
+        );
     });
 }
 
@@ -750,6 +806,51 @@ fn normal_mode_asks_before_running_a_process_and_fails_closed_without_an_approve
         );
         assert_eq!(harness.status("call-ask"), AuditStatus::Denied);
         assert!(harness.supervisor.records().is_empty());
+    });
+}
+
+#[test]
+fn an_approval_recorded_before_dispatch_survives_the_adapter_policy_recheck() {
+    asupersync::test_utils::run_test(|| async {
+        let workspace = tempfile::tempdir().unwrap();
+        let harness = Harness::new(workspace.path(), AgentMode::Normal, PermissionMode::Normal);
+
+        // Exactly what `Agent::execute_tool` does before it dispatches: policy
+        // returns `Ask`, an approval surface answers, and the approval is
+        // recorded on the call's audit record.
+        let decision = harness.policy.evaluate(&ToolRequest {
+            call_id: "call-approved".to_string(),
+            tool_name: "exec".to_string(),
+            arguments: json!({"command": "echo approved"}),
+            origin: ToolRequestOrigin::Native,
+        });
+        assert_eq!(decision.action, PolicyAction::Ask);
+        assert!(
+            harness
+                .audit
+                .mark_allowed("call-approved", Some("approval"))
+        );
+
+        // The adapter re-evaluates the same call. Re-asking here would convert
+        // an approved call into a denial, so the recorded approval must hold.
+        let output = harness
+            .call("exec", "call-approved", json!({"command": "echo approved"}))
+            .await;
+
+        assert!(!output.is_error, "{}", text(&output));
+        assert!(text(&output).contains("approved"));
+        assert_eq!(harness.status("call-approved"), AuditStatus::Succeeded);
+        assert_eq!(harness.records_for("call-approved"), 1);
+        assert_eq!(
+            harness
+                .audit
+                .record_for("call-approved")
+                .unwrap()
+                .approval_source
+                .as_deref(),
+            Some("approval"),
+            "the approver must stay recorded through the re-evaluation"
+        );
     });
 }
 
