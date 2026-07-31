@@ -145,6 +145,13 @@ impl DevinSessionState {
         });
     }
 
+    /// Whether a granted scope covers `path` for `access`.
+    ///
+    /// `path` must already be absolute and canonicalized. This is a raw prefix
+    /// comparison: it neither rejects `..` components nor resolves symlinks, so
+    /// an unresolved path such as `<scope_root>/../secret` would match a scope
+    /// it must never reach. `ToolPolicyEngine` resolves paths before any scope
+    /// check; other callers must do the same.
     #[must_use]
     pub fn scope_permits(&self, path: &Path, access: ScopeAccess) -> bool {
         self.scopes

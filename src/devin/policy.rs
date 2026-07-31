@@ -287,6 +287,20 @@ fn permission_decision(
     category: ToolCategory,
     name: &str,
 ) -> (PolicyAction, String) {
+    // Guards that must never be skipped come first: no mode and no category may
+    // short-circuit past scope expansion or a missing sandbox.
+    if name == "request_scope" {
+        return (
+            PolicyAction::Ask,
+            "expanding session scope requires explicit approval".to_string(),
+        );
+    }
+    if mode == PermissionMode::Autonomous && !sandbox_active {
+        return (
+            PolicyAction::Deny,
+            "autonomous mode requires an active OS sandbox".to_string(),
+        );
+    }
     if mode == PermissionMode::Bypass {
         // Reached only after `validate_paths` confirmed every path and process
         // working directory resolves inside the workspace or a granted scope,
@@ -297,12 +311,6 @@ fn permission_decision(
         return (
             PolicyAction::Ask,
             "unknown tools require explicit approval".to_string(),
-        );
-    }
-    if name == "request_scope" {
-        return (
-            PolicyAction::Ask,
-            "expanding session scope requires explicit approval".to_string(),
         );
     }
     if matches!(
@@ -333,10 +341,7 @@ fn permission_decision(
             "smart mode requires a risk-aware approval".to_string(),
         ),
         PermissionMode::Bypass => (PolicyAction::Allow, bypass_reason(category)),
-        PermissionMode::Autonomous if !sandbox_active => (
-            PolicyAction::Deny,
-            "autonomous mode requires an active OS sandbox".to_string(),
-        ),
+        // A missing sandbox is already denied by the guard above.
         PermissionMode::Autonomous if category == ToolCategory::FileMutation => (
             PolicyAction::Ask,
             "direct file tools execute outside the sandbox and require approval".to_string(),
@@ -616,6 +621,28 @@ mod tests {
                 .evaluate(&request("extension_custom_tool", json!({})))
                 .action,
             PolicyAction::Allow
+        );
+    }
+
+    #[test]
+    fn scope_expansion_and_missing_sandbox_are_not_short_circuited() {
+        let workspace = tempfile::tempdir().unwrap();
+        let bypass = engine(workspace.path(), AgentMode::Normal, PermissionMode::Bypass);
+        assert_eq!(
+            bypass
+                .evaluate(&request("request_scope", json!({"root": "/etc"})))
+                .action,
+            PolicyAction::Ask
+        );
+
+        let mut state = DevinSessionState::new("session", workspace.path());
+        state.permission_mode = PermissionMode::Autonomous;
+        let autonomous = ToolPolicyEngine::new(Arc::new(RwLock::new(state)));
+        assert_eq!(
+            autonomous
+                .evaluate(&request("extension_custom_tool", json!({})))
+                .action,
+            PolicyAction::Deny
         );
     }
 
