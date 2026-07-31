@@ -17,6 +17,7 @@ use crate::compaction::{self, ResolvedCompactionSettings};
 use crate::compaction_worker::{
     CompactionAdmissionSignals, CompactionQuota, CompactionWorkerState,
 };
+use crate::devin::{PolicyAction, ToolPolicyEngine, ToolRequest, ToolRequestOrigin};
 use crate::error::{Error, Result};
 use crate::extension_events::{
     BeforeAgentStartOutcome, InputEventOutcome, SessionBeforeCompactOutcome,
@@ -1120,6 +1121,9 @@ pub struct Agent {
     /// Agent configuration.
     config: AgentConfig,
 
+    /// Session-scoped Devin policy gate, shared across frontend surfaces.
+    tool_policy: Option<Arc<ToolPolicyEngine>>,
+
     /// Optional extension manager for tool/event hooks.
     extensions: Option<ExtensionManager>,
 
@@ -1146,6 +1150,7 @@ impl Agent {
             provider,
             tools,
             config,
+            tool_policy: None,
             extensions: None,
             messages: Vec::new(),
             steering_fetchers: Vec::new(),
@@ -1153,6 +1158,16 @@ impl Agent {
             message_queue: MessageQueue::new(QueueMode::OneAtATime, QueueMode::OneAtATime),
             cached_tool_defs: None,
         }
+    }
+
+    /// Install the central session policy gate used before any tool executes.
+    pub fn set_tool_policy(&mut self, policy: Arc<ToolPolicyEngine>) {
+        self.tool_policy = Some(policy);
+    }
+
+    /// Remove the session policy gate and restore legacy approval behavior.
+    pub fn clear_tool_policy(&mut self) {
+        self.tool_policy = None;
     }
 
     /// Get the current message history.
@@ -2959,9 +2974,28 @@ impl Agent {
     ) -> (ToolOutput, bool) {
         let extensions = self.extensions.clone();
 
-        let approval_denied_output = self
-            .request_tool_approval(&tool_call, Arc::clone(&on_event))
-            .await;
+        let approval_denied_output = if let Some(policy) = &self.tool_policy {
+            let decision = policy.evaluate(&ToolRequest {
+                call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                arguments: tool_call.arguments.clone(),
+                origin: ToolRequestOrigin::Native,
+            });
+            match decision.action {
+                PolicyAction::Allow => None,
+                PolicyAction::Ask => {
+                    self.request_tool_approval(&tool_call, Arc::clone(&on_event), true)
+                        .await
+                }
+                PolicyAction::Deny => Some(Self::tool_approval_denied_output(&decision.reason)),
+                PolicyAction::Sandbox => Some(Self::tool_approval_denied_output(
+                    "sandbox execution adapter is not configured; refusing unsandboxed execution",
+                )),
+            }
+        } else {
+            self.request_tool_approval(&tool_call, Arc::clone(&on_event), false)
+                .await
+        };
 
         let (mut output, is_error) = if let Some(output) = approval_denied_output {
             (output, true)
@@ -3007,9 +3041,14 @@ impl Agent {
         &self,
         tool_call: &ToolCall,
         on_event: AgentEventHandler,
+        required: bool,
     ) -> Option<ToolOutput> {
         let Some(approval) = &self.config.tool_approval else {
-            return None;
+            return required.then(|| {
+                Self::tool_approval_denied_output(
+                    "policy requires approval but no approval handler is available",
+                )
+            });
         };
 
         let request = ToolApprovalRequest {

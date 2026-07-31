@@ -91,6 +91,8 @@ pub mod connectors;
 #[doc(hidden)]
 pub mod crypto_shim;
 #[doc(hidden)]
+pub mod devin;
+#[doc(hidden)]
 pub mod doctor;
 #[doc(hidden)]
 pub mod error;

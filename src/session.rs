@@ -2851,6 +2851,39 @@ impl Session {
         id
     }
 
+    /// Persist the current Devin modes, sandbox state, and scopes on this
+    /// session branch.
+    pub fn append_devin_state(
+        &mut self,
+        state: &crate::devin::DevinSessionState,
+    ) -> Result<String> {
+        let data = serde_json::to_value(state)
+            .map_err(|err| Error::session(format!("Failed to serialize Devin state: {err}")))?;
+        Ok(self.append_custom_entry(
+            crate::devin::DEVIN_SESSION_STATE_CUSTOM_TYPE.to_string(),
+            Some(data),
+        ))
+    }
+
+    /// Load the latest Devin state from the current session branch.
+    pub fn latest_devin_state(&self) -> Result<Option<crate::devin::DevinSessionState>> {
+        for entry in self.entries_for_current_path().into_iter().rev() {
+            let SessionEntry::Custom(custom) = entry else {
+                continue;
+            };
+            if custom.custom_type != crate::devin::DEVIN_SESSION_STATE_CUSTOM_TYPE {
+                continue;
+            }
+            let Some(data) = custom.data.clone() else {
+                return Ok(None);
+            };
+            let state = serde_json::from_value(data)
+                .map_err(|err| Error::session(format!("Failed to parse Devin state: {err}")))?;
+            return Ok(Some(state));
+        }
+        Ok(None)
+    }
+
     pub fn append_bash_execution(
         &mut self,
         command: String,
