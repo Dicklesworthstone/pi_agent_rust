@@ -57,14 +57,21 @@ pub struct AuditRecord {
 #[derive(Debug)]
 pub struct AuditLog {
     capacity: usize,
+    salt: [u8; 32],
     records: Mutex<VecDeque<AuditRecord>>,
 }
 
 impl AuditLog {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let mut salt = [0_u8; 32];
+        salt[..16].copy_from_slice(first.as_bytes());
+        salt[16..].copy_from_slice(second.as_bytes());
         Self {
             capacity: capacity.max(1),
+            salt,
             records: Mutex::new(VecDeque::with_capacity(capacity.max(1))),
         }
     }
@@ -86,14 +93,19 @@ impl AuditLog {
             .cloned()
             .collect()
     }
+
+    #[must_use]
+    pub(crate) fn hash_arguments(&self, arguments: &Value) -> String {
+        argument_hash(arguments, &self.salt)
+    }
 }
 
 /// Hash canonical JSON so equivalent object key order produces the same audit
 /// identity while secret-bearing values never enter the record.
-#[must_use]
-pub fn argument_hash(arguments: &Value) -> String {
+fn argument_hash(arguments: &Value, salt: &[u8; 32]) -> String {
     let canonical = canonical_json(arguments);
     let mut hasher = Sha256::new();
+    hasher.update(salt);
     hasher.update(canonical.as_bytes());
     hasher
         .finalize()
@@ -171,9 +183,19 @@ mod tests {
 
     #[test]
     fn argument_hash_is_independent_of_object_key_order() {
+        let audit = AuditLog::new(8);
         assert_eq!(
-            argument_hash(&json!({"a": 1, "b": {"x": true, "y": false}})),
-            argument_hash(&json!({"b": {"y": false, "x": true}, "a": 1}))
+            audit.hash_arguments(&json!({"a": 1, "b": {"x": true, "y": false}})),
+            audit.hash_arguments(&json!({"b": {"y": false, "x": true}, "a": 1}))
+        );
+    }
+
+    #[test]
+    fn separate_audit_logs_use_distinct_hash_salts() {
+        let arguments = json!({"token": "low-entropy"});
+        assert_ne!(
+            AuditLog::new(8).hash_arguments(&arguments),
+            AuditLog::new(8).hash_arguments(&arguments)
         );
     }
 

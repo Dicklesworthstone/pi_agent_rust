@@ -27,10 +27,12 @@ pub enum PermissionMode {
     #[default]
     Normal,
     /// Auto-approve workspace edits while still prompting for processes.
+    #[serde(rename = "accept-edits", alias = "accept_edits")]
     AcceptEdits,
     /// Risk-sensitive approval mode.
     Smart,
     /// Auto-approve calls that remain inside enforced scopes.
+    #[serde(alias = "dangerous", alias = "yolo")]
     Bypass,
     /// Execute process and network calls only through an active OS sandbox.
     Autonomous,
@@ -150,5 +152,21 @@ mod tests {
         assert!(ScopeAccess::Write.permits(ScopeAccess::Read));
         assert!(ScopeAccess::Write.permits(ScopeAccess::Write));
         assert!(!ScopeAccess::Read.permits(ScopeAccess::Write));
+    }
+
+    #[test]
+    fn permission_modes_use_devin_cli_names_and_aliases() {
+        assert_eq!(
+            serde_json::to_string(&PermissionMode::AcceptEdits).unwrap(),
+            "\"accept-edits\""
+        );
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>("\"dangerous\"").unwrap(),
+            PermissionMode::Bypass
+        );
+        assert_eq!(
+            serde_json::from_str::<PermissionMode>("\"yolo\"").unwrap(),
+            PermissionMode::Bypass
+        );
     }
 }

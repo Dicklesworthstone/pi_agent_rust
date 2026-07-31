@@ -2,7 +2,30 @@
   "schema_version": 1,
   "source": "local_devin_cli_transcript_tool_definitions",
   "transcripts_compared": 4,
-  "canonicalization": "sorted_compact_json_sha256_prefix_12",
+  "transcript_format": "ATIF-v1.7",
+  "devin_version": "3000.2.17",
+  "installed_devin_version_at_extraction": "3000.3.22",
+  "hash_scope": "function.parameters",
+  "canonicalization": "python_json_dumps_sort_keys_compact_ascii_sha256_prefix_12",
+  "toolset_fingerprint": "444e21eed402",
+  "sources": [
+    {
+      "name": "wooded-guest.json",
+      "sha256": "42cef0e7da607eb19af1578cada3cae6aed8e83972b6ddeb0f12e45343649748"
+    },
+    {
+      "name": "unmarred-barbecue.json",
+      "sha256": "5919e087067ce352cfa8791c2dd081efb63b55c4eb6f3461c814290c0c8212da"
+    },
+    {
+      "name": "fork-class.json",
+      "sha256": "7903fecfa02b4a376c1474eaf011dbdcb3254d401253f1caac7fc1a81f79ad91"
+    },
+    {
+      "name": "steep-sidecar.json",
+      "sha256": "97e7b8cca32ac5fd711d4f58ec2da96ff190e9e75d5ebeca0b25cdb630223e7e"
+    }
+  ],
   "tools": {
     "apply_patch": "44136fa355b3",
     "ask_user_question": "543035bcee45",

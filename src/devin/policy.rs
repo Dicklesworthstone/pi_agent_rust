@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use super::audit::{AuditLog, AuditRecord, AuditStatus, ToolEffect, argument_hash};
+use super::audit::{AuditLog, AuditRecord, AuditStatus, ToolEffect};
 use super::state::{
     AgentMode, PermissionMode, SandboxStatus, ScopeAccess, SharedDevinSessionState,
 };
@@ -162,22 +162,23 @@ impl ToolPolicyEngine {
             return;
         };
         let now = Utc::now();
+        let denied = decision.action == PolicyAction::Deny;
         audit.push(AuditRecord {
             call_id: request.call_id.clone(),
             session_id: state.session_id.clone(),
             parent_agent: state.parent_agent.clone(),
             tool_name: request.tool_name.clone(),
-            argument_hash: argument_hash(&request.arguments),
+            argument_hash: audit.hash_arguments(&request.arguments),
             effects: effects_for(decision.category),
             risk: decision.risk,
             policy_action: decision.action,
             approval_source: None,
             started_at: now,
-            ended_at: Some(now),
-            status: match decision.action {
-                PolicyAction::Allow => AuditStatus::Allowed,
-                PolicyAction::Deny => AuditStatus::Denied,
-                PolicyAction::Ask | PolicyAction::Sandbox => AuditStatus::Pending,
+            ended_at: denied.then_some(now),
+            status: if denied {
+                AuditStatus::Denied
+            } else {
+                AuditStatus::Pending
             },
             artifact_refs: Vec::new(),
             redacted_error: None,
@@ -255,6 +256,12 @@ fn permission_decision(
     category: ToolCategory,
     name: &str,
 ) -> (PolicyAction, String) {
+    if mode == PermissionMode::Bypass {
+        return (
+            PolicyAction::Allow,
+            "bypass mode allows calls inside enforced scopes".to_string(),
+        );
+    }
     if category == ToolCategory::Unknown {
         return (
             PolicyAction::Ask,
@@ -536,6 +543,18 @@ mod tests {
                 .evaluate(&request("exec", json!({"command": "true"})))
                 .action,
             PolicyAction::Deny
+        );
+    }
+
+    #[test]
+    fn bypass_allows_unknown_extension_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = engine(workspace.path(), AgentMode::Normal, PermissionMode::Bypass);
+        assert_eq!(
+            policy
+                .evaluate(&request("extension_custom_tool", json!({})))
+                .action,
+            PolicyAction::Allow
         );
     }
 

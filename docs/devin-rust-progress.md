@@ -17,10 +17,11 @@ changed to CI-only Rust validation.
 No further Cargo, rustc, clippy, rustfmt, or release builds run on the local
 workstation. Rust verification is performed by GitHub Actions.
 
-## Proven parity
+## Implemented evidence
 
-- The live local Devin CLI exposes 28 function-calling tools in four available
-  transcript fixtures.
+- Four ATIF-v1.7 transcripts exported by Devin `3000.2.17` expose the same 28
+  function-calling tools. The installed binary at extraction time was
+  `3000.3.22`; no current-version transcript was available.
 - All four transcripts have identical JSON-schema hashes for every tool.
 - `AgentMode` and `PermissionMode` are independent, session-scoped values.
 - Devin mode, sandbox, workspace, and scope state round-trips through versioned
@@ -32,7 +33,7 @@ workstation. Rust verification is performed by GitHub Actions.
   allow, ask, deny, or sandbox.
 - Native agent tool execution can use the same central policy gate before
   approvals, extension hooks, and tool execution.
-- Audit records retain argument hashes instead of raw arguments.
+- Audit records retain per-log salted argument hashes instead of raw arguments.
 
 ## Remaining gaps
 
