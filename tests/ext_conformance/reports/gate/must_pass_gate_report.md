@@ -1,8 +1,8 @@
 # Must-Pass Extension CI Gate Report
 
-> Generated: 2026-05-15T17:03:02Z
-> Run ID: local-20260515T170218075Z
-> Correlation ID: must-pass-gate-local-20260515T170218075Z
+> Generated: 2026-08-03T16:31:07Z
+> Run ID: 30806608383
+> Correlation ID: weekly-30806608383
 > Mode: strict
 
 ## Gate Verdict
@@ -19,10 +19,10 @@
 | Metric | Value |
 |--------|-------|
 | Total | 123 |
-| Tested | 123 |
-| Passed | 123 |
+| Tested | 122 |
+| Passed | 122 |
 | Failed | 0 |
-| Skipped | 0 |
+| Skipped | 1 |
 | Pass rate | 100.0% |
 
 ## Stretch Set (Tier 3+) — Non-Blocking
@@ -34,3 +34,4 @@
 | Passed | 100 |
 | Failed | 1 |
 | Skipped | 0 |
+

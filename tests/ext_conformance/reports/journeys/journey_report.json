@@ -9,13 +9,13 @@
     {
       "category": "event_subscriber",
       "failed": 0,
-      "passed": 35,
-      "skipped": 0
+      "passed": 34,
+      "skipped": 1
     },
     {
       "category": "multi_capability",
-      "failed": 0,
-      "passed": 42,
+      "failed": 1,
+      "passed": 41,
       "skipped": 0
     },
     {
@@ -31,13 +31,22 @@
       "skipped": 0
     }
   ],
-  "failed": 0,
-  "failures": [],
-  "generated_at": "2026-05-13T02:59:58.302Z",
+  "failed": 1,
+  "failures": [
+    {
+      "category": "multi_capability",
+      "extension_id": "npm/pi-prompt-template-model",
+      "failure_reason": "Expected commands registration but none found",
+      "failure_step": "verify_all_registrations",
+      "reproduce": "cargo test --test ext_conformance_generated --features ext-conformance -- ext_npm_pi_prompt_template_model --nocapture --exact",
+      "tier": 2
+    }
+  ],
+  "generated_at": "2026-08-03T16:32:18.688Z",
   "must_pass_count": 123,
-  "pass_rate_pct": 100.0,
-  "passed": 123,
+  "pass_rate_pct": 99.18032786885246,
+  "passed": 121,
   "schema": "pi.ext.journey_report.v1",
-  "skipped": 0,
-  "tested": 123
+  "skipped": 1,
+  "tested": 122
 }

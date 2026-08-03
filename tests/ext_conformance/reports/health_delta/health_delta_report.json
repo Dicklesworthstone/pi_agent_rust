@@ -1,16 +1,16 @@
 {
   "schema": "pi.ext.health_delta.v1",
-  "generated_at": "2026-05-13T03:37:59.568Z",
-  "baseline_path": "/data/projects/pi_agent_rust/tests/ext_conformance/reports/conformance_baseline.json",
+  "generated_at": "2026-08-03T16:32:36.411Z",
+  "baseline_path": "/home/runner/work/pi_agent_rust/pi_agent_rust/tests/ext_conformance/reports/conformance_baseline.json",
   "baseline_date": "2026-02-07T23:31:53Z",
   "current_summary": {
     "excluded": 1,
     "failed": 0,
     "manifest_count": 224,
     "pass_rate_pct": 100.0,
-    "passed": 223,
-    "skipped": 1,
-    "tested": 223
+    "passed": 222,
+    "skipped": 2,
+    "tested": 222
   },
   "baseline_summary": {
     "failed": 14,
@@ -21,7 +21,7 @@
   "aggregate_delta": {
     "fail_delta": -14,
     "net_change": 13,
-    "pass_delta": 14,
+    "pass_delta": 13,
     "rate_delta_pct": 6.299999999999997
   },
   "regressions": [],
@@ -159,12 +159,6 @@
     {
       "id": "bookmark",
       "tier": 1,
-      "delta_type": "new_pass",
-      "current_status": "pass"
-    },
-    {
-      "id": "claude-rules",
-      "tier": 2,
       "delta_type": "new_pass",
       "current_status": "pass"
     },

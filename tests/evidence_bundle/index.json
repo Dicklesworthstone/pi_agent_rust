@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-05-12T19:26:21.441Z",
-  "git_ref": "80edf7ef9",
-  "ci_run_id": "local-20260512T192621Z",
+  "generated_at": "2026-08-03T16:33:11.395Z",
+  "git_ref": "5ff94dee",
+  "ci_run_id": "30806608383",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,7 +13,7 @@
       "schema": "pi.ext.conformance_summary.v2",
       "summary": {
         "fail": 0,
-        "generated_at": "2026-05-10T23:08:55Z",
+        "generated_at": "2026-05-12T19:26:24Z",
         "pass": 60,
         "pass_rate_pct": 100.0,
         "total": 224
@@ -42,10 +42,11 @@
       "id": "conformance_events",
       "label": "Conformance event log",
       "category": "conformance",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/conformance_events.jsonl",
-      "file_count": 1,
-      "total_bytes": 223532
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "conformance_report_md",
@@ -60,24 +61,21 @@
       "id": "regression_verdict",
       "label": "Regression gate verdict",
       "category": "conformance",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
-      "schema": "pi.conformance.regression_gate.v1",
-      "summary": {
-        "effective_pass_rate_pct": null,
-        "status": "pass"
-      },
-      "file_count": 1,
-      "total_bytes": 1658
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "conformance_trend",
       "label": "Conformance trend data",
       "category": "conformance",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/conformance_trend.jsonl",
-      "file_count": 1,
-      "total_bytes": 3075
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "must_pass_gate",
@@ -87,18 +85,18 @@
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
       "schema": "pi.ext.must_pass_gate.v1",
       "summary": {
-        "correlation_id": "local-20260501T0316",
-        "generated_at": "2026-05-01T03:20:54.460Z",
+        "correlation_id": "weekly-30806608383",
+        "generated_at": "2026-08-03T16:30:44.525Z",
         "must_pass_failed": 0,
         "must_pass_pass_rate_pct": 100.0,
-        "must_pass_passed": 123,
-        "must_pass_skipped": 0,
+        "must_pass_passed": 122,
+        "must_pass_skipped": 1,
         "must_pass_total": 123,
-        "run_id": "local-20260501T0316",
+        "run_id": "30806608383",
         "status": "pass"
       },
       "file_count": 1,
-      "total_bytes": 1206
+      "total_bytes": 1199
     },
     {
       "id": "must_pass_gate_events",
@@ -107,20 +105,17 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_events.jsonl",
       "file_count": 1,
-      "total_bytes": 56814
+      "total_bytes": 53754
     },
     {
       "id": "failure_dossiers",
       "label": "Per-extension failure dossiers",
       "category": "diagnostics",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/dossiers",
-      "summary": {
-        "file_count": 34,
-        "total_bytes": 140366
-      },
-      "file_count": 34,
-      "total_bytes": 140366
+      "diagnostics": "Directory not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "health_delta",
@@ -130,36 +125,30 @@
       "artifact_path": "tests/ext_conformance/reports/health_delta",
       "summary": {
         "file_count": 3,
-        "total_bytes": 88320
+        "total_bytes": 80204
       },
       "file_count": 3,
-      "total_bytes": 88320
+      "total_bytes": 80204
     },
     {
       "id": "provider_compat",
       "label": "Provider compatibility matrix",
       "category": "diagnostics",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/provider_compat",
-      "summary": {
-        "file_count": 753,
-        "total_bytes": 375207
-      },
-      "file_count": 753,
-      "total_bytes": 375207
+      "diagnostics": "Directory not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "sharded_reports",
       "label": "Sharded extension matrix reports",
       "category": "diagnostics",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/sharded",
-      "summary": {
-        "file_count": 12,
-        "total_bytes": 280518
-      },
-      "file_count": 12,
-      "total_bytes": 280518
+      "diagnostics": "Directory not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "journey_report",
@@ -169,17 +158,17 @@
       "artifact_path": "tests/ext_conformance/reports/journeys/journey_report.json",
       "schema": "pi.ext.journey_report.v1",
       "file_count": 1,
-      "total_bytes": 14742
+      "total_bytes": 1185
     },
     {
       "id": "auto_repair_summary",
       "label": "Auto-repair summary",
       "category": "diagnostics",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/auto_repair_summary.json",
-      "schema": "pi.ext.auto_repair_summary.v1",
-      "file_count": 1,
-      "total_bytes": 56700
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "e2e_results",
@@ -188,11 +177,11 @@
       "status": "present",
       "artifact_path": "tests/e2e_results",
       "summary": {
-        "file_count": 1176,
-        "total_bytes": 183247322
+        "file_count": 74,
+        "total_bytes": 256474
       },
-      "file_count": 1176,
-      "total_bytes": 183247322
+      "file_count": 74,
+      "total_bytes": 256474
     },
     {
       "id": "quarantine_report",
@@ -269,21 +258,21 @@
       "artifact_path": "tests/perf/reports/stress_triage.json",
       "schema": "pi.ext.stress_triage.v1",
       "summary": {
-        "generated_at": "2026-05-10T01:22:30Z",
+        "generated_at": "2026-08-03T16:33:10Z",
         "pass": true
       },
       "file_count": 1,
-      "total_bytes": 4829
+      "total_bytes": 4797
     },
     {
       "id": "load_time_benchmark",
       "label": "Extension load-time benchmark",
       "category": "performance",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/load_time_benchmark.json",
-      "schema": "pi.ext.load_time_benchmark.v1",
-      "file_count": 1,
-      "total_bytes": 17566
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "risk_review",
@@ -293,7 +282,7 @@
       "artifact_path": "tests/ext_conformance/artifacts/RISK_REVIEW.json",
       "schema": "pi.ext.risk_review.v1",
       "file_count": 1,
-      "total_bytes": 86687
+      "total_bytes": 86698
     },
     {
       "id": "provenance_verification",
@@ -312,7 +301,7 @@
       "status": "present",
       "artifact_path": "docs/traceability_matrix.json",
       "file_count": 1,
-      "total_bytes": 89373
+      "total_bytes": 94721
     },
     {
       "id": "high_value_suite_artifact_inventory",
@@ -328,55 +317,41 @@
       "id": "extension_inventory",
       "label": "Extension inventory",
       "category": "inventory",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/inventory.json",
-      "schema": "pi.ext.inventory.v1",
-      "summary": {
-        "total_extensions": null
-      },
-      "file_count": 1,
-      "total_bytes": 89349
+      "diagnostics": "File not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "inclusion_manifest",
       "label": "Extension inclusion manifest",
       "category": "inventory",
-      "status": "present",
+      "status": "missing",
       "artifact_path": "tests/ext_conformance/reports/inclusion_manifest",
-      "summary": {
-        "file_count": 4,
-        "total_bytes": 406062
-      },
-      "file_count": 4,
-      "total_bytes": 406062
+      "diagnostics": "Directory not found",
+      "file_count": 0,
+      "total_bytes": 0
     },
     {
       "id": "perf3x_lineage_contract",
       "label": "PERF-3X lineage coherence contract",
       "category": "performance",
-      "status": "present",
+      "status": "invalid",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
-      "summary": {
-        "artifact_span_minutes": 14148,
-        "conformance_generated_at": "2026-05-10T23:08:55+00:00",
-        "correlation_id": "local-20260501T0316",
-        "max_allowed_span_days": 14,
-        "must_pass_generated_at": "2026-05-01T03:20:54.460+00:00",
-        "run_id": "local-20260501T0316",
-        "stress_generated_at": "2026-05-10T01:22:30+00:00"
-      },
+      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id '30806608383' (oldest=2026-05-12 19:26:24 UTC, newest=2026-08-03 16:33:10 UTC)",
       "file_count": 0,
       "total_bytes": 0
     }
   ],
   "summary": {
     "total_sections": 29,
-    "present_sections": 29,
-    "missing_sections": 0,
-    "invalid_sections": 0,
-    "total_artifacts": 2004,
-    "total_bytes": 185415411,
-    "verdict": "complete"
+    "present_sections": 18,
+    "missing_sections": 10,
+    "invalid_sections": 1,
+    "total_artifacts": 93,
+    "total_bytes": 811117,
+    "verdict": "insufficient"
   }
 }

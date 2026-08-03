@@ -1,7 +1,7 @@
 {
   "schema": "pi.ci.full_suite_gate.v1",
-  "generated_at": "2026-05-14T19:59:36.564Z",
-  "verdict": "pass",
+  "generated_at": "2026-08-03T16:33:13.106Z",
+  "verdict": "fail",
   "policy": "Full-suite gate: all blocking gates must pass for release. Non-blocking gates produce warnings but do not block.",
   "gates": [
     {
@@ -34,18 +34,20 @@
       "id": "ext_provider_compat",
       "name": "Extension provider compatibility matrix",
       "bead": "bd-1f42.4.6",
-      "status": "pass",
+      "status": "skip",
       "blocking": false,
       "artifact_path": "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact"
     },
     {
       "id": "evidence_bundle",
       "name": "Unified evidence bundle",
       "bead": "bd-1f42.6.8",
-      "status": "pass",
+      "status": "fail",
       "blocking": false,
       "artifact_path": "tests/evidence_bundle/index.json",
+      "detail": "summary.verdict = 'insufficient' (expected one of: [\"complete\", \"partial\"])",
       "reproduce_command": "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"
     },
     {
@@ -61,9 +63,10 @@
       "id": "conformance_regression",
       "name": "Conformance regression gate",
       "bead": "bd-1f42.4",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
       "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/regression_verdict.json; fail-closed policy: blocking gates cannot remain in skip state",
       "reproduce_command": "cargo test --test conformance_regression_gate -- --nocapture"
     },
     {
@@ -187,12 +190,12 @@
   ],
   "summary": {
     "total_gates": 20,
-    "passed": 20,
-    "failed": 0,
+    "passed": 17,
+    "failed": 2,
     "warned": 0,
-    "skipped": 0,
-    "blocking_pass": 14,
+    "skipped": 1,
+    "blocking_pass": 13,
     "blocking_total": 14,
-    "all_blocking_pass": true
+    "all_blocking_pass": false
   }
 }

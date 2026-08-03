@@ -1,6 +1,6 @@
 {
   "schema": "pi.perf3x.practical_finish_checkpoint.v1",
-  "generated_at": "2026-05-14T19:59:37.050Z",
+  "generated_at": "2026-08-03T16:33:13.575Z",
   "status": "pass",
   "detail": "Practical-finish checkpoint reached: no open PERF-3X issues remain.",
   "technical_completion_reached": true,

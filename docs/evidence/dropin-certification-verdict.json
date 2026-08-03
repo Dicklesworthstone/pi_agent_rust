@@ -1,8 +1,8 @@
 {
   "schema": "pi.dropin.certification_verdict.v1",
-  "git_commit": "52e9fbfb24352045985b59df9d7ea63f1f8f2ef8",
-  "generated_at_utc": "2026-05-18T19:37:26Z",
-  "overall_verdict": "CERTIFIED",
+  "git_commit": "5ff94dee2f4cac9b9a39d80eadd7841005e40a79",
+  "generated_at_utc": "2026-08-03T16:33:13Z",
+  "overall_verdict": "NOT_CERTIFIED",
   "hard_gate_results": [
     {
       "gate_id": "non_mock_unit",
@@ -30,17 +30,17 @@
     },
     {
       "gate_id": "ext_provider_compat",
-      "status": "pass",
+      "status": "skip",
       "blocking": false,
-      "detail": null,
+      "detail": "Artifact not found: tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
       "artifact_path": "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
       "bead": "bd-1f42.4.6"
     },
     {
       "gate_id": "evidence_bundle",
-      "status": "pass",
+      "status": "fail",
       "blocking": false,
-      "detail": null,
+      "detail": "summary.verdict = 'insufficient' (expected one of: [\"complete\", \"partial\"])",
       "artifact_path": "tests/evidence_bundle/index.json",
       "bead": "bd-1f42.6.8"
     },
@@ -54,9 +54,9 @@
     },
     {
       "gate_id": "conformance_regression",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
-      "detail": null,
+      "detail": "Artifact not found: tests/ext_conformance/reports/regression_verdict.json; fail-closed policy: blocking gates cannot remain in skip state",
       "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
       "bead": "bd-1f42.4"
     },
@@ -163,25 +163,11 @@
       "detail": null,
       "artifact_path": "tests/full_suite_gate/waiver_audit.json",
       "bead": "bd-1f42.8.8.1"
-    },
-    {
-      "gate_id": "G04-cli-parity",
-      "status": "pass",
-      "blocking": true,
-      "detail": "gap-cli-slash-command-surface resolved: tests/dropin_slash_differential.rs now requires real mirrored Rust Pi/pi-mono RPC pass evidence for credential-free slash scenarios, with UI-only, process-exit, invalid parser, and model-dependent compaction scenarios explicitly excluded from pass evidence.",
-      "artifact_path": "docs/evidence/dropin-differential-evidence-suite.json",
-      "bead": "bd-7derw"
-    },
-    {
-      "gate_id": "G10-differential-evidence-suite",
-      "status": "pass",
-      "blocking": true,
-      "detail": "dropin-differential-evidence-suite passes with slash_command_differential backed by real mirrored RPC execution.",
-      "artifact_path": "docs/evidence/dropin-differential-evidence-suite.json",
-      "bead": "bd-7derw"
     }
   ],
-  "blocking_reasons": [],
+  "blocking_reasons": [
+    "conformance_regression:fail (Artifact not found: tests/ext_conformance/reports/regression_verdict.json; fail-closed policy: blocking gates cannot remain in skip state)"
+  ],
   "evidence_index": [
     {
       "path": "docs/non-mock-rubric.json",
@@ -197,7 +183,7 @@
     },
     {
       "path": "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
-      "exists": true
+      "exists": false
     },
     {
       "path": "tests/evidence_bundle/index.json",
@@ -209,7 +195,7 @@
     },
     {
       "path": "tests/ext_conformance/reports/regression_verdict.json",
-      "exists": true
+      "exists": false
     },
     {
       "path": "tests/ext_conformance/reports/conformance_summary.json",
@@ -262,20 +248,11 @@
     {
       "path": "tests/full_suite_gate/waiver_audit.json",
       "exists": true
-    },
-    {
-      "path": "docs/evidence/dropin-differential-evidence-suite.json",
-      "exists": true
-    },
-    {
-      "path": "docs/evidence/dropin-parity-gap-ledger.json",
-      "exists": true
     }
   ],
   "source": {
     "certification_lane_artifact": "tests/full_suite_gate/certification_verdict.json",
-    "lane_verdict": "pass",
-    "lane_generated_at": "2026-05-01T06:00:46.624Z",
-    "claim_integrity_override": "bd-jgnx0 reopened gap-cli-slash-command-surface after detecting that slash_command_differential pass evidence was backed by fail-closed placeholder evidence; bd-7derw restored real mirrored RPC execution and closed the gap."
+    "lane_verdict": "fail",
+    "lane_generated_at": "2026-08-03T16:33:13.594Z"
   }
 }

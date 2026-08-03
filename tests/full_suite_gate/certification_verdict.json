@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.certification_lane.v1",
   "lane": "full",
-  "generated_at": "2026-05-14T19:59:37.227Z",
-  "verdict": "pass",
+  "generated_at": "2026-08-03T16:33:13.594Z",
+  "verdict": "fail",
   "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
   "gates": [
     {
@@ -35,18 +35,20 @@
       "id": "ext_provider_compat",
       "name": "Extension provider compatibility matrix",
       "bead": "bd-1f42.4.6",
-      "status": "pass",
+      "status": "skip",
       "blocking": false,
       "artifact_path": "tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/provider_compat/provider_compat_report.json",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_provider_compat_matrix --nocapture --exact"
     },
     {
       "id": "evidence_bundle",
       "name": "Unified evidence bundle",
       "bead": "bd-1f42.6.8",
-      "status": "pass",
+      "status": "fail",
       "blocking": false,
       "artifact_path": "tests/evidence_bundle/index.json",
+      "detail": "summary.verdict = 'insufficient' (expected one of: [\"complete\", \"partial\"])",
       "reproduce_command": "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"
     },
     {
@@ -62,9 +64,10 @@
       "id": "conformance_regression",
       "name": "Conformance regression gate",
       "bead": "bd-1f42.4",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
       "artifact_path": "tests/ext_conformance/reports/regression_verdict.json",
+      "detail": "Artifact not found: tests/ext_conformance/reports/regression_verdict.json; fail-closed policy: blocking gates cannot remain in skip state",
       "reproduce_command": "cargo test --test conformance_regression_gate -- --nocapture"
     },
     {
@@ -188,7 +191,7 @@
   ],
   "waiver_audit": {
     "schema": "pi.ci.waiver_audit.v1",
-    "generated_at": "2026-05-14T19:59:37.226Z",
+    "generated_at": "2026-08-03T16:33:13.593Z",
     "total_waivers": 0,
     "active": 0,
     "expired": 0,
@@ -200,21 +203,23 @@
   "waivers_applied": [],
   "summary": {
     "total_gates": 20,
-    "passed": 20,
-    "failed": 0,
+    "passed": 17,
+    "failed": 2,
     "warned": 0,
-    "skipped": 0,
+    "skipped": 1,
     "waived": 0,
-    "blocking_pass": 14,
+    "blocking_pass": 13,
     "blocking_total": 14,
-    "all_blocking_pass": true
+    "all_blocking_pass": false
   },
   "promotion_rules": {
-    "can_promote": true,
-    "blocker_gates": [],
+    "can_promote": false,
+    "blocker_gates": [
+      "conformance_regression"
+    ],
     "waiver_gates": [],
     "conditions": [
-      "All blocking gates pass (including waivers)"
+      "Blocking gates still failing: conformance_regression"
     ]
   },
   "rerun_guidance": {
