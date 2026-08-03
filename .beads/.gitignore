@@ -2,6 +2,7 @@
 *.db
 *.db-shm
 *.db-wal
+*.db-fsqlite-ns-*
 
 # Lock files
 *.lock
