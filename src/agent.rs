@@ -1993,6 +1993,10 @@ impl Agent {
         // uniformly for every provider.
         let mut tool_call_raw_args: std::collections::HashMap<usize, String> =
             std::collections::HashMap::new();
+        // #148: whether this streaming response ever began assembling a tool
+        // call. Needed to tell "cut off mid tool call" apart from "cut off in
+        // the middle of plain prose", which is an ordinary `Length` stop.
+        let mut tool_call_started = false;
 
         'stream: loop {
             if checkpoint_cx.checkpoint().is_err() {
@@ -2431,6 +2435,7 @@ impl Agent {
                     id,
                     name,
                 } => {
+                    tool_call_started = true;
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -2480,6 +2485,7 @@ impl Agent {
                     delta,
                     ..
                 } => {
+                    tool_call_started = true;
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -2545,6 +2551,7 @@ impl Agent {
                     tool_call,
                     ..
                 } => {
+                    tool_call_started = true;
                     self.seed_partial_message_if_missing(&mut added_partial);
                     if let Some(Message::Assistant(msg_arc)) = self
                         .messages
@@ -2587,7 +2594,18 @@ impl Agent {
                         });
                     }
                 }
-                StreamEvent::Done { message, .. } => {
+                StreamEvent::Done { mut message, .. } => {
+                    // #148: a turn cut short by the provider's token limit while a
+                    // tool call was still being assembled must not finalize as an
+                    // ordinary stop. The half-built call is unusable, so the run
+                    // loop would see no executable tool call and quietly end the
+                    // turn. Re-stamping it as `Error` routes it through the
+                    // existing error handling, which surfaces `error_message` to
+                    // the caller via `AgentEnd`.
+                    if is_truncated_before_tool_call(&message, tool_call_started) {
+                        message.stop_reason = StopReason::Error;
+                        message.error_message = Some(TRUNCATED_TOOL_CALL_ERROR.to_string());
+                    }
                     return Ok(self.finalize_assistant_message(message, &on_event, added_partial));
                 }
                 StreamEvent::Error { error, .. } => {
@@ -2607,8 +2625,19 @@ impl Agent {
                 .find(|m| matches!(m, Message::Assistant(_)))
             {
                 let mut final_msg = (**last_msg).clone();
+                // #148: same truncation check as the `Done` arm. A provider can
+                // stamp `Length` on a partial (via `Start`/deltas) and then drop
+                // the connection without a terminal event; the resulting error
+                // should name the truncated tool call rather than the generic
+                // missing-`Done` condition.
+                let truncated_tool_call =
+                    is_truncated_before_tool_call(&final_msg, tool_call_started);
                 final_msg.stop_reason = StopReason::Error;
-                final_msg.error_message = Some("Stream ended without Done event".to_string());
+                final_msg.error_message = Some(if truncated_tool_call {
+                    TRUNCATED_TOOL_CALL_ERROR.to_string()
+                } else {
+                    "Stream ended without Done event".to_string()
+                });
                 return Ok(self.finalize_assistant_message(final_msg, &on_event, true));
             }
         }
@@ -10416,6 +10445,54 @@ fn filter_image_blocks(blocks: &mut Vec<ContentBlock>) -> usize {
     removed
 }
 
+/// Error text stamped on an assistant message whose stream was cut off by the
+/// provider's token limit while a tool call was still being assembled (#148).
+const TRUNCATED_TOOL_CALL_ERROR: &str = "Model output truncated before tool call completed (provider stop reason: length); \
+     the incomplete tool call was not executed";
+
+/// Whether a tool call survived streaming intact enough to execute.
+///
+/// Two ways a truncated call fails this: an empty `name` (the placeholder
+/// `stream_assistant_response` seeds when deltas arrive before the call is
+/// identified), or `arguments` left as JSON null. Providers set null exactly
+/// when the accumulated argument fragment does not parse — see
+/// `openai::finalize_tool_call_arguments` and
+/// `anthropic::handle_content_block_stop`, which both log a parse warning and
+/// fall back to `Value::Null`. A complete no-argument call carries `{}`, not
+/// null, so this does not misjudge argument-less tools.
+fn is_complete_tool_call(tool_call: &ToolCall) -> bool {
+    !tool_call.name.trim().is_empty() && !tool_call.arguments.is_null()
+}
+
+/// Whether `message` represents a response the provider truncated at its token
+/// limit before any tool call finished (#148).
+///
+/// `tool_call_started` says a `ToolCall{Start,Delta,End}` event arrived on this
+/// stream; without it, a `Length` stop in the middle of plain prose (no tool
+/// call involved) would be misreported as a failure. It also covers the case
+/// where truncation drops the half-built call from the final message entirely,
+/// leaving nothing in `content` to inspect.
+///
+/// Returns `false` when at least one usable tool call survived — that turn still
+/// has work the run loop can execute, so it keeps its provider stop reason.
+fn is_truncated_before_tool_call(message: &AssistantMessage, tool_call_started: bool) -> bool {
+    if message.stop_reason != StopReason::Length {
+        return false;
+    }
+
+    let mut saw_incomplete = false;
+    for block in &message.content {
+        if let ContentBlock::ToolCall(tool_call) = block {
+            if is_complete_tool_call(tool_call) {
+                return false;
+            }
+            saw_incomplete = true;
+        }
+    }
+
+    tool_call_started || saw_incomplete
+}
+
 /// Extract tool calls from content blocks.
 fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
     content
@@ -10769,6 +10846,242 @@ mod tests {
             assert_eq!(
                 assistant_texts.as_slice(),
                 ["prev".to_string(), "hello".to_string()]
+            );
+        });
+    }
+
+    /// #148: first turn is cut off by the token cap while a tool call is still
+    /// streaming, exactly as OpenAI (`finish_reason: "length"`) and Anthropic
+    /// (`stop_reason: "max_tokens"`) report it — the tool call keeps its name
+    /// but its argument fragment fails to parse, so the provider stores
+    /// `arguments: null`. A second turn is scripted so the pre-fix behaviour
+    /// (continue as if nothing went wrong) is observable rather than hanging.
+    #[derive(Debug)]
+    struct TruncatedToolCallProvider {
+        stream_calls: StdArc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl TruncatedToolCallProvider {
+        fn new() -> Self {
+            Self {
+                stream_calls: StdArc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }
+        }
+
+        /// Shared handle to the stream-call counter, taken before the provider
+        /// is moved into the agent.
+        fn calls(&self) -> StdArc<std::sync::atomic::AtomicUsize> {
+            StdArc::clone(&self.stream_calls)
+        }
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for TruncatedToolCallProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let call_index = self.stream_calls.fetch_add(1, Ordering::SeqCst);
+            if call_index > 0 {
+                let events = vec![Ok(StreamEvent::Done {
+                    reason: StopReason::Stop,
+                    message: assistant_message("recovered"),
+                })];
+                return Ok(Box::pin(futures::stream::iter(events)));
+            }
+
+            let mut truncated = assistant_message("Let me read that file");
+            truncated.stop_reason = StopReason::Length;
+            truncated.content.push(ContentBlock::ToolCall(ToolCall {
+                id: "call-1".to_string(),
+                name: "read_file".to_string(),
+                // `{"path": "/etc/ho` does not parse; both providers fall back
+                // to null after logging a parse warning.
+                arguments: Value::Null,
+                thought_signature: None,
+            }));
+
+            let events = vec![
+                Ok(StreamEvent::Start {
+                    partial: assistant_message(""),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "Let me read that file".to_string(),
+                }),
+                Ok(StreamEvent::ToolCallStart {
+                    content_index: 1,
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                }),
+                Ok(StreamEvent::ToolCallDelta {
+                    content_index: 1,
+                    delta: "{\"path\": \"/etc/ho".to_string(),
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Length,
+                    message: truncated,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    /// #148 negative case: the same token cap, but the model was writing prose.
+    /// No tool call was ever started, so this is an ordinary `Length` stop and
+    /// must not be rewritten into an error.
+    #[derive(Debug)]
+    struct TruncatedTextProvider;
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for TruncatedTextProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            _context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            let mut truncated = assistant_message("The answer is fourty-tw");
+            truncated.stop_reason = StopReason::Length;
+
+            let events = vec![
+                Ok(StreamEvent::Start {
+                    partial: assistant_message(""),
+                }),
+                Ok(StreamEvent::TextDelta {
+                    content_index: 0,
+                    delta: "The answer is fourty-tw".to_string(),
+                }),
+                Ok(StreamEvent::Done {
+                    reason: StopReason::Length,
+                    message: truncated,
+                }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[test]
+    fn truncated_tool_call_finalizes_as_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = TruncatedToolCallProvider::new();
+            let stream_calls = provider.calls();
+            let tools = ToolRegistry::from_tools(Vec::new());
+            let mut agent = Agent::new(Arc::new(provider), tools, AgentConfig::default());
+
+            let result = agent
+                .run_with_message_with_abort(user_message("read /etc/hosts"), None, |_| {})
+                .await
+                .expect("run");
+
+            assert_eq!(
+                result.stop_reason,
+                StopReason::Error,
+                "truncated tool call must not finalize as a normal turn"
+            );
+            let error_message = result
+                .error_message
+                .as_deref()
+                .expect("truncated turn carries an error message");
+            assert!(
+                error_message.contains("truncated before tool call completed"),
+                "unexpected error message: {error_message}"
+            );
+
+            // The turn must stop here: continuing would either execute a tool
+            // call whose arguments were cut off, or silently drop it.
+            assert_eq!(
+                stream_calls.load(Ordering::SeqCst),
+                1,
+                "agent kept running past the truncated tool call"
+            );
+
+            // The partial text is retained so the caller can show what arrived.
+            let last = agent
+                .messages()
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::Assistant(assistant) => Some(Arc::clone(assistant)),
+                    _ => None,
+                })
+                .expect("assistant message in history");
+            assert_eq!(last.stop_reason, StopReason::Error);
+            assert!(
+                last.content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text(text)
+                        if text.text == "Let me read that file")),
+                "partial text was dropped: {:?}",
+                last.content
+            );
+        });
+    }
+
+    #[test]
+    fn truncated_text_without_tool_call_stays_a_length_stop() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async {
+            let provider = Arc::new(TruncatedTextProvider);
+            let tools = ToolRegistry::from_tools(Vec::new());
+            let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+            let result = agent
+                .run_with_message_with_abort(user_message("what is the answer"), None, |_| {})
+                .await
+                .expect("run");
+
+            assert_eq!(
+                result.stop_reason,
+                StopReason::Length,
+                "a plain length stop must not be rewritten into an error"
+            );
+            assert_eq!(result.error_message, None);
+            assert!(
+                result
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Text(text)
+                        if text.text == "The answer is fourty-tw")),
+                "partial text was dropped: {:?}",
+                result.content
             );
         });
     }
