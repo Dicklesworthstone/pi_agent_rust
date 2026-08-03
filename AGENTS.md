@@ -191,7 +191,7 @@ cargo test conformance
 ```
 CLI (clap) → main/app/config/resources → Agent Session
                          ↓
-Provider Layer (10 native provider implementation modules + extension providers)
+Provider Layer (11 native provider implementation modules + extension providers)
                          ↓
 Tool Registry (built-ins + extension tools) ↔ Extension Runtime (QuickJS + capability policy)
                          ↓
@@ -277,7 +277,7 @@ This port uses two key libraries from sibling projects:
 **Current Status:**
 - asupersync powers runtime + HTTP/TLS + cancellation + optional SQLite integration
 - rich_rust/charmed_rust stack powers the interactive terminal UI
-- Provider layer has 10 native provider implementation modules in `src/providers/`: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, and GitLab Duo
+- Provider layer has 11 native provider implementation modules in `src/providers/`: Anthropic, OpenAI Chat, OpenAI Responses/Codex Responses, Gemini, Cohere, Azure OpenAI, Bedrock, Vertex AI, GitHub Copilot, GitLab Duo, and Cursor
 - Extension runtime, capability policy, and conformance harness are integrated
 
 ### Performance Targets
