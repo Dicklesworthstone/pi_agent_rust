@@ -8,7 +8,10 @@
 use pi::extension_preflight::{
     FindingCategory, FindingSeverity, PreflightAnalyzer, PreflightReport, PreflightVerdict,
 };
-use pi::extensions::{CompatibilityScanner, ExtensionPolicy};
+use pi::extensions::{
+    CompatCapabilityEvidence, CompatEvidence, CompatIssueEvidence, CompatLedger,
+    CompatRewriteEvidence, CompatibilityScanner, ExtensionPolicy,
+};
 use std::fs;
 
 fn analyze_source(source: &str) -> PreflightReport {
@@ -25,6 +28,30 @@ fn analyze_path_source(source: &str) -> PreflightReport {
     let policy = ExtensionPolicy::default();
     let analyzer = PreflightAnalyzer::new(&policy, Some("test-ext"));
     analyzer.analyze(&entry)
+}
+
+#[test]
+fn compatibility_contracts_keep_their_public_type_identity() {
+    assert_eq!(
+        std::any::type_name::<CompatEvidence>(),
+        "pi::extensions::CompatEvidence"
+    );
+    assert_eq!(
+        std::any::type_name::<CompatCapabilityEvidence>(),
+        "pi::extensions::CompatCapabilityEvidence"
+    );
+    assert_eq!(
+        std::any::type_name::<CompatRewriteEvidence>(),
+        "pi::extensions::CompatRewriteEvidence"
+    );
+    assert_eq!(
+        std::any::type_name::<CompatIssueEvidence>(),
+        "pi::extensions::CompatIssueEvidence"
+    );
+    assert_eq!(
+        std::any::type_name::<CompatLedger>(),
+        "pi::extensions::CompatLedger"
+    );
 }
 
 #[test]

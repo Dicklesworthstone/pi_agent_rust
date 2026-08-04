@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-08-04T03:32:13.863Z",
-  "git_ref": "d0df6e21",
-  "ci_run_id": "local-20260804T033213Z",
+  "generated_at": "2026-08-04T03:44:37.546Z",
+  "git_ref": "9eaead83",
+  "ci_run_id": "local-20260804T034437Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,7 +13,7 @@
       "schema": "pi.ext.conformance_summary.v2",
       "summary": {
         "fail": 0,
-        "generated_at": "2026-08-04T03:31:34Z",
+        "generated_at": "2026-08-04T03:37:29Z",
         "pass": 60,
         "pass_rate_pct": 100.0,
         "total": 224
@@ -357,7 +357,7 @@
       "status": "invalid",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
-      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 03:31:34 UTC)",
+      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 03:37:29 UTC)",
       "file_count": 0,
       "total_bytes": 0
     }

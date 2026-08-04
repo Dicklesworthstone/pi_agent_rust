@@ -1,8 +1,8 @@
 # Unified CI Evidence Bundle
 
-> Generated: 2026-08-04T03:32:13Z
-> Git ref: d0df6e21
-> CI run: local-20260804T033213Z
+> Generated: 2026-08-04T03:44:37Z
+> Git ref: 9eaead83
+> CI run: local-20260804T034437Z
 > Verdict: **INSUFFICIENT**
 
 ## Summary
@@ -88,6 +88,6 @@
 
 ## Missing / Invalid Sections
 
-- **PERF-3X lineage coherence contract** (invalid): PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 03:31:34 UTC)
+- **PERF-3X lineage coherence contract** (invalid): PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 03:37:29 UTC)
   Path: `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json`
 
