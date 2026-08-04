@@ -38,7 +38,7 @@
               {"role": "user", "content": [{"type": "text", "text": "Hello from stdin pipe content."}]}
             ],
             "system": "Echo test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
-            "max_tokens": 8192,
+            "max_tokens": 64000,
             "stream": true
           }
         },

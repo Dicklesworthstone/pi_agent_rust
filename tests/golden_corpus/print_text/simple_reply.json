@@ -40,7 +40,7 @@
               {"role": "user", "content": [{"type": "text", "text": "Reply with the single word: pong."}]}
             ],
             "system": "You are a test harness model.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
-            "max_tokens": 8192,
+            "max_tokens": 64000,
             "stream": true
           }
         },

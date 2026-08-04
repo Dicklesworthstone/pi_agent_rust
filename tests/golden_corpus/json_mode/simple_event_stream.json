@@ -41,7 +41,7 @@
               {"role": "user", "content": [{"type": "text", "text": "Reply with JSON mode pong."}]}
             ],
             "system": "JSON mode event stream test.\nCurrent date and time: <TIMESTAMP>\nCurrent working directory: <CWD>",
-            "max_tokens": 8192,
+            "max_tokens": 64000,
             "stream": true
           }
         },
