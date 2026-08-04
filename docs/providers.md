@@ -10,9 +10,9 @@ Snapshot basis:
 - `src/provider_metadata.rs` (`PROVIDER_METADATA`, aliases, onboarding modes)
 - `src/providers/*.rs` native implementations
 - Original snapshot timestamp: 2026-02-10
-- Last source cross-check: 2026-05-10 (`bd-8t27h.7`)
+- Last source cross-check: 2026-08-03
 
-Provider-count rule: Pi has 10 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`: `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, and `gitlab`. User-visible canonical IDs, aliases, OpenAI-compatible presets, VCR coverage families, and extension-provided providers are separate counts.
+Provider-count rule: Pi has 11 native provider implementation modules. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, and `cursor`. User-visible canonical IDs, aliases, OpenAI-compatible presets, VCR coverage families, and extension-provided providers are separate counts. The factory module `mod.rs` and shared live-catalog helper `model_fetch.rs` are support modules, not provider implementations, and are excluded.
 
 This rule is guarded by `tests/traceability_staleness.rs::native_provider_module_inventory_matches_provider_docs`, which compares this list against the live `src/providers/*.rs` inventory.
 
@@ -28,6 +28,7 @@ This rule is guarded by `tests/traceability_staleness.rs::native_provider_module
 | `vertex` | `google-vertex`, `vertexai` | Vertex AI Gemini/Anthropic publisher path. |
 | `copilot` | `github-copilot`, `copilot` | GitHub Copilot chat/completions path. |
 | `gitlab` | `gitlab`, `gitlab-duo` | GitLab Duo chat path. |
+| `cursor` | `cursor` | Cursor Connect RPC path. |
 
 Extension-provided providers route through the extension provider bridge in `src/providers/mod.rs`; they are intentionally excluded from the native module count because they are discovered at runtime.
 

@@ -1,23 +1,23 @@
 ## Test Coverage Matrix (Current Source Inventory)
 
-> Last regenerated: 2026-05-10
+> Last regenerated: 2026-08-03
 > Owner bead: `bd-8t27h.1`
 
 This document is the current source-file coverage inventory for `src/**/*.rs`. It is not a drop-in certification artifact and does not override `docs/evidence/dropin-certification-verdict.json`.
 
 ### Regeneration Evidence
 
-- `rg --files src -g '*.rs' | sort` -> 111 current source files.
-- `rg --files tests -g '*.rs' | wc -l` -> 304 Rust test files under `tests/`.
+- `rg --files src -g '*.rs' | sort` -> 121 current source files.
+- `rg --files tests -g '*.rs' | wc -l` -> 327 Rust test files under `tests/`.
 - `rg -n '#\\[cfg\\(test\\)|mod tests' src -g '*.rs'` -> in-source unit-test inventory used for the `Unit` status below.
-- `python3 scripts/check_traceability_matrix.py` passes with 100.00% classified trace coverage and 100.00% E2E scenario coverage after the `e2e_swarm_flight_recorder` and `rch_artifact_sync_preflight` inventory refresh. Broader semantic traceability expansion remains tracked by `bd-8t27h.3`.
-- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory now reflects the 111-file current tree.
+- `python3 scripts/check_traceability_matrix.py` passes with 302/302 classified tests traced (100.00%) and 39/39 classified E2E suites covered (100.00%).
+- `docs/coverage-baseline-map.json` is historical coverage evidence from 2026-02-14 and covers 107 source files; this markdown inventory reflects the 121-file current tree.
 - Drift guard: `cargo test --test traceability_staleness source_coverage_matrix_matches_current_src_inventory`.
 
 ### Current Drift Check
 
-- Current `src/` inventory: 111 files.
-- Source-file rows below: 111.
+- Current `src/` inventory: 121 files.
+- Source-file rows below: 121.
 - Source files omitted from this document: 0.
 - Split modules, provider expansion modules, hostcall scheduling/queue modules, PiWasm, session v2/SQLite, resources, resource governor, and scheduler/admission surfaces are represented explicitly and linked through the `resource_scheduler_admission` artifact-inventory lane.
 - Machine-readable traceability remains governed by `docs/traceability_matrix.json`, `tests/suite_classification.toml`, `docs/e2e_scenario_matrix.json`, and `scripts/check_traceability_matrix.py`.
@@ -68,7 +68,9 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/extension_tools.rs` | Extension tools | Unit; `tests/e2e_extension_registration.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/extension_validation.rs` | Extension validation | Unit; `tests/extension_validation.rs`, `tests/extension_lockfile_provenance.rs`, `tests/ext_provenance_verification.rs`. |
 | `src/extensions.rs` | Extension protocol/runtime | Unit; `tests/extensions_*.rs`, `tests/ext_conformance*.rs`, `tests/e2e_extension_registration.rs`. |
+| `src/extensions/compatibility.rs` | Extension compatibility contracts and scanner | Unit; compatibility scanner tests in this module plus `tests/ext_entry_scan.rs` and extension conformance suites. |
 | `src/extensions_js.rs` | QuickJS bridge | Unit; `tests/event_loop_conformance.rs`, `tests/js_runtime_ordering.rs`, `tests/node_*_shim.rs`, `tests/e2e_ts_extension_loading.rs`. |
+| `src/file_lock.rs` | Cross-process directory locking | Unit; session-index lock integration coverage in `tests/session_index_tests.rs` and RPC concurrency coverage in `tests/e2e_rpc.rs`. |
 | `src/flake_classifier.rs` | Flake classifier | Unit; patterns are mirrored by `scripts/ci_conformance_retry.sh`. |
 | `src/hostcall_amac.rs` | Hostcall AMAC | Unit; `tests/streaming_hostcall.rs`. |
 | `src/hostcall_io_uring_lane.rs` | Hostcall io_uring lane | Unit; `tests/streaming_hostcall.rs`. |
@@ -105,6 +107,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/main.rs` | CLI entry | Unit; `tests/e2e_cli.rs`, `tests/e2e_rpc.rs`, `tests/main_cli_selection.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/migrations.rs` | Migrations | Unit; SQLite/session migration coverage through `tests/session_sqlite.rs`. |
 | `src/model.rs` | Message/content model | Unit; `tests/model_serialization.rs`. |
+| `src/model_routing.rs` | Model-routing policy and evidence | Unit; model-routing tests in this module plus `tests/model_selector_cycling.rs`. |
 | `src/model_selector.rs` | Model selector | Unit; `tests/model_selector_cycling.rs`. |
 | `src/models.rs` | Model registry | Unit; `tests/model_registry.rs`. |
 | `src/package_manager.rs` | Package manager | Unit; `tests/package_manager.rs`, `tests/e2e_cli.rs`. |
@@ -119,8 +122,10 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/providers/bedrock.rs` | Bedrock provider | Unit; provider native/contract suites. |
 | `src/providers/cohere.rs` | Cohere provider | Unit; `tests/provider_streaming/cohere.rs`, provider error/path suites. |
 | `src/providers/copilot.rs` | Copilot provider | Unit; provider native/contract suites. |
+| `src/providers/cursor.rs` | Cursor Connect provider | Unit; `tests/provider_smoke_matrix.rs`, `tests/provider_native_contract.rs`, and provider factory suites. |
 | `src/providers/gemini.rs` | Gemini provider | Unit; `tests/provider_streaming/gemini.rs`, provider error/path suites. |
 | `src/providers/gitlab.rs` | GitLab Duo provider | Unit; provider native/contract suites. |
+| `src/providers/model_fetch.rs` | Live provider-model discovery and cache | Unit tests in this module; static-registry integration through `tests/model_registry.rs`. |
 | `src/providers/mod.rs` | Provider factory | Unit; `tests/provider_factory.rs`, `tests/provider_native_verify.rs`; branch export baseline marks this family partly branch-SIGSEGV fallback. |
 | `src/providers/openai.rs` | OpenAI chat provider | Unit; `tests/provider_streaming/openai.rs`, provider error/path suites. |
 | `src/providers/openai_responses.rs` | OpenAI Responses provider | Unit; `tests/provider_streaming/openai_responses.rs`, provider error/path suites. |
@@ -130,6 +135,7 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/rpc.rs` | RPC/stdin mode | Unit; `tests/rpc_mode.rs`, `tests/rpc_protocol.rs`, `tests/rpc_edge_cases.rs`, `tests/e2e_rpc.rs`. |
 | `src/scheduler.rs` | Scheduler/admission | Unit; `tests/scheduler_repro.rs`, `tests/cargo_headroom_admission.rs`; traceability lane `resource_scheduler_admission`. |
 | `src/sdk.rs` | SDK API | Unit; `tests/sdk_api.rs`, `tests/sdk_integration.rs`, `tests/sdk_unit.rs`. |
+| `src/semantic_workspace_graph.rs` | Semantic workspace graph and context bundles | Unit; `tests/semantic_workspace_graph_contract.rs`, `tests/semantic_workspace_graph_builder.rs`, and agent integration tests. |
 | `src/session.rs` | Session JSONL/tree | Unit; `tests/session_conformance.rs`, `tests/e2e_session_persistence.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/session_index.rs` | Session index | Unit; `tests/session_index_tests.rs`, `tests/reproduce_index_gap.rs`. |
 | `src/session_metrics.rs` | Session metrics | Unit; `tests/provider_session_coverage.rs` and session evidence suites. |
@@ -138,12 +144,16 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 | `src/session_store_v2.rs` | Session store v2 | Unit; `tests/session_store_v2.rs`, `tests/session_store_v2_contract.rs`. |
 | `src/session_test.rs` | Session test helpers | Waived test-support module; compiled by session tests. |
 | `src/sse.rs` | SSE parser | Unit; `tests/sse_strict_compliance.rs`, `tests/repro_sse_flush.rs`, `tests/repro_sse_newline.rs`. |
+| `src/subagents.rs` | Native isolated child-agent tool | Unit tests in this module; opt-in registration coverage through built-in tool tests. |
 | `src/swarm_activity_ledger.rs` | Swarm activity ledger | Unit; evidence docs in `docs/swarm-activity-ledger.md`, CI evidence bundle tests. |
 | `src/swarm_flight_recorder.rs` | Swarm flight recorder | Unit and E2E; `tests/e2e_swarm_flight_recorder.rs` covers deterministic multi-agent replay artifacts. |
+| `src/swarm_progress_slo.rs` | Swarm progress SLO evaluation | Unit; `tests/swarm_progress_slo_contract.rs`, `tests/swarm_progress_cli.rs`, and `tests/swarm_progress_slo_e2e.rs`. |
+| `src/swarm_replay.rs` | Swarm trace replay and policy comparison | Unit; `tests/swarm_replay_trace_contract.rs`, `tests/swarm_replay_ingestor.rs`, and `tests/swarm_replay_preview_cli.rs`. |
 | `src/terminal_images.rs` | Terminal images | Unit; interactive/TUI rendering tests. |
 | `src/theme.rs` | Theme loading | Unit; `tests/tui_snapshot.rs`, interactive UI tests. |
 | `src/tools.rs` | Built-in tools | Unit; `tests/tools_conformance.rs`, `tests/e2e_tools.rs`, `tests/tools_hardened.rs`; branch export baseline marks this as branch-SIGSEGV fallback. |
 | `src/tui.rs` | Terminal renderer | Unit; `tests/tui_snapshot.rs`, `tests/tui_state.rs`, `tests/e2e_tui.rs`. |
+| `src/validation_broker.rs` | Validation admission and slot broker | Unit; `tests/validation_broker_contract.rs`, `tests/validation_broker_store.rs`, `tests/validation_broker_cli.rs`, and `tests/validation_broker_e2e.rs`. |
 | `src/vcr.rs` | VCR playback/record | Unit; `tests/vcr_parity_validation.rs`, `tests/vcr_redaction_scan.rs`, provider/RPC VCR suites. |
 | `src/version_check.rs` | Version checks | Unit; cross-platform and release-readiness tests exercise the surrounding behavior. |
 
@@ -151,14 +161,14 @@ This document is the current source-file coverage inventory for `src/**/*.rs`. I
 
 ## 2) Test Suite Inventory Pointer
 
-The full Rust test inventory is too large for this markdown table to remain the source of truth. Current counts on 2026-05-10:
+The full Rust test inventory is too large for this markdown table to remain the source of truth. Current counts on 2026-08-03:
 
 | Inventory | Count | Source of truth |
 |---|---:|---|
-| Source files | 111 | `rg --files src -g '*.rs' | sort` |
-| Rust test files | 304 | `rg --files tests -g '*.rs' | sort` |
-| Classified top-level test files | 280 | `tests/suite_classification.toml` |
-| Traceability-matrix referenced classified tests | 280 | `docs/traceability_matrix.json` via `scripts/check_traceability_matrix.py` |
+| Source files | 121 | `rg --files src -g '*.rs' | sort` |
+| Rust test files | 327 | `rg --files tests -g '*.rs' | sort` |
+| Classified top-level test files | 302 | `tests/suite_classification.toml` |
+| Traceability-matrix referenced classified tests | 302 | `docs/traceability_matrix.json` via `scripts/check_traceability_matrix.py` |
 | Classified-but-untraced tests | 0 | `scripts/check_traceability_matrix.py` |
 
 Representative high-signal suites:
@@ -199,15 +209,15 @@ Structured evidence locations are governed outside this markdown file:
 - `tests/ext_conformance/reports/*`
 - `tests/perf/reports/*`
 
-The active JSONL inventory gap is `bd-8t27h.9`.
+JSONL artifact-inventory expansion was completed under `bd-8t27h.9`; the current high-value inventory is enforced by `tests/traceability_staleness.rs` and `scripts/check_traceability_matrix.py`.
 
 ---
 
-## 5) Active Follow-up Work From This Refresh
+## 5) Completed Follow-up Work From the 2026-05 Refresh
 
 | Bead | Scope |
 |---|---|
-| `bd-8t27h.2` | Add deterministic source coverage drift guard so this 110-file inventory cannot silently become stale. |
+| `bd-8t27h.2` | Added the deterministic source coverage drift guard that detected this refresh. |
 | `bd-8t27h.3` | Repair traceability matrix, suite classification, evidence logs, and E2E scenario coverage. |
 | `bd-8t27h.5` | Replace macOS ignored extension OAuth MockHttpServer tests. |
 | `bd-8t27h.6` | Make hostcall queue loom tests runnable behind explicit opt-in cfg/profile. |
@@ -257,11 +267,11 @@ Current historical baseline evidence lives in `docs/coverage-baseline-map.json`:
 |---|---:|
 | Generated at | 2026-02-14T14:00:00Z |
 | Source files in baseline | 107 |
-| Current source files | 110 |
+| Source files at baseline comparison refresh | 110 |
 | Line coverage | 79.08% |
 | Branch coverage | 51.95% lower bound |
 | Function coverage | 78.01% |
 | Branch-measurable files | 63 |
 | Branch export SIGSEGV fallback files | 44 |
 
-That baseline is useful evidence, but it is not a current-head full source inventory. This document now supplies the current 110-file inventory; `bd-8t27h.2` owns turning that inventory into an enforced drift guard.
+That baseline is useful historical evidence, but it is not a current-head full source inventory. This document supplies the current 121-file inventory, enforced by the drift guard completed under `bd-8t27h.2`.

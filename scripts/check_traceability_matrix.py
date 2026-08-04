@@ -202,6 +202,36 @@ def _git_tracked_test_stems(tests_dir: Path) -> set[str] | None:
     return stems
 
 
+def _literal_gitignored_test_stems() -> set[str]:
+    """Return top-level test stems named by literal `.gitignore` entries.
+
+    RCH worker overlays intentionally omit `.git` metadata and can retain a
+    previously transferred ignored repro. In that fallback environment the
+    literal ignore rules preserve the same inventory boundary as
+    `git ls-files`, without trying to reimplement wildcard matching.
+    """
+
+    ignore_path = REPO_ROOT / ".gitignore"
+    try:
+        lines = ignore_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return set()
+
+    stems: set[str] = set()
+    for raw in lines:
+        line = raw.strip()
+        if (
+            not line
+            or line.startswith(("#", "!"))
+            or any(char in line for char in "*?[")
+        ):
+            continue
+        stem = extract_test_stem(line)
+        if stem is not None and "/" not in stem:
+            stems.add(stem)
+    return stems
+
+
 def check_stale_mappings(
     matrix: dict[str, Any],
     errors: list[str],
@@ -240,8 +270,10 @@ def check_stale_mappings(
     tracked_stems = _git_tracked_test_stems(tests_dir)
     if tracked_stems is None:
         # Not a git checkout (or git unavailable): fall back to filesystem scan.
+        ignored_stems = _literal_gitignored_test_stems()
         for f in sorted(tests_dir.glob("*.rs")):
-            on_disk_stems.add(f.stem)
+            if f.stem not in ignored_stems:
+                on_disk_stems.add(f.stem)
     else:
         on_disk_stems = tracked_stems
 

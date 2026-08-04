@@ -916,7 +916,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-Provider-count rule: Pi has 11 native provider implementation modules, counted as the Rust files under `src/providers/` excluding `mod.rs`. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, and `cursor`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes.
+Provider-count rule: Pi has 11 native provider implementation modules. Those modules are `anthropic`, `openai`, `openai_responses`, `gemini`, `cohere`, `azure`, `bedrock`, `vertex`, `copilot`, `gitlab`, and `cursor`. User-visible provider IDs, aliases, OpenAI-compatible presets, and extension-provided `streamSimple` providers are counted separately because several native modules expose multiple routes. The factory module `mod.rs` and shared live-catalog helper `model_fetch.rs` are support modules, not provider implementations, and are excluded.
 
 ### Key Design Decisions
 

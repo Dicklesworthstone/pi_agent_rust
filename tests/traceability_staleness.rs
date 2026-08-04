@@ -11,11 +11,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const HIGH_VALUE_ARTIFACT_INVENTORY: &str =
     "docs/evidence/high-value-suite-artifact-inventory.json";
 const UBS_EXTENSION_RUNTIME_NOISE_BASELINE: &str =
     "docs/evidence/ubs-extension-runtime-noise-baseline.json";
+const PROVIDER_SUPPORT_MODULES: &[&str] = &["model_fetch"];
 const REQUIRED_ARTIFACT_INVENTORY_AREAS: &[&str] = &[
     "provider_streaming",
     "sessions",
@@ -119,16 +121,71 @@ fn load_json_value(root: &Path, relative_path: &str) -> serde_json::Value {
         .unwrap_or_else(|e| panic!("invalid JSON in {}: {e}", path.display())) // ubs:ignore test harness assertion, not production runtime.
 }
 
-/// Discover all `tests/*.rs` file stems on disk.
+fn git_tracked_test_stems(root: &Path) -> Option<BTreeSet<String>> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--", "tests/*.rs"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    Some(
+        stdout
+            .lines()
+            .filter_map(|line| {
+                let stem = line.strip_prefix("tests/")?.strip_suffix(".rs")?;
+                (!stem.contains('/')).then(|| stem.to_string())
+            })
+            .collect(),
+    )
+}
+
+fn literal_gitignored_test_stems(root: &Path) -> BTreeSet<String> {
+    let Ok(content) = std::fs::read_to_string(root.join(".gitignore")) else {
+        return BTreeSet::new();
+    };
+
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.starts_with('#')
+                && !line.starts_with('!')
+                && !line.contains('*')
+                && !line.contains('?')
+                && !line.contains('[')
+                && line.starts_with("tests/")
+                && Path::new(line)
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
+        })
+        .filter_map(|line| {
+            let stem = line.strip_prefix("tests/")?.strip_suffix(".rs")?;
+            (!stem.contains('/')).then(|| stem.to_string())
+        })
+        .collect()
+}
+
+/// Discover tracked `tests/*.rs` stems, falling back to disk without Git metadata.
 fn on_disk_test_stems(root: &Path) -> BTreeSet<String> {
+    if let Some(stems) = git_tracked_test_stems(root) {
+        return stems;
+    }
+
     let tests_dir = root.join("tests");
+    let ignored = literal_gitignored_test_stems(root);
     let mut stems = BTreeSet::new();
     if let Ok(entries) = std::fs::read_dir(&tests_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.extension().is_some_and(|e| e == "rs") {
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    stems.insert(stem.to_string());
+                    if !ignored.contains(stem) {
+                        stems.insert(stem.to_string());
+                    }
                 }
             }
         }
@@ -227,7 +284,7 @@ fn on_disk_native_provider_modules(root: &Path) -> BTreeSet<String> {
             .file_stem()
             .and_then(|value| value.to_str())
             .unwrap_or_else(|| panic!("provider file has invalid UTF-8 path: {}", path.display())); // ubs:ignore test harness assertion, not production runtime.
-        if stem != "mod" {
+        if stem != "mod" && !PROVIDER_SUPPORT_MODULES.contains(&stem) {
             modules.insert(stem.to_string());
         }
     }
@@ -238,18 +295,17 @@ fn load_provider_doc_native_modules(root: &Path) -> BTreeSet<String> {
     let path = root.join("docs/providers.md");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display())); // ubs:ignore test harness assertion, not production runtime.
-    let marker = "excluding `mod.rs`:";
-    let list_line = content
+    let marker = "Those modules are ";
+    let module_text = content
         .split(marker)
         .nth(1)
-        .and_then(|rest| rest.lines().next())
+        .and_then(|rest| rest.split(". User-visible").next())
         .unwrap_or_else(|| panic!("docs/providers.md missing provider-count rule marker")); // ubs:ignore test harness assertion, not production runtime.
 
-    list_line
+    module_text
         .split('`')
         .skip(1)
         .step_by(2)
-        .filter(|module| !module.contains('/') && *module != "mod.rs")
         .map(str::to_string)
         .collect()
 }
@@ -346,11 +402,11 @@ fn native_provider_module_inventory_matches_provider_docs() {
 
     assert_eq!(
         documented, on_disk,
-        "docs/providers.md provider-count rule must match src/providers/*.rs excluding mod.rs"
+        "docs/providers.md provider-count rule must match direct provider implementations"
     );
     assert_eq!(
         on_disk.len(),
-        10,
+        11,
         "native provider module count changed; update docs/providers.md and this expectation"
     );
 }
@@ -364,7 +420,7 @@ fn native_provider_module_inventory_matches_readme_claims() {
     assert_readme_native_provider_count_claims(&root, on_disk.len());
     assert_eq!(
         documented, on_disk,
-        "README.md provider-count rule must match src/providers/*.rs excluding mod.rs"
+        "README.md provider-count rule must match direct provider implementations"
     );
 }
 
