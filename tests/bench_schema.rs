@@ -437,9 +437,25 @@ fn install_fake_orchestrate_staging_artifacts(target_dir: &Path) {
         target_dir.join("criterion/ext_load_init/load_init_cold/hello/new/estimates.json"),
         target_dir.join("criterion/ext_policy/evaluate/hello/new/estimates.json"),
         target_dir.join("criterion/ext_protocol/parse_and_validate/hello/new/estimates.json"),
+        target_dir
+            .join("criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json"),
+        target_dir
+            .join("criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json"),
+        target_dir.join(
+            "criterion/semantic_context/incremental_update/large_workspace/new/estimates.json",
+        ),
+        target_dir.join("criterion/semantic_context/planning/large_workspace/new/estimates.json"),
+        target_dir.join(
+            "criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json",
+        ),
     ] {
         write_json(&path, criterion_estimate);
     }
+
+    write_json(
+        &target_dir.join("perf/context_intelligence/perf_budget.json"),
+        r#"{"schema":"pi.semantic_context.performance_budget.v1"}"#,
+    );
 
     let release_pi = target_dir.join("release/pi");
     fs::create_dir_all(release_pi.parent().expect("release path has parent"))

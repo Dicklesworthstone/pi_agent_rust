@@ -7609,7 +7609,8 @@ mod turn_event_tests {
         let contexts = provider_for_assertions
             .contexts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         assert_eq!(contexts.len(), 2);
         assert!(matches!(contexts[0].as_slice(), [Message::User(_)]));
         assert!(matches!(
@@ -7646,7 +7647,8 @@ mod turn_event_tests {
         let contexts = provider_for_assertions
             .contexts
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         assert!(matches!(
             contexts[1].as_slice(),
             [Message::User(_), Message::Assistant(message)]

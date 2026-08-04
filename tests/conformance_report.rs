@@ -1257,10 +1257,6 @@ fn exception_policy_covers_full_conformance_failures() {
         .get("entries")
         .and_then(Value::as_array)
         .expect("exception_policy.entries must be an array");
-    assert!(
-        !entries.is_empty(),
-        "exception_policy.entries should not be empty"
-    );
 
     let today = Utc::now().date_naive();
     let mut approved_ids = HashSet::new();
@@ -1309,16 +1305,27 @@ fn exception_policy_covers_full_conformance_failures() {
         .and_then(Value::as_array)
         .expect("conformance_report.failures must be an array");
 
-    let missing = failures
+    let failure_ids = failures
         .iter()
         .filter_map(|failure| failure.get("id").and_then(Value::as_str))
-        .filter(|id| !approved_ids.contains(*id))
         .map(ToOwned::to_owned)
+        .collect::<HashSet<String>>();
+    let missing = failure_ids
+        .difference(&approved_ids)
+        .cloned()
+        .collect::<Vec<String>>();
+    let stale = approved_ids
+        .difference(&failure_ids)
+        .cloned()
         .collect::<Vec<String>>();
 
     assert!(
         missing.is_empty(),
         "all current full conformance failures must be covered by exception policy entries; missing={missing:?}"
+    );
+    assert!(
+        stale.is_empty(),
+        "exception policy must not retain entries for resolved conformance failures; stale={stale:?}"
     );
 }
 

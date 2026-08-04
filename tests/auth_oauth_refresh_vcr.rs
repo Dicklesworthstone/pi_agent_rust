@@ -30,7 +30,10 @@ fn redact_auth_json(value: &mut Value) -> usize {
         Value::Object(map) => {
             let mut redacted = 0usize;
             for (key, child) in map.iter_mut() {
-                if matches!(key.as_str(), "access_token" | "refresh_token" | "key") {
+                if matches!(
+                    key.as_str(),
+                    "access" | "refresh" | "access_token" | "refresh_token" | "key"
+                ) {
                     if !child.is_null() {
                         *child = Value::String("[REDACTED]".to_string());
                         redacted = redacted.saturating_add(1);
@@ -182,8 +185,8 @@ async fn run_refresh_scenario(
 
     let after_json = read_json(&auth_path);
     let entry = oauth_entry(&after_json, "anthropic");
-    let after_access = oauth_field(entry, "access_token");
-    let after_refresh = oauth_field(entry, "refresh_token");
+    let after_access = oauth_field(entry, "access");
+    let after_refresh = oauth_field(entry, "refresh");
     let after_expires = entry
         .get("expires")
         .and_then(Value::as_i64)
@@ -520,8 +523,8 @@ fn auth_oauth_refresh_race_condition_vcr() {
 
         let after_json = read_json(&auth_path);
         let entry = oauth_entry(&after_json, "anthropic");
-        let after_access = oauth_field(entry, "access_token");
-        let after_refresh = oauth_field(entry, "refresh_token");
+        let after_access = oauth_field(entry, "access");
+        let after_refresh = oauth_field(entry, "refresh");
         let after_expires = entry
             .get("expires")
             .and_then(Value::as_i64)

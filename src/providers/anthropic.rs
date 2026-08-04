@@ -1045,11 +1045,10 @@ where
         if let Some(stop_reason) = delta.stop_reason.as_deref() {
             self.partial.stop_reason = match stop_reason {
                 "end_turn" | "stop_sequence" => StopReason::Stop,
-                "max_tokens" => StopReason::Length,
                 // Our normalized model has one truncation outcome; Anthropic's
                 // context-window stop is therefore intentionally represented as
                 // `Length`, alongside ordinary output-token exhaustion.
-                "model_context_window_exceeded" => StopReason::Length,
+                "max_tokens" | "model_context_window_exceeded" => StopReason::Length,
                 "tool_use" => StopReason::ToolUse,
                 "pause_turn" => StopReason::PauseTurn,
                 "refusal" => StopReason::Refusal,
@@ -1060,7 +1059,7 @@ where
                     ));
                 }
             };
-            self.partial.stop_details = delta.stop_details.clone();
+            self.partial.stop_details.clone_from(&delta.stop_details);
         }
 
         if let Some(u) = usage {

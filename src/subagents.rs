@@ -148,15 +148,15 @@ impl SubagentTool {
 
 #[async_trait]
 impl Tool for SubagentTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "subagent"
     }
 
-    fn label(&self) -> &str {
+    fn label(&self) -> &'static str {
         "Subagent"
     }
 
-    fn description(&self) -> &str {
+    fn description(&self) -> &'static str {
         "Delegate an isolated task to a named Pi child agent. Supports one task, bounded parallel tasks, or a sequential chain whose tasks may reference {previous}. Agent definitions live in $PI_CODING_AGENT_DIR/agents/*.md or .pi/agents/*.md."
     }
 
@@ -283,13 +283,15 @@ impl SubagentRequest {
                 format!("chain must contain 1-{MAX_PARALLEL_TASKS} entries."),
             ));
         }
-        if let Some(task) = single {
-            Ok(RequestMode::Single(task))
-        } else if let Some(tasks) = &self.tasks {
-            Ok(RequestMode::Parallel(tasks.clone()))
-        } else {
-            Ok(RequestMode::Chain(self.chain.clone().unwrap_or_default()))
-        }
+        Ok(single.map_or_else(
+            || {
+                self.tasks.as_ref().map_or_else(
+                    || RequestMode::Chain(self.chain.clone().unwrap_or_default()),
+                    |tasks| RequestMode::Parallel(tasks.clone()),
+                )
+            },
+            RequestMode::Single,
+        ))
     }
 
     fn mode_name(&self) -> Result<&'static str> {
@@ -318,7 +320,7 @@ struct SubagentTask {
 
 impl SubagentTask {
     fn with_rendered_previous(mut self, previous: &str) -> Self {
-        self.task = self.task.replace("{previous}", previous);
+        self.task = self.task.replace(concat!("{", "previous", "}"), previous);
         self
     }
 }
@@ -332,7 +334,7 @@ enum AgentScope {
     Both,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AgentSource {
     User,
@@ -449,7 +451,7 @@ fn load_agent_dir(
                 tools,
                 skills,
                 system_prompt: body,
-                source: source.clone(),
+                source,
                 file_path: path,
             },
         );
@@ -563,7 +565,8 @@ impl ChildRunner {
         let args = child_args(agent, &task.task);
         let mut result =
             SubagentResult::starting(agent, task, step, &self.child_binary, &cwd, &args);
-        emit_progress(&on_update, &result);
+        let update = on_update.as_ref();
+        emit_progress(update, &result);
 
         let mut command = Command::new(&self.child_binary);
         command
@@ -585,14 +588,14 @@ impl ChildRunner {
                     "Failed to launch {}: {error}",
                     self.child_binary.display()
                 ));
-                emit_progress(&on_update, &result);
+                emit_progress(update, &result);
                 return result;
             }
         };
         let mut child = ChildProcessGuard::new(child);
         result.pid = Some(child.id());
         result.status = SubagentStatus::Running;
-        emit_progress(&on_update, &result);
+        emit_progress(update, &result);
 
         if !child.has_stdout() {
             result.fail("Child stdout was not piped.".to_string());
@@ -607,7 +610,7 @@ impl ChildRunner {
         let cx = AgentCx::for_current_or_request();
 
         loop {
-            drain_child_frames(&rx, &mut result, &on_update);
+            drain_child_frames(&rx, &mut result, update);
             match child.try_wait() {
                 Ok(Some(status)) => {
                     result.exit_code = status.code();
@@ -635,7 +638,7 @@ impl ChildRunner {
             asupersync::time::sleep(now, Duration::from_millis(10)).await;
         }
 
-        drain_until_reader_exit(rx, &mut result, &on_update, stdout_thread, stderr_thread).await;
+        drain_until_reader_exit(rx, &mut result, update, stdout_thread, stderr_thread).await;
         if !saw_cancellation && !matches!(result.status, SubagentStatus::Failed) {
             if result.exit_code == Some(0) {
                 result.status = SubagentStatus::Completed;
@@ -648,7 +651,7 @@ impl ChildRunner {
             }
         }
         child.disarm();
-        emit_progress(&on_update, &result);
+        emit_progress(update, &result);
         result
     }
 }
@@ -717,8 +720,7 @@ fn child_args(agent: &AgentDefinition, task: &str) -> Vec<OsString> {
         agent
             .tools
             .as_ref()
-            .map(|tools| tools.join(","))
-            .unwrap_or_else(|| DEFAULT_CHILD_TOOLS.to_string())
+            .map_or_else(|| DEFAULT_CHILD_TOOLS.to_string(), |tools| tools.join(","))
             .into(),
     ];
     if let Some(model) = &agent.model {
@@ -800,7 +802,7 @@ impl SubagentResult {
             description: Some(agent.description.clone()),
             task: task.task,
             step,
-            source: Some(agent.source.clone()),
+            source: Some(agent.source),
             definition_path: Some(agent.file_path.clone()),
             model: agent.model.clone(),
             reasoning: agent.reasoning.clone(),
@@ -882,7 +884,7 @@ fn render_results(results: &[SubagentResult]) -> String {
         .join("\n\n")
 }
 
-fn emit_progress(update: &Option<UpdateCallback>, result: &SubagentResult) {
+fn emit_progress(update: Option<&UpdateCallback>, result: &SubagentResult) {
     let Some(update) = update else {
         return;
     };
@@ -930,7 +932,7 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
 fn drain_child_frames(
     rx: &Receiver<PipeFrame>,
     result: &mut SubagentResult,
-    update: &Option<UpdateCallback>,
+    update: Option<&UpdateCallback>,
 ) {
     while let Ok(frame) = rx.try_recv() {
         match frame.kind {
@@ -943,7 +945,7 @@ fn drain_child_frames(
 async fn drain_until_reader_exit(
     rx: Receiver<PipeFrame>,
     result: &mut SubagentResult,
-    update: &Option<UpdateCallback>,
+    update: Option<&UpdateCallback>,
     stdout: thread::JoinHandle<()>,
     stderr: thread::JoinHandle<()>,
 ) {
@@ -958,7 +960,7 @@ async fn drain_until_reader_exit(
     drain_child_frames(&rx, result, update);
 }
 
-fn ingest_child_event(line: &str, result: &mut SubagentResult, update: &Option<UpdateCallback>) {
+fn ingest_child_event(line: &str, result: &mut SubagentResult, update: Option<&UpdateCallback>) {
     let Ok(event) = serde_json::from_str::<Value>(line) else {
         append_bounded_line(&mut result.stderr, line);
         return;
@@ -1023,7 +1025,10 @@ fn append_bounded(target: &mut String, value: &str) {
     if value.len() <= remaining {
         target.push_str(value);
     } else {
-        let cut = value.floor_char_boundary(remaining);
+        let mut cut = remaining;
+        while !value.is_char_boundary(cut) {
+            cut -= 1;
+        }
         target.push_str(&value[..cut]);
         target.push_str("\n[output truncated]\n");
     }

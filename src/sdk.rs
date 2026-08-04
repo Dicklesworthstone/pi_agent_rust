@@ -422,7 +422,7 @@ pub struct AgentSessionState {
 /// Prompt completion payload returned by `SessionTransport`.
 #[derive(Debug, Clone)]
 pub enum SessionPromptResult {
-    InProcess(AssistantMessage),
+    InProcess(Box<AssistantMessage>),
     RpcEvents(Vec<Value>),
 }
 
@@ -695,7 +695,7 @@ impl SessionTransport {
                         (on_event)(SessionTransportEvent::InProcess(event));
                     })
                     .await?;
-                Ok(SessionPromptResult::InProcess(assistant))
+                Ok(SessionPromptResult::InProcess(Box::new(assistant)))
             }
             Self::RpcSubprocess(client) => {
                 let events = client.prompt(input).await?;

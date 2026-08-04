@@ -52,7 +52,7 @@ pub enum ExtensionEvent {
     TurnEnd {
         session_id: String,
         turn_index: usize,
-        message: AssistantMessage,
+        message: Box<AssistantMessage>,
         tool_results: Vec<ToolResultMessage>,
     },
 
@@ -609,7 +609,7 @@ mod tests {
                 ExtensionEvent::TurnEnd {
                     session_id: "s".to_string(),
                     turn_index: 0,
-                    message: sample_assistant_message(),
+                    message: Box::new(sample_assistant_message()),
                     tool_results: vec![sample_tool_result()],
                 },
                 "turn_end",

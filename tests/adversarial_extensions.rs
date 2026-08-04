@@ -621,7 +621,9 @@ export default function activate(pi) {
   pi.on("agent_start", () => {
     try {
       // Use a unique path to avoid interference
-      const path = "/tmp/adversarial_escape_test_" + Date.now();
+      // `/tmp` is intentionally virtualized per extension; use a non-virtualized
+      // absolute root to exercise host-workspace confinement itself.
+      const path = "/outside-workspace/adversarial_escape_test_" + Date.now();
       fs.writeFileSync(path, "gap-g2-test");
       // Clean up immediately
       try { fs.unlinkSync(path); } catch(e) {}

@@ -5016,10 +5016,17 @@ fn insert_compiled_source(
 }
 
 fn current_extension_id(ctx: &Ctx<'_>) -> Option<String> {
-    ctx.globals()
-        .get::<_, Option<String>>("__pi_current_extension_id")
+    let globals = ctx.globals();
+    globals
+        .get::<_, Function<'_>>("__pi_get_current_extension_id")
         .ok()
-        .flatten()
+        .and_then(|getter| getter.call::<_, Option<String>>(()).ok().flatten())
+        .or_else(|| {
+            globals
+                .get::<_, Option<String>>("__pi_current_extension_id")
+                .ok()
+                .flatten()
+        })
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
@@ -17778,7 +17785,8 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                         move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
                             let extension_id = current_extension_id(&ctx);
 
-                            // Keep standalone PiJsRuntime unit harness behavior unchanged.
+                            // Standalone runtime harnesses have no active extension. Their
+                            // virtual filesystem behavior is intentionally unrestricted.
                             if extension_id.is_none() {
                                 return Ok(());
                             }
@@ -18755,6 +18763,10 @@ const __pi_event_listeners = new Map();
 // ============================================================================
 
 var __pi_current_extension_id = null;
+
+function __pi_get_current_extension_id() {
+    return __pi_current_extension_id;
+}
 
 // extension_id -> { id, name, version, apiVersion, tools: Map, commands: Map, hooks: Map, mcpServers: Map }
 const __pi_extensions = new Map();
@@ -29699,7 +29711,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.piAiRegisteredApiProvider = {};
                     (async () => {
                         const ai = await import('@earendil-works/pi-ai/compat');
@@ -29752,7 +29764,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     })().catch((error) => {
                         globalThis.piAiRegisteredApiProvider.error = String((error && error.message) || error || '');
                     });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("eval registerApiProvider");

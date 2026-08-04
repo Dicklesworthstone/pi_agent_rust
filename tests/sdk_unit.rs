@@ -198,7 +198,7 @@ fn transport_session_prompt_result_variants() {
         error_message: None,
         timestamp: 0,
     };
-    let in_process = SessionPromptResult::InProcess(msg);
+    let in_process = SessionPromptResult::InProcess(Box::new(msg));
     let rpc = SessionPromptResult::RpcEvents(vec![json!({"type": "agent_end"})]);
 
     // Debug works

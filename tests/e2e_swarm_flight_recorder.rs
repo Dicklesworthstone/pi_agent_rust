@@ -1136,7 +1136,7 @@ fn multi_agent_flight_recorder_bundle_replays_without_credentials() {
         let recorder_a = Arc::clone(&recorder);
         let recorder_b = Arc::clone(&recorder);
         async move {
-            futures::future::join(
+            Box::pin(futures::future::join(
                 run_flight_session(
                     "agent-alpha".to_string(),
                     InputSource::Rpc,
@@ -1149,7 +1149,7 @@ fn multi_agent_flight_recorder_bundle_replays_without_credentials() {
                     beta_workspace,
                     recorder_b,
                 ),
-            )
+            ))
             .await
         }
     });
