@@ -983,7 +983,10 @@ fn fs_enoent_errors() {
         assert!(errs["stat"].as_str().unwrap().contains("ENOENT"));
         assert!(errs["unlink"].as_str().unwrap().contains("ENOENT"));
         assert!(errs["rmdir"].as_str().unwrap().contains("ENOENT"));
-        assert!(errs["readdir"].as_str().unwrap().contains("ENOENT"));
+        assert!(
+            errs["readdir"].as_str().unwrap().contains("ENOENT"),
+            "unexpected fs shim errors: {errs}"
+        );
         assert!(errs["rename"].as_str().unwrap().contains("ENOENT"));
     });
 }

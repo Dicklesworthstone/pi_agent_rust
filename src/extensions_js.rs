@@ -11788,9 +11788,6 @@ export function readdirSync(path, opts) {
       }
     } catch (e) {
       const message = String((e && e.message) ? e.message : e);
-      if (message.includes("host readdir denied") && !foundDir) {
-        throw e;
-      }
       hostError = message;
     }
   }
