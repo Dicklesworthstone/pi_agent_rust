@@ -847,20 +847,35 @@ fn scenarios() -> Vec<Scenario> {
     ]
 }
 
-fn live_repo_guard_bytes() -> TestResult<(Vec<u8>, Vec<u8>)> {
+fn live_repo_guard_bytes() -> TestResult<Vec<(PathBuf, Vec<u8>)>> {
     let root = repo_root();
-    Ok((
-        fs::read(root.join(".git").join("HEAD"))?,
-        fs::read(root.join(".beads").join("issues.jsonl"))?,
-    ))
+    let mut guards = Vec::new();
+    for path in [
+        root.join(".git").join("HEAD"),
+        root.join(".beads").join("issues.jsonl"),
+    ] {
+        if path.try_exists()? {
+            let contents = fs::read(&path)?;
+            guards.push((path, contents));
+        }
+    }
+    if guards.is_empty() {
+        return Err(test_error(
+            "live repo has neither Git HEAD nor Beads ledger to guard",
+        ));
+    }
+    Ok(guards)
 }
 
-fn assert_live_repo_unchanged(before: &(Vec<u8>, Vec<u8>)) -> TestResult {
-    let after = live_repo_guard_bytes()?;
-    if &after != before {
-        return Err(test_error(
-            "live repo git HEAD or Beads ledger changed during E2E",
-        ));
+fn assert_live_repo_unchanged(before: &[(PathBuf, Vec<u8>)]) -> TestResult {
+    for (path, expected) in before {
+        let actual = fs::read(path)?;
+        if &actual != expected {
+            return Err(test_error(format!(
+                "live repo sentinel changed during E2E: {}",
+                path.display()
+            )));
+        }
     }
     Ok(())
 }

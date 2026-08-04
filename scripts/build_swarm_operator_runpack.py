@@ -10166,19 +10166,25 @@ def is_temp_artifact_path(path: str) -> bool:
 
 
 def temp_artifact_kind_from_path(path: str, fallback: str) -> str:
+    if fallback not in {"temp_artifact", "command_output"}:
+        return fallback
+
     lowered = path.lower()
-    if "cargo" in lowered and "target" in lowered:
-        return "cargo_target_dir"
-    if "tmp" in lowered and "cargo" in lowered:
-        return "cargo_tmpdir"
-    if ".rch-target" in lowered:
-        return "rch_remote_target_dir"
-    if ".rch-tmp" in lowered:
-        return "rch_remote_tmpdir"
+    # Specific leaf/workspace markers must win over broad parent-directory
+    # hints. RCH and CI commonly place every test temp path below a directory
+    # containing `cargo`, `target`, or both.
     if "clean-worktree" in lowered or "clean_worktree" in lowered:
         return "clean_worktree_validation_dir"
     if "git_scan" in lowered or "ubs" in lowered:
         return "ubs_shadow_workspace"
+    if ".rch-target" in lowered:
+        return "rch_remote_target_dir"
+    if ".rch-tmp" in lowered:
+        return "rch_remote_tmpdir"
+    if "cargo" in lowered and "target" in lowered:
+        return "cargo_target_dir"
+    if "tmp" in lowered and "cargo" in lowered:
+        return "cargo_tmpdir"
     return fallback
 
 

@@ -130,6 +130,14 @@ pub(crate) fn provider_request_schema_hash(
 pub(crate) fn build_provider_replay_cache_entry(
     spec: &ProviderReplayCacheSpec<'_>,
 ) -> Result<ProviderReplayCacheEntry, ProviderReplayCacheRefusal> {
+    let git_commit = current_git_commit();
+    build_provider_replay_cache_entry_with_git_commit(spec, git_commit.as_deref())
+}
+
+fn build_provider_replay_cache_entry_with_git_commit(
+    spec: &ProviderReplayCacheSpec<'_>,
+    git_commit: Option<&str>,
+) -> Result<ProviderReplayCacheEntry, ProviderReplayCacheRefusal> {
     if spec.request_schema_hash.trim().is_empty() {
         return Err(replay_cache_refusal(
             "ambiguous_request_schema",
@@ -190,7 +198,7 @@ pub(crate) fn build_provider_replay_cache_entry(
         ));
     }
 
-    let git_commit = current_git_commit().ok_or_else(|| {
+    let git_commit = git_commit.and_then(normalize_git_hash).ok_or_else(|| {
         replay_cache_refusal(
             "ambiguous_git_commit",
             "could not resolve the current git commit",
@@ -1711,6 +1719,8 @@ mod replay_cache_tests {
     use super::*;
     use pi::vcr::{Interaction, RecordedRequest, RecordedResponse};
 
+    const TEST_GIT_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
     fn write_test_cassette(path: &Path, response: &str) {
         let cassette = Cassette {
             version: PROVIDER_REPLAY_CACHE_CASSETTE_VERSION.to_string(),
@@ -1751,6 +1761,20 @@ mod replay_cache_tests {
         }
     }
 
+    fn build_test_cache_entry(
+        spec: &ProviderReplayCacheSpec<'_>,
+    ) -> Result<ProviderReplayCacheEntry, ProviderReplayCacheRefusal> {
+        build_provider_replay_cache_entry_with_git_commit(spec, Some(TEST_GIT_COMMIT))
+    }
+
+    fn test_cache_report(
+        expected: Option<&ProviderReplayCacheEntry>,
+        spec: &ProviderReplayCacheSpec<'_>,
+    ) -> Value {
+        let current = build_test_cache_entry(spec);
+        provider_replay_cache_report_with_current(spec, expected, current)
+    }
+
     #[test]
     fn provider_replay_cache_accepts_matching_lineage() {
         let harness = TestHarness::new("provider_replay_cache_accepts_matching_lineage");
@@ -1760,8 +1784,8 @@ mod replay_cache_tests {
             provider_request_schema_hash(&[user_text("hello")], &[], &json!({"maxTokens": 16}));
         let spec = test_spec(&cassette_path, &request_schema_hash);
 
-        let expected_entry = build_provider_replay_cache_entry(&spec).expect("build cache entry");
-        let report = provider_replay_cache_report(Some(&expected_entry), &spec);
+        let expected_entry = build_test_cache_entry(&spec).expect("build cache entry");
+        let report = test_cache_report(Some(&expected_entry), &spec);
 
         assert_eq!(
             report.get("schema"),
@@ -1811,10 +1835,10 @@ mod replay_cache_tests {
         let request_schema_hash =
             provider_request_schema_hash(&[user_text("hello")], &[], &json!({"maxTokens": 16}));
         let spec = test_spec(&cassette_path, &request_schema_hash);
-        let expected_entry = build_provider_replay_cache_entry(&spec).expect("build cache entry");
+        let expected_entry = build_test_cache_entry(&spec).expect("build cache entry");
 
         write_test_cassette(&cassette_path, "changed-response");
-        let report = provider_replay_cache_report(Some(&expected_entry), &spec);
+        let report = test_cache_report(Some(&expected_entry), &spec);
         assert_eq!(report.get("verdict"), Some(&json!("stale")));
         assert_eq!(report.get("cacheReusable"), Some(&json!(false)));
         assert_eq!(report.get("failClosed"), Some(&json!(true)));

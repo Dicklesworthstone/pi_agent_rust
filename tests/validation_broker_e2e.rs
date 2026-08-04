@@ -199,6 +199,16 @@ fn run_output(mut command: Command, label: &str) -> TestResult<Output> {
     }
 }
 
+fn executable_available(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
 #[test]
 fn swarm_runpack_freshness_script_self_test_passes() -> TestResult {
     let output = run_output(
@@ -223,6 +233,11 @@ fn swarm_runpack_freshness_script_self_test_passes() -> TestResult {
 
 #[test]
 fn swarm_runpack_freshness_runpack_smoke_passes() -> TestResult {
+    if !executable_available("br") {
+        eprintln!("skipping real-Beads runpack smoke: br is not installed on this test host");
+        return Ok(());
+    }
+
     let output = run_output(
         {
             let mut command = Command::new("python3");

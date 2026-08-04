@@ -39,8 +39,12 @@ fn test_workspace(name: &str) -> TestResult<PathBuf> {
 }
 
 fn run_pi(args: &[&str]) -> Result<Output, std::io::Error> {
+    run_pi_in(&repo_root(), args)
+}
+
+fn run_pi_in(cwd: &Path, args: &[&str]) -> Result<Output, std::io::Error> {
     Command::new(binary_path()) // ubs:ignore Cargo provides this test binary path.
-        .current_dir(repo_root())
+        .current_dir(cwd)
         .args(args)
         .output()
 }
@@ -287,18 +291,25 @@ fn swarm_progress_stdout_does_not_mutate_git_or_beads_files() -> TestResult {
     let temp = test_workspace("read-only")?;
     let input_path = temp.join("progress-input.json");
     write_input(&input_path, healthy_metrics())?;
-    let git_head_path = repo_root().join(".git").join("HEAD");
-    let beads_path = repo_root().join(".beads").join("issues.jsonl");
+    let git_head_path = temp.join(".git").join("HEAD");
+    let beads_path = temp.join(".beads").join("issues.jsonl");
+    fs::create_dir_all(git_head_path.parent().ok_or("git HEAD has no parent")?)?;
+    fs::create_dir_all(beads_path.parent().ok_or("Beads ledger has no parent")?)?;
+    fs::write(&git_head_path, "ref: refs/heads/main\n")?;
+    fs::write(&beads_path, "{\"id\":\"pi-test\",\"status\":\"open\"}\n")?;
     let git_head_before = fs::read(&git_head_path)?;
     let beads_before = fs::read(&beads_path)?;
 
-    let output = run_pi(&[
-        "swarm-progress",
-        "--input",
-        path_str(&input_path)?,
-        "--format",
-        "json",
-    ])?;
+    let output = run_pi_in(
+        &temp,
+        &[
+            "swarm-progress",
+            "--input",
+            path_str(&input_path)?,
+            "--format",
+            "json",
+        ],
+    )?;
 
     assert!(output.status.success(), "{}", output_debug(&output));
     assert_eq!(fs::read(&git_head_path)?, git_head_before);
