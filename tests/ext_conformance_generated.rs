@@ -22,12 +22,14 @@ use pi::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHa
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::tools::ToolRegistry;
 use serde_json::Value;
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 // ─── Manifest types ─────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct ManifestEntry {
     id: String,
     entry_path: String,
@@ -36,7 +38,7 @@ struct ManifestEntry {
     registrations: Registrations,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[allow(dead_code, clippy::struct_excessive_bools)]
 struct Capabilities {
     registers_tools: bool,
@@ -48,7 +50,7 @@ struct Capabilities {
     has_npm_deps: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Deserialize)]
 #[allow(dead_code)]
 struct Registrations {
     tools: Vec<String>,
@@ -57,8 +59,9 @@ struct Registrations {
     event_handlers: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Deserialize)]
 struct Manifest {
+    schema: String,
     extensions: Vec<ManifestEntry>,
 }
 
@@ -78,87 +81,626 @@ fn artifacts_dir() -> PathBuf {
 }
 
 fn manifest_path() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("ext_conformance")
-        .join("VALIDATED_MANIFEST.json")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(MUST_PASS_MANIFEST_PATH)
+}
+
+const MUST_PASS_INCLUSION_PATH: &str = "docs/extension-inclusion-list.json";
+const MUST_PASS_MANIFEST_PATH: &str = "tests/ext_conformance/VALIDATED_MANIFEST.json";
+const EXPECTED_CANONICAL_MUST_PASS_EXTENSIONS_V1: usize = 208;
+const MUST_PASS_ARTIFACTS_PATH: &str = "tests/ext_conformance/artifacts";
+
+const MUST_PASS_SOURCE_PATHS: &[&str] = &[
+    ".cargo/config.toml",
+    ".gitattributes",
+    "CHANGELOG.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "build.rs",
+    "docs/evidence/tool-output-context-cache.jsonl",
+    "docs/extension-artifact-provenance.json",
+    "docs/provider-upstream-model-ids-snapshot.json",
+    "docs/schema/extension_protocol.json",
+    "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
+    "rust-toolchain.toml",
+    "src",
+    "tests/common",
+    MUST_PASS_INCLUSION_PATH,
+    MUST_PASS_MANIFEST_PATH,
+    MUST_PASS_ARTIFACTS_PATH,
+    "tests/ext_conformance_generated.rs",
+    "tests/release_readiness.rs",
+];
+
+fn current_git_commit(root: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to execute git rev-parse HEAD: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let commit = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git rev-parse HEAD returned non-UTF-8 output: {err}"))?;
+    let commit = commit.trim();
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "git rev-parse HEAD returned invalid commit: {commit}"
+        ));
+    }
+    Ok(commit.to_string())
+}
+
+fn ensure_must_pass_worktree_matches_commit(
+    root: &Path,
+    commit: &str,
+    source_paths: &[&str],
+) -> Result<(), String> {
+    let observed_head = current_git_commit(root)?;
+    if observed_head != commit {
+        return Err(format!(
+            "must-pass source HEAD changed while capturing provenance: expected {commit}, found {observed_head}"
+        ));
+    }
+
+    let mut untracked_command = std::process::Command::new("git");
+    untracked_command
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--others", "-z", "--"])
+        .args(source_paths);
+    let untracked_output = untracked_command
+        .output()
+        .map_err(|err| format!("failed to list untracked must-pass source inputs: {err}"))?;
+    if !untracked_output.status.success() {
+        return Err(format!(
+            "git ls-files failed while checking untracked must-pass inputs: {}",
+            String::from_utf8_lossy(&untracked_output.stderr).trim()
+        ));
+    }
+    let untracked = String::from_utf8(untracked_output.stdout)
+        .map_err(|err| format!("git ls-files returned non-UTF-8 untracked paths: {err}"))?;
+    let untracked = untracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .take(5)
+        .collect::<Vec<_>>();
+    if !untracked.is_empty() {
+        return Err(format!(
+            "must-pass source inputs contain untracked files: {}",
+            untracked.join(", ")
+        ));
+    }
+
+    let flag_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-v", "-z", "--"])
+        .args(source_paths)
+        .output()
+        .map_err(|err| format!("failed to inspect must-pass index flags: {err}"))?;
+    if !flag_output.status.success() {
+        return Err(format!(
+            "git ls-files failed while checking must-pass index flags: {}",
+            String::from_utf8_lossy(&flag_output.stderr).trim()
+        ));
+    }
+    let flagged = String::from_utf8(flag_output.stdout)
+        .map_err(|err| format!("git ls-files returned non-UTF-8 flag records: {err}"))?
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .filter(|record| !record.starts_with("H "))
+        .take(5)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !flagged.is_empty() {
+        return Err(format!(
+            "must-pass source inputs use non-canonical index flags (including assume-unchanged or skip-worktree): {}",
+            flagged.join(", ")
+        ));
+    }
+
+    for (label, diff_args) in [
+        ("worktree", vec!["diff", "--quiet", "--no-ext-diff", "--"]),
+        (
+            "index",
+            vec!["diff", "--cached", "--quiet", "--no-ext-diff", commit, "--"],
+        ),
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(diff_args)
+            .args(source_paths)
+            .status()
+            .map_err(|err| format!("failed to inspect must-pass source dirt: {err}"))?;
+        match status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Err(format!(
+                    "must-pass source inputs differ in the {label}; commit them before generating release evidence"
+                ));
+            }
+            code => {
+                return Err(format!(
+                    "git diff failed while inspecting must-pass source inputs (status {code:?})"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn must_pass_tree_records(
+    root: &Path,
+    commit: &str,
+    source_paths: &[&str],
+) -> Result<Vec<(String, String, String)>, String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("-C")
+        .arg(root)
+        .args(["ls-tree", "-r", "-z", "--full-tree", commit, "--"])
+        .args(source_paths);
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to list tracked must-pass source inputs: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-tree failed for must-pass source inputs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let records = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git ls-tree returned non-UTF-8 records: {err}"))?;
+    let records = records
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let (metadata, path) = record
+                .split_once('\t')
+                .ok_or_else(|| format!("malformed git ls-tree record: {record}"))?;
+            let mut fields = metadata.split_ascii_whitespace();
+            let mode = fields
+                .next()
+                .ok_or_else(|| format!("missing mode in git ls-tree record: {record}"))?;
+            let object_type = fields
+                .next()
+                .ok_or_else(|| format!("missing type in git ls-tree record: {record}"))?;
+            let blob = fields
+                .next()
+                .ok_or_else(|| format!("missing blob in git ls-tree record: {record}"))?;
+            if fields.next().is_some()
+                || object_type != "blob"
+                || !matches!(mode, "100644" | "100755")
+                || !matches!(blob.len(), 40 | 64)
+                || !blob.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!("invalid git ls-tree record: {record}"));
+            }
+            Ok((path.to_string(), mode.to_string(), blob.to_string()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut parsed = records;
+    parsed.sort_by(|left, right| left.0.cmp(&right.0));
+    if parsed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("git ls-tree returned duplicate must-pass source paths".to_string());
+    }
+    for required in source_paths {
+        let prefix = format!("{required}/");
+        if !parsed
+            .iter()
+            .any(|(path, _, _)| *path == *required || path.starts_with(&prefix))
+        {
+            return Err(format!(
+                "required must-pass source input is not tracked: {required}"
+            ));
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn source_tree_sha256(records: &[(String, String, String)]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi.ext.must_pass_source_tree.v2\0");
+    for (path, mode, blob) in records {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(mode.as_bytes());
+        hasher.update([0]);
+        hasher.update(blob.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
+    let header = format!("blob {}\0", contents.len());
+    match oid_hex_len {
+        40 => {
+            let mut hasher = Sha1::new();
+            hasher.update(header.as_bytes());
+            hasher.update(contents);
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        64 => {
+            let mut hasher = Sha256::new();
+            hasher.update(header.as_bytes());
+            hasher.update(contents);
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        length => Err(format!("unsupported Git object ID length: {length}")),
+    }
+}
+
+fn ensure_worktree_bytes_match_tree(
+    root: &Path,
+    records: &[(String, String, String)],
+) -> Result<(), String> {
+    for (path, _, expected_blob) in records {
+        let contents = std::fs::read(root.join(path)).map_err(|err| {
+            format!("failed to read must-pass worktree input {path} for byte comparison: {err}")
+        })?;
+        let actual_blob = git_blob_oid(&contents, expected_blob.len())?;
+        if actual_blob != *expected_blob {
+            return Err(format!(
+                "must-pass worktree bytes differ from canonical commit for {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn git_commit_file_contents(root: &Path, commit: &str, relative: &str) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", &format!("{commit}:{relative}")])
+        .output()
+        .map_err(|err| format!("failed to read canonical Git blob for {relative}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git show failed for canonical {relative} blob: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AuthoritativeInclusionList {
+    schema: String,
+    summary: AuthoritativeInclusionSummary,
+    tier1: Vec<AuthoritativeInclusionEntry>,
+    tier1_review: Vec<AuthoritativeInclusionEntry>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AuthoritativeInclusionSummary {
+    tier1_count: usize,
+    tier1_review_count: usize,
+    total_must_pass: usize,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct AuthoritativeInclusionEntry {
+    id: String,
+}
+
+fn parse_authoritative_must_pass_ids(
+    contents: &[u8],
+    expected_must_pass: usize,
+) -> Result<Vec<String>, String> {
+    let inclusion: AuthoritativeInclusionList = serde_json::from_slice(contents)
+        .map_err(|err| format!("invalid {MUST_PASS_INCLUSION_PATH}: {err}"))?;
+    if inclusion.schema != "pi.ext.inclusion_list.v1" {
+        return Err(format!(
+            "unexpected schema in {MUST_PASS_INCLUSION_PATH}: {}",
+            inclusion.schema
+        ));
+    }
+
+    let observed_tier1 = inclusion.tier1.len();
+    let observed_review = inclusion.tier1_review.len();
+    let observed_total = observed_tier1
+        .checked_add(observed_review)
+        .ok_or_else(|| format!("must-pass count overflow in {MUST_PASS_INCLUSION_PATH}"))?;
+    if inclusion.summary.tier1_count != observed_tier1
+        || inclusion.summary.tier1_review_count != observed_review
+        || inclusion.summary.total_must_pass != observed_total
+        || observed_total != expected_must_pass
+    {
+        return Err(format!(
+            "{MUST_PASS_INCLUSION_PATH} summary mismatch or unexpected versioned must-pass denominator: summary={}+{}={}, observed={observed_tier1}+{observed_review}={observed_total}, expected={expected_must_pass}",
+            inclusion.summary.tier1_count,
+            inclusion.summary.tier1_review_count,
+            inclusion.summary.total_must_pass,
+        ));
+    }
+
+    let mut ids = Vec::with_capacity(observed_total);
+    let mut seen = std::collections::BTreeSet::new();
+    for (section, entries) in [
+        ("tier1", inclusion.tier1),
+        ("tier1_review", inclusion.tier1_review),
+    ] {
+        for (index, entry) in entries.into_iter().enumerate() {
+            let id = entry.id;
+            if id.is_empty() || id.trim() != id || id.chars().any(char::is_control) {
+                return Err(format!(
+                    "{MUST_PASS_INCLUSION_PATH} {section}[{index}] has a malformed id"
+                ));
+            }
+            if !seen.insert(id.clone()) {
+                return Err(format!(
+                    "{MUST_PASS_INCLUSION_PATH} contains duplicate must-pass id {id}"
+                ));
+            }
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+fn is_canonical_manifest_name(value: &str) -> bool {
+    !value.is_empty() && value.trim() == value && !value.chars().any(char::is_control)
+}
+
+fn is_canonical_artifact_entry_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    let has_windows_drive_prefix =
+        bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    is_canonical_manifest_name(value)
+        && !value.contains('\\')
+        && !value.starts_with('/')
+        && !has_windows_drive_prefix
+        && value
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn declared_name_set(
+    entry_id: &str,
+    field: &str,
+    values: &[String],
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut names = std::collections::BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        if !is_canonical_manifest_name(value) {
+            return Err(format!(
+                "manifest entry {entry_id} has malformed {field}[{index}]"
+            ));
+        }
+        if !names.insert(value.clone()) {
+            return Err(format!(
+                "manifest entry {entry_id} has duplicate {field} identity {value}"
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn validate_manifest_entry_contract(entry: &ManifestEntry) -> Result<(), String> {
+    if !is_canonical_manifest_name(&entry.id) {
+        return Err(format!("manifest entry has malformed id: {:?}", entry.id));
+    }
+    if !is_canonical_artifact_entry_path(&entry.entry_path) {
+        return Err(format!(
+            "manifest entry {} must use a normalized relative artifact entry_path, found {:?}",
+            entry.id, entry.entry_path
+        ));
+    }
+    if !(1..=5).contains(&entry.conformance_tier) {
+        return Err(format!(
+            "manifest entry {} has invalid conformance_tier {}; expected 1..=5",
+            entry.id, entry.conformance_tier
+        ));
+    }
+
+    let tools = declared_name_set(&entry.id, "registrations.tools", &entry.registrations.tools)?;
+    let commands = declared_name_set(
+        &entry.id,
+        "registrations.commands",
+        &entry.registrations.commands,
+    )?;
+    let flags = declared_name_set(&entry.id, "registrations.flags", &entry.registrations.flags)?;
+    let event_handlers = declared_name_set(
+        &entry.id,
+        "registrations.event_handlers",
+        &entry.registrations.event_handlers,
+    )?;
+    let subscribed_events = declared_name_set(
+        &entry.id,
+        "capabilities.subscribes_events",
+        &entry.capabilities.subscribes_events,
+    )?;
+
+    for (capability, declared, label) in [
+        (entry.capabilities.registers_tools, &tools, "tools"),
+        (entry.capabilities.registers_commands, &commands, "commands"),
+        (entry.capabilities.registers_flags, &flags, "flags"),
+    ] {
+        if !capability && !declared.is_empty() {
+            return Err(format!(
+                "manifest entry {} declares {label} identities while the matching capability is false",
+                entry.id
+            ));
+        }
+    }
+    if subscribed_events != event_handlers {
+        return Err(format!(
+            "manifest entry {} has divergent subscribes_events and event_handlers identities",
+            entry.id
+        ));
+    }
+    Ok(())
+}
+
+struct AuthoritativeConformanceSets<'a> {
+    must_pass: Vec<&'a ManifestEntry>,
+    stretch: Vec<&'a ManifestEntry>,
+}
+
+fn select_authoritative_conformance_sets<'a>(
+    manifest: &'a Manifest,
+    must_pass_ids: &[String],
+) -> Result<AuthoritativeConformanceSets<'a>, String> {
+    if manifest.schema != "pi.ext.validated-manifest.v1" {
+        return Err(format!(
+            "unexpected schema in {MUST_PASS_MANIFEST_PATH}: {}",
+            manifest.schema
+        ));
+    }
+
+    let mut manifest_by_id = std::collections::BTreeMap::new();
+    let mut manifest_entry_paths = std::collections::BTreeSet::new();
+    for (index, entry) in manifest.extensions.iter().enumerate() {
+        validate_manifest_entry_contract(entry).map_err(|err| {
+            format!("{MUST_PASS_MANIFEST_PATH} extensions[{index}] is invalid: {err}")
+        })?;
+        if manifest_by_id.insert(entry.id.as_str(), entry).is_some() {
+            return Err(format!(
+                "{MUST_PASS_MANIFEST_PATH} contains duplicate extension id {}",
+                entry.id
+            ));
+        }
+        if !manifest_entry_paths.insert(entry.entry_path.as_str()) {
+            return Err(format!(
+                "{MUST_PASS_MANIFEST_PATH} contains duplicate artifact entry_path {}",
+                entry.entry_path
+            ));
+        }
+    }
+
+    let mut selected_ids = std::collections::BTreeSet::new();
+    let mut must_pass = Vec::with_capacity(must_pass_ids.len());
+    for id in must_pass_ids {
+        if !selected_ids.insert(id.as_str()) {
+            return Err(format!(
+                "{MUST_PASS_INCLUSION_PATH} contains duplicate must-pass id {id}"
+            ));
+        }
+        let entry = manifest_by_id.get(id.as_str()).copied().ok_or_else(|| {
+            format!(
+                "canonical must-pass id {id} from {MUST_PASS_INCLUSION_PATH} is absent from {MUST_PASS_MANIFEST_PATH}"
+            )
+        })?;
+        must_pass.push(entry);
+    }
+
+    let stretch = manifest
+        .extensions
+        .iter()
+        .filter(|entry| !selected_ids.contains(entry.id.as_str()))
+        .collect();
+    Ok(AuthoritativeConformanceSets { must_pass, stretch })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MustPassSourceProvenance {
+    git_commit: String,
+    source_tree_sha256: String,
+    inclusion_sha256: String,
+    manifest_sha256: String,
+}
+
+#[derive(Debug)]
+struct MustPassSourceSnapshot {
+    provenance: MustPassSourceProvenance,
+    inclusion_contents: Vec<u8>,
+    manifest_contents: Vec<u8>,
+    tracked_paths: std::collections::BTreeSet<String>,
+}
+
+fn capture_must_pass_source_snapshot(root: &Path) -> Result<MustPassSourceSnapshot, String> {
+    let git_commit = current_git_commit(root)?;
+    ensure_must_pass_worktree_matches_commit(root, &git_commit, MUST_PASS_SOURCE_PATHS)?;
+    let records = must_pass_tree_records(root, &git_commit, MUST_PASS_SOURCE_PATHS)?;
+    ensure_worktree_bytes_match_tree(root, &records)?;
+    let inclusion_contents = git_commit_file_contents(root, &git_commit, MUST_PASS_INCLUSION_PATH)?;
+    let manifest_contents = git_commit_file_contents(root, &git_commit, MUST_PASS_MANIFEST_PATH)?;
+    let observed_head = current_git_commit(root)?;
+    if observed_head != git_commit {
+        return Err(format!(
+            "must-pass source HEAD changed during snapshot capture: {git_commit} -> {observed_head}"
+        ));
+    }
+    ensure_must_pass_worktree_matches_commit(root, &git_commit, MUST_PASS_SOURCE_PATHS)?;
+    ensure_worktree_bytes_match_tree(root, &records)?;
+
+    let tracked_paths = records.iter().map(|record| record.0.clone()).collect();
+    Ok(MustPassSourceSnapshot {
+        provenance: MustPassSourceProvenance {
+            git_commit,
+            source_tree_sha256: source_tree_sha256(&records),
+            inclusion_sha256: format!("{:x}", Sha256::digest(&inclusion_contents)),
+            manifest_sha256: format!("{:x}", Sha256::digest(&manifest_contents)),
+        },
+        inclusion_contents,
+        manifest_contents,
+        tracked_paths,
+    })
+}
+
+fn ensure_must_pass_source_unchanged(
+    before: &MustPassSourceProvenance,
+    after: &MustPassSourceProvenance,
+) -> Result<(), String> {
+    if before == after {
+        return Ok(());
+    }
+
+    let mut changed = Vec::new();
+    if before.git_commit != after.git_commit {
+        changed.push("git_commit");
+    }
+    if before.source_tree_sha256 != after.source_tree_sha256 {
+        changed.push("source_tree_sha256");
+    }
+    if before.inclusion_sha256 != after.inclusion_sha256 {
+        changed.push("inclusion_sha256");
+    }
+    if before.manifest_sha256 != after.manifest_sha256 {
+        changed.push("manifest_sha256");
+    }
+    Err(format!(
+        "must-pass source provenance changed during extension execution: {}",
+        changed.join(", ")
+    ))
+}
+
+fn validate_snapshot_artifact_paths(
+    snapshot: &MustPassSourceSnapshot,
+    manifest: &Manifest,
+) -> Result<(), String> {
+    for entry in &manifest.extensions {
+        let artifact_path = format!("{MUST_PASS_ARTIFACTS_PATH}/{}", entry.entry_path);
+        if !snapshot.tracked_paths.contains(&artifact_path) {
+            return Err(format!(
+                "manifest entry {} points to artifact input not tracked by canonical commit {}: {artifact_path}",
+                entry.id, snapshot.provenance.git_commit
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn parse_manifest(contents: &[u8]) -> Result<Manifest, String> {
+    serde_json::from_slice(contents)
+        .map_err(|err| format!("failed to parse {MUST_PASS_MANIFEST_PATH}: {err}"))
 }
 
 fn load_manifest() -> &'static Manifest {
     static MANIFEST: OnceLock<Manifest> = OnceLock::new();
     MANIFEST.get_or_init(|| {
-        let data = std::fs::read_to_string(manifest_path())
-            .expect("Failed to read VALIDATED_MANIFEST.json");
-        let json: Value =
-            serde_json::from_str(&data).expect("Failed to parse VALIDATED_MANIFEST.json");
-
-        let extensions = json["extensions"]
-            .as_array()
-            .expect("manifest.extensions should be an array")
-            .iter()
-            .map(|e| {
-                let caps = &e["capabilities"];
-                let regs = &e["registrations"];
-                ManifestEntry {
-                    id: e["id"].as_str().unwrap_or("").to_string(),
-                    entry_path: e["entry_path"].as_str().unwrap_or("").to_string(),
-                    conformance_tier: u32::try_from(e["conformance_tier"].as_u64().unwrap_or(0))
-                        .unwrap_or(0),
-                    capabilities: Capabilities {
-                        registers_tools: caps["registers_tools"].as_bool().unwrap_or(false),
-                        registers_commands: caps["registers_commands"].as_bool().unwrap_or(false),
-                        registers_flags: caps["registers_flags"].as_bool().unwrap_or(false),
-                        registers_providers: caps["registers_providers"].as_bool().unwrap_or(false),
-                        subscribes_events: caps["subscribes_events"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        is_multi_file: caps["is_multi_file"].as_bool().unwrap_or(false),
-                        has_npm_deps: caps["has_npm_deps"].as_bool().unwrap_or(false),
-                    },
-                    registrations: Registrations {
-                        tools: regs["tools"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        commands: regs["commands"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        flags: regs["flags"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                        event_handlers: regs["event_handlers"]
-                            .as_array()
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|v| v.as_str().map(String::from))
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    },
-                }
-            })
-            .collect();
-
-        Manifest { extensions }
+        let data = std::fs::read(manifest_path()).expect("Failed to read VALIDATED_MANIFEST.json");
+        parse_manifest(&data).expect("Failed to parse VALIDATED_MANIFEST.json")
     })
 }
 
@@ -311,73 +853,20 @@ fn run_conformance_test(ext_id: &str) {
 
     // ── Validate registrations against manifest ──
 
-    // Commands: verify every manifest-listed command was registered.
-    let actual_commands = manager.list_commands();
-    let actual_cmd_names: Vec<&str> = actual_commands
-        .iter()
-        .filter_map(|v| v.get("name").and_then(Value::as_str))
-        .collect();
-
-    for expected_cmd in &entry.registrations.commands {
-        assert!(
-            actual_cmd_names.contains(&expected_cmd.as_str()),
-            "Extension '{ext_id}': expected command '{expected_cmd}' not found in actual commands: {actual_cmd_names:?}"
-        );
-    }
-
-    // If the manifest says the extension registers commands, verify at least one was captured.
-    if entry.capabilities.registers_commands && !entry.registrations.commands.is_empty() {
-        assert!(
-            !actual_commands.is_empty(),
-            "Extension '{ext_id}': manifest says it registers commands, but none were captured"
-        );
-    }
-
-    // Flags: verify expected flags were registered.
-    let actual_flags = manager.list_flags();
-    let actual_flag_names: Vec<&str> = actual_flags
-        .iter()
-        .filter_map(|v| v.get("name").and_then(Value::as_str))
-        .collect();
-
-    for expected_flag in &entry.registrations.flags {
-        assert!(
-            actual_flag_names.contains(&expected_flag.as_str()),
-            "Extension '{ext_id}': expected flag '{expected_flag}' not found in actual flags: {actual_flag_names:?}"
-        );
-    }
-
-    // Tools: if manifest says the extension registers tools, verify tool defs exist.
-    if entry.capabilities.registers_tools {
-        let tool_defs = manager.extension_tool_defs();
-        assert!(
-            !tool_defs.is_empty(),
-            "Extension '{ext_id}': manifest says it registers tools, but no tool defs were captured"
-        );
-    }
-
-    // Providers: if manifest says it registers providers, verify they exist.
-    if entry.capabilities.registers_providers {
-        let providers = manager.extension_providers();
-        assert!(
-            !providers.is_empty(),
-            "Extension '{ext_id}': manifest says it registers providers, but none were captured"
-        );
-    }
+    // Use the same fail-closed identity contract as the aggregate must-pass
+    // gate so individual extension tests cannot accept weaker evidence.
+    let observation = observe_registrations(&manager).unwrap_or_else(|err| {
+        panic!("Extension '{ext_id}': malformed runtime registration evidence: {err}")
+    });
+    validate_registration_observation(entry, &observation).unwrap_or_else(|err| panic!("{err}"));
 
     harness
         .log()
         .info_ctx("conformance", "Validation passed", |ctx| {
-            ctx.push(("commands".into(), actual_commands.len().to_string()));
-            ctx.push(("flags".into(), actual_flags.len().to_string()));
-            ctx.push((
-                "tool_defs".into(),
-                manager.extension_tool_defs().len().to_string(),
-            ));
-            ctx.push((
-                "providers".into(),
-                manager.extension_providers().len().to_string(),
-            ));
+            ctx.push(("commands".into(), observation.commands.len().to_string()));
+            ctx.push(("flags".into(), observation.flags.len().to_string()));
+            ctx.push(("tool_defs".into(), observation.tools.len().to_string()));
+            ctx.push(("providers".into(), observation.providers.len().to_string()));
         });
 
     // Write JSONL logs.
@@ -901,12 +1390,153 @@ struct ExtensionConformanceResult {
     duration_ms: u64,
 }
 
+#[derive(Debug, Default)]
+struct RegistrationObservation {
+    commands: std::collections::BTreeSet<String>,
+    flags: std::collections::BTreeSet<String>,
+    tools: std::collections::BTreeSet<String>,
+    providers: std::collections::BTreeSet<String>,
+    event_handlers: std::collections::BTreeSet<String>,
+}
+
+fn value_identity_set(
+    values: &[Value],
+    identity_field: &str,
+    kind: &str,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut identities = std::collections::BTreeSet::new();
+    for (index, value) in values.iter().enumerate() {
+        let identity = value
+            .get(identity_field)
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("registered {kind}[{index}] is missing {identity_field}"))?;
+        if !is_canonical_manifest_name(identity) {
+            return Err(format!(
+                "registered {kind}[{index}] has malformed {identity_field}"
+            ));
+        }
+        if !identities.insert(identity.to_string()) {
+            return Err(format!(
+                "registered {kind} identity is duplicated: {identity}"
+            ));
+        }
+    }
+    Ok(identities)
+}
+
+fn string_identity_set(
+    values: &[String],
+    kind: &str,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut identities = std::collections::BTreeSet::new();
+    for (index, identity) in values.iter().enumerate() {
+        if !is_canonical_manifest_name(identity) {
+            return Err(format!(
+                "registered {kind}[{index}] has a malformed identity"
+            ));
+        }
+        if !identities.insert(identity.clone()) {
+            return Err(format!(
+                "registered {kind} identity is duplicated: {identity}"
+            ));
+        }
+    }
+    Ok(identities)
+}
+
+fn observe_registrations(manager: &ExtensionManager) -> Result<RegistrationObservation, String> {
+    Ok(RegistrationObservation {
+        commands: value_identity_set(&manager.list_commands(), "name", "commands")?,
+        flags: value_identity_set(&manager.list_flags(), "name", "flags")?,
+        tools: value_identity_set(&manager.extension_tool_defs(), "name", "tools")?,
+        providers: value_identity_set(&manager.extension_providers(), "id", "providers")?,
+        event_handlers: string_identity_set(&manager.list_event_hooks(), "event handlers")?,
+    })
+}
+
+fn validate_named_registration_contract(
+    entry_id: &str,
+    kind: &str,
+    capability: bool,
+    declared: &[String],
+    actual: &std::collections::BTreeSet<String>,
+) -> Result<(), String> {
+    if capability != !actual.is_empty() {
+        return Err(format!(
+            "Extension '{entry_id}': manifest {kind} capability={capability}, but runtime registered {} {kind}",
+            actual.len()
+        ));
+    }
+    let declared = declared_name_set(entry_id, kind, declared)?;
+    let missing = declared.difference(actual).cloned().collect::<Vec<_>>();
+    let unexpected = actual.difference(&declared).cloned().collect::<Vec<_>>();
+    if !missing.is_empty() || !unexpected.is_empty() {
+        return Err(format!(
+            "Extension '{entry_id}': runtime {kind} identities differ from the manifest; missing declared identities={missing:?}, unexpected runtime identities={unexpected:?}, expected={declared:?}, actual={actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_registration_observation(
+    entry: &ManifestEntry,
+    actual: &RegistrationObservation,
+) -> Result<(), String> {
+    validate_manifest_entry_contract(entry)?;
+    validate_named_registration_contract(
+        &entry.id,
+        "commands",
+        entry.capabilities.registers_commands,
+        &entry.registrations.commands,
+        &actual.commands,
+    )?;
+    validate_named_registration_contract(
+        &entry.id,
+        "flags",
+        entry.capabilities.registers_flags,
+        &entry.registrations.flags,
+        &actual.flags,
+    )?;
+    validate_named_registration_contract(
+        &entry.id,
+        "tools",
+        entry.capabilities.registers_tools,
+        &entry.registrations.tools,
+        &actual.tools,
+    )?;
+    if entry.capabilities.registers_providers != !actual.providers.is_empty() {
+        return Err(format!(
+            "Extension '{}': manifest provider capability={}, but runtime registered {} providers",
+            entry.id,
+            entry.capabilities.registers_providers,
+            actual.providers.len()
+        ));
+    }
+
+    let expected_events = declared_name_set(
+        &entry.id,
+        "event handlers",
+        &entry.registrations.event_handlers,
+    )?;
+    if actual.event_handlers != expected_events {
+        return Err(format!(
+            "Extension '{}': event-handler identities differ from the manifest; expected={expected_events:?}, actual={:?}",
+            entry.id, actual.event_handlers
+        ));
+    }
+    Ok(())
+}
+
 /// Run conformance check for a single extension, returning a result without
 /// panicking. This is used by the report generator to collect all results
 /// even when some extensions fail.
 #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
-    let manifest = load_manifest();
+    try_conformance_with_manifest(load_manifest(), ext_id)
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
+fn try_conformance_with_manifest(manifest: &Manifest, ext_id: &str) -> ExtensionConformanceResult {
     let Some(entry) = manifest.find(ext_id) else {
         return ExtensionConformanceResult {
             id: ext_id.to_string(),
@@ -1035,83 +1665,37 @@ fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
         };
     }
 
-    // Validate registrations against manifest.
-    let actual_commands = manager.list_commands();
-    let actual_cmd_names: Vec<&str> = actual_commands
-        .iter()
-        .filter_map(|v| v.get("name").and_then(Value::as_str))
-        .collect();
-
-    for expected_cmd in &entry.registrations.commands {
-        if !actual_cmd_names.contains(&expected_cmd.as_str()) {
+    // Validate both capability presence and exact identity equality with the
+    // canonical manifest. Undeclared runtime registrations are evidence drift,
+    // not successful conformance.
+    let observation = match observe_registrations(&manager) {
+        Ok(observation) => observation,
+        Err(err) => {
             return ExtensionConformanceResult {
                 id: ext_id.to_string(),
                 tier: entry.conformance_tier,
                 status: "fail".to_string(),
-                failure_reason: Some(format!(
-                    "Missing command '{expected_cmd}'. Actual: {actual_cmd_names:?}"
-                )),
+                failure_reason: Some(format!("Malformed runtime registration evidence: {err}")),
                 artifact_path: None,
-                commands_registered: actual_commands.len(),
+                commands_registered: manager.list_commands().len(),
                 flags_registered: manager.list_flags().len(),
                 tools_registered: manager.extension_tool_defs().len(),
                 providers_registered: manager.extension_providers().len(),
                 duration_ms: start.elapsed().as_millis() as u64,
             };
         }
-    }
-
-    let actual_flags = manager.list_flags();
-    let actual_flag_names: Vec<&str> = actual_flags
-        .iter()
-        .filter_map(|v| v.get("name").and_then(Value::as_str))
-        .collect();
-
-    for expected_flag in &entry.registrations.flags {
-        if !actual_flag_names.contains(&expected_flag.as_str()) {
-            return ExtensionConformanceResult {
-                id: ext_id.to_string(),
-                tier: entry.conformance_tier,
-                status: "fail".to_string(),
-                failure_reason: Some(format!(
-                    "Missing flag '{expected_flag}'. Actual: {actual_flag_names:?}"
-                )),
-                artifact_path: None,
-                commands_registered: actual_commands.len(),
-                flags_registered: actual_flags.len(),
-                tools_registered: manager.extension_tool_defs().len(),
-                providers_registered: manager.extension_providers().len(),
-                duration_ms: start.elapsed().as_millis() as u64,
-            };
-        }
-    }
-
-    if entry.capabilities.registers_tools && manager.extension_tool_defs().is_empty() {
+    };
+    if let Err(err) = validate_registration_observation(entry, &observation) {
         return ExtensionConformanceResult {
             id: ext_id.to_string(),
             tier: entry.conformance_tier,
             status: "fail".to_string(),
-            failure_reason: Some("Manifest expects tools but none registered".to_string()),
+            failure_reason: Some(err),
             artifact_path: None,
-            commands_registered: actual_commands.len(),
-            flags_registered: actual_flags.len(),
-            tools_registered: 0,
-            providers_registered: manager.extension_providers().len(),
-            duration_ms: start.elapsed().as_millis() as u64,
-        };
-    }
-
-    if entry.capabilities.registers_providers && manager.extension_providers().is_empty() {
-        return ExtensionConformanceResult {
-            id: ext_id.to_string(),
-            tier: entry.conformance_tier,
-            status: "fail".to_string(),
-            failure_reason: Some("Manifest expects providers but none registered".to_string()),
-            artifact_path: None,
-            commands_registered: actual_commands.len(),
-            flags_registered: actual_flags.len(),
-            tools_registered: manager.extension_tool_defs().len(),
-            providers_registered: 0,
+            commands_registered: observation.commands.len(),
+            flags_registered: observation.flags.len(),
+            tools_registered: observation.tools.len(),
+            providers_registered: observation.providers.len(),
             duration_ms: start.elapsed().as_millis() as u64,
         };
     }
@@ -1129,10 +1713,10 @@ fn try_conformance(ext_id: &str) -> ExtensionConformanceResult {
         status: "pass".to_string(),
         failure_reason: None,
         artifact_path: Some(snapshot_path.display().to_string()),
-        commands_registered: actual_commands.len(),
-        flags_registered: actual_flags.len(),
-        tools_registered: manager.extension_tool_defs().len(),
-        providers_registered: manager.extension_providers().len(),
+        commands_registered: observation.commands.len(),
+        flags_registered: observation.flags.len(),
+        tools_registered: observation.tools.len(),
+        providers_registered: observation.providers.len(),
         duration_ms: start.elapsed().as_millis() as u64,
     }
 }
@@ -2517,15 +3101,11 @@ fn conformance_failure_dossiers() {
     eprintln!();
 }
 
-// ─── CI Gate for 208 Must-Pass Extensions (bd-1f42.4.4) ─────────────────────
+// ─── CI Gate for the Canonical Must-Pass Extensions (bd-1f42.4.4) ───────────
 //
-// Hard CI gate: blocks merge if any must-pass extension (tier 1-2) fails
-// conformance.  Stretch-set (tier 3+) results are logged as non-blocking.
-//
-// Environment variables:
-//   PI_EXT_GATE_MUST_PASS_RATE  — minimum pass rate for must-pass set (default: 100.0)
-//   PI_EXT_GATE_MAX_FAILURES    — maximum allowed failures in must-pass set (default: 0)
-//   PI_EXT_GATE_MODE            — "strict" (fail test) or "warn" (log only) (default: strict)
+// Hard CI gate: blocks merge if any extension in the authoritative inclusion
+// list's tier1 + tier1_review sets fails conformance. Manifest tiers 1-5 remain
+// attached to results; entries outside the authoritative set are non-blocking.
 //
 // Run:
 //   `cargo test --test ext_conformance_generated --features ext-conformance \
@@ -2538,8 +3118,12 @@ struct MustPassGateVerdict {
     generated_at: String,
     run_id: String,
     correlation_id: String,
+    git_commit: String,
+    source_tree_sha256: String,
+    inclusion_sha256: String,
+    manifest_sha256: String,
     mode: String,
-    status: String, // "pass", "fail", "warn"
+    status: String, // "pass" or "fail"
     thresholds: MustPassThresholds,
     observed: MustPassObserved,
     checks: Vec<serde_json::Value>,
@@ -2586,6 +3170,10 @@ fn resolve_must_pass_gate_lineage(
     let correlation_id = normalize_optional_env(ci_correlation_id)
         .unwrap_or_else(|| format!("must-pass-gate-{run_id}"));
     (run_id, correlation_id)
+}
+
+fn must_pass_gate_passes(passed: usize, failed: usize, skipped: usize, total: usize) -> bool {
+    total > 0 && passed == total && failed == 0 && skipped == 0
 }
 
 fn current_must_pass_gate_lineage(now: chrono::DateTime<chrono::Utc>) -> (String, String) {
@@ -2641,7 +3229,344 @@ fn must_pass_lineage_falls_back_to_local_run_id_when_env_missing() {
     assert_eq!(correlation_id, format!("must-pass-gate-{run_id}"));
 }
 
-/// CI gate test that blocks merge if must-pass extensions (tier 1-2) fail.
+#[test]
+fn must_pass_gate_rejects_skipped_entries_even_when_tested_entries_pass() {
+    assert!(must_pass_gate_passes(2, 0, 0, 2));
+    assert!(
+        !must_pass_gate_passes(1, 0, 1, 2),
+        "an untested must-pass entry must block the gate"
+    );
+    assert!(
+        !must_pass_gate_passes(1, 1, 0, 2),
+        "a failed must-pass entry must block the gate"
+    );
+    assert!(
+        !must_pass_gate_passes(0, 0, 0, 0),
+        "an empty must-pass set must block the gate"
+    );
+}
+
+fn selection_test_entry(id: &str, conformance_tier: u32) -> ManifestEntry {
+    ManifestEntry {
+        id: id.to_string(),
+        entry_path: format!("{id}.js"),
+        conformance_tier,
+        capabilities: Capabilities {
+            registers_tools: false,
+            registers_commands: false,
+            registers_flags: false,
+            registers_providers: false,
+            subscribes_events: Vec::new(),
+            is_multi_file: false,
+            has_npm_deps: false,
+        },
+        registrations: Registrations {
+            tools: Vec::new(),
+            commands: Vec::new(),
+            flags: Vec::new(),
+            event_handlers: Vec::new(),
+        },
+    }
+}
+
+#[test]
+fn authoritative_must_pass_parser_combines_sections_and_rejects_bad_ids() {
+    let valid = br#"{
+        "schema": "pi.ext.inclusion_list.v1",
+        "summary": {"tier1_count": 2, "tier1_review_count": 1, "total_must_pass": 3},
+        "tier1": [{"id": "alpha"}, {"id": "beta"}],
+        "tier1_review": [{"id": "gamma"}]
+    }"#;
+    assert_eq!(
+        parse_authoritative_must_pass_ids(valid, 3).expect("parse valid inclusion fixture"),
+        ["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+    );
+
+    let duplicate = br#"{
+        "schema": "pi.ext.inclusion_list.v1",
+        "summary": {"tier1_count": 1, "tier1_review_count": 1, "total_must_pass": 2},
+        "tier1": [{"id": "duplicate"}],
+        "tier1_review": [{"id": "duplicate"}]
+    }"#;
+    let duplicate_error = parse_authoritative_must_pass_ids(duplicate, 2)
+        .expect_err("duplicate inclusion ID must fail closed");
+    assert!(duplicate_error.contains("duplicate must-pass id duplicate"));
+
+    let missing = br#"{
+        "schema": "pi.ext.inclusion_list.v1",
+        "summary": {"tier1_count": 1, "tier1_review_count": 0, "total_must_pass": 1},
+        "tier1": [{}],
+        "tier1_review": []
+    }"#;
+    assert!(
+        parse_authoritative_must_pass_ids(missing, 1).is_err(),
+        "missing inclusion ID must fail closed"
+    );
+
+    let malformed = br#"{
+        "schema": "pi.ext.inclusion_list.v1",
+        "summary": {"tier1_count": 1, "tier1_review_count": 0, "total_must_pass": 1},
+        "tier1": [{"id": " padded "}],
+        "tier1_review": []
+    }"#;
+    assert!(
+        parse_authoritative_must_pass_ids(malformed, 1).is_err(),
+        "non-canonical inclusion ID must fail closed"
+    );
+
+    assert!(
+        parse_authoritative_must_pass_ids(valid, 2).is_err(),
+        "a self-consistent but smaller denominator must fail closed"
+    );
+    assert!(
+        parse_authoritative_must_pass_ids(valid, 4).is_err(),
+        "a self-consistent but larger denominator must fail closed"
+    );
+}
+
+#[test]
+fn authoritative_must_pass_selection_uses_exact_ids_and_retains_manifest_tiers() {
+    let manifest = Manifest {
+        schema: "pi.ext.validated-manifest.v1".to_string(),
+        extensions: vec![
+            selection_test_entry("alpha", 1),
+            selection_test_entry("beta", 5),
+            selection_test_entry("outside", 2),
+        ],
+    };
+    let ids = vec!["beta".to_string(), "alpha".to_string()];
+    let sets = select_authoritative_conformance_sets(&manifest, &ids)
+        .expect("map authoritative IDs to manifest fixture");
+
+    assert_eq!(
+        sets.must_pass
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.conformance_tier))
+            .collect::<Vec<_>>(),
+        [("beta", 5), ("alpha", 1)]
+    );
+    assert_eq!(
+        sets.stretch
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>(),
+        ["outside"]
+    );
+
+    let unmapped = vec!["missing".to_string()];
+    let error = select_authoritative_conformance_sets(&manifest, &unmapped)
+        .err()
+        .expect("unmapped inclusion ID must fail closed");
+    assert!(error.contains("canonical must-pass id missing"));
+
+    let mut duplicate_path_entry = selection_test_entry("beta", 2);
+    duplicate_path_entry.entry_path = "alpha.js".to_string();
+    let duplicate_path_manifest = Manifest {
+        schema: "pi.ext.validated-manifest.v1".to_string(),
+        extensions: vec![selection_test_entry("alpha", 1), duplicate_path_entry],
+    };
+    let error = select_authoritative_conformance_sets(
+        &duplicate_path_manifest,
+        &["alpha".to_string(), "beta".to_string()],
+    )
+    .err()
+    .expect("duplicate artifact entry paths must fail closed");
+    assert!(error.contains("duplicate artifact entry_path"), "{error}");
+}
+
+#[test]
+fn gate_hardening_manifest_contract_rejects_paths_and_registration_claim_drift() {
+    for invalid_path in [
+        "../escape.js",
+        "nested//entry.js",
+        "nested/./entry.js",
+        "nested/entry.js/",
+        "C:/entry.js",
+    ] {
+        let mut entry = selection_test_entry("alpha", 1);
+        entry.entry_path = invalid_path.to_string();
+        let error = validate_manifest_entry_contract(&entry)
+            .expect_err("non-canonical artifact paths must fail closed");
+        assert!(error.contains("normalized relative"), "{error}");
+    }
+
+    let mut entry = selection_test_entry("alpha", 1);
+    entry.registrations.tools = vec!["declared-tool".to_string()];
+    let error = validate_manifest_entry_contract(&entry)
+        .expect_err("declared tool with a false capability must fail closed");
+    assert!(error.contains("matching capability is false"), "{error}");
+
+    let mut entry = selection_test_entry("alpha", 1);
+    entry.capabilities.subscribes_events = vec!["session_start".to_string()];
+    entry.registrations.event_handlers = vec!["session_end".to_string()];
+    let error = validate_manifest_entry_contract(&entry)
+        .expect_err("divergent event identities must fail closed");
+    assert!(error.contains("divergent"), "{error}");
+}
+
+#[test]
+fn gate_hardening_runtime_registration_contract_requires_capabilities_and_declared_identities() {
+    let mut entry = selection_test_entry("alpha", 1);
+    entry.capabilities.registers_tools = true;
+    entry.registrations.tools = vec!["declared-tool".to_string()];
+
+    let mut actual = RegistrationObservation::default();
+    actual.tools.insert("different-tool".to_string());
+    let error = validate_registration_observation(&entry, &actual)
+        .expect_err("a different runtime tool must not satisfy a declared identity");
+    assert!(error.contains("missing declared identities"), "{error}");
+
+    entry.registrations.tools.clear();
+    actual.tools.clear();
+    let error = validate_registration_observation(&entry, &actual)
+        .expect_err("a true capability must require at least one runtime registration");
+    assert!(error.contains("capability=true"), "{error}");
+
+    let entry = selection_test_entry("alpha", 1);
+    actual.commands.insert("unexpected-command".to_string());
+    let error = validate_registration_observation(&entry, &actual)
+        .expect_err("a false capability must reject runtime registrations");
+    assert!(error.contains("capability=false"), "{error}");
+}
+
+#[test]
+fn gate_hardening_runtime_registration_contract_requires_exact_event_handlers() {
+    let mut entry = selection_test_entry("alpha", 1);
+    entry.capabilities.subscribes_events = vec!["session_start".to_string()];
+    entry.registrations.event_handlers = vec!["session_start".to_string()];
+
+    let mut actual = RegistrationObservation::default();
+    actual.event_handlers.insert("session_end".to_string());
+    let error = validate_registration_observation(&entry, &actual)
+        .expect_err("a different runtime event handler must fail closed");
+    assert!(error.contains("event-handler identities differ"), "{error}");
+
+    actual.event_handlers.clear();
+    actual.event_handlers.insert("session_start".to_string());
+    validate_registration_observation(&entry, &actual)
+        .expect("the exact declared runtime event set must pass");
+}
+
+#[test]
+fn gate_hardening_runtime_registration_contract_rejects_undeclared_extras() {
+    let mut entry = selection_test_entry("alpha", 1);
+    entry.capabilities.registers_commands = true;
+    entry.capabilities.registers_tools = true;
+    entry.capabilities.registers_flags = true;
+    entry.registrations.commands = vec!["declared-command".to_string()];
+    entry.registrations.tools = vec!["declared-tool".to_string()];
+    entry.registrations.flags = vec!["declared-flag".to_string()];
+
+    let mut actual = RegistrationObservation::default();
+    actual.commands.insert("declared-command".to_string());
+    actual.tools.insert("declared-tool".to_string());
+    actual.flags.insert("declared-flag".to_string());
+    validate_registration_observation(&entry, &actual)
+        .expect("exact declared runtime identities must pass");
+
+    actual.commands.insert("undeclared-command".to_string());
+    let error = validate_registration_observation(&entry, &actual)
+        .expect_err("an undeclared runtime command must fail closed");
+    assert!(
+        error.contains("unexpected runtime identities=[\"undeclared-command\"]"),
+        "{error}"
+    );
+
+    actual.commands.remove("undeclared-command");
+    actual.tools.insert("undeclared-tool".to_string());
+    let error = validate_registration_observation(&entry, &actual)
+        .expect_err("an undeclared runtime tool must fail closed");
+    assert!(
+        error.contains("unexpected runtime identities=[\"undeclared-tool\"]"),
+        "{error}"
+    );
+
+    actual.tools.remove("undeclared-tool");
+    actual.flags.insert("undeclared-flag".to_string());
+    let error = validate_registration_observation(&entry, &actual)
+        .expect_err("an undeclared runtime flag must fail closed");
+    assert!(
+        error.contains("unexpected runtime identities=[\"undeclared-flag\"]"),
+        "{error}"
+    );
+
+    let mut undeclared_only_entry = selection_test_entry("undeclared-only", 1);
+    undeclared_only_entry.capabilities.registers_commands = true;
+    undeclared_only_entry.capabilities.registers_tools = true;
+    let mut undeclared_only_actual = RegistrationObservation::default();
+    undeclared_only_actual
+        .commands
+        .insert("runtime-only-command".to_string());
+    undeclared_only_actual
+        .tools
+        .insert("runtime-only-tool".to_string());
+    let error = validate_registration_observation(&undeclared_only_entry, &undeclared_only_actual)
+        .expect_err("capability=true must not implicitly authorize unnamed registrations");
+    assert!(
+        error.contains("unexpected runtime identities=[\"runtime-only-command\"]"),
+        "{error}"
+    );
+
+    undeclared_only_entry.capabilities.registers_commands = false;
+    undeclared_only_actual.commands.clear();
+    let error = validate_registration_observation(&undeclared_only_entry, &undeclared_only_actual)
+        .expect_err("capability=true must not implicitly authorize an unnamed tool");
+    assert!(
+        error.contains("unexpected runtime identities=[\"runtime-only-tool\"]"),
+        "{error}"
+    );
+}
+
+#[test]
+fn canonical_contract_currently_maps_all_208_must_pass_ids() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let snapshot =
+        capture_must_pass_source_snapshot(repo_root).expect("capture canonical source snapshot");
+    let manifest = parse_manifest(&snapshot.manifest_contents).expect("parse canonical manifest");
+    let ids = parse_authoritative_must_pass_ids(
+        &snapshot.inclusion_contents,
+        EXPECTED_CANONICAL_MUST_PASS_EXTENSIONS_V1,
+    )
+    .expect("validate canonical inclusion list");
+    let sets = select_authoritative_conformance_sets(&manifest, &ids)
+        .expect("every canonical inclusion ID must map to exactly one manifest entry");
+    validate_snapshot_artifact_paths(&snapshot, &manifest)
+        .expect("every manifest artifact entry must be tracked by the source commit");
+
+    assert_eq!(
+        ids.len(),
+        EXPECTED_CANONICAL_MUST_PASS_EXTENSIONS_V1,
+        "unexpected canonical must-pass denominator"
+    );
+    assert_eq!(sets.must_pass.len(), ids.len());
+    assert_eq!(
+        sets.must_pass.len() + sets.stretch.len(),
+        manifest.extensions.len()
+    );
+}
+
+#[test]
+fn canonical_contract_binds_inclusion_list_and_rejects_source_drift() {
+    assert!(MUST_PASS_SOURCE_PATHS.contains(&MUST_PASS_INCLUSION_PATH));
+
+    let before = MustPassSourceProvenance {
+        git_commit: "commit-a".to_string(),
+        source_tree_sha256: "source-a".to_string(),
+        inclusion_sha256: "inclusion-a".to_string(),
+        manifest_sha256: "manifest-a".to_string(),
+    };
+    assert!(ensure_must_pass_source_unchanged(&before, &before).is_ok());
+
+    let after = MustPassSourceProvenance {
+        inclusion_sha256: "inclusion-b".to_string(),
+        ..before.clone()
+    };
+    let error = ensure_must_pass_source_unchanged(&before, &after)
+        .expect_err("inclusion-list source drift must fail closed");
+    assert!(error.contains("inclusion_sha256"));
+}
+
+/// CI gate test that blocks merge if any canonical inclusion-list extension fails.
 ///
 /// Run with:
 /// `cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture`
@@ -2655,20 +3580,29 @@ fn conformance_must_pass_gate() {
     use chrono::{SecondsFormat, Utc};
     use std::fmt::Write as _;
 
-    let manifest = load_manifest();
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let source_snapshot = capture_must_pass_source_snapshot(repo_root)
+        .expect("capture coherent must-pass release source snapshot");
+    let source_provenance = &source_snapshot.provenance;
+    let git_commit = source_provenance.git_commit.clone();
+    let manifest = parse_manifest(&source_snapshot.manifest_contents)
+        .expect("parse canonical extension manifest from source commit");
+    let authoritative_ids = parse_authoritative_must_pass_ids(
+        &source_snapshot.inclusion_contents,
+        EXPECTED_CANONICAL_MUST_PASS_EXTENSIONS_V1,
+    )
+    .expect("validate canonical extension inclusion list");
+    let AuthoritativeConformanceSets { must_pass, stretch } =
+        select_authoritative_conformance_sets(&manifest, &authoritative_ids)
+            .expect("map canonical inclusion-list IDs to the validated manifest");
+    validate_snapshot_artifact_paths(&source_snapshot, &manifest)
+        .expect("bind every manifest artifact entry to the canonical source commit");
 
-    // ── Read gate configuration ──
-    let min_pass_rate: f64 = std::env::var("PI_EXT_GATE_MUST_PASS_RATE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100.0);
-    let max_failures: usize = std::env::var("PI_EXT_GATE_MAX_FAILURES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    let mode = std::env::var("PI_EXT_GATE_MODE")
-        .unwrap_or_else(|_| "strict".to_string())
-        .to_lowercase();
+    // The canonical release-blocking corpus is deliberately not configurable:
+    // every authoritative inclusion-list entry must run and pass.
+    let min_pass_rate = 100.0;
+    let max_failures = 0;
+    let mode = "strict".to_string();
     let now = Utc::now();
     let generated_at = now.to_rfc3339_opts(SecondsFormat::Millis, true);
     let (run_id, correlation_id) = current_must_pass_gate_lineage(now);
@@ -2680,27 +3614,25 @@ fn conformance_must_pass_gate() {
         .join("gate");
     let _ = std::fs::create_dir_all(&report_dir);
 
-    // ── Partition extensions into must-pass (tier 1-2) and stretch (tier 3+) ──
-    let must_pass: Vec<&ManifestEntry> = manifest
-        .extensions
-        .iter()
-        .filter(|e| e.conformance_tier <= 2)
-        .collect();
-    let stretch: Vec<&ManifestEntry> = manifest
-        .extensions
-        .iter()
-        .filter(|e| e.conformance_tier > 2)
-        .collect();
-
     eprintln!("\n=== Must-Pass Extension CI Gate (bd-1f42.4.4) ===");
     eprintln!("  Mode:            {mode}");
     eprintln!("  Run ID:          {run_id}");
     eprintln!("  Correlation ID:  {correlation_id}");
+    eprintln!("  Git commit:      {git_commit}");
     eprintln!(
-        "  Must-pass set:   {} extensions (tier 1-2)",
+        "  Source digest:   {}",
+        source_provenance.source_tree_sha256
+    );
+    eprintln!("  Inclusion digest: {}", source_provenance.inclusion_sha256);
+    eprintln!("  Manifest digest: {}", source_provenance.manifest_sha256);
+    eprintln!(
+        "  Must-pass set:   {} canonical inclusion-list extensions",
         must_pass.len()
     );
-    eprintln!("  Stretch set:     {} extensions (tier 3+)", stretch.len());
+    eprintln!(
+        "  Stretch set:     {} manifest extensions outside the canonical set",
+        stretch.len()
+    );
     eprintln!("  Min pass rate:   {min_pass_rate:.1}%");
     eprintln!("  Max failures:    {max_failures}");
     eprintln!();
@@ -2726,7 +3658,7 @@ fn conformance_must_pass_gate() {
             continue;
         }
         eprint!("  [{:>3}/{}] {:<50} ", idx + 1, must_pass.len(), entry.id);
-        let result = try_conformance(&entry.id);
+        let result = try_conformance_with_manifest(&manifest, &entry.id);
         eprintln!(
             "{:<6} ({}ms)",
             result.status.to_uppercase(),
@@ -2756,7 +3688,7 @@ fn conformance_must_pass_gate() {
             continue;
         }
         eprint!("  [{:>3}/{}] {:<50} ", idx + 1, stretch.len(), entry.id);
-        let result = try_conformance(&entry.id);
+        let result = try_conformance_with_manifest(&manifest, &entry.id);
         eprintln!(
             "{:<6} ({}ms)",
             result.status.to_uppercase(),
@@ -2764,6 +3696,11 @@ fn conformance_must_pass_gate() {
         );
         stretch_results.push(result);
     }
+
+    let source_snapshot_after = capture_must_pass_source_snapshot(repo_root)
+        .expect("must-pass source inputs changed or became untracked during execution");
+    ensure_must_pass_source_unchanged(source_provenance, &source_snapshot_after.provenance)
+        .expect("must-pass source provenance changed during extension execution");
 
     // ── Compute statistics ──
     let mp_pass = mp_results.iter().filter(|r| r.status == "pass").count();
@@ -2791,22 +3728,17 @@ fn conformance_must_pass_gate() {
     let st_tested = st_pass + st_fail;
 
     // ── Gate checks ──
-    let rate_ok = mp_pass_rate >= min_pass_rate;
-    let count_ok = mp_fail <= max_failures;
-    let gate_pass = rate_ok && count_ok;
+    let rate_ok = mp_pass_rate == min_pass_rate;
+    let count_ok = mp_fail == max_failures;
+    let coverage_ok = mp_tested == must_pass.len();
+    let gate_pass = must_pass_gate_passes(mp_pass, mp_fail, mp_skip, must_pass.len());
 
-    let status = if gate_pass {
-        "pass".to_string()
-    } else if mode == "warn" {
-        "warn".to_string()
-    } else {
-        "fail".to_string()
-    };
+    let status = if gate_pass { "pass" } else { "fail" }.to_string();
 
     // ── Build blocking failure list with reproduce commands ──
     let blocking_failures: Vec<serde_json::Value> = mp_results
         .iter()
-        .filter(|r| r.status == "fail")
+        .filter(|r| r.status != "pass")
         .map(|r| {
             let test_fn = format!("ext_{}", r.id.replace(['/', '-'], "_"));
             let category = FailureCategory::classify(r.failure_reason.as_deref().unwrap_or(""));
@@ -2823,6 +3755,7 @@ fn conformance_must_pass_gate() {
             })
         })
         .collect();
+    let has_blocking_failures = !blocking_failures.is_empty();
 
     let checks = vec![
         serde_json::json!({
@@ -2839,6 +3772,13 @@ fn conformance_must_pass_gate() {
             "threshold": max_failures,
             "ok": count_ok,
         }),
+        serde_json::json!({
+            "id": "must_pass_complete_coverage",
+            "description": "Every canonical must-pass entry was exercised",
+            "actual": mp_tested,
+            "threshold": must_pass.len(),
+            "ok": coverage_ok,
+        }),
     ];
 
     let verdict = MustPassGateVerdict {
@@ -2846,6 +3786,10 @@ fn conformance_must_pass_gate() {
         generated_at,
         run_id: run_id.clone(),
         correlation_id: correlation_id.clone(),
+        git_commit: git_commit.clone(),
+        source_tree_sha256: source_provenance.source_tree_sha256.clone(),
+        inclusion_sha256: source_provenance.inclusion_sha256.clone(),
+        manifest_sha256: source_provenance.manifest_sha256.clone(),
         mode: mode.clone(),
         status: status.clone(),
         thresholds: MustPassThresholds {
@@ -2896,6 +3840,10 @@ fn conformance_must_pass_gate() {
             "set": "must_pass",
             "run_id": run_id.clone(),
             "correlation_id": correlation_id.clone(),
+            "git_commit": git_commit.clone(),
+            "source_tree_sha256": source_provenance.source_tree_sha256.clone(),
+            "inclusion_sha256": source_provenance.inclusion_sha256.clone(),
+            "manifest_sha256": source_provenance.manifest_sha256.clone(),
             "id": r.id,
             "tier": r.tier,
             "status": r.status,
@@ -2903,7 +3851,8 @@ fn conformance_must_pass_gate() {
             "duration_ms": r.duration_ms,
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         });
-        event_lines.push(serde_json::to_string(&line).unwrap_or_default());
+        event_lines
+            .push(serde_json::to_string(&line).expect("serialize must-pass gate event JSONL row"));
     }
     for r in &stretch_results {
         let line = serde_json::json!({
@@ -2911,6 +3860,10 @@ fn conformance_must_pass_gate() {
             "set": "stretch",
             "run_id": run_id.clone(),
             "correlation_id": correlation_id.clone(),
+            "git_commit": git_commit.clone(),
+            "source_tree_sha256": source_provenance.source_tree_sha256.clone(),
+            "inclusion_sha256": source_provenance.inclusion_sha256.clone(),
+            "manifest_sha256": source_provenance.manifest_sha256.clone(),
             "id": r.id,
             "tier": r.tier,
             "status": r.status,
@@ -2918,7 +3871,8 @@ fn conformance_must_pass_gate() {
             "duration_ms": r.duration_ms,
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         });
-        event_lines.push(serde_json::to_string(&line).unwrap_or_default());
+        event_lines
+            .push(serde_json::to_string(&line).expect("serialize stretch gate event JSONL row"));
     }
     let events_payload = event_lines.join("\n") + "\n";
     assert!(
@@ -2937,6 +3891,22 @@ fn conformance_must_pass_gate() {
     );
     let _ = writeln!(md, "> Run ID: {run_id}");
     let _ = writeln!(md, "> Correlation ID: {correlation_id}");
+    let _ = writeln!(md, "> Git commit: `{git_commit}`");
+    let _ = writeln!(
+        md,
+        "> Source tree SHA-256: `{}`",
+        source_provenance.source_tree_sha256
+    );
+    let _ = writeln!(
+        md,
+        "> Inclusion-list SHA-256: `{}`",
+        source_provenance.inclusion_sha256
+    );
+    let _ = writeln!(
+        md,
+        "> Manifest SHA-256: `{}`",
+        source_provenance.manifest_sha256
+    );
     let _ = writeln!(md, "> Mode: {mode}\n");
 
     md.push_str("## Gate Verdict\n\n");
@@ -2955,9 +3925,17 @@ fn conformance_must_pass_gate() {
         "| Failure count | {mp_fail} | <={max_failures} | {} |",
         if count_ok { "PASS" } else { "FAIL" }
     );
+    let _ = writeln!(
+        md,
+        "| Complete coverage | {mp_tested}/{} | {}/{} | {} |",
+        must_pass.len(),
+        must_pass.len(),
+        must_pass.len(),
+        if coverage_ok { "PASS" } else { "FAIL" }
+    );
     md.push('\n');
 
-    md.push_str("## Must-Pass Set (Tier 1-2)\n\n");
+    md.push_str("## Canonical Must-Pass Set (Tier-1 + Tier-1 Review)\n\n");
     md.push_str("| Metric | Value |\n|--------|-------|\n");
     let _ = writeln!(md, "| Total | {} |", must_pass.len());
     let _ = writeln!(md, "| Tested | {mp_tested} |");
@@ -2967,9 +3945,9 @@ fn conformance_must_pass_gate() {
     let _ = writeln!(md, "| Pass rate | {mp_pass_rate:.1}% |");
     md.push('\n');
 
-    if mp_fail > 0 {
+    if has_blocking_failures {
         md.push_str("## Blocking Failures\n\n");
-        for r in mp_results.iter().filter(|r| r.status == "fail") {
+        for r in mp_results.iter().filter(|r| r.status != "pass") {
             let test_fn = format!("ext_{}", r.id.replace(['/', '-'], "_"));
             let _ = writeln!(md, "### {}\n", r.id);
             let _ = writeln!(md, "- **Tier:** {}", r.tier);
@@ -2993,7 +3971,7 @@ fn conformance_must_pass_gate() {
         }
     }
 
-    md.push_str("## Stretch Set (Tier 3+) — Non-Blocking\n\n");
+    md.push_str("## Manifest Entries Outside the Canonical Set — Non-Blocking\n\n");
     md.push_str("| Metric | Value |\n|--------|-------|\n");
     let _ = writeln!(md, "| Total | {} |", stretch.len());
     let _ = writeln!(md, "| Tested | {st_tested} |");
@@ -3033,9 +4011,9 @@ fn conformance_must_pass_gate() {
     eprintln!("  Mode:       {mode}");
     eprintln!("  Must-pass:  {mp_pass}/{mp_tested} passed ({mp_pass_rate:.1}%)");
     eprintln!("  Stretch:    {st_pass}/{st_tested} passed (non-blocking)");
-    if mp_fail > 0 {
+    if has_blocking_failures {
         eprintln!("  Blocking failures:");
-        for r in mp_results.iter().filter(|r| r.status == "fail") {
+        for r in mp_results.iter().filter(|r| r.status != "pass") {
             eprintln!(
                 "    - {} ({})",
                 r.id,
@@ -3050,12 +4028,18 @@ fn conformance_must_pass_gate() {
     eprintln!("    MD:      {}", md_path.display());
     eprintln!();
 
-    // ── Hard gate: fail the test if must-pass set doesn't meet thresholds ──
+    let final_source_snapshot = capture_must_pass_source_snapshot(repo_root)
+        .expect("must-pass source inputs changed while writing gate evidence");
+    ensure_must_pass_source_unchanged(source_provenance, &final_source_snapshot.provenance)
+        .expect("must-pass source provenance changed while writing gate evidence");
+
+    // ── Hard gate: every canonical must-pass extension must pass ──
     assert!(
-        mode != "strict" || gate_pass,
+        gate_pass,
         "GATE BLOCKED: Must-pass extension conformance failed.\n\
          Pass rate: {mp_pass_rate:.1}% (min: {min_pass_rate:.1}%)\n\
          Failures: {mp_fail} (max: {max_failures})\n\
+         Skipped: {mp_skip} (must be 0)\n\
          See: {}\n\
          Run dossiers: cargo test --test ext_conformance_generated --features ext-conformance -- conformance_failure_dossiers --nocapture",
         verdict_path.display()
@@ -4187,7 +5171,7 @@ fn run_category_journey(
     }
 }
 
-/// End-user CLI extension journey test for the 208 must-pass set.
+/// End-user CLI extension journey test for the canonical tier 1-2 must-pass set.
 ///
 /// Run with:
 /// `cargo test --test ext_conformance_generated --features ext-conformance -- conformance_extension_journeys --nocapture`

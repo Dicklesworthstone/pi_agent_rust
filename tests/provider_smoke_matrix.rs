@@ -1220,23 +1220,23 @@ fn smoke_credentialed_openai_completions_presets_use_bearer_auth() {
         if meta.onboarding != ProviderOnboardingMode::OpenAICompatiblePreset {
             continue;
         }
-        if let Some(defaults) = meta.routing_defaults {
-            if defaults.api == "openai-completions" {
-                if meta.auth_env_keys.is_empty() {
-                    assert!(
-                        !defaults.auth_header,
-                        "local/no-auth preset {} should not require bearer auth",
-                        meta.canonical_id
-                    );
-                    continue;
-                }
+        if let Some(defaults) = meta.routing_defaults
+            && defaults.api == "openai-completions"
+        {
+            if meta.auth_env_keys.is_empty() {
                 assert!(
-                    defaults.auth_header,
-                    "openai-completions preset {} should have auth_header=true",
+                    !defaults.auth_header,
+                    "local/no-auth preset {} should not require bearer auth",
                     meta.canonical_id
                 );
-                checked += 1;
+                continue;
             }
+            assert!(
+                defaults.auth_header,
+                "openai-completions preset {} should have auth_header=true",
+                meta.canonical_id
+            );
+            checked += 1;
         }
     }
 

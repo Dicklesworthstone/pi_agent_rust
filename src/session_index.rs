@@ -809,10 +809,10 @@ pub(crate) fn session_file_stats(path: &Path) -> Result<(i64, u64)> {
 }
 
 pub(crate) fn is_session_file_path(path: &Path) -> bool {
-    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        if name.starts_with("session-index.") {
-            return false;
-        }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str())
+        && name.starts_with("session-index.")
+    {
+        return false;
     }
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("jsonl") => true,
@@ -866,10 +866,11 @@ pub(crate) fn walk_sessions(root: &Path) -> Vec<std::io::Result<PathBuf>> {
                     stack.push(path);
                 } else if file_type.is_symlink() {
                     // Allow symlinks to files, but skip symlinked directories to avoid cycles
-                    if let Ok(meta) = fs::metadata(&path) {
-                        if meta.is_file() && is_session_file_path(&path) {
-                            out.push(Ok(path));
-                        }
+                    if let Ok(meta) = fs::metadata(&path)
+                        && meta.is_file()
+                        && is_session_file_path(&path)
+                    {
+                        out.push(Ok(path));
                     }
                 } else if is_session_file_path(&path) {
                     out.push(Ok(path));

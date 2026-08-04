@@ -172,16 +172,13 @@ pub fn canonicalize_response(mut response: Value) -> Value {
         obj.retain(|key, _| !is_nondeterministic_response_key(key));
         canonicalize_fixture_model_inventory(obj);
 
-        // Canonicalize paths to be relative
-        if let Some(path) = obj.get_mut("path") {
-            if let Some(path_str) = path.as_str() {
-                // Convert absolute paths to relative
-                if let Ok(canonical) = std::path::Path::new(path_str).canonicalize() {
-                    if let Some(file_name) = canonical.file_name() {
-                        *path = json!(file_name);
-                    }
-                }
-            }
+        // Canonicalize paths to be relative.
+        if let Some(path) = obj.get_mut("path")
+            && let Some(path_str) = path.as_str()
+            && let Ok(canonical) = std::path::Path::new(path_str).canonicalize()
+            && let Some(file_name) = canonical.file_name()
+        {
+            *path = json!(file_name);
         }
 
         // Recursively canonicalize nested objects

@@ -21,13 +21,18 @@ jobs:
       TMPDIR: /tmp/pi-agent-rust-tmp
       CI_RUN_ID: weekly-${{ github.run_id }}
       CI_CORRELATION_ID: weekly-${{ github.run_id }}
+      EXPECTED_SOURCE_SHA: ${{ github.sha }}
+      PRE_REFRESH_SNAPSHOT: /tmp/weekly-certification-pre-refresh-${{ github.run_id }}.json
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy
 
       - name: Prepare temp directories
@@ -35,151 +40,819 @@ jobs:
           set -euxo pipefail
           mkdir -p "$CARGO_TARGET_DIR" "$TMPDIR"
 
-      - name: Refresh must-pass extension gate
-        continue-on-error: true
+      - name: Snapshot pre-refresh artifact state
         run: |
           set -euxo pipefail
-          cargo test --test ext_conformance_generated --features ext-conformance \
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          paths = [
+              "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+              "tests/ext_conformance/reports/lifecycle_hooks/lifecycle_hook_parity_matrix.json",
+              "tests/ext_conformance/reports/journeys/journey_report.json",
+              "tests/ext_conformance/reports/health_delta/health_delta_report.json",
+              "tests/perf/reports/stress_triage.json",
+              "tests/evidence_bundle/index.json",
+              "tests/full_suite_gate/full_suite_verdict.json",
+              "tests/full_suite_gate/certification_verdict.json",
+              "docs/evidence/dropin-certification-verdict.json",
+          ]
+          snapshot = {}
+          for raw_path in paths:
+              path = Path(raw_path)
+              snapshot[raw_path] = (
+                  hashlib.sha256(path.read_bytes()).hexdigest()
+                  if path.is_file()
+                  else None
+              )
+          snapshot_path = Path(os.environ["PRE_REFRESH_SNAPSHOT"])
+          snapshot_path.write_text(
+              json.dumps(snapshot, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          print(f"Recorded {len(snapshot)} pre-refresh artifact fingerprints")
+          PY
+
+      - name: Refresh must-pass extension gate
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test ext_conformance_generated --features ext-conformance \
             -- conformance_must_pass_gate --nocapture --exact
 
       - name: Refresh extension lifecycle parity evidence
-        continue-on-error: true
         run: |
           set -euxo pipefail
-          cargo test --test extensions_event_wiring \
+          cargo test --locked --test extensions_event_wiring \
             -- lifecycle_hook_parity_matrix_writes_evidence_artifact --nocapture --exact
 
       - name: Refresh extension journey report
-        continue-on-error: true
         run: |
           set -euxo pipefail
-          cargo test --test ext_conformance_generated --features ext-conformance \
+          cargo test --locked --test ext_conformance_generated --features ext-conformance \
             -- conformance_extension_journeys --nocapture --exact
 
       - name: Refresh extension health delta
-        continue-on-error: true
+        env:
+          PI_HEALTH_FAIL_ON_REGRESSION: "1"
         run: |
           set -euxo pipefail
-          cargo test --test ext_conformance_generated --features ext-conformance \
+          cargo test --locked --test ext_conformance_generated --features ext-conformance \
             -- conformance_health_delta --nocapture --exact
 
       - name: Refresh stress triage report
-        continue-on-error: true
         run: |
           set -euxo pipefail
-          cargo test --test extensions_stress \
+          cargo test --locked --test extensions_stress \
             -- stress_short_10_extensions --nocapture --exact
           mkdir -p tests/perf/reports
           cp "$CARGO_TARGET_DIR/perf/stress_triage.json" tests/perf/reports/stress_triage.json
 
-      - name: Refresh evidence bundle
-        continue-on-error: true
+      - name: Commit source-bound extension evidence
         run: |
           set -euxo pipefail
-          cargo test --test ci_evidence_bundle \
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            tests/ext_conformance/reports/gate/ \
+            tests/ext_conformance/reports/lifecycle_hooks/ \
+            tests/ext_conformance/reports/journeys/ \
+            tests/ext_conformance/reports/health_delta/ \
+            tests/perf/reports/stress_triage.json
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "::error::The extension evidence producers did not refresh any tracked bytes"
+            exit 1
+          fi
+          git commit -m "Refresh source-bound extension evidence [skip actions]" \
+            -m "Bind regenerated extension evidence to source commit $EXPECTED_SOURCE_SHA before aggregate consumers run."
+
+      - name: Refresh evidence bundle
+        run: |
+          set -euxo pipefail
+          cargo test --locked --test ci_evidence_bundle \
             -- build_evidence_bundle --nocapture --exact
 
       - name: Refresh full-suite gate
-        continue-on-error: true
         run: |
           set -euxo pipefail
-          cargo test --test ci_full_suite_gate \
+          cargo test --locked --test ci_full_suite_gate \
             -- full_suite_gate --nocapture --exact
 
       - name: Refresh certification lane
-        continue-on-error: true
         run: |
           set -euxo pipefail
-          cargo test --test ci_full_suite_gate \
+          cargo test --locked --test ci_full_suite_gate \
             -- full_certification --nocapture --exact
 
       - name: Build drop-in certification verdict artifact
         run: |
           set -euxo pipefail
           python3 - <<'PY'
+          import hashlib
           import json
           import os
+          import re
+          import subprocess
+          import sys
           from datetime import datetime, timezone
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
 
           source_path = Path("tests/full_suite_gate/certification_verdict.json")
+          contract_path = Path("docs/contracts/dropin-certification-contract.json")
           target_path = Path("docs/evidence/dropin-certification-verdict.json")
+          snapshot_path = Path(os.environ["PRE_REFRESH_SNAPSHOT"])
           generated_at = (
               datetime.now(timezone.utc)
               .replace(microsecond=0)
               .isoformat()
               .replace("+00:00", "Z")
           )
+          gate_id_pattern = re.compile(r"G(0[1-9]|1[0-2])-[a-z0-9]+(?:-[a-z0-9]+)*")
+          commit_pattern = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+          windows_drive_pattern = re.compile(r"^[A-Za-z]:")
+          expected_must_pass_count = 208
+          refreshed_artifact_schemas = {
+              "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json":
+                  "pi.ext.must_pass_gate.v1",
+              "tests/ext_conformance/reports/lifecycle_hooks/lifecycle_hook_parity_matrix.json":
+                  "pi.ext.lifecycle_hook_parity_matrix.v1",
+              "tests/ext_conformance/reports/journeys/journey_report.json":
+                  "pi.ext.journey_report.v1",
+              "tests/ext_conformance/reports/health_delta/health_delta_report.json":
+                  "pi.ext.health_delta.v1",
+              "tests/perf/reports/stress_triage.json": "pi.ext.stress_triage.v1",
+              "tests/evidence_bundle/index.json": "pi.ci.evidence_bundle.v1",
+              "tests/full_suite_gate/full_suite_verdict.json":
+                  "pi.ci.full_suite_gate.v1",
+              source_path.as_posix(): "pi.ci.certification_lane.v1",
+          }
 
           def write_payload(payload):
               target_path.parent.mkdir(parents=True, exist_ok=True)
               target_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
               print(f"Wrote {target_path} with overall_verdict={payload.get('overall_verdict')}")
 
-          if not source_path.exists():
-              write_payload({
-                  "schema": "pi.dropin.certification_verdict.v1",
-                  "git_commit": os.environ.get("GITHUB_SHA", "unknown"),
-                  "generated_at_utc": generated_at,
-                  "overall_verdict": "NOT_CERTIFIED",
-                  "hard_gate_results": [],
-                  "blocking_reasons": [f"missing source artifact: {source_path.as_posix()}"],
-                  "evidence_index": [{"path": source_path.as_posix(), "exists": False}],
-                  "source": {
-                      "certification_lane_artifact": source_path.as_posix(),
-                      "lane_verdict": "missing",
-                  },
-              })
-              raise SystemExit(0)
+          def append_unique(items, message):
+              if message not in items:
+                  items.append(message)
 
-          source = json.loads(source_path.read_text(encoding="utf-8"))
-          gates = source.get("gates", [])
+          def sha256_file(path):
+              return hashlib.sha256(path.read_bytes()).hexdigest()
+
+          def load_object(path, label, errors):
+              if path.is_symlink():
+                  append_unique(errors, f"invalid {label}: symlinks are not accepted")
+                  return {}
+              if not path.is_file():
+                  append_unique(errors, f"missing {label}: {path.as_posix()}")
+                  return {}
+              if path.stat().st_size == 0:
+                  append_unique(errors, f"empty {label}: {path.as_posix()}")
+                  return {}
+              try:
+                  payload = json.loads(path.read_text(encoding="utf-8"))
+              except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                  append_unique(errors, f"invalid {label}: {exc}")
+                  return {}
+              if not isinstance(payload, dict):
+                  append_unique(errors, f"invalid {label}: root must be an object")
+                  return {}
+              return payload
+
+          def canonical_repo_path(value):
+              if (
+                  not isinstance(value, str)
+                  or not value
+                  or "\\" in value
+                  or windows_drive_pattern.match(value)
+                  or any(ord(character) < 32 or ord(character) == 127 for character in value)
+              ):
+                  return None
+              pure = PurePosixPath(value)
+              if (
+                  pure.is_absolute()
+                  or pure.as_posix() != value
+                  or any(part in ("", ".", "..") for part in pure.parts)
+              ):
+                  return None
+              return pure.as_posix()
+
+          def regular_nonempty_file(path):
+              return (
+                  not path.is_symlink()
+                  and path.is_file()
+                  and path.stat().st_size > 0
+              )
+
+          def is_unsigned_integer(value):
+              return type(value) is int and value >= 0
+
+          def parse_fresh_timestamp(payload, path, errors):
+              raw = payload.get("generated_at")
+              if not isinstance(raw, str) or not raw:
+                  append_unique(errors, f"{path} missing generated_at")
+                  return
+              try:
+                  parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+              except ValueError:
+                  append_unique(errors, f"{path} has invalid generated_at={raw!r}")
+                  return
+              if parsed.tzinfo is None:
+                  append_unique(errors, f"{path} generated_at must include a timezone")
+                  return
+              age_seconds = (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
+              if age_seconds < -300 or age_seconds > 21600:
+                  append_unique(
+                      errors,
+                      f"{path} generated_at is outside the current-run freshness window",
+                  )
+
+          def git_output(*args):
+              result = subprocess.run(
+                  ["git", *args],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              return result.returncode, result.stdout.strip(), result.stderr.strip()
+
+          integrity_errors = []
+          certification_blockers = []
+          pre_refresh = load_object(snapshot_path, "pre-refresh fingerprint snapshot", integrity_errors)
+
+          expected_source_sha = os.environ.get("EXPECTED_SOURCE_SHA", "").strip()
+          head_status, head_sha, head_stderr = git_output("rev-parse", "--verify", "HEAD^{commit}")
+          if head_status != 0 or not commit_pattern.fullmatch(head_sha):
+              append_unique(
+                  integrity_errors,
+                  f"cannot resolve checkout HEAD: {head_stderr or head_sha or 'unknown error'}",
+              )
+          if not commit_pattern.fullmatch(expected_source_sha):
+              append_unique(integrity_errors, "EXPECTED_SOURCE_SHA is not a full commit id")
+          elif commit_pattern.fullmatch(head_sha):
+              ancestor_status, _, ancestor_stderr = git_output(
+                  "merge-base",
+                  "--is-ancestor",
+                  expected_source_sha,
+                  head_sha,
+              )
+              if ancestor_status != 0:
+                  append_unique(
+                      integrity_errors,
+                      "workflow HEAD is not a descendant of EXPECTED_SOURCE_SHA: "
+                      f"{ancestor_stderr or 'ancestry check failed'}",
+                  )
+              changed_status, changed_paths_raw, changed_stderr = git_output(
+                  "diff",
+                  "--name-only",
+                  "-z",
+                  f"{expected_source_sha}..{head_sha}",
+              )
+              if changed_status != 0:
+                  append_unique(
+                      integrity_errors,
+                      f"cannot inspect evidence-only descendants: {changed_stderr}",
+                  )
+              else:
+                  allowed_prefixes = (
+                      "tests/ext_conformance/reports/",
+                      "tests/perf/reports/",
+                  )
+                  changed_paths = [path for path in changed_paths_raw.split("\0") if path]
+                  disallowed_paths = [
+                      path
+                      for path in changed_paths
+                      if not path.startswith(allowed_prefixes)
+                  ]
+                  if disallowed_paths:
+                      append_unique(
+                          integrity_errors,
+                          "workflow source commit has non-evidence descendants: "
+                          + ", ".join(disallowed_paths[:5]),
+                      )
+          source_commit = expected_source_sha
+          evidence_head_commit = head_sha
+
+          refreshed_payloads = {}
+          for artifact, expected_schema in refreshed_artifact_schemas.items():
+              path = Path(artifact)
+              payload = load_object(path, f"refreshed artifact {artifact}", integrity_errors)
+              refreshed_payloads[artifact] = payload
+              if payload.get("schema") != expected_schema:
+                  append_unique(
+                      integrity_errors,
+                      f"{artifact} schema must be {expected_schema!r}",
+                  )
+              if artifact not in pre_refresh:
+                  append_unique(
+                      integrity_errors,
+                      f"pre-refresh snapshot did not cover {artifact}",
+                  )
+              elif path.is_file() and pre_refresh[artifact] == sha256_file(path):
+                  append_unique(
+                      integrity_errors,
+                      f"{artifact} was not regenerated by this workflow run",
+                  )
+              parse_fresh_timestamp(payload, artifact, integrity_errors)
+
+          must_pass_path = "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json"
+          must_pass = refreshed_payloads.get(must_pass_path, {})
+          if must_pass.get("git_commit") != source_commit:
+              append_unique(
+                  integrity_errors,
+                  f"{must_pass_path} git_commit does not match checkout source commit",
+              )
+          if must_pass.get("run_id") != os.environ.get("GITHUB_RUN_ID"):
+              append_unique(integrity_errors, f"{must_pass_path} run_id does not match this run")
+          if must_pass.get("correlation_id") != os.environ.get("CI_CORRELATION_ID"):
+              append_unique(
+                  integrity_errors,
+                  f"{must_pass_path} correlation_id does not match this run",
+              )
+          if must_pass.get("mode") != "strict":
+              append_unique(certification_blockers, "must-pass extension gate mode is not strict")
+          if must_pass.get("status") != "pass":
+              append_unique(certification_blockers, "must-pass extension gate did not pass")
+          thresholds = must_pass.get("thresholds")
+          if not isinstance(thresholds, dict):
+              append_unique(integrity_errors, "must-pass extension thresholds must be an object")
+          elif (
+              not isinstance(thresholds.get("min_pass_rate_pct"), (int, float))
+              or isinstance(thresholds.get("min_pass_rate_pct"), bool)
+              or thresholds.get("min_pass_rate_pct") != 100.0
+              or not is_unsigned_integer(thresholds.get("max_failures"))
+              or thresholds.get("max_failures") != 0
+          ):
+              append_unique(certification_blockers, "must-pass extension thresholds are not exact")
+          observed = must_pass.get("observed")
+          expected_observed = {
+              "must_pass_total": expected_must_pass_count,
+              "must_pass_tested": expected_must_pass_count,
+              "must_pass_passed": expected_must_pass_count,
+              "must_pass_failed": 0,
+              "must_pass_skipped": 0,
+              "must_pass_pass_rate_pct": 100.0,
+          }
+          if not isinstance(observed, dict):
+              append_unique(integrity_errors, "must-pass extension observed counts must be an object")
+          else:
+              for field, expected_value in expected_observed.items():
+                  actual_value = observed.get(field)
+                  valid_type = (
+                      isinstance(actual_value, (int, float))
+                      and not isinstance(actual_value, bool)
+                      if field == "must_pass_pass_rate_pct"
+                      else is_unsigned_integer(actual_value)
+                  )
+                  if not valid_type or actual_value != expected_value:
+                      append_unique(
+                          certification_blockers,
+                          f"must-pass extension {field}={actual_value!r}, expected {expected_value}",
+                      )
+
+          lifecycle = refreshed_payloads.get(
+              "tests/ext_conformance/reports/lifecycle_hooks/lifecycle_hook_parity_matrix.json",
+              {},
+          )
+          if lifecycle.get("status") != "pass":
+              append_unique(certification_blockers, "extension lifecycle parity did not pass")
+
+          journey = refreshed_payloads.get(
+              "tests/ext_conformance/reports/journeys/journey_report.json",
+              {},
+          )
+          expected_journey = {
+              "must_pass_count": expected_must_pass_count,
+              "tested": expected_must_pass_count,
+              "passed": expected_must_pass_count,
+              "failed": 0,
+              "skipped": 0,
+              "pass_rate_pct": 100.0,
+          }
+          for field, expected_value in expected_journey.items():
+              actual_value = journey.get(field)
+              valid_type = (
+                  isinstance(actual_value, (int, float))
+                  and not isinstance(actual_value, bool)
+                  if field == "pass_rate_pct"
+                  else is_unsigned_integer(actual_value)
+              )
+              if not valid_type or actual_value != expected_value:
+                  append_unique(
+                      certification_blockers,
+                      f"extension journey {field}={actual_value!r}, expected {expected_value}",
+                  )
+
+          health = refreshed_payloads.get(
+              "tests/ext_conformance/reports/health_delta/health_delta_report.json",
+              {},
+          )
+          if (
+              not is_unsigned_integer(health.get("total_regressions"))
+              or health.get("total_regressions") != 0
+          ):
+              append_unique(certification_blockers, "extension health delta reports regressions")
+
+          stress = refreshed_payloads.get("tests/perf/reports/stress_triage.json", {})
+          if stress.get("run_id") != os.environ.get("CI_RUN_ID"):
+              append_unique(integrity_errors, "stress triage run_id does not match this run")
+          if stress.get("correlation_id") != os.environ.get("CI_CORRELATION_ID"):
+              append_unique(integrity_errors, "stress triage correlation_id does not match this run")
+          if stress.get("pass") is not True:
+              append_unique(certification_blockers, "stress triage did not pass")
+
+          short_status, short_sha, short_stderr = git_output("rev-parse", "--short", "HEAD")
+          if short_status != 0 or not short_sha:
+              append_unique(
+                  integrity_errors,
+                  f"cannot resolve abbreviated checkout commit: {short_stderr or 'unknown error'}",
+              )
+          evidence_bundle = refreshed_payloads.get("tests/evidence_bundle/index.json", {})
+          if evidence_bundle.get("git_ref") != short_sha:
+              append_unique(integrity_errors, "evidence bundle git_ref does not match checkout HEAD")
+          if evidence_bundle.get("ci_run_id") != os.environ.get("GITHUB_RUN_ID"):
+              append_unique(integrity_errors, "evidence bundle ci_run_id does not match this run")
+          evidence_summary = evidence_bundle.get("summary")
+          if not isinstance(evidence_summary, dict):
+              append_unique(integrity_errors, "evidence bundle summary must be an object")
+          elif evidence_summary.get("verdict") not in {"complete", "partial"}:
+              append_unique(certification_blockers, "evidence bundle verdict is insufficient")
+
+          full_suite = refreshed_payloads.get("tests/full_suite_gate/full_suite_verdict.json", {})
+          full_suite_gates = full_suite.get("gates")
+          if not isinstance(full_suite_gates, list) or not full_suite_gates:
+              append_unique(integrity_errors, "full-suite gates must be a non-empty array")
+          else:
+              full_suite_ids = []
+              for index, gate in enumerate(full_suite_gates):
+                  if not isinstance(gate, dict):
+                      append_unique(
+                          integrity_errors,
+                          f"full-suite gate[{index}] must be an object",
+                      )
+                      continue
+                  gate_id = gate.get("id")
+                  if not isinstance(gate_id, str) or not gate_id or gate_id in full_suite_ids:
+                      append_unique(
+                          integrity_errors,
+                          f"full-suite gate[{index}] has an invalid or duplicate id",
+                      )
+                  else:
+                      full_suite_ids.append(gate_id)
+                  if gate.get("status") not in {"pass", "fail", "warn", "skip"}:
+                      append_unique(
+                          integrity_errors,
+                          f"full-suite gate[{index}] has an invalid status",
+                      )
+              full_summary = full_suite.get("summary")
+              if not isinstance(full_summary, dict):
+                  append_unique(integrity_errors, "full-suite summary must be an object")
+              else:
+                  full_counts = [
+                      full_summary.get(field)
+                      for field in ("passed", "failed", "warned", "skipped")
+                  ]
+                  if (
+                      full_summary.get("total_gates") != len(full_suite_gates)
+                      or not all(is_unsigned_integer(value) for value in full_counts)
+                      or sum(full_counts) != len(full_suite_gates)
+                  ):
+                      append_unique(integrity_errors, "full-suite summary counts are incoherent")
+          if full_suite.get("verdict") not in {"pass", "warn", "fail"}:
+              append_unique(integrity_errors, "full-suite verdict is invalid")
+
+          contract = load_object(contract_path, "drop-in certification contract", integrity_errors)
+          source = refreshed_payloads.get(source_path.as_posix(), {})
+
+          if contract.get("schema") != "pi.dropin.certification_contract.v1":
+              append_unique(integrity_errors, "unsupported drop-in certification contract schema")
+          enforcement = contract.get("release_process_enforcement")
+          verdict_spec = (
+              enforcement.get("verdict_artifact_contract")
+              if isinstance(enforcement, dict)
+              else None
+          )
+          required_verdict_fields = {
+              "git_commit",
+              "generated_at_utc",
+              "overall_verdict",
+              "hard_gate_results",
+              "blocking_reasons",
+              "evidence_index",
+          }
+          if not isinstance(verdict_spec, dict):
+              append_unique(integrity_errors, "contract verdict_artifact_contract must be an object")
+          else:
+              if verdict_spec.get("path") != target_path.as_posix():
+                  append_unique(
+                      integrity_errors,
+                      "contract verdict path does not name the canonical target",
+                  )
+              if verdict_spec.get("schema") != "pi.dropin.certification_verdict.v1":
+                  append_unique(integrity_errors, "contract names an unsupported verdict schema")
+              required_fields = verdict_spec.get("required_fields")
+              if (
+                  not isinstance(required_fields, list)
+                  or len(required_fields) != len(set(required_fields))
+                  or set(required_fields) != required_verdict_fields
+              ):
+                  append_unique(
+                      integrity_errors,
+                      "contract verdict required_fields do not match the v1 schema",
+                  )
+
+          contract_gates = contract.get("hard_gates")
+          gate_specs = []
+          if not isinstance(contract_gates, list):
+              append_unique(integrity_errors, "contract hard_gates must be an array")
+          else:
+              seen_gate_ids = set()
+              for index, gate in enumerate(contract_gates, start=1):
+                  if not isinstance(gate, dict):
+                      append_unique(
+                          integrity_errors,
+                          f"contract hard_gates[{index - 1}] must be an object",
+                      )
+                      continue
+                  gate_id = gate.get("gate_id")
+                  match = gate_id_pattern.fullmatch(gate_id) if isinstance(gate_id, str) else None
+                  if match is None or int(match.group(1)) != index:
+                      append_unique(
+                          integrity_errors,
+                          f"contract hard_gates[{index - 1}] must be canonical gate G{index:02d}",
+                      )
+                      continue
+                  if gate_id in seen_gate_ids:
+                      append_unique(integrity_errors, f"duplicate contract hard gate: {gate_id}")
+                      continue
+                  seen_gate_ids.add(gate_id)
+                  blocking = gate.get("blocking")
+                  if not isinstance(blocking, bool):
+                      append_unique(
+                          integrity_errors,
+                          f"contract hard gate {gate_id} blocking must be boolean",
+                      )
+                      continue
+                  bead = gate.get("owner_issue_primary")
+                  if not isinstance(bead, str) or not bead:
+                      append_unique(
+                          integrity_errors,
+                          f"contract hard gate {gate_id} owner_issue_primary must be non-empty",
+                      )
+                      continue
+                  required_artifacts = gate.get("required_artifacts")
+                  if not isinstance(required_artifacts, list) or not required_artifacts:
+                      append_unique(
+                          integrity_errors,
+                          f"contract hard gate {gate_id} required_artifacts must be non-empty",
+                      )
+                      continue
+                  canonical_artifacts = [canonical_repo_path(path) for path in required_artifacts]
+                  if any(path is None for path in canonical_artifacts):
+                      append_unique(
+                          integrity_errors,
+                          f"contract hard gate {gate_id} has a non-canonical required artifact",
+                      )
+                      continue
+                  if len(canonical_artifacts) != len(set(canonical_artifacts)):
+                      append_unique(
+                          integrity_errors,
+                          f"contract hard gate {gate_id} repeats a required artifact",
+                      )
+                      continue
+                  gate_specs.append(
+                      {
+                          "gate_id": gate_id,
+                          "blocking": blocking,
+                          "required_artifacts": canonical_artifacts,
+                          "bead": bead,
+                      }
+                  )
+              if len(contract_gates) != 12 or len(gate_specs) != 12:
+                  append_unique(
+                      integrity_errors,
+                      "contract must define exactly the ordered G01-G12 gate set; "
+                      f"found {len(gate_specs)} valid gates",
+                  )
+
+          source_gates = source.get("gates")
+          source_gate_by_id = {}
+          source_gate_ids = []
+          if not isinstance(source_gates, list) or not source_gates:
+              append_unique(integrity_errors, "certification lane gates must be a non-empty array")
+          else:
+              for index, gate in enumerate(source_gates):
+                  if (
+                      not isinstance(gate, dict)
+                      or not isinstance(gate.get("id"), str)
+                      or not gate["id"]
+                  ):
+                      append_unique(
+                          integrity_errors,
+                          f"certification lane gate[{index}] is malformed",
+                      )
+                      continue
+                  gate_id = gate["id"]
+                  if gate_id in source_gate_by_id:
+                      append_unique(
+                          integrity_errors,
+                          f"duplicate certification lane gate: {gate_id}",
+                      )
+                      continue
+                  if gate.get("status") not in {"pass", "fail", "warn", "skip", "blocked", "waived"}:
+                      append_unique(
+                          integrity_errors,
+                          f"certification lane gate {gate_id} has invalid status",
+                      )
+                  if not isinstance(gate.get("blocking"), bool):
+                      append_unique(
+                          integrity_errors,
+                          f"certification lane gate {gate_id} blocking must be boolean",
+                      )
+                  source_gate_ids.append(gate_id)
+                  source_gate_by_id[gate_id] = gate
+
+          if source.get("lane") != "full":
+              append_unique(integrity_errors, "certification lane must identify lane='full'")
+          if source.get("verdict") not in {"pass", "warn", "fail"}:
+              append_unique(integrity_errors, "certification lane verdict is invalid")
+          source_summary = source.get("summary")
+          if not isinstance(source_summary, dict):
+              append_unique(integrity_errors, "certification lane summary must be an object")
+          elif isinstance(source_gates, list):
+              source_counts = [
+                  source_summary.get(field)
+                  for field in ("passed", "failed", "warned", "skipped", "waived")
+              ]
+              if (
+                  source_summary.get("total_gates") != len(source_gates)
+                  or not all(is_unsigned_integer(value) for value in source_counts)
+                  or sum(source_counts) != len(source_gates)
+              ):
+                  append_unique(
+                      integrity_errors,
+                      "certification lane summary counts are incoherent",
+                  )
+
+          expected_gate_ids = [spec["gate_id"] for spec in gate_specs]
+          if source_gate_ids != expected_gate_ids:
+              append_unique(
+                  certification_blockers,
+                  "certification lane gate IDs/order do not match the exact contract G01-G12 set",
+              )
+
           hard_gate_results = []
-          blocking_reasons = []
-          evidence_index = []
+          blocking_reasons = list(integrity_errors) + list(certification_blockers)
+          evidence_by_path = {}
+          for spec in gate_specs:
+              gate_id = spec["gate_id"]
+              required_artifacts = spec["required_artifacts"]
+              for artifact_path in required_artifacts:
+                  artifact = Path(artifact_path)
+                  exists = regular_nonempty_file(artifact)
+                  evidence_by_path.setdefault(
+                      artifact_path,
+                      {
+                          "path": artifact_path,
+                          "exists": exists,
+                          "sha256": sha256_file(artifact) if exists else None,
+                      },
+                  )
 
-          for gate in gates:
-              gate_id = str(gate.get("id", "unknown"))
-              status = str(gate.get("status", "unknown")).lower()
-              blocking = bool(gate.get("blocking", False))
-              detail = gate.get("detail")
-              artifact_path = gate.get("artifact_path")
+              source_gate = source_gate_by_id.get(gate_id)
+              failures = []
+              status = "fail"
+              detail = None
+              if source_gate is None:
+                  failures.append("canonical gate is absent from certification lane output")
+              else:
+                  source_status = source_gate.get("status")
+                  if source_status != "pass":
+                      failures.append(f"certification lane status={source_status!r}")
+                  if source_gate.get("blocking") is not spec["blocking"]:
+                      failures.append(
+                          "certification lane blocking="
+                          f"{source_gate.get('blocking')!r}, expected {spec['blocking']}"
+                      )
+                  source_artifacts = source_gate.get("artifact_paths")
+                  if source_artifacts is None and isinstance(source_gate.get("artifact_path"), str):
+                      source_artifacts = [source_gate["artifact_path"]]
+                  if source_artifacts != required_artifacts:
+                      failures.append("certification lane artifact paths do not match the contract")
+                  source_detail = source_gate.get("detail")
+                  if source_detail is not None and not isinstance(source_detail, str):
+                      failures.append("certification lane detail must be a string or null")
+                  elif source_detail:
+                      detail = source_detail
 
-              hard_gate_results.append({
-                  "gate_id": gate_id,
-                  "status": status,
-                  "blocking": blocking,
-                  "detail": detail,
-                  "artifact_path": artifact_path,
-                  "bead": gate.get("bead"),
-              })
+              missing_artifacts = [
+                  path
+                  for path in required_artifacts
+                  if not regular_nonempty_file(Path(path))
+              ]
+              if missing_artifacts:
+                  failures.append("missing or empty required artifacts: " + ", ".join(missing_artifacts))
 
-              if blocking and status != "pass":
-                  reason = f"{gate_id}:{status}"
-                  if detail:
-                      reason = f"{reason} ({detail})"
-                  blocking_reasons.append(reason)
+              if not failures:
+                  status = "pass"
+              else:
+                  failure_detail = "; ".join(failures)
+                  detail = f"{detail}; {failure_detail}" if detail else failure_detail
+                  append_unique(blocking_reasons, f"{gate_id}:fail ({failure_detail})")
+              hard_gate_results.append(
+                  {
+                      "gate_id": gate_id,
+                      "status": status,
+                      "blocking": spec["blocking"],
+                      "detail": detail,
+                      "artifact_paths": required_artifacts,
+                      "bead": spec["bead"],
+                  }
+              )
 
-              if isinstance(artifact_path, str) and artifact_path:
-                  evidence_index.append({
-                      "path": artifact_path,
-                      "exists": Path(artifact_path).exists(),
-                  })
+          lane_verdict = source.get("verdict", "missing")
+          if lane_verdict != "pass":
+              append_unique(
+                  blocking_reasons,
+                  f"certification lane verdict={lane_verdict!r} (expected 'pass')",
+              )
 
-          write_payload({
+          overall_verdict = (
+              "CERTIFIED"
+              if source_commit == expected_source_sha
+              and len(hard_gate_results) == 12
+              and [gate["gate_id"] for gate in hard_gate_results] == expected_gate_ids
+              and all(gate["status"] == "pass" for gate in hard_gate_results)
+              and lane_verdict == "pass"
+              and not blocking_reasons
+              else "NOT_CERTIFIED"
+          )
+          payload = {
               "schema": "pi.dropin.certification_verdict.v1",
-              "git_commit": os.environ.get("GITHUB_SHA", "unknown"),
+              "git_commit": source_commit,
               "generated_at_utc": generated_at,
-              "overall_verdict": "CERTIFIED" if not blocking_reasons else "NOT_CERTIFIED",
+              "overall_verdict": overall_verdict,
               "hard_gate_results": hard_gate_results,
               "blocking_reasons": blocking_reasons,
-              "evidence_index": evidence_index,
+              "evidence_index": list(evidence_by_path.values()),
               "source": {
                   "certification_lane_artifact": source_path.as_posix(),
-                  "lane_verdict": source.get("verdict", "unknown"),
+                  "certification_lane_sha256": (
+                      sha256_file(source_path) if source_path.is_file() else None
+                  ),
+                  "checkout_git_commit": evidence_head_commit,
+                  "source_git_commit": source_commit,
+                  "lane_schema": source.get("schema"),
+                  "lane_verdict": lane_verdict,
                   "lane_generated_at": source.get("generated_at"),
+                  "gate_ids": source_gate_ids,
               },
-          })
+          }
+          write_payload(payload)
+
+          written = load_object(target_path, "generated drop-in verdict", integrity_errors)
+          if written.get("schema") != "pi.dropin.certification_verdict.v1":
+              append_unique(integrity_errors, "generated verdict schema is invalid")
+          if written.get("git_commit") != expected_source_sha:
+              append_unique(integrity_errors, "generated verdict source SHA is invalid")
+          written_results = written.get("hard_gate_results")
+          if (
+              not isinstance(written_results, list)
+              or len(written_results) != 12
+              or [gate.get("gate_id") for gate in written_results if isinstance(gate, dict)]
+              != expected_gate_ids
+          ):
+              append_unique(integrity_errors, "generated verdict hard-gate set is not exact G01-G12")
+          elif any(
+              gate.get("status") not in {"pass", "fail"}
+              or not isinstance(gate.get("blocking"), bool)
+              or not isinstance(gate.get("artifact_paths"), list)
+              or not gate.get("artifact_paths")
+              for gate in written_results
+          ):
+              append_unique(integrity_errors, "generated verdict hard-gate records are malformed")
+          old_target_hash = pre_refresh.get(target_path.as_posix())
+          if target_path.is_file() and old_target_hash == sha256_file(target_path):
+              append_unique(integrity_errors, "generated drop-in verdict was not refreshed")
+          if written.get("overall_verdict") == "CERTIFIED" and (
+              integrity_errors
+              or written.get("blocking_reasons")
+              or not isinstance(written_results, list)
+              or any(gate.get("status") != "pass" for gate in written_results)
+          ):
+              append_unique(
+                  integrity_errors,
+                  "generated verdict attempted CERTIFIED with invalid or non-passing evidence",
+              )
+
+          if integrity_errors:
+              print("Certification producer integrity failures:", file=sys.stderr)
+              for error in integrity_errors:
+                  print(f"  - {error}", file=sys.stderr)
+              raise SystemExit(1)
           PY
 
       - name: Open refresh pull request

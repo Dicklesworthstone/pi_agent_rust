@@ -239,7 +239,7 @@ const REGISTRATION_METHODS: &[&str] = &[
 /// It is `MentionOnly` if it references Pi but lacks the protocol implementation.
 /// Otherwise it is `Unknown`.
 #[must_use]
-pub fn classify_from_evidence(evidence: &ValidationEvidence) -> ValidationStatus {
+pub const fn classify_from_evidence(evidence: &ValidationEvidence) -> ValidationStatus {
     let has_registrations = !evidence.registrations.is_empty();
 
     if evidence.has_api_import && (evidence.has_export_default || has_registrations) {
@@ -495,10 +495,10 @@ pub fn run_validation_pipeline(
                 .unwrap_or_else(|| npm_canonical.clone());
 
             let mut aliases = vec![npm_canonical.clone()];
-            if let Some(ref gc) = github_canonical {
-                if *gc != target_id {
-                    aliases.push(gc.clone());
-                }
+            if let Some(ref gc) = github_canonical
+                && *gc != target_id
+            {
+                aliases.push(gc.clone());
             }
             // Remove duplicates with target_id.
             aliases.retain(|a| *a != target_id);
@@ -766,7 +766,7 @@ fn days_to_ymd(mut days: u64) -> (u64, u64, u64) {
 }
 
 const fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 // ────────────────────────────────────────────────────────────────────────────

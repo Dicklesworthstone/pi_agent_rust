@@ -136,12 +136,12 @@ pub struct AmacBatchGroup {
 
 impl AmacBatchGroup {
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.requests.len()
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.requests.is_empty()
     }
 }
@@ -581,20 +581,20 @@ impl AmacBatchExecutor {
         }
 
         // Flush final run
-        if let Some(current_key) = current_key_opt {
-            if !current_requests.is_empty() {
-                let decision = self.decide_toggle(&current_key, current_requests.len());
-                if decision.is_interleave() {
-                    interleaved_groups += 1;
-                } else {
-                    sequential_groups += 1;
-                }
-                groups.push(AmacBatchGroup {
-                    key: current_key,
-                    requests: current_requests,
-                });
-                decisions.push(decision);
+        if let Some(current_key) = current_key_opt
+            && !current_requests.is_empty()
+        {
+            let decision = self.decide_toggle(&current_key, current_requests.len());
+            if decision.is_interleave() {
+                interleaved_groups += 1;
+            } else {
+                sequential_groups += 1;
             }
+            groups.push(AmacBatchGroup {
+                key: current_key,
+                requests: current_requests,
+            });
+            decisions.push(decision);
         }
 
         // Flush trailing logs (or if input was only logs).

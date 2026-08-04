@@ -107,10 +107,10 @@ impl ExtensionSelector {
             if line.is_empty() {
                 continue;
             }
-            if let Ok(evt) = serde_json::from_str::<ConformanceEvent>(line) {
-                if evt.overall_status != "N/A" {
-                    passed_ids.insert(evt.extension_id);
-                }
+            if let Ok(evt) = serde_json::from_str::<ConformanceEvent>(line)
+                && evt.overall_status != "N/A"
+            {
+                passed_ids.insert(evt.extension_id);
             }
         }
 
@@ -139,7 +139,7 @@ impl ExtensionSelector {
     }
 
     /// Total number of eligible extensions in the N/A pool.
-    fn pool_size(&self) -> usize {
+    const fn pool_size(&self) -> usize {
         self.eligible.len()
     }
 
@@ -153,15 +153,15 @@ impl ExtensionSelector {
             .eligible
             .iter()
             .filter(|e| {
-                if let Some((min, max)) = filter.tier_range {
-                    if e.conformance_tier < min || e.conformance_tier > max {
-                        return false;
-                    }
+                if let Some((min, max)) = filter.tier_range
+                    && (e.conformance_tier < min || e.conformance_tier > max)
+                {
+                    return false;
                 }
-                if let Some(ref cat) = filter.source_category {
-                    if &e.source_tier != cat {
-                        return false;
-                    }
+                if let Some(ref cat) = filter.source_category
+                    && &e.source_tier != cat
+                {
+                    return false;
                 }
                 true
             })

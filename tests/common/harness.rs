@@ -401,10 +401,10 @@ impl Drop for TestHarness {
             }
             eprintln!("=== END LOGS ===\n");
 
-            if let Ok(path) = env::var("TEST_LOG_PATH") {
-                if let Err(err) = self.logger.as_ref().write_dump_to_path(&path) {
-                    eprintln!("Failed to write test log to {path}: {err}");
-                }
+            if let Ok(path) = env::var("TEST_LOG_PATH")
+                && let Err(err) = self.logger.as_ref().write_dump_to_path(&path)
+            {
+                eprintln!("Failed to write test log to {path}: {err}");
             }
         }
     }
@@ -1115,20 +1115,20 @@ impl LiveE2eRegistry {
         if let Some(model_id) = requested_model {
             let model_id = model_id.trim();
             if !model_id.is_empty() {
-                if let Some(entry) = self.registry.find(target.provider, model_id) {
-                    if self.resolve_api_key_with_source(&entry).is_some() {
-                        return Some(entry);
-                    }
+                if let Some(entry) = self.registry.find(target.provider, model_id)
+                    && self.resolve_api_key_with_source(&entry).is_some()
+                {
+                    return Some(entry);
                 }
                 return None;
             }
         }
 
         for model_id in target.preferred_models {
-            if let Some(entry) = self.registry.find(target.provider, model_id) {
-                if self.resolve_api_key_with_source(&entry).is_some() {
-                    return Some(entry);
-                }
+            if let Some(entry) = self.registry.find(target.provider, model_id)
+                && self.resolve_api_key_with_source(&entry).is_some()
+            {
+                return Some(entry);
             }
         }
 

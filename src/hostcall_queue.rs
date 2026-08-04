@@ -2052,6 +2052,7 @@ mod tests {
             while !gate.pin_ready {
                 gate = cvar.wait(gate).expect("wait for pin");
             }
+            drop(gate);
         }
 
         fn mark_pin_ready(sync: &Arc<(Mutex<PinGate>, Condvar)>) {
@@ -2062,12 +2063,14 @@ mod tests {
             while !gate.release_pin {
                 gate = cvar.wait(gate).expect("wait for pin release");
             }
+            drop(gate);
         }
 
         fn release_pin(sync: &Arc<(Mutex<PinGate>, Condvar)>) {
             let (lock, cvar) = &**sync;
             let mut gate = lock.lock().expect("lock pin gate");
             gate.release_pin = true;
+            drop(gate);
             cvar.notify_all();
         }
 

@@ -742,7 +742,7 @@ fn seeded_randomized_append_replay_invariants() -> PiResult<()> {
             let entry_id = format!("entry_{:08}", idx + 1);
             let parent_entry_id = if idx == 0 {
                 None
-            } else if lcg_next(&mut state) % 5 == 0 {
+            } else if lcg_next(&mut state).is_multiple_of(5) {
                 let parent_index = usize::try_from(lcg_next(&mut state)).unwrap_or(0) % idx;
                 Some(expected_ids[parent_index].clone())
             } else {

@@ -139,7 +139,7 @@ run_cargo() {
 path_for_remote_runner() {
     local original="$1"
     if [[ "$original" == "$PROJECT_ROOT/"* ]]; then
-        printf '%s' "${original#$PROJECT_ROOT/}"
+        printf '%s' "${original#"$PROJECT_ROOT"/}"
     else
         printf '%s' "$original"
     fi
@@ -172,6 +172,11 @@ for name in data.get('suite', {}).get('$suite_name', {}).get('files', []):
 mapfile -t ALL_UNIT_FILES < <(read_toml_array "unit")
 mapfile -t ALL_VCR_FILES < <(read_toml_array "vcr")
 mapfile -t ALL_E2E_FILES < <(read_toml_array "e2e")
+
+if [[ ${#ALL_UNIT_FILES[@]} -eq 0 || ${#ALL_VCR_FILES[@]} -eq 0 || ${#ALL_E2E_FILES[@]} -eq 0 ]]; then
+    echo "Failed to load non-empty unit, vcr, and e2e suites from $CLASSIFICATION_FILE" >&2
+    exit 1
+fi
 
 # Combined non-E2E targets (unit + vcr) for integration test phase.
 ALL_UNIT_TARGETS=("${ALL_UNIT_FILES[@]}" "${ALL_VCR_FILES[@]}")
@@ -632,7 +637,7 @@ capture_env() {
     rustc_version="$(rustc --version 2>/dev/null || echo 'unknown')"
     cargo_version="$(run_cargo --version 2>/dev/null || echo 'unknown')"
     os_info="$(uname -srm 2>/dev/null || echo 'unknown')"
-    git_sha="$(git rev-parse --short HEAD 2>/dev/null || echo 'unknown')"
+    git_sha="$(git rev-parse HEAD 2>/dev/null || echo 'unknown')"
     git_branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo 'unknown')"
 
     cat > "$env_file" <<ENVJSON
@@ -741,16 +746,16 @@ run_split_clippy_gates() {
         echo "=== clippy slice: $label ===" >> "$log_file"
         case "$label" in
             "lib+bins")
-                args=(clippy --lib --bins -- -D warnings)
+                args=(clippy --locked --lib --bins -- -D warnings)
                 ;;
             "tests")
-                args=(clippy --tests -- -D warnings)
+                args=(clippy --locked --tests -- -D warnings)
                 ;;
             "benches")
-                args=(clippy --benches -- -D warnings)
+                args=(clippy --locked --benches -- -D warnings)
                 ;;
             "examples")
-                args=(clippy --examples -- -D warnings)
+                args=(clippy --locked --examples -- -D warnings)
                 ;;
         esac
 
@@ -780,7 +785,7 @@ run_lib_tests() {
     start_epoch=$(date +%s%N 2>/dev/null || date +%s)
 
     set +e
-    run_cargo test --lib -- --test-threads="$PARALLELISM" 2>&1 | tee "$log_file"
+    run_cargo test --locked --lib -- --test-threads="$PARALLELISM" 2>&1 | tee "$log_file"
     exit_code=${PIPESTATUS[0]}
     set -e
 
@@ -821,7 +826,7 @@ RESULTJSON
         echo "[lib] FAIL (exit $exit_code, $failed failed, $passed passed, ${duration_ms}ms)"
     fi
 
-    return $exit_code
+    return "$exit_code"
 }
 
 # ─── Build First ──────────────────────────────────────────────────────────────
@@ -837,7 +842,7 @@ build_tests() {
             continue
         fi
         echo "[build]   unit:$target"
-        if ! run_cargo test --test "$target" --no-run 2>>"$build_log"; then
+        if ! run_cargo test --locked --test "$target" --no-run 2>>"$build_log"; then
             echo "[build]   unit:$target FAILED" >&2
             build_ok=false
         fi
@@ -849,7 +854,7 @@ build_tests() {
             continue
         fi
         echo "[build]   e2e:$suite"
-        if ! run_cargo test --test "$suite" --no-run 2>>"$build_log"; then
+        if ! run_cargo test --locked --test "$suite" --no-run 2>>"$build_log"; then
             echo "[build]   e2e:$suite FAILED" >&2
             build_ok=false
         fi
@@ -892,6 +897,7 @@ run_unit_target() {
 
     set +e
     run_cargo test \
+        --locked \
         --test "$target" \
         -- \
         --test-threads="$PARALLELISM" \
@@ -943,7 +949,7 @@ RESULTJSON
         fi
     fi
 
-    return $exit_code
+    return "$exit_code"
 }
 
 run_suite() {
@@ -969,6 +975,7 @@ run_suite() {
 
     set +e
     run_cargo test \
+        --locked \
         --test "$suite" \
         -- \
         --test-threads="$PARALLELISM" \
@@ -1024,7 +1031,7 @@ RESULTJSON
         fi
     fi
 
-    return $exit_code
+    return "$exit_code"
 }
 
 # ─── Summary Manifest ────────────────────────────────────────────────────────
@@ -4538,8 +4545,14 @@ if summary_correlation_id and environment_correlation_id:
         ),
     )
 
-# Full-profile baseline runs must cover every configured target and suite.
-strict_conformance = profile == "full" and rerun_from is None
+# Full-profile, unsharded baseline runs must cover every configured target and
+# suite. Partial shards remain useful CI evidence, but must never claim strict
+# conformance (the release gate rejects full-profile evidence with that flag
+# disabled).
+summary_shard = summary.get("shard") if isinstance(summary, dict) else None
+shard_kind = summary_shard.get("kind") if isinstance(summary_shard, dict) else None
+is_sharded = shard_kind in {"unit", "suite", "both"}
+strict_conformance = profile == "full" and rerun_from is None and not is_sharded
 full_scope_path = artifact_dir / "summary.json"
 if profile == "full":
     require_condition(
@@ -4548,6 +4561,14 @@ if profile == "full":
         ok=rerun_from is None,
         ok_msg="full profile baseline run (not rerun)",
         fail_msg="full profile rerun detected; scope checks downgraded to warnings",
+        strict=False,
+    )
+    require_condition(
+        "full_profile.shard_mode",
+        path=full_scope_path,
+        ok=not is_sharded,
+        ok_msg="full profile baseline run is unsharded",
+        fail_msg="full profile shard detected; scope checks downgraded to warnings",
         strict=False,
     )
 

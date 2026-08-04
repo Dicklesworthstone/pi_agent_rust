@@ -373,10 +373,10 @@ fn source_type_and_package(source: &CandidateSource) -> (&'static str, Option<St
 }
 
 fn repo_key(item: &CandidateItem) -> String {
-    if let Some(repo_url) = item.repository_url.as_deref() {
-        if let Some(key) = canonical_repo_url(repo_url) {
-            return key;
-        }
+    if let Some(repo_url) = item.repository_url.as_deref()
+        && let Some(key) = canonical_repo_url(repo_url)
+    {
+        return key;
     }
 
     match &item.source {
@@ -636,7 +636,7 @@ fn format_u64(value: u64) -> String {
     for (index, byte) in bytes.iter().enumerate() {
         out.push(char::from(*byte));
         let remaining = bytes.len().saturating_sub(index + 1);
-        if remaining > 0 && remaining % 3 == 0 {
+        if remaining > 0 && remaining.is_multiple_of(3) {
             out.push(',');
         }
     }

@@ -2,9 +2,9 @@
 //!
 //! This library provides the core functionality for the Pi CLI tool,
 //! a Rust port of pi-mono (TypeScript) with emphasis on:
-//! - Performance: Sub-100ms startup, smooth TUI at 60fps
-//! - Reliability: No panics in normal operation
-//! - Efficiency: Single binary, minimal dependencies
+//! - Performance-oriented native architecture with instrumented startup and TUI paths
+//! - Reliability through explicit errors, bounded cancellation, and conformance tests
+//! - Distribution through one supported end-user binary in official release archives
 //!
 //! ## Public API policy
 //!

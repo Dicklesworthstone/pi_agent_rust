@@ -36,7 +36,9 @@
 //!   cargo test --test `ci_full_suite_gate` -- --nocapture
 
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use sha1::Sha1;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
 const CI_WORKFLOW_PATH: &str = ".github/workflows/ci.yml";
@@ -45,10 +47,44 @@ const QA_RUNBOOK_PATH: &str = "docs/qa-runbook.md";
 const CI_OPERATOR_RUNBOOK_PATH: &str = "docs/ci-operator-runbook.md";
 const PRACTICAL_FINISH_SNAPSHOT_PATH: &str =
     "tests/full_suite_gate/practical_finish_issues_snapshot.jsonl";
-const PRACTICAL_FINISH_ISSUE_SOURCES: &[&str] = &[
-    ".beads/issues.jsonl",
-    ".beads/beads.base.jsonl",
-    PRACTICAL_FINISH_SNAPSHOT_PATH,
+const PRACTICAL_FINISH_LIVE_ISSUE_SOURCE: &str = ".beads/issues.jsonl";
+const PRACTICAL_FINISH_BASE_SOURCE: &str = ".beads/beads.base.jsonl";
+// The live ledger is release-authoritative only when its working-tree bytes,
+// index blob, and HEAD blob are identical. Lower-authority snapshots remain
+// diagnostics; neither mtimes nor a partial list of familiar IDs can establish
+// completeness.
+const PRACTICAL_FINISH_REQUIRED_LEDGER_ANCHORS: &[&str] =
+    &["bd-3ar8v", "bd-3ar8v.6", "bd-3ar8v.6.9"];
+
+const MUST_PASS_GATE_SCHEMA: &str = "pi.ext.must_pass_gate.v1";
+const MUST_PASS_EVENT_SCHEMA: &str = "pi.ext.gate_event.v1";
+const MUST_PASS_INCLUSION_PATH: &str = "docs/extension-inclusion-list.json";
+const MUST_PASS_MANIFEST_PATH: &str = "tests/ext_conformance/VALIDATED_MANIFEST.json";
+const MUST_PASS_VERDICT_PATH: &str =
+    "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json";
+const MUST_PASS_EVENTS_PATH: &str = "tests/ext_conformance/reports/gate/must_pass_events.jsonl";
+const MUST_PASS_ARTIFACTS_PATH: &str = "tests/ext_conformance/artifacts";
+const EXPECTED_CANONICAL_MUST_PASS_EXTENSIONS_V1: u64 = 208;
+const MUST_PASS_SOURCE_PATHS: &[&str] = &[
+    ".cargo/config.toml",
+    ".gitattributes",
+    "CHANGELOG.md",
+    "Cargo.lock",
+    "Cargo.toml",
+    "build.rs",
+    "docs/evidence/tool-output-context-cache.jsonl",
+    "docs/extension-artifact-provenance.json",
+    "docs/provider-upstream-model-ids-snapshot.json",
+    "docs/schema/extension_protocol.json",
+    "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
+    "rust-toolchain.toml",
+    "src",
+    "tests/common",
+    MUST_PASS_INCLUSION_PATH,
+    MUST_PASS_MANIFEST_PATH,
+    MUST_PASS_ARTIFACTS_PATH,
+    "tests/ext_conformance_generated.rs",
+    "tests/release_readiness.rs",
 ];
 
 fn repo_root() -> PathBuf {
@@ -472,9 +508,16 @@ fn normalize_issue_labels(labels: &[String]) -> Vec<String> {
 }
 
 #[allow(dead_code)]
-fn is_open_issue_status(status: &str) -> bool {
+fn is_nonterminal_issue_status(status: &str) -> Result<bool, String> {
     let normalized = status.trim().to_ascii_lowercase();
-    normalized == "open" || normalized == "in_progress"
+    match normalized.as_str() {
+        "closed" | "tombstone" => Ok(false),
+        "" => Err("missing Beads issue status".to_string()),
+        // Beads has exactly two terminal states. Treat every other state as
+        // unresolved so new/custom workflow states cannot create a release
+        // false-green merely because this gate predates them.
+        _ => Ok(true),
+    }
 }
 
 #[allow(dead_code)]
@@ -491,43 +534,38 @@ fn is_practical_finish_in_scope_issue_id(id: &str) -> bool {
 
 #[allow(dead_code)]
 fn filter_practical_finish_leaf_issues(
-    open_issues: Vec<PracticalFinishOpenIssue>,
+    open_issues: &[PracticalFinishOpenIssue],
 ) -> Vec<PracticalFinishOpenIssue> {
-    let open_ids = open_issues
-        .iter()
-        .map(|issue| issue.id.clone())
-        .collect::<Vec<_>>();
-
     open_issues
-        .into_iter()
+        .iter()
         .filter(|issue| {
             let prefix = format!("{}.", issue.id);
-            !open_ids
-                .iter()
-                .any(|other_id| other_id != &issue.id && other_id.starts_with(&prefix))
+            let issue_is_docs_only = is_docs_only_issue(issue);
+            !open_issues.iter().any(|other| {
+                other.id != issue.id
+                    && other.id.starts_with(&prefix)
+                    && is_docs_only_issue(other) == issue_is_docs_only
+            })
         })
+        .cloned()
         .collect()
 }
 
 #[allow(dead_code)]
-fn is_docs_or_report_issue(issue: &PracticalFinishOpenIssue) -> bool {
-    if issue.issue_type.eq_ignore_ascii_case("docs") {
-        return true;
-    }
-
-    issue.labels.iter().any(|label| {
-        matches!(
-            label.as_str(),
-            "docs" | "docs-last" | "documentation" | "report" | "runbook"
-        )
-    })
+fn is_docs_only_issue(issue: &PracticalFinishOpenIssue) -> bool {
+    // Generic labels such as `report`, `runbook`, or `docs-last` describe an
+    // output or phase, not the work's semantics. Only the explicit Beads docs
+    // issue type is strong enough to exempt an open item from the technical
+    // practical-finish blocker set.
+    issue.issue_type.eq_ignore_ascii_case("docs")
 }
 
 #[allow(dead_code)]
 fn load_open_perf3x_issues(root: &Path) -> Result<Vec<PracticalFinishOpenIssue>, String> {
     let (source, _path, contents) = read_practical_finish_issue_source(root)?;
 
-    let mut latest_by_id: HashMap<String, PracticalFinishOpenIssue> = HashMap::new();
+    let mut in_scope_issues = Vec::new();
+    let mut seen_issue_ids = HashSet::new();
     for (line_idx, raw_line) in contents.lines().enumerate() {
         let line = raw_line.trim();
         if line.is_empty() {
@@ -542,10 +580,18 @@ fn load_open_perf3x_issues(root: &Path) -> Result<Vec<PracticalFinishOpenIssue>,
                 line_idx + 1
             ));
         }
+        if !seen_issue_ids.insert(id.to_string()) {
+            return Err(format!(
+                "invalid JSONL row {} in {source}: duplicate issue id {id}",
+                line_idx + 1
+            ));
+        }
         if !is_practical_finish_in_scope_issue_id(id) {
             continue;
         }
         let status = record.status.trim().to_ascii_lowercase();
+        let is_nonterminal = is_nonterminal_issue_status(&status)
+            .map_err(|err| format!("invalid JSONL row {} in {source}: {err}", line_idx + 1))?;
         let issue_type = if record.issue_type.trim().is_empty() {
             "unknown".to_string()
         } else {
@@ -557,85 +603,303 @@ fn load_open_perf3x_issues(root: &Path) -> Result<Vec<PracticalFinishOpenIssue>,
             record.title.trim().to_string()
         };
         let labels = normalize_issue_labels(&record.labels);
-        latest_by_id.insert(
-            id.to_string(),
-            PracticalFinishOpenIssue {
+        if is_nonterminal {
+            in_scope_issues.push(PracticalFinishOpenIssue {
                 id: id.to_string(),
                 title,
                 status,
                 issue_type,
                 labels,
-            },
-        );
+            });
+        }
     }
 
-    let mut open = latest_by_id
-        .into_values()
-        .filter(|issue| is_open_issue_status(&issue.status))
+    let missing_anchors = PRACTICAL_FINISH_REQUIRED_LEDGER_ANCHORS
+        .iter()
+        .filter(|id| !seen_issue_ids.contains(**id))
+        .copied()
         .collect::<Vec<_>>();
+    if !missing_anchors.is_empty() {
+        return Err(format!(
+            "practical-finish source {source} is missing required canonical ledger anchor(s): {}; source may be empty, truncated, or non-authoritative",
+            missing_anchors.join(", ")
+        ));
+    }
+
+    let mut open = in_scope_issues;
     open.sort_by(|a, b| a.id.cmp(&b.id));
-    Ok(filter_practical_finish_leaf_issues(open))
+    Ok(filter_practical_finish_leaf_issues(&open))
 }
 
 #[allow(dead_code)]
-type PracticalFinishIssueSourceCandidate = (u128, usize, &'static str, PathBuf, String);
+fn git_blob_bytes(root: &Path, object: &str, context: &str) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["show", object])
+        .output()
+        .map_err(|err| format!("failed to execute git show for {context}: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git show failed for {context}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(output.stdout)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedRegularFile {
+    git_commit: String,
+    blob_oid: String,
+    contents: Vec<u8>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn capture_committed_regular_file(
+    root: &Path,
+    relative: &str,
+    description: &str,
+) -> Result<CommittedRegularFile, String> {
+    let git_commit = current_git_commit(root)?;
+    let tree_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-tree", "-z", "--full-tree", &git_commit, "--", relative])
+        .output()
+        .map_err(|err| format!("failed to inspect {description} at HEAD: {err}"))?;
+    if !tree_output.status.success() {
+        return Err(format!(
+            "git ls-tree failed while inspecting {description}: {}",
+            String::from_utf8_lossy(&tree_output.stderr).trim()
+        ));
+    }
+    let tree_records = String::from_utf8(tree_output.stdout)
+        .map_err(|err| format!("git ls-tree returned non-UTF-8 {description} data: {err}"))?
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if tree_records.len() != 1 {
+        return Err(format!(
+            "{description} must be exactly one tracked regular blob at HEAD: {relative}"
+        ));
+    }
+    let (tree_metadata, tree_path) = tree_records[0]
+        .split_once('\t')
+        .ok_or_else(|| format!("malformed HEAD record for {description}"))?;
+    let mut tree_fields = tree_metadata.split_ascii_whitespace();
+    let head_mode = tree_fields.next().unwrap_or("");
+    let head_type = tree_fields.next().unwrap_or("");
+    let head_oid = tree_fields.next().unwrap_or("");
+    if tree_fields.next().is_some()
+        || tree_path != relative
+        || !matches!(head_mode, "100644" | "100755")
+        || head_type != "blob"
+        || !matches!(head_oid.len(), 40 | 64)
+        || !head_oid.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(format!(
+            "{description} is not a canonical regular blob at HEAD: {relative}"
+        ));
+    }
+
+    let index_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--stage", "-z", "--", relative])
+        .output()
+        .map_err(|err| format!("failed to inspect {description} index entry: {err}"))?;
+    if !index_output.status.success() {
+        return Err(format!(
+            "git ls-files --stage failed while inspecting {description}: {}",
+            String::from_utf8_lossy(&index_output.stderr).trim()
+        ));
+    }
+    let index_records = String::from_utf8(index_output.stdout)
+        .map_err(|err| format!("git ls-files returned non-UTF-8 {description} data: {err}"))?
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if index_records.len() != 1 {
+        return Err(format!(
+            "{description} must have exactly one stage-0 index entry: {relative}"
+        ));
+    }
+    let (index_metadata, index_path) = index_records[0]
+        .split_once('\t')
+        .ok_or_else(|| format!("malformed index record for {description}"))?;
+    let mut index_fields = index_metadata.split_ascii_whitespace();
+    let index_mode = index_fields.next().unwrap_or("");
+    let index_oid = index_fields.next().unwrap_or("");
+    let index_stage = index_fields.next().unwrap_or("");
+    if index_fields.next().is_some()
+        || index_path != relative
+        || index_stage != "0"
+        || !matches!(index_mode, "100644" | "100755")
+        || index_mode != head_mode
+        || index_oid != head_oid
+    {
+        return Err(format!(
+            "{description} differs between the Git index and HEAD; the index entry does not exactly match its regular HEAD blob: {relative}"
+        ));
+    }
+
+    let flag_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-v", "-z", "--", relative])
+        .output()
+        .map_err(|err| format!("failed to inspect {description} index flags: {err}"))?;
+    if !flag_output.status.success() {
+        return Err(format!(
+            "git ls-files -v failed while inspecting {description}: {}",
+            String::from_utf8_lossy(&flag_output.stderr).trim()
+        ));
+    }
+    let canonical_flag_record = format!("H {relative}\0");
+    if flag_output.stdout != canonical_flag_record.as_bytes() {
+        return Err(format!(
+            "{description} uses non-canonical index flags (including assume-unchanged or skip-worktree): {relative}"
+        ));
+    }
+
+    for (label, args) in [
+        (
+            "worktree",
+            vec!["diff", "--quiet", "--no-ext-diff", "--", relative],
+        ),
+        (
+            "index",
+            vec![
+                "diff",
+                "--cached",
+                "--quiet",
+                "--no-ext-diff",
+                git_commit.as_str(),
+                "--",
+                relative,
+            ],
+        ),
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .map_err(|err| format!("failed to inspect {description} {label} drift: {err}"))?;
+        match status.code() {
+            Some(0) => {}
+            Some(1) => {
+                let relationship = if label == "worktree" {
+                    "between the working tree and Git index"
+                } else {
+                    "between the Git index and HEAD"
+                };
+                return Err(format!(
+                    "{description} differs {relationship}; commit the authoritative file before release evaluation"
+                ));
+            }
+            code => {
+                return Err(format!(
+                    "git diff failed while inspecting {description} {label} drift (status {code:?})"
+                ));
+            }
+        }
+    }
+
+    let full_path = root.join(relative);
+    let metadata = std::fs::symlink_metadata(&full_path)
+        .map_err(|err| format!("failed to inspect {description} worktree file: {err}"))?;
+    if !metadata.file_type().is_file() {
+        return Err(format!(
+            "{description} must be a regular worktree file: {}",
+            full_path.display()
+        ));
+    }
+    let contents = std::fs::read(&full_path)
+        .map_err(|err| format!("failed to read {description} worktree bytes: {err}"))?;
+    let worktree_oid = git_blob_oid(&contents, head_oid.len())?;
+    if worktree_oid != head_oid {
+        return Err(format!(
+            "{description} raw worktree bytes differ from the HEAD blob: {relative}"
+        ));
+    }
+    if current_git_commit(root)? != git_commit {
+        return Err(format!(
+            "HEAD changed while binding {description} to the release commit"
+        ));
+    }
+
+    Ok(CommittedRegularFile {
+        git_commit,
+        blob_oid: head_oid.to_string(),
+        contents,
+    })
+}
 
 #[allow(dead_code)]
-fn select_practical_finish_issue_source(
-    candidates: Vec<PracticalFinishIssueSourceCandidate>,
-) -> Option<(&'static str, PathBuf, String)> {
-    use std::cmp::Reverse;
-
-    candidates
-        .into_iter()
-        .max_by_key(|(freshness_millis, order, _, _, _)| (*freshness_millis, Reverse(*order)))
-        .map(|(_, _, source, path, contents)| (source, path, contents))
+fn validate_live_ledger_git_binding(
+    root: &Path,
+    relative: &str,
+    worktree_bytes: &[u8],
+) -> Result<(), String> {
+    let before = capture_committed_regular_file(root, relative, "live Beads ledger")?;
+    if worktree_bytes != before.contents {
+        return Err(format!(
+            "live Beads ledger {relative} differs between the working tree and Git index; flush and commit the authoritative ledger before release evaluation"
+        ));
+    }
+    let after = capture_committed_regular_file(root, relative, "live Beads ledger")?;
+    if before != after {
+        return Err(format!(
+            "live Beads ledger {relative} changed while validating its Git binding"
+        ));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
 fn read_practical_finish_issue_source(
     root: &Path,
 ) -> Result<(&'static str, PathBuf, String), String> {
-    use std::time::UNIX_EPOCH;
-
-    let mut candidates: Vec<PracticalFinishIssueSourceCandidate> = Vec::new();
-    let mut missing_paths = Vec::new();
-
-    for (order, relative) in PRACTICAL_FINISH_ISSUE_SOURCES.iter().enumerate() {
-        let path = root.join(relative);
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => {
-                let freshness_millis = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                    .map_or(0, |age| age.as_millis());
-                candidates.push((freshness_millis, order, *relative, path, contents));
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                missing_paths.push(path);
-            }
-            Err(err) => {
-                return Err(format!(
-                    "failed to read practical-finish source {relative} at {}: {err}",
-                    path.display()
-                ));
-            }
+    let path = root.join(PRACTICAL_FINISH_LIVE_ISSUE_SOURCE);
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            let diagnostics = [PRACTICAL_FINISH_BASE_SOURCE, PRACTICAL_FINISH_SNAPSHOT_PATH]
+                .into_iter()
+                .filter(|relative| root.join(relative).is_file())
+                .collect::<Vec<_>>();
+            let suffix = if diagnostics.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; lower-authority diagnostic source(s) present but non-certifying: {}",
+                    diagnostics.join(", ")
+                )
+            };
+            return Err(format!(
+                "release-authoritative live Beads ledger is missing at {}{suffix}",
+                path.display()
+            ));
         }
-    }
-
-    if let Some((source, path, contents)) = select_practical_finish_issue_source(candidates) {
-        return Ok((source, path, contents));
-    }
-
-    let tried = missing_paths
-        .iter()
-        .map(|path| format!("`{}`", path.display()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(format!(
-        "failed to read practical-finish source: none of the candidate files exist ({tried})"
-    ))
+        Err(err) => {
+            return Err(format!(
+                "failed to read release-authoritative live Beads ledger at {}: {err}",
+                path.display()
+            ));
+        }
+    };
+    validate_live_ledger_git_binding(root, PRACTICAL_FINISH_LIVE_ISSUE_SOURCE, &bytes)?;
+    let contents = String::from_utf8(bytes).map_err(|err| {
+        format!(
+            "release-authoritative live Beads ledger at {} is not UTF-8: {err}",
+            path.display()
+        )
+    })?;
+    Ok((PRACTICAL_FINISH_LIVE_ISSUE_SOURCE, path, contents))
 }
 
 #[allow(dead_code)]
@@ -645,7 +909,7 @@ fn split_practical_finish_issue_buckets(
     let mut docs_or_report = Vec::new();
     let mut technical = Vec::new();
     for issue in open_issues {
-        if is_docs_or_report_issue(issue) {
+        if is_docs_only_issue(issue) {
             docs_or_report.push(issue.clone());
         } else {
             technical.push(issue.clone());
@@ -825,12 +1089,12 @@ fn parse_required_evidence_paths(
         }
         let normalized_path =
             normalize_repo_relative_evidence_path(raw_path, row_idx, field_name, path_idx)?;
-        if let Some(previous) = previous_path.as_deref() {
-            if normalized_path.as_str() < previous {
-                return Err(format!(
-                    "coverage_rows[{row_idx}] field '{field_name}' must be sorted by normalized path order: '{normalized_path}' appears after '{previous}'"
-                ));
-            }
+        if let Some(previous) = previous_path.as_deref()
+            && normalized_path.as_str() < previous
+        {
+            return Err(format!(
+                "coverage_rows[{row_idx}] field '{field_name}' must be sorted by normalized path order: '{normalized_path}' appears after '{previous}'"
+            ));
         }
         previous_path = Some(normalized_path.clone());
         if !seen_paths.insert(normalized_path.clone()) {
@@ -898,10 +1162,7 @@ fn normalize_repo_relative_evidence_path(
 
 const fn is_windows_absolute_path(path: &str) -> bool {
     let bytes = path.as_bytes();
-    if bytes.len() < 2 {
-        return false;
-    }
-    bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes.len() == 2 || bytes[2] == b'/')
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn is_canonical_perf3x_bead_id(bead: &str) -> bool {
@@ -1012,13 +1273,13 @@ fn validate_perf3x_bead_coverage_contract(
         let bead_segments = canonical_perf3x_bead_segments(&bead).ok_or_else(|| {
             format!("coverage_rows[{row_idx}] has unparsable PERF-3X bead id segments: {bead}")
         })?;
-        if let Some(previous_segments) = previous_bead_segments.as_ref() {
-            if bead_segments < *previous_segments {
-                let previous_bead = previous_bead_id.as_deref().unwrap_or("<unknown>");
-                return Err(format!(
-                    "coverage_rows must be sorted by canonical bead id order: row {row_idx} bead '{bead}' appears after '{previous_bead}'"
-                ));
-            }
+        if let Some(previous_segments) = previous_bead_segments.as_ref()
+            && bead_segments < *previous_segments
+        {
+            let previous_bead = previous_bead_id.as_deref().unwrap_or("<unknown>");
+            return Err(format!(
+                "coverage_rows must be sorted by canonical bead id order: row {row_idx} bead '{bead}' appears after '{previous_bead}'"
+            ));
         }
         previous_bead_segments = Some(bead_segments);
         previous_bead_id = Some(bead.clone());
@@ -1060,6 +1321,39 @@ fn validate_perf3x_bead_coverage_contract(
     Ok(parsed)
 }
 
+fn validate_repo_evidence_path(root: &Path, relative: &str) -> Result<(), String> {
+    let mut cursor = root.to_path_buf();
+    let mut final_metadata = None;
+    for component in Path::new(relative).components() {
+        let Component::Normal(segment) = component else {
+            return Err("path is not canonical repository-relative evidence".to_string());
+        };
+        cursor.push(segment);
+        let metadata = std::fs::symlink_metadata(&cursor)
+            .map_err(|err| format!("path is missing or unreadable: {err}"))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "path traverses symbolic link at {}",
+                cursor.display()
+            ));
+        }
+        final_metadata = Some(metadata);
+    }
+
+    let metadata = final_metadata.ok_or_else(|| "path has no components".to_string())?;
+    if !metadata.file_type().is_file() && !metadata.file_type().is_dir() {
+        return Err("path is not a regular file or directory".to_string());
+    }
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|err| format!("repository root is unreadable: {err}"))?;
+    let canonical_path = std::fs::canonicalize(&cursor)
+        .map_err(|err| format!("path cannot be canonicalized: {err}"))?;
+    if !canonical_path.starts_with(&canonical_root) {
+        return Err("path resolves outside the repository root".to_string());
+    }
+    Ok(())
+}
+
 /// Evaluate contract coverage against files present in repository artifacts.
 fn evaluate_perf3x_bead_coverage_internal(
     root: &Path,
@@ -1085,8 +1379,8 @@ fn evaluate_perf3x_bead_coverage_internal(
             ("log", &row.log_evidence),
         ] {
             for path in evidence_paths {
-                if !root.join(path).exists() {
-                    missing.push(format!("{}:{}:{}", row.bead, class_name, path));
+                if let Err(detail) = validate_repo_evidence_path(root, path) {
+                    missing.push(format!("{}:{}:{} ({detail})", row.bead, class_name, path));
                 }
             }
         }
@@ -1214,6 +1508,918 @@ fn check_artifact_status(
     }
 }
 
+fn current_git_commit(root: &Path) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|err| format!("failed to execute git rev-parse HEAD: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let commit = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git rev-parse HEAD returned non-UTF-8 output: {err}"))?;
+    let commit = commit.trim();
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "git rev-parse HEAD returned invalid commit: {commit}"
+        ));
+    }
+    Ok(commit.to_string())
+}
+
+fn ensure_must_pass_worktree_matches_commit(
+    root: &Path,
+    commit: &str,
+    source_paths: &[&str],
+) -> Result<(), String> {
+    let observed_head = current_git_commit(root)?;
+    if observed_head != commit {
+        return Err(format!(
+            "must-pass source HEAD changed while capturing provenance: expected {commit}, found {observed_head}"
+        ));
+    }
+
+    let mut untracked_command = std::process::Command::new("git");
+    untracked_command
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "--others", "-z", "--"])
+        .args(source_paths);
+    let untracked_output = untracked_command
+        .output()
+        .map_err(|err| format!("failed to list untracked must-pass source inputs: {err}"))?;
+    if !untracked_output.status.success() {
+        return Err(format!(
+            "git ls-files failed while checking untracked must-pass inputs: {}",
+            String::from_utf8_lossy(&untracked_output.stderr).trim()
+        ));
+    }
+    let untracked = String::from_utf8(untracked_output.stdout)
+        .map_err(|err| format!("git ls-files returned non-UTF-8 untracked paths: {err}"))?;
+    let untracked = untracked
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .take(5)
+        .collect::<Vec<_>>();
+    if !untracked.is_empty() {
+        return Err(format!(
+            "must-pass source inputs contain untracked files: {}",
+            untracked.join(", ")
+        ));
+    }
+
+    let flag_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-files", "-v", "-z", "--"])
+        .args(source_paths)
+        .output()
+        .map_err(|err| format!("failed to inspect must-pass index flags: {err}"))?;
+    if !flag_output.status.success() {
+        return Err(format!(
+            "git ls-files failed while checking must-pass index flags: {}",
+            String::from_utf8_lossy(&flag_output.stderr).trim()
+        ));
+    }
+    let flagged = String::from_utf8(flag_output.stdout)
+        .map_err(|err| format!("git ls-files returned non-UTF-8 flag records: {err}"))?
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .filter(|record| !record.starts_with("H "))
+        .take(5)
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if !flagged.is_empty() {
+        return Err(format!(
+            "must-pass source inputs use non-canonical index flags (including assume-unchanged or skip-worktree): {}",
+            flagged.join(", ")
+        ));
+    }
+
+    for (label, diff_args) in [
+        ("worktree", vec!["diff", "--quiet", "--no-ext-diff", "--"]),
+        (
+            "index",
+            vec!["diff", "--cached", "--quiet", "--no-ext-diff", commit, "--"],
+        ),
+    ] {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(diff_args)
+            .args(source_paths)
+            .status()
+            .map_err(|err| format!("failed to inspect must-pass source dirt: {err}"))?;
+        match status.code() {
+            Some(0) => {}
+            Some(1) => {
+                return Err(format!(
+                    "must-pass source inputs differ in the {label}; commit them before release evaluation"
+                ));
+            }
+            code => {
+                return Err(format!(
+                    "git diff failed while inspecting must-pass source inputs (status {code:?})"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn must_pass_tree_records(
+    root: &Path,
+    commit: &str,
+    source_paths: &[&str],
+) -> Result<Vec<(String, String, String)>, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["ls-tree", "-r", "-z", "--full-tree", commit, "--"])
+        .args(source_paths)
+        .output()
+        .map_err(|err| format!("failed to list tracked must-pass source inputs: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git ls-tree failed for must-pass source inputs: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let records = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git ls-tree returned non-UTF-8 records: {err}"))?;
+    let records = records
+        .split('\0')
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let (metadata, path) = record
+                .split_once('\t')
+                .ok_or_else(|| format!("malformed git ls-tree record: {record}"))?;
+            let mut fields = metadata.split_ascii_whitespace();
+            let mode = fields
+                .next()
+                .ok_or_else(|| format!("missing mode in git ls-tree record: {record}"))?;
+            let object_type = fields
+                .next()
+                .ok_or_else(|| format!("missing type in git ls-tree record: {record}"))?;
+            let blob = fields
+                .next()
+                .ok_or_else(|| format!("missing blob in git ls-tree record: {record}"))?;
+            if fields.next().is_some()
+                || object_type != "blob"
+                || !matches!(mode, "100644" | "100755")
+                || !matches!(blob.len(), 40 | 64)
+                || !blob.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(format!("invalid git ls-tree record: {record}"));
+            }
+            Ok((path.to_string(), mode.to_string(), blob.to_string()))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut parsed = records;
+    parsed.sort_by(|left, right| left.0.cmp(&right.0));
+    if parsed.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("git ls-tree returned duplicate must-pass source paths".to_string());
+    }
+    for required in source_paths {
+        let prefix = format!("{required}/");
+        if !parsed
+            .iter()
+            .any(|(path, _, _)| *path == *required || path.starts_with(&prefix))
+        {
+            return Err(format!(
+                "required must-pass source input is not tracked: {required}"
+            ));
+        }
+    }
+    Ok(parsed)
+}
+
+fn must_pass_source_tree_sha256(records: &[(String, String, String)]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"pi.ext.must_pass_source_tree.v2\0");
+    for (path, mode, blob) in records {
+        hasher.update(path.as_bytes());
+        hasher.update([0]);
+        hasher.update(mode.as_bytes());
+        hasher.update([0]);
+        hasher.update(blob.as_bytes());
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
+    let header = format!("blob {}\0", contents.len());
+    match oid_hex_len {
+        40 => {
+            let mut hasher = Sha1::new();
+            hasher.update(header.as_bytes());
+            hasher.update(contents);
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        64 => {
+            let mut hasher = Sha256::new();
+            hasher.update(header.as_bytes());
+            hasher.update(contents);
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        length => Err(format!("unsupported Git object ID length: {length}")),
+    }
+}
+
+fn ensure_worktree_bytes_match_tree(
+    root: &Path,
+    records: &[(String, String, String)],
+) -> Result<(), String> {
+    for (path, _, expected_blob) in records {
+        let contents = std::fs::read(root.join(path)).map_err(|err| {
+            format!("failed to read must-pass worktree input {path} for byte comparison: {err}")
+        })?;
+        let actual_blob = git_blob_oid(&contents, expected_blob.len())?;
+        if actual_blob != *expected_blob {
+            return Err(format!(
+                "must-pass worktree bytes differ from canonical commit for {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedMustPassEvidence {
+    // The artifact commit is HEAD; the embedded git_commit remains the tested
+    // source commit and may be an earlier evidence-only ancestor.
+    git_commit: String,
+    verdict_contents: Vec<u8>,
+    events_contents: Vec<u8>,
+}
+
+fn capture_committed_must_pass_evidence(root: &Path) -> Result<CommittedMustPassEvidence, String> {
+    let verdict_before =
+        capture_committed_regular_file(root, MUST_PASS_VERDICT_PATH, "must-pass verdict evidence")?;
+    let events =
+        capture_committed_regular_file(root, MUST_PASS_EVENTS_PATH, "must-pass event evidence")?;
+    let verdict_after =
+        capture_committed_regular_file(root, MUST_PASS_VERDICT_PATH, "must-pass verdict evidence")?;
+    let events_after =
+        capture_committed_regular_file(root, MUST_PASS_EVENTS_PATH, "must-pass event evidence")?;
+    if verdict_before != verdict_after
+        || events != events_after
+        || verdict_before.git_commit != events.git_commit
+    {
+        return Err(
+            "committed must-pass evidence changed while binding both artifacts to HEAD".to_string(),
+        );
+    }
+
+    Ok(CommittedMustPassEvidence {
+        git_commit: verdict_before.git_commit,
+        verdict_contents: verdict_before.contents,
+        events_contents: events.contents,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MustPassSourceSnapshot {
+    git_commit: String,
+    source_tree_sha256: String,
+    inclusion_sha256: String,
+    manifest_sha256: String,
+    inclusion_contents: Vec<u8>,
+    manifest_contents: Vec<u8>,
+    tracked_paths: BTreeSet<String>,
+}
+
+fn capture_must_pass_source_snapshot(root: &Path) -> Result<MustPassSourceSnapshot, String> {
+    let git_commit = current_git_commit(root)?;
+    ensure_must_pass_worktree_matches_commit(root, &git_commit, MUST_PASS_SOURCE_PATHS)?;
+    let records = must_pass_tree_records(root, &git_commit, MUST_PASS_SOURCE_PATHS)?;
+    ensure_worktree_bytes_match_tree(root, &records)?;
+    let inclusion_contents = git_blob_bytes(
+        root,
+        &format!("{git_commit}:{MUST_PASS_INCLUSION_PATH}"),
+        "canonical must-pass inclusion-list blob",
+    )?;
+    let manifest_contents = git_blob_bytes(
+        root,
+        &format!("{git_commit}:{MUST_PASS_MANIFEST_PATH}"),
+        "canonical must-pass manifest blob",
+    )?;
+    let observed_head = current_git_commit(root)?;
+    if observed_head != git_commit {
+        return Err(format!(
+            "must-pass source HEAD changed during snapshot capture: {git_commit} -> {observed_head}"
+        ));
+    }
+    ensure_must_pass_worktree_matches_commit(root, &git_commit, MUST_PASS_SOURCE_PATHS)?;
+    ensure_worktree_bytes_match_tree(root, &records)?;
+    let tracked_paths = records.iter().map(|record| record.0.clone()).collect();
+    Ok(MustPassSourceSnapshot {
+        git_commit,
+        source_tree_sha256: must_pass_source_tree_sha256(&records),
+        inclusion_sha256: format!("{:x}", Sha256::digest(&inclusion_contents)),
+        manifest_sha256: format!("{:x}", Sha256::digest(&manifest_contents)),
+        inclusion_contents,
+        manifest_contents,
+        tracked_paths,
+    })
+}
+
+fn canonical_must_pass_entries(
+    inclusion_contents: &[u8],
+    manifest_contents: &[u8],
+    tracked_paths: &BTreeSet<String>,
+) -> Result<BTreeMap<String, u64>, String> {
+    let inclusion: Value = serde_json::from_slice(inclusion_contents)
+        .map_err(|err| format!("invalid {MUST_PASS_INCLUSION_PATH}: {err}"))?;
+    if inclusion.get("schema").and_then(Value::as_str) != Some("pi.ext.inclusion_list.v1") {
+        return Err(format!(
+            "unexpected schema in {MUST_PASS_INCLUSION_PATH}: {}",
+            inclusion
+                .get("schema")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        ));
+    }
+
+    let mut ids = BTreeSet::new();
+    let mut observed_section_counts = BTreeMap::new();
+    for section in ["tier1", "tier1_review"] {
+        let rows = inclusion
+            .get(section)
+            .and_then(Value::as_array)
+            .ok_or_else(|| format!("{MUST_PASS_INCLUSION_PATH} missing {section} array"))?;
+        observed_section_counts.insert(section, rows.len());
+        for (index, row) in rows.iter().enumerate() {
+            let id = row
+                .get("id")
+                .and_then(Value::as_str)
+                .filter(|id| {
+                    !id.is_empty() && id.trim() == *id && !id.chars().any(char::is_control)
+                })
+                .ok_or_else(|| {
+                    format!("{MUST_PASS_INCLUSION_PATH} {section}[{index}] has a malformed id")
+                })?;
+            if !ids.insert(id.to_string()) {
+                return Err(format!(
+                    "{MUST_PASS_INCLUSION_PATH} contains duplicate must-pass id {id}"
+                ));
+            }
+        }
+    }
+
+    let summary_count = |field: &str| {
+        inclusion
+            .pointer(&format!("/summary/{field}"))
+            .and_then(Value::as_u64)
+            .ok_or_else(|| format!("{MUST_PASS_INCLUSION_PATH} missing unsigned summary.{field}"))
+    };
+    let tier1_count = summary_count("tier1_count")?;
+    let review_count = summary_count("tier1_review_count")?;
+    let total_count = summary_count("total_must_pass")?;
+    let observed_tier1 = u64::try_from(observed_section_counts["tier1"]).unwrap_or(u64::MAX);
+    let observed_review =
+        u64::try_from(observed_section_counts["tier1_review"]).unwrap_or(u64::MAX);
+    let observed_total = u64::try_from(ids.len()).unwrap_or(u64::MAX);
+    if tier1_count != observed_tier1
+        || review_count != observed_review
+        || total_count != observed_total
+        || observed_total != EXPECTED_CANONICAL_MUST_PASS_EXTENSIONS_V1
+    {
+        return Err(format!(
+            "{MUST_PASS_INCLUSION_PATH} summary mismatch or unexpected versioned must-pass denominator: summary={tier1_count}+{review_count}={total_count}, observed={observed_tier1}+{observed_review}={observed_total}, expected={EXPECTED_CANONICAL_MUST_PASS_EXTENSIONS_V1}"
+        ));
+    }
+
+    let manifest: Value = serde_json::from_slice(manifest_contents)
+        .map_err(|err| format!("invalid {MUST_PASS_MANIFEST_PATH}: {err}"))?;
+    if manifest.get("schema").and_then(Value::as_str) != Some("pi.ext.validated-manifest.v1") {
+        return Err(format!(
+            "unexpected schema in {MUST_PASS_MANIFEST_PATH}: {}",
+            manifest
+                .get("schema")
+                .and_then(Value::as_str)
+                .unwrap_or("missing")
+        ));
+    }
+    let extensions = manifest
+        .get("extensions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("{MUST_PASS_MANIFEST_PATH} missing extensions array"))?;
+    let mut manifest_tiers = BTreeMap::new();
+    let mut manifest_artifact_ids = BTreeMap::new();
+    for (index, extension) in extensions.iter().enumerate() {
+        let id = extension
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.trim() == *id && !id.chars().any(char::is_control))
+            .ok_or_else(|| {
+                format!("{MUST_PASS_MANIFEST_PATH} extensions[{index}] has a malformed id")
+            })?;
+        let tier = extension
+            .get("conformance_tier")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                format!(
+                    "{MUST_PASS_MANIFEST_PATH} extensions[{index}] missing unsigned conformance_tier"
+                )
+            })?;
+        if !(1..=5).contains(&tier) {
+            return Err(format!(
+                "{MUST_PASS_MANIFEST_PATH} extensions[{index}] has invalid conformance_tier {tier}; expected 1..=5"
+            ));
+        }
+        let relative = extension
+            .get("entry_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!("{MUST_PASS_MANIFEST_PATH} extensions[{index}] missing artifact entry_path")
+            })?;
+        let relative_path = Path::new(relative);
+        if relative.is_empty()
+            || relative.trim() != relative
+            || relative.chars().any(char::is_control)
+            || relative.contains('\\')
+            || is_windows_absolute_path(relative)
+            || relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(format!(
+                "manifest entry {id} has a non-canonical artifact entry_path: {relative:?}"
+            ));
+        }
+        let artifact_path = format!("{MUST_PASS_ARTIFACTS_PATH}/{relative}");
+        if !tracked_paths.contains(&artifact_path) {
+            return Err(format!(
+                "manifest entry {id} points to an artifact input not tracked by the canonical commit: {artifact_path}"
+            ));
+        }
+        if let Some(first_id) = manifest_artifact_ids.insert(artifact_path.clone(), id.to_string())
+        {
+            return Err(format!(
+                "{MUST_PASS_MANIFEST_PATH} reuses artifact entry_path {relative} for extension ids {first_id} and {id}"
+            ));
+        }
+        if manifest_tiers.insert(id.to_string(), tier).is_some() {
+            return Err(format!(
+                "{MUST_PASS_MANIFEST_PATH} contains duplicate extension id {id}"
+            ));
+        }
+    }
+
+    ids.into_iter()
+        .map(|id| {
+            let tier = manifest_tiers.get(&id).copied().ok_or_else(|| {
+                format!(
+                    "canonical must-pass id {id} from {MUST_PASS_INCLUSION_PATH} is absent from {MUST_PASS_MANIFEST_PATH}"
+                )
+            })?;
+            Ok((id, tier))
+        })
+        .collect()
+}
+
+fn required_must_pass_string<'a>(verdict: &'a Value, field: &str) -> Result<&'a str, String> {
+    verdict
+        .get(field)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("must-pass verdict missing non-empty {field}"))
+}
+
+fn required_must_pass_count(verdict: &Value, field: &str) -> Result<u64, String> {
+    verdict
+        .pointer(&format!("/observed/{field}"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("must-pass verdict missing unsigned observed.{field}"))
+}
+
+fn validate_must_pass_verdict_contract(
+    verdict: &Value,
+    expected_count: u64,
+    expected_source_tree_sha256: &str,
+    expected_inclusion_sha256: &str,
+    expected_manifest_sha256: &str,
+) -> Result<(), String> {
+    let schema = verdict
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("missing");
+    if schema != MUST_PASS_GATE_SCHEMA {
+        return Err(format!(
+            "must-pass verdict schema mismatch: expected {MUST_PASS_GATE_SCHEMA}, found {schema}"
+        ));
+    }
+    if verdict.get("status").and_then(Value::as_str) != Some("pass") {
+        return Err("must-pass verdict status must be pass".to_string());
+    }
+
+    let git_commit = required_must_pass_string(verdict, "git_commit")?;
+    if !matches!(git_commit.len(), 40 | 64)
+        || !git_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(
+            "must-pass verdict git_commit must be a full 40- or 64-character hexadecimal commit ID"
+                .to_string(),
+        );
+    }
+    for (field, expected) in [
+        ("source_tree_sha256", expected_source_tree_sha256),
+        ("inclusion_sha256", expected_inclusion_sha256),
+        ("manifest_sha256", expected_manifest_sha256),
+    ] {
+        let actual = required_must_pass_string(verdict, field)?;
+        if actual.len() != 64 || !actual.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!(
+                "must-pass verdict {field} must be a 64-character hexadecimal SHA-256"
+            ));
+        }
+        if actual != expected {
+            return Err(format!(
+                "must-pass verdict {field} does not match current authoritative release inputs"
+            ));
+        }
+    }
+
+    let total = required_must_pass_count(verdict, "must_pass_total")?;
+    let tested = required_must_pass_count(verdict, "must_pass_tested")?;
+    let passed = required_must_pass_count(verdict, "must_pass_passed")?;
+    let failed = required_must_pass_count(verdict, "must_pass_failed")?;
+    let skipped = required_must_pass_count(verdict, "must_pass_skipped")?;
+    if passed.checked_add(failed) != Some(tested) || tested.checked_add(skipped) != Some(total) {
+        return Err(format!(
+            "must-pass verdict counts are incoherent: total={total}, tested={tested}, passed={passed}, failed={failed}, skipped={skipped}"
+        ));
+    }
+    if total != expected_count
+        || tested != expected_count
+        || passed != expected_count
+        || failed != 0
+        || skipped != 0
+    {
+        return Err(format!(
+            "must-pass verdict must prove the exact canonical set: expected={expected_count}, total={total}, tested={tested}, passed={passed}, failed={failed}, skipped={skipped}"
+        ));
+    }
+    let pass_rate = verdict
+        .pointer("/observed/must_pass_pass_rate_pct")
+        .and_then(Value::as_f64)
+        .ok_or_else(|| {
+            "must-pass verdict missing numeric observed.must_pass_pass_rate_pct".to_string()
+        })?;
+    if pass_rate.to_bits() != 100.0_f64.to_bits() {
+        return Err(format!(
+            "must-pass verdict pass rate must be 100.0, found {pass_rate}"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ObservedGateEvents {
+    must_pass: BTreeMap<String, u64>,
+    stretch: BTreeSet<String>,
+}
+
+fn observed_must_pass_events_from_contents(
+    contents: &str,
+    verdict: &Value,
+) -> Result<ObservedGateEvents, String> {
+    let run_id = required_must_pass_string(verdict, "run_id")?;
+    let correlation_id = required_must_pass_string(verdict, "correlation_id")?;
+    let git_commit = required_must_pass_string(verdict, "git_commit")?;
+    let source_tree_sha256 = required_must_pass_string(verdict, "source_tree_sha256")?;
+    let inclusion_sha256 = required_must_pass_string(verdict, "inclusion_sha256")?;
+    let manifest_sha256 = required_must_pass_string(verdict, "manifest_sha256")?;
+    let mut must_pass = BTreeMap::new();
+    let mut stretch = BTreeSet::new();
+    let mut event_keys = BTreeSet::new();
+
+    for (line_index, raw_line) in contents.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let event: Value = serde_json::from_str(line).map_err(|err| {
+            format!(
+                "invalid JSONL row {} in {MUST_PASS_EVENTS_PATH}: {err}",
+                line_index + 1
+            )
+        })?;
+        if event.get("schema").and_then(Value::as_str) != Some(MUST_PASS_EVENT_SCHEMA) {
+            return Err(format!(
+                "invalid event schema at {MUST_PASS_EVENTS_PATH}:{}",
+                line_index + 1
+            ));
+        }
+        let set = event.get("set").and_then(Value::as_str).ok_or_else(|| {
+            format!(
+                "event at {MUST_PASS_EVENTS_PATH}:{} is missing a string set",
+                line_index + 1
+            )
+        })?;
+        if !matches!(set, "must_pass" | "stretch") {
+            return Err(format!(
+                "event at {MUST_PASS_EVENTS_PATH}:{} has unexpected set {set}",
+                line_index + 1
+            ));
+        }
+        for (field, expected) in [
+            ("run_id", run_id),
+            ("correlation_id", correlation_id),
+            ("git_commit", git_commit),
+            ("source_tree_sha256", source_tree_sha256),
+            ("inclusion_sha256", inclusion_sha256),
+            ("manifest_sha256", manifest_sha256),
+        ] {
+            if event.get(field).and_then(Value::as_str) != Some(expected) {
+                return Err(format!(
+                    "must-pass event {field} mismatch at {MUST_PASS_EVENTS_PATH}:{}",
+                    line_index + 1
+                ));
+            }
+        }
+        let id = event
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.trim() == *id && !id.chars().any(char::is_control))
+            .ok_or_else(|| {
+                format!(
+                    "must-pass event at {MUST_PASS_EVENTS_PATH}:{} has a malformed id",
+                    line_index + 1
+                )
+            })?;
+        let tier = event.get("tier").and_then(Value::as_u64).ok_or_else(|| {
+            format!(
+                "must-pass event at {MUST_PASS_EVENTS_PATH}:{} is missing an unsigned tier",
+                line_index + 1
+            )
+        })?;
+        if !(1..=5).contains(&tier) {
+            return Err(format!(
+                "must-pass event at {MUST_PASS_EVENTS_PATH}:{} has invalid tier {tier}",
+                line_index + 1
+            ));
+        }
+        let status = event.get("status").and_then(Value::as_str).ok_or_else(|| {
+            format!(
+                "event at {MUST_PASS_EVENTS_PATH}:{} is missing a string status",
+                line_index + 1
+            )
+        })?;
+        if !matches!(status, "pass" | "fail" | "skip") {
+            return Err(format!(
+                "event at {MUST_PASS_EVENTS_PATH}:{} has unexpected status {status}",
+                line_index + 1
+            ));
+        }
+        if !event_keys.insert((set.to_string(), id.to_string())) {
+            let set_label = if set == "must_pass" {
+                "must-pass"
+            } else {
+                "stretch"
+            };
+            return Err(format!(
+                "duplicate {set_label} event id {id} in {MUST_PASS_EVENTS_PATH}"
+            ));
+        }
+        if set == "must_pass" {
+            if status != "pass" {
+                return Err(format!(
+                    "non-pass must-pass event at {MUST_PASS_EVENTS_PATH}:{}",
+                    line_index + 1
+                ));
+            }
+            must_pass.insert(id.to_string(), tier);
+        } else {
+            stretch.insert(id.to_string());
+        }
+    }
+    if must_pass.is_empty() {
+        return Err(format!(
+            "{MUST_PASS_EVENTS_PATH} contains no must-pass events"
+        ));
+    }
+    Ok(ObservedGateEvents { must_pass, stretch })
+}
+
+fn observed_must_pass_events(
+    root: &Path,
+    verdict: &Value,
+) -> Result<BTreeMap<String, u64>, String> {
+    let contents = std::fs::read_to_string(root.join(MUST_PASS_EVENTS_PATH))
+        .map_err(|err| format!("failed to read {MUST_PASS_EVENTS_PATH}: {err}"))?;
+    observed_must_pass_events_from_contents(&contents, verdict).map(|events| events.must_pass)
+}
+
+fn validate_event_set_identities(
+    events: &ObservedGateEvents,
+    expected: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    if let Some(mislabeled_id) = events.stretch.iter().find(|id| expected.contains_key(*id)) {
+        return Err(format!(
+            "canonical must-pass id {mislabeled_id} is incorrectly labeled stretch in {MUST_PASS_EVENTS_PATH}"
+        ));
+    }
+    Ok(())
+}
+
+fn evidence_followup_path_allowed(path: &str) -> bool {
+    [
+        "tests/ext_conformance/reports/",
+        "tests/perf/reports/",
+        "tests/cross_platform_reports/",
+        "tests/franken_node_compat/reports/",
+        "tests/evidence_bundle/",
+        "tests/certification/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+}
+
+fn validate_must_pass_git_commit(
+    root: &Path,
+    source_commit: &str,
+    current_commit: &str,
+) -> Result<(), String> {
+    if !matches!(source_commit.len(), 40 | 64)
+        || !source_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("must-pass evidence git_commit is not a full commit ID".to_string());
+    }
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "rev-parse",
+            "--verify",
+            &format!("{source_commit}^{{commit}}"),
+        ])
+        .output()
+        .map_err(|err| format!("failed to resolve must-pass evidence git_commit: {err}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "must-pass evidence git_commit does not resolve to a commit: {source_commit}"
+        ));
+    }
+    let resolved = String::from_utf8(output.stdout)
+        .map_err(|err| format!("git rev-parse returned non-UTF-8 output: {err}"))?;
+    if !resolved.trim().eq_ignore_ascii_case(source_commit) {
+        return Err(format!(
+            "must-pass evidence git_commit did not resolve exactly: expected {source_commit}, found {}",
+            resolved.trim()
+        ));
+    }
+    let ancestor_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["merge-base", "--is-ancestor", source_commit, current_commit])
+        .status()
+        .map_err(|err| format!("failed to inspect must-pass evidence ancestry: {err}"))?;
+    match ancestor_status.code() {
+        Some(0) => {}
+        Some(1) => {
+            return Err(format!(
+                "must-pass evidence git_commit {source_commit} is not an ancestor of current release commit {current_commit}"
+            ));
+        }
+        code => {
+            return Err(format!(
+                "git merge-base failed while inspecting evidence ancestry (status {code:?})"
+            ));
+        }
+    }
+    if source_commit.eq_ignore_ascii_case(current_commit) {
+        return Ok(());
+    }
+
+    let history = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "log",
+            "--format=",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &format!("{source_commit}..{current_commit}"),
+            "--",
+        ])
+        .output()
+        .map_err(|err| format!("failed to inspect evidence follow-up history: {err}"))?;
+    if !history.status.success() {
+        return Err(format!(
+            "git log failed while inspecting evidence follow-up history: {}",
+            String::from_utf8_lossy(&history.stderr).trim()
+        ));
+    }
+    let paths = String::from_utf8(history.stdout)
+        .map_err(|err| format!("git log returned non-UTF-8 paths: {err}"))?;
+    let disallowed = paths
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .filter(|path| !evidence_followup_path_allowed(path))
+        .take(5)
+        .collect::<Vec<_>>();
+    if !disallowed.is_empty() {
+        return Err(format!(
+            "must-pass evidence git_commit is followed by commits touching non-evidence paths: {}",
+            disallowed.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authoritative_must_pass_artifacts(root: &Path, verdict: &Value) -> Result<(), String> {
+    let evidence_before = capture_committed_must_pass_evidence(root)?;
+    let committed_verdict: Value = serde_json::from_slice(&evidence_before.verdict_contents)
+        .map_err(|err| format!("failed to parse committed {MUST_PASS_VERDICT_PATH}: {err}"))?;
+    if &committed_verdict != verdict {
+        return Err(format!(
+            "validated {MUST_PASS_VERDICT_PATH} does not match the commit-bound artifact bytes"
+        ));
+    }
+    let events_contents = std::str::from_utf8(&evidence_before.events_contents)
+        .map_err(|err| format!("committed {MUST_PASS_EVENTS_PATH} is not UTF-8: {err}"))?;
+    let snapshot = capture_must_pass_source_snapshot(root)?;
+    let expected = canonical_must_pass_entries(
+        &snapshot.inclusion_contents,
+        &snapshot.manifest_contents,
+        &snapshot.tracked_paths,
+    )?;
+    let expected_count = u64::try_from(expected.len()).unwrap_or(u64::MAX);
+    validate_must_pass_verdict_contract(
+        verdict,
+        expected_count,
+        &snapshot.source_tree_sha256,
+        &snapshot.inclusion_sha256,
+        &snapshot.manifest_sha256,
+    )?;
+    validate_must_pass_git_commit(
+        root,
+        required_must_pass_string(verdict, "git_commit")?,
+        &snapshot.git_commit,
+    )?;
+    let observed_events = observed_must_pass_events_from_contents(events_contents, verdict)?;
+    validate_event_set_identities(&observed_events, &expected)?;
+    let observed = observed_events.must_pass;
+    if observed != expected {
+        let expected_ids = expected.keys().cloned().collect::<BTreeSet<_>>();
+        let observed_ids = observed.keys().cloned().collect::<BTreeSet<_>>();
+        let missing = expected_ids
+            .difference(&observed_ids)
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        let unexpected = observed_ids
+            .difference(&expected_ids)
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        let tier_mismatches = expected
+            .iter()
+            .filter_map(|(id, expected_tier)| {
+                observed
+                    .get(id)
+                    .filter(|observed_tier| *observed_tier != expected_tier)
+                    .map(|observed_tier| format!("{id}:{observed_tier}!={expected_tier}"))
+            })
+            .take(5)
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "must-pass events do not match the exact canonical inclusion-list set: expected={}, observed={}, missing=[{}], unexpected=[{}], tier_mismatches=[{}]",
+            expected.len(),
+            observed.len(),
+            missing.join(", "),
+            unexpected.join(", "),
+            tier_mismatches.join(", ")
+        ));
+    }
+    let snapshot_after = capture_must_pass_source_snapshot(root)?;
+    if snapshot != snapshot_after {
+        return Err(
+            "must-pass canonical source inputs changed during aggregate release-gate validation"
+                .to_string(),
+        );
+    }
+    let evidence_after = capture_committed_must_pass_evidence(root)?;
+    if evidence_before != evidence_after {
+        return Err(
+            "committed must-pass evidence changed during aggregate release-gate validation"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 const MUST_PASS_LINEAGE_MAX_AGE_DAYS: i64 = 7;
 const MUST_PASS_LINEAGE_MAX_FUTURE_SKEW_MINUTES: i64 = 5;
 
@@ -1293,6 +2499,9 @@ fn check_must_pass_gate_artifact(root: &Path, artifact_rel: &str) -> (String, Op
     if let Err(detail) =
         validate_must_pass_lineage_metadata(&verdict, artifact_rel, chrono::Utc::now())
     {
+        return ("fail".to_string(), Some(detail));
+    }
+    if let Err(detail) = validate_authoritative_must_pass_artifacts(root, &verdict) {
         return ("fail".to_string(), Some(detail));
     }
 
@@ -2157,19 +3366,14 @@ fn collect_gates(root: &Path) -> Vec<SubGate> {
     });
 
     // Gate 3: Extension must-pass gate.
-    let (status, detail) = check_must_pass_gate_artifact(
-        root,
-        "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
-    );
+    let (status, detail) = check_must_pass_gate_artifact(root, MUST_PASS_VERDICT_PATH);
     gates.push(SubGate {
         id: "ext_must_pass".to_string(),
         name: "Extension must-pass gate".to_string(),
         bead: "bd-1f42.4.4".to_string(),
         status,
         blocking: true,
-        artifact_path: Some(
-            "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json".to_string(),
-        ),
+        artifact_path: Some(MUST_PASS_VERDICT_PATH.to_string()),
         detail,
         reproduce_command: Some(
             "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact".to_string(),
@@ -4038,6 +5242,20 @@ fn perf3x_bead_coverage_contract_fails_closed_on_windows_absolute_path() {
 }
 
 #[test]
+fn perf3x_bead_coverage_contract_fails_closed_on_windows_drive_relative_path() {
+    let mut contract = perf3x_bead_coverage_contract();
+    contract["coverage_rows"][0]["e2e_evidence"] =
+        serde_json::json!(["tests/e2e_results", "C:temp/outside.json"]);
+
+    let error = validate_perf3x_bead_coverage_contract(&contract)
+        .expect_err("windows drive-relative path must fail closed");
+    assert!(
+        error.contains("windows-absolute"),
+        "error should mention the rejected Windows drive prefix: {error}"
+    );
+}
+
+#[test]
 fn perf3x_bead_coverage_contract_fails_closed_on_unc_path() {
     let mut contract = perf3x_bead_coverage_contract();
     contract["coverage_rows"][0]["log_evidence"] = serde_json::json!([
@@ -4076,6 +5294,33 @@ fn perf3x_bead_coverage_evaluator_fails_closed_when_evidence_paths_are_missing()
     );
 
     let _ = std::fs::remove_dir_all(&temp);
+}
+
+#[cfg(unix)]
+#[test]
+fn perf3x_bead_coverage_evaluator_rejects_symlink_evidence() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().expect("create coverage root");
+    let outside = tempfile::tempdir().expect("create outside coverage root");
+    std::fs::create_dir_all(root.path().join("tests")).expect("create coverage tests directory");
+    let outside_file = outside.path().join("bench_schema.rs");
+    std::fs::write(&outside_file, "external evidence\n").expect("write outside evidence");
+    symlink(&outside_file, root.path().join("tests/bench_schema.rs"))
+        .expect("create evidence symlink fixture");
+
+    let evaluation =
+        evaluate_perf3x_bead_coverage_internal(root.path(), &perf3x_bead_coverage_contract());
+    assert_eq!(evaluation.status, "fail");
+    let symlink_failure = evaluation
+        .missing_evidence
+        .iter()
+        .find(|entry| entry.contains("tests/bench_schema.rs"))
+        .expect("symlink evidence must be included in fail-closed diagnostics");
+    assert!(
+        symlink_failure.contains("symbolic link"),
+        "{symlink_failure}"
+    );
 }
 
 #[test]
@@ -4182,7 +5427,38 @@ fn perf3x_bead_coverage_audit_report_tracks_missing_evidence_fail_closed() {
 }
 
 fn write_practical_finish_issue_fixture(root: &Path, entries: &[Value]) {
-    write_practical_finish_issue_fixture_to(root, ".beads/issues.jsonl", entries);
+    write_complete_practical_finish_issue_fixture_to(
+        root,
+        PRACTICAL_FINISH_LIVE_ISSUE_SOURCE,
+        entries,
+    );
+    commit_practical_finish_issue_fixture(root, PRACTICAL_FINISH_LIVE_ISSUE_SOURCE);
+}
+
+fn write_complete_practical_finish_issue_fixture_to(
+    root: &Path,
+    relative: &str,
+    entries: &[Value],
+) {
+    let mut complete_entries = PRACTICAL_FINISH_REQUIRED_LEDGER_ANCHORS
+        .iter()
+        .filter(|anchor| {
+            !entries
+                .iter()
+                .any(|entry| entry.get("id").and_then(Value::as_str) == Some(**anchor))
+        })
+        .map(|anchor| {
+            serde_json::json!({
+                "id": anchor,
+                "status": "closed",
+                "issue_type": "epic",
+                "title": "Canonical PERF-3X ledger anchor",
+                "labels": ["perf-3x"]
+            })
+        })
+        .collect::<Vec<_>>();
+    complete_entries.extend(entries.iter().cloned());
+    write_practical_finish_issue_fixture_to(root, relative, &complete_entries);
 }
 
 fn write_practical_finish_issue_fixture_to(root: &Path, relative: &str, entries: &[Value]) {
@@ -4200,30 +5476,66 @@ fn write_practical_finish_issue_fixture_to(root: &Path, relative: &str, entries:
     std::fs::write(path, lines.join("\n") + "\n").expect("write issues fixture");
 }
 
+fn run_practical_finish_fixture_git(root: &Path, args: &[&str]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("failed to execute fixture git {args:?}: {err}"));
+    assert!(
+        output.status.success(),
+        "fixture git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn commit_practical_finish_issue_fixture(root: &Path, relative: &str) {
+    run_practical_finish_fixture_git(root, &["init", "--quiet", "--initial-branch=main"]);
+    run_practical_finish_fixture_git(root, &["add", "--", relative]);
+    run_practical_finish_fixture_git(
+        root,
+        &[
+            "-c",
+            "user.name=Pi Gate Fixture",
+            "-c",
+            "user.email=pi-gate-fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--message",
+            "Add authoritative Beads fixture",
+        ],
+    );
+}
+
 #[test]
-fn practical_finish_classifier_marks_docs_and_report_labels() {
+fn practical_finish_classifier_requires_explicit_docs_issue_type() {
     let docs_issue = PracticalFinishOpenIssue {
         id: "bd-3ar8v.6.5".to_string(),
         title: "Final report artifact".to_string(),
         status: "open".to_string(),
-        issue_type: "task".to_string(),
+        issue_type: "docs".to_string(),
         labels: vec!["report".to_string()],
     };
     assert!(
-        is_docs_or_report_issue(&docs_issue),
-        "report-labeled issue should classify as docs/report"
+        is_docs_only_issue(&docs_issue),
+        "the explicit docs issue type should classify as docs-only"
     );
 
-    let technical_issue = PracticalFinishOpenIssue {
+    let mislabeled_technical_issue = PracticalFinishOpenIssue {
         id: "bd-3ar8v.6.2".to_string(),
-        title: "Parameter sweeps".to_string(),
+        title: "Harden permanent gates and write their runbook".to_string(),
         status: "open".to_string(),
         issue_type: "task".to_string(),
-        labels: vec!["perf-3x".to_string(), "tuning".to_string()],
+        labels: vec![
+            "docs-last".to_string(),
+            "report".to_string(),
+            "runbook".to_string(),
+        ],
     };
     assert!(
-        !is_docs_or_report_issue(&technical_issue),
-        "technical tuning issue should remain in technical bucket"
+        !is_docs_only_issue(&mislabeled_technical_issue),
+        "generic output labels must not exempt a technical task"
     );
 }
 
@@ -4235,7 +5547,7 @@ fn practical_finish_report_passes_with_docs_only_residual_open_issues() {
         &[serde_json::json!({
             "id": "bd-3ar8v.6.5",
             "status": "open",
-            "issue_type": "task",
+            "issue_type": "docs",
             "title": "Final report and go/no-go summary",
             "labels": ["report"]
         })],
@@ -4263,6 +5575,37 @@ fn practical_finish_report_passes_with_docs_only_residual_open_issues() {
 }
 
 #[test]
+fn practical_finish_report_treats_report_labeled_task_as_technical() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[serde_json::json!({
+            "id": "bd-3ar8v.6.4",
+            "status": "open",
+            "issue_type": "task",
+            "title": "Harden permanent performance gates and their triage runbook",
+            "labels": ["docs-last", "report", "runbook"]
+        })],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(
+        report.status, "fail",
+        "generic documentation-output labels must not exempt a technical task"
+    );
+    assert!(!report.technical_completion_reached);
+    assert_eq!(report.residual_open_scope, "technical_remaining");
+    assert_eq!(report.open_perf3x_count, 1);
+    assert_eq!(report.technical_open_count, 1);
+    assert_eq!(report.docs_or_report_open_count, 0);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("bd-3ar8v.6.4"),
+        "technical blocker ID should remain visible: {detail}"
+    );
+}
+
+#[test]
 fn practical_finish_report_fails_when_technical_open_issues_remain() {
     let temp = tempfile::tempdir().expect("create tempdir");
     write_practical_finish_issue_fixture(
@@ -4278,7 +5621,7 @@ fn practical_finish_report_fails_when_technical_open_issues_remain() {
             serde_json::json!({
                 "id": "bd-3ar8v.6.5",
                 "status": "open",
-                "issue_type": "task",
+                "issue_type": "docs",
                 "title": "Final report and go/no-go summary",
                 "labels": ["report"]
             }),
@@ -4305,15 +5648,128 @@ fn practical_finish_report_fails_when_technical_open_issues_remain() {
 }
 
 #[test]
-fn practical_finish_report_falls_back_to_beads_base_when_live_issues_missing() {
+fn practical_finish_report_blocks_every_nonterminal_technical_status() {
+    for (index, status) in [
+        "open",
+        "in_progress",
+        "blocked",
+        "deferred",
+        "draft",
+        "pinned",
+        "custom_waiting",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let temp = tempfile::tempdir().expect("create tempdir");
+        let issue_id = format!("bd-3ar8v.6.{}", index + 20);
+        write_practical_finish_issue_fixture(
+            temp.path(),
+            &[serde_json::json!({
+                "id": issue_id,
+                "status": status,
+                "issue_type": "task",
+                "title": "Unresolved technical work",
+                "labels": ["perf-3x"]
+            })],
+        );
+
+        let report = build_practical_finish_checkpoint_report(temp.path());
+        assert_eq!(
+            report.status, "fail",
+            "nonterminal status {status} must block practical finish"
+        );
+        assert!(!report.technical_completion_reached);
+        assert_eq!(report.open_perf3x_count, 1, "status={status}");
+        assert_eq!(report.technical_open_count, 1, "status={status}");
+        assert_eq!(report.docs_or_report_open_count, 0, "status={status}");
+        let detail = report.detail.unwrap_or_default();
+        assert!(
+            detail.contains(&issue_id),
+            "blocker for status {status} should remain visible: {detail}"
+        );
+    }
+}
+
+#[test]
+fn practical_finish_report_rejects_duplicate_issue_ids() {
     let temp = tempfile::tempdir().expect("create tempdir");
-    write_practical_finish_issue_fixture_to(
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[
+            serde_json::json!({
+                "id": "bd-3ar8v.6.21",
+                "status": "closed",
+                "issue_type": "task",
+                "title": "Historical copy",
+                "labels": ["perf-3x"]
+            }),
+            serde_json::json!({
+                "id": "bd-3ar8v.6.21",
+                "status": "open",
+                "issue_type": "task",
+                "title": "Conflicting live copy",
+                "labels": ["perf-3x"]
+            }),
+        ],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(report.status, "fail");
+    assert!(!report.technical_completion_reached);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("duplicate issue id bd-3ar8v.6.21"),
+        "duplicate rows must fail instead of using last-row-wins semantics: {detail}"
+    );
+}
+
+#[test]
+fn practical_finish_docs_descendant_cannot_hide_technical_parent() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[
+            serde_json::json!({
+                "id": "bd-3ar8v.6.22",
+                "status": "open",
+                "issue_type": "task",
+                "title": "Technical parent still incomplete",
+                "labels": ["perf-3x"]
+            }),
+            serde_json::json!({
+                "id": "bd-3ar8v.6.22.1",
+                "status": "open",
+                "issue_type": "docs",
+                "title": "Document the incomplete parent",
+                "labels": ["report"]
+            }),
+        ],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(report.status, "fail");
+    assert!(!report.technical_completion_reached);
+    assert_eq!(report.open_perf3x_count, 2);
+    assert_eq!(report.technical_open_count, 1);
+    assert_eq!(report.docs_or_report_open_count, 1);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("bd-3ar8v.6.22"),
+        "a docs-only child must not collapse its technical parent: {detail}"
+    );
+}
+
+#[test]
+fn practical_finish_report_rejects_base_when_live_issues_missing() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_complete_practical_finish_issue_fixture_to(
         temp.path(),
         ".beads/beads.base.jsonl",
         &[serde_json::json!({
             "id": "bd-3ar8v.6.5",
             "status": "open",
-            "issue_type": "task",
+            "issue_type": "docs",
             "title": "Final report and go/no-go summary",
             "labels": ["report"]
         })],
@@ -4321,21 +5777,25 @@ fn practical_finish_report_falls_back_to_beads_base_when_live_issues_missing() {
 
     let report = build_practical_finish_checkpoint_report(temp.path());
     assert_eq!(
-        report.status, "pass",
-        "beads.base fallback should allow practical-finish evaluation"
+        report.status, "fail",
+        "a base snapshot must not replace the commit-bound live ledger"
     );
-    assert!(
-        report.technical_completion_reached,
-        "docs/report fallback residual should still mark technical completion reached"
-    );
-    assert_eq!(report.residual_open_scope, "docs_or_report_only");
-    assert_eq!(report.open_perf3x_count, 1);
+    assert!(!report.technical_completion_reached);
+    assert_eq!(report.residual_open_scope, "technical_remaining");
+    assert_eq!(report.open_perf3x_count, 0);
     assert_eq!(report.technical_open_count, 0);
-    assert_eq!(report.docs_or_report_open_count, 1);
+    assert_eq!(report.docs_or_report_open_count, 0);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("live Beads ledger is missing")
+            && detail.contains(PRACTICAL_FINISH_BASE_SOURCE)
+            && detail.contains("non-certifying"),
+        "failure should identify the diagnostic-only base source: {detail}"
+    );
 }
 
 #[test]
-fn practical_finish_report_falls_back_to_snapshot_when_beads_sources_missing() {
+fn practical_finish_report_fails_closed_on_unproven_snapshot_only() {
     let temp = tempfile::tempdir().expect("create tempdir");
     write_practical_finish_issue_fixture_to(
         temp.path(),
@@ -4351,73 +5811,91 @@ fn practical_finish_report_falls_back_to_snapshot_when_beads_sources_missing() {
 
     let report = build_practical_finish_checkpoint_report(temp.path());
     assert_eq!(
-        report.status, "pass",
-        "snapshot fallback should allow practical-finish evaluation when .beads sources are unavailable"
+        report.status, "fail",
+        "an unproven snapshot must not certify completion when authoritative Beads sources are unavailable"
     );
     assert!(
-        report.technical_completion_reached,
-        "docs/report fallback residual should still mark technical completion reached"
+        !report.technical_completion_reached,
+        "an unproven snapshot must keep technical completion false"
     );
-    assert_eq!(report.residual_open_scope, "docs_or_report_only");
-    assert_eq!(report.open_perf3x_count, 1);
+    assert_eq!(report.residual_open_scope, "technical_remaining");
+    assert_eq!(report.open_perf3x_count, 0);
     assert_eq!(report.technical_open_count, 0);
-    assert_eq!(report.docs_or_report_open_count, 1);
-}
-
-#[test]
-fn practical_finish_source_selection_prefers_freshest_candidate() {
-    let selected = select_practical_finish_issue_source(vec![
-        (
-            1_000,
-            0,
-            ".beads/issues.jsonl",
-            PathBuf::from(".beads/issues.jsonl"),
-            "{\"id\":\"bd-3ar8v.6.2\"}".to_string(),
-        ),
-        (
-            2_000,
-            2,
-            PRACTICAL_FINISH_SNAPSHOT_PATH,
-            PathBuf::from(PRACTICAL_FINISH_SNAPSHOT_PATH),
-            "{\"id\":\"bd-3ar8v.6.5\"}".to_string(),
-        ),
-    ])
-    .expect("newest source candidate should be selected");
-
-    assert_eq!(
-        selected.0, PRACTICAL_FINISH_SNAPSHOT_PATH,
-        "freshness should dominate source selection"
+    assert_eq!(report.docs_or_report_open_count, 0);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("live Beads ledger is missing")
+            && detail.contains(PRACTICAL_FINISH_SNAPSHOT_PATH)
+            && detail.contains("non-certifying"),
+        "failure should explain why snapshot-only evidence is rejected: {detail}"
     );
 }
 
 #[test]
-fn practical_finish_source_selection_uses_source_order_for_ties() {
-    let selected = select_practical_finish_issue_source(vec![
-        (
-            5_000,
-            1,
-            ".beads/beads.base.jsonl",
-            PathBuf::from(".beads/beads.base.jsonl"),
-            "{\"id\":\"bd-3ar8v.6.2\"}".to_string(),
-        ),
-        (
-            5_000,
-            0,
-            ".beads/issues.jsonl",
-            PathBuf::from(".beads/issues.jsonl"),
-            "{\"id\":\"bd-3ar8v.6.5\"}".to_string(),
-        ),
-    ])
-    .expect("tie should resolve deterministically by source order");
+fn practical_finish_report_rejects_uncommitted_truncation_that_preserves_anchors() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[serde_json::json!({
+            "id": "bd-3ar8v.6.2",
+            "status": "open",
+            "issue_type": "task",
+            "title": "Authoritative technical blocker",
+            "labels": ["perf-3x"]
+        })],
+    );
 
-    assert_eq!(
-        selected.0, ".beads/issues.jsonl",
-        "when freshness ties, source order should prefer live issues first"
+    write_complete_practical_finish_issue_fixture_to(
+        temp.path(),
+        PRACTICAL_FINISH_LIVE_ISSUE_SOURCE,
+        &[],
+    );
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(report.status, "fail");
+    assert!(!report.technical_completion_reached);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("differs between the working tree and Git index"),
+        "a truncated ledger preserving all weak anchors must fail provenance: {detail}"
     );
 }
 
 #[test]
-fn practical_finish_report_prefers_fresh_snapshot_over_stale_live_issues() {
+fn practical_finish_report_rejects_staged_truncation_that_preserves_anchors() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture(
+        temp.path(),
+        &[serde_json::json!({
+            "id": "bd-3ar8v.6.2",
+            "status": "open",
+            "issue_type": "task",
+            "title": "Authoritative technical blocker",
+            "labels": ["perf-3x"]
+        })],
+    );
+
+    write_complete_practical_finish_issue_fixture_to(
+        temp.path(),
+        PRACTICAL_FINISH_LIVE_ISSUE_SOURCE,
+        &[],
+    );
+    run_practical_finish_fixture_git(
+        temp.path(),
+        &["add", "--", PRACTICAL_FINISH_LIVE_ISSUE_SOURCE],
+    );
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(report.status, "fail");
+    assert!(!report.technical_completion_reached);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("differs between the Git index and HEAD"),
+        "a staged truncated ledger must not certify until it is committed: {detail}"
+    );
+}
+
+#[test]
+fn practical_finish_report_rejects_newer_incomplete_snapshot_over_live_blocker() {
     let temp = tempfile::tempdir().expect("create tempdir");
     write_practical_finish_issue_fixture(
         temp.path(),
@@ -4430,8 +5908,6 @@ fn practical_finish_report_prefers_fresh_snapshot_over_stale_live_issues() {
         })],
     );
 
-    // Some filesystems have coarse mtime granularity; ensure snapshot is newer.
-    std::thread::sleep(std::time::Duration::from_millis(1_100));
     write_practical_finish_issue_fixture_to(
         temp.path(),
         PRACTICAL_FINISH_SNAPSHOT_PATH,
@@ -4444,19 +5920,47 @@ fn practical_finish_report_prefers_fresh_snapshot_over_stale_live_issues() {
         })],
     );
 
+    let live_path = temp.path().join(".beads/issues.jsonl");
+    let snapshot_path = temp.path().join(PRACTICAL_FINISH_SNAPSHOT_PATH);
+    filetime::set_file_mtime(
+        &live_path,
+        filetime::FileTime::from_unix_time(1_700_000_000, 0),
+    )
+    .expect("set older live-ledger mtime");
+    filetime::set_file_mtime(
+        &snapshot_path,
+        filetime::FileTime::from_unix_time(1_700_000_100, 0),
+    )
+    .expect("set newer snapshot mtime");
+    let live_mtime = std::fs::metadata(&live_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("read live-ledger mtime");
+    let snapshot_mtime = std::fs::metadata(&snapshot_path)
+        .and_then(|metadata| metadata.modified())
+        .expect("read snapshot mtime");
+    assert!(
+        snapshot_mtime > live_mtime,
+        "regression fixture must plant a snapshot newer than the live ledger"
+    );
+
     let report = build_practical_finish_checkpoint_report(temp.path());
     assert_eq!(
-        report.status, "pass",
-        "fresh snapshot should supersede stale live issue cache"
+        report.status, "fail",
+        "a newer incomplete snapshot must not conceal a live technical blocker"
     );
     assert!(
-        report.technical_completion_reached,
-        "fresh docs-only snapshot should mark technical completion reached"
+        !report.technical_completion_reached,
+        "the authoritative live technical blocker must keep completion false"
     );
-    assert_eq!(report.residual_open_scope, "docs_or_report_only");
+    assert_eq!(report.residual_open_scope, "technical_remaining");
     assert_eq!(report.open_perf3x_count, 1);
-    assert_eq!(report.technical_open_count, 0);
-    assert_eq!(report.docs_or_report_open_count, 1);
+    assert_eq!(report.technical_open_count, 1);
+    assert_eq!(report.docs_or_report_open_count, 0);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("bd-3ar8v.6.2"),
+        "failure detail should retain the authoritative blocker ID: {detail}"
+    );
 }
 
 #[test]
@@ -4474,6 +5978,30 @@ fn practical_finish_report_passes_with_no_open_perf3x_issues() {
     assert_eq!(report.open_perf3x_count, 0);
     assert_eq!(report.technical_open_count, 0);
     assert_eq!(report.docs_or_report_open_count, 0);
+}
+
+#[test]
+fn practical_finish_report_fails_closed_on_empty_live_ledger() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    write_practical_finish_issue_fixture_to(temp.path(), PRACTICAL_FINISH_LIVE_ISSUE_SOURCE, &[]);
+    commit_practical_finish_issue_fixture(temp.path(), PRACTICAL_FINISH_LIVE_ISSUE_SOURCE);
+
+    let report = build_practical_finish_checkpoint_report(temp.path());
+    assert_eq!(
+        report.status, "fail",
+        "an empty live-ledger file must not certify that all technical work is complete"
+    );
+    assert!(!report.technical_completion_reached);
+    assert_eq!(report.residual_open_scope, "technical_remaining");
+    assert_eq!(report.open_perf3x_count, 0);
+    assert_eq!(report.technical_open_count, 0);
+    assert_eq!(report.docs_or_report_open_count, 0);
+    let detail = report.detail.unwrap_or_default();
+    assert!(
+        detail.contains("missing required canonical ledger anchor(s)")
+            && detail.contains("bd-3ar8v"),
+        "failure should identify the missing semantic completeness anchors: {detail}"
+    );
 }
 
 #[test]
@@ -4564,7 +6092,7 @@ fn practical_finish_report_excludes_post_perf3x_phase7_nodes() {
             serde_json::json!({
                 "id": "bd-3ar8v.6.5",
                 "status": "open",
-                "issue_type": "task",
+                "issue_type": "docs",
                 "title": "Final report and go/no-go summary",
                 "labels": ["report"]
             }),
@@ -5194,6 +6722,653 @@ fn must_pass_lineage_fixture(generated_at: &str) -> Value {
         "correlation_id": "must-pass-gate-run-123",
         "generated_at": generated_at
     })
+}
+
+const TEST_MUST_PASS_SHA256_A: &str =
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const TEST_MUST_PASS_SHA256_B: &str =
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn must_pass_contract_fixture(count: u64) -> Value {
+    serde_json::json!({
+        "schema": MUST_PASS_GATE_SCHEMA,
+        "status": "pass",
+        "run_id": "run-123",
+        "correlation_id": "must-pass-gate-run-123",
+        "generated_at": "2026-08-04T12:00:00Z",
+        "git_commit": "0123456789abcdef0123456789abcdef01234567",
+        "source_tree_sha256": TEST_MUST_PASS_SHA256_A,
+        "inclusion_sha256": TEST_MUST_PASS_SHA256_A,
+        "manifest_sha256": TEST_MUST_PASS_SHA256_A,
+        "observed": {
+            "must_pass_total": count,
+            "must_pass_tested": count,
+            "must_pass_passed": count,
+            "must_pass_failed": 0,
+            "must_pass_skipped": 0,
+            "must_pass_pass_rate_pct": 100.0
+        }
+    })
+}
+
+fn canonical_must_pass_fixture(count: usize) -> (Vec<u8>, Vec<u8>, BTreeSet<String>) {
+    let ids = (0..count)
+        .map(|index| format!("extension-{index:03}"))
+        .collect::<Vec<_>>();
+    let inclusion = serde_json::json!({
+        "schema": "pi.ext.inclusion_list.v1",
+        "tier1": ids
+            .iter()
+            .map(|id| serde_json::json!({"id": id}))
+            .collect::<Vec<_>>(),
+        "tier1_review": [],
+        "summary": {
+            "tier1_count": count,
+            "tier1_review_count": 0,
+            "total_must_pass": count
+        }
+    });
+    let manifest = serde_json::json!({
+        "schema": "pi.ext.validated-manifest.v1",
+        "extensions": ids
+            .iter()
+            .map(|id| serde_json::json!({
+                "id": id,
+                "conformance_tier": 1,
+                "entry_path": format!("{id}/index.ts")
+            }))
+            .collect::<Vec<_>>()
+    });
+    let tracked_paths = ids
+        .iter()
+        .map(|id| format!("{MUST_PASS_ARTIFACTS_PATH}/{id}/index.ts"))
+        .collect();
+    (
+        serde_json::to_vec(&inclusion).expect("serialize inclusion fixture"),
+        serde_json::to_vec(&manifest).expect("serialize manifest fixture"),
+        tracked_paths,
+    )
+}
+
+#[test]
+fn canonical_must_pass_contract_requires_exact_versioned_denominator() {
+    let (inclusion, manifest, tracked_paths) = canonical_must_pass_fixture(208);
+    let entries = canonical_must_pass_entries(&inclusion, &manifest, &tracked_paths)
+        .expect("the exact v1 denominator should pass");
+    assert_eq!(entries.len(), 208);
+
+    let (inclusion, manifest, tracked_paths) = canonical_must_pass_fixture(207);
+    let err = canonical_must_pass_entries(&inclusion, &manifest, &tracked_paths)
+        .expect_err("a smaller internally coherent set must not redefine the v1 denominator");
+    assert!(
+        err.contains("unexpected versioned must-pass denominator") && err.contains("expected=208"),
+        "{err}"
+    );
+}
+
+#[test]
+fn canonical_must_pass_contract_binds_manifest_entry_paths_to_tracked_inputs() {
+    let (inclusion, manifest, mut tracked_paths) = canonical_must_pass_fixture(208);
+    assert!(
+        tracked_paths.remove("tests/ext_conformance/artifacts/extension-007/index.ts"),
+        "fixture must remove one canonical artifact path"
+    );
+    let err = canonical_must_pass_entries(&inclusion, &manifest, &tracked_paths)
+        .expect_err("an untracked manifest artifact input must fail closed");
+    assert!(
+        err.contains("extension-007") && err.contains("not tracked"),
+        "{err}"
+    );
+}
+
+#[test]
+fn canonical_must_pass_contract_rejects_duplicate_artifact_identities() {
+    let (inclusion, manifest, tracked_paths) = canonical_must_pass_fixture(208);
+    let mut manifest: Value =
+        serde_json::from_slice(&manifest).expect("parse canonical manifest fixture");
+    let first_entry_path = manifest["extensions"][0]["entry_path"].clone();
+    manifest["extensions"][1]["entry_path"] = first_entry_path;
+    let manifest = serde_json::to_vec(&manifest).expect("serialize duplicate-artifact fixture");
+
+    let error = canonical_must_pass_entries(&inclusion, &manifest, &tracked_paths)
+        .expect_err("two extension IDs must not share one artifact identity");
+    assert!(error.contains("reuses artifact entry_path"), "{error}");
+}
+
+#[test]
+fn canonical_must_pass_contract_rejects_unsafe_artifact_paths_even_when_tracked() {
+    for unsafe_path in [
+        "C:/outside.ts",
+        "C:outside.ts",
+        "../outside.ts",
+        "directory/\ncontrol.ts",
+    ] {
+        let (inclusion, manifest, mut tracked_paths) = canonical_must_pass_fixture(208);
+        let mut manifest: Value =
+            serde_json::from_slice(&manifest).expect("parse canonical manifest fixture");
+        manifest["extensions"][0]["entry_path"] = Value::String(unsafe_path.to_string());
+        tracked_paths.insert(format!("{MUST_PASS_ARTIFACTS_PATH}/{unsafe_path}"));
+        let manifest =
+            serde_json::to_vec(&manifest).expect("serialize unsafe-artifact-path fixture");
+
+        let error = canonical_must_pass_entries(&inclusion, &manifest, &tracked_paths)
+            .expect_err("unsafe manifest artifact path must fail before tracked-path lookup");
+        assert!(
+            error.contains("non-canonical artifact entry_path"),
+            "{unsafe_path}: {error}"
+        );
+    }
+}
+
+fn committed_evidence_binding_fixture(
+    attributes: Option<&str>,
+    track_events: bool,
+) -> tempfile::TempDir {
+    let temp = tempfile::tempdir().expect("create committed-evidence fixture");
+    let root = temp.path();
+    run_practical_finish_fixture_git(root, &["init", "--quiet", "--initial-branch=main"]);
+    let verdict_path = root.join(MUST_PASS_VERDICT_PATH);
+    let events_path = root.join(MUST_PASS_EVENTS_PATH);
+    std::fs::create_dir_all(verdict_path.parent().expect("verdict fixture parent"))
+        .expect("create committed-evidence fixture directory");
+    std::fs::write(&verdict_path, "{}\n").expect("write verdict fixture");
+    std::fs::write(&events_path, "{}\n").expect("write events fixture");
+    if let Some(contents) = attributes {
+        std::fs::write(root.join(".gitattributes"), contents)
+            .expect("write evidence attributes fixture");
+        run_practical_finish_fixture_git(root, &["add", ".gitattributes"]);
+    }
+    run_practical_finish_fixture_git(root, &["add", MUST_PASS_VERDICT_PATH]);
+    if track_events {
+        run_practical_finish_fixture_git(root, &["add", MUST_PASS_EVENTS_PATH]);
+    }
+    run_practical_finish_fixture_git(
+        root,
+        &[
+            "-c",
+            "user.name=Pi Evidence Fixture",
+            "-c",
+            "user.email=pi-evidence@example.invalid",
+            "commit",
+            "--quiet",
+            "--message",
+            "fixture",
+        ],
+    );
+    temp
+}
+
+#[test]
+fn committed_must_pass_evidence_rejects_untracked_staged_and_worktree_inputs() {
+    let untracked = committed_evidence_binding_fixture(None, false);
+    let error = capture_committed_must_pass_evidence(untracked.path())
+        .expect_err("an untracked event log must fail closed");
+    assert!(error.contains("tracked regular blob at HEAD"), "{error}");
+
+    let staged = committed_evidence_binding_fixture(None, true);
+    capture_committed_must_pass_evidence(staged.path())
+        .expect("clean committed evidence must be accepted");
+    std::fs::write(
+        staged.path().join(MUST_PASS_VERDICT_PATH),
+        "{\"staged\":true}\n",
+    )
+    .expect("write staged verdict drift");
+    run_practical_finish_fixture_git(staged.path(), &["add", MUST_PASS_VERDICT_PATH]);
+    let error = capture_committed_must_pass_evidence(staged.path())
+        .expect_err("staged evidence drift must fail closed");
+    assert!(error.contains("between the Git index and HEAD"), "{error}");
+
+    let worktree = committed_evidence_binding_fixture(None, true);
+    std::fs::write(
+        worktree.path().join(MUST_PASS_EVENTS_PATH),
+        "{\"worktree\":true}\n",
+    )
+    .expect("write worktree event drift");
+    let error = capture_committed_must_pass_evidence(worktree.path())
+        .expect_err("unstaged evidence drift must fail closed");
+    assert!(
+        error.contains("between the working tree and Git index"),
+        "{error}"
+    );
+}
+
+#[test]
+fn committed_must_pass_evidence_rejects_flags_and_filter_hidden_bytes() {
+    for (flag, path) in [
+        ("--assume-unchanged", MUST_PASS_VERDICT_PATH),
+        ("--skip-worktree", MUST_PASS_EVENTS_PATH),
+    ] {
+        let flagged = committed_evidence_binding_fixture(None, true);
+        run_practical_finish_fixture_git(flagged.path(), &["update-index", flag, path]);
+        let error = capture_committed_must_pass_evidence(flagged.path())
+            .expect_err("non-canonical evidence index flags must fail closed");
+        assert!(
+            error.contains("non-canonical index flags"),
+            "{flag}: {error}"
+        );
+    }
+
+    let filtered =
+        committed_evidence_binding_fixture(Some("*.json text eol=lf\n*.jsonl text eol=lf\n"), true);
+    std::fs::write(filtered.path().join(MUST_PASS_EVENTS_PATH), "{}\r\n")
+        .expect("write filter-hidden event drift");
+    let diff_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(filtered.path())
+        .args(["diff", "--quiet", "--", MUST_PASS_EVENTS_PATH])
+        .status()
+        .expect("check filter-hidden evidence fixture");
+    assert!(
+        diff_status.success(),
+        "fixture must demonstrate evidence drift hidden by Git clean filtering"
+    );
+    let error = capture_committed_must_pass_evidence(filtered.path())
+        .expect_err("raw evidence byte drift must fail closed");
+    assert!(error.contains("raw worktree bytes differ"), "{error}");
+}
+
+#[test]
+fn live_ledger_binding_rejects_noncanonical_flags_and_head_mode() {
+    let flagged = tempfile::tempdir().expect("create flagged ledger fixture");
+    write_practical_finish_issue_fixture(flagged.path(), &[]);
+    run_practical_finish_fixture_git(
+        flagged.path(),
+        &[
+            "update-index",
+            "--skip-worktree",
+            PRACTICAL_FINISH_LIVE_ISSUE_SOURCE,
+        ],
+    );
+    let bytes = std::fs::read(flagged.path().join(PRACTICAL_FINISH_LIVE_ISSUE_SOURCE))
+        .expect("read flagged ledger fixture");
+    let error = validate_live_ledger_git_binding(
+        flagged.path(),
+        PRACTICAL_FINISH_LIVE_ISSUE_SOURCE,
+        &bytes,
+    )
+    .expect_err("skip-worktree ledger must fail closed");
+    assert!(error.contains("non-canonical index flags"), "{error}");
+
+    let nonregular = tempfile::tempdir().expect("create nonregular ledger fixture");
+    write_practical_finish_issue_fixture(nonregular.path(), &[]);
+    let oid_output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(nonregular.path())
+        .args(["hash-object", PRACTICAL_FINISH_LIVE_ISSUE_SOURCE])
+        .output()
+        .expect("hash nonregular ledger fixture");
+    assert!(oid_output.status.success(), "git hash-object must succeed");
+    let oid = String::from_utf8(oid_output.stdout)
+        .expect("ledger fixture object ID is UTF-8")
+        .trim()
+        .to_string();
+    run_practical_finish_fixture_git(
+        nonregular.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("120000,{oid},{PRACTICAL_FINISH_LIVE_ISSUE_SOURCE}"),
+        ],
+    );
+    run_practical_finish_fixture_git(
+        nonregular.path(),
+        &[
+            "-c",
+            "user.name=Pi Gate Fixture",
+            "-c",
+            "user.email=pi-gate-fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--message",
+            "Make ledger nonregular",
+        ],
+    );
+    let bytes = std::fs::read(nonregular.path().join(PRACTICAL_FINISH_LIVE_ISSUE_SOURCE))
+        .expect("read nonregular ledger fixture");
+    let error = validate_live_ledger_git_binding(
+        nonregular.path(),
+        PRACTICAL_FINISH_LIVE_ISSUE_SOURCE,
+        &bytes,
+    )
+    .expect_err("nonregular HEAD ledger mode must fail closed");
+    assert!(
+        error.contains("not a canonical regular blob at HEAD"),
+        "{error}"
+    );
+}
+
+#[test]
+fn must_pass_source_snapshot_rejects_filter_normalized_worktree_bytes() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let root = temp.path();
+    run_practical_finish_fixture_git(root, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(root.join(".gitattributes"), "tracked.txt text eol=lf\n")
+        .expect("write attributes fixture");
+    std::fs::write(root.join("tracked.txt"), "tracked\n").expect("write source fixture");
+    run_practical_finish_fixture_git(root, &["add", ".gitattributes", "tracked.txt"]);
+    run_practical_finish_fixture_git(
+        root,
+        &[
+            "-c",
+            "user.name=Pi Gate Fixture",
+            "-c",
+            "user.email=pi-gate-fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "--message",
+            "Add must-pass source fixture",
+        ],
+    );
+
+    let commit = current_git_commit(root).expect("resolve source fixture commit");
+    let records =
+        must_pass_tree_records(root, &commit, &["tracked.txt"]).expect("read source fixture tree");
+    ensure_worktree_bytes_match_tree(root, &records).expect("initial bytes must match tree");
+
+    std::fs::write(root.join("tracked.txt"), "tracked\r\n")
+        .expect("write filter-normalized source fixture");
+    let diff_status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["diff", "--quiet", "--", "tracked.txt"])
+        .status()
+        .expect("run git diff for filter-normalized fixture");
+    assert!(
+        diff_status.success(),
+        "fixture must demonstrate a byte change hidden by Git clean filtering"
+    );
+    let err = ensure_worktree_bytes_match_tree(root, &records)
+        .expect_err("filter-normalized byte drift must fail closed");
+    assert!(err.contains("worktree bytes differ"), "{err}");
+}
+
+#[test]
+fn must_pass_source_commit_rejects_reverted_non_evidence_followup() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let root = temp.path();
+    let commit = |message: &str| {
+        run_practical_finish_fixture_git(
+            root,
+            &[
+                "-c",
+                "user.name=Pi Gate Fixture",
+                "-c",
+                "user.email=pi-gate-fixture@example.invalid",
+                "commit",
+                "--quiet",
+                "--message",
+                message,
+            ],
+        );
+        current_git_commit(root).expect("resolve fixture commit")
+    };
+
+    run_practical_finish_fixture_git(root, &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(root.join("source.txt"), "tested source\n").expect("write source fixture");
+    run_practical_finish_fixture_git(root, &["add", "source.txt"]);
+    let source_commit = commit("Add tested source");
+
+    std::fs::create_dir_all(root.join("tests/evidence_bundle"))
+        .expect("create evidence fixture directory");
+    std::fs::write(root.join("tests/evidence_bundle/index.json"), "{}\n")
+        .expect("write evidence fixture");
+    run_practical_finish_fixture_git(root, &["add", "tests/evidence_bundle/index.json"]);
+    let evidence_commit = commit("Add evidence only");
+    validate_must_pass_git_commit(root, &source_commit, &evidence_commit)
+        .expect("evidence-only descendant must be accepted");
+
+    std::fs::write(root.join("source.txt"), "temporary change\n")
+        .expect("change non-evidence source");
+    run_practical_finish_fixture_git(root, &["add", "source.txt"]);
+    commit("Temporarily change source");
+    std::fs::write(root.join("source.txt"), "tested source\n")
+        .expect("restore non-evidence source");
+    run_practical_finish_fixture_git(root, &["add", "source.txt"]);
+    let reverted_commit = commit("Restore source bytes");
+
+    let err = validate_must_pass_git_commit(root, &source_commit, &reverted_commit)
+        .expect_err("a reverted non-evidence follow-up must still fail closed");
+    assert!(err.contains("non-evidence paths"), "{err}");
+}
+
+#[test]
+fn must_pass_verdict_contract_accepts_exact_current_set() {
+    let verdict = must_pass_contract_fixture(208);
+    let result = validate_must_pass_verdict_contract(
+        &verdict,
+        208,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+    );
+    assert!(
+        result.is_ok(),
+        "exact authoritative contract should pass: {result:?}"
+    );
+}
+
+#[test]
+fn must_pass_verdict_contract_rejects_status_only_lineage_artifact() {
+    let verdict = must_pass_lineage_fixture("2026-08-04T12:00:00Z");
+    let err = validate_must_pass_verdict_contract(
+        &verdict,
+        208,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+    )
+    .expect_err("status plus fresh lineage must not substitute for certification evidence");
+    assert!(
+        err.contains("schema mismatch"),
+        "the strict contract should reject the incomplete artifact immediately: {err}"
+    );
+}
+
+#[test]
+fn must_pass_verdict_contract_rejects_abbreviated_commit_ids() {
+    let mut verdict = must_pass_contract_fixture(208);
+    verdict["git_commit"] = serde_json::json!("0123456");
+    let err = validate_must_pass_verdict_contract(
+        &verdict,
+        208,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+    )
+    .expect_err("abbreviated commit IDs are not immutable provenance");
+    assert!(err.contains("full 40- or 64-character"), "{err}");
+}
+
+#[test]
+fn must_pass_verdict_contract_rejects_smaller_historical_pass_set() {
+    let verdict = must_pass_contract_fixture(1);
+    let err = validate_must_pass_verdict_contract(
+        &verdict,
+        208,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+    )
+    .expect_err("a historical 1/1 pass must not certify the current 208-entry set");
+    assert!(
+        err.contains("exact canonical set")
+            && err.contains("expected=208")
+            && err.contains("total=1"),
+        "count mismatch should identify the historical subset: {err}"
+    );
+}
+
+#[test]
+fn must_pass_verdict_contract_rejects_stale_or_missing_provenance() {
+    for field in ["source_tree_sha256", "inclusion_sha256", "manifest_sha256"] {
+        let mut stale = must_pass_contract_fixture(208);
+        stale[field] = serde_json::json!(TEST_MUST_PASS_SHA256_B);
+        let err = validate_must_pass_verdict_contract(
+            &stale,
+            208,
+            TEST_MUST_PASS_SHA256_A,
+            TEST_MUST_PASS_SHA256_A,
+            TEST_MUST_PASS_SHA256_A,
+        )
+        .expect_err("stale provenance must fail closed");
+        assert!(
+            err.contains(field) && err.contains("current authoritative release inputs"),
+            "stale {field} should be diagnosed precisely: {err}"
+        );
+
+        let mut missing = must_pass_contract_fixture(208);
+        missing
+            .as_object_mut()
+            .expect("fixture is an object")
+            .remove(field);
+        let err = validate_must_pass_verdict_contract(
+            &missing,
+            208,
+            TEST_MUST_PASS_SHA256_A,
+            TEST_MUST_PASS_SHA256_A,
+            TEST_MUST_PASS_SHA256_A,
+        )
+        .expect_err("missing provenance must fail closed");
+        assert!(
+            err.contains(field) && err.contains("missing non-empty"),
+            "missing {field} should be diagnosed precisely: {err}"
+        );
+    }
+}
+
+#[test]
+fn must_pass_verdict_contract_rejects_incoherent_or_nonpassing_counts() {
+    let mut incoherent = must_pass_contract_fixture(208);
+    incoherent["observed"]["must_pass_tested"] = serde_json::json!(207);
+    let err = validate_must_pass_verdict_contract(
+        &incoherent,
+        208,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+    )
+    .expect_err("incoherent counts must fail closed");
+    assert!(err.contains("counts are incoherent"), "{err}");
+
+    let mut skipped = must_pass_contract_fixture(208);
+    skipped["observed"]["must_pass_tested"] = serde_json::json!(207);
+    skipped["observed"]["must_pass_passed"] = serde_json::json!(207);
+    skipped["observed"]["must_pass_skipped"] = serde_json::json!(1);
+    let err = validate_must_pass_verdict_contract(
+        &skipped,
+        208,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+        TEST_MUST_PASS_SHA256_A,
+    )
+    .expect_err("skipped canonical entries must fail closed");
+    assert!(
+        err.contains("exact canonical set") && err.contains("skipped=1"),
+        "{err}"
+    );
+}
+
+fn write_must_pass_event_fixture(root: &Path, events: &[Value]) {
+    let path = root.join(MUST_PASS_EVENTS_PATH);
+    std::fs::create_dir_all(path.parent().expect("events fixture parent"))
+        .expect("create events fixture directory");
+    let body = events
+        .iter()
+        .map(|event| serde_json::to_string(event).expect("serialize event fixture"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, body + "\n").expect("write events fixture");
+}
+
+fn must_pass_event_fixture(id: &str) -> Value {
+    serde_json::json!({
+        "schema": MUST_PASS_EVENT_SCHEMA,
+        "set": "must_pass",
+        "status": "pass",
+        "id": id,
+        "tier": 1,
+        "run_id": "run-123",
+        "correlation_id": "must-pass-gate-run-123",
+        "git_commit": "0123456789abcdef0123456789abcdef01234567",
+        "source_tree_sha256": TEST_MUST_PASS_SHA256_A,
+        "inclusion_sha256": TEST_MUST_PASS_SHA256_A,
+        "manifest_sha256": TEST_MUST_PASS_SHA256_A
+    })
+}
+
+#[test]
+fn must_pass_event_contract_rejects_duplicate_ids() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let event = must_pass_event_fixture("duplicate-extension");
+    write_must_pass_event_fixture(temp.path(), &[event.clone(), event]);
+
+    let verdict = must_pass_contract_fixture(2);
+    let err = observed_must_pass_events(temp.path(), &verdict)
+        .expect_err("duplicate must-pass events must fail closed");
+    assert!(
+        err.contains("duplicate must-pass event id duplicate-extension"),
+        "{err}"
+    );
+}
+
+#[test]
+fn must_pass_event_contract_rejects_unbound_source_provenance() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let mut event = must_pass_event_fixture("extension-a");
+    event["source_tree_sha256"] = serde_json::json!(TEST_MUST_PASS_SHA256_B);
+    write_must_pass_event_fixture(temp.path(), &[event]);
+
+    let verdict = must_pass_contract_fixture(1);
+    let err = observed_must_pass_events(temp.path(), &verdict)
+        .expect_err("events from another source tree must fail closed");
+    assert!(err.contains("source_tree_sha256 mismatch"), "{err}");
+}
+
+#[test]
+fn must_pass_event_contract_validates_stretch_rows_instead_of_skipping_them() {
+    let temp = tempfile::tempdir().expect("create tempdir");
+    let must_pass = must_pass_event_fixture("extension-a");
+    let mut invalid_stretch = must_pass_event_fixture("extension-stretch");
+    invalid_stretch["set"] = Value::String("stretch".to_string());
+    invalid_stretch["schema"] = Value::String("pi.ext.gate_event.v0".to_string());
+    write_must_pass_event_fixture(temp.path(), &[must_pass.clone(), invalid_stretch]);
+
+    let verdict = must_pass_contract_fixture(1);
+    let error = observed_must_pass_events(temp.path(), &verdict)
+        .expect_err("a malformed stretch row must not be silently ignored");
+    assert!(error.contains("invalid event schema"), "{error}");
+
+    let mut stretch = must_pass_event_fixture("extension-stretch");
+    stretch["set"] = Value::String("stretch".to_string());
+    stretch["status"] = Value::String("fail".to_string());
+    write_must_pass_event_fixture(temp.path(), &[must_pass, stretch.clone(), stretch]);
+    let error = observed_must_pass_events(temp.path(), &verdict)
+        .expect_err("duplicate stretch identities must fail closed");
+    assert!(
+        error.contains("duplicate stretch event id extension-stretch"),
+        "{error}"
+    );
+}
+
+#[test]
+fn must_pass_event_contract_rejects_canonical_ids_mislabeled_as_stretch() {
+    let verdict = must_pass_contract_fixture(1);
+    let mut stretch = must_pass_event_fixture("extension-a");
+    stretch["set"] = Value::String("stretch".to_string());
+    let contents = [
+        serde_json::to_string(&must_pass_event_fixture("extension-a"))
+            .expect("serialize must-pass event"),
+        serde_json::to_string(&stretch).expect("serialize stretch event"),
+    ]
+    .join("\n");
+    let events = observed_must_pass_events_from_contents(&contents, &verdict)
+        .expect("both rows are individually well-formed");
+    let expected = BTreeMap::from([("extension-a".to_string(), 1)]);
+
+    let error = validate_event_set_identities(&events, &expected)
+        .expect_err("a canonical must-pass ID must not also be labeled stretch");
+    assert!(error.contains("incorrectly labeled stretch"), "{error}");
 }
 
 #[test]

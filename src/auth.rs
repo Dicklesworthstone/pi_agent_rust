@@ -647,10 +647,10 @@ impl AuthStorage {
             return Some(key);
         }
 
-        if self.allow_external_provider_lookup() {
-            if let Some(key) = resolve_external_provider_api_key(provider) {
-                return Some(key);
-            }
+        if self.allow_external_provider_lookup()
+            && let Some(key) = resolve_external_provider_api_key(provider)
+        {
+            return Some(key);
         }
 
         canonical_provider_id(provider)
@@ -785,10 +785,8 @@ impl AuthStorage {
             }
         }
 
-        if needs_save {
-            if let Err(e) = self.save_async().await {
-                tracing::warn!("Failed to save auth.json after refreshing OAuth tokens: {e}");
-            }
+        if needs_save && let Err(e) = self.save_async().await {
+            tracing::warn!("Failed to save auth.json after refreshing OAuth tokens: {e}");
         }
 
         if !failed_providers.is_empty() {
@@ -842,10 +840,10 @@ impl AuthStorage {
                 if token_url.is_some() && client_id.is_some() {
                     continue;
                 }
-                if *expires <= proactive_deadline {
-                    if let Some(config) = extension_configs.get(provider) {
-                        refreshes.push((provider.clone(), refresh_token.clone(), config.clone()));
-                    }
+                if *expires <= proactive_deadline
+                    && let Some(config) = extension_configs.get(provider)
+                {
+                    refreshes.push((provider.clone(), refresh_token.clone(), config.clone()));
                 }
             }
         }
@@ -886,12 +884,8 @@ impl AuthStorage {
             }
         }
 
-        if needs_save {
-            if let Err(e) = self.save_async().await {
-                tracing::warn!(
-                    "Failed to save auth.json after refreshing extension OAuth tokens: {e}"
-                );
-            }
+        if needs_save && let Err(e) = self.save_async().await {
+            tracing::warn!("Failed to save auth.json after refreshing extension OAuth tokens: {e}");
         }
 
         if failed_providers.is_empty() {
@@ -1546,20 +1540,20 @@ where
     // 2. Explicit IAM credentials from env
     if let Some(access_key) = env("AWS_ACCESS_KEY_ID") {
         let access_key = access_key.trim().to_string();
-        if !access_key.is_empty() {
-            if let Some(secret_key) = env("AWS_SECRET_ACCESS_KEY") {
-                let secret_key = secret_key.trim().to_string();
-                if !secret_key.is_empty() {
-                    let session_token = env("AWS_SESSION_TOKEN")
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty());
-                    return Some(AwsResolvedCredentials::Sigv4 {
-                        access_key_id: access_key,
-                        secret_access_key: secret_key,
-                        session_token,
-                        region,
-                    });
-                }
+        if !access_key.is_empty()
+            && let Some(secret_key) = env("AWS_SECRET_ACCESS_KEY")
+        {
+            let secret_key = secret_key.trim().to_string();
+            if !secret_key.is_empty() {
+                let session_token = env("AWS_SESSION_TOKEN")
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty());
+                return Some(AwsResolvedCredentials::Sigv4 {
+                    access_key_id: access_key,
+                    secret_access_key: secret_key,
+                    session_token,
+                    region,
+                });
             }
         }
     }
@@ -1777,27 +1771,23 @@ where
     let mut region = region_override.map_or_else(|| region_default.to_string(), str::to_string);
 
     let allow_config_region = region_override.is_none();
-    if allow_config_region {
-        if let Some(value) = section.get("region") {
-            let trimmed = value.trim();
-            if !trimmed.is_empty() {
-                region = trimmed.to_string();
-            }
+    if allow_config_region && let Some(value) = section.get("region") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            region = trimmed.to_string();
         }
     }
 
-    if allow_config_region {
-        if let Ok(config_text) = std::fs::read_to_string(&config_path) {
-            let config = parse_aws_ini(&config_text);
-            for name in profile_section_candidates(&profile_key) {
-                if let Some(section) = config.get(&name) {
-                    if let Some(value) = section.get("region") {
-                        let trimmed = value.trim();
-                        if !trimmed.is_empty() {
-                            region = trimmed.to_string();
-                            break;
-                        }
-                    }
+    if allow_config_region && let Ok(config_text) = std::fs::read_to_string(&config_path) {
+        let config = parse_aws_ini(&config_text);
+        for name in profile_section_candidates(&profile_key) {
+            if let Some(section) = config.get(&name)
+                && let Some(value) = section.get("region")
+            {
+                let trimmed = value.trim();
+                if !trimmed.is_empty() {
+                    region = trimmed.to_string();
+                    break;
                 }
             }
         }
@@ -2400,10 +2390,10 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     // 1. JSON-encoded service key from env
-    if let Some(key_json) = env("AICORE_SERVICE_KEY") {
-        if let Some(creds) = parse_sap_service_key_json(&key_json) {
-            return Some(creds);
-        }
+    if let Some(key_json) = env("AICORE_SERVICE_KEY")
+        && let Some(creds) = parse_sap_service_key_json(&key_json)
+    {
+        return Some(creds);
     }
 
     // 2. Individual env vars
@@ -2437,22 +2427,23 @@ where
         token_url,
         service_url,
     }) = auth.credential_for_provider(provider)
-    {
-        if let (Some(id), Some(secret), Some(turl), Some(surl)) = (
+        && let (Some(id), Some(secret), Some(turl), Some(surl)) = (
             client_id.as_ref(),
             client_secret.as_ref(),
             token_url.as_ref(),
             service_url.as_ref(),
-        ) {
-            if !id.is_empty() && !secret.is_empty() && !turl.is_empty() && !surl.is_empty() {
-                return Some(SapResolvedCredentials {
-                    client_id: id.clone(),
-                    client_secret: secret.clone(),
-                    token_url: turl.clone(),
-                    service_url: surl.clone(),
-                });
-            }
-        }
+        )
+        && !id.is_empty()
+        && !secret.is_empty()
+        && !turl.is_empty()
+        && !surl.is_empty()
+    {
+        return Some(SapResolvedCredentials {
+            client_id: id.clone(),
+            client_secret: secret.clone(),
+            token_url: turl.clone(),
+            service_url: surl.clone(),
+        });
     }
 
     None
@@ -3146,14 +3137,14 @@ fn kimi_device_id() -> String {
         }
     }
 
-    if let Some(parent) = primary.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            tracing::debug!(
-                path = ?parent,
-                error = %err,
-                "Failed to create directory for generated credential file"
-            );
-        }
+    if let Some(parent) = primary.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        tracing::debug!(
+            path = ?parent,
+            error = %err,
+            "Failed to create directory for generated credential file"
+        );
     }
 
     let mut options = std::fs::OpenOptions::new();
@@ -3165,14 +3156,14 @@ fn kimi_device_id() -> String {
         options.mode(0o600);
     }
 
-    if let Ok(mut file) = options.open(&primary) {
-        if let Err(err) = file.write_all(generated.as_bytes()) {
-            tracing::debug!(
-                path = ?primary,
-                error = %err,
-                "Failed to write generated credential data to file"
-            );
-        }
+    if let Ok(mut file) = options.open(&primary)
+        && let Err(err) = file.write_all(generated.as_bytes())
+    {
+        tracing::debug!(
+            path = ?primary,
+            error = %err,
+            "Failed to write generated credential data to file"
+        );
     }
 
     generated
@@ -3566,12 +3557,11 @@ async fn discover_google_gemini_cli_project_id(
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
 
-    if (200..300).contains(&status) {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(project_id) = parse_code_assist_project_id(&value) {
-                return Ok(project_id);
-            }
-        }
+    if (200..300).contains(&status)
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+        && let Some(project_id) = parse_code_assist_project_id(&value)
+    {
+        return Ok(project_id);
     }
 
     if let Some(project_id) = env_project {
@@ -3611,10 +3601,10 @@ async fn discover_google_antigravity_project_id(
             continue;
         }
         let text = response.text().await.unwrap_or_default();
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-            if let Some(project_id) = parse_code_assist_project_id(&value) {
-                return Ok(project_id);
-            }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(project_id) = parse_code_assist_project_id(&value)
+        {
+            return Ok(project_id);
         }
     }
 

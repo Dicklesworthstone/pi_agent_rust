@@ -31,7 +31,7 @@ use ast_grep_language::SupportLang;
 use asupersync::channel::{mpsc, oneshot};
 use asupersync::runtime::RuntimeBuilder;
 #[cfg(feature = "wasm-host")]
-use asupersync::sync::Mutex as AsyncMutex;
+use asupersync::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use asupersync::time::{sleep, timeout, wall_now};
 use asupersync::{Budget, Cx};
 use async_trait::async_trait;
@@ -105,12 +105,12 @@ pub fn safe_canonicalize(path: &Path) -> PathBuf {
             //    If we are in `/link/new_file` and `/link` -> `/target`, we want
             //    to resolve to `/target/new_file` to match the root resolution.
             for ancestor in absolute.ancestors().skip(1) {
-                if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
-                    if let Ok(suffix) = absolute.strip_prefix(ancestor) {
-                        let combined = canonical_ancestor.join(suffix);
-                        // Normalize handles any `..` in the suffix.
-                        return strip_unc_prefix(normalize_dot_segments(&combined));
-                    }
+                if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor)
+                    && let Ok(suffix) = absolute.strip_prefix(ancestor)
+                {
+                    let combined = canonical_ancestor.join(suffix);
+                    // Normalize handles any `..` in the suffix.
+                    return strip_unc_prefix(normalize_dot_segments(&combined));
                 }
             }
 
@@ -513,7 +513,7 @@ impl CompatLedger {
     }
 
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.capabilities.is_empty()
             && self.rewrites.is_empty()
             && self.forbidden.is_empty()
@@ -2396,57 +2396,54 @@ fn check_extension_quota(
     }
 
     // 4. Total hostcall budget.
-    if let Some(max_total) = config.max_hostcalls_total {
-        if state.hostcalls_total >= max_total {
-            return QuotaCheckResult::Exceeded {
-                reason: format!(
-                    "total hostcalls {} exceeds limit {max_total}",
-                    state.hostcalls_total
-                ),
-            };
-        }
+    if let Some(max_total) = config.max_hostcalls_total
+        && state.hostcalls_total >= max_total
+    {
+        return QuotaCheckResult::Exceeded {
+            reason: format!(
+                "total hostcalls {} exceeds limit {max_total}",
+                state.hostcalls_total
+            ),
+        };
     }
 
     // 5. Subprocess fan-out (only relevant for exec capability).
-    if capability == "exec" {
-        if let Some(max_sub) = config.max_subprocesses {
-            if state.active_subprocesses >= max_sub {
-                return QuotaCheckResult::Exceeded {
-                    reason: format!(
-                        "active subprocesses {} reaches limit {max_sub}",
-                        state.active_subprocesses
-                    ),
-                };
-            }
-        }
+    if capability == "exec"
+        && let Some(max_sub) = config.max_subprocesses
+        && state.active_subprocesses >= max_sub
+    {
+        return QuotaCheckResult::Exceeded {
+            reason: format!(
+                "active subprocesses {} reaches limit {max_sub}",
+                state.active_subprocesses
+            ),
+        };
     }
 
     // 6. HTTP request budget.
-    if capability == "http" {
-        if let Some(max_http) = config.max_http_requests {
-            if state.http_requests_total >= max_http {
-                return QuotaCheckResult::Exceeded {
-                    reason: format!(
-                        "HTTP requests {} exceeds limit {max_http}",
-                        state.http_requests_total
-                    ),
-                };
-            }
-        }
+    if capability == "http"
+        && let Some(max_http) = config.max_http_requests
+        && state.http_requests_total >= max_http
+    {
+        return QuotaCheckResult::Exceeded {
+            reason: format!(
+                "HTTP requests {} exceeds limit {max_http}",
+                state.http_requests_total
+            ),
+        };
     }
 
     // 7. Write bytes budget (tracked externally via record_write_bytes).
-    if capability == "write" {
-        if let Some(max_wb) = config.max_write_bytes {
-            if state.write_bytes_total >= max_wb {
-                return QuotaCheckResult::Exceeded {
-                    reason: format!(
-                        "write bytes {} exceeds limit {max_wb}",
-                        state.write_bytes_total
-                    ),
-                };
-            }
-        }
+    if capability == "write"
+        && let Some(max_wb) = config.max_write_bytes
+        && state.write_bytes_total >= max_wb
+    {
+        return QuotaCheckResult::Exceeded {
+            reason: format!(
+                "write bytes {} exceeds limit {max_wb}",
+                state.write_bytes_total
+            ),
+        };
     }
 
     // All checks passed; record usage.
@@ -4565,25 +4562,25 @@ pub fn query_security_alerts(
         .alerts
         .into_iter()
         .filter(|a| {
-            if let Some(cat) = &filter.category {
-                if a.category != *cat {
-                    return false;
-                }
+            if let Some(cat) = &filter.category
+                && a.category != *cat
+            {
+                return false;
             }
-            if let Some(sev) = &filter.min_severity {
-                if a.severity < *sev {
-                    return false;
-                }
+            if let Some(sev) = &filter.min_severity
+                && a.severity < *sev
+            {
+                return false;
             }
-            if let Some(ext) = &filter.extension_id {
-                if a.extension_id != *ext {
-                    return false;
-                }
+            if let Some(ext) = &filter.extension_id
+                && a.extension_id != *ext
+            {
+                return false;
             }
-            if let Some(after) = filter.after_ts_ms {
-                if a.ts_ms < after {
-                    return false;
-                }
+            if let Some(after) = filter.after_ts_ms
+                && a.ts_ms < after
+            {
+                return false;
             }
             true
         })
@@ -7907,7 +7904,7 @@ fn baseline_median(sorted: &[f64]) -> f64 {
         return 0.0;
     }
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         // Use midpoint arithmetic to avoid overflow lint
         let a = sorted[mid - 1];
         let b = sorted[mid];
@@ -8681,18 +8678,17 @@ impl ExtensionPolicy {
         let ext_override = extension_id.and_then(|id| self.per_extension.get(id));
 
         // Layer 1: per-extension deny.
-        if let Some(ovr) = ext_override {
-            if ovr
+        if let Some(ovr) = ext_override
+            && ovr
                 .deny
                 .iter()
                 .any(|cap| cap.eq_ignore_ascii_case(&normalized))
-            {
-                return PolicyCheck {
-                    decision: PolicyDecision::Deny,
-                    capability: normalized,
-                    reason: "extension_deny".to_string(),
-                };
-            }
+        {
+            return PolicyCheck {
+                decision: PolicyDecision::Deny,
+                capability: normalized,
+                reason: "extension_deny".to_string(),
+            };
         }
 
         // Layer 2: global deny_caps.
@@ -8709,18 +8705,17 @@ impl ExtensionPolicy {
         }
 
         // Layer 3: per-extension allow.
-        if let Some(ovr) = ext_override {
-            if ovr
+        if let Some(ovr) = ext_override
+            && ovr
                 .allow
                 .iter()
                 .any(|cap| cap.eq_ignore_ascii_case(&normalized))
-            {
-                return PolicyCheck {
-                    decision: PolicyDecision::Allow,
-                    capability: normalized,
-                    reason: "extension_allow".to_string(),
-                };
-            }
+        {
+            return PolicyCheck {
+                decision: PolicyDecision::Allow,
+                capability: normalized,
+                reason: "extension_allow".to_string(),
+            };
         }
 
         // Layer 4: global default_caps.
@@ -11752,7 +11747,7 @@ impl HostcallReactorMesh {
 
     /// Number of shard lanes.
     #[must_use]
-    pub fn shard_count(&self) -> usize {
+    pub const fn shard_count(&self) -> usize {
         self.lanes.len()
     }
 
@@ -11852,7 +11847,7 @@ impl HostcallReactorMesh {
     }
 
     /// Route using round-robin for load distribution.
-    fn rr_route(&mut self) -> usize {
+    const fn rr_route(&mut self) -> usize {
         if self.lanes.len() <= 1 {
             return 0;
         }
@@ -13038,22 +13033,21 @@ mod wasm_host {
                 );
             };
 
-            if let Some(extension_id) = self.extension_id.as_deref() {
-                if let Some(allow) =
+            if let Some(extension_id) = self.extension_id.as_deref()
+                && let Some(allow) =
                     manager.cached_policy_prompt_decision(extension_id, &capability)
-                {
-                    let decision = if allow {
-                        PolicyDecision::Allow
-                    } else {
-                        PolicyDecision::Deny
-                    };
-                    let reason = if allow {
-                        "prompt_cache_allow".to_string()
-                    } else {
-                        "prompt_cache_deny".to_string()
-                    };
-                    return (decision, reason, capability);
-                }
+            {
+                let decision = if allow {
+                    PolicyDecision::Allow
+                } else {
+                    PolicyDecision::Deny
+                };
+                let reason = if allow {
+                    "prompt_cache_allow".to_string()
+                } else {
+                    "prompt_cache_deny".to_string()
+                };
+                return (decision, reason, capability);
             }
 
             let prompt_extension_id = self.extension_id.as_deref().unwrap_or(UNKNOWN_EXTENSION_ID);
@@ -13097,12 +13091,13 @@ mod wasm_host {
                 .cloned()
                 .unwrap_or_else(|| Value::Object(serde_json::Map::default()));
 
-            if tool_name.eq_ignore_ascii_case("bash") && input.get("timeout").is_none() {
-                if let Some(timeout_ms) = call_timeout_ms {
-                    let timeout_secs = timeout_ms.div_ceil(1000);
-                    if let Some(obj) = input.as_object_mut() {
-                        obj.insert("timeout".to_string(), json!(timeout_secs));
-                    }
+            if tool_name.eq_ignore_ascii_case("bash")
+                && input.get("timeout").is_none()
+                && let Some(timeout_ms) = call_timeout_ms
+            {
+                let timeout_secs = timeout_ms.div_ceil(1000);
+                if let Some(obj) = input.as_object_mut() {
+                    obj.insert("timeout".to_string(), json!(timeout_secs));
                 }
             }
 
@@ -13687,7 +13682,7 @@ mod wasm_host {
         ) -> Result<Self> {
             let component = Component::from_file(engine, path).map_err(|err| {
                 Error::extension(format!(
-                    "Failed to load WASM component {}: {err}",
+                    "Failed to load WASM component {}: {err:#}",
                     path.display()
                 ))
             })?;
@@ -13703,7 +13698,7 @@ mod wasm_host {
             let bindings = PiExtension::instantiate_async(&mut store, &component, &linker)
                 .await
                 .map_err(|err| {
-                    Error::extension(format!("Failed to instantiate WASM extension: {err}"))
+                    Error::extension(format!("Failed to instantiate WASM extension: {err:#}"))
                 })?;
 
             Ok(Self { store, bindings })
@@ -13780,9 +13775,10 @@ mod wasm_host {
 
     #[cfg(test)]
     mod tests {
+        use super::super::WasmExtensionHost;
         use super::*;
         use crate::connectors::http::HttpConnectorConfig;
-        use crate::model::ContentBlock;
+        use crate::model::{ContentBlock, TextContent};
         use crate::tools::{Tool, ToolOutput, ToolRegistry, ToolUpdate};
         use asupersync::runtime::RuntimeBuilder;
         use asupersync::time::{sleep, wall_now};
@@ -13944,6 +13940,334 @@ mod wasm_host {
                 flags: Vec::new(),
                 event_hooks: Vec::new(),
             }
+        }
+
+        fn wat_data(text: &str) -> String {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            let mut encoded = String::with_capacity(text.len() * 3);
+            for byte in text.bytes() {
+                encoded.push('\\');
+                encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+                encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+            }
+            encoded
+        }
+
+        const REAL_COMPONENT_WAT_TEMPLATE: &str = r#"
+(component
+  (type $host-interface
+    (instance
+      (type $host-result (result string (error string)))
+      (type $host-call
+        (func
+          (param "name" string)
+          (param "input-json" string)
+          (result $host-result)))
+      (export "call" (func (type $host-call)))))
+  (import "pi:extension/host" (instance $host (type $host-interface)))
+
+  (core module $guest
+    (memory (export "memory") 2)
+    (global $heap (mut i32) (i32.const 8192))
+    (data (i32.const 0) "@@REGISTRATION_DATA@@")
+    (data (i32.const 2048) "@@TOOL_DATA@@")
+    (data (i32.const 4096) "@@SLASH_DATA@@")
+
+    (func $realloc
+      (export "cabi_realloc")
+      (param $old-ptr i32)
+      (param $old-size i32)
+      (param $align i32)
+      (param $new-size i32)
+      (result i32)
+      (local $result i32)
+      (if (result i32) (i32.eqz (local.get $new-size))
+        (then (i32.const 0))
+        (else
+          (local.set $result
+            (i32.and
+              (i32.add (global.get $heap) (i32.const 7))
+              (i32.const -8)))
+          (global.set $heap
+            (i32.add (local.get $result) (local.get $new-size)))
+          (local.get $result))))
+
+    (func $ok-result (param $data i32) (param $len i32) (result i32)
+      (i32.store (i32.const 7168) (i32.const 0))
+      (i32.store offset=4 (i32.const 7168) (local.get $data))
+      (i32.store offset=8 (i32.const 7168) (local.get $len))
+      (i32.const 7168))
+
+    (func (export "init") (param i32 i32) (result i32)
+      (call $ok-result (i32.const 0) (i32.const @@REGISTRATION_LEN@@)))
+    (func (export "cabi_post_init") (param i32))
+
+    (func (export "handle-tool") (param i32 i32 i32 i32) (result i32)
+      (call $ok-result (i32.const 2048) (i32.const @@TOOL_LEN@@)))
+    (func (export "cabi_post_handle-tool") (param i32))
+
+    (func (export "handle-slash")
+      (param i32 i32 i32 i32 i32 i32)
+      (result i32)
+      (call $ok-result (i32.const 4096) (i32.const @@SLASH_LEN@@)))
+    (func (export "cabi_post_handle-slash") (param i32))
+
+    (func (export "handle-event") (param i32 i32) (result i32)
+      unreachable)
+    (func (export "cabi_post_handle-event") (param i32))
+    (func (export "shutdown")))
+
+  (core module $host-call-adapter
+    (type $lowered-host-call-type
+      (func (param i32 i32 i32 i32 i32)))
+    (import "host" "call"
+      (func $imported-lowered-host-call (type $lowered-host-call-type)))
+    (func (export "handle-tool")
+      (param $name-ptr i32)
+      (param $name-len i32)
+      (param $input-ptr i32)
+      (param $input-len i32)
+      (result i32)
+      (local.get $name-ptr)
+      (local.get $name-len)
+      (local.get $input-ptr)
+      (local.get $input-len)
+      (i32.const 7168)
+      (call $imported-lowered-host-call)
+      (i32.const 7168))
+    (func (export "cabi_post_handle-tool") (param i32)))
+
+  (core instance $guest-instance (instantiate $guest))
+  (alias core export $guest-instance "memory" (core memory $memory))
+  (alias core export $guest-instance "cabi_realloc" (core func $realloc))
+  (alias export $host "call" (func $host-call))
+  (core func $lowered-host-call
+    (canon lower
+      (func $host-call)
+      (memory $memory)
+      (realloc $realloc)
+      string-encoding=utf8))
+  (core instance $host-call-imports
+    (export "call" (func $lowered-host-call)))
+  (core instance $host-call-adapter-instance
+    (instantiate $host-call-adapter
+      (with "host" (instance $host-call-imports))))
+  (alias core export $host-call-adapter-instance "handle-tool"
+    (core func $adapter-handle-tool))
+  (alias core export $host-call-adapter-instance "cabi_post_handle-tool"
+    (core func $adapter-post-handle-tool))
+
+  (type $string-result (result string (error string)))
+  (type $init-type
+    (func (param "manifest-json" string) (result $string-result)))
+  (type $handle-tool-type
+    (func
+      (param "name" string)
+      (param "input-json" string)
+      (result $string-result)))
+  (type $string-list (list string))
+  (type $handle-slash-type
+    (func
+      (param "command" string)
+      (param "args" $string-list)
+      (param "input-json" string)
+      (result $string-result)))
+  (type $handle-event-type
+    (func (param "event-json" string) (result $string-result)))
+  (type $shutdown-type (func))
+
+  (alias core export $guest-instance "init" (core func $core-init))
+  (alias core export $guest-instance "cabi_post_init" (core func $post-init))
+  (func $init (type $init-type)
+    (canon lift
+      (core func $core-init)
+      (memory $memory)
+      (realloc $realloc)
+      string-encoding=utf8
+      (post-return $post-init)))
+
+  (func $handle-tool (type $handle-tool-type)
+    (canon lift
+      (core func $adapter-handle-tool)
+      (memory $memory)
+      (realloc $realloc)
+      string-encoding=utf8
+      (post-return $adapter-post-handle-tool)))
+
+  (alias core export $guest-instance "handle-slash" (core func $core-handle-slash))
+  (alias core export $guest-instance "cabi_post_handle-slash" (core func $post-handle-slash))
+  (func $handle-slash (type $handle-slash-type)
+    (canon lift
+      (core func $core-handle-slash)
+      (memory $memory)
+      (realloc $realloc)
+      string-encoding=utf8
+      (post-return $post-handle-slash)))
+
+  (alias core export $guest-instance "handle-event" (core func $core-handle-event))
+  (alias core export $guest-instance "cabi_post_handle-event" (core func $post-handle-event))
+  (func $handle-event (type $handle-event-type)
+    (canon lift
+      (core func $core-handle-event)
+      (memory $memory)
+      (realloc $realloc)
+      string-encoding=utf8
+      (post-return $post-handle-event)))
+
+  (alias core export $guest-instance "shutdown" (core func $core-shutdown))
+  (func $shutdown (type $shutdown-type)
+    (canon lift (core func $core-shutdown)))
+
+  (instance $extension
+    (export "init" (func $init))
+    (export "handle-tool" (func $handle-tool))
+    (export "handle-slash" (func $handle-slash))
+    (export "handle-event" (func $handle-event))
+    (export "shutdown" (func $shutdown)))
+  (export "pi:extension/extension" (instance $extension)))
+"#;
+
+        fn real_component_fixture() -> Vec<u8> {
+            let registration =
+                serde_json::to_string(&registration_payload()).expect("serialize registration");
+            let tool_output = serde_json::to_string(&ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("wasm-tool-ok"))],
+                details: None,
+                is_error: false,
+            })
+            .expect("serialize tool output");
+            let slash_output = serde_json::to_string(&ToolOutput {
+                content: vec![ContentBlock::Text(TextContent::new("wasm-slash-ok"))],
+                details: None,
+                is_error: false,
+            })
+            .expect("serialize slash output");
+            assert!(
+                registration.len() < 2048,
+                "registration fixture is too large"
+            );
+            assert!(tool_output.len() < 2048, "tool fixture is too large");
+            assert!(slash_output.len() < 3072, "slash fixture is too large");
+
+            let registration_data = wat_data(&registration);
+            let tool_data = wat_data(&tool_output);
+            let slash_data = wat_data(&slash_output);
+            let registration_len = registration.len();
+            let tool_len = tool_output.len();
+            let slash_len = slash_output.len();
+
+            let component = REAL_COMPONENT_WAT_TEMPLATE
+                .replace("@@REGISTRATION_DATA@@", &registration_data)
+                .replace("@@TOOL_DATA@@", &tool_data)
+                .replace("@@SLASH_DATA@@", &slash_data)
+                .replace("@@REGISTRATION_LEN@@", &registration_len.to_string())
+                .replace("@@TOOL_LEN@@", &tool_len.to_string())
+                .replace("@@SLASH_LEN@@", &slash_len.to_string());
+
+            wat::parse_str(component).expect("compile real component fixture")
+        }
+
+        #[test]
+        fn wasm_host_loads_instantiates_and_calls_real_component() {
+            let dir = tempdir().expect("tempdir");
+            let component_path = dir.path().join("real-extension.wasm");
+            std::fs::write(&component_path, real_component_fixture())
+                .expect("write component fixture");
+
+            let host = WasmExtensionHost::new(dir.path(), permissive_policy())
+                .expect("create WASM extension host");
+            let extension = host
+                .load_from_path(&component_path)
+                .expect("load component path");
+            let mut instance =
+                run_async(host.instantiate(&extension)).expect("instantiate real component");
+
+            let registration_json = run_async(instance.init(r#"{"name":"fixture-manifest"}"#))
+                .expect("initialize real component");
+            let registration: RegisterPayload =
+                serde_json::from_str(&registration_json).expect("parse registration");
+            assert_eq!(registration.name, "ext.test");
+            assert_eq!(registration.api_version, PROTOCOL_VERSION);
+
+            let env_call = HostCallPayload {
+                call_id: "call-component-env".to_string(),
+                capability: "env".to_string(),
+                method: "env".to_string(),
+                params: json!({ "name": "PI_TEST_ENV" }),
+                timeout_ms: None,
+                cancel_token: None,
+                context: None,
+            };
+            let env_call_json = serde_json::to_string(&env_call).expect("serialize env hostcall");
+            let tool_json = run_async(instance.handle_tool("env", &env_call_json))
+                .expect("call imported host function through the real component ABI");
+            let tool_output: Value =
+                serde_json::from_str(&tool_json).expect("parse hostcall output");
+            assert!(
+                tool_output
+                    .get("values")
+                    .and_then(Value::as_object)
+                    .is_some_and(|values| values.contains_key("PI_TEST_ENV")),
+                "unexpected env hostcall output: {tool_output}"
+            );
+
+            let slash_json = run_async(instance.handle_slash(
+                "fixture",
+                &["alpha".to_string(), "beta".to_string()],
+                r#"{"value":2}"#,
+            ))
+            .expect("call real component slash export");
+            let slash_output: ToolOutput =
+                serde_json::from_str(&slash_json).expect("parse slash output");
+            assert!(matches!(
+                &slash_output.content[0],
+                ContentBlock::Text(text) if text.text == "wasm-slash-ok"
+            ));
+
+            run_async(instance.shutdown()).expect("shut down real component");
+        }
+
+        #[test]
+        fn wasm_host_real_component_reports_malformed_artifact_and_guest_trap() {
+            let dir = tempdir().expect("tempdir");
+            let host = WasmExtensionHost::new(dir.path(), permissive_policy())
+                .expect("create WASM extension host");
+
+            let malformed_path = dir.path().join("core-module-not-component.wasm");
+            std::fs::write(
+                &malformed_path,
+                wat::parse_str("(module)").expect("compile core module"),
+            )
+            .expect("write malformed component fixture");
+            let malformed = host
+                .load_from_path(&malformed_path)
+                .expect("existing artifact passes path validation");
+            let malformed_error = run_async(host.instantiate(&malformed))
+                .err()
+                .expect("core module must not instantiate as a component");
+            assert!(
+                malformed_error
+                    .to_string()
+                    .contains("Failed to load WASM component"),
+                "unexpected malformed-component error: {malformed_error}"
+            );
+
+            let component_path = dir.path().join("trapping-extension.wasm");
+            std::fs::write(&component_path, real_component_fixture())
+                .expect("write trapping component fixture");
+            let extension = host
+                .load_from_path(&component_path)
+                .expect("load trapping component path");
+            let mut instance =
+                run_async(host.instantiate(&extension)).expect("instantiate trapping component");
+            let trap = run_async(instance.handle_event(r#"{"type":"fixture"}"#))
+                .expect_err("guest unreachable must surface as a trap");
+            let trap_message = trap.to_string();
+            assert!(
+                trap_message.contains("WASM handle-event failed")
+                    && trap_message.contains("error while executing at wasm backtrace"),
+                "unexpected guest trap error: {trap_message}"
+            );
         }
 
         #[derive(Debug, Clone)]
@@ -14699,7 +15023,6 @@ impl WasmExtensionHost {
     pub fn new(cwd: &Path, policy: ExtensionPolicy) -> Result<Self> {
         let mut config = wasmtime::Config::new();
         config.wasm_component_model(true);
-        config.async_support(true);
 
         let engine = wasmtime::Engine::new(&config)
             .map_err(|err| Error::extension(format!("Failed to create WASM engine: {err}")))?;
@@ -15011,16 +15334,16 @@ impl ExtensionManifest {
         package_name: Option<String>,
         package_version: Option<String>,
     ) -> Result<Self> {
-        if self.name.trim().is_empty() {
-            if let Some(name) = package_name {
-                self.name = name;
-            }
+        if self.name.trim().is_empty()
+            && let Some(name) = package_name
+        {
+            self.name = name;
         }
 
-        if self.version.trim().is_empty() {
-            if let Some(version) = package_version {
-                self.version = version;
-            }
+        if self.version.trim().is_empty()
+            && let Some(version) = package_version
+        {
+            self.version = version;
         }
 
         if self.api_version.trim().is_empty() {
@@ -15681,19 +16004,19 @@ pub fn load_extension_manifest(root: &Path) -> Result<Option<ExtensionManifestSo
         }));
     }
 
-    if let Some(pi) = package_pi {
-        if pi.get("schema").and_then(Value::as_str) == Some("pi.ext.manifest.v1") {
-            let manifest = parse_extension_manifest_value(pi, package_name, package_version)?;
-            let manifest_json = serde_json::to_string(&manifest)
-                .map_err(|err| Error::validation(format!("Serialize manifest: {err}")))?;
-            let manifest_path = root.join("package.json");
-            return Ok(Some(ExtensionManifestSource {
-                manifest,
-                manifest_json,
-                root: root.to_path_buf(),
-                manifest_path,
-            }));
-        }
+    if let Some(pi) = package_pi
+        && pi.get("schema").and_then(Value::as_str) == Some("pi.ext.manifest.v1")
+    {
+        let manifest = parse_extension_manifest_value(pi, package_name, package_version)?;
+        let manifest_json = serde_json::to_string(&manifest)
+            .map_err(|err| Error::validation(format!("Serialize manifest: {err}")))?;
+        let manifest_path = root.join("package.json");
+        return Ok(Some(ExtensionManifestSource {
+            manifest,
+            manifest_json,
+            root: root.to_path_buf(),
+            manifest_path,
+        }));
     }
 
     Ok(None)
@@ -15913,21 +16236,19 @@ impl JsExtensionLoadSpec {
 
         if let Some(parent) = entry_path.parent() {
             let manifest_path = parent.join("package.json");
-            if manifest_path.exists() {
-                if let Ok(raw) = fs::read_to_string(&manifest_path) {
-                    if let Ok(json) = serde_json::from_str::<Value>(&raw) {
-                        if let Some(manifest_name) = json.get("name").and_then(Value::as_str) {
-                            if !manifest_name.trim().is_empty() {
-                                name = manifest_name.trim().to_string();
-                            }
-                        }
-                        if let Some(manifest_version) = json.get("version").and_then(Value::as_str)
-                        {
-                            if !manifest_version.trim().is_empty() {
-                                version = manifest_version.trim().to_string();
-                            }
-                        }
-                    }
+            if manifest_path.exists()
+                && let Ok(raw) = fs::read_to_string(&manifest_path)
+                && let Ok(json) = serde_json::from_str::<Value>(&raw)
+            {
+                if let Some(manifest_name) = json.get("name").and_then(Value::as_str)
+                    && !manifest_name.trim().is_empty()
+                {
+                    name = manifest_name.trim().to_string();
+                }
+                if let Some(manifest_version) = json.get("version").and_then(Value::as_str)
+                    && !manifest_version.trim().is_empty()
+                {
+                    version = manifest_version.trim().to_string();
                 }
             }
         }
@@ -16016,14 +16337,13 @@ impl NativeRustExtensionLoadSpec {
         let mut name = extension_id.clone();
         let mut version = "0.0.0".to_string();
         let mut api_version = PROTOCOL_VERSION.to_string();
-        if let Some(parent) = entry_path.parent() {
-            if let Ok(Some(manifest)) = load_extension_manifest(parent) {
-                if manifest.manifest.runtime == ExtensionRuntime::NativeRust {
-                    name.clone_from(&manifest.manifest.name);
-                    version.clone_from(&manifest.manifest.version);
-                    api_version.clone_from(&manifest.manifest.api_version);
-                }
-            }
+        if let Some(parent) = entry_path.parent()
+            && let Ok(Some(manifest)) = load_extension_manifest(parent)
+            && manifest.manifest.runtime == ExtensionRuntime::NativeRust
+        {
+            name.clone_from(&manifest.manifest.name);
+            version.clone_from(&manifest.manifest.version);
+            api_version.clone_from(&manifest.manifest.api_version);
         }
 
         Ok(Self {
@@ -17066,9 +17386,7 @@ impl WasmExtensionHandle {
         let input_json = serde_json::to_string(input)
             .map_err(|err| Error::extension(format!("Serialize tool input: {err}")))?;
         let cx = Cx::for_request();
-        let mut instance = self
-            .instance
-            .lock(&cx)
+        let mut instance = OwnedMutexGuard::lock(Arc::clone(&self.instance), &cx)
             .await
             .map_err(|err| Error::extension(format!("Lock wasm instance: {err}")))?;
         instance.handle_tool(name, &input_json).await
@@ -17083,9 +17401,7 @@ impl WasmExtensionHandle {
         let input_json = serde_json::to_string(input)
             .map_err(|err| Error::extension(format!("Serialize slash input: {err}")))?;
         let cx = Cx::for_request();
-        let mut instance = self
-            .instance
-            .lock(&cx)
+        let mut instance = OwnedMutexGuard::lock(Arc::clone(&self.instance), &cx)
             .await
             .map_err(|err| Error::extension(format!("Lock wasm instance: {err}")))?;
         instance.handle_slash(command, args, &input_json).await
@@ -17100,9 +17416,7 @@ impl WasmExtensionHandle {
             .map_err(|err| Error::extension(format!("Serialize event: {err}")))?;
         let cx = Cx::for_request();
         let fut = async {
-            let mut instance = self
-                .instance
-                .lock(&cx)
+            let mut instance = OwnedMutexGuard::lock(Arc::clone(&self.instance), &cx)
                 .await
                 .map_err(|err| Error::extension(format!("Lock wasm instance: {err}")))?;
             instance.handle_event(&event_json).await
@@ -19562,10 +19876,10 @@ fn collect_extension_entries_from_dir(dir: &Path) -> Vec<PathBuf> {
 
     for ext in JS_EXTENSION_ENTRY_EXTS {
         let candidate = dir.join(format!("index.{ext}"));
-        if let Some(path) = resolve_extension_entry_file(&candidate) {
-            if seen.insert(path.clone()) {
-                out.push(path);
-            }
+        if let Some(path) = resolve_extension_entry_file(&candidate)
+            && seen.insert(path.clone())
+        {
+            out.push(path);
         }
     }
 
@@ -19578,10 +19892,10 @@ fn collect_extension_entries_from_dir(dir: &Path) -> Vec<PathBuf> {
                 if let Some(index_path) = resolve_extension_entry_file(&path.join("index")) {
                     nested.push(index_path);
                 }
-                if let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) {
-                    if let Some(named_path) = resolve_extension_entry_file(&path.join(dir_name)) {
-                        nested.push(named_path);
-                    }
+                if let Some(dir_name) = path.file_name().and_then(|name| name.to_str())
+                    && let Some(named_path) = resolve_extension_entry_file(&path.join(dir_name))
+                {
+                    nested.push(named_path);
                 }
                 continue;
             }
@@ -20096,10 +20410,10 @@ fn discover_sibling_extension_entries(primary: &Path) -> Vec<PathBuf> {
             if let Some(index_path) = resolve_extension_entry_file(&path.join("index")) {
                 sibling_dirs.push(index_path);
             }
-            if let Some(dir_name) = path.file_name().and_then(|name| name.to_str()) {
-                if let Some(named_path) = resolve_extension_entry_file(&path.join(dir_name)) {
-                    sibling_dirs.push(named_path);
-                }
+            if let Some(dir_name) = path.file_name().and_then(|name| name.to_str())
+                && let Some(named_path) = resolve_extension_entry_file(&path.join(dir_name))
+            {
+                sibling_dirs.push(named_path);
             }
         }
     }
@@ -20169,16 +20483,17 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
             .file_stem()
             .and_then(|stem| stem.to_str())
             .is_some_and(|stem| stem.eq_ignore_ascii_case("index"));
-        if selected_package_entries_len == 1 && is_primary_index {
-            if let Some(package_dir) = selected_package_dir.as_deref() {
-                let bundle_entries = discover_workspace_bundle_entries(package_dir)?;
-                if bundle_entries.len() >= 2
-                    && bundle_entries.iter().any(|path| path == &canonical_primary)
-                {
-                    for path in bundle_entries {
-                        if seen.insert(path.clone()) {
-                            out.push(path);
-                        }
+        if selected_package_entries_len == 1
+            && is_primary_index
+            && let Some(package_dir) = selected_package_dir.as_deref()
+        {
+            let bundle_entries = discover_workspace_bundle_entries(package_dir)?;
+            if bundle_entries.len() >= 2
+                && bundle_entries.iter().any(|path| path == &canonical_primary)
+            {
+                for path in bundle_entries {
+                    if seen.insert(path.clone()) {
+                        out.push(path);
                     }
                 }
             }
@@ -20929,23 +21244,22 @@ async fn resolve_js_hostcall_policy_decision(
         return (decision, reason, capability);
     }
 
-    if let Some(extension_id) = extension_id {
-        if let Some(allow) = host
+    if let Some(extension_id) = extension_id
+        && let Some(allow) = host
             .manager()
             .and_then(|m| m.cached_policy_prompt_decision(extension_id, &capability))
-        {
-            decision = if allow {
-                PolicyDecision::Allow
-            } else {
-                PolicyDecision::Deny
-            };
-            reason = if allow {
-                "prompt_cache_allow".to_string()
-            } else {
-                "prompt_cache_deny".to_string()
-            };
-            return (decision, reason, capability);
-        }
+    {
+        decision = if allow {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny
+        };
+        reason = if allow {
+            "prompt_cache_allow".to_string()
+        } else {
+            "prompt_cache_deny".to_string()
+        };
+        return (decision, reason, capability);
     }
 
     let prompt_extension_id = extension_id.unwrap_or(UNKNOWN_EXTENSION_ID);
@@ -21239,67 +21553,60 @@ pub async fn dispatch_host_call_shared(
     );
 
     // SEC-4.1: Per-extension quota check (after policy, before risk eval).
-    if decision == PolicyDecision::Allow {
-        if let Some(manager) = ctx.manager.as_ref() {
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
-            let quota_result =
-                manager.check_quota(ctx.extension_id, capability, now_ms, ctx.policy);
-            if let QuotaCheckResult::Exceeded { reason: ref qr } = quota_result {
-                tracing::warn!(
-                    event = "ext.quota.exceeded",
-                    extension_id = ?ctx.extension_id,
-                    capability,
-                    method = %method,
-                    reason = %qr,
-                );
-                manager.record_budget_overload_signal(
-                    ctx.extension_id,
-                    "quota_exceeded",
-                    None,
-                    None,
-                );
-                // SEC-5.1: Alert for quota breach.
-                manager.record_security_alert(SecurityAlert {
-                    schema: SECURITY_ALERT_SCHEMA_VERSION.to_string(),
-                    ts_ms: runtime_risk_now_ms(),
-                    sequence_id: 0,
-                    extension_id: ctx.extension_id.unwrap_or("<unknown>").to_string(),
-                    category: SecurityAlertCategory::QuotaBreach,
-                    severity: SecurityAlertSeverity::Warning,
-                    capability: capability.to_string(),
-                    method: method.to_string(),
-                    reason_codes: vec!["quota_exceeded".to_string()],
-                    summary: format!("Quota exceeded: {qr}"),
-                    policy_source: "quota".to_string(),
-                    action: SecurityAlertAction::Deny,
-                    remediation: "Increase quota limits or reduce extension call frequency."
-                        .to_string(),
-                    risk_score: 0.0,
-                    risk_state: None,
-                    context_hash: params_hash.clone(),
-                });
-                let outcome = HostcallOutcome::Error {
-                    code: "quota_exceeded".to_string(),
-                    message: format!("Quota exceeded for extension: {qr}"),
-                };
-                let duration_ms =
-                    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
-                log_hostcall_end(
-                    ctx.runtime_name,
-                    call_id,
-                    ctx.extension_id,
-                    capability,
-                    method,
-                    &params_hash,
-                    duration_ms,
-                    None,
-                    &marshalling_telemetry,
-                    &outcome,
-                );
-                return outcome_to_host_result(call_id, &outcome);
-            }
+    if decision == PolicyDecision::Allow
+        && let Some(manager) = ctx.manager.as_ref()
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let quota_result = manager.check_quota(ctx.extension_id, capability, now_ms, ctx.policy);
+        if let QuotaCheckResult::Exceeded { reason: ref qr } = quota_result {
+            tracing::warn!(
+                event = "ext.quota.exceeded",
+                extension_id = ?ctx.extension_id,
+                capability,
+                method = %method,
+                reason = %qr,
+            );
+            manager.record_budget_overload_signal(ctx.extension_id, "quota_exceeded", None, None);
+            // SEC-5.1: Alert for quota breach.
+            manager.record_security_alert(SecurityAlert {
+                schema: SECURITY_ALERT_SCHEMA_VERSION.to_string(),
+                ts_ms: runtime_risk_now_ms(),
+                sequence_id: 0,
+                extension_id: ctx.extension_id.unwrap_or("<unknown>").to_string(),
+                category: SecurityAlertCategory::QuotaBreach,
+                severity: SecurityAlertSeverity::Warning,
+                capability: capability.to_string(),
+                method: method.to_string(),
+                reason_codes: vec!["quota_exceeded".to_string()],
+                summary: format!("Quota exceeded: {qr}"),
+                policy_source: "quota".to_string(),
+                action: SecurityAlertAction::Deny,
+                remediation: "Increase quota limits or reduce extension call frequency."
+                    .to_string(),
+                risk_score: 0.0,
+                risk_state: None,
+                context_hash: params_hash.clone(),
+            });
+            let outcome = HostcallOutcome::Error {
+                code: "quota_exceeded".to_string(),
+                message: format!("Quota exceeded for extension: {qr}"),
+            };
+            let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+            log_hostcall_end(
+                ctx.runtime_name,
+                call_id,
+                ctx.extension_id,
+                capability,
+                method,
+                &params_hash,
+                duration_ms,
+                None,
+                &marshalling_telemetry,
+                &outcome,
+            );
+            return outcome_to_host_result(call_id, &outcome);
         }
     }
 
@@ -21368,10 +21675,11 @@ pub async fn dispatch_host_call_shared(
         };
 
         // SEC-4.1: record subprocess spawn before exec dispatch.
-        if is_exec && will_dispatch {
-            if let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id) {
-                manager.record_subprocess_spawn(ext_id);
-            }
+        if is_exec
+            && will_dispatch
+            && let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id)
+        {
+            manager.record_subprocess_spawn(ext_id);
         }
 
         let dispatched = if shadow_mode {
@@ -21518,10 +21826,11 @@ pub async fn dispatch_host_call_shared(
         };
 
         // SEC-4.1: record subprocess exit after exec dispatch completes.
-        if is_exec && will_dispatch {
-            if let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id) {
-                manager.record_subprocess_exit(ext_id);
-            }
+        if is_exec
+            && will_dispatch
+            && let (Some(manager), Some(ext_id)) = (ctx.manager.as_ref(), ctx.extension_id)
+        {
+            manager.record_subprocess_exit(ext_id);
         }
 
         dispatched
@@ -21594,67 +21903,66 @@ pub async fn dispatch_host_call_shared(
     }
 
     // Replay trace recording: if the manager has replay enabled, record this dispatch.
-    if let Some(manager) = ctx.manager.as_ref() {
-        if let Some(replay_config) = manager.replay_config() {
-            let ext_id = ctx.extension_id.unwrap_or("unknown");
-            let trace_id = format!("hc-{call_id}");
-            let mut recorder =
-                crate::extension_replay::ReplayRecorder::new(trace_id, replay_config);
+    if let Some(manager) = ctx.manager.as_ref()
+        && let Some(replay_config) = manager.replay_config()
+    {
+        let ext_id = ctx.extension_id.unwrap_or("unknown");
+        let trace_id = format!("hc-{call_id}");
+        let mut recorder = crate::extension_replay::ReplayRecorder::new(trace_id, replay_config);
 
-            recorder.tick();
-            recorder.record_scheduled(
-                ext_id,
-                call_id,
-                replay_scheduled_attributes(
-                    &call,
-                    capability,
-                    method,
-                    &params_hash,
-                    &args_shape_hash,
-                    resource_target_class,
-                    policy_profile,
-                ),
-            );
-            recorder.tick();
-            recorder.record_queue_accepted(
-                ext_id,
-                call_id,
-                replay_queue_attributes(lane_execution.as_ref(), manager),
-            );
-            recorder.tick();
+        recorder.tick();
+        recorder.record_scheduled(
+            ext_id,
+            call_id,
+            replay_scheduled_attributes(
+                &call,
+                capability,
+                method,
+                &params_hash,
+                &args_shape_hash,
+                resource_target_class,
+                policy_profile,
+            ),
+        );
+        recorder.tick();
+        recorder.record_queue_accepted(
+            ext_id,
+            call_id,
+            replay_queue_attributes(lane_execution.as_ref(), manager),
+        );
+        recorder.tick();
 
-            recorder.record_policy_decision(
-                ext_id,
-                call_id,
-                replay_policy_attributes(decision, &reason, runtime_risk_decision.as_ref()),
-            );
-            recorder.tick();
+        recorder.record_policy_decision(
+            ext_id,
+            call_id,
+            replay_policy_attributes(decision, &reason, runtime_risk_decision.as_ref()),
+        );
+        recorder.tick();
 
-            let outcome_kind = if outcome_error_code.is_some() {
-                crate::extension_replay::ReplayEventKind::Failed
-            } else {
-                crate::extension_replay::ReplayEventKind::Completed
-            };
-            recorder.record(
-                ext_id,
-                call_id,
-                outcome_kind,
-                replay_outcome_attributes(&outcome, duration_ms, resource_target_class),
-            );
+        let outcome_kind = if outcome_error_code.is_some() {
+            crate::extension_replay::ReplayEventKind::Failed
+        } else {
+            crate::extension_replay::ReplayEventKind::Completed
+        };
+        recorder.record(
+            ext_id,
+            call_id,
+            outcome_kind,
+            replay_outcome_attributes(&outcome, duration_ms, resource_target_class),
+        );
 
-            let observed_micros = u64::try_from(started_at.elapsed().as_micros())
-                .unwrap_or(u64::MAX)
-                .max(1);
-            let observation = crate::extension_replay::ReplayCaptureObservation {
-                baseline_micros: observed_micros,
-                captured_micros: observed_micros,
-                trace_bytes: 0,
-            };
-            if let Ok(result) = recorder.finish(observation) {
-                if result.gate_report.capture_allowed {
-                    manager.store_replay_bundle(result.bundle);
-                }
-            }
+        let observed_micros = u64::try_from(started_at.elapsed().as_micros())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        let observation = crate::extension_replay::ReplayCaptureObservation {
+            baseline_micros: observed_micros,
+            captured_micros: observed_micros,
+            trace_bytes: 0,
+        };
+        if let Ok(result) = recorder.finish(observation)
+            && result.gate_report.capture_allowed
+        {
+            manager.store_replay_bundle(result.bundle);
         }
     }
 
@@ -22001,24 +22309,23 @@ async fn resolve_shared_policy_prompt(
     capability: &str,
 ) -> (PolicyDecision, String) {
     // Check prompt cache.
-    if let Some(ext_id) = ctx.extension_id {
-        if let Some(allow) = ctx
+    if let Some(ext_id) = ctx.extension_id
+        && let Some(allow) = ctx
             .manager
             .as_ref()
             .and_then(|m| m.cached_policy_prompt_decision(ext_id, capability))
-        {
-            let decision = if allow {
-                PolicyDecision::Allow
-            } else {
-                PolicyDecision::Deny
-            };
-            let reason = if allow {
-                "prompt_cache_allow"
-            } else {
-                "prompt_cache_deny"
-            };
-            return (decision, reason.to_string());
-        }
+    {
+        let decision = if allow {
+            PolicyDecision::Allow
+        } else {
+            PolicyDecision::Deny
+        };
+        let reason = if allow {
+            "prompt_cache_allow"
+        } else {
+            "prompt_cache_deny"
+        };
+        return (decision, reason.to_string());
     }
 
     // Prompt the user via UI.
@@ -22995,10 +23302,10 @@ async fn dispatch_hostcall_with_runtime(
     request: HostcallRequest,
 ) -> HostcallOutcome {
     // Test interceptor check (short-circuits before the shared ABI path).
-    if let Some(ref interceptor) = host.interceptor {
-        if let Some(outcome) = interceptor.intercept(&request) {
-            return outcome;
-        }
+    if let Some(ref interceptor) = host.interceptor
+        && let Some(outcome) = interceptor.intercept(&request)
+    {
+        return outcome;
     }
 
     // Convert JS request to canonical payload.
@@ -23289,183 +23596,180 @@ async fn dispatch_hostcall_exec_ref_with_limit(
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    if stream {
-        if let Some(runtime) = runtime {
+    if stream && let Some(runtime) = runtime {
+        if !runtime.is_hostcall_active(call_id) {
+            return HostcallOutcome::StreamChunk {
+                sequence: 0,
+                chunk: Value::Null,
+                is_final: false,
+            };
+        }
+
+        let cmd = cmd.to_string();
+        // Keep the pump threads draining pipes even if the runtime is
+        // temporarily behind on chunk delivery. Bounded channels can
+        // recreate the same shell/pipe deadlock seen in the main bash tool.
+        let (tx, rx) = mpsc::sync_channel::<ExecStreamFrame>(1024);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_worker = Arc::clone(&cancel);
+        let call_id_for_error = call_id.to_string();
+
+        thread::spawn(move || {
+            let result = (|| -> std::result::Result<(), String> {
+                let mut command = Command::new(&cmd);
+                command
+                    .args(&args)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+
+                if let Some(cwd) = cwd.as_ref() {
+                    command.current_dir(cwd);
+                }
+                crate::tools::isolate_command_process_group(&mut command);
+
+                let mut child = command.spawn().map_err(|err| err.to_string())?;
+                let pid = child.id();
+
+                let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
+                let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
+
+                let stdout_tx = tx.clone();
+                let stderr_tx = tx.clone();
+                let stdout_handle = thread::spawn(move || pump_stream(stdout, &stdout_tx, true));
+                let stderr_handle = thread::spawn(move || pump_stream(stderr, &stderr_tx, false));
+
+                let start = Instant::now();
+                let mut killed = false;
+                let status = loop {
+                    if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
+                        break status;
+                    }
+
+                    if !killed && cancel_worker.load(AtomicOrdering::SeqCst) {
+                        killed = true;
+                        crate::tools::kill_process_group_tree(Some(pid));
+                        let _ = child.kill();
+                        break child.wait().map_err(|err| err.to_string())?;
+                    }
+
+                    if let Some(timeout_ms) = timeout_ms
+                        && !killed
+                        && start.elapsed() >= Duration::from_millis(timeout_ms)
+                    {
+                        killed = true;
+                        crate::tools::kill_process_group_tree(Some(pid));
+                        let _ = child.kill();
+                        break child.wait().map_err(|err| err.to_string())?;
+                    }
+
+                    thread::sleep(Duration::from_millis(10));
+                };
+
+                let drain_start = Instant::now();
+                let drain_deadline = drain_start + Duration::from_secs(5);
+                loop {
+                    if stdout_handle.is_finished() && stderr_handle.is_finished() {
+                        break;
+                    }
+                    if Instant::now() >= drain_deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+
+                // Explicitly reap to avoid leaving a zombie behind after a
+                // successful try_wait()-observed exit on isolated process groups.
+                let _ = child.wait();
+
+                let code = exit_status_code(status);
+                let _ = tx.send(ExecStreamFrame::Final { code, killed });
+                Ok(())
+            })();
+
+            if let Err(err) = result
+                && tx.send(ExecStreamFrame::Error(err)).is_err()
+            {
+                tracing::trace!(
+                    call_id = %call_id_for_error,
+                    "Exec hostcall stream result dropped before completion"
+                );
+            }
+        });
+
+        let mut sequence = 0_u64;
+        let mut processed_in_turn = 0_u32;
+        let call_id_owned = call_id.to_string();
+        loop {
             if !runtime.is_hostcall_active(call_id) {
+                cancel.store(true, AtomicOrdering::SeqCst);
                 return HostcallOutcome::StreamChunk {
-                    sequence: 0,
+                    sequence,
                     chunk: Value::Null,
                     is_final: false,
                 };
             }
 
-            let cmd = cmd.to_string();
-            // Keep the pump threads draining pipes even if the runtime is
-            // temporarily behind on chunk delivery. Bounded channels can
-            // recreate the same shell/pipe deadlock seen in the main bash tool.
-            let (tx, rx) = mpsc::sync_channel::<ExecStreamFrame>(1024);
-            let cancel = Arc::new(AtomicBool::new(false));
-            let cancel_worker = Arc::clone(&cancel);
-            let call_id_for_error = call_id.to_string();
-
-            thread::spawn(move || {
-                let result = (|| -> std::result::Result<(), String> {
-                    let mut command = Command::new(&cmd);
-                    command
-                        .args(&args)
-                        .stdin(Stdio::null())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped());
-
-                    if let Some(cwd) = cwd.as_ref() {
-                        command.current_dir(cwd);
-                    }
-                    crate::tools::isolate_command_process_group(&mut command);
-
-                    let mut child = command.spawn().map_err(|err| err.to_string())?;
-                    let pid = child.id();
-
-                    let stdout = child.stdout.take().ok_or("Missing stdout pipe")?;
-                    let stderr = child.stderr.take().ok_or("Missing stderr pipe")?;
-
-                    let stdout_tx = tx.clone();
-                    let stderr_tx = tx.clone();
-                    let stdout_handle =
-                        thread::spawn(move || pump_stream(stdout, &stdout_tx, true));
-                    let stderr_handle =
-                        thread::spawn(move || pump_stream(stderr, &stderr_tx, false));
-
-                    let start = Instant::now();
-                    let mut killed = false;
-                    let status = loop {
-                        if let Some(status) = child.try_wait().map_err(|err| err.to_string())? {
-                            break status;
-                        }
-
-                        if !killed && cancel_worker.load(AtomicOrdering::SeqCst) {
-                            killed = true;
-                            crate::tools::kill_process_group_tree(Some(pid));
-                            let _ = child.kill();
-                            break child.wait().map_err(|err| err.to_string())?;
-                        }
-
-                        if let Some(timeout_ms) = timeout_ms {
-                            if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
-                                killed = true;
-                                crate::tools::kill_process_group_tree(Some(pid));
-                                let _ = child.kill();
-                                break child.wait().map_err(|err| err.to_string())?;
-                            }
-                        }
-
-                        thread::sleep(Duration::from_millis(10));
-                    };
-
-                    let drain_start = Instant::now();
-                    let drain_deadline = drain_start + Duration::from_secs(5);
-                    loop {
-                        if stdout_handle.is_finished() && stderr_handle.is_finished() {
-                            break;
-                        }
-                        if Instant::now() >= drain_deadline {
-                            break;
-                        }
-                        thread::sleep(Duration::from_millis(10));
-                    }
-
-                    // Explicitly reap to avoid leaving a zombie behind after a
-                    // successful try_wait()-observed exit on isolated process groups.
-                    let _ = child.wait();
-
-                    let code = exit_status_code(status);
-                    let _ = tx.send(ExecStreamFrame::Final { code, killed });
-                    Ok(())
-                })();
-
-                if let Err(err) = result {
-                    if tx.send(ExecStreamFrame::Error(err)).is_err() {
-                        tracing::trace!(
-                            call_id = %call_id_for_error,
-                            "Exec hostcall stream result dropped before completion"
-                        );
-                    }
+            match rx.try_recv() {
+                Ok(ExecStreamFrame::Stdout(chunk)) => {
+                    let mut m = serde_json::Map::with_capacity(1);
+                    m.insert("stdout".into(), Value::String(chunk));
+                    runtime.complete_hostcall(
+                        call_id_owned.clone(),
+                        HostcallOutcome::StreamChunk {
+                            sequence,
+                            chunk: Value::Object(m),
+                            is_final: false,
+                        },
+                    );
+                    sequence = sequence.saturating_add(1);
+                    processed_in_turn += 1;
                 }
-            });
-
-            let mut sequence = 0_u64;
-            let mut processed_in_turn = 0_u32;
-            let call_id_owned = call_id.to_string();
-            loop {
-                if !runtime.is_hostcall_active(call_id) {
-                    cancel.store(true, AtomicOrdering::SeqCst);
+                Ok(ExecStreamFrame::Stderr(chunk)) => {
+                    let mut m = serde_json::Map::with_capacity(1);
+                    m.insert("stderr".into(), Value::String(chunk));
+                    runtime.complete_hostcall(
+                        call_id_owned.clone(),
+                        HostcallOutcome::StreamChunk {
+                            sequence,
+                            chunk: Value::Object(m),
+                            is_final: false,
+                        },
+                    );
+                    sequence = sequence.saturating_add(1);
+                    processed_in_turn += 1;
+                }
+                Ok(ExecStreamFrame::Final { code, killed }) => {
                     return HostcallOutcome::StreamChunk {
                         sequence,
-                        chunk: Value::Null,
-                        is_final: false,
+                        chunk: json!({
+                            "code": code,
+                            "killed": killed,
+                        }),
+                        is_final: true,
                     };
                 }
-
-                match rx.try_recv() {
-                    Ok(ExecStreamFrame::Stdout(chunk)) => {
-                        let mut m = serde_json::Map::with_capacity(1);
-                        m.insert("stdout".into(), Value::String(chunk));
-                        runtime.complete_hostcall(
-                            call_id_owned.clone(),
-                            HostcallOutcome::StreamChunk {
-                                sequence,
-                                chunk: Value::Object(m),
-                                is_final: false,
-                            },
-                        );
-                        sequence = sequence.saturating_add(1);
-                        processed_in_turn += 1;
-                    }
-                    Ok(ExecStreamFrame::Stderr(chunk)) => {
-                        let mut m = serde_json::Map::with_capacity(1);
-                        m.insert("stderr".into(), Value::String(chunk));
-                        runtime.complete_hostcall(
-                            call_id_owned.clone(),
-                            HostcallOutcome::StreamChunk {
-                                sequence,
-                                chunk: Value::Object(m),
-                                is_final: false,
-                            },
-                        );
-                        sequence = sequence.saturating_add(1);
-                        processed_in_turn += 1;
-                    }
-                    Ok(ExecStreamFrame::Final { code, killed }) => {
-                        return HostcallOutcome::StreamChunk {
-                            sequence,
-                            chunk: json!({
-                                "code": code,
-                                "killed": killed,
-                            }),
-                            is_final: true,
-                        };
-                    }
-                    Ok(ExecStreamFrame::Error(message)) => {
-                        return HostcallOutcome::Error {
-                            code: "io".to_string(),
-                            message,
-                        };
-                    }
-                    Err(mpsc::TryRecvError::Empty) => {
-                        processed_in_turn = 0;
-                        extension_wait_sleep(Duration::from_millis(25)).await;
-                    }
-                    Err(mpsc::TryRecvError::Disconnected) => {
-                        return HostcallOutcome::Error {
-                            code: "internal".to_string(),
-                            message: "exec stream channel closed".to_string(),
-                        };
-                    }
+                Ok(ExecStreamFrame::Error(message)) => {
+                    return HostcallOutcome::Error {
+                        code: "io".to_string(),
+                        message,
+                    };
                 }
-
-                if processed_in_turn >= 64 {
+                Err(mpsc::TryRecvError::Empty) => {
                     processed_in_turn = 0;
-                    asupersync::runtime::yield_now().await;
+                    extension_wait_sleep(Duration::from_millis(25)).await;
                 }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    return HostcallOutcome::Error {
+                        code: "internal".to_string(),
+                        message: "exec stream channel closed".to_string(),
+                    };
+                }
+            }
+
+            if processed_in_turn >= 64 {
+                processed_in_turn = 0;
+                asupersync::runtime::yield_now().await;
             }
         }
     }
@@ -23532,13 +23836,14 @@ async fn dispatch_hostcall_exec_ref_with_limit(
                     break child.wait().map_err(|err| err.to_string())?;
                 }
 
-                if let Some(timeout_ms) = timeout_ms {
-                    if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
-                        killed = true;
-                        crate::tools::kill_process_group_tree(Some(pid));
-                        let _ = child.kill();
-                        break child.wait().map_err(|err| err.to_string())?;
-                    }
+                if let Some(timeout_ms) = timeout_ms
+                    && !killed
+                    && start.elapsed() >= Duration::from_millis(timeout_ms)
+                {
+                    killed = true;
+                    crate::tools::kill_process_group_tree(Some(pid));
+                    let _ = child.kill();
+                    break child.wait().map_err(|err| err.to_string())?;
                 }
 
                 if let Ok(frame) = rx_stream.recv_timeout(Duration::from_millis(10)) {
@@ -23587,14 +23892,14 @@ async fn dispatch_hostcall_exec_ref_with_limit(
     let _guard = CancelGuard(Arc::clone(&cancel));
 
     loop {
-        if let Some(runtime) = runtime {
-            if !runtime.is_hostcall_active(call_id) {
-                cancel.store(true, AtomicOrdering::SeqCst);
-                return HostcallOutcome::Error {
-                    code: "internal".to_string(),
-                    message: "exec task cancelled".to_string(),
-                };
-            }
+        if let Some(runtime) = runtime
+            && !runtime.is_hostcall_active(call_id)
+        {
+            cancel.store(true, AtomicOrdering::SeqCst);
+            return HostcallOutcome::Error {
+                code: "internal".to_string(),
+                message: "exec task cancelled".to_string(),
+            };
         }
 
         match rx.try_recv() {
@@ -24507,17 +24812,17 @@ async fn dispatch_hostcall_events_ref(
             manager.set_current_model(provider.clone(), model_id.clone());
 
             // Persist via session (creates ModelChangeEntry + updates header).
-            if let Some(session) = manager.session_handle() {
-                let p = provider.unwrap_or_default();
-                let m = model_id.unwrap_or_default();
-                if !p.is_empty() && !m.is_empty() {
-                    if let Err(err) = session.set_model(p, m).await {
-                        return HostcallOutcome::Error {
-                            code: "io".to_string(),
-                            message: format!("setModel: session update failed: {err}"),
-                        };
-                    }
-                }
+            let p = provider.unwrap_or_default();
+            let m = model_id.unwrap_or_default();
+            if let Some(session) = manager.session_handle()
+                && !p.is_empty()
+                && !m.is_empty()
+                && let Err(err) = session.set_model(p, m).await
+            {
+                return HostcallOutcome::Error {
+                    code: "io".to_string(),
+                    message: format!("setModel: session update failed: {err}"),
+                };
             }
             HostcallOutcome::Success(Value::Null)
         }
@@ -24542,15 +24847,14 @@ async fn dispatch_hostcall_events_ref(
             manager.set_current_thinking_level(level.clone());
 
             // Persist via session (creates ThinkingLevelChangeEntry + updates header).
-            if let Some(session) = manager.session_handle() {
-                if let Some(ref lvl) = level {
-                    if let Err(err) = session.set_thinking_level(lvl.clone()).await {
-                        return HostcallOutcome::Error {
-                            code: "io".to_string(),
-                            message: format!("setThinkingLevel: session update failed: {err}"),
-                        };
-                    }
-                }
+            if let Some(session) = manager.session_handle()
+                && let Some(ref lvl) = level
+                && let Err(err) = session.set_thinking_level(lvl.clone()).await
+            {
+                return HostcallOutcome::Error {
+                    code: "io".to_string(),
+                    message: format!("setThinkingLevel: session update failed: {err}"),
+                };
             }
             HostcallOutcome::Success(Value::Null)
         }
@@ -24641,46 +24945,44 @@ async fn await_js_task(
                 if value.is_null() || value.is_undefined() {
                     return Ok(TaskTakeResult::Missing);
                 }
-                if let Some(obj) = value.as_object() {
-                    if let Ok(status) = obj.get::<_, String>("status") {
-                        match status.as_str() {
-                            "pending" => return Ok(TaskTakeResult::Pending),
-                            "resolved" => {
-                                let resolved_js = obj.get::<_, rquickjs::Value<'_>>("value").ok();
-                                let resolved_json = if let Some(v) = resolved_js {
-                                    js_to_json(&v)?
-                                } else {
-                                    Value::Null
-                                };
-                                return Ok(TaskTakeResult::Resolved(resolved_json));
-                            }
-                            "rejected" => {
-                                let (code, message, stack) = obj
-                                    .get::<_, rquickjs::Value<'_>>("error")
-                                    .ok()
-                                    .and_then(|error_value| error_value.as_object().cloned())
-                                    .map_or_else(
-                                        || (None, "Unknown JS task error".to_string(), None),
-                                        |error_obj| {
-                                            (
-                                                error_obj.get::<_, String>("code").ok(),
-                                                error_obj
-                                                    .get::<_, String>("message")
-                                                    .unwrap_or_else(|_| {
-                                                        "Unknown JS task error".to_string()
-                                                    }),
-                                                error_obj.get::<_, String>("stack").ok(),
-                                            )
-                                        },
-                                    );
-                                return Ok(TaskTakeResult::Rejected {
-                                    code,
-                                    message,
-                                    stack,
-                                });
-                            }
-                            _ => {}
+                if let Some(obj) = value.as_object()
+                    && let Ok(status) = obj.get::<_, String>("status")
+                {
+                    match status.as_str() {
+                        "pending" => return Ok(TaskTakeResult::Pending),
+                        "resolved" => {
+                            let resolved_js = obj.get::<_, rquickjs::Value<'_>>("value").ok();
+                            let resolved_json = if let Some(v) = resolved_js {
+                                js_to_json(&v)?
+                            } else {
+                                Value::Null
+                            };
+                            return Ok(TaskTakeResult::Resolved(resolved_json));
                         }
+                        "rejected" => {
+                            let (code, message, stack) = obj
+                                .get::<_, rquickjs::Value<'_>>("error")
+                                .ok()
+                                .and_then(|error_value| error_value.as_object().cloned())
+                                .map_or_else(
+                                    || (None, "Unknown JS task error".to_string(), None),
+                                    |error_obj| {
+                                        (
+                                            error_obj.get::<_, String>("code").ok(),
+                                            error_obj.get::<_, String>("message").unwrap_or_else(
+                                                |_| "Unknown JS task error".to_string(),
+                                            ),
+                                            error_obj.get::<_, String>("stack").ok(),
+                                        )
+                                    },
+                                );
+                            return Ok(TaskTakeResult::Rejected {
+                                code,
+                                message,
+                                stack,
+                            });
+                        }
+                        _ => {}
                     }
                 }
                 Ok(TaskTakeResult::Snapshot(js_to_json(&value)?))
@@ -24705,11 +25007,11 @@ async fn await_js_task(
                 if let Some(code) = code {
                     message = format!("{code}: {message}");
                 }
-                if let Some(stack) = stack {
-                    if !stack.is_empty() {
-                        message.push('\n');
-                        message.push_str(&stack);
-                    }
+                if let Some(stack) = stack
+                    && !stack.is_empty()
+                {
+                    message.push('\n');
+                    message.push_str(&stack);
                 }
                 return Err(Error::extension(message));
             }
@@ -24734,11 +25036,11 @@ async fn await_js_task(
                         if let Some(code) = err.code {
                             message = format!("{code}: {message}");
                         }
-                        if let Some(stack) = err.stack {
-                            if !stack.is_empty() {
-                                message.push('\n');
-                                message.push_str(&stack);
-                            }
+                        if let Some(stack) = err.stack
+                            && !stack.is_empty()
+                        {
+                            message.push('\n');
+                            message.push_str(&stack);
                         }
                         return Err(Error::extension(message));
                     }
@@ -26639,13 +26941,12 @@ impl ExtensionManager {
         {
             triggers.push("dangerous_capability_escalation".to_string());
         }
-        if let Some(ref prev_cap) = state.last_capability {
-            if prev_cap != capability
-                && runtime_risk_is_dangerous(capability)
-                && !runtime_risk_is_dangerous(prev_cap)
-            {
-                triggers.push("unseen_capability_transition".to_string());
-            }
+        if let Some(ref prev_cap) = state.last_capability
+            && prev_cap != capability
+            && runtime_risk_is_dangerous(capability)
+            && !runtime_risk_is_dangerous(prev_cap)
+        {
+            triggers.push("unseen_capability_transition".to_string());
         }
         if (meta.resource_target_class.starts_with("filesystem.")
             || meta.resource_target_class.starts_with("subprocess.")
@@ -28088,10 +28389,10 @@ impl ExtensionManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.policy_prompt_cache.remove(extension_id);
-        if let Some(ref mut store) = guard.permission_store {
-            if let Err(e) = store.revoke_extension(extension_id) {
-                tracing::warn!("Failed to revoke extension permissions: {e}");
-            }
+        if let Some(ref mut store) = guard.permission_store
+            && let Err(e) = store.revoke_extension(extension_id)
+        {
+            tracing::warn!("Failed to revoke extension permissions: {e}");
         }
     }
 
@@ -28102,10 +28403,10 @@ impl ExtensionManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.policy_prompt_cache.clear();
-        if let Some(ref mut store) = guard.permission_store {
-            if let Err(e) = store.reset() {
-                tracing::warn!("Failed to reset all permissions: {e}");
-            }
+        if let Some(ref mut store) = guard.permission_store
+            && let Err(e) = store.reset()
+        {
+            tracing::warn!("Failed to reset all permissions: {e}");
         }
     }
 
@@ -28210,16 +28511,16 @@ impl ExtensionManager {
                 event_hooks,
                 active_tools: ext_active_tools,
             } = snapshot;
-            if let Some(hints_by_extension) = compat_hints_by_extension.as_ref() {
-                if let Some(hints) = hints_by_extension.get(&id) {
-                    apply_compat_registration_hints(
-                        &id,
-                        if name.is_empty() { &id } else { &name },
-                        &mut tools,
-                        &mut slash_commands,
-                        hints,
-                    );
-                }
+            if let Some(hints_by_extension) = compat_hints_by_extension.as_ref()
+                && let Some(hints) = hints_by_extension.get(&id)
+            {
+                apply_compat_registration_hints(
+                    &id,
+                    if name.is_empty() { &id } else { &name },
+                    &mut tools,
+                    &mut slash_commands,
+                    hints,
+                );
             }
             all_providers.extend(providers);
             all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
@@ -28640,10 +28941,10 @@ impl ExtensionManager {
             return;
         }
         let name = name.to_string();
-        if let Some(obj) = spec.as_object_mut() {
-            if obj.get("name").and_then(Value::as_str) != Some(name.as_str()) {
-                obj.insert("name".to_string(), Value::String(name.clone()));
-            }
+        if let Some(obj) = spec.as_object_mut()
+            && obj.get("name").and_then(Value::as_str) != Some(name.as_str())
+        {
+            obj.insert("name".to_string(), Value::String(name.clone()));
         }
         let mut guard = self
             .inner
@@ -29095,10 +29396,10 @@ impl ExtensionManager {
         };
 
         // Cache hit: version matches → return Arc (no deep clone).
-        if let Some(ref c) = cached {
-            if c.generation == version {
-                return Arc::clone(&c.payload);
-            }
+        if let Some(ref c) = cached
+            && c.generation == version
+        {
+            return Arc::clone(&c.payload);
         }
 
         // Cache miss: read state from the RCU snapshot (no mutex needed).
@@ -29205,43 +29506,44 @@ impl ExtensionManager {
             Some(other) => json!({ "type": event_name, "data": other }),
         };
 
-        let mut response = None;
-        if let Some(runtime) = runtime {
-            if has_hook {
-                #[cfg(feature = "wasm-host")]
-                let runtime_event_payload = event_payload.clone();
-                #[cfg(not(feature = "wasm-host"))]
-                let runtime_event_payload = event_payload;
+        let response = if let Some(runtime) = runtime
+            && has_hook
+        {
+            #[cfg(feature = "wasm-host")]
+            let runtime_event_payload = event_payload.clone();
+            #[cfg(not(feature = "wasm-host"))]
+            let runtime_event_payload = event_payload;
 
-                let js_response = runtime
-                    .dispatch_event(
-                        event_name.clone(),
-                        runtime_event_payload,
-                        Arc::clone(&ctx_payload),
-                        timeout_ms,
-                    )
-                    .await?;
-                response = Some(js_response);
-            }
-        }
+            let js_response = runtime
+                .dispatch_event(
+                    event_name.clone(),
+                    runtime_event_payload,
+                    Arc::clone(&ctx_payload),
+                    timeout_ms,
+                )
+                .await?;
+            Some(js_response)
+        } else {
+            None
+        };
 
         #[cfg(feature = "wasm-host")]
-        if has_hook_wasm {
+        let response = if has_hook_wasm {
             let mut wasm_payload = event_payload;
             if let Value::Object(map) = &mut wasm_payload {
                 map.insert("ctx".into(), (*ctx_payload).clone());
             }
-            if let Some(value) = Self::dispatch_wasm_event_value(
+            Self::dispatch_wasm_event_value(
                 &wasm_extensions,
                 &event_name,
                 &wasm_payload,
                 timeout_ms,
             )
             .await?
-            {
-                response = Some(value);
-            }
-        }
+            .or(response)
+        } else {
+            response
+        };
 
         let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         tracing::info!(
@@ -29580,24 +29882,24 @@ impl ExtensionManager {
 
         let mut response: Option<ToolCallEventResult> = None;
 
-        if let Some(runtime) = runtime {
-            if has_hook_js {
-                let js_response = runtime
-                    .dispatch_event(
-                        event_name.to_string(),
-                        event_payload.clone(),
-                        Arc::clone(&ctx_payload),
-                        timeout_ms,
-                    )
-                    .await?;
-                if !js_response.is_null() {
-                    let parsed: ToolCallEventResult = serde_json::from_value(js_response)
-                        .map_err(|err| Error::extension(err.to_string()))?;
-                    if parsed.block {
-                        return Ok(Some(parsed));
-                    }
-                    response = Some(parsed);
+        if let Some(runtime) = runtime
+            && has_hook_js
+        {
+            let js_response = runtime
+                .dispatch_event(
+                    event_name.to_string(),
+                    event_payload.clone(),
+                    Arc::clone(&ctx_payload),
+                    timeout_ms,
+                )
+                .await?;
+            if !js_response.is_null() {
+                let parsed: ToolCallEventResult = serde_json::from_value(js_response)
+                    .map_err(|err| Error::extension(err.to_string()))?;
+                if parsed.block {
+                    return Ok(Some(parsed));
                 }
+                response = Some(parsed);
             }
         }
 
@@ -29694,22 +29996,22 @@ impl ExtensionManager {
 
         let mut response: Option<ToolResultEventResult> = None;
 
-        if let Some(runtime) = runtime {
-            if has_hook_js {
-                let js_response = runtime
-                    .dispatch_event(
-                        event_name.to_string(),
-                        event_payload.clone(),
-                        Arc::clone(&ctx_payload),
-                        timeout_ms,
-                    )
-                    .await?;
-                if !js_response.is_null() {
-                    response = Some(
-                        serde_json::from_value(js_response)
-                            .map_err(|err| Error::extension(err.to_string()))?,
-                    );
-                }
+        if let Some(runtime) = runtime
+            && has_hook_js
+        {
+            let js_response = runtime
+                .dispatch_event(
+                    event_name.to_string(),
+                    event_payload.clone(),
+                    Arc::clone(&ctx_payload),
+                    timeout_ms,
+                )
+                .await?;
+            if !js_response.is_null() {
+                response = Some(
+                    serde_json::from_value(js_response)
+                        .map_err(|err| Error::extension(err.to_string()))?,
+                );
             }
         }
 

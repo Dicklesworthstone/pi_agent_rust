@@ -10357,17 +10357,19 @@ fn swarm_temp_dir_finding(
     let cat = CheckCategory::Swarm;
     let data = swarm_temp_dir_data(env_name, Some(path), true, available_kb);
 
-    if let Some(available_kb) = available_kb {
-        if available_kb < SWARM_DISK_WARN_AVAILABLE_KB {
-            return Finding::warn(cat, format!("{env_name} has low free space"))
-                .with_detail(format!(
-                    "{} available at {}",
-                    format_available_kb(available_kb),
-                    path.display()
-                ))
-                .with_remediation("Switch to a larger /data/tmp target or wait for cleanup before heavy cargo checks")
-                .with_data(data);
-        }
+    if let Some(available_kb) = available_kb
+        && available_kb < SWARM_DISK_WARN_AVAILABLE_KB
+    {
+        return Finding::warn(cat, format!("{env_name} has low free space"))
+            .with_detail(format!(
+                "{} available at {}",
+                format_available_kb(available_kb),
+                path.display()
+            ))
+            .with_remediation(
+                "Switch to a larger /data/tmp target or wait for cleanup before heavy cargo checks",
+            )
+            .with_data(data);
     }
 
     if !path_under_swarm_scratch_root(path) {

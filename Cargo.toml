@@ -1,8 +1,8 @@
 [package]
 name = "pi_agent_rust"
-version = "0.1.23"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.95"
 description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
 authors = ["Jeffrey Emanuel"]
 license-file = "LICENSE"
@@ -15,23 +15,28 @@ categories = ["command-line-utilities", "development-tools"]
 autobins = false
 # Binary organization per bd-uuwgi.1/bd-uuwgi.2 classification:
 # - SHIPPING: src/main.rs (pi) - main CLI binary
-# - RETIRABLE: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
-# - DEV-ONLY: moved to examples/ (21 files: ext_*, test_*, debug utilities)
+# - INTERNAL/OPT-IN: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
+# - DEV-ONLY: moved to examples/ (23 files: ext_*, test_*, debug utilities)
 include = [
-    "docs/extension-artifact-provenance.json",
-    "docs/wit/extension.wit",
-    "docs/provider-upstream-model-ids-snapshot.json",
-    "docs/schema/extension_protocol.json",
-    "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
-    "Cargo.toml",
-    "LICENSE",
-    "README.md",
+    "/docs/extension-artifact-provenance.json",
+    # Compile-time unit-test evidence referenced by src/tools.rs. Keeping it in
+    # the source package lets `cargo test` compile after crates.io extraction.
+    "/docs/evidence/tool-output-context-cache.jsonl",
+    "/docs/wit/extension.wit",
+    "/docs/provider-upstream-model-ids-snapshot.json",
+    "/docs/schema/extension_protocol.json",
+    "/legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
+    # Compile-time unit-test fixture referenced by src/doctor.rs.
+    "/tests/fixtures/agent_mail/schema_corrupt_health.json",
+    "/Cargo.toml",
+    "/LICENSE",
+    "/README.md",
     # Pulled in by `include_str!("../../CHANGELOG.md")` in
     # src/interactive/commands.rs and src/interactive.rs — without it the
     # `cargo publish --dry-run` verify step fails to build the packaged tarball.
-    "CHANGELOG.md",
-    "build.rs",
-    "src/**",
+    "/CHANGELOG.md",
+    "/build.rs",
+    "/src/**",
 ]
 
 [lib]
@@ -48,12 +53,16 @@ path = "src/main.rs"
 # consumers that do not want the terminal stack.
 required-features = ["tui"]
 
-# RETIRABLE binary (pending RULE 1 approval)
-# Legacy capture functionality - 91KB, last modified 2026-03-12
-# Candidate for removal per binary classification bd-uuwgi.1
+# RETIRABLE internal conformance utility (pending RULE 1 approval). Keeping it
+# behind a non-default feature prevents an ordinary `cargo install
+# pi_agent_rust` from installing this unsupported executable. Repository gates
+# that exercise it explicitly enable `internal-legacy-capture`; the matching
+# integration test is gated below so CARGO_BIN_EXE_pi_legacy_capture is defined
+# whenever that test is compiled.
 [[bin]]
 name = "pi_legacy_capture"
 path = "src/bin/pi_legacy_capture.rs"
+required-features = ["internal-legacy-capture"]
 
 # Examples (moved from src/bin/ to examples/)
 # These binaries are accessible via: cargo run --example <name>
@@ -172,13 +181,13 @@ serde_json = { version = "1", features = ["raw_value"] }
 json5 = "1.3.1"
 
 # Error handling
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 thiserror = "2"
 
 # Terminal output (rich_rust for beautiful TUI).
 # rich_rust is shared by non-TUI code paths (plain styled stdout/markdown
 # rendering in src/tui.rs and elsewhere), so it stays unconditional.
-rich_rust = { version = "0.2.0", features = ["markdown"] }
+rich_rust = { version = "0.2.2", features = ["markdown"] }
 # crossterm is the low-level terminal driver used exclusively by the
 # interactive front-end, so it is gated behind the `tui` feature.
 crossterm = { version = "0.29", optional = true }
@@ -251,7 +260,7 @@ swc_ecma_parser = "34.0.0"
 swc_ecma_transforms_base = "37.0.0"
 swc_ecma_transforms_typescript = "41.0.0"
 swc_ecma_visit = "20.0.0"
-wasmtime = { version = "41.0.3", features = ["component-model"], optional = true }
+wasmtime = { version = "47.0.3", features = ["component-model"], optional = true }
 filetime = "0.2.27"
 
 # Image processing (optional)
@@ -269,7 +278,7 @@ asupersync = { version = "0.3.9", default-features = false, features = ["test-in
 criterion = { version = "0.8.2", features = ["html_reports"] }
 jsonschema = { version = "0.42.0", default-features = false }
 proptest = "1.10.0"
-wat = "1.245.1"
+wat = "1.255.0"
 toml = "1.0.3"
 loom = "0.7.2"
 signal-hook = "0.4.4"
@@ -351,6 +360,11 @@ sqlite-sessions = []
 syntax-highlighting = ["rich_rust/syntax"]
 ext-conformance = []
 fuzzing = []
+# Internal-only legacy capture utility. This is deliberately non-default so
+# end-user `cargo install` installs only the supported `pi` executable. The
+# single integration test that executes it is gated at the test-function level
+# so the rest of that target remains in ordinary test runs.
+internal-legacy-capture = []
 # Opt-in loom model-checking lane. These tests are excluded from default
 # all-target gates because loom explores scheduler interleavings aggressively.
 loom-tests = []

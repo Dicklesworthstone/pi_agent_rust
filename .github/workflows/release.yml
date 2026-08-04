@@ -16,7 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   plan:
@@ -26,48 +26,154 @@ jobs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
       prerelease: ${{ steps.tag.outputs.prerelease }}
+      commit: ${{ steps.source.outputs.commit }}
+      tag_oid: ${{ steps.source.outputs.tag_oid }}
+      main_commit: ${{ steps.source.outputs.main_commit }}
     steps:
       - name: Determine and validate tag
         id: tag
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: |
           set -euxo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          if [ "$RELEASE_EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$RELEASE_TAG_INPUT"
           else
+            if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+              echo "::error::Expected a tag ref, got '$GITHUB_REF'"
+              exit 1
+            fi
             TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          semver_tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$TAG" =~ $semver_tag_re ]]; then
+            echo "::error::Tag '$TAG' is not a complete v-prefixed SemVer tag"
+            exit 1
           fi
           VERSION="${TAG#v}"
 
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
-            echo "Error: Version '$VERSION' does not match semver format"
-            exit 1
-          fi
-
-          if echo "$TAG" | grep -q -- '-'; then
+          version_without_build="${VERSION%%+*}"
+          if [[ "$version_without_build" == *-* ]]; then
             PRERELEASE="true"
           else
             PRERELEASE="false"
           fi
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$PRERELEASE" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag for commit resolution
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+
+      - name: Freeze release source commit
+        id: source
+        working-directory: pi_agent_rust
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/plan/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/plan/main"
+          validation_master_ref="refs/release-validation/plan/master"
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}" \
+            "refs/heads/master:${validation_master_ref}"
+          tag_oid="$(git rev-parse "${tag_ref}")"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          tag_commit="$(git rev-parse "${tag_ref}^{commit}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          main_commit="$(git rev-parse "${validation_main_ref}^{commit}")"
+          master_commit="$(git rev-parse "${validation_master_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          for oid in "$tag_oid" "$remote_tag_oid" "$tag_commit" "$remote_commit" "$main_commit" "$master_commit" "$head_commit"; do
+            if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Release source did not resolve to a full Git object ID: $oid"
+              exit 1
+            fi
+          done
+          if [ "$tag_oid" != "$remote_tag_oid" ]; then
+            echo "::error::Local and remote release tag objects differ"
+            exit 1
+          fi
+          if [ "$head_commit" != "$tag_commit" ] || [ "$remote_commit" != "$tag_commit" ]; then
+            echo "::error::Release tag, remote tag, and checked-out HEAD do not resolve to one commit"
+            exit 1
+          fi
+          if [ "$tag_commit" != "$main_commit" ] || [ "$tag_commit" != "$master_commit" ]; then
+            echo "::error::Release tag must point at the synchronized origin/main and origin/master tips"
+            exit 1
+          fi
+          {
+            echo "commit=$tag_commit"
+            echo "tag_oid=$tag_oid"
+            echo "main_commit=$main_commit"
+          } >> "$GITHUB_OUTPUT"
 
   gate:
     name: Release gate
     needs: plan
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     defaults:
       run:
         working-directory: pi_agent_rust
         shell: bash
     steps:
       - name: Checkout pi_agent_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: pi_agent_rust
           fetch-depth: 0
-          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+          ref: ${{ needs.plan.outputs.commit }}
+
+      - name: Verify frozen release source
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/gate/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/gate/main"
+          for oid in "$RELEASE_COMMIT" "$RELEASE_TAG_OID" "$RELEASE_MAIN_COMMIT"; do
+            if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Frozen release source contains an invalid Git object ID: $oid"
+              exit 1
+            fi
+          done
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$head_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ]; then
+            echo "::error::Frozen tag object, peeled commit, checkout, or main-tip binding changed"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen origin/main tip is no longer an ancestor of origin/main"
+            exit 1
+          fi
 
       - name: Verify Cargo.toml version matches tag
         run: |
@@ -81,23 +187,31 @@ jobs:
           echo "Version verified: $cargo_version"
 
       - name: Run release gate
-        continue-on-error: true
+        env:
+          RELEASE_GATE_CARGO_RUNNER: local
+          RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED: "0"
+          RELEASE_GATE_REQUIRE_PREFLIGHT: "1"
+          RELEASE_GATE_REQUIRE_QUALITY: "1"
         run: |
           set -euxo pipefail
           chmod +x scripts/release_gate.sh
-          ./scripts/release_gate.sh --no-rch --report | tee release_gate_report.json
-          VERDICT=$(python3 -c "import json; print(json.load(open('release_gate_report.json')).get('verdict','unknown'))")
+          report_path="${RUNNER_TEMP}/pi-release-gate-report.json"
+          gate_exit=0
+          ./scripts/release_gate.sh --no-rch --report | tee "$report_path" || gate_exit=$?
+          VERDICT=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('verdict','unknown'))" "$report_path")
           echo "Release gate verdict: $VERDICT"
-          if [ "$VERDICT" = "fail" ]; then
-            echo "::warning::Release gate reported FAIL — proceeding anyway (early development)"
+          if [ "$gate_exit" -ne 0 ] || [ "$VERDICT" != "pass" ]; then
+            echo "::error::Release gate failed (exit=$gate_exit, verdict=$VERDICT)"
+            exit 1
           fi
 
       - name: Upload release gate report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release-gate-report
-          path: pi_agent_rust/release_gate_report.json
+          path: ${{ runner.temp }}/pi-release-gate-report.json
+          if-no-files-found: error
 
   installer_regression:
     name: Installer regression
@@ -110,11 +224,48 @@ jobs:
         shell: bash
     steps:
       - name: Checkout pi_agent_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: pi_agent_rust
           fetch-depth: 0
-          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+          ref: ${{ needs.plan.outputs.commit }}
+
+      - name: Verify frozen release source
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/installer/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/installer/main"
+          for oid in "$RELEASE_COMMIT" "$RELEASE_TAG_OID" "$RELEASE_MAIN_COMMIT"; do
+            if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Frozen release source contains an invalid Git object ID: $oid"
+              exit 1
+            fi
+          done
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$head_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ]; then
+            echo "::error::Frozen tag object, peeled commit, checkout, or main-tip binding changed"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen origin/main tip is no longer an ancestor of origin/main"
+            exit 1
+          fi
 
       - name: Run installer regression harness
         run: |
@@ -124,7 +275,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.target }})
-    needs: [plan]
+    needs: [plan, gate]
     strategy:
       fail-fast: false
       matrix:
@@ -155,11 +306,12 @@ jobs:
         shell: bash
     steps:
       - name: Checkout pi_agent_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: pi_agent_rust
           fetch-depth: 0
-          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+          ref: ${{ needs.plan.outputs.commit }}
           # DO NOT add `submodules: false` here (YAML boolean).
           # actions/checkout@v4 treats the YAML boolean false as "recursive",
           # which then fails because legacy_pi_mono_code/pi-mono has no
@@ -167,50 +319,96 @@ jobs:
           # default (string "false" = don't checkout submodules).
           # See: https://github.com/Dicklesworthstone/pi_agent_rust/issues/34
 
-      - name: Ensure submodule content exists
+      - name: Verify frozen release source
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
         run: |
-          # The legacy_pi_mono_code/pi-mono submodule may lack a .gitmodules
-          # entry, which prevents automatic checkout. Create a minimal stub so
-          # the include_str!() in src/models.rs compiles even when the
-          # submodule cannot be resolved.
-          MODELS_TS="legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts"
-          if [ ! -f "$MODELS_TS" ]; then
-            echo "::warning::Submodule file missing — creating stub: $MODELS_TS"
-            mkdir -p "$(dirname "$MODELS_TS")"
-            cat > "$MODELS_TS" <<'STUB'
-          // Stub generated by CI — the real file lives in the pi-mono submodule.
-          // See: https://github.com/Dicklesworthstone/pi_agent_rust/issues/5
-          export const MODELS = {} as const;
-          STUB
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/build/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/build/main"
+          for oid in "$RELEASE_COMMIT" "$RELEASE_TAG_OID" "$RELEASE_MAIN_COMMIT"; do
+            if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Frozen release source contains an invalid Git object ID: $oid"
+              exit 1
+            fi
+          done
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$head_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ]; then
+            echo "::error::Frozen tag object, peeled commit, checkout, or main-tip binding changed"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen origin/main tip is no longer an ancestor of origin/main"
+            exit 1
           fi
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: asupersync
-          fetch-depth: 1
+      - name: Verify committed model registry source
+        run: |
+          set -euo pipefail
+          MODELS_TS="legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts"
 
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: rich_rust
-          fetch-depth: 1
+          before_head="$(git rev-parse HEAD)"
+          before_status="$(git status --porcelain=v2 --untracked-files=all)"
+          if [ -n "$before_status" ]; then
+            echo "::error::Release checkout is not clean before model registry validation"
+            printf '%s\n' "$before_status"
+            exit 1
+          fi
 
-      - name: Checkout charmed_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/charmed_rust
-          path: charmed_rust
-          fetch-depth: 1
+          if [ ! -f "$MODELS_TS" ] || [ -L "$MODELS_TS" ]; then
+            echo "::error::$MODELS_TS must be an existing regular non-symlink file"
+            exit 1
+          fi
 
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
+          head_entry="$(git ls-tree HEAD -- "$MODELS_TS")"
+          if [ -z "$head_entry" ]; then
+            echo "::error::$MODELS_TS is not tracked by HEAD"
+            exit 1
+          fi
+          read -r head_mode head_type head_oid head_path <<< "$head_entry"
+          if [[ ! "$head_mode" =~ ^100(644|755)$ ]] || [ "$head_type" != "blob" ] || [ "$head_path" != "$MODELS_TS" ]; then
+            echo "::error::$MODELS_TS is not a regular tracked HEAD blob: $head_entry"
+            exit 1
+          fi
+
+          index_entry="$(git ls-files --stage -- "$MODELS_TS")"
+          read -r index_mode index_oid index_stage index_path <<< "$index_entry"
+          if [ "$index_mode" != "$head_mode" ] || [ "$index_oid" != "$head_oid" ] || [ "$index_stage" != "0" ] || [ "$index_path" != "$MODELS_TS" ]; then
+            echo "::error::$MODELS_TS index entry does not match the HEAD blob"
+            exit 1
+          fi
+
+          index_state="$(git ls-files -v -- "$MODELS_TS")"
+          if [ "$index_state" != "H $MODELS_TS" ]; then
+            echo "::error::$MODELS_TS has an unexpected or hidden index state: $index_state"
+            exit 1
+          fi
+
+          worktree_oid="$(git hash-object --no-filters -- "$MODELS_TS")"
+          if [ "$worktree_oid" != "$head_oid" ]; then
+            echo "::error::$MODELS_TS worktree bytes do not match the committed HEAD blob"
+            exit 1
+          fi
+
+          after_head="$(git rev-parse HEAD)"
+          after_status="$(git status --porcelain=v2 --untracked-files=all)"
+          if [ "$after_head" != "$before_head" ] || [ "$after_status" != "$before_status" ]; then
+            echo "::error::Model registry validation mutated the checked-out source tree"
+            exit 1
+          fi
 
       - name: Install system deps (xcb + build tools) [linux]
         if: runner.os == 'Linux'
@@ -229,15 +427,16 @@ jobs:
             libxcb-xfixes0-dev
 
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master commit verified 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy
 
       - name: Add target
         run: rustup target add "${{ matrix.target }}"
 
       - name: Cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           workspaces: pi_agent_rust -> target
           key: release-${{ matrix.target }}
@@ -245,95 +444,617 @@ jobs:
       - name: Build release binary
         run: cargo build --release --locked --bin pi --target "${{ matrix.target }}"
 
+      - name: Revalidate source after build
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/post-build/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/post-build/main"
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$head_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ]; then
+            echo "::error::Release source or remote tag changed during the build"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen origin/main tip is no longer an ancestor of origin/main"
+            exit 1
+          fi
+          if ! git diff --quiet HEAD -- || ! git diff --cached --quiet HEAD --; then
+            echo "::error::Tracked worktree or index bytes changed during the release build"
+            exit 1
+          fi
+          if [ -n "$(git ls-files --others --exclude-standard)" ]; then
+            echo "::error::Release build created unexpected untracked source-tree files"
+            git ls-files --others --exclude-standard
+            exit 1
+          fi
+          noncanonical_flags="$(git ls-files -v | grep -v '^H ' || true)"
+          if [ -n "$noncanonical_flags" ]; then
+            echo "::error::Release index contains hidden or noncanonical flags after build"
+            printf '%s\n' "$noncanonical_flags"
+            exit 1
+          fi
+
+          critical_paths=(
+            Cargo.toml
+            Cargo.lock
+            rust-toolchain.toml
+            legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts
+          )
+          for path in "${critical_paths[@]}"; do
+            head_entry="$(git ls-tree HEAD -- "$path")"
+            index_entry="$(git ls-files --stage -- "$path")"
+            read -r head_mode head_type head_oid head_path <<< "$head_entry"
+            read -r index_mode index_oid index_stage index_path <<< "$index_entry"
+            worktree_oid="$(git hash-object --no-filters -- "$path")"
+            index_state="$(git ls-files -v -- "$path")"
+            if [[ ! "$head_mode" =~ ^100(644|755)$ ]] \
+              || [ "$head_type" != "blob" ] \
+              || [ "$head_path" != "$path" ] \
+              || [ "$index_mode" != "$head_mode" ] \
+              || [ "$index_oid" != "$head_oid" ] \
+              || [ "$index_stage" != "0" ] \
+              || [ "$index_path" != "$path" ] \
+              || [ "$worktree_oid" != "$head_oid" ] \
+              || [ "$index_state" != "H $path" ]; then
+              echo "::error::Critical release input differs from its committed blob: $path"
+              exit 1
+            fi
+          done
+
       - name: Create tarball (Unix)
         if: runner.os != 'Windows'
         run: |
           set -euxo pipefail
-          mkdir -p dist
+          mkdir dist
 
-          # Stage the binary and license into a clean directory for the archive
-          STAGE_DIR="pi-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
-          mkdir -p "$STAGE_DIR"
+          # RUNNER_TEMP is job-scoped, so staging never mutates the release checkout.
+          STAGE_NAME="pi-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
+          STAGE_DIR="${RUNNER_TEMP}/${STAGE_NAME}"
+          mkdir "$STAGE_DIR"
           cp "target/${{ matrix.target }}/release/pi" "$STAGE_DIR/"
-          cp LICENSE "$STAGE_DIR/" 2>/dev/null || true
-          cp README.md "$STAGE_DIR/" 2>/dev/null || true
+          cp LICENSE README.md "$STAGE_DIR/"
 
-          tar -cJf "dist/${{ matrix.asset }}.tar.xz" "$STAGE_DIR"
-          rm -rf "$STAGE_DIR"
+          tar -C "$RUNNER_TEMP" -cJf "dist/${{ matrix.asset }}.tar.xz" "$STAGE_NAME"
 
       - name: Create zip (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path dist
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Path dist
 
-          $stageDir = "pi-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
-          New-Item -ItemType Directory -Force -Path $stageDir
+          $stageName = "pi-${{ needs.plan.outputs.version }}-${{ matrix.target }}"
+          $stageDir = Join-Path $env:RUNNER_TEMP $stageName
+          New-Item -ItemType Directory -Path $stageDir
           Copy-Item "target/${{ matrix.target }}/release/pi.exe" "$stageDir/"
-          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "$stageDir/" }
-          if (Test-Path "README.md") { Copy-Item "README.md" "$stageDir/" }
+          Copy-Item "LICENSE" "$stageDir/"
+          Copy-Item "README.md" "$stageDir/"
 
           Compress-Archive -Path "$stageDir" -DestinationPath "dist/${{ matrix.asset }}.zip"
-          Remove-Item -Recurse -Force $stageDir
 
       - name: Build manifest
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TARGET: ${{ matrix.target }}
+          RELEASE_ASSET: ${{ matrix.asset }}
+          RELEASE_RUNNER_OS: ${{ runner.os }}
         run: |
-          set -euxo pipefail
-          PI_SHA="$(git rev-parse HEAD)"
-          ASUPERSYNC_SHA="$(git -C ../asupersync rev-parse HEAD)"
-          RICH_RUST_SHA="$(git -C ../rich_rust rev-parse HEAD)"
-          CHARMED_RUST_SHA="$(git -C ../charmed_rust rev-parse HEAD)"
-          SQLMODEL_RUST_SHA="$(git -C ../sqlmodel_rust rev-parse HEAD)"
-          RUSTC="$(rustc -Vv | tr '\n' ' ' | sed 's/\"/\\\\\"/g')"
+          set -euo pipefail
+          PI_AGENT_RUST_SHA="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$PI_AGENT_RUST_SHA" != "$RELEASE_COMMIT" ]; then
+            echo "::error::Manifest source commit differs from the frozen release commit"
+            exit 1
+          fi
+          CARGO_TOML_BLOB="$(git rev-parse 'HEAD:Cargo.toml')"
+          CARGO_LOCK_BLOB="$(git rev-parse 'HEAD:Cargo.lock')"
+          RUST_TOOLCHAIN_BLOB="$(git rev-parse 'HEAD:rust-toolchain.toml')"
+          MODELS_BLOB="$(git rev-parse 'HEAD:legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts')"
+          RELEASE_RUSTC="$(rustc -Vv)"
+          RELEASE_TOOLCHAIN="$(rustup show active-toolchain | awk '{print $1}')"
+          export PI_AGENT_RUST_SHA CARGO_TOML_BLOB CARGO_LOCK_BLOB RUST_TOOLCHAIN_BLOB
+          export MODELS_BLOB RELEASE_RUSTC RELEASE_TOOLCHAIN
+          if command -v python3 >/dev/null 2>&1; then
+            PYTHON=python3
+          else
+            PYTHON=python
+          fi
+          "$PYTHON" - <<'PY'
+          import json
+          import hashlib
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
 
-          cat > "dist/build-manifest-${{ matrix.asset }}.json" <<EOF
-          {
-            "tag": "${{ needs.plan.outputs.tag }}",
-            "version": "${{ needs.plan.outputs.version }}",
-            "target": "${{ matrix.target }}",
-            "asset": "${{ matrix.asset }}",
-            "runner_os": "${{ runner.os }}",
-            "pi_agent_rust": "$PI_SHA",
-            "deps": {
-              "asupersync": "$ASUPERSYNC_SHA",
-              "rich_rust": "$RICH_RUST_SHA",
-              "charmed_rust": "$CHARMED_RUST_SHA",
-              "sqlmodel_rust": "$SQLMODEL_RUST_SHA"
-            },
-            "rustc": "$RUSTC"
+          def digest(path):
+              data = path.read_bytes()
+              return {"name": path.name, "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}
+
+          lock = tomllib.loads(Path("Cargo.lock").read_text(encoding="utf-8"))
+          crates_io_source = "registry+https://github.com/rust-lang/crates.io-index"
+          selected = []
+          for package in lock["package"]:
+              name = package["name"]
+              if not (
+                  name in {"asupersync", "rich_rust"}
+                  or name.startswith("charmed-")
+                  or name.startswith("sqlmodel-")
+              ):
+                  continue
+              source = package.get("source")
+              checksum = package.get("checksum")
+              if source != crates_io_source:
+                  raise SystemExit(f"expected crates.io source for {name}, got {source!r}")
+              if not isinstance(checksum, str) or re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
+                  raise SystemExit(f"invalid crates.io checksum for {name}")
+              selected.append(
+                  {
+                      "name": name,
+                      "version": package["version"],
+                      "source": source,
+                      "checksum": checksum,
+                  }
+              )
+
+          selected.sort(key=lambda package: (package["name"], package["version"]))
+          selected_identities = [(package["name"], package["version"]) for package in selected]
+          if len(selected_identities) != len(set(selected_identities)):
+              raise SystemExit("selected locked package provenance contains duplicate identities")
+          selected_names = {package["name"] for package in selected}
+          required_names = {"asupersync", "rich_rust", "sqlmodel-core", "sqlmodel-sqlite"}
+          if not required_names.issubset(selected_names):
+              missing = sorted(required_names - selected_names)
+              raise SystemExit(f"missing required locked package provenance: {missing}")
+
+          toolchain = tomllib.loads(Path("rust-toolchain.toml").read_text(encoding="utf-8"))["toolchain"]
+          expected_channel = toolchain["channel"]
+          expected_active_toolchain = f"{expected_channel}-{os.environ['RELEASE_TARGET']}"
+          if os.environ["RELEASE_TOOLCHAIN"] != expected_active_toolchain:
+              raise SystemExit(
+                  "active Rust toolchain "
+                  f"{os.environ['RELEASE_TOOLCHAIN']!r} != {expected_active_toolchain!r}"
+              )
+          rustc_lines = os.environ["RELEASE_RUSTC"].splitlines()
+          if not rustc_lines or not rustc_lines[0].startswith("rustc "):
+              raise SystemExit("rustc -Vv did not start with an exact rustc version line")
+          rustc_fields = {}
+          for line in rustc_lines[1:]:
+              if ": " not in line:
+                  raise SystemExit(f"unexpected rustc -Vv metadata line: {line!r}")
+              key, value = line.split(": ", 1)
+              if key in rustc_fields or not value:
+                  raise SystemExit(f"duplicate or empty rustc -Vv field: {key!r}")
+              rustc_fields[key] = value
+          required_rustc_fields = {"binary", "commit-hash", "commit-date", "host", "release", "LLVM version"}
+          if set(rustc_fields) != required_rustc_fields:
+              raise SystemExit(f"unexpected rustc -Vv field set: {sorted(rustc_fields)}")
+          if rustc_fields["host"] != os.environ["RELEASE_TARGET"]:
+              raise SystemExit("native release runner host does not equal the declared artifact target")
+
+          is_windows = os.environ["RELEASE_RUNNER_OS"] == "Windows"
+          archive = Path("dist") / (
+              f"{os.environ['RELEASE_ASSET']}.zip"
+              if is_windows
+              else f"{os.environ['RELEASE_ASSET']}.tar.xz"
+          )
+          binary = Path("target") / os.environ["RELEASE_TARGET"] / "release" / (
+              "pi.exe" if is_windows else "pi"
+          )
+          manifest = {
+              "schema": "pi.release.build_manifest.v1",
+              "tag": os.environ["RELEASE_TAG"],
+              "version": os.environ["RELEASE_VERSION"],
+              "target": os.environ["RELEASE_TARGET"],
+              "asset": os.environ["RELEASE_ASSET"],
+              "runner_os": os.environ["RELEASE_RUNNER_OS"],
+              "pi_agent_rust": os.environ["PI_AGENT_RUST_SHA"],
+              "source_blobs": {
+                  "cargo_toml": os.environ["CARGO_TOML_BLOB"],
+                  "cargo_lock": os.environ["CARGO_LOCK_BLOB"],
+                  "rust_toolchain": os.environ["RUST_TOOLCHAIN_BLOB"],
+                  "models_generated_ts": os.environ["MODELS_BLOB"],
+              },
+              "selected_locked_registry_packages": selected,
+              "rustc": {
+                  "toolchain_channel": expected_channel,
+                  "version": rustc_lines[0],
+                  "binary": rustc_fields["binary"],
+                  "commit_hash": rustc_fields["commit-hash"],
+                  "commit_date": rustc_fields["commit-date"],
+                  "host": rustc_fields["host"],
+                  "release": rustc_fields["release"],
+                  "llvm_version": rustc_fields["LLVM version"],
+              },
+              "archive": digest(archive),
+              "binary": digest(binary),
           }
-          EOF
+          output = Path(f"dist/build-manifest-{os.environ['RELEASE_ASSET']}.json")
+          output.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Verify build artifact pair
+        env:
+          RELEASE_ASSET: ${{ matrix.asset }}
+          RELEASE_RUNNER_OS: ${{ runner.os }}
+        run: |
+          set -euo pipefail
+          if [ "$RELEASE_RUNNER_OS" = "Windows" ]; then
+            archive="dist/${RELEASE_ASSET}.zip"
+          else
+            archive="dist/${RELEASE_ASSET}.tar.xz"
+          fi
+          manifest="dist/build-manifest-${RELEASE_ASSET}.json"
+          for path in "$archive" "$manifest"; do
+            if [ ! -f "$path" ] || [ -L "$path" ] || [ ! -s "$path" ]; then
+              echo "::error::Missing, empty, or non-regular build artifact: $path"
+              exit 1
+            fi
+          done
+          mapfile -t actual_entries < <(find dist -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort)
+          if [ "${#actual_entries[@]}" -ne 2 ]; then
+            echo "::error::Build leg produced ${#actual_entries[@]} entries; expected exactly archive + manifest"
+            printf '%s\n' "${actual_entries[@]}"
+            exit 1
+          fi
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: dist-${{ matrix.target }}
           path: pi_agent_rust/dist/*
+          if-no-files-found: error
 
   release:
-    name: Create GitHub Release
-    needs: [plan, installer_regression, build]
-    if: always() && needs.plan.result == 'success' && needs.installer_regression.result == 'success' && needs.build.result == 'success' && !cancelled()
+    name: Prepare verified GitHub release draft
+    needs: [plan, gate, installer_regression, build]
+    if: always() && needs.plan.result == 'success' && needs.gate.result == 'success' && needs.installer_regression.result == 'success' && needs.build.result == 'success' && !cancelled()
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    # Repository settings must require approval for this protected environment.
+    environment:
+      name: release
+    permissions:
+      contents: write
     steps:
       - name: Checkout (for install script + changelog)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: pi_agent_rust
           fetch-depth: 0
-          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+          ref: ${{ needs.plan.outputs.commit }}
+
+      - name: Verify frozen release source
+        working-directory: pi_agent_rust
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/release/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/release/main"
+          for oid in "$RELEASE_COMMIT" "$RELEASE_TAG_OID" "$RELEASE_MAIN_COMMIT"; do
+            if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Frozen release source contains an invalid Git object ID: $oid"
+              exit 1
+            fi
+          done
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$head_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ]; then
+            echo "::error::Frozen tag object, peeled commit, checkout, or main-tip binding changed"
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen origin/main tip is no longer an ancestor of origin/main"
+            exit 1
+          fi
 
       - name: Download build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
+          pattern: dist-*
           merge-multiple: true
+
+      - name: Verify exact release inventory and provenance
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import stat
+          import struct
+          import subprocess
+          import tarfile
+          import tomllib
+          import zipfile
+          from pathlib import Path
+
+          root = Path("pi_agent_rust")
+          dist = Path("dist")
+          tag = os.environ["RELEASE_TAG"]
+          version = os.environ["RELEASE_VERSION"]
+          commit = os.environ["RELEASE_COMMIT"]
+
+          def fail(message):
+              raise SystemExit(message)
+
+          def strict_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      fail(f"duplicate JSON object key: {key!r}")
+                  result[key] = value
+              return result
+
+          def strict_json(path):
+              try:
+                  return json.loads(path.read_text(encoding="utf-8"), object_pairs_hook=strict_object)
+              except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                  fail(f"invalid JSON {path}: {exc}")
+
+          def git(*args):
+              completed = subprocess.run(
+                  ["git", "-C", str(root), *args],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if completed.returncode != 0:
+                  fail(f"git {' '.join(args)} failed: {completed.stderr.strip()}")
+              return completed.stdout.strip()
+
+          def sha256(data):
+              return hashlib.sha256(data).hexdigest()
+
+          def canonical_member(name):
+              if "\\" in name or name.startswith("/"):
+                  return False
+              parts = name.split("/")
+              return bool(parts) and all(part not in {"", ".", ".."} for part in parts)
+
+          def validate_binary(data, target):
+              if target.endswith("linux-gnu"):
+                  if len(data) < 20 or data[:5] != b"\x7fELF\x02" or data[5] != 1:
+                      fail(f"{target} binary is not a 64-bit little-endian ELF image")
+                  expected_machine = 0x3E if target.startswith("x86_64") else 0xB7
+                  if struct.unpack_from("<H", data, 18)[0] != expected_machine:
+                      fail(f"{target} ELF machine does not match the declared target")
+              elif target.endswith("apple-darwin"):
+                  if len(data) < 8 or data[:4] != b"\xcf\xfa\xed\xfe":
+                      fail(f"{target} binary is not a little-endian Mach-O 64 image")
+                  expected_cpu = 0x01000007 if target.startswith("x86_64") else 0x0100000C
+                  if struct.unpack_from("<I", data, 4)[0] != expected_cpu:
+                      fail(f"{target} Mach-O CPU type does not match the declared target")
+              elif target.endswith("windows-msvc"):
+                  if len(data) < 64 or data[:2] != b"MZ":
+                      fail("Windows binary has no DOS/PE header")
+                  pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                  if pe_offset + 6 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\0\0":
+                      fail("Windows binary has an invalid PE header offset")
+                  if struct.unpack_from("<H", data, pe_offset + 4)[0] != 0x8664:
+                      fail("Windows PE machine is not x86_64")
+              else:
+                  fail(f"unsupported release target: {target}")
+
+          def archive_binary(archive_path, target):
+              root_name = f"pi-{version}-{target}"
+              binary_name = "pi.exe" if target.endswith("windows-msvc") else "pi"
+              expected_files = {
+                  f"{root_name}/{binary_name}",
+                  f"{root_name}/LICENSE",
+                  f"{root_name}/README.md",
+              }
+              if archive_path.suffix == ".zip":
+                  try:
+                      with zipfile.ZipFile(archive_path) as archive:
+                          infos = archive.infolist()
+                          names = [info.filename.rstrip("/") for info in infos]
+                          if len(names) != len(set(names)):
+                              fail(f"archive contains duplicate paths: {archive_path}")
+                          files = set()
+                          directories = set()
+                          for info, name in zip(infos, names, strict=True):
+                              if not canonical_member(name) or info.flag_bits & 0x1:
+                                  fail(f"archive contains unsafe/encrypted path: {info.filename!r}")
+                              mode = info.external_attr >> 16
+                              if stat.S_ISLNK(mode):
+                                  fail(f"archive contains a symlink: {info.filename!r}")
+                              (directories if info.is_dir() else files).add(name)
+                          if files != expected_files or directories not in ({root_name}, set()):
+                              fail(f"archive layout mismatch: {archive_path}")
+                          if archive.read(f"{root_name}/LICENSE") != (root / "LICENSE").read_bytes() \
+                              or archive.read(f"{root_name}/README.md") != (root / "README.md").read_bytes():
+                              fail(f"archive documentation bytes differ from frozen source: {archive_path}")
+                          return archive.read(f"{root_name}/{binary_name}")
+                  except (OSError, zipfile.BadZipFile) as exc:
+                      fail(f"invalid zip archive {archive_path}: {exc}")
+              try:
+                  with tarfile.open(archive_path, mode="r:xz") as archive:
+                      members = archive.getmembers()
+                      names = [member.name.rstrip("/") for member in members]
+                      if len(names) != len(set(names)):
+                          fail(f"archive contains duplicate paths: {archive_path}")
+                      files = set()
+                      directories = set()
+                      binary = None
+                      license_bytes = None
+                      readme_bytes = None
+                      for member, name in zip(members, names, strict=True):
+                          if not canonical_member(name) or member.issym() or member.islnk():
+                              fail(f"archive contains unsafe link/path: {member.name!r}")
+                          if member.isdir():
+                              directories.add(name)
+                          elif member.isreg():
+                              files.add(name)
+                              if name == f"{root_name}/{binary_name}":
+                                  if member.mode & 0o111 == 0:
+                                      fail(f"Unix binary is not executable in archive: {archive_path}")
+                                  extracted = archive.extractfile(member)
+                                  if extracted is None:
+                                      fail(f"could not read binary from {archive_path}")
+                                  binary = extracted.read()
+                              elif name == f"{root_name}/LICENSE":
+                                  extracted = archive.extractfile(member)
+                                  license_bytes = None if extracted is None else extracted.read()
+                              elif name == f"{root_name}/README.md":
+                                  extracted = archive.extractfile(member)
+                                  readme_bytes = None if extracted is None else extracted.read()
+                          else:
+                              fail(f"archive contains a non-file/non-directory entry: {member.name!r}")
+                      if files != expected_files or directories not in ({root_name}, set()) or binary is None:
+                          fail(f"archive layout mismatch: {archive_path}")
+                      if license_bytes != (root / "LICENSE").read_bytes() \
+                          or readme_bytes != (root / "README.md").read_bytes():
+                          fail(f"archive documentation bytes differ from frozen source: {archive_path}")
+                      return binary
+              except (OSError, tarfile.TarError) as exc:
+                  fail(f"invalid tar archive {archive_path}: {exc}")
+
+          if re.fullmatch(r"[0-9a-f]{40}", commit) is None or git("rev-parse", "HEAD^{commit}") != commit:
+              fail("final release checkout differs from the frozen full commit ID")
+          source_blobs = {
+              "cargo_toml": git("rev-parse", "HEAD:Cargo.toml"),
+              "cargo_lock": git("rev-parse", "HEAD:Cargo.lock"),
+              "rust_toolchain": git("rev-parse", "HEAD:rust-toolchain.toml"),
+              "models_generated_ts": git(
+                  "rev-parse", "HEAD:legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts"
+              ),
+          }
+          expected_toolchain = tomllib.loads(
+              (root / "rust-toolchain.toml").read_text(encoding="utf-8")
+          )["toolchain"]["channel"]
+          specs = {
+              "pi-linux-amd64": ("x86_64-unknown-linux-gnu", "Linux", ".tar.xz"),
+              "pi-linux-arm64": ("aarch64-unknown-linux-gnu", "Linux", ".tar.xz"),
+              "pi-darwin-amd64": ("x86_64-apple-darwin", "macOS", ".tar.xz"),
+              "pi-darwin-arm64": ("aarch64-apple-darwin", "macOS", ".tar.xz"),
+              "pi-windows-amd64": ("x86_64-pc-windows-msvc", "Windows", ".zip"),
+          }
+          expected_names = {
+              *(asset + suffix for asset, (_, _, suffix) in specs.items()),
+              *(f"build-manifest-{asset}.json" for asset in specs),
+          }
+          if not dist.is_dir() or dist.is_symlink():
+              fail("downloaded artifact directory is missing or is a symlink")
+          entries = list(dist.iterdir())
+          actual_names = {entry.name for entry in entries}
+          if len(entries) != len(actual_names) or actual_names != expected_names:
+              fail(f"release inventory mismatch: expected={sorted(expected_names)}, actual={sorted(actual_names)}")
+          for entry in entries:
+              if entry.is_symlink() or not entry.is_file() or entry.stat().st_size == 0:
+                  fail(f"release inventory entry must be a non-empty regular file: {entry}")
+
+          lock = tomllib.loads((root / "Cargo.lock").read_text(encoding="utf-8"))
+          crates_io_source = "registry+https://github.com/rust-lang/crates.io-index"
+          selected = []
+          for package in lock["package"]:
+              name = package["name"]
+              if not (name in {"asupersync", "rich_rust"} or name.startswith("charmed-") or name.startswith("sqlmodel-")):
+                  continue
+              source = package.get("source")
+              checksum = package.get("checksum")
+              if source != crates_io_source or not isinstance(checksum, str) or re.fullmatch(r"[0-9a-f]{64}", checksum) is None:
+                  fail(f"invalid registry provenance for locked package {name}")
+              selected.append({"name": name, "version": package["version"], "source": source, "checksum": checksum})
+          selected.sort(key=lambda package: (package["name"], package["version"]))
+          identities = [(package["name"], package["version"]) for package in selected]
+          required = {"asupersync", "rich_rust", "sqlmodel-core", "sqlmodel-sqlite"}
+          if len(identities) != len(set(identities)) or not required.issubset({name for name, _ in identities}):
+              fail("selected locked package provenance is duplicate or incomplete")
+
+          manifest_keys = {
+              "schema", "tag", "version", "target", "asset", "runner_os",
+              "pi_agent_rust", "source_blobs", "selected_locked_registry_packages",
+              "rustc", "archive", "binary",
+          }
+          rustc_keys = {
+              "toolchain_channel", "version", "binary", "commit_hash", "commit_date",
+              "host", "release", "llvm_version",
+          }
+          common_rustc = None
+          for asset, (target, runner_os, suffix) in specs.items():
+              manifest_path = dist / f"build-manifest-{asset}.json"
+              manifest = strict_json(manifest_path)
+              if not isinstance(manifest, dict) or set(manifest) != manifest_keys:
+                  fail(f"build manifest has an unexpected schema: {manifest_path}")
+              expected_fields = {
+                  "schema": "pi.release.build_manifest.v1", "tag": tag, "version": version,
+                  "target": target, "asset": asset, "runner_os": runner_os,
+                  "pi_agent_rust": commit, "source_blobs": source_blobs,
+                  "selected_locked_registry_packages": selected,
+              }
+              for field, expected in expected_fields.items():
+                  if manifest.get(field) != expected:
+                      fail(f"{manifest_path} field {field} differs from frozen release source")
+              rustc = manifest.get("rustc")
+              if not isinstance(rustc, dict) or set(rustc) != rustc_keys:
+                  fail(f"{manifest_path} has an unexpected rustc schema")
+              if rustc["toolchain_channel"] != expected_toolchain or rustc["host"] != target:
+                  fail(f"{manifest_path} rustc toolchain/host does not match the frozen target")
+              for key, value in rustc.items():
+                  if not isinstance(value, str) or not value:
+                      fail(f"{manifest_path} rustc field {key} is empty or non-string")
+              identity = tuple(rustc[key] for key in sorted(rustc_keys - {"host"}))
+              if common_rustc is None:
+                  common_rustc = identity
+              elif identity != common_rustc:
+                  fail("release targets were not built with one exact Rust compiler identity")
+
+              archive_path = dist / f"{asset}{suffix}"
+              archive_bytes = archive_path.read_bytes()
+              expected_archive = {"name": archive_path.name, "sha256": sha256(archive_bytes), "size": len(archive_bytes)}
+              if manifest.get("archive") != expected_archive:
+                  fail(f"{manifest_path} archive digest/size binding failed")
+              binary_bytes = archive_binary(archive_path, target)
+              binary_name = "pi.exe" if runner_os == "Windows" else "pi"
+              expected_binary = {"name": binary_name, "sha256": sha256(binary_bytes), "size": len(binary_bytes)}
+              if manifest.get("binary") != expected_binary:
+                  fail(f"{manifest_path} extracted binary digest/size binding failed")
+              validate_binary(binary_bytes, target)
+          print("Verified exact five-platform inventory, strict manifests, archives, binaries, and compiler provenance")
+          PY
 
       - name: Prepare release directory
         run: |
           set -euxo pipefail
-          mkdir -p release
+          mkdir release
 
           # Copy archives and manifests
           for f in dist/*; do
@@ -341,7 +1062,12 @@ jobs:
           done
 
           # Include install script
+          if [ ! -f pi_agent_rust/install.sh ] || [ -L pi_agent_rust/install.sh ]; then
+            echo "::error::Frozen install.sh is missing, non-regular, or a symlink"
+            exit 1
+          fi
           cp pi_agent_rust/install.sh release/
+          cmp --silent pi_agent_rust/install.sh release/install.sh
 
           ls -lah release/
 
@@ -350,11 +1076,16 @@ jobs:
           set -euxo pipefail
           cd release
           # Stable ordering for reproducible checksums file.
-          ls -1 | LC_ALL=C sort | while read -r f; do
+          find . -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort | while read -r f; do
             [ "$f" = "SHA256SUMS" ] && continue
             sha256sum "$f"
           done > SHA256SUMS
           cat SHA256SUMS
+          if [ "$(wc -l < SHA256SUMS)" -ne 11 ]; then
+            echo "::error::SHA256SUMS must bind exactly the other 11 public assets"
+            exit 1
+          fi
+          sha256sum --check --strict SHA256SUMS
 
       - name: Build release notes
         run: |
@@ -377,6 +1108,45 @@ jobs:
             echo "## $TAG" > RELEASE_BODY.md
             echo "" >> RELEASE_BODY.md
           fi
+
+          # Every release must disclose the strict drop-in claim status. A
+          # missing verdict is allowed for an ordinary early-development
+          # release, but is represented honestly as NOT_CERTIFIED.
+          DROPIN_VERDICT_PATH="pi_agent_rust/docs/evidence/dropin-certification-verdict.json"
+          DROPIN_STATUS="$(python3 - "$DROPIN_VERDICT_PATH" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          path = Path(sys.argv[1])
+          if not path.is_file():
+              print("NOT_CERTIFIED")
+              raise SystemExit(0)
+
+          payload = json.loads(path.read_text(encoding="utf-8"))
+          if not isinstance(payload, dict):
+              raise SystemExit("drop-in certification verdict root must be an object")
+          if payload.get("schema") != "pi.dropin.certification_verdict.v1":
+              raise SystemExit("unsupported drop-in certification verdict schema")
+          verdict = payload.get("overall_verdict")
+          if verdict not in {"CERTIFIED", "NOT_CERTIFIED"}:
+              raise SystemExit(f"invalid drop-in certification verdict: {verdict!r}")
+          print(verdict)
+          PY
+          )"
+          if [ "$DROPIN_STATUS" = "CERTIFIED" ]; then
+            DROPIN_COPY="The committed release-source evidence satisfies the strict drop-in certification contract."
+          else
+            DROPIN_COPY="This release must not be described as a strict drop-in replacement."
+          fi
+          cat >> RELEASE_BODY.md <<EOF
+
+          ### Drop-in certification status
+
+          **${DROPIN_STATUS}** — ${DROPIN_COPY}
+
+          Evidence: [drop-in certification verdict](https://github.com/Dicklesworthstone/pi_agent_rust/blob/${TAG}/docs/evidence/dropin-certification-verdict.json)
+          EOF
 
           # Append install instructions
           cat >> RELEASE_BODY.md <<'INSTALL'
@@ -413,14 +1183,928 @@ jobs:
           # Replace version placeholder
           sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" RELEASE_BODY.md
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+      - name: Inspect or reconcile GitHub draft
+        id: draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          expected_names = {
+              "pi-linux-amd64.tar.xz", "pi-linux-arm64.tar.xz",
+              "pi-darwin-amd64.tar.xz", "pi-darwin-arm64.tar.xz",
+              "pi-windows-amd64.zip", "install.sh", "SHA256SUMS",
+              "build-manifest-pi-linux-amd64.json",
+              "build-manifest-pi-linux-arm64.json",
+              "build-manifest-pi-darwin-amd64.json",
+              "build-manifest-pi-darwin-arm64.json",
+              "build-manifest-pi-windows-amd64.json",
+          }
+          release_dir = Path("release")
+          entries = list(release_dir.iterdir()) if release_dir.is_dir() and not release_dir.is_symlink() else []
+          actual_names = {entry.name for entry in entries}
+          if len(entries) != len(actual_names) or actual_names != expected_names:
+              raise SystemExit(f"local public asset inventory mismatch: {sorted(actual_names)}")
+          local = {}
+          for entry in entries:
+              if entry.is_symlink() or not entry.is_file() or entry.stat().st_size == 0:
+                  raise SystemExit(f"invalid local public asset: {entry}")
+              data = entry.read_bytes()
+              local[entry.name] = (len(data), hashlib.sha256(data).hexdigest())
+
+          api = os.environ["GITHUB_API_URL"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          tag = os.environ["RELEASE_TAG"]
+          commit = os.environ["RELEASE_COMMIT"]
+
+          api_url = urllib.parse.urlparse(api)
+          api_origin = (api_url.scheme.lower(), (api_url.hostname or "").lower(), api_url.port or 443)
+          storage_hosts = {
+              "objects.githubusercontent.com",
+              "release-assets.githubusercontent.com",
+              "github-releases.githubusercontent.com",
+          }
+          if api_origin[0] != "https" or not api_origin[1]:
+              raise SystemExit("GITHUB_API_URL must use a valid HTTPS origin")
+
+          class SafeGitHubRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, headers, newurl):
+                  absolute = urllib.parse.urljoin(req.full_url, newurl)
+                  target = urllib.parse.urlparse(absolute)
+                  target_origin = (
+                      target.scheme.lower(), (target.hostname or "").lower(), target.port or 443
+                  )
+                  if target_origin[0] != "https" or (
+                      target_origin != api_origin
+                      and not (target_origin[1] in storage_hosts and target_origin[2] == 443)
+                  ):
+                      raise urllib.error.HTTPError(
+                          absolute, code, "refusing untrusted GitHub asset redirect", headers, fp
+                      )
+                  redirected = super().redirect_request(req, fp, code, msg, headers, absolute)
+                  if redirected is not None and target_origin != api_origin:
+                      redirected.remove_header("Authorization")
+                      for mapping in (redirected.headers, redirected.unredirected_hdrs):
+                          for key in list(mapping):
+                              if key.lower() == "authorization":
+                                  del mapping[key]
+                  return redirected
+
+          opener = urllib.request.build_opener(SafeGitHubRedirect())
+
+          def request(url, accept="application/vnd.github+json", timeout=30):
+              parsed = urllib.parse.urlparse(url)
+              request_origin = (
+                  parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or 443
+              )
+              if request_origin != api_origin:
+                  raise SystemExit(f"refusing non-API GitHub request URL: {url!r}")
+              req = urllib.request.Request(
+                  url,
+                  headers={
+                      "Accept": accept,
+                      "Authorization": f"Bearer {token}",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "User-Agent": "pi-agent-rust-release-verifier",
+                  },
+              )
+              return opener.open(req, timeout=timeout)
+
+          endpoint = f"{api}/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}"
+          try:
+              with request(endpoint) as response:
+                  release = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  print("No existing release; a new draft will be created")
+                  with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                      output.write("upload_needed=true\n")
+                  raise SystemExit(0)
+              raise
+
+          if release.get("tag_name") != tag or release.get("target_commitish") != commit:
+              raise SystemExit("existing release tag/target_commitish differs from the frozen release")
+          if release.get("draft") is not True:
+              raise SystemExit("a public release already exists; refusing to mutate or republish it")
+          with request(f"{release['assets_url']}?per_page=100") as response:
+              assets = json.load(response)
+          remote_names = [asset.get("name") for asset in assets]
+          if len(remote_names) != len(set(remote_names)):
+              raise SystemExit("existing draft contains duplicate asset names")
+          if not assets:
+              upload_needed = "true"
+          elif set(remote_names) != expected_names:
+              raise SystemExit(
+                  "existing draft is partial or has extra assets; refusing destructive reconciliation: "
+                  f"{sorted(remote_names)}"
+              )
+          else:
+              for asset in assets:
+                  name = asset["name"]
+                  with request(asset["url"], "application/octet-stream", timeout=60) as response:
+                      data = response.read()
+                  if (len(data), hashlib.sha256(data).hexdigest()) != local[name]:
+                      raise SystemExit(f"existing draft asset bytes differ: {name}")
+                  if asset.get("size") != len(data):
+                      raise SystemExit(f"existing draft asset API size differs: {name}")
+              upload_needed = "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"upload_needed={upload_needed}\n")
+          PY
+
+      - name: Revalidate frozen source before draft creation
+        working-directory: pi_agent_rust
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/pre-draft/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/pre-draft/main"
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$head_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen release source changed before draft creation"
+            exit 1
+          fi
+
+      - name: Create or complete GitHub draft
+        if: steps.draft.outputs.upload_needed == 'true'
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ needs.plan.outputs.tag }}
           name: ${{ needs.plan.outputs.tag }}
           prerelease: ${{ needs.plan.outputs.prerelease == 'true' }}
+          draft: true
+          target_commitish: ${{ needs.plan.outputs.commit }}
+          overwrite_files: false
+          fail_on_unmatched_files: true
           body_path: RELEASE_BODY.md
           files: |
-            release/*
+            release/pi-linux-amd64.tar.xz
+            release/pi-linux-arm64.tar.xz
+            release/pi-darwin-amd64.tar.xz
+            release/pi-darwin-arm64.tar.xz
+            release/pi-windows-amd64.zip
+            release/build-manifest-pi-linux-amd64.json
+            release/build-manifest-pi-linux-arm64.json
+            release/build-manifest-pi-darwin-amd64.json
+            release/build-manifest-pi-darwin-arm64.json
+            release/build-manifest-pi-windows-amd64.json
+            release/install.sh
+            release/SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify exact GitHub draft assets
+        id: verify_draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          local = {}
+          for path in Path("release").iterdir():
+              data = path.read_bytes()
+              local[path.name] = (len(data), hashlib.sha256(data).hexdigest())
+          headers = {
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "pi-agent-rust-release-verifier",
+          }
+          api_url = urllib.parse.urlparse(os.environ["GITHUB_API_URL"])
+          api_origin = (api_url.scheme.lower(), (api_url.hostname or "").lower(), api_url.port or 443)
+          storage_hosts = {
+              "objects.githubusercontent.com",
+              "release-assets.githubusercontent.com",
+              "github-releases.githubusercontent.com",
+          }
+          if api_origin[0] != "https" or not api_origin[1]:
+              raise SystemExit("GITHUB_API_URL must use a valid HTTPS origin")
+
+          class SafeGitHubRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, response_headers, newurl):
+                  absolute = urllib.parse.urljoin(req.full_url, newurl)
+                  target = urllib.parse.urlparse(absolute)
+                  target_origin = (
+                      target.scheme.lower(), (target.hostname or "").lower(), target.port or 443
+                  )
+                  if target_origin[0] != "https" or (
+                      target_origin != api_origin
+                      and not (target_origin[1] in storage_hosts and target_origin[2] == 443)
+                  ):
+                      raise urllib.error.HTTPError(
+                          absolute, code, "refusing untrusted GitHub asset redirect", response_headers, fp
+                      )
+                  redirected = super().redirect_request(
+                      req, fp, code, msg, response_headers, absolute
+                  )
+                  if redirected is not None and target_origin != api_origin:
+                      redirected.remove_header("Authorization")
+                      for mapping in (redirected.headers, redirected.unredirected_hdrs):
+                          for key in list(mapping):
+                              if key.lower() == "authorization":
+                                  del mapping[key]
+                  return redirected
+
+          opener = urllib.request.build_opener(SafeGitHubRedirect())
+
+          def api_request(url, accept, timeout=30):
+              parsed = urllib.parse.urlparse(url)
+              request_origin = (
+                  parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or 443
+              )
+              if request_origin != api_origin:
+                  raise SystemExit(f"refusing non-API GitHub request URL: {url!r}")
+              return opener.open(
+                  urllib.request.Request(url, headers={**headers, "Accept": accept}), timeout=timeout
+              )
+
+          endpoint = (
+              f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/"
+              f"{urllib.parse.quote(os.environ['RELEASE_TAG'], safe='')}"
+          )
+          with api_request(endpoint, "application/vnd.github+json") as response:
+              release = json.load(response)
+          if release.get("draft") is not True or release.get("target_commitish") != os.environ["RELEASE_COMMIT"]:
+              raise SystemExit("release is not a draft bound to the frozen commit")
+          with api_request(f"{release['assets_url']}?per_page=100", "application/vnd.github+json") as response:
+              assets = json.load(response)
+          names = [asset.get("name") for asset in assets]
+          if len(names) != len(set(names)) or set(names) != set(local) or len(names) != 12:
+              raise SystemExit(f"draft does not contain the exact 12 public assets: {sorted(names)}")
+          for asset in assets:
+              with api_request(asset["url"], "application/octet-stream", timeout=60) as response:
+                  data = response.read()
+              if (len(data), hashlib.sha256(data).hexdigest()) != local[asset["name"]] or asset.get("size") != len(data):
+                  raise SystemExit(f"draft asset bytes/size differ: {asset['name']}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"release_id={release['id']}\n")
+          print("Verified exact 12-asset draft inventory and bytes")
+          PY
+
+      - name: Revalidate frozen source before draft handoff
+        working-directory: pi_agent_rust
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          validation_tag_ref="refs/release-validation/pre-publication/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/pre-publication/main"
+          git fetch --no-tags --force origin \
+            "refs/tags/${RELEASE_TAG}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$(git rev-parse 'HEAD^{commit}')" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen release source changed before draft handoff"
+            exit 1
+          fi
+
+      - name: Upload verified draft publication inputs
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-publication-inputs-${{ needs.plan.outputs.tag }}
+          path: |
+            release
+            RELEASE_BODY.md
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Confirm verified release remains a draft
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_ID: ${{ steps.verify_draft.outputs.release_id }}
+          RELEASE_PRERELEASE: ${{ needs.plan.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+          from pathlib import Path
+
+          local = {path.name: (path.stat().st_size, hashlib.sha256(path.read_bytes()).hexdigest()) for path in Path("release").iterdir()}
+          headers = {
+              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "pi-agent-rust-release-verifier",
+          }
+          api_url = urllib.parse.urlparse(os.environ["GITHUB_API_URL"])
+          api_origin = (api_url.scheme.lower(), (api_url.hostname or "").lower(), api_url.port or 443)
+          storage_hosts = {
+              "objects.githubusercontent.com",
+              "release-assets.githubusercontent.com",
+              "github-releases.githubusercontent.com",
+          }
+          if api_origin[0] != "https" or not api_origin[1]:
+              raise SystemExit("GITHUB_API_URL must use a valid HTTPS origin")
+
+          class SafeGitHubRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, req, fp, code, msg, response_headers, newurl):
+                  absolute = urllib.parse.urljoin(req.full_url, newurl)
+                  target = urllib.parse.urlparse(absolute)
+                  target_origin = (
+                      target.scheme.lower(), (target.hostname or "").lower(), target.port or 443
+                  )
+                  if target_origin[0] != "https" or (
+                      target_origin != api_origin
+                      and not (target_origin[1] in storage_hosts and target_origin[2] == 443)
+                  ):
+                      raise urllib.error.HTTPError(
+                          absolute, code, "refusing untrusted GitHub asset redirect", response_headers, fp
+                      )
+                  redirected = super().redirect_request(
+                      req, fp, code, msg, response_headers, absolute
+                  )
+                  if redirected is not None and target_origin != api_origin:
+                      redirected.remove_header("Authorization")
+                      for mapping in (redirected.headers, redirected.unredirected_hdrs):
+                          for key in list(mapping):
+                              if key.lower() == "authorization":
+                                  del mapping[key]
+                  return redirected
+
+          opener = urllib.request.build_opener(SafeGitHubRedirect())
+
+          def api_request(url, accept, timeout=30):
+              parsed = urllib.parse.urlparse(url)
+              request_origin = (
+                  parsed.scheme.lower(), (parsed.hostname or "").lower(), parsed.port or 443
+              )
+              if request_origin != api_origin:
+                  raise SystemExit(f"refusing non-API GitHub request URL: {url!r}")
+              return opener.open(
+                  urllib.request.Request(url, headers={**headers, "Accept": accept}), timeout=timeout
+              )
+
+          endpoint = (
+              f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/releases/tags/"
+              f"{urllib.parse.quote(os.environ['RELEASE_TAG'], safe='')}"
+          )
+          with api_request(endpoint, "application/vnd.github+json") as response:
+              release = json.load(response)
+          if release.get("draft") is not True \
+              or release.get("id") != int(os.environ["RELEASE_ID"]) \
+              or release.get("tag_name") != os.environ["RELEASE_TAG"] \
+              or release.get("target_commitish") != os.environ["RELEASE_COMMIT"] \
+              or release.get("prerelease") != (os.environ["RELEASE_PRERELEASE"] == "true"):
+              raise SystemExit("verified release did not remain a draft bound to the frozen commit")
+          with api_request(f"{release['assets_url']}?per_page=100", "application/vnd.github+json") as response:
+              assets = json.load(response)
+          names = [asset.get("name") for asset in assets]
+          if len(names) != 12 or len(names) != len(set(names)) or set(names) != set(local):
+              raise SystemExit(f"draft release does not contain the exact 12 assets: {sorted(names)}")
+          for asset in assets:
+              with api_request(asset["url"], "application/octet-stream", timeout=60) as response:
+                  data = response.read()
+              if (len(data), hashlib.sha256(data).hexdigest()) != local[asset["name"]] or asset.get("size") != len(data):
+                  raise SystemExit(f"draft asset bytes/size differ: {asset['name']}")
+          print("Confirmed exact 12-asset release remains an unpublished draft")
+          PY
+
+      - name: Revalidate frozen source after draft handoff
+        working-directory: pi_agent_rust
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          validation_tag_ref="refs/release-validation/post-draft-handoff/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/post-draft-handoff/main"
+          git fetch --no-tags --force origin \
+            "refs/tags/${RELEASE_TAG}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          if [ "$(git rev-parse "${validation_tag_ref}")" != "$RELEASE_TAG_OID" ] \
+            || [ "$(git rev-parse "${validation_tag_ref}^{commit}")" != "$RELEASE_COMMIT" ] \
+            || [ "$(git rev-parse 'HEAD^{commit}')" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$(git rev-parse "${validation_main_ref}^{commit}")"; then
+            echo "::error::Frozen release source changed across draft handoff"
+            exit 1
+          fi
+
+  verify_crate:
+    name: Verify exact crate publication payload
+    needs: [plan, release]
+    if: needs.plan.result == 'success' && needs.release.result == 'success' && needs.plan.outputs.prerelease == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: pi_agent_rust
+        shell: bash
+    steps:
+      - name: Checkout frozen release commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.plan.outputs.commit }}
+
+      - name: Verify frozen release source
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          validation_tag_ref="refs/release-validation/crate/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/crate/main"
+          git fetch --no-tags --force origin \
+            "refs/tags/${RELEASE_TAG}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$(git rev-parse 'HEAD^{commit}')" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen release source changed before crate validation"
+            exit 1
+          fi
+
+      - name: Install system dependencies
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+      - name: Install frozen Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master commit verified 2026-08-04
+        with:
+          toolchain: nightly-2026-07-05
+
+      - name: Resolve exact root package
+        id: package
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -euo pipefail
+          metadata="$(cargo metadata --no-deps --locked --format-version 1)"
+          package_fields="$(python3 -c '
+          import json, pathlib, sys
+          metadata = json.load(sys.stdin)
+          manifest = pathlib.Path("Cargo.toml").resolve()
+          matches = [package for package in metadata["packages"] if pathlib.Path(package["manifest_path"]) == manifest]
+          if len(matches) != 1:
+              raise SystemExit(f"expected one root package, found {len(matches)}")
+          package = matches[0]
+          print(package["name"], package["version"])
+          ' <<< "$metadata")"
+          read -r package_name package_version <<< "$package_fields"
+          if [ "$package_name" != "pi_agent_rust" ] || [ "$package_version" != "$RELEASE_VERSION" ]; then
+            echo "::error::Root package identity differs from release tag: ${package_name} ${package_version}"
+            exit 1
+          fi
+          {
+            echo "name=$package_name"
+            echo "version=$package_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and verify dry-run crate package
+        id: crate
+        env:
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain=v2 --untracked-files=all)" ] \
+            || ! git diff --quiet HEAD -- \
+            || ! git diff --cached --quiet HEAD --; then
+            echo "::error::Canonical release checkout is dirty before cargo publish dry-run"
+            exit 1
+          fi
+          noncanonical_flags="$(git ls-files -v | grep -v '^H ' || true)"
+          if [ -n "$noncanonical_flags" ]; then
+            echo "::error::Release index contains hidden or noncanonical flags"
+            printf '%s\n' "$noncanonical_flags"
+            exit 1
+          fi
+          cargo publish --dry-run --locked
+          crate_path="target/package/${PACKAGE_NAME}-${PACKAGE_VERSION}.crate"
+          if [ ! -f "$crate_path" ] || [ -L "$crate_path" ] || [ ! -s "$crate_path" ]; then
+            echo "::error::cargo publish dry-run did not produce the expected regular .crate"
+            exit 1
+          fi
+          CRATE_PATH="$crate_path" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import re
+          import subprocess
+          import tarfile
+          import tomllib
+          from pathlib import Path, PurePosixPath
+
+          crate_path = Path(os.environ["CRATE_PATH"])
+          package_name = os.environ["PACKAGE_NAME"]
+          version = os.environ["PACKAGE_VERSION"]
+          commit = os.environ["RELEASE_COMMIT"]
+          prefix = f"{package_name}-{version}"
+
+          def strict_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise SystemExit(f"duplicate JSON key in crate metadata: {key!r}")
+                  result[key] = value
+              return result
+
+          def head_blob(path):
+              tree = subprocess.run(
+                  ["git", "ls-tree", "HEAD", "--", path], capture_output=True, text=True, check=True
+              ).stdout.strip().split()
+              if len(tree) < 4 or tree[0] not in {"100644", "100755"} or tree[1] != "blob":
+                  raise SystemExit(f"packaged path is not a regular tracked HEAD blob: {path}")
+              return subprocess.run(["git", "show", f"HEAD:{path}"], capture_output=True, check=True).stdout
+
+          data = crate_path.read_bytes()
+          with tarfile.open(fileobj=__import__("io").BytesIO(data), mode="r:gz") as archive:
+              members = archive.getmembers()
+              names = [member.name.rstrip("/") for member in members]
+              if len(names) != len(set(names)):
+                  raise SystemExit("dry-run crate archive contains duplicate paths")
+              saw_vcs = saw_original_manifest = saw_normalized_manifest = False
+              for member, name in zip(members, names, strict=True):
+                  raw_parts = name.split("/")
+                  path = PurePosixPath(name)
+                  if "\\" in name or name.startswith("/") or not raw_parts or raw_parts[0] != prefix \
+                      or any(part in {"", ".", ".."} for part in raw_parts):
+                      raise SystemExit(f"unsafe dry-run crate path: {name!r}")
+                  if member.isdir():
+                      continue
+                  if not member.isreg() or member.issym() or member.islnk():
+                      raise SystemExit(f"non-regular dry-run crate entry: {name!r}")
+                  extracted = archive.extractfile(member)
+                  if extracted is None:
+                      raise SystemExit(f"unreadable dry-run crate entry: {name!r}")
+                  member_bytes = extracted.read()
+                  relative = PurePosixPath(*path.parts[1:]).as_posix()
+                  if relative == ".cargo_vcs_info.json":
+                      vcs = json.loads(member_bytes, object_pairs_hook=strict_object)
+                      if not isinstance(vcs, dict) or not set(vcs).issubset({"git", "path_in_vcs"}) or "git" not in vcs:
+                          raise SystemExit("unexpected .cargo_vcs_info.json schema")
+                      if set(vcs["git"]) not in ({"sha1"}, {"sha1", "dirty"}) \
+                          or vcs["git"].get("sha1") != commit or vcs["git"].get("dirty", False) is not False:
+                          raise SystemExit("crate VCS metadata is not bound cleanly to the frozen commit")
+                      if "path_in_vcs" in vcs and vcs["path_in_vcs"] != "":
+                          raise SystemExit("root package has unexpected path_in_vcs metadata")
+                      saw_vcs = True
+                  elif relative == "Cargo.toml.orig":
+                      if member_bytes != head_blob("Cargo.toml"):
+                          raise SystemExit("Cargo.toml.orig bytes differ from frozen HEAD")
+                      saw_original_manifest = True
+                  elif relative == "Cargo.toml":
+                      normalized = tomllib.loads(member_bytes.decode("utf-8"))
+                      if normalized.get("package", {}).get("name") != package_name \
+                          or normalized.get("package", {}).get("version") != version:
+                          raise SystemExit("normalized package manifest identity differs")
+                      saw_normalized_manifest = True
+                  elif member_bytes != head_blob(relative):
+                      raise SystemExit(f"packaged bytes differ from frozen HEAD: {relative}")
+              if not (saw_vcs and saw_original_manifest and saw_normalized_manifest):
+                  raise SystemExit("dry-run crate is missing required Cargo/VCS metadata")
+          digest = hashlib.sha256(data).hexdigest()
+          if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+              raise SystemExit("invalid dry-run crate SHA256")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"path={crate_path.as_posix()}\nsha256={digest}\nsize={len(data)}\n")
+          print(f"Verified canonical dry-run crate: sha256={digest} size={len(data)}")
+          PY
+
+      - name: Check crates.io reconciliation state
+        id: registry
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+          CRATE_SHA256: ${{ steps.crate.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          endpoint = (
+              "https://crates.io/api/v1/crates/"
+              f"{urllib.parse.quote(os.environ['PACKAGE_NAME'], safe='')}/"
+              f"{urllib.parse.quote(os.environ['PACKAGE_VERSION'], safe='')}"
+          )
+          request = urllib.request.Request(endpoint, headers={"User-Agent": "pi-agent-rust-release-verifier"})
+          try:
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  payload = json.load(response)
+          except urllib.error.HTTPError as exc:
+              if exc.code == 404:
+                  needed = "true"
+              else:
+                  raise
+          else:
+              checksum = payload.get("version", {}).get("checksum")
+              if checksum != os.environ["CRATE_SHA256"]:
+                  raise SystemExit(f"existing crates.io version checksum differs: {checksum!r}")
+              needed = "false"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"publish_needed={needed}\n")
+          PY
+
+      - name: Final source and package proof before payload capture
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+          CRATE_PATH: ${{ steps.crate.outputs.path }}
+          CRATE_SHA256: ${{ steps.crate.outputs.sha256 }}
+          CRATE_SIZE: ${{ steps.crate.outputs.size }}
+        run: |
+          set -euo pipefail
+          validation_tag_ref="refs/release-validation/pre-crates/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/pre-crates/main"
+          git fetch --no-tags --force origin \
+            "refs/tags/${RELEASE_TAG}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          if [ "$(git rev-parse "${validation_tag_ref}")" != "$RELEASE_TAG_OID" ] \
+            || [ "$(git rev-parse "${validation_tag_ref}^{commit}")" != "$RELEASE_COMMIT" ] \
+            || [ "$(git rev-parse 'HEAD^{commit}')" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$(git rev-parse "${validation_main_ref}^{commit}")"; then
+            echo "::error::Frozen release source changed immediately before payload capture"
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain=v2 --untracked-files=all)" ] \
+            || ! git diff --quiet HEAD -- \
+            || ! git diff --cached --quiet HEAD -- \
+            || [ -n "$(git ls-files -v | grep -v '^H ' || true)" ]; then
+            echo "::error::Release checkout/index is not canonical immediately before payload capture"
+            exit 1
+          fi
+          actual_sha256="$(sha256sum "$CRATE_PATH" | awk '{print $1}')"
+          actual_size="$(stat -c '%s' "$CRATE_PATH")"
+          if [ "$actual_sha256" != "$CRATE_SHA256" ] || [ "$actual_size" != "$CRATE_SIZE" ]; then
+            echo "::error::Dry-run .crate changed after raw-byte verification"
+            exit 1
+          fi
+
+      - name: Capture Cargo's exact verified registry payload
+        id: capture
+        env:
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+          CRATE_SHA256: ${{ steps.crate.outputs.sha256 }}
+        run: |
+          set -euo pipefail
+          server_path="${RUNNER_TEMP}/pi-cargo-publish-capture-server.py"
+          body_path="${RUNNER_TEMP}/pi-crates-publish-body.bin"
+          receipt_path="${RUNNER_TEMP}/pi-crates-publish-receipt.json"
+          port_path="${RUNNER_TEMP}/pi-cargo-publish-capture-port"
+          cat > "$server_path" <<'PY'
+          import json
+          import os
+          import threading
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          from pathlib import Path
+
+          body_path = Path(os.environ["PI_CAPTURE_BODY"])
+          port_path = Path(os.environ["PI_CAPTURE_PORT"])
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, format, *args):
+                  return
+
+              def do_GET(self):
+                  if self.path == "/index/config.json":
+                      payload = json.dumps(
+                          {
+                              "dl": f"http://127.0.0.1:{self.server.server_port}/crates",
+                              "api": f"http://127.0.0.1:{self.server.server_port}",
+                          },
+                          separators=(",", ":"),
+                      ).encode("utf-8")
+                      self.send_response(200)
+                      self.send_header("Content-Type", "application/json")
+                      self.send_header("Content-Length", str(len(payload)))
+                      self.end_headers()
+                      self.wfile.write(payload)
+                  else:
+                      self.send_response(404)
+                      self.end_headers()
+
+              def do_PUT(self):
+                  if self.path != "/api/v1/crates/new":
+                      self.send_response(404)
+                      self.end_headers()
+                      return
+                  try:
+                      length = int(self.headers.get("Content-Length", ""))
+                  except ValueError:
+                      length = -1
+                  if length <= 8 or length > 512 * 1024 * 1024:
+                      self.send_response(400)
+                      self.end_headers()
+                      return
+                  body = self.rfile.read(length)
+                  if len(body) != length:
+                      self.send_response(400)
+                      self.end_headers()
+                      return
+                  body_path.write_bytes(body)
+                  payload = b'{"warnings":{"invalid_categories":[],"invalid_badges":[],"other":[]}}'
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(payload)))
+                  self.end_headers()
+                  self.wfile.write(payload)
+                  threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+          server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+          port_path.write_text(f"{server.server_port}\n", encoding="utf-8")
+          server.serve_forever()
+          server.server_close()
+          PY
+          chmod 700 "$server_path"
+          PI_CAPTURE_BODY="$body_path" PI_CAPTURE_PORT="$port_path" \
+            python3 "$server_path" &
+          server_pid=$!
+          for _ in $(seq 1 100); do
+            [ -s "$port_path" ] && break
+            sleep 0.1
+          done
+          if [ ! -s "$port_path" ]; then
+            echo "::error::Local Cargo publish capture server did not start"
+            exit 1
+          fi
+          capture_port="$(cat "$port_path")"
+          if [[ ! "$capture_port" =~ ^[0-9]+$ ]]; then
+            echo "::error::Local Cargo publish capture server emitted an invalid port"
+            exit 1
+          fi
+          capture_index="sparse+http://127.0.0.1:${capture_port}/index/"
+          cargo -Zpublish-timeout publish \
+            --locked \
+            --registry pi-local-capture \
+            --token pi-local-non-secret-capture-token \
+            --config "registries.pi-local-capture.index='${capture_index}'" \
+            --config 'publish.timeout=0'
+          wait "$server_pid"
+
+          PI_CAPTURE_BODY="$body_path" PI_CAPTURE_RECEIPT="$receipt_path" \
+            CRATE_PATH="${{ steps.crate.outputs.path }}" python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import struct
+          from pathlib import Path
+
+          def strict_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise SystemExit(f"duplicate Cargo publish metadata key: {key!r}")
+                  result[key] = value
+              return result
+
+          body_path = Path(os.environ["PI_CAPTURE_BODY"])
+          crate_path = Path(os.environ["CRATE_PATH"])
+          if not body_path.is_file() or body_path.is_symlink() or not crate_path.is_file():
+              raise SystemExit("Cargo capture body or verified dry-run crate is missing/non-regular")
+          body = body_path.read_bytes()
+          if len(body) < 8:
+              raise SystemExit("Cargo registry publish body is truncated")
+          metadata_len = struct.unpack_from("<I", body, 0)[0]
+          metadata_start = 4
+          metadata_end = metadata_start + metadata_len
+          if metadata_end + 4 > len(body):
+              raise SystemExit("Cargo registry metadata length exceeds captured body")
+          crate_len = struct.unpack_from("<I", body, metadata_end)[0]
+          crate_start = metadata_end + 4
+          if crate_start + crate_len != len(body):
+              raise SystemExit("Cargo registry crate length does not exactly consume captured body")
+          metadata_bytes = body[metadata_start:metadata_end]
+          crate_bytes = body[crate_start:]
+          metadata = json.loads(metadata_bytes, object_pairs_hook=strict_object)
+          required_metadata = {
+              "name", "vers", "deps", "features", "authors", "description",
+              "documentation", "homepage", "readme", "readme_file", "keywords",
+              "categories", "license", "license_file", "repository", "badges",
+              "links", "rust_version",
+          }
+          if not isinstance(metadata, dict) or not required_metadata.issubset(metadata):
+              raise SystemExit("Cargo registry publish metadata is incomplete or malformed")
+          if metadata.get("name") != os.environ["PACKAGE_NAME"] \
+              or metadata.get("vers") != os.environ["PACKAGE_VERSION"]:
+              raise SystemExit("Cargo registry publish metadata package identity differs")
+          dry_run_bytes = crate_path.read_bytes()
+          crate_sha256 = hashlib.sha256(crate_bytes).hexdigest()
+          if crate_bytes != dry_run_bytes or crate_sha256 != os.environ["CRATE_SHA256"]:
+              raise SystemExit("Cargo captured upload crate differs from the fully verified dry-run crate")
+          receipt = {
+              "schema": "pi.release.crates_publish_payload.v1",
+              "name": os.environ["PACKAGE_NAME"],
+              "version": os.environ["PACKAGE_VERSION"],
+              "body_sha256": hashlib.sha256(body).hexdigest(),
+              "body_size": len(body),
+              "metadata_sha256": hashlib.sha256(metadata_bytes).hexdigest(),
+              "metadata_size": len(metadata_bytes),
+              "crate_sha256": crate_sha256,
+              "crate_size": len(crate_bytes),
+          }
+          Path(os.environ["PI_CAPTURE_RECEIPT"]).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          print("Captured Cargo's canonical publish body with the exact fully verified .crate bytes")
+          PY
+          {
+            echo "body=$body_path"
+            echo "receipt=$receipt_path"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Upload exact crates.io publication payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crates-publication-payload-${{ needs.plan.outputs.tag }}
+          path: |
+            ${{ steps.capture.outputs.body }}
+            ${{ steps.capture.outputs.receipt }}
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Revalidate frozen source after payload capture
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          validation_tag_ref="refs/release-validation/post-crate-capture/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/post-crate-capture/main"
+          git fetch --no-tags --force origin \
+            "refs/tags/${RELEASE_TAG}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          if [ "$(git rev-parse "${validation_tag_ref}")" != "$RELEASE_TAG_OID" ] \
+            || [ "$(git rev-parse "${validation_tag_ref}^{commit}")" != "$RELEASE_COMMIT" ] \
+            || [ "$(git rev-parse 'HEAD^{commit}')" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$(git rev-parse "${validation_main_ref}^{commit}")"; then
+            echo "::error::Frozen release source changed across crate payload capture"
+            exit 1
+          fi

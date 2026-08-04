@@ -14,6 +14,81 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
+## [v0.2.0] — 2026-08-04 — Release
+
+### Breaking Changes
+
+- **The Rust SDK now boxes in-process prompt results** —
+  `SessionPromptResult::InProcess` carries `Box<AssistantMessage>`. SDK callers
+  that construct or pattern-match this variant must account for the box.
+- **Assistant stop metadata is richer** — `AssistantMessage` adds optional
+  structured `stop_details`, `pi::sdk` now exports `StopDetails`, and
+  `StopReason` adds `PauseTurn` and `Refusal`. Downstream `AssistantMessage`
+  struct literals must initialize the new field (normally with `None`), and
+  exhaustive `StopReason` matches must handle the new variants.
+- **The minimum supported Rust version is now 1.95** — published crate metadata
+  declares Rust 1.95, while repository release builds remain reproducibly
+  pinned to `nightly-2026-07-05`.
+
+### Features
+
+- **Native, opt-in subagent orchestration** — the ninth built-in tool can run
+  one named child agent, bounded parallel tasks, or a sequential chain. Child
+  processes inherit the parent environment (including auth/router variables),
+  apply each agent definition's model, reasoning, skill, and configured-or-default
+  tool list, stream structured progress, and are cancelled and reaped with their
+  parent. Addresses [#132](https://github.com/Dicklesworthstone/pi_agent_rust/issues/132),
+  [#144](https://github.com/Dicklesworthstone/pi_agent_rust/issues/144), and
+  [#145](https://github.com/Dicklesworthstone/pi_agent_rust/issues/145).
+- **Provider and model parity improvements** — Anthropic `pause_turn` responses
+  resume with a bounded continuation budget, refusal details remain structured,
+  extension-registered providers can stream through the provider factory, and
+  the built-in catalog includes GPT-5.6 Sol, Terra, and Luna seeds.
+- **Injectable model credential resolution** — harnesses and SDK embedders can
+  load the model registry without ambient process credentials affecting model
+  availability, while production continues to use `AuthStorage`.
+
+### Reliability and Release Integrity
+
+- **Truncated tool calls fail explicitly** — a provider token limit reached
+  while a tool call is incomplete now ends the turn as an error instead of
+  silently treating an unusable partial call as a normal length stop. Fixes
+  [#148](https://github.com/Dicklesworthstone/pi_agent_rust/issues/148).
+- **File-lock ownership is identity-aware** — long-held locks refresh a
+  heartbeat, stale reclaim checks ownership, and displaced owners cannot remove
+  a replacement lock directory.
+- **Concurrency-sensitive tests are deterministic** — RPC crash-recovery
+  checkpoints, process-wide current-directory mutation, remote-worker fixtures,
+  and extension memory/scanner cases now isolate their shared state.
+- **Extension filesystem fallback is more robust** — a denied host `readdir`
+  no longer aborts the filesystem shim before later fallback paths are checked.
+- **Context-evidence suppression is deterministic** — duplicate stale/unsafe
+  suppression records are collapsed per source and reason while the complete
+  excluded-item audit trail is retained.
+- **Release evidence fails closed** — must-pass extension evidence is bound to
+  the exact authoritative inclusion-list identities, corresponding validated
+  manifest metadata, source-tree/inclusion-list/manifest digests, run lineage,
+  non-skipped per-extension events, and exact declared runtime registrations.
+  Stale, smaller, or identity-expanded historical evidence cannot certify a
+  release. Release builds and publication are now blocked on the same gate,
+  and the producer and validator share the canonical G01–G12 contract.
+  Per-target build manifests now identify selected sibling-project crates by
+  their locked registry version, source, and checksum instead of attributing
+  binaries to unrelated sibling repository HEADs.
+- **Cargo-audit vulnerability findings are remediated** — the lockfile
+  advances `anyhow`, `crossbeam-epoch`, `event-listener`, `memmap2`,
+  `plist`/`quick-xml`, and the optional Wasmtime component host to their
+  patched release lines. Warning-only upstream maintenance inventory remains
+  tracked separately. Wasmtime 47 compatibility also uses a movable owned
+  runtime guard and gains real component load, call, trap, and malformed-input
+  coverage.
+
+### Internal
+
+- Extracted the extension compatibility scanner into its own module while
+  preserving the public compatibility contract and expanded the conformance,
+  governance, provider, SDK, RPC, and swarm evidence suites.
+
 ## [v0.1.23] — 2026-07-28 — Release
 
 ### Features
@@ -1050,12 +1125,19 @@ Key early commits:
 
 ---
 
-[Unreleased]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.20...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.2.0...HEAD
+[v0.2.0]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.23...v0.2.0
+[v0.1.23]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.22...v0.1.23
+[v0.1.22]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.21...v0.1.22
 [v0.1.20]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.19...v0.1.20
 [v0.1.19]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.18...v0.1.19
 [v0.1.18]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.17...v0.1.18
 [v0.1.17]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.16...v0.1.17
 [v0.1.16]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.15...v0.1.16
+[v0.1.15]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.14...v0.1.15
+[v0.1.14]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.13...v0.1.14
+[v0.1.12]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.11...v0.1.12
+[v0.1.11]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.10...v0.1.11
 [v0.1.9]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.8...v0.1.9
 [v0.1.8]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.7...v0.1.8
 [v0.1.7]: https://github.com/Dicklesworthstone/pi_agent_rust/compare/v0.1.6...v0.1.7

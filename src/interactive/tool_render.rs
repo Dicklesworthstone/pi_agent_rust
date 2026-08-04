@@ -210,7 +210,7 @@ fn render_word_diff_pair(removed: &str, added: &str, styles: &TuiStyles, out: &m
 }
 
 /// Split a diff line like `"-  3 content here"` into prefix `"-  3 "` and content `"content here"`.
-pub(super) fn split_diff_prefix(line: &str) -> (&str, &str) {
+pub(super) const fn split_diff_prefix(line: &str) -> (&str, &str) {
     // Format: [+-] then line number with spaces, then a space, then content.
     // E.g., "+  3 let x = 1;" => prefix "+  3 ", content "let x = 1;"
     // Or "- 12 old text"    => prefix "- 12 ", content "old text"

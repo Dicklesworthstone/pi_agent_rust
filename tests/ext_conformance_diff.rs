@@ -133,8 +133,7 @@ fn env_or_default_owned(key: &str, default: String) -> String {
 fn default_deterministic_base() -> PathBuf {
     std::env::var_os("TMPDIR")
         .filter(|val| !val.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir)
+        .map_or_else(std::env::temp_dir, PathBuf::from)
 }
 
 fn default_deterministic_cwd() -> String {
@@ -1172,31 +1171,29 @@ fn compare_parameters(
             // Compare property names
             if let (Some(ts_props), Some(rust_props)) =
                 (ts_p.get("properties"), rust_p.get("properties"))
-            {
-                if let (Some(ts_obj), Some(rust_obj)) =
+                && let (Some(ts_obj), Some(rust_obj)) =
                     (ts_props.as_object(), rust_props.as_object())
-                {
-                    for (prop_name, ts_prop_val) in ts_obj {
-                        if let Some(rust_prop_val) = rust_obj.get(prop_name) {
-                            if ts_prop_val.get("type") != rust_prop_val.get("type") {
-                                diffs.push(format!(
-                                    "tools '{tool_name}'.parameters.properties.{prop_name}.type: TS={} Rust={}",
-                                    ts_prop_val.get("type").unwrap_or(&Value::Null),
-                                    rust_prop_val.get("type").unwrap_or(&Value::Null),
-                                ));
-                            }
-                        } else {
+            {
+                for (prop_name, ts_prop_val) in ts_obj {
+                    if let Some(rust_prop_val) = rust_obj.get(prop_name) {
+                        if ts_prop_val.get("type") != rust_prop_val.get("type") {
                             diffs.push(format!(
-                                "tools '{tool_name}'.parameters.properties.{prop_name}: in TS, missing in Rust"
+                                "tools '{tool_name}'.parameters.properties.{prop_name}.type: TS={} Rust={}",
+                                ts_prop_val.get("type").unwrap_or(&Value::Null),
+                                rust_prop_val.get("type").unwrap_or(&Value::Null),
                             ));
                         }
+                    } else {
+                        diffs.push(format!(
+                            "tools '{tool_name}'.parameters.properties.{prop_name}: in TS, missing in Rust"
+                        ));
                     }
-                    for prop_name in rust_obj.keys() {
-                        if !ts_obj.contains_key(prop_name) {
-                            diffs.push(format!(
-                                "tools '{tool_name}'.parameters.properties.{prop_name}: in Rust, missing in TS"
-                            ));
-                        }
+                }
+                for prop_name in rust_obj.keys() {
+                    if !ts_obj.contains_key(prop_name) {
+                        diffs.push(format!(
+                            "tools '{tool_name}'.parameters.properties.{prop_name}: in Rust, missing in TS"
+                        ));
                     }
                 }
             }

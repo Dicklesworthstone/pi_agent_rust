@@ -20,12 +20,12 @@ fn resolve_pi_binary_path() -> PathBuf {
         return PathBuf::from(path);
     }
 
-    if let Ok(test_exe) = std::env::current_exe() {
-        if let Some(target_dir) = test_exe.parent().and_then(|parent| parent.parent()) {
-            let candidate = target_dir.join("pi");
-            if candidate.exists() {
-                return candidate;
-            }
+    if let Ok(test_exe) = std::env::current_exe()
+        && let Some(target_dir) = test_exe.parent().and_then(|parent| parent.parent())
+    {
+        let candidate = target_dir.join("pi");
+        if candidate.exists() {
+            return candidate;
         }
     }
 

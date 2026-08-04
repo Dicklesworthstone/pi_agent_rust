@@ -49,8 +49,9 @@ jobs:
           sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: clippy
 
       - name: Cache cargo registry
@@ -74,10 +75,12 @@ jobs:
           mkdir -p target/perf
           scripts/bench_env_setup.sh fingerprint | tee target/perf/bench_env_fingerprint.json || true
           # Validate and report
-          echo "## Benchmark Environment" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
-          scripts/bench_env_setup.sh validate 2>&1 | sed 's/\x1b\[[0-9;]*m//g' >> $GITHUB_STEP_SUMMARY || true
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Benchmark Environment"
+            echo '```'
+            scripts/bench_env_setup.sh validate 2>&1 | sed 's/\x1b\[[0-9;]*m//g' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build release binary
         run: cargo build --release
@@ -91,14 +94,16 @@ jobs:
           # gating, which is tracked separately.
           SIZE_BYTES=$(stat --printf="%s" target/release/pi)
           SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1024 / 1024" | bc)
-          echo "## Binary Size" >> $GITHUB_STEP_SUMMARY
-          echo "- Size: ${SIZE_MB}MB" >> $GITHUB_STEP_SUMMARY
-          echo "- Budget: 25MB" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## Binary Size"
+            echo "- Size: ${SIZE_MB}MB"
+            echo "- Budget: 25MB"
+          } >> "$GITHUB_STEP_SUMMARY"
           if (( $(echo "$SIZE_MB > 25" | bc -l) )); then
             echo "::error::Binary size ${SIZE_MB}MB exceeds 25MB budget"
             exit 1
           fi
-          echo "- Status: Within budget" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: Within budget" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run micro-benchmarks (tools)
         run: cargo bench --bench tools -- --noplot
@@ -124,43 +129,45 @@ jobs:
 
       - name: Generate benchmark summary
         run: |
-          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Startup Time" >> $GITHUB_STEP_SUMMARY
-          if [ -d "target/criterion/startup" ]; then
-            for dir in target/criterion/startup/*/; do
-              name=$(basename "$dir")
-              if [ -f "$dir/new/estimates.json" ]; then
-                mean=$(jq -r '.mean.point_estimate' "$dir/new/estimates.json" 2>/dev/null || echo "N/A")
-                echo "- $name: ${mean}ns" >> $GITHUB_STEP_SUMMARY
-              fi
-            done
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Truncation" >> $GITHUB_STEP_SUMMARY
-          if [ -d "target/criterion/truncation" ]; then
-            for dir in target/criterion/truncation/*/; do
-              name=$(basename "$dir")
-              if [ -f "$dir/new/estimates.json" ]; then
-                mean=$(jq -r '.mean.point_estimate' "$dir/new/estimates.json" 2>/dev/null || echo "N/A")
-                echo "- $name: ${mean}ns" >> $GITHUB_STEP_SUMMARY
-              fi
-            done
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### TUI Rendering (PERF-8)" >> $GITHUB_STEP_SUMMARY
-          for group in build_conversation_content view viewport_operations markdown_rendering; do
-            if [ -d "target/criterion/$group" ]; then
-              echo "**$group**" >> $GITHUB_STEP_SUMMARY
-              for dir in target/criterion/"$group"/*/; do
+          {
+            echo "## Benchmark Results"
+            echo ""
+            echo "### Startup Time"
+            if [ -d "target/criterion/startup" ]; then
+              for dir in target/criterion/startup/*/; do
                 name=$(basename "$dir")
                 if [ -f "$dir/new/estimates.json" ]; then
                   mean=$(jq -r '.mean.point_estimate' "$dir/new/estimates.json" 2>/dev/null || echo "N/A")
-                  echo "- $name: ${mean}ns" >> $GITHUB_STEP_SUMMARY
+                  echo "- $name: ${mean}ns"
                 fi
               done
             fi
-          done
+            echo ""
+            echo "### Truncation"
+            if [ -d "target/criterion/truncation" ]; then
+              for dir in target/criterion/truncation/*/; do
+                name=$(basename "$dir")
+                if [ -f "$dir/new/estimates.json" ]; then
+                  mean=$(jq -r '.mean.point_estimate' "$dir/new/estimates.json" 2>/dev/null || echo "N/A")
+                  echo "- $name: ${mean}ns"
+                fi
+              done
+            fi
+            echo ""
+            echo "### TUI Rendering (PERF-8)"
+            for group in build_conversation_content view viewport_operations markdown_rendering; do
+              if [ -d "target/criterion/$group" ]; then
+                echo "**$group**"
+                for dir in target/criterion/"$group"/*/; do
+                  name=$(basename "$dir")
+                  if [ -f "$dir/new/estimates.json" ]; then
+                    mean=$(jq -r '.mean.point_estimate' "$dir/new/estimates.json" 2>/dev/null || echo "N/A")
+                    echo "- $name: ${mean}ns"
+                  fi
+                done
+              fi
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Perf budget gate
         run: cargo test --test perf_budgets -- --nocapture
@@ -204,7 +211,9 @@ jobs:
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
       - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
+        with:
+          toolchain: nightly-2026-07-05
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -246,15 +255,17 @@ jobs:
           PERF_REGRESSION_THRESHOLD: ${{ vars.PERF_REGRESSION_THRESHOLD || '20' }}
         run: |
           set -euo pipefail
-          echo "## TUI Performance Comparison" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          {
+            echo "## TUI Performance Comparison"
+            echo ""
+          } >> "$GITHUB_STEP_SUMMARY"
 
           # Run critcmp with threshold
           if critcmp main pr --threshold "${PERF_REGRESSION_THRESHOLD}" 2>/dev/null; then
-            echo "✅ No TUI performance regressions detected (threshold: ${PERF_REGRESSION_THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
+            echo "✅ No TUI performance regressions detected (threshold: ${PERF_REGRESSION_THRESHOLD}%)" >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "❌ TUI performance regression detected (>${PERF_REGRESSION_THRESHOLD}%)" >> $GITHUB_STEP_SUMMARY
+            echo "❌ TUI performance regression detected (>${PERF_REGRESSION_THRESHOLD}%)" >> "$GITHUB_STEP_SUMMARY"
             # Show detailed comparison
-            critcmp main pr 2>/dev/null >> $GITHUB_STEP_SUMMARY || true
+            critcmp main pr 2>/dev/null >> "$GITHUB_STEP_SUMMARY" || true
             exit 1
           fi

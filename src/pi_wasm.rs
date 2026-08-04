@@ -21,8 +21,8 @@ use rquickjs::{ArrayBuffer, Ctx, Value};
 use serde::Serialize;
 use tracing::debug;
 use wasmtime::{
-    Caller, Engine, ExternType, Instance as WasmInstance, Linker, Module as WasmModule, Store, Val,
-    ValType,
+    Caller, Engine, ExternType, Instance as WasmInstance, Linker, Module as WasmModule, Store,
+    ToWasmtimeResult as _, Val, ValType,
 };
 
 // ---------------------------------------------------------------------------
@@ -159,6 +159,10 @@ fn throw_wasm(ctx: &Ctx<'_>, class: &str, msg: &str) -> rquickjs::Error {
         let _ = ctx.throw(js_text.into_value());
     }
     rquickjs::Error::Exception
+}
+
+fn wasmtime_host_result<T>(operation: impl FnOnce() -> anyhow::Result<T>) -> wasmtime::Result<T> {
+    operation().to_wasmtime_result()
 }
 
 // ---------------------------------------------------------------------------
@@ -466,11 +470,14 @@ fn register_compat_stub_import(
             imp_name,
             func_ty.clone(),
             move |_caller: Caller<'_, WasmHostData>, _params: &[Val], results: &mut [Val]| {
-                for (i, ty) in result_types.iter().enumerate() {
-                    results[i] = Val::default_for_ty(ty)
-                        .ok_or_else(|| anyhow!("Unsupported default result for {import_label}"))?;
-                }
-                Ok(())
+                wasmtime_host_result(|| {
+                    for (i, ty) in result_types.iter().enumerate() {
+                        results[i] = Val::default_for_ty(ty).ok_or_else(|| {
+                            anyhow!("Unsupported default result for {import_label}")
+                        })?;
+                    }
+                    Ok(())
+                })
             },
         )
         .map_err(|e| format!("Failed to register compatibility stub {mod_name}.{imp_name}: {e}"))?;
@@ -497,76 +504,83 @@ fn register_host_imports(
                             imp_name,
                             func_ty.clone(),
                             move |mut caller, params, results| {
-                                let path_ptr = usize::try_from(val_i32(params, 1, "path")?)
-                                    .map_err(|_| anyhow!("Negative path pointer"))?;
-                                let flags = val_i32(params, 2, "flags")?;
-                                let path = caller_read_c_string(&mut caller, path_ptr)?;
-                                let Some((readable, writable)) = descriptor_access(flags) else {
-                                    set_i32_result(results, -ERRNO_INVAL);
-                                    return Ok(());
-                                };
-                                if flags & O_TRUNC != 0 && !writable {
-                                    set_i32_result(results, -ERRNO_INVAL);
-                                    return Ok(());
-                                }
-
-                                let append = flags & O_APPEND != 0;
-                                let (fd, bytes_len) = {
-                                    let host = caller.data_mut();
-                                    let path_exists = host.staged_files.contains_key(&path);
-                                    if !path_exists {
-                                        if flags & O_CREAT == 0 {
-                                            set_i32_result(results, -ERRNO_NOENT);
-                                            return Ok(());
-                                        }
-                                        host.staged_files
-                                            .insert(path.clone(), std::sync::Arc::new(Vec::new()));
-                                    } else if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
-                                        set_i32_result(results, -ERRNO_EXIST);
+                                wasmtime_host_result(|| {
+                                    let path_ptr = usize::try_from(val_i32(params, 1, "path")?)
+                                        .map_err(|_| anyhow!("Negative path pointer"))?;
+                                    let flags = val_i32(params, 2, "flags")?;
+                                    let path = caller_read_c_string(&mut caller, path_ptr)?;
+                                    let Some((readable, writable)) = descriptor_access(flags)
+                                    else {
+                                        set_i32_result(results, -ERRNO_INVAL);
+                                        return Ok(());
+                                    };
+                                    if flags & O_TRUNC != 0 && !writable {
+                                        set_i32_result(results, -ERRNO_INVAL);
                                         return Ok(());
                                     }
 
-                                    let (position, bytes_len) = {
-                                        let file_arc =
-                                            host.staged_files.get_mut(&path).ok_or_else(|| {
-                                                anyhow!("Virtual file disappeared during open")
-                                            })?;
-                                        if flags & O_TRUNC != 0 {
-                                            std::sync::Arc::make_mut(file_arc).clear();
+                                    let append = flags & O_APPEND != 0;
+                                    let (fd, bytes_len) = {
+                                        let host = caller.data_mut();
+                                        let path_exists = host.staged_files.contains_key(&path);
+                                        if !path_exists {
+                                            if flags & O_CREAT == 0 {
+                                                set_i32_result(results, -ERRNO_NOENT);
+                                                return Ok(());
+                                            }
+                                            host.staged_files.insert(
+                                                path.clone(),
+                                                std::sync::Arc::new(Vec::new()),
+                                            );
+                                        } else if flags & O_CREAT != 0 && flags & O_EXCL != 0 {
+                                            set_i32_result(results, -ERRNO_EXIST);
+                                            return Ok(());
                                         }
-                                        let bytes_len = file_arc.len();
-                                        let position = if append { bytes_len } else { 0 };
-                                        (position, bytes_len)
-                                    };
 
-                                    if host.next_fd == u32::MAX {
-                                        return Err(anyhow!("Synthetic fd space exhausted"));
-                                    }
-                                    let fd = host.next_fd;
-                                    host.next_fd = host.next_fd.saturating_add(1);
-                                    host.open_files.insert(
+                                        let (position, bytes_len) = {
+                                            let file_arc = host
+                                                .staged_files
+                                                .get_mut(&path)
+                                                .ok_or_else(|| {
+                                                    anyhow!("Virtual file disappeared during open")
+                                                })?;
+                                            if flags & O_TRUNC != 0 {
+                                                std::sync::Arc::make_mut(file_arc).clear();
+                                            }
+                                            let bytes_len = file_arc.len();
+                                            let position = if append { bytes_len } else { 0 };
+                                            (position, bytes_len)
+                                        };
+
+                                        if host.next_fd == u32::MAX {
+                                            return Err(anyhow!("Synthetic fd space exhausted"));
+                                        }
+                                        let fd = host.next_fd;
+                                        host.next_fd = host.next_fd.saturating_add(1);
+                                        host.open_files.insert(
+                                            fd,
+                                            VirtualFileHandle {
+                                                path: path.clone(),
+                                                position,
+                                                readable,
+                                                writable,
+                                                append,
+                                            },
+                                        );
+                                        (fd, bytes_len)
+                                    };
+                                    debug!(
+                                        path,
+                                        bytes = bytes_len,
                                         fd,
-                                        VirtualFileHandle {
-                                            path: path.clone(),
-                                            position,
-                                            readable,
-                                            writable,
-                                            append,
-                                        },
+                                        readable,
+                                        writable,
+                                        append,
+                                        "wasm: staged file open"
                                     );
-                                    (fd, bytes_len)
-                                };
-                                debug!(
-                                    path,
-                                    bytes = bytes_len,
-                                    fd,
-                                    readable,
-                                    writable,
-                                    append,
-                                    "wasm: staged file open"
-                                );
-                                set_i32_result(results, i32::try_from(fd).unwrap_or(i32::MAX));
-                                Ok(())
+                                    set_i32_result(results, i32::try_from(fd).unwrap_or(i32::MAX));
+                                    Ok(())
+                                })
                             },
                         )
                         .map_err(|e| {
@@ -580,75 +594,81 @@ fn register_host_imports(
                             imp_name,
                             func_ty.clone(),
                             move |mut caller, params, results| {
-                                let fd = u32::try_from(val_i32(params, 0, "fd")?)
-                                    .map_err(|_| anyhow!("Negative fd"))?;
-                                let iov = usize::try_from(val_i32(params, 1, "iov")?)
-                                    .map_err(|_| anyhow!("Negative iov pointer"))?;
-                                let iovcnt = usize::try_from(val_i32(params, 2, "iovcnt")?)
-                                    .map_err(|_| anyhow!("Negative iov count"))?;
-                                let pnum = usize::try_from(val_i32(params, 3, "pnum")?)
-                                    .map_err(|_| anyhow!("Negative pnum pointer"))?;
+                                wasmtime_host_result(|| {
+                                    let fd = u32::try_from(val_i32(params, 0, "fd")?)
+                                        .map_err(|_| anyhow!("Negative fd"))?;
+                                    let iov = usize::try_from(val_i32(params, 1, "iov")?)
+                                        .map_err(|_| anyhow!("Negative iov pointer"))?;
+                                    let iovcnt = usize::try_from(val_i32(params, 2, "iovcnt")?)
+                                        .map_err(|_| anyhow!("Negative iov count"))?;
+                                    let pnum = usize::try_from(val_i32(params, 3, "pnum")?)
+                                        .map_err(|_| anyhow!("Negative pnum pointer"))?;
 
-                                let (path, mut position) =
-                                    if let Some(handle) = caller.data().open_files.get(&fd) {
-                                        if !handle.readable {
+                                    let (path, mut position) =
+                                        if let Some(handle) = caller.data().open_files.get(&fd) {
+                                            if !handle.readable {
+                                                set_i32_result(results, ERRNO_BADF);
+                                                return Ok(());
+                                            }
+                                            (handle.path.clone(), handle.position)
+                                        } else {
                                             set_i32_result(results, ERRNO_BADF);
                                             return Ok(());
+                                        };
+
+                                    let mut total = 0_usize;
+                                    for index in 0..iovcnt {
+                                        let base = iov
+                                            .checked_add(index.saturating_mul(8))
+                                            .ok_or_else(|| anyhow!("iov overflow"))?;
+                                        let ptr =
+                                            usize::try_from(caller_read_u32(&mut caller, base)?)
+                                                .map_err(|_| anyhow!("iov ptr overflow"))?;
+                                        let len = usize::try_from(caller_read_u32(
+                                            &mut caller,
+                                            base + 4,
+                                        )?)
+                                        .map_err(|_| anyhow!("iov len overflow"))?;
+                                        let chunk = {
+                                            let host = caller.data();
+                                            let Some(file) = host.staged_files.get(&path) else {
+                                                set_i32_result(results, ERRNO_NOENT);
+                                                return Ok(());
+                                            };
+                                            if position >= file.len() || len == 0 {
+                                                Vec::new()
+                                            } else {
+                                                let available = file.len().saturating_sub(position);
+                                                let to_copy = available.min(len);
+                                                file[position..position + to_copy].to_vec()
+                                            }
+                                        };
+                                        if chunk.is_empty() {
+                                            break;
                                         }
-                                        (handle.path.clone(), handle.position)
+                                        caller_write_bytes(&mut caller, ptr, &chunk)?;
+                                        position += chunk.len();
+                                        total += chunk.len();
+                                        if chunk.len() < len {
+                                            break;
+                                        }
+                                    }
+
+                                    caller_write_u32(
+                                        &mut caller,
+                                        pnum,
+                                        u32::try_from(total).unwrap_or(u32::MAX),
+                                    )?;
+                                    if let Some(handle) = caller.data_mut().open_files.get_mut(&fd)
+                                    {
+                                        handle.position = position;
                                     } else {
                                         set_i32_result(results, ERRNO_BADF);
                                         return Ok(());
-                                    };
-
-                                let mut total = 0_usize;
-                                for index in 0..iovcnt {
-                                    let base = iov
-                                        .checked_add(index.saturating_mul(8))
-                                        .ok_or_else(|| anyhow!("iov overflow"))?;
-                                    let ptr = usize::try_from(caller_read_u32(&mut caller, base)?)
-                                        .map_err(|_| anyhow!("iov ptr overflow"))?;
-                                    let len =
-                                        usize::try_from(caller_read_u32(&mut caller, base + 4)?)
-                                            .map_err(|_| anyhow!("iov len overflow"))?;
-                                    let chunk = {
-                                        let host = caller.data();
-                                        let Some(file) = host.staged_files.get(&path) else {
-                                            set_i32_result(results, ERRNO_NOENT);
-                                            return Ok(());
-                                        };
-                                        if position >= file.len() || len == 0 {
-                                            Vec::new()
-                                        } else {
-                                            let available = file.len().saturating_sub(position);
-                                            let to_copy = available.min(len);
-                                            file[position..position + to_copy].to_vec()
-                                        }
-                                    };
-                                    if chunk.is_empty() {
-                                        break;
                                     }
-                                    caller_write_bytes(&mut caller, ptr, &chunk)?;
-                                    position += chunk.len();
-                                    total += chunk.len();
-                                    if chunk.len() < len {
-                                        break;
-                                    }
-                                }
-
-                                caller_write_u32(
-                                    &mut caller,
-                                    pnum,
-                                    u32::try_from(total).unwrap_or(u32::MAX),
-                                )?;
-                                if let Some(handle) = caller.data_mut().open_files.get_mut(&fd) {
-                                    handle.position = position;
-                                } else {
-                                    set_i32_result(results, ERRNO_BADF);
-                                    return Ok(());
-                                }
-                                set_i32_result(results, 0);
-                                Ok(())
+                                    set_i32_result(results, 0);
+                                    Ok(())
+                                })
                             },
                         )
                         .map_err(|e| {
@@ -662,58 +682,61 @@ fn register_host_imports(
                             imp_name,
                             func_ty.clone(),
                             move |mut caller, params, results| {
-                                let fd = u32::try_from(val_i32(params, 0, "fd")?)
-                                    .map_err(|_| anyhow!("Negative fd"))?;
-                                let offset = val_i64(params, 1, "offset")?;
-                                let whence = val_i32(params, 2, "whence")?;
-                                let new_offset_ptr =
-                                    usize::try_from(val_i32(params, 3, "newOffset")?)
-                                        .map_err(|_| anyhow!("Negative newOffset pointer"))?;
+                                wasmtime_host_result(|| {
+                                    let fd = u32::try_from(val_i32(params, 0, "fd")?)
+                                        .map_err(|_| anyhow!("Negative fd"))?;
+                                    let offset = val_i64(params, 1, "offset")?;
+                                    let whence = val_i32(params, 2, "whence")?;
+                                    let new_offset_ptr =
+                                        usize::try_from(val_i32(params, 3, "newOffset")?)
+                                            .map_err(|_| anyhow!("Negative newOffset pointer"))?;
 
-                                let (path, current_position) =
-                                    if let Some(handle) = caller.data().open_files.get(&fd) {
-                                        (handle.path.clone(), handle.position)
-                                    } else {
-                                        set_i32_result(results, ERRNO_BADF);
+                                    let (path, current_position) =
+                                        if let Some(handle) = caller.data().open_files.get(&fd) {
+                                            (handle.path.clone(), handle.position)
+                                        } else {
+                                            set_i32_result(results, ERRNO_BADF);
+                                            return Ok(());
+                                        };
+                                    let Some(file_len) =
+                                        caller.data().staged_files.get(&path).map(|v| v.len())
+                                    else {
+                                        set_i32_result(results, ERRNO_NOENT);
                                         return Ok(());
                                     };
-                                let Some(file_len) =
-                                    caller.data().staged_files.get(&path).map(|v| v.len())
-                                else {
-                                    set_i32_result(results, ERRNO_NOENT);
-                                    return Ok(());
-                                };
-                                let base = match whence {
-                                    0 => 0_i64,
-                                    1 => i64::try_from(current_position).unwrap_or(i64::MAX),
-                                    2 => i64::try_from(file_len).unwrap_or(i64::MAX),
-                                    _ => {
+                                    let base = match whence {
+                                        0 => 0_i64,
+                                        1 => i64::try_from(current_position).unwrap_or(i64::MAX),
+                                        2 => i64::try_from(file_len).unwrap_or(i64::MAX),
+                                        _ => {
+                                            set_i32_result(results, ERRNO_INVAL);
+                                            return Ok(());
+                                        }
+                                    };
+                                    let next = base
+                                        .checked_add(offset)
+                                        .ok_or_else(|| anyhow!("Seek overflow"))?;
+                                    if next < 0 {
                                         set_i32_result(results, ERRNO_INVAL);
                                         return Ok(());
                                     }
-                                };
-                                let next = base
-                                    .checked_add(offset)
-                                    .ok_or_else(|| anyhow!("Seek overflow"))?;
-                                if next < 0 {
-                                    set_i32_result(results, ERRNO_INVAL);
-                                    return Ok(());
-                                }
-                                let next =
-                                    usize::try_from(next).map_err(|_| anyhow!("Seek overflow"))?;
-                                if let Some(handle) = caller.data_mut().open_files.get_mut(&fd) {
-                                    handle.position = next;
-                                } else {
-                                    set_i32_result(results, ERRNO_BADF);
-                                    return Ok(());
-                                }
-                                caller_write_u64(
-                                    &mut caller,
-                                    new_offset_ptr,
-                                    u64::try_from(next).unwrap_or(u64::MAX),
-                                )?;
-                                set_i32_result(results, 0);
-                                Ok(())
+                                    let next = usize::try_from(next)
+                                        .map_err(|_| anyhow!("Seek overflow"))?;
+                                    if let Some(handle) = caller.data_mut().open_files.get_mut(&fd)
+                                    {
+                                        handle.position = next;
+                                    } else {
+                                        set_i32_result(results, ERRNO_BADF);
+                                        return Ok(());
+                                    }
+                                    caller_write_u64(
+                                        &mut caller,
+                                        new_offset_ptr,
+                                        u64::try_from(next).unwrap_or(u64::MAX),
+                                    )?;
+                                    set_i32_result(results, 0);
+                                    Ok(())
+                                })
                             },
                         )
                         .map_err(|e| {
@@ -727,15 +750,18 @@ fn register_host_imports(
                             imp_name,
                             func_ty.clone(),
                             move |mut caller, params, results| {
-                                let fd = u32::try_from(val_i32(params, 0, "fd")?)
-                                    .map_err(|_| anyhow!("Negative fd"))?;
-                                let result = if caller.data_mut().open_files.remove(&fd).is_some() {
-                                    0
-                                } else {
-                                    ERRNO_BADF
-                                };
-                                set_i32_result(results, result);
-                                Ok(())
+                                wasmtime_host_result(|| {
+                                    let fd = u32::try_from(val_i32(params, 0, "fd")?)
+                                        .map_err(|_| anyhow!("Negative fd"))?;
+                                    let result =
+                                        if caller.data_mut().open_files.remove(&fd).is_some() {
+                                            0
+                                        } else {
+                                            ERRNO_BADF
+                                        };
+                                    set_i32_result(results, result);
+                                    Ok(())
+                                })
                             },
                         )
                         .map_err(|e| {
@@ -749,71 +775,131 @@ fn register_host_imports(
                             imp_name,
                             func_ty.clone(),
                             move |mut caller, params, results| {
-                                let fd = u32::try_from(val_i32(params, 0, "fd")?)
-                                    .map_err(|_| anyhow!("Negative fd"))?;
-                                let iov = usize::try_from(val_i32(params, 1, "iov")?)
-                                    .map_err(|_| anyhow!("Negative iov pointer"))?;
-                                let iovcnt = usize::try_from(val_i32(params, 2, "iovcnt")?)
-                                    .map_err(|_| anyhow!("Negative iov count"))?;
-                                let pnum = usize::try_from(val_i32(params, 3, "pnum")?)
-                                    .map_err(|_| anyhow!("Negative pnum pointer"))?;
-                                let (path, mut position, append, file_len) = {
-                                    let host = caller.data();
-                                    if let Some(handle) = host.open_files.get(&fd) {
-                                        if !handle.writable {
+                                wasmtime_host_result(|| {
+                                    let fd = u32::try_from(val_i32(params, 0, "fd")?)
+                                        .map_err(|_| anyhow!("Negative fd"))?;
+                                    let iov = usize::try_from(val_i32(params, 1, "iov")?)
+                                        .map_err(|_| anyhow!("Negative iov pointer"))?;
+                                    let iovcnt = usize::try_from(val_i32(params, 2, "iovcnt")?)
+                                        .map_err(|_| anyhow!("Negative iov count"))?;
+                                    let pnum = usize::try_from(val_i32(params, 3, "pnum")?)
+                                        .map_err(|_| anyhow!("Negative pnum pointer"))?;
+                                    let (path, mut position, append, file_len) = {
+                                        let host = caller.data();
+                                        if let Some(handle) = host.open_files.get(&fd) {
+                                            if !handle.writable {
+                                                set_i32_result(results, ERRNO_BADF);
+                                                return Ok(());
+                                            }
+                                            let Some(file_len) = host
+                                                .staged_files
+                                                .get(&handle.path)
+                                                .map(|v| v.len())
+                                            else {
+                                                set_i32_result(results, ERRNO_NOENT);
+                                                return Ok(());
+                                            };
+                                            (
+                                                handle.path.clone(),
+                                                handle.position,
+                                                handle.append,
+                                                file_len,
+                                            )
+                                        } else {
                                             set_i32_result(results, ERRNO_BADF);
                                             return Ok(());
                                         }
-                                        let Some(file_len) =
-                                            host.staged_files.get(&handle.path).map(|v| v.len())
+                                    };
+                                    let base_position = if append { file_len } else { position };
+                                    let mut total = 0_usize;
+                                    let mut chunks = Vec::new();
+                                    for index in 0..iovcnt {
+                                        let base = iov
+                                            .checked_add(index.saturating_mul(8))
+                                            .ok_or_else(|| anyhow!("iov overflow"))?;
+                                        let ptr =
+                                            usize::try_from(caller_read_u32(&mut caller, base)?)
+                                                .map_err(|_| anyhow!("iov ptr overflow"))?;
+                                        let len = usize::try_from(caller_read_u32(
+                                            &mut caller,
+                                            base + 4,
+                                        )?)
+                                        .map_err(|_| anyhow!("iov len overflow"))?;
+                                        if len == 0 {
+                                            continue;
+                                        }
+                                        let next_total =
+                                            total.checked_add(len).ok_or_else(|| {
+                                                anyhow!("fd_write byte count overflow")
+                                            })?;
+                                        if base_position
+                                            .checked_add(next_total)
+                                            .ok_or_else(|| anyhow!("fd_write overflow"))?
+                                            > MAX_VIRTUAL_FILE_BYTES
+                                        {
+                                            set_i32_result(results, ERRNO_FBIG);
+                                            return Ok(());
+                                        }
+
+                                        let bytes = caller_read_bytes(&mut caller, ptr, len)?;
+                                        total = next_total;
+                                        chunks.push(bytes);
+                                    }
+                                    if total == 0 {
+                                        caller_write_u32(&mut caller, pnum, 0)?;
+                                        if let Some(handle) =
+                                            caller.data_mut().open_files.get_mut(&fd)
+                                        {
+                                            handle.position = position;
+                                        } else {
+                                            set_i32_result(results, ERRNO_BADF);
+                                            return Ok(());
+                                        }
+                                        set_i32_result(results, 0);
+                                        return Ok(());
+                                    }
+                                    {
+                                        let host = caller.data_mut();
+                                        let Some(file_arc) = host.staged_files.get_mut(&path)
                                         else {
                                             set_i32_result(results, ERRNO_NOENT);
                                             return Ok(());
                                         };
-                                        (
-                                            handle.path.clone(),
-                                            handle.position,
-                                            handle.append,
-                                            file_len,
-                                        )
-                                    } else {
-                                        set_i32_result(results, ERRNO_BADF);
-                                        return Ok(());
-                                    }
-                                };
-                                let base_position = if append { file_len } else { position };
-                                let mut total = 0_usize;
-                                let mut chunks = Vec::new();
-                                for index in 0..iovcnt {
-                                    let base = iov
-                                        .checked_add(index.saturating_mul(8))
-                                        .ok_or_else(|| anyhow!("iov overflow"))?;
-                                    let ptr = usize::try_from(caller_read_u32(&mut caller, base)?)
-                                        .map_err(|_| anyhow!("iov ptr overflow"))?;
-                                    let len =
-                                        usize::try_from(caller_read_u32(&mut caller, base + 4)?)
-                                            .map_err(|_| anyhow!("iov len overflow"))?;
-                                    if len == 0 {
-                                        continue;
-                                    }
-                                    let next_total = total
-                                        .checked_add(len)
-                                        .ok_or_else(|| anyhow!("fd_write byte count overflow"))?;
-                                    if base_position
-                                        .checked_add(next_total)
-                                        .ok_or_else(|| anyhow!("fd_write overflow"))?
-                                        > MAX_VIRTUAL_FILE_BYTES
-                                    {
-                                        set_i32_result(results, ERRNO_FBIG);
-                                        return Ok(());
-                                    }
+                                        let file = std::sync::Arc::make_mut(file_arc);
+                                        if append {
+                                            position = base_position;
+                                        }
+                                        let end = position
+                                            .checked_add(total)
+                                            .ok_or_else(|| anyhow!("fd_write overflow"))?;
+                                        if end > MAX_VIRTUAL_FILE_BYTES {
+                                            set_i32_result(results, ERRNO_FBIG);
+                                            return Ok(());
+                                        }
+                                        if position > file.len() {
+                                            file.resize(position, 0);
+                                        }
+                                        if end > file.len() {
+                                            file.resize(end, 0);
+                                        }
 
-                                    let bytes = caller_read_bytes(&mut caller, ptr, len)?;
-                                    total = next_total;
-                                    chunks.push(bytes);
-                                }
-                                if total == 0 {
-                                    caller_write_u32(&mut caller, pnum, 0)?;
+                                        // Stage guest buffers before mutating the virtual file so
+                                        // size-limit failures do not commit a partial multi-iov write.
+                                        let mut write_position = position;
+                                        for bytes in &chunks {
+                                            let chunk_end = write_position
+                                                .checked_add(bytes.len())
+                                                .ok_or_else(|| anyhow!("fd_write overflow"))?;
+                                            file[write_position..chunk_end].copy_from_slice(bytes);
+                                            write_position = chunk_end;
+                                        }
+                                        position = write_position;
+                                    }
+                                    caller_write_u32(
+                                        &mut caller,
+                                        pnum,
+                                        u32::try_from(total).unwrap_or(u32::MAX),
+                                    )?;
                                     if let Some(handle) = caller.data_mut().open_files.get_mut(&fd)
                                     {
                                         handle.position = position;
@@ -822,57 +908,8 @@ fn register_host_imports(
                                         return Ok(());
                                     }
                                     set_i32_result(results, 0);
-                                    return Ok(());
-                                }
-                                {
-                                    let host = caller.data_mut();
-                                    let Some(file_arc) = host.staged_files.get_mut(&path) else {
-                                        set_i32_result(results, ERRNO_NOENT);
-                                        return Ok(());
-                                    };
-                                    let file = std::sync::Arc::make_mut(file_arc);
-                                    if append {
-                                        position = base_position;
-                                    }
-                                    let end = position
-                                        .checked_add(total)
-                                        .ok_or_else(|| anyhow!("fd_write overflow"))?;
-                                    if end > MAX_VIRTUAL_FILE_BYTES {
-                                        set_i32_result(results, ERRNO_FBIG);
-                                        return Ok(());
-                                    }
-                                    if position > file.len() {
-                                        file.resize(position, 0);
-                                    }
-                                    if end > file.len() {
-                                        file.resize(end, 0);
-                                    }
-
-                                    // Stage guest buffers before mutating the virtual file so
-                                    // size-limit failures do not commit a partial multi-iov write.
-                                    let mut write_position = position;
-                                    for bytes in &chunks {
-                                        let chunk_end = write_position
-                                            .checked_add(bytes.len())
-                                            .ok_or_else(|| anyhow!("fd_write overflow"))?;
-                                        file[write_position..chunk_end].copy_from_slice(bytes);
-                                        write_position = chunk_end;
-                                    }
-                                    position = write_position;
-                                }
-                                caller_write_u32(
-                                    &mut caller,
-                                    pnum,
-                                    u32::try_from(total).unwrap_or(u32::MAX),
-                                )?;
-                                if let Some(handle) = caller.data_mut().open_files.get_mut(&fd) {
-                                    handle.position = position;
-                                } else {
-                                    set_i32_result(results, ERRNO_BADF);
-                                    return Ok(());
-                                }
-                                set_i32_result(results, 0);
-                                Ok(())
+                                    Ok(())
+                                })
                             },
                         )
                         .map_err(|e| {
@@ -903,36 +940,38 @@ fn register_host_imports(
                             imp_name,
                             func_ty.clone(),
                             move |mut caller, params, results| {
-                                let requested_size =
-                                    usize::try_from(val_i32(params, 0, "requestedSize")?)
-                                        .map_err(|_| anyhow!("Negative heap size"))?;
-                                let memory = caller_memory(&mut caller)?;
-                                let current_size = memory.data_size(&mut caller);
-                                if requested_size <= current_size {
-                                    set_i32_result(results, 1);
-                                    return Ok(());
-                                }
-                                let page_size =
-                                    usize::try_from(memory.page_size(&caller)).unwrap_or(65_536);
-                                let needed_bytes = requested_size.saturating_sub(current_size);
-                                let needed_pages =
-                                    (needed_bytes.saturating_add(page_size - 1)) / page_size;
-                                let current_pages = memory.size(&caller);
-                                let requested_pages = current_pages.saturating_add(
-                                    u64::try_from(needed_pages).unwrap_or(u64::MAX),
-                                );
-                                if requested_pages > caller.data().max_memory_pages {
-                                    set_i32_result(results, 0);
-                                    return Ok(());
-                                }
-                                let grown = memory
-                                    .grow(
-                                        &mut caller,
+                                wasmtime_host_result(|| {
+                                    let requested_size =
+                                        usize::try_from(val_i32(params, 0, "requestedSize")?)
+                                            .map_err(|_| anyhow!("Negative heap size"))?;
+                                    let memory = caller_memory(&mut caller)?;
+                                    let current_size = memory.data_size(&mut caller);
+                                    if requested_size <= current_size {
+                                        set_i32_result(results, 1);
+                                        return Ok(());
+                                    }
+                                    let page_size = usize::try_from(memory.page_size(&caller))
+                                        .unwrap_or(65_536);
+                                    let needed_bytes = requested_size.saturating_sub(current_size);
+                                    let needed_pages =
+                                        (needed_bytes.saturating_add(page_size - 1)) / page_size;
+                                    let current_pages = memory.size(&caller);
+                                    let requested_pages = current_pages.saturating_add(
                                         u64::try_from(needed_pages).unwrap_or(u64::MAX),
-                                    )
-                                    .is_ok();
-                                set_i32_result(results, i32::from(grown));
-                                Ok(())
+                                    );
+                                    if requested_pages > caller.data().max_memory_pages {
+                                        set_i32_result(results, 0);
+                                        return Ok(());
+                                    }
+                                    let grown = memory
+                                        .grow(
+                                            &mut caller,
+                                            u64::try_from(needed_pages).unwrap_or(u64::MAX),
+                                        )
+                                        .is_ok();
+                                    set_i32_result(results, i32::from(grown));
+                                    Ok(())
+                                })
                             },
                         )
                         .map_err(|e| {
@@ -2599,10 +2638,10 @@ mod tests {
             ctx.globals().set("__test_bytes", arr).unwrap();
 
             let result: rquickjs::Result<u32> = ctx.eval(
-                r#"
+                r"
                     var mid = __pi_wasm_compile_native(__test_bytes);
                     __pi_wasm_instantiate_native(mid);
-                "#,
+                ",
             );
             assert!(result.is_err());
         });
@@ -2655,10 +2694,10 @@ mod tests {
             ctx.globals().set("__test_bytes", arr).unwrap();
 
             let result: rquickjs::Result<u32> = ctx.eval(
-                r#"
+                r"
                     var mid = __pi_wasm_compile_native(__test_bytes);
                     __pi_wasm_instantiate_native(mid);
-                "#,
+                ",
             );
             assert!(result.is_err());
         });

@@ -72,20 +72,20 @@ fn check_exec_capability(policy: &ExtensionPolicy, extension_id: Option<&str>) -
     let cap = "exec";
 
     // 1. Per-extension overrides
-    if let Some(id) = extension_id {
-        if let Some(override_config) = policy.per_extension.get(id) {
-            if override_config.deny.iter().any(|c| c == cap) {
-                return false;
-            }
-            if override_config.allow.iter().any(|c| c == cap) {
-                return true;
-            }
-            if let Some(mode) = override_config.mode {
-                return match mode {
-                    ExtensionPolicyMode::Permissive => true,
-                    ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
-                };
-            }
+    if let Some(id) = extension_id
+        && let Some(override_config) = policy.per_extension.get(id)
+    {
+        if override_config.deny.iter().any(|c| c == cap) {
+            return false;
+        }
+        if override_config.allow.iter().any(|c| c == cap) {
+            return true;
+        }
+        if let Some(mode) = override_config.mode {
+            return match mode {
+                ExtensionPolicyMode::Permissive => true,
+                ExtensionPolicyMode::Strict | ExtensionPolicyMode::Prompt => false, // Prompt = deny for sync
+            };
         }
     }
 
@@ -841,17 +841,17 @@ fn map_js_error(err: &rquickjs::Error) -> Error {
 }
 
 fn format_quickjs_exception<'js>(ctx: &Ctx<'js>, caught: Value<'js>) -> String {
-    if let Ok(obj) = caught.clone().try_into_object() {
-        if let Some(exception) = Exception::from_object(obj) {
-            if let Some(message) = exception.message() {
-                if let Some(stack) = exception.stack() {
-                    return format!("{message}\n{stack}");
-                }
-                return message;
-            }
+    if let Ok(obj) = caught.clone().try_into_object()
+        && let Some(exception) = Exception::from_object(obj)
+    {
+        if let Some(message) = exception.message() {
             if let Some(stack) = exception.stack() {
-                return stack;
+                return format!("{message}\n{stack}");
             }
+            return message;
+        }
+        if let Some(stack) = exception.stack() {
+            return stack;
         }
     }
 
@@ -1159,7 +1159,7 @@ impl PatchProposal {
     }
 
     /// Number of patch operations in this proposal.
-    pub fn op_count(&self) -> usize {
+    pub const fn op_count(&self) -> usize {
         self.ops.len()
     }
 }
@@ -2187,12 +2187,12 @@ impl IntentGraph {
     }
 
     /// True if the graph contains no signals at all.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.signals.is_empty()
     }
 
     /// Total number of signals.
-    pub fn signal_count(&self) -> usize {
+    pub const fn signal_count(&self) -> usize {
         self.signals.len()
     }
 }
@@ -3327,7 +3327,7 @@ pub struct GoldenChecksumManifest {
 
 impl GoldenChecksumManifest {
     /// Number of artifacts in the manifest.
-    pub fn artifact_count(&self) -> usize {
+    pub const fn artifact_count(&self) -> usize {
         self.entries.len()
     }
 
@@ -3910,12 +3910,12 @@ impl AuditLedger {
     }
 
     /// Number of entries in the ledger.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True if the ledger is empty.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -4051,12 +4051,12 @@ impl TelemetryCollector {
     }
 
     /// Number of recorded points.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.points.len()
     }
 
     /// True if no points recorded.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.points.is_empty()
     }
 }
@@ -4189,7 +4189,7 @@ pub struct ForensicBundle {
 
 impl ForensicBundle {
     /// Number of audit entries in this bundle.
-    pub fn audit_count(&self) -> usize {
+    pub const fn audit_count(&self) -> usize {
         self.audit_entries.len()
     }
 
@@ -4645,7 +4645,7 @@ impl InterruptBudget {
         false
     }
 
-    fn did_trip(&self) -> bool {
+    const fn did_trip(&self) -> bool {
         self.tripped.get()
     }
 
@@ -4985,13 +4985,13 @@ fn insert_compiled_source(
     entry: CompiledModuleCacheEntry,
 ) {
     let entry_len = compiled_source_len(&entry);
-    if let Some(limit) = state.compiled_cache_limit_bytes {
-        if limit == 0 || entry_len > limit {
-            let _ = remove_compiled_source(state, name);
-            state.module_cache_counters.invalidations =
-                state.module_cache_counters.invalidations.saturating_add(1);
-            return;
-        }
+    if let Some(limit) = state.compiled_cache_limit_bytes
+        && (limit == 0 || entry_len > limit)
+    {
+        let _ = remove_compiled_source(state, name);
+        state.module_cache_counters.invalidations =
+            state.module_cache_counters.invalidations.saturating_add(1);
+        return;
     }
 
     let _ = remove_compiled_source(state, name);
@@ -5960,11 +5960,11 @@ fn try_load_from_disk_cache(cache_dir: &Path, cache_key: &str) -> Option<Vec<u8>
 /// Persist a transpiled module source to the disk cache (best-effort).
 fn store_to_disk_cache(cache_dir: &Path, cache_key: &str, source: &[u8]) {
     let path = disk_cache_path(cache_dir, cache_key);
-    if let Some(parent) = path.parent() {
-        if let Err(err) = fs::create_dir_all(parent) {
-            tracing::debug!(event = "pijs.module_cache.disk.mkdir_failed", path = %parent.display(), %err);
-            return;
-        }
+    if let Some(parent) = path.parent()
+        && let Err(err) = fs::create_dir_all(parent)
+    {
+        tracing::debug!(event = "pijs.module_cache.disk.mkdir_failed", path = %parent.display(), %err);
+        return;
     }
 
     let temp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
@@ -16231,7 +16231,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         }
 
         let tick = self.tick_counter.fetch_add(1, AtomicOrdering::SeqCst) + 1;
-        tick == 1 || (tick % UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS == 0)
+        tick == 1 || tick.is_multiple_of(UNBOUNDED_MEMORY_USAGE_SAMPLE_EVERY_TICKS)
     }
 
     fn module_cache_snapshot(&self) -> (u64, u64, u64, u64, u64, u64, Option<u64>) {
@@ -17016,10 +17016,10 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// bundled assets (HTML templates, markdown docs, etc.).
     pub fn add_allowed_read_root(&self, root: &std::path::Path) {
         let canonical_root = crate::extensions::safe_canonicalize(root);
-        if let Ok(mut roots) = self.allowed_read_roots.lock() {
-            if !roots.contains(&canonical_root) {
-                roots.push(canonical_root);
-            }
+        if let Ok(mut roots) = self.allowed_read_roots.lock()
+            && !roots.contains(&canonical_root)
+        {
+            roots.push(canonical_root);
         }
     }
 
@@ -18253,40 +18253,40 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             };
 
                             // 2. Per-extension capability check
-                            if denied_reason.is_none() {
-                                if let Some(policy) = &policy {
-                                    let extension_id: Option<String> = ctx
-                                        .globals()
-                                        .get::<_, Option<String>>("__pi_current_extension_id")
-                                        .ok()
-                                        .flatten()
-                                        .map(|value| value.trim().to_string())
-                                        .filter(|value| !value.is_empty());
+                            if denied_reason.is_none()
+                                && let Some(policy) = &policy
+                            {
+                                let extension_id: Option<String> = ctx
+                                    .globals()
+                                    .get::<_, Option<String>>("__pi_current_extension_id")
+                                    .ok()
+                                    .flatten()
+                                    .map(|value| value.trim().to_string())
+                                    .filter(|value| !value.is_empty());
 
-                                    if check_exec_capability(policy, extension_id.as_deref()) {
-                                        match evaluate_exec_mediation(&policy.exec_mediation, &cmd, &args) {
-                                            ExecMediationResult::Deny { reason, .. } => {
-                                                denied_reason = Some(format!(
-                                                    "command blocked by exec mediation: {reason}"
-                                                ));
-                                            }
-                                            ExecMediationResult::AllowWithAudit {
-                                                class,
-                                                reason,
-                                            } => {
-                                                tracing::info!(
-                                                    event = "pijs.exec_sync.mediation_audit",
-                                                    cmd = %cmd,
-                                                    class = class.label(),
-                                                    reason = %reason,
-                                                    "sync child_process command allowed with exec mediation audit"
-                                                );
-                                            }
-                                            ExecMediationResult::Allow => {}
+                                if check_exec_capability(policy, extension_id.as_deref()) {
+                                    match evaluate_exec_mediation(&policy.exec_mediation, &cmd, &args) {
+                                        ExecMediationResult::Deny { reason, .. } => {
+                                            denied_reason = Some(format!(
+                                                "command blocked by exec mediation: {reason}"
+                                            ));
                                         }
-                                    } else {
-                                        denied_reason = Some("extension lacks 'exec' capability".to_string());
+                                        ExecMediationResult::AllowWithAudit {
+                                            class,
+                                            reason,
+                                        } => {
+                                            tracing::info!(
+                                                event = "pijs.exec_sync.mediation_audit",
+                                                cmd = %cmd,
+                                                class = class.label(),
+                                                reason = %reason,
+                                                "sync child_process command allowed with exec mediation audit"
+                                            );
+                                        }
+                                        ExecMediationResult::Allow => {}
                                     }
+                                } else {
+                                    denied_reason = Some("extension lacks 'exec' capability".to_string());
                                 }
                             }
 
@@ -18436,13 +18436,14 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                                         let _ = child.kill();
                                         break child.wait().map_err(|e| e.to_string())?;
                                     }
-                                    if let Some(t) = timeout {
-                                        if !killed && start.elapsed() >= t {
-                                            killed = true;
-                                            crate::tools::kill_process_group_tree(Some(pid));
-                                            let _ = child.kill();
-                                            break child.wait().map_err(|e| e.to_string())?;
-                                        }
+                                    if let Some(t) = timeout
+                                        && !killed
+                                        && start.elapsed() >= t
+                                    {
+                                        killed = true;
+                                        crate::tools::kill_process_group_tree(Some(pid));
+                                        let _ = child.kill();
+                                        break child.wait().map_err(|e| e.to_string())?;
                                     }
                                     if let Ok(chunk) = rx.recv_timeout(Duration::from_millis(5)) {
                                         ingest_chunk!(chunk.kind, chunk.bytes);

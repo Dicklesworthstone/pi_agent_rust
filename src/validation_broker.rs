@@ -985,7 +985,7 @@ impl ValidationBrokerInputSnapshot {
     }
 
     #[must_use]
-    pub fn is_degraded(&self) -> bool {
+    pub const fn is_degraded(&self) -> bool {
         !self.degraded_reasons.is_empty()
     }
 }

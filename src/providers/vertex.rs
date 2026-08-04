@@ -281,11 +281,11 @@ impl Provider for VertexProvider {
             .header("Authorization", format!("Bearer {auth_value}"));
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                for (key, value) in custom_headers {
-                    request = request.header(key, value);
-                }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            for (key, value) in custom_headers {
+                request = request.header(key, value);
             }
         }
 
@@ -439,10 +439,10 @@ where
         }
 
         // Process candidates.
-        if let Some(candidates) = response.candidates {
-            if let Some(candidate) = candidates.into_iter().next() {
-                self.process_candidate(candidate)?;
-            }
+        if let Some(candidates) = response.candidates
+            && let Some(candidate) = candidates.into_iter().next()
+        {
+            self.process_candidate(candidate)?;
         }
 
         Ok(())

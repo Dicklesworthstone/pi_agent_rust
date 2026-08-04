@@ -241,16 +241,16 @@ fn validate_scenario_fixture(path: &Path, value: &Value) -> Result<(), String> {
             _ => {}
         }
 
-        if let Some(input_value) = value.pointer(&ptr("input")) {
-            if !(input_value.is_object() || input_value.is_null()) {
-                return Err(format!("{} must be object or null", ptr("input")));
-            }
+        if let Some(input_value) = value.pointer(&ptr("input"))
+            && !(input_value.is_object() || input_value.is_null())
+        {
+            return Err(format!("{} must be object or null", ptr("input")));
         }
 
-        if let Some(expect_value) = value.pointer(&ptr("expect")) {
-            if !expect_value.is_object() {
-                return Err(format!("{} must be object", ptr("expect")));
-            }
+        if let Some(expect_value) = value.pointer(&ptr("expect"))
+            && !expect_value.is_object()
+        {
+            return Err(format!("{} must be object", ptr("expect")));
         }
     }
 

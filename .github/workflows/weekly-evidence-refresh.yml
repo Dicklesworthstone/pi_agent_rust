@@ -40,8 +40,9 @@ jobs:
           sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy
 
       - name: Cargo cache

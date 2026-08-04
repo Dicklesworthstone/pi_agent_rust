@@ -215,29 +215,27 @@ pub fn github_repo_guesses_from_slug(slug: &str) -> Vec<GitHubRepoRef> {
     // Common case for our third-party imports: `owner-pi-foo` should be `owner/pi-foo`.
     if let Some((owner, suffix)) = slug.split_once("-pi-") {
         let repo = format!("pi-{suffix}");
-        if let Some(r) = parse_owner_repo(owner, &repo) {
-            if seen.insert(r.clone()) {
-                out.push(r);
-            }
+        if let Some(r) = parse_owner_repo(owner, &repo)
+            && seen.insert(r.clone())
+        {
+            out.push(r);
         }
     }
 
     // Try first hyphen split: `owner-rest...` -> `owner/rest...`
-    if let Some((owner, repo)) = slug.split_once('-') {
-        if let Some(r) = parse_owner_repo(owner, repo) {
-            if seen.insert(r.clone()) {
-                out.push(r);
-            }
-        }
+    if let Some((owner, repo)) = slug.split_once('-')
+        && let Some(r) = parse_owner_repo(owner, repo)
+        && seen.insert(r.clone())
+    {
+        out.push(r);
     }
 
     // Try last hyphen split: `owner...-repo` -> `owner.../repo`
-    if let Some((owner, repo)) = slug.rsplit_once('-') {
-        if let Some(r) = parse_owner_repo(owner, repo) {
-            if seen.insert(r.clone()) {
-                out.push(r);
-            }
-        }
+    if let Some((owner, repo)) = slug.rsplit_once('-')
+        && let Some(r) = parse_owner_repo(owner, repo)
+        && seen.insert(r.clone())
+    {
+        out.push(r);
     }
 
     out

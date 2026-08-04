@@ -162,8 +162,9 @@ jobs:
           choco install -y fd ripgrep
 
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy, llvm-tools-preview
 
       - name: Install cargo-llvm-cov
@@ -717,14 +718,14 @@ jobs:
         run: cargo fmt --check
 
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings
 
       - name: cargo clippy (wasm-host) [linux]
         if: runner.os == 'Linux'
-        run: cargo clippy --all-targets --features wasm-host -- -D warnings
+        run: cargo clippy --locked --all-targets --features wasm-host,internal-legacy-capture -- -D warnings
 
       - name: cargo doc
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
 
       - name: Reclaim disk space before tests [linux]
         if: runner.os == 'Linux'
@@ -737,7 +738,7 @@ jobs:
           df -h /
 
       - name: cargo test
-        run: cargo test --all-targets
+        run: cargo test --locked --all-targets --features internal-legacy-capture
 
       - name: Upload inclusion manifest artifacts
         if: always()
@@ -761,7 +762,7 @@ jobs:
 
       - name: cargo test (wasm-host) [linux]
         if: runner.os == 'Linux'
-        run: cargo test --all-targets --features wasm-host
+        run: cargo test --locked --all-targets --features wasm-host,internal-legacy-capture
 
       - name: Prepare claim-integrity perf paths [linux]
         if: runner.os == 'Linux'
@@ -769,12 +770,14 @@ jobs:
           set -euxo pipefail
           PERF_CLAIM_CORRELATION_ID="ci-claim-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           PERF_EVIDENCE_DIR="tests/e2e_results/perf-ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          echo "PERF_CLAIM_CORRELATION_ID=${PERF_CLAIM_CORRELATION_ID}" >> "$GITHUB_ENV"
-          echo "PERF_EVIDENCE_DIR=${PERF_EVIDENCE_DIR}" >> "$GITHUB_ENV"
-          echo "PERF_BASELINE_CONFIDENCE_JSON=${PERF_EVIDENCE_DIR}/results/baseline_variance_confidence.json" >> "$GITHUB_ENV"
-          echo "PERF_EXTENSION_STRATIFICATION_JSON=${PERF_EVIDENCE_DIR}/results/extension_benchmark_stratification.json" >> "$GITHUB_ENV"
-          echo "PERF_SCENARIO_CELL_STATUS_JSON=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.json" >> "$GITHUB_ENV"
-          echo "PERF_SCENARIO_CELL_STATUS_MD=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.md" >> "$GITHUB_ENV"
+          {
+            echo "PERF_CLAIM_CORRELATION_ID=${PERF_CLAIM_CORRELATION_ID}"
+            echo "PERF_EVIDENCE_DIR=${PERF_EVIDENCE_DIR}"
+            echo "PERF_BASELINE_CONFIDENCE_JSON=${PERF_EVIDENCE_DIR}/results/baseline_variance_confidence.json"
+            echo "PERF_EXTENSION_STRATIFICATION_JSON=${PERF_EVIDENCE_DIR}/results/extension_benchmark_stratification.json"
+            echo "PERF_SCENARIO_CELL_STATUS_JSON=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.json"
+            echo "PERF_SCENARIO_CELL_STATUS_MD=${PERF_EVIDENCE_DIR}/claim_integrity_scenario_cell_status.md"
+          } >> "$GITHUB_ENV"
 
       - name: Generate perf claim-integrity evidence bundle [linux]
         if: runner.os == 'Linux'
@@ -1116,7 +1119,7 @@ jobs:
           PI_EXT_GATE_MODE: ${{ vars.PI_EXT_GATE_MODE || 'strict' }}
         run: |
           set -euxo pipefail
-          cargo test --test ext_conformance_generated --features ext-conformance \
+          cargo test --locked --test ext_conformance_generated --features ext-conformance \
             -- conformance_must_pass_gate --nocapture --exact
         continue-on-error: false
 
@@ -1135,7 +1138,7 @@ jobs:
         if: always()
         run: |
           set -euxo pipefail
-          cargo test --test ci_cross_platform_matrix \
+          cargo test --locked --test ci_cross_platform_matrix \
             -- cross_platform_matrix --nocapture --exact
         continue-on-error: true
 
@@ -1154,7 +1157,7 @@ jobs:
         if: always() && runner.os == 'Linux'
         run: |
           set -euxo pipefail
-          cargo test --test ci_evidence_bundle \
+          cargo test --locked --test ci_evidence_bundle \
             -- build_evidence_bundle --nocapture --exact
         continue-on-error: true
 
@@ -1162,14 +1165,14 @@ jobs:
         if: always() && runner.os == 'Linux'
         run: |
           set -euxo pipefail
-          cargo test --test security_conformance_benign -- --nocapture
+          cargo test --locked --test security_conformance_benign -- --nocapture
         continue-on-error: true
 
       - name: Full-suite gate [linux]
         if: always() && runner.os == 'Linux'
         run: |
           set -euxo pipefail
-          cargo test --test ci_full_suite_gate \
+          cargo test --locked --test ci_full_suite_gate \
             -- full_suite_gate --nocapture --exact
         continue-on-error: true
 
@@ -1180,101 +1183,350 @@ jobs:
           python3 - <<'PY'
           import json
           import os
+          import re
+          import subprocess
           from datetime import datetime, timezone
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
 
           source_path = Path("tests/full_suite_gate/certification_verdict.json")
+          contract_path = Path("docs/contracts/dropin-certification-contract.json")
           target_path = Path("docs/evidence/dropin-certification-verdict.json")
+          repo_root = Path.cwd().resolve(strict=True)
           generated_at = (
               datetime.now(timezone.utc)
               .replace(microsecond=0)
               .isoformat()
               .replace("+00:00", "Z")
           )
+          gate_id_pattern = re.compile(r"G(0[1-9]|1[0-2])-[a-z0-9]+(?:-[a-z0-9]+)*")
+          commit_pattern = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 
           def write_payload(payload):
+              if target_path.is_symlink():
+                  raise RuntimeError(f"refusing to replace symlinked verdict target: {target_path}")
               target_path.parent.mkdir(parents=True, exist_ok=True)
               target_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
               print(
                   f"Wrote {target_path} with overall_verdict={payload.get('overall_verdict')}"
               )
 
-          if not source_path.exists():
-              write_payload(
-                  {
-                      "schema": "pi.dropin.certification_verdict.v1",
-                      "git_commit": os.environ.get("GITHUB_SHA", "unknown"),
-                      "generated_at_utc": generated_at,
-                      "overall_verdict": "NOT_CERTIFIED",
-                      "hard_gate_results": [],
-                      "blocking_reasons": [
-                          f"missing source artifact: {source_path.as_posix()}"
-                      ],
-                      "evidence_index": [
-                          {
-                              "path": source_path.as_posix(),
-                              "exists": False,
-                          }
-                      ],
-                      "source": {
-                          "certification_lane_artifact": source_path.as_posix(),
-                          "lane_verdict": "missing",
-                      },
-                  }
+          def load_object(path, label, errors):
+              if path.is_symlink() or not path.is_file():
+                  errors.append(
+                      f"missing or non-regular {label}: {path.as_posix()}"
+                  )
+                  return {}
+              try:
+                  payload = json.loads(path.read_text(encoding="utf-8"))
+              except Exception as exc:  # noqa: BLE001
+                  errors.append(f"invalid {label}: {exc}")
+                  return {}
+              if not isinstance(payload, dict):
+                  errors.append(f"invalid {label}: root must be an object")
+                  return {}
+              return payload
+
+          def canonical_repo_path(value):
+              if (
+                  not isinstance(value, str)
+                  or not value
+                  or "\\" in value
+                  or re.match(r"^[A-Za-z]:", value) is not None
+              ):
+                  return None
+              pure = PurePosixPath(value)
+              if (
+                  pure.is_absolute()
+                  or pure.as_posix() != value
+                  or any(part in ("", ".", "..") for part in pure.parts)
+              ):
+                  return None
+              return pure.as_posix()
+
+          def run_git(*args, text=True):
+              env = os.environ.copy()
+              env["GIT_LITERAL_PATHSPECS"] = "1"
+              return subprocess.run(
+                  ["git", *args],
+                  check=False,
+                  capture_output=True,
+                  text=text,
+                  env=env,
               )
-              raise SystemExit(0)
 
-          source = json.loads(source_path.read_text(encoding="utf-8"))
-          gates = source.get("gates", [])
+          def committed_regular_blob_error(value):
+              relative = canonical_repo_path(value)
+              if relative is None:
+                  return "path is not canonical and repository-relative"
+              candidate = Path(relative)
+              if candidate.is_symlink() or not candidate.is_file():
+                  return "path is not a regular non-symlink file"
+              try:
+                  candidate.resolve(strict=True).relative_to(repo_root)
+              except (OSError, RuntimeError, ValueError):
+                  return "path resolves outside the repository"
+
+              tree = run_git("ls-tree", "-z", "HEAD", "--", relative, text=False)
+              if tree.returncode != 0:
+                  return "unable to inspect release HEAD"
+              records = [record for record in tree.stdout.split(b"\0") if record]
+              if len(records) != 1:
+                  return "path is not tracked as one exact release-HEAD entry"
+              try:
+                  metadata, recorded_path = records[0].split(b"\t", 1)
+                  mode, object_type, object_id = metadata.split(b" ", 2)
+              except ValueError:
+                  return "release-HEAD entry is malformed"
+              if (
+                  mode not in (b"100644", b"100755")
+                  or object_type != b"blob"
+                  or os.fsdecode(recorded_path) != relative
+              ):
+                  return "release-HEAD entry is not a canonical regular-file blob"
+
+              committed = run_git("cat-file", "blob", os.fsdecode(object_id), text=False)
+              if committed.returncode != 0:
+                  return "unable to read release-HEAD blob"
+              try:
+                  worktree_bytes = candidate.read_bytes()
+              except OSError as exc:
+                  return f"unable to read worktree artifact: {exc}"
+              if committed.stdout != worktree_bytes:
+                  return "worktree bytes differ from the release-HEAD blob"
+              return None
+
+          def resolve_git_commit():
+              candidate = os.environ.get("GITHUB_SHA", "").strip()
+              if commit_pattern.fullmatch(candidate):
+                  return candidate
+              result = subprocess.run(
+                  ["git", "rev-parse", "--verify", "HEAD^{commit}"],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              fallback = result.stdout.strip()
+              return fallback if result.returncode == 0 else candidate
+
+          producer_errors = []
+          contract = load_object(contract_path, "drop-in certification contract", producer_errors)
+          source = load_object(source_path, "certification lane artifact", producer_errors)
+          contract_provenance_error = committed_regular_blob_error(contract_path.as_posix())
+          if contract_provenance_error is not None:
+              producer_errors.append(
+                  "drop-in certification contract provenance: " + contract_provenance_error
+              )
+
+          if contract.get("schema") != "pi.dropin.certification_contract.v1":
+              producer_errors.append("unsupported drop-in certification contract schema")
+          enforcement = contract.get("release_process_enforcement")
+          verdict_spec = enforcement.get("verdict_artifact_contract") if isinstance(enforcement, dict) else None
+          required_verdict_fields = {
+              "git_commit",
+              "generated_at_utc",
+              "overall_verdict",
+              "hard_gate_results",
+              "blocking_reasons",
+              "evidence_index",
+          }
+          if not isinstance(verdict_spec, dict):
+              producer_errors.append("contract verdict_artifact_contract must be an object")
+          else:
+              if verdict_spec.get("path") != target_path.as_posix():
+                  producer_errors.append("contract verdict path does not name the canonical target")
+              if verdict_spec.get("schema") != "pi.dropin.certification_verdict.v1":
+                  producer_errors.append("contract names an unsupported verdict schema")
+              required_fields = verdict_spec.get("required_fields")
+              if (
+                  not isinstance(required_fields, list)
+                  or len(required_fields) != len(set(required_fields))
+                  or set(required_fields) != required_verdict_fields
+              ):
+                  producer_errors.append("contract verdict required_fields do not match the v1 schema")
+          if source.get("schema") != "pi.ci.certification_lane.v1":
+              producer_errors.append("unsupported certification lane schema")
+
+          contract_gates = contract.get("hard_gates")
+          gate_specs = []
+          if not isinstance(contract_gates, list):
+              producer_errors.append("contract hard_gates must be an array")
+          else:
+              seen_gate_ids = set()
+              for index, gate in enumerate(contract_gates, start=1):
+                  if not isinstance(gate, dict):
+                      producer_errors.append(f"contract hard_gates[{index - 1}] must be an object")
+                      continue
+                  gate_id = gate.get("gate_id")
+                  match = gate_id_pattern.fullmatch(gate_id) if isinstance(gate_id, str) else None
+                  if match is None or int(match.group(1)) != index:
+                      producer_errors.append(
+                          f"contract hard_gates[{index - 1}] must be canonical gate G{index:02d}"
+                      )
+                      continue
+                  if gate_id in seen_gate_ids:
+                      producer_errors.append(f"duplicate contract hard gate: {gate_id}")
+                      continue
+                  seen_gate_ids.add(gate_id)
+                  blocking = gate.get("blocking")
+                  if not isinstance(blocking, bool):
+                      producer_errors.append(f"contract hard gate {gate_id} blocking must be boolean")
+                      continue
+                  bead = gate.get("owner_issue_primary")
+                  if not isinstance(bead, str) or not bead:
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} owner_issue_primary must be non-empty"
+                      )
+                      continue
+                  required_artifacts = gate.get("required_artifacts")
+                  if not isinstance(required_artifacts, list) or not required_artifacts:
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} required_artifacts must be non-empty"
+                      )
+                      continue
+                  canonical_artifacts = [canonical_repo_path(path) for path in required_artifacts]
+                  if any(path is None for path in canonical_artifacts):
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} has a non-canonical required artifact"
+                      )
+                      continue
+                  if len(canonical_artifacts) != len(set(canonical_artifacts)):
+                      producer_errors.append(
+                          f"contract hard gate {gate_id} repeats a required artifact"
+                      )
+                      continue
+                  gate_specs.append(
+                      {
+                          "gate_id": gate_id,
+                          "blocking": blocking,
+                          "required_artifacts": canonical_artifacts,
+                          "bead": bead,
+                      }
+                  )
+              if len(contract_gates) != 12 or len(gate_specs) != 12:
+                  producer_errors.append(
+                      f"contract must define exactly the ordered G01-G12 gate set; found {len(gate_specs)} valid gates"
+                  )
+
+          source_gates = source.get("gates")
+          source_gate_by_id = {}
+          if not isinstance(source_gates, list):
+              producer_errors.append("certification lane gates must be an array")
+          else:
+              for index, gate in enumerate(source_gates):
+                  if (
+                      not isinstance(gate, dict)
+                      or not isinstance(gate.get("id"), str)
+                      or not gate["id"]
+                  ):
+                      producer_errors.append(f"certification lane gate[{index}] is malformed")
+                      continue
+                  gate_id = gate["id"]
+                  if gate_id in source_gate_by_id:
+                      producer_errors.append(f"duplicate certification lane gate: {gate_id}")
+                      continue
+                  source_gate_by_id[gate_id] = gate
+
           hard_gate_results = []
-          blocking_reasons = []
-          evidence_index = []
+          blocking_reasons = list(producer_errors)
+          evidence_by_path = {}
+          artifact_errors = {}
+          for spec in gate_specs:
+              gate_id = spec["gate_id"]
+              required_artifacts = spec["required_artifacts"]
+              for artifact_path in required_artifacts:
+                  if artifact_path not in artifact_errors:
+                      artifact_errors[artifact_path] = committed_regular_blob_error(
+                          artifact_path
+                      )
+                  evidence_by_path.setdefault(
+                      artifact_path,
+                      {"path": artifact_path, "exists": artifact_errors[artifact_path] is None},
+                  )
 
-          for gate in gates:
-              gate_id = str(gate.get("id", "unknown"))
-              status = str(gate.get("status", "unknown")).lower()
-              blocking = bool(gate.get("blocking", False))
-              detail = gate.get("detail")
-              artifact_path = gate.get("artifact_path")
+              source_gate = source_gate_by_id.get(gate_id)
+              failures = []
+              status = "fail"
+              detail = None
+              if source_gate is None:
+                  failures.append("canonical gate is absent from certification lane output")
+              else:
+                  source_status = source_gate.get("status")
+                  normalized_status = source_status.lower() if isinstance(source_status, str) else ""
+                  if normalized_status not in ("pass", "fail", "blocked", "waived"):
+                      failures.append(f"invalid certification lane status: {source_status!r}")
+                  elif normalized_status != "pass":
+                      failures.append(f"certification lane status={normalized_status}")
 
+                  source_blocking = source_gate.get("blocking")
+                  if source_blocking is not spec["blocking"]:
+                      failures.append(
+                          f"certification lane blocking={source_blocking!r}, expected {spec['blocking']}"
+                      )
+
+                  source_artifacts = source_gate.get("artifact_paths")
+                  if source_artifacts is None and isinstance(source_gate.get("artifact_path"), str):
+                      source_artifacts = [source_gate["artifact_path"]]
+                  if source_artifacts != required_artifacts:
+                      failures.append(
+                          "certification lane artifact paths do not match the contract"
+                      )
+                  source_detail = source_gate.get("detail")
+                  if source_detail is not None and not isinstance(source_detail, str):
+                      failures.append("certification lane detail must be a string or null")
+                  elif source_detail:
+                      detail = source_detail
+
+              invalid_artifacts = [
+                  f"{path} ({artifact_errors[path]})"
+                  for path in required_artifacts
+                  if artifact_errors[path] is not None
+              ]
+              if invalid_artifacts:
+                  failures.append(
+                      "invalid required artifacts: " + ", ".join(invalid_artifacts)
+                  )
+
+              if not failures:
+                  status = "pass"
+              else:
+                  failure_detail = "; ".join(failures)
+                  detail = f"{detail}; {failure_detail}" if detail else failure_detail
+                  blocking_reasons.append(f"{gate_id}:fail ({failure_detail})")
               hard_gate_results.append(
                   {
                       "gate_id": gate_id,
                       "status": status,
-                      "blocking": blocking,
+                      "blocking": spec["blocking"],
                       "detail": detail,
-                      "artifact_path": artifact_path,
-                      "bead": gate.get("bead"),
+                      "artifact_paths": required_artifacts,
+                      "bead": spec["bead"],
                   }
               )
 
-              if blocking and status != "pass":
-                  reason = f"{gate_id}:{status}"
-                  if detail:
-                      reason = f"{reason} ({detail})"
-                  blocking_reasons.append(reason)
+          lane_verdict = source.get("verdict", "missing")
+          if lane_verdict != "pass":
+              blocking_reasons.append(f"certification lane verdict={lane_verdict!r} (expected 'pass')")
 
-              if isinstance(artifact_path, str) and artifact_path:
-                  evidence_index.append(
-                      {
-                          "path": artifact_path,
-                          "exists": Path(artifact_path).exists(),
-                      }
-                  )
-
-          overall_verdict = "CERTIFIED" if not blocking_reasons else "NOT_CERTIFIED"
+          overall_verdict = (
+              "CERTIFIED"
+              if len(hard_gate_results) == 12
+              and all(gate["status"] == "pass" for gate in hard_gate_results)
+              and not blocking_reasons
+              else "NOT_CERTIFIED"
+          )
           write_payload(
               {
                   "schema": "pi.dropin.certification_verdict.v1",
-                  "git_commit": os.environ.get("GITHUB_SHA", "unknown"),
+                  "git_commit": resolve_git_commit(),
                   "generated_at_utc": generated_at,
                   "overall_verdict": overall_verdict,
                   "hard_gate_results": hard_gate_results,
                   "blocking_reasons": blocking_reasons,
-                  "evidence_index": evidence_index,
+                  "evidence_index": list(evidence_by_path.values()),
                   "source": {
                       "certification_lane_artifact": source_path.as_posix(),
-                      "lane_verdict": source.get("verdict", "unknown"),
+                      "lane_schema": source.get("schema"),
+                      "lane_verdict": lane_verdict,
                       "lane_generated_at": source.get("generated_at"),
                   },
               }
@@ -1291,16 +1543,30 @@ jobs:
           RELEASE_GATE_CARGO_RUNNER: local
         run: |
           set -euxo pipefail
-          ./scripts/release_gate.sh --report --no-rch | tee release_gate_report.json
-          VERDICT=$(python3 -c "import json; print(json.load(open('release_gate_report.json')).get('verdict','unknown'))")
+          report_path="${RUNNER_TEMP}/pi-release-gate-report.json"
+          gate_checkout="${RUNNER_TEMP}/pi-release-gate-checkout"
+          # Earlier evidence producers intentionally write ignored and tracked
+          # artifacts in the primary checkout. The release gate verifies only
+          # committed evidence and a clean source tree, so run it against a
+          # detached worktree populated from the exact CI commit.
+          git worktree add --detach "$gate_checkout" HEAD
+          cd "$gate_checkout"
+          gate_exit=0
+          ./scripts/release_gate.sh --report --no-rch | tee "$report_path" || gate_exit=$?
+          VERDICT=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('verdict','unknown'))" "$report_path")
           echo "Release gate verdict: $VERDICT"
-          if [ "$VERDICT" = "fail" ]; then
-            if [ "${RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED:-0}" = "1" ]; then
-              echo "::error::Release gate failed under strict mode (RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED=1)"
-              exit 1
-            fi
-            echo "::warning::Release gate failed — conformance evidence bundle does not meet thresholds"
+          if [ "$gate_exit" -ne 0 ] || [ "$VERDICT" != "pass" ]; then
+            echo "::error::Release gate failed (exit=$gate_exit, verdict=$VERDICT)"
+            exit 1
           fi
+
+      - name: Upload release gate report [linux]
+        if: always() && runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-gate-${{ github.sha }}
+          path: ${{ runner.temp }}/pi-release-gate-report.json
+          if-no-files-found: error
 
       - name: Upload unified evidence bundle [linux]
         if: always() && runner.os == 'Linux'
@@ -1325,7 +1591,6 @@ jobs:
             tests/security_compat/security_compat_dashboard.json
             tests/security_compat/security_compat_events.jsonl
             docs/evidence/dropin-certification-verdict.json
-            release_gate_report.json
           if-no-files-found: warn
 
       - name: Reclaim disk space before coverage [linux]
@@ -1342,7 +1607,7 @@ jobs:
           set -euxo pipefail
           start=$(date +%s)
           echo "env: CI=$CI VCR_MODE=$VCR_MODE VCR_CASSETTE_DIR=$VCR_CASSETTE_DIR"
-          cargo llvm-cov --all-targets --workspace --summary-only | tee llvm-cov-summary.txt
+          cargo llvm-cov --locked --all-targets --workspace --summary-only | tee llvm-cov-summary.txt
           end=$(date +%s)
           echo "coverage_summary_duration_s=$((end-start))"
 
@@ -1352,14 +1617,14 @@ jobs:
           set -euxo pipefail
           start=$(date +%s)
           # Coverage gate: 50% (actual: ~66% as of 2026-02-05)
-          cargo llvm-cov --all-targets --workspace --lcov --output-path lcov.info --fail-under-lines 50
+          cargo llvm-cov --locked --all-targets --workspace --lcov --output-path lcov.info --fail-under-lines 50
           ls -lah lcov.info
           end=$(date +%s)
           echo "coverage_lcov_duration_s=$((end-start))"
 
       - name: Coverage report (html)
         if: runner.os == 'Linux'
-        run: cargo llvm-cov --all-targets --workspace --html
+        run: cargo llvm-cov --locked --all-targets --workspace --html
 
       - name: Upload coverage artifacts
         if: runner.os == 'Linux'
@@ -1421,8 +1686,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
@@ -1434,7 +1700,7 @@ jobs:
       - name: Release evidence gate
         run: |
           set -euxo pipefail
-          cargo test --test release_evidence_gate -- --nocapture
+          cargo test --locked --test release_evidence_gate -- --nocapture
 
   qa_shards_linux:
     name: qa-shard (${{ matrix.shard.name }})
@@ -1520,8 +1786,9 @@ jobs:
           sudo ln -sf "$(command -v fdfind)" /usr/local/bin/fd
 
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy, llvm-tools-preview
 
       - name: Cache cargo artifacts
@@ -1574,7 +1841,7 @@ jobs:
               PI_SHARD_TOTAL="${{ matrix.shard.shard_total }}" \
               PI_SHARD_PARALLELISM="${{ vars.PI_EXT_SHARD_PARALLELISM || '4' }}" \
               RUST_LOG=info \
-              cargo test --test ext_conformance_generated --features ext-conformance \
+              cargo test --locked --test ext_conformance_generated --features ext-conformance \
                 -- conformance_sharded_matrix --nocapture --exact \
                 2>&1 | tee "$SHARD_ARTIFACT_DIR/output.log"
               mkdir -p "$SHARD_ARTIFACT_DIR/sharded"
@@ -1587,6 +1854,7 @@ jobs:
               TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
               RUST_LOG=info \
               cargo test \
+                --locked \
                 --test json_mode_parity \
                 --test cross_surface_parity \
                 --test config_precedence \
@@ -1603,6 +1871,7 @@ jobs:
               TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
               RUST_LOG=info \
               cargo test \
+                --locked \
                 --test security_budgets \
                 --test security_fs_escape \
                 --test security_http_policy \
@@ -1613,11 +1882,12 @@ jobs:
               TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
               TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
               RUST_LOG=info \
-              cargo build --bin pi
+              cargo build --locked --bin pi
               TEST_LOG_JSONL_PATH="$SHARD_ARTIFACT_DIR/test-log.jsonl" \
               TEST_ARTIFACT_INDEX_PATH="$SHARD_ARTIFACT_DIR/artifact-index.jsonl" \
               RUST_LOG=info \
               cargo test \
+                --locked \
                 --test perf_budgets \
                 --test perf_regression \
                 --test perf_comparison \
@@ -2224,8 +2494,9 @@ jobs:
           fetch-depth: 0
 
       - name: Install Rust toolchain (nightly)
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # pinned 2026-08-04
         with:
+          toolchain: nightly-2026-07-05
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
@@ -2242,4 +2513,4 @@ jobs:
           # `--lib` (not `--all-targets`) is deliberate: the `pi` binary and the
           # integration tests/benches require the `tui` feature, so they are
           # expected to be skipped here — only the library contract is locked in.
-          cargo check --no-default-features --lib
+          cargo check --locked --no-default-features --lib

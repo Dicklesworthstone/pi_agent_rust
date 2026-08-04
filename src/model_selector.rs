@@ -113,7 +113,7 @@ impl ModelSelectorOverlay {
         }
     }
 
-    pub fn select_next(&mut self) {
+    pub const fn select_next(&mut self) {
         if !self.filtered.is_empty() {
             self.selected = (self.selected + 1) % self.filtered.len();
         }
@@ -145,7 +145,7 @@ impl ModelSelectorOverlay {
     }
 
     #[must_use]
-    pub fn filtered_len(&self) -> usize {
+    pub const fn filtered_len(&self) -> usize {
         self.filtered.len()
     }
 

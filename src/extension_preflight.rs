@@ -834,17 +834,19 @@ fn extract_import_specifiers_simple(line: &str) -> Vec<String> {
     if trimmed.starts_with("import ") || trimmed.starts_with("export ") {
         if let Some(from_idx) = trimmed.find(" from ") {
             let rest = &trimmed[from_idx + 6..];
-            if let Some(spec) = extract_quoted_string(rest) {
-                if !spec.starts_with('.') && !spec.starts_with('/') {
-                    specs.push(spec);
-                }
+            if let Some(spec) = extract_quoted_string(rest)
+                && !spec.starts_with('.')
+                && !spec.starts_with('/')
+            {
+                specs.push(spec);
             }
         } else if let Some(rest) = trimmed.strip_prefix("import ") {
             // Check for side-effect import: import "spec"
-            if let Some(spec) = extract_quoted_string(rest) {
-                if !spec.starts_with('.') && !spec.starts_with('/') {
-                    specs.push(spec);
-                }
+            if let Some(spec) = extract_quoted_string(rest)
+                && !spec.starts_with('.')
+                && !spec.starts_with('/')
+            {
+                specs.push(spec);
             }
         }
     }
@@ -853,10 +855,11 @@ fn extract_import_specifiers_simple(line: &str) -> Vec<String> {
     let mut search = trimmed;
     while let Some(req_idx) = search.find("require(") {
         let rest = &search[req_idx + 8..];
-        if let Some(spec) = extract_quoted_string(rest) {
-            if !spec.starts_with('.') && !spec.starts_with('/') {
-                specs.push(spec);
-            }
+        if let Some(spec) = extract_quoted_string(rest)
+            && !spec.starts_with('.')
+            && !spec.starts_with('/')
+        {
+            specs.push(spec);
         }
         search = &search[req_idx + 8..];
     }
@@ -2017,15 +2020,15 @@ fn contains_with_statement(text: &str) -> bool {
         return true;
     }
     // Also catch `} with (` for inline blocks.
-    if let Some(pos) = text.find("with") {
-        if pos > 0 {
-            let before = text[..pos].trim_end();
-            let after = text[pos + 4..].trim_start();
-            if (before.ends_with('{') || before.ends_with('}') || before.ends_with(';'))
-                && after.starts_with('(')
-            {
-                return true;
-            }
+    if let Some(pos) = text.find("with")
+        && pos > 0
+    {
+        let before = text[..pos].trim_end();
+        let after = text[pos + 4..].trim_start();
+        if (before.ends_with('{') || before.ends_with('}') || before.ends_with(';'))
+            && after.starts_with('(')
+        {
+            return true;
         }
     }
     false
@@ -2194,15 +2197,14 @@ fn collect_scannable_files(path: &Path) -> std::io::Result<Vec<std::path::PathBu
                 continue;
             }
             files.extend(collect_scannable_files(&p)?);
-        } else if p.is_file() {
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if matches!(
-                    ext,
-                    "js" | "ts" | "mjs" | "mts" | "cjs" | "cts" | "jsx" | "tsx"
-                ) {
-                    files.push(p);
-                }
-            }
+        } else if p.is_file()
+            && let Some(ext) = p.extension().and_then(|e| e.to_str())
+            && matches!(
+                ext,
+                "js" | "ts" | "mjs" | "mts" | "cjs" | "cts" | "jsx" | "tsx"
+            )
+        {
+            files.push(p);
         }
     }
     files.sort();

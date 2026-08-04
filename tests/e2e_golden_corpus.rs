@@ -273,12 +273,12 @@ impl GoldenTestHarness {
             buf
         });
 
-        if let Some(input) = stdin {
-            if let Some(mut child_stdin) = child.stdin.take() {
-                child_stdin
-                    .write_all(input.as_bytes())
-                    .expect("write stdin");
-            }
+        if let Some(input) = stdin
+            && let Some(mut child_stdin) = child.stdin.take()
+        {
+            child_stdin
+                .write_all(input.as_bytes())
+                .expect("write stdin");
         }
 
         let timeout = Duration::from_secs(DEFAULT_TIMEOUT_SECS);

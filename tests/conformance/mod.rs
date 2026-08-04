@@ -228,12 +228,12 @@ pub fn validate_expected(
     }
 
     // Check content_exact
-    if let Some(exact) = &expected.content_exact {
-        if content != exact {
-            return Err(format!(
-                "Content mismatch.\nExpected:\n{exact}\nActual:\n{content}"
-            ));
-        }
+    if let Some(exact) = &expected.content_exact
+        && content != exact
+    {
+        return Err(format!(
+            "Content mismatch.\nExpected:\n{exact}\nActual:\n{content}"
+        ));
     }
 
     // Check content_regex

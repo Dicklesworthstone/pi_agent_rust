@@ -1,23 +1,18 @@
-# Pinned to a specific nightly so CI is reproducible. The codebase requires
-# nightly because the fsqlite / sqlmodel-sqlite dependency family uses
-# feature(portable_simd) (pi itself is #![forbid(unsafe_code)] and uses no
-# nightly features directly). An unpinned `nightly` channel let clippy drift
-# across toolchains: newer nightlies strengthen the pedantic/nursery lint groups
-# and even stop honoring crate-level/`#[allow]`d lints (e.g. the floating
-# 2026-05-22 nightly re-flagged ~19 `clippy::unused_async` sites that already
-# carry `#![allow(clippy::unused_async)]` in src/lib.rs). CI runs
-# `cargo clippy --all-targets -- -D warnings`, so every newly-introduced or
-# newly-unmasked lint turned the build red without any code change. Pinning a
-# known-good date keeps lint results stable. Bump this deliberately, re-running
-# clippy, rather than floating.
+# Pinned to a specific nightly so builds and lint results are reproducible.
+# The locked dependency graph requires Rust 1.95 or newer; the repository's
+# validated release toolchain is nightly-2026-07-05. An unpinned `nightly`
+# channel let clippy drift across toolchains: newer nightlies strengthen the
+# pedantic/nursery lint groups and can expose new warnings without a source
+# change. CI runs `cargo clippy --all-targets -- -D warnings`, so bump this pin
+# deliberately and re-run the complete release gates rather than floating.
 #
 # Deliberate bump 2026-07-09: nightly-2026-02-19 -> nightly-2026-07-05.
-# asupersync 0.3.6 requires `sysinfo = "0.39"`, and every sysinfo 0.39.x uses
-# `core::cfg_select!`, which only stabilized after 2026-02-19 (it emits E0658 on
-# the old pin). nightly-2026-07-05 is the toolchain asupersync 0.3.6 itself pins
-# and is the current fleet default, so it is the natural, tested landing spot.
-# (Sibling beads_rust / meta_skill stay on 2026-02-19; they do not consume
-# asupersync 0.3.6.)
+# asupersync requires `sysinfo = "0.39"`; the locked sysinfo 0.39.6 declares
+# Rust 1.95 and uses language/library support unavailable on the old pin.
+# nightly-2026-07-05 is the validated landing spot for the current dependency
+# graph and lint policy.
+# (Sibling projects may use different pins because they do not consume this
+# repository's locked asupersync/sysinfo graph.)
 [toolchain]
 channel = "nightly-2026-07-05"
 components = ["rustfmt", "clippy"]

@@ -1,9 +1,6 @@
-name: Publish
+name: Publish validation (no publication)
 
 on:
-  push:
-    tags:
-      - 'v[0-9]+.*'
   workflow_dispatch:
     inputs:
       tag:
@@ -12,8 +9,12 @@ on:
         type: string
 
 concurrency:
-  group: publish
+  # Share the one release lane with release.yml; this workflow never publishes.
+  group: release
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -25,72 +26,144 @@ jobs:
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
       version: ${{ steps.tag.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
+      commit: ${{ steps.source.outputs.commit }}
+      tag_oid: ${{ steps.source.outputs.tag_oid }}
+      main_commit: ${{ steps.source.outputs.main_commit }}
     steps:
       - name: Determine and validate tag
         id: tag
+        env:
+          RELEASE_EVENT_NAME: ${{ github.event_name }}
+          RELEASE_TAG_INPUT: ${{ inputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            TAG="${{ inputs.tag }}"
+          set -euo pipefail
+          if [ "$RELEASE_EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$RELEASE_TAG_INPUT"
           else
+            if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+              echo "::error::Expected a tag ref, got '$GITHUB_REF'"
+              exit 1
+            fi
             TAG="${GITHUB_REF#refs/tags/}"
+          fi
+
+          semver_tag_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$'
+          if [[ ! "$TAG" =~ $semver_tag_re ]]; then
+            echo "::error::Tag '$TAG' is not a complete v-prefixed SemVer tag"
+            exit 1
           fi
           VERSION="${TAG#v}"
 
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
-            echo "Error: Version '$VERSION' does not match semver format"
-            exit 1
+          version_without_build="${VERSION%%+*}"
+          if [[ "$version_without_build" == *-* ]]; then
+            PRERELEASE="true"
+          else
+            PRERELEASE="false"
           fi
 
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=$TAG"
+            echo "version=$VERSION"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout release tag for commit resolution
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          path: pi_agent_rust
+          fetch-depth: 0
+          persist-credentials: false
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+
+      - name: Freeze release source commit
+        id: source
+        working-directory: pi_agent_rust
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/publish-validation-plan/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/publish-validation-plan/main"
+          validation_master_ref="refs/release-validation/publish-validation-plan/master"
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}" \
+            "refs/heads/master:${validation_master_ref}"
+          tag_oid="$(git rev-parse "${tag_ref}")"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          tag_commit="$(git rev-parse "${tag_ref}^{commit}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          main_commit="$(git rev-parse "${validation_main_ref}^{commit}")"
+          master_commit="$(git rev-parse "${validation_master_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          for oid in "$tag_oid" "$remote_tag_oid" "$tag_commit" "$remote_commit" "$main_commit" "$master_commit" "$head_commit"; do
+            if [[ ! "$oid" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "::error::Release validation source contains an invalid Git object ID: $oid"
+              exit 1
+            fi
+          done
+          if [ "$tag_oid" != "$remote_tag_oid" ] \
+            || [ "$head_commit" != "$tag_commit" ] \
+            || [ "$remote_commit" != "$tag_commit" ] \
+            || [ "$tag_commit" != "$main_commit" ] \
+            || [ "$tag_commit" != "$master_commit" ]; then
+            echo "::error::Tag object/commit must equal the synchronized main/master release tips"
+            exit 1
+          fi
+          {
+            echo "commit=$tag_commit"
+            echo "tag_oid=$tag_oid"
+            echo "main_commit=$main_commit"
+          } >> "$GITHUB_OUTPUT"
 
   publish:
-    name: Publish to crates.io
+    # Irreversible publication lives only in release.yml, after binary verification.
+    name: Validate crates.io package (dry run only)
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    if: ${{ !contains(needs.plan.outputs.tag, '-') }}
-    env:
-      HAS_CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN != '' }}
+    timeout-minutes: 60
+    if: ${{ needs.plan.outputs.prerelease == 'false' }}
     defaults:
       run:
         working-directory: pi_agent_rust
         shell: bash
     steps:
       - name: Checkout pi_agent_rust
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           path: pi_agent_rust
           fetch-depth: 0
-          ref: ${{ needs.plan.outputs.tag }}
+          persist-credentials: false
+          ref: ${{ needs.plan.outputs.commit }}
 
-      - name: Checkout asupersync
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/asupersync
-          path: asupersync
-          fetch-depth: 1
-
-      - name: Checkout rich_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/rich_rust
-          path: rich_rust
-          fetch-depth: 1
-
-      - name: Checkout charmed_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/charmed_rust
-          path: charmed_rust
-          fetch-depth: 1
-
-      - name: Checkout sqlmodel_rust
-        uses: actions/checkout@v4
-        with:
-          repository: Dicklesworthstone/sqlmodel_rust
-          path: sqlmodel_rust
-          fetch-depth: 1
+      - name: Verify frozen release source
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          validation_tag_ref="refs/release-validation/publish-validation/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/publish-validation/main"
+          git fetch --no-tags --force origin \
+            "${tag_ref}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
+          remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          head_commit="$(git rev-parse 'HEAD^{commit}')"
+          if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
+            || [ "$head_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
+            echo "::error::Frozen release validation source changed"
+            exit 1
+          fi
 
       - name: Install system deps (xcb) [linux]
         run: |
@@ -98,42 +171,80 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master commit verified 2026-08-04
+        with:
+          toolchain: nightly-2026-07-05
 
       - name: Verify version matches tag
+        env:
+          RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
-          cargo_version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)
-          tag_version="${{ needs.plan.outputs.version }}"
-          if [[ "$cargo_version" != "$tag_version" ]]; then
-            echo "Version mismatch: Cargo.toml=$cargo_version, tag=$tag_version"
+          set -euo pipefail
+          cargo_version="$(cargo metadata --no-deps --locked --format-version 1 \
+            | python3 -c 'import json, pathlib, sys; data=json.load(sys.stdin); root=pathlib.Path("Cargo.toml").resolve(); matches=[p for p in data["packages"] if pathlib.Path(p["manifest_path"]) == root]; assert len(matches) == 1; print(matches[0]["version"])')"
+          if [[ "$cargo_version" != "$RELEASE_VERSION" ]]; then
+            echo "Version mismatch: Cargo.toml=$cargo_version, tag=$RELEASE_VERSION"
             exit 1
           fi
           echo "Version verified: $cargo_version"
 
+      - name: Run release gate
+        env:
+          RELEASE_GATE_CARGO_RUNNER: local
+          RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED: "0"
+          RELEASE_GATE_REQUIRE_PREFLIGHT: "1"
+          RELEASE_GATE_REQUIRE_QUALITY: "1"
+        run: |
+          set -euo pipefail
+          chmod +x scripts/release_gate.sh
+          report_path="${RUNNER_TEMP}/pi-publish-release-gate-report.json"
+          gate_exit=0
+          ./scripts/release_gate.sh --no-rch --report | tee "$report_path" || gate_exit=$?
+          verdict=$(python3 -c "import json, sys; print(json.load(open(sys.argv[1])).get('verdict','unknown'))" "$report_path")
+          echo "Release gate verdict: $verdict"
+          if [ "$gate_exit" -ne 0 ] || [ "$verdict" != "pass" ]; then
+            echo "::error::Release gate failed (exit=$gate_exit, verdict=$verdict)"
+            exit 1
+          fi
+
+      - name: Upload release gate report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: publish-release-gate-report
+          path: ${{ runner.temp }}/pi-publish-release-gate-report.json
+          if-no-files-found: error
+
       - name: Dry run publish
         run: cargo publish --dry-run --locked
 
-      # #99: this publish job only runs on a real (non-prerelease) release tag, so
-      # reaching it without a token means the release would otherwise *silently*
-      # skip cargo publish and still report success — which is how crates.io fell
-      # behind the repo. Fail loudly instead so a missing token is visible.
-      - name: Require CARGO_REGISTRY_TOKEN for release publish
-        if: env.HAS_CARGO_REGISTRY_TOKEN != 'true'
-        run: |
-          # GitHub parses ::error:: workflow commands from stdout (not stderr).
-          echo "::error::CARGO_REGISTRY_TOKEN secret is not configured — cannot publish to crates.io for this release tag."
-          echo "crates.io publishing would have been silently skipped (see #99). Set the CARGO_REGISTRY_TOKEN repo secret, then re-run."
-          exit 1
-
-      - name: Publish to crates.io
+      - name: Revalidate frozen source after dry run
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --locked
+          RELEASE_TAG: ${{ needs.plan.outputs.tag }}
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          RELEASE_TAG_OID: ${{ needs.plan.outputs.tag_oid }}
+          RELEASE_MAIN_COMMIT: ${{ needs.plan.outputs.main_commit }}
+        run: |
+          set -euo pipefail
+          validation_tag_ref="refs/release-validation/final-publish-validation/tag/${RELEASE_TAG}"
+          validation_main_ref="refs/release-validation/final-publish-validation/main"
+          git fetch --no-tags --force origin \
+            "refs/tags/${RELEASE_TAG}:${validation_tag_ref}" \
+            "refs/heads/main:${validation_main_ref}"
+          if [ "$(git rev-parse "${validation_tag_ref}")" != "$RELEASE_TAG_OID" ] \
+            || [ "$(git rev-parse "${validation_tag_ref}^{commit}")" != "$RELEASE_COMMIT" ] \
+            || [ "$(git rev-parse 'HEAD^{commit}')" != "$RELEASE_COMMIT" ] \
+            || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$(git rev-parse "${validation_main_ref}^{commit}")"; then
+            echo "::error::Frozen release source changed during publish validation"
+            exit 1
+          fi
 
       - name: Summary
-        # Reaching here means the token guard passed and the publish ran, so the
-        # old "Skipped" branch is unreachable (a missing token now fails the job).
         run: |
-          echo "## Crates.io Publish" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
-          echo "Published pi v${{ needs.plan.outputs.version }} to crates.io" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## Crates.io package validation"
+            echo ""
+            echo "Validated pi_agent_rust v${{ needs.plan.outputs.version }} with cargo publish --dry-run."
+            echo "No registry mutation is performed by this workflow; release.yml owns publication."
+          } >> "$GITHUB_STEP_SUMMARY"

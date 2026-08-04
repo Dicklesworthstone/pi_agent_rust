@@ -961,10 +961,10 @@ impl TestLogger {
     /// Dump logs and artifacts to a file path.
     pub fn write_dump_to_path(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
         }
 
         let mut output = self.dump();
@@ -1345,10 +1345,10 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 fn write_string_to_path(path: &Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
     fs::write(path, contents)
 }
@@ -1436,71 +1436,71 @@ pub fn validate_jsonl_line(line: &str, line_number: usize) -> Result<(), JsonlVa
     }
 
     // Type checks for numeric/string fields.
-    if let Some(seq) = obj.get("seq") {
-        if !seq.is_number() {
-            return Err(JsonlValidationError {
-                line: line_number,
-                field: "seq".to_string(),
-                message: format!("expected number, got {seq}"),
-            });
-        }
+    if let Some(seq) = obj.get("seq")
+        && !seq.is_number()
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "seq".to_string(),
+            message: format!("expected number, got {seq}"),
+        });
     }
-    if let Some(ts) = obj.get("ts") {
-        if !ts.is_string() {
-            return Err(JsonlValidationError {
-                line: line_number,
-                field: "ts".to_string(),
-                message: format!("expected string, got {ts}"),
-            });
-        }
+    if let Some(ts) = obj.get("ts")
+        && !ts.is_string()
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "ts".to_string(),
+            message: format!("expected string, got {ts}"),
+        });
     }
-    if let Some(t_ms) = obj.get("t_ms") {
-        if !t_ms.is_number() {
-            return Err(JsonlValidationError {
-                line: line_number,
-                field: "t_ms".to_string(),
-                message: format!("expected number, got {t_ms}"),
-            });
-        }
+    if let Some(t_ms) = obj.get("t_ms")
+        && !t_ms.is_number()
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "t_ms".to_string(),
+            message: format!("expected number, got {t_ms}"),
+        });
     }
 
     // V2 type checks for correlation fields.
     if schema == "pi.test.log.v2" {
-        if let Some(trace_id) = obj.get("trace_id") {
-            if !trace_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "trace_id".to_string(),
-                    message: format!("expected string, got {trace_id}"),
-                });
-            }
+        if let Some(trace_id) = obj.get("trace_id")
+            && !trace_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "trace_id".to_string(),
+                message: format!("expected string, got {trace_id}"),
+            });
         }
-        if let Some(span_id) = obj.get("span_id") {
-            if !span_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "span_id".to_string(),
-                    message: format!("expected string, got {span_id}"),
-                });
-            }
+        if let Some(span_id) = obj.get("span_id")
+            && !span_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "span_id".to_string(),
+                message: format!("expected string, got {span_id}"),
+            });
         }
-        if let Some(parent_span_id) = obj.get("parent_span_id") {
-            if !parent_span_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "parent_span_id".to_string(),
-                    message: format!("expected string, got {parent_span_id}"),
-                });
-            }
+        if let Some(parent_span_id) = obj.get("parent_span_id")
+            && !parent_span_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "parent_span_id".to_string(),
+                message: format!("expected string, got {parent_span_id}"),
+            });
         }
-        if let Some(ci_correlation_id) = obj.get("ci_correlation_id") {
-            if !ci_correlation_id.is_string() {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "ci_correlation_id".to_string(),
-                    message: format!("expected string, got {ci_correlation_id}"),
-                });
-            }
+        if let Some(ci_correlation_id) = obj.get("ci_correlation_id")
+            && !ci_correlation_id.is_string()
+        {
+            return Err(JsonlValidationError {
+                line: line_number,
+                field: "ci_correlation_id".to_string(),
+                message: format!("expected string, got {ci_correlation_id}"),
+            });
         }
     }
 
@@ -1522,18 +1522,15 @@ pub fn validate_jsonl_line_v2_only(
     validate_jsonl_line(line, line_number)?;
 
     // Then reject v1 log schema.
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-        if let Some(schema) = value.get("schema").and_then(|v| v.as_str()) {
-            if schema == TEST_LOG_SCHEMA_V1 {
-                return Err(JsonlValidationError {
-                    line: line_number,
-                    field: "schema".to_string(),
-                    message: format!(
-                        "deprecated schema '{schema}': new tests must use {TEST_LOG_SCHEMA}"
-                    ),
-                });
-            }
-        }
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+        && let Some(schema) = value.get("schema").and_then(|v| v.as_str())
+        && schema == TEST_LOG_SCHEMA_V1
+    {
+        return Err(JsonlValidationError {
+            line: line_number,
+            field: "schema".to_string(),
+            message: format!("deprecated schema '{schema}': new tests must use {TEST_LOG_SCHEMA}"),
+        });
     }
 
     Ok(())

@@ -560,10 +560,10 @@ impl ExtensionStreamSimpleProvider {
             "cacheRetention".to_string(),
             Value::String(cache_retention.to_string()),
         );
-        if let Some(level) = options.thinking_level {
-            if level != crate::model::ThinkingLevel::Off {
-                map.insert("reasoning".to_string(), Value::String(level.to_string()));
-            }
+        if let Some(level) = options.thinking_level
+            && level != crate::model::ThinkingLevel::Off
+        {
+            map.insert("reasoning".to_string(), Value::String(level.to_string()));
         }
         if let Some(budgets) = &options.thinking_budgets {
             map.insert(
@@ -911,19 +911,19 @@ pub fn create_provider(
     entry: &ModelEntry,
     extensions: Option<&ExtensionManager>,
 ) -> Result<Arc<dyn Provider>> {
-    if let Some(manager) = extensions {
-        if manager.provider_has_stream_simple(&entry.model.provider) {
-            let runtime = manager.runtime().ok_or_else(|| {
-                Error::provider(
-                    &entry.model.provider,
-                    "Extension runtime not configured for streamSimple provider",
-                )
-            })?;
-            return Ok(Arc::new(ExtensionStreamSimpleProvider::new(
-                entry.model.clone(),
-                runtime,
-            )));
-        }
+    if let Some(manager) = extensions
+        && manager.provider_has_stream_simple(&entry.model.provider)
+    {
+        let runtime = manager.runtime().ok_or_else(|| {
+            Error::provider(
+                &entry.model.provider,
+                "Extension runtime not configured for streamSimple provider",
+            )
+        })?;
+        return Ok(Arc::new(ExtensionStreamSimpleProvider::new(
+            entry.model.clone(),
+            runtime,
+        )));
     }
 
     let (route, canonical_provider, effective_api) = resolve_provider_route(entry)?;
@@ -1278,13 +1278,13 @@ pub fn normalize_cursor_base(base_url: &str) -> String {
         return cursor::CURSOR_API_URL.to_string();
     }
 
-    if let Ok(url) = Url::parse(trimmed) {
-        if !url.cannot_be_a_base() {
-            if trimmed_url_path(&url).ends_with(&format!("/{RPC_PATH}")) {
-                return canonicalize_url_path(&url);
-            }
-            return append_url_path(&url, RPC_PATH);
+    if let Ok(url) = Url::parse(trimmed)
+        && !url.cannot_be_a_base()
+    {
+        if trimmed_url_path(&url).ends_with(&format!("/{RPC_PATH}")) {
+            return canonicalize_url_path(&url);
         }
+        return append_url_path(&url, RPC_PATH);
     }
 
     let base = trimmed.trim_end_matches('/');

@@ -186,7 +186,7 @@ pub struct ResourceCliOptions {
 
 impl ResourceCliOptions {
     #[must_use]
-    pub fn has_explicit_paths(&self) -> bool {
+    pub const fn has_explicit_paths(&self) -> bool {
         !self.skill_paths.is_empty()
             || !self.prompt_paths.is_empty()
             || !self.extension_paths.is_empty()
@@ -218,7 +218,7 @@ pub struct ExtensionResourcePaths {
 }
 
 impl ExtensionResourcePaths {
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.skill_paths.is_empty() && self.prompt_paths.is_empty() && self.theme_paths.is_empty()
     }
 }
@@ -656,11 +656,11 @@ pub async fn discover_package_resources(manager: &PackageManager) -> Result<Pack
         let Some(root) = manager.installed_path(&entry.source, entry.scope).await? else {
             continue;
         };
-        if !root.exists() {
-            if let Err(err) = manager.install(&entry.source, entry.scope).await {
-                warn!("Failed to install {}: {err}", entry.source);
-                continue;
-            }
+        if !root.exists()
+            && let Err(err) = manager.install(&entry.source, entry.scope).await
+        {
+            warn!("Failed to install {}: {err}", entry.source);
+            continue;
         }
 
         if !root.exists() {
@@ -1380,10 +1380,11 @@ fn load_templates_from_dir(dir: &Path, source: &str, label: &str) -> Vec<PromptT
     for full_path in read_dir_sorted_paths(dir) {
         let (_, is_file) = resolved_path_kind(&full_path);
 
-        if is_file && full_path.extension().is_some_and(|ext| ext == "md") {
-            if let Some(template) = load_template_from_file(&full_path, source, label) {
-                templates.push(template);
-            }
+        if is_file
+            && full_path.extension().is_some_and(|ext| ext == "md")
+            && let Some(template) = load_template_from_file(&full_path, source, label)
+        {
+            templates.push(template);
         }
     }
 
@@ -1399,17 +1400,17 @@ fn load_template_from_file(path: &Path, source: &str, label: &str) -> Option<Pro
         .cloned()
         .unwrap_or_default();
 
-    if description.is_empty() {
-        if let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty()) {
-            let trimmed = first_line.trim();
-            let truncated = if trimmed.chars().count() > 60 {
-                let s: String = trimmed.chars().take(57).collect();
-                format!("{s}...")
-            } else {
-                trimmed.to_string()
-            };
-            description = truncated;
-        }
+    if description.is_empty()
+        && let Some(first_line) = parsed.body.lines().find(|line| !line.trim().is_empty())
+    {
+        let trimmed = first_line.trim();
+        let truncated = if trimmed.chars().count() > 60 {
+            let s: String = trimmed.chars().take(57).collect();
+            format!("{s}...")
+        } else {
+            trimmed.to_string()
+        };
+        description = truncated;
     }
 
     if description.is_empty() {
@@ -1514,10 +1515,11 @@ fn load_themes_from_dir(
     for full_path in read_dir_sorted_paths(dir) {
         let (_, is_file) = resolved_path_kind(&full_path);
 
-        if is_file && is_theme_file(&full_path) {
-            if let Some(theme) = load_theme_from_file(&full_path, source, label, diagnostics) {
-                themes.push(theme);
-            }
+        if is_file
+            && is_theme_file(&full_path)
+            && let Some(theme) = load_theme_from_file(&full_path, source, label, diagnostics)
+        {
+            themes.push(theme);
         }
     }
 
@@ -2043,11 +2045,11 @@ fn dedupe_extension_entries_by_id_with_cache_dir(
         let cache = is_cache_module_path_with_cache_dir(path, cache_dir);
         is_cache.push(cache);
 
-        if let Some(id) = extension_dedupe_key_from_path(path) {
-            if !cache {
-                // Source entry wins; record its index.
-                id_to_source_idx.entry(id).or_insert(idx);
-            }
+        if let Some(id) = extension_dedupe_key_from_path(path)
+            && !cache
+        {
+            // Source entry wins; record its index.
+            id_to_source_idx.entry(id).or_insert(idx);
         }
     }
 
@@ -2055,13 +2057,12 @@ fn dedupe_extension_entries_by_id_with_cache_dir(
     // has a source entry.
     let mut out = Vec::with_capacity(entries.len());
     for (idx, path) in entries.into_iter().enumerate() {
-        if is_cache[idx] {
-            if let Some(id) = extension_dedupe_key_from_path(&path) {
-                if id_to_source_idx.contains_key(&id) {
-                    // Skip cache entry — source entry is preferred.
-                    continue;
-                }
-            }
+        if is_cache[idx]
+            && let Some(id) = extension_dedupe_key_from_path(&path)
+            && id_to_source_idx.contains_key(&id)
+        {
+            // Skip cache entry — source entry is preferred.
+            continue;
         }
         out.push(path);
     }

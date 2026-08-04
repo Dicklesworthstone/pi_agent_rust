@@ -116,10 +116,10 @@ async fn refresh_cache_if_stale_at(
     current_version: &str,
     release_url: &str,
 ) -> VersionCheckResult {
-    if let Some(latest) = read_cached_version_at(path) {
-        if parse_semver_like(&latest).is_some() {
-            return version_status_for(current_version, latest);
-        }
+    if let Some(latest) = read_cached_version_at(path)
+        && parse_semver_like(&latest).is_some()
+    {
+        return version_status_for(current_version, latest);
     }
 
     match fetch_latest_release_version_from_url(client, release_url).await {

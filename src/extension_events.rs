@@ -398,10 +398,10 @@ pub fn apply_before_agent_start_response(
         return outcome;
     }
 
-    if let Some(message_value) = obj.get("message") {
-        if let Some(msg) = parse_custom_message(message_value, timestamp) {
-            outcome.messages.push(msg);
-        }
+    if let Some(message_value) = obj.get("message")
+        && let Some(msg) = parse_custom_message(message_value, timestamp)
+    {
+        outcome.messages.push(msg);
     }
 
     outcome

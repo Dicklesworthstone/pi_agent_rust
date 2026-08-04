@@ -125,7 +125,11 @@ run_step() {
     local output
     local exit_code=0
     if [[ "$VERBOSE" -eq 1 ]]; then
-        "$@" 2>&1 || exit_code=$?
+        if [[ "$REPORT_JSON" -eq 1 ]]; then
+            "$@" >&2 || exit_code=$?
+        else
+            "$@" 2>&1 || exit_code=$?
+        fi
     else
         output=$("$@" 2>&1) || exit_code=$?
     fi
@@ -141,7 +145,7 @@ run_step() {
         log "FAIL" "$name (${elapsed}s, exit=$exit_code)"
         if [[ "$VERBOSE" -eq 0 ]] && [[ -n "${output:-}" ]]; then
             # Show last 20 lines on failure.
-            echo "$output" | tail -20
+            printf '%s\n' "$output" | tail -20 >&2
         fi
         FAIL_COUNT=$((FAIL_COUNT + 1))
         RESULTS+=("{\"name\":\"$name\",\"status\":\"fail\",\"seconds\":$elapsed,\"exit_code\":$exit_code}")
@@ -221,11 +225,14 @@ log "INFO" "cargo runner: $CARGO_RUNNER_MODE (request=$CARGO_RUNNER_REQUEST)"
 run_step "cargo-fmt" cargo fmt --check
 
 # Stage 2: Clippy
-run_compile_step "clippy-lib" clippy --lib -- -D warnings
-run_compile_step "clippy-bin" clippy --bin pi -- -D warnings
+run_compile_step "clippy-lib" clippy --locked --lib -- -D warnings
+run_compile_step "clippy-bin" clippy --locked --bin pi -- -D warnings
 
-# Stage 3: Cargo check (catches compilation errors in test files)
-run_compile_step "cargo-check-tests" check --tests
+# Stage 3: Cargo check (catches compilation errors in test files). The
+# ext_conformance target executes the internal legacy-capture binary, so the
+# repository-only feature must be explicit even though end-user installs leave
+# it disabled.
+run_compile_step "cargo-check-tests" check --locked --tests --features internal-legacy-capture
 
 if [[ "$MODE" == "check" ]]; then
     for target in "${EXT_UNIT_TARGETS[@]}" "${EXT_INTEGRATION_TARGETS[@]}" "${EXT_CONFORMANCE_TARGETS[@]}"; do
@@ -238,18 +245,22 @@ else
             skip_step "test:$target"
             continue
         fi
-        run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads="$PARALLELISM"
+        run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --locked --test "$target" -- --test-threads="$PARALLELISM"
     done
 
     if [[ "$MODE" != "quick" ]]; then
         # Stage 5: Extension integration tests
         for target in "${EXT_INTEGRATION_TARGETS[@]}"; do
-            run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads="$PARALLELISM"
+            run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --locked --test "$target" -- --test-threads="$PARALLELISM"
         done
 
         # Stage 6: Conformance tests
         for target in "${EXT_CONFORMANCE_TARGETS[@]}"; do
-            run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --test "$target" -- --test-threads="$PARALLELISM"
+            if [[ "$target" == "ext_conformance" ]]; then
+                run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --locked --test "$target" --features internal-legacy-capture -- --test-threads="$PARALLELISM"
+            else
+                run_step "test:$target" timeout "$TIMEOUT" "${CARGO_RUNNER_ARGS[@]}" test --locked --test "$target" -- --test-threads="$PARALLELISM"
+            fi
         done
     else
         for target in "${EXT_INTEGRATION_TARGETS[@]}" "${EXT_CONFORMANCE_TARGETS[@]}"; do
@@ -258,7 +269,7 @@ else
     fi
 
     # Stage 7: Inline extension module tests
-    run_step "test:lib-extension-preflight" "${CARGO_RUNNER_ARGS[@]}" test --lib extension_preflight -- --test-threads="$PARALLELISM"
+    run_step "test:lib-extension-preflight" "${CARGO_RUNNER_ARGS[@]}" test --locked --lib extension_preflight -- --test-threads="$PARALLELISM"
 fi
 
 # ─── Summary ────────────────────────────────────────────────────────────────
@@ -300,6 +311,9 @@ if [[ "$REPORT_JSON" -eq 1 ]]; then
   "steps": [$JSON_RESULTS]
 }
 EOF
+    if [[ $FAIL_COUNT -gt 0 ]]; then
+        exit 1
+    fi
 else
     echo ""
     echo "═══════════════════════════════════════════════════════════"

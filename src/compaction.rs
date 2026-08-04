@@ -1523,23 +1523,19 @@ pub fn prepare_compaction(
     let mut file_ops = FileOperations::default();
 
     // Collect file tracking from previous compaction details if pi-generated.
-    if let Some(idx) = prev_compaction_index {
-        if let SessionEntry::Compaction(entry) = &path_entries[idx] {
-            if !entry.from_hook.unwrap_or(false) {
-                if let Some(details) = entry.details.as_ref().and_then(Value::as_object) {
-                    if let Some(read_files) = details.get("readFiles").and_then(Value::as_array) {
-                        for item in read_files.iter().filter_map(Value::as_str) {
-                            file_ops.read.insert(item.to_string());
-                        }
-                    }
-                    if let Some(modified_files) =
-                        details.get("modifiedFiles").and_then(Value::as_array)
-                    {
-                        for item in modified_files.iter().filter_map(Value::as_str) {
-                            file_ops.edited.insert(item.to_string());
-                        }
-                    }
-                }
+    if let Some(idx) = prev_compaction_index
+        && let SessionEntry::Compaction(entry) = &path_entries[idx]
+        && !entry.from_hook.unwrap_or(false)
+        && let Some(details) = entry.details.as_ref().and_then(Value::as_object)
+    {
+        if let Some(read_files) = details.get("readFiles").and_then(Value::as_array) {
+            for item in read_files.iter().filter_map(Value::as_str) {
+                file_ops.read.insert(item.to_string());
+            }
+        }
+        if let Some(modified_files) = details.get("modifiedFiles").and_then(Value::as_array) {
+            for item in modified_files.iter().filter_map(Value::as_str) {
+                file_ops.edited.insert(item.to_string());
             }
         }
     }

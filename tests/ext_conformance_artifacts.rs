@@ -1567,37 +1567,37 @@ fn extract_registrations(content: &str) -> ManifestRegistrations {
 
     for (idx, _) in content.match_indices("registerTool(") {
         let window = safe_window(content, idx, 500);
-        if let Some(name) = extract_quoted_after(window, "name:") {
-            if !tools.contains(&name) {
-                tools.push(name);
-            }
+        if let Some(name) = extract_quoted_after(window, "name:")
+            && !tools.contains(&name)
+        {
+            tools.push(name);
         }
     }
 
     for (idx, _) in content.match_indices("registerCommand(") {
         let window = safe_window(content, idx, 200);
-        if let Some(name) = extract_first_string_arg(window, "registerCommand(") {
-            if !commands.contains(&name) {
-                commands.push(name);
-            }
+        if let Some(name) = extract_first_string_arg(window, "registerCommand(")
+            && !commands.contains(&name)
+        {
+            commands.push(name);
         }
     }
 
     for (idx, _) in content.match_indices("registerFlag(") {
         let window = safe_window(content, idx, 500);
-        if let Some(name) = extract_quoted_after(window, "name:") {
-            if !flags.contains(&name) {
-                flags.push(name);
-            }
+        if let Some(name) = extract_quoted_after(window, "name:")
+            && !flags.contains(&name)
+        {
+            flags.push(name);
         }
     }
 
     for (idx, _) in content.match_indices(".on(") {
         let window = safe_window(content, idx, 100);
-        if let Some(name) = extract_first_string_arg(window, ".on(") {
-            if !event_handlers.contains(&name) {
-                event_handlers.push(name);
-            }
+        if let Some(name) = extract_first_string_arg(window, ".on(")
+            && !event_handlers.contains(&name)
+        {
+            event_handlers.push(name);
         }
     }
 
@@ -1803,15 +1803,14 @@ fn discover_extension_dirs(artifacts_dir: &Path) -> Vec<(String, PathBuf)> {
 fn find_entry_point(ext_dir: &Path, artifacts_dir: &Path) -> Option<String> {
     // Check package.json for explicit declaration.
     let pkg_path = ext_dir.join("package.json");
-    if pkg_path.is_file() {
-        if let Ok(bytes) = fs::read(&pkg_path) {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes) {
-                for entry in package_declared_entry_points(&json) {
-                    let candidate = ext_dir.join(entry);
-                    if candidate.is_file() {
-                        return Some(relative_posix(artifacts_dir, &candidate));
-                    }
-                }
+    if pkg_path.is_file()
+        && let Ok(bytes) = fs::read(&pkg_path)
+        && let Ok(json) = serde_json::from_slice::<serde_json::Value>(&bytes)
+    {
+        for entry in package_declared_entry_points(&json) {
+            let candidate = ext_dir.join(entry);
+            if candidate.is_file() {
+                return Some(relative_posix(artifacts_dir, &candidate));
             }
         }
     }

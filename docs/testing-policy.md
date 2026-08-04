@@ -341,9 +341,20 @@ waiver audit, and produces a verdict with promotion rules and rerun guidance. Co
 cargo test --test ci_full_suite_gate -- full_certification --nocapture --exact
 ```
 
-**Drop-in contract gate (bd-35t7i):** strict drop-in release language is only allowed when
-`docs/contracts/dropin-certification-contract.json` evaluates to all hard gates `pass` and the emitted
-`docs/evidence/dropin-certification-verdict.json` has `overall_verdict = CERTIFIED`.
+**Extension must-pass authority:** The release-blocking `ext_must_pass` corpus is
+the exact selection in `docs/extension-inclusion-list.json` (`tier1` plus
+`tier1_review`). `tests/ext_conformance/VALIDATED_MANIFEST.json` supplies the
+corresponding artifact metadata, but its numeric tier labels do not independently
+define or shrink the release set. A passing extension gate is necessary release
+evidence; it does not by itself authorize a strict drop-in claim.
+
+**Drop-in contract gate (bd-35t7i):** strict drop-in release language is only
+allowed when `docs/contracts/dropin-certification-contract.json` evaluates to
+all hard gates `pass` and the emitted
+`docs/evidence/dropin-certification-verdict.json` has
+`overall_verdict = CERTIFIED` with `git_commit` naming the clean release source
+commit. The final release ref must equal that commit or descend from it only
+through allowlisted evidence-only commits.
 Operational incident response for parity regressions is documented in
 `docs/ci-operator-runbook.md` under **Parity Incident Response (DROPIN-162)**.
 
@@ -473,9 +484,11 @@ Release/certification decisions must apply a docs-last contract before final rep
 
 1. `practical_finish_checkpoint` must pass before declaring final PERF-3X completion.
 2. `parameter_sweeps_integrity`, `extension_remediation_backlog`, and `conformance_stress_lineage` are co-required release gates.
-3. Remaining open PERF-3X work is allowed only for docs/report scope (`docs`, `docs-last`,
-   `documentation`, `report`, or `runbook` labels). Any technical open PERF-3X issue is
-   fail-closed and blocks GO.
+3. Remaining open PERF-3X work is allowed only when the Beads `issue_type` is explicitly
+   `docs`. Generic labels such as `docs-last`, `documentation`, `report`, or `runbook` do
+   not prove that a task is documentation-only. For this contract, **docs/report scope**
+   means exactly `issue_type = docs`; any technical open PERF-3X issue is fail-closed and
+   blocks GO.
 
 Required evidence artifacts for this policy:
 

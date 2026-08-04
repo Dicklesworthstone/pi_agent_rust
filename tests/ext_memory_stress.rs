@@ -394,7 +394,7 @@ fn run_stress_loop(manager: &ExtensionManager, params: &StressParams) -> StressO
                 quickjs_heap_kb: quickjs_kb,
             });
 
-            if samples.len() % 6 == 0 {
+            if samples.len().is_multiple_of(6) {
                 eprintln!(
                     "[mem-stress] t={elapsed_secs}s events={events_dispatched} \
                      rss={rss_kb}KB heap={quickjs_kb}KB"

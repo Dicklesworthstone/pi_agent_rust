@@ -2056,14 +2056,14 @@ fn canonical_scenarios_are_valid() {
 
     // Tool scenarios must provide at least one tool definition.
     for scenario in &scenarios {
-        if let CanonicalExpectation::Stream(exp) = &scenario.expectation {
-            if exp.min_tool_calls > 0 {
-                assert!(
-                    !scenario.tools.is_empty(),
-                    "Scenario '{}' expects tool calls but provides no tools",
-                    scenario.tag
-                );
-            }
+        if let CanonicalExpectation::Stream(exp) = &scenario.expectation
+            && exp.min_tool_calls > 0
+        {
+            assert!(
+                !scenario.tools.is_empty(),
+                "Scenario '{}' expects tool calls but provides no tools",
+                scenario.tag
+            );
         }
     }
 }

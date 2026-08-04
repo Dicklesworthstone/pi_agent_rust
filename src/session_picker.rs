@@ -523,14 +523,14 @@ fn remove_sqlite_sidecars_best_effort(path: &Path, trash_cmd: &str) {
             if try_trash_with_cmd(&auxiliary_path, trash_cmd) {
                 continue;
             }
-            if let Err(err) = fs::remove_file(&auxiliary_path) {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        path = %auxiliary_path.display(),
-                        error = %err,
-                        "Failed to remove SQLite sidecar"
-                    );
-                }
+            if let Err(err) = fs::remove_file(&auxiliary_path)
+                && err.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(
+                    path = %auxiliary_path.display(),
+                    error = %err,
+                    "Failed to remove SQLite sidecar"
+                );
             }
         }
     }

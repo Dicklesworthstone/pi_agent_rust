@@ -129,15 +129,15 @@ pub enum StopReason {
     Length,
     /// The provider requested tool execution.
     ToolUse,
+    /// The stream terminated due to an error.
+    Error,
+    /// The request was aborted locally.
+    Aborted,
     /// The provider paused a long-running turn and expects the assistant
     /// response to be resubmitted unchanged to continue it.
     PauseTurn,
     /// The provider completed the request but declined it for policy reasons.
     Refusal,
-    /// The stream terminated due to an error.
-    Error,
-    /// The request was aborted locally.
-    Aborted,
 }
 
 /// Provider-supplied structured details for a terminal stop reason.

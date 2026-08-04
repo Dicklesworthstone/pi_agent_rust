@@ -36,7 +36,7 @@ pub struct KeyBindingsLoadResult {
 impl KeyBindingsLoadResult {
     /// Check if there were any warnings.
     #[must_use]
-    pub fn has_warnings(&self) -> bool {
+    pub const fn has_warnings(&self) -> bool {
         !self.warnings.is_empty()
     }
 

@@ -719,10 +719,10 @@ impl SwarmActivitySketch {
                 self.config.max_hotspots,
             );
         }
-        if LATENCY_DETAIL_KEYS.contains(&normalized_key.as_str()) {
-            if let Some(sample_ms) = parse_latency_ms(value) {
-                self.latency_ms.record(sample_ms);
-            }
+        if LATENCY_DETAIL_KEYS.contains(&normalized_key.as_str())
+            && let Some(sample_ms) = parse_latency_ms(value)
+        {
+            self.latency_ms.record(sample_ms);
         }
     }
 }
@@ -932,13 +932,13 @@ impl SwarmActivityLedger {
 
     /// Number of entries.
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.entries.len()
     }
 
     /// True when no entries have been appended.
     #[must_use]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
@@ -2188,10 +2188,10 @@ fn stale_introduction_pointers(
     let mut introduction_keys = BTreeSet::new();
     let mut claim_keys = BTreeSet::new();
     for entry in entries {
-        if is_introduction_entry(entry) {
-            if let Some(key) = saturation_actor_key(entry) {
-                introduction_keys.insert(key);
-            }
+        if is_introduction_entry(entry)
+            && let Some(key) = saturation_actor_key(entry)
+        {
+            introduction_keys.insert(key);
         }
         if is_claim_or_reservation_entry(entry) {
             for key in saturation_claim_keys(entry) {

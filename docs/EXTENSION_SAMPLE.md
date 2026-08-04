@@ -139,8 +139,8 @@ Write that value to `docs/extension-sample.json` at `items[].checksum.sha256`.
 ### 5) Re-run legacy capture and regenerate fixtures
 
 1. Run the capture pipeline:
-   - Full suite: `cargo run --bin pi_legacy_capture`
-   - One scenario: `cargo run --bin pi_legacy_capture -- --scenario-id scn-<ext>-<nnn>`
+   - Full suite: `cargo run --features internal-legacy-capture --bin pi_legacy_capture`
+   - One scenario: `cargo run --features internal-legacy-capture --bin pi_legacy_capture -- --scenario-id scn-<ext>-<nnn>`
 2. Confirm the fixture exists:
    - `tests/ext_conformance/fixtures/<extension_id>.json`
 
@@ -227,7 +227,7 @@ The capture tool records the actual legacy pi-mono checkout used in each scenari
 From repo root:
 
 ```bash
-cargo run --bin pi_legacy_capture
+cargo run --features internal-legacy-capture --bin pi_legacy_capture
 ```
 
 Defaults (see `src/bin/pi_legacy_capture.rs`):
@@ -242,7 +242,7 @@ Defaults (see `src/bin/pi_legacy_capture.rs`):
 ### Run a Single Scenario (Debugging)
 
 ```bash
-cargo run --bin pi_legacy_capture -- --scenario-id scn-todo-003
+cargo run --features internal-legacy-capture --bin pi_legacy_capture -- --scenario-id scn-todo-003
 ```
 
 This is useful when fixing one scenario without regenerating everything.

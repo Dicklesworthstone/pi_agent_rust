@@ -627,14 +627,14 @@ impl Provider for AnthropicProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization", "x-api-key"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization", "x-api-key"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -967,10 +967,10 @@ where
                 // The Anthropic API sends signature_delta for thinking blocks
                 // to deliver the thinking_signature required for multi-turn
                 // extended thinking conversations.
-                if let Some(sig) = signature {
-                    if let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx) {
-                        t.thinking_signature = Some(sig);
-                    }
+                if let Some(sig) = signature
+                    && let Some(ContentBlock::Thinking(t)) = self.partial.content.get_mut(idx)
+                {
+                    t.thinking_signature = Some(sig);
                 }
                 None
             }

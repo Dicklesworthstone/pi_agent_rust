@@ -146,10 +146,10 @@ fn detect_build_profile() -> String {
         }
     }
 
-    if let Ok(path) = std::env::current_exe() {
-        if let Some(profile) = profile_from_target_path(&path) {
-            return profile;
-        }
+    if let Ok(path) = std::env::current_exe()
+        && let Some(profile) = profile_from_target_path(&path)
+    {
+        return profile;
     }
 
     if cfg!(debug_assertions) {
@@ -289,16 +289,14 @@ fn find_entry_path(ext_name: &str) -> Option<PathBuf> {
     }
     // Check for package.json with main field
     let pkg_json = dir.join("package.json");
-    if pkg_json.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pkg_json) {
-            if let Ok(pkg) = serde_json::from_str::<Value>(&content) {
-                if let Some(main) = pkg.get("main").and_then(Value::as_str) {
-                    let main_path = dir.join(main);
-                    if main_path.exists() {
-                        return Some(main_path);
-                    }
-                }
-            }
+    if pkg_json.exists()
+        && let Ok(content) = std::fs::read_to_string(&pkg_json)
+        && let Ok(pkg) = serde_json::from_str::<Value>(&content)
+        && let Some(main) = pkg.get("main").and_then(Value::as_str)
+    {
+        let main_path = dir.join(main);
+        if main_path.exists() {
+            return Some(main_path);
         }
     }
     None
@@ -836,17 +834,16 @@ fn bench_extension_scenarios() {
 
     // Budget gate: cold start p99 < 50ms for simple extensions (hello).
     // Only enforced in release builds — debug builds are ~2x slower.
-    if !cfg!(debug_assertions) {
-        if let Some(hello_cold) = records
+    if !cfg!(debug_assertions)
+        && let Some(hello_cold) = records
             .iter()
             .find(|r| r.scenario == "cold_start" && r.extension == "hello")
-        {
-            assert!(
-                hello_cold.summary.p99_ms < 50.0,
-                "hello cold start p99 ({:.2}ms) exceeds 50ms budget",
-                hello_cold.summary.p99_ms,
-            );
-        }
+    {
+        assert!(
+            hello_cold.summary.p99_ms < 50.0,
+            "hello cold start p99 ({:.2}ms) exceeds 50ms budget",
+            hello_cold.summary.p99_ms,
+        );
     }
 }
 

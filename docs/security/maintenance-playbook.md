@@ -220,13 +220,14 @@ Add to `allow_patterns`. Allow patterns are checked before deny patterns.
 
 ### Gate Overview
 
-The full-suite CI gate (`ci_full_suite_gate.rs`) includes 14 sub-gates. Security-relevant gates:
+The Linux full-suite CI gate (`ci_full_suite_gate.rs`) includes 20 sub-gates,
+14 of them blocking. Security-relevant gates:
 
 | Gate ID | Name | Blocking | Artifact |
 |---------|------|----------|----------|
-| `security_compat` | Security compatibility | YES | `tests/security_compat/security_compat_dashboard.json` |
+| `sec_conformance` | SEC-6.4 security compatibility conformance | YES | `tests/full_suite_gate/sec_conformance_verdict.json` |
 | `conformance_regression` | Conformance regression | YES | `tests/ext_conformance/reports/regression_verdict.json` |
-| `ext_must_pass` | Extension must-pass (208) | YES | `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` |
+| `ext_must_pass` | Extension must-pass (authoritative inclusion list) | YES | `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` |
 | `non_mock_unit` | Non-mock compliance | YES | `docs/non-mock-rubric.json` |
 | `waiver_lifecycle` | Waiver lifecycle | YES | `tests/full_suite_gate/waiver_audit.json` |
 
@@ -247,7 +248,11 @@ CI_GATE_MAX_FAIL_COUNT: "36"       # Maximum failures
 CI_GATE_MAX_NA_COUNT: "170"        # Maximum N/A count
 ```
 
-To adjust: update the GitHub variable and document the justification.
+These values govern the broader conformance promotion gate. They do not weaken
+the release-blocking extension must-pass corpus selected by
+`docs/extension-inclusion-list.json`, which requires exact coverage and passing
+results for every included entry. To adjust a promotion threshold, update the
+GitHub variable and document the justification.
 
 ---
 
@@ -258,7 +263,7 @@ To adjust: update the GitHub variable and document the justification.
 Waivers provide time-bounded CI gate bypass. Add to `tests/suite_classification.toml`:
 
 ```toml
-[waiver.security_compat]
+[waiver.sec_conformance]
 owner = "YourName"
 created = "2026-02-14"
 expires = "2026-02-28"
@@ -267,6 +272,12 @@ reason = "Scanner update pending for new evasion pattern"
 scope = "full"
 remove_when = "Scanner update deployed and all compatibility tests pass"
 ```
+
+Reproduce this aggregate gate with
+`cargo test --test sec_compatibility_conformance -- --nocapture`. The
+`tests/security_compat/security_compat_dashboard.json` artifact described below
+is additional monitoring evidence, not the aggregate gate's waiver ID or
+verdict artifact.
 
 **Required fields:** owner, created, expires, bead, reason, scope, remove_when.
 
@@ -321,10 +332,12 @@ If the dashboard shows `regression_detected: true`:
 
 When new extensions are added to the conformance corpus:
 
-1. Run the full conformance suite
-2. Check that conformance pass rate stays above 80% (SLO threshold)
-3. Update the conformance baseline if the new extensions are expected to pass
-4. File beads for any new failures that need investigation
+1. Update and validate `docs/extension-inclusion-list.json`.
+2. Run the full conformance suite.
+3. Require every entry in the authoritative must-pass selection to be exercised
+   and pass; the broader-corpus 80% SLO is not a substitute for this release gate.
+4. Update the conformance baseline if the new extensions are expected to pass.
+5. File beads for any new failures that need investigation.
 
 ---
 

@@ -8,11 +8,14 @@
 //! Also enriches each extension with best-effort provenance/version metadata from
 //! `docs/extension-artifact-provenance.json`.
 //!
-//! Run with: `cargo test --test conformance_report generate_conformance_report -- --nocapture`
+//! Report generation is deliberately opt-in because the outputs are tracked
+//! release evidence. Run it only from a clean source commit with:
+//! `PI_GENERATE_CONFORMANCE_REPORT=1 cargo test --locked --test conformance_report generate_conformance_report -- --exact --nocapture`
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -36,6 +39,226 @@ fn provenance_path() -> PathBuf {
 }
 
 static CONFORMANCE_REPORT_IO_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+const GENERATE_CONFORMANCE_REPORT_ENV: &str = "PI_GENERATE_CONFORMANCE_REPORT";
+
+fn report_generation_requested(value: Option<&str>) -> bool {
+    value.is_some_and(|candidate| candidate.trim() == "1")
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|err| format!("failed to execute git {}: {err}", args.join(" ")))
+}
+
+fn git_blob_oid(contents: &[u8], oid_hex_len: usize) -> Result<String, String> {
+    let header = format!("blob {}\0", contents.len());
+    match oid_hex_len {
+        40 => {
+            let mut hasher = sha1::Sha1::new();
+            hasher.update(header.as_bytes());
+            hasher.update(contents);
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        64 => {
+            let mut hasher = Sha256::new();
+            hasher.update(header.as_bytes());
+            hasher.update(contents);
+            Ok(format!("{:x}", hasher.finalize()))
+        }
+        length => Err(format!("unsupported Git object ID length: {length}")),
+    }
+}
+
+fn ensure_no_symlink_parent(root: &Path, relative: &Path) -> Result<(), String> {
+    let mut current = root.to_path_buf();
+    let components = relative.components().collect::<Vec<_>>();
+    for component in components.iter().take(components.len().saturating_sub(1)) {
+        current.push(component.as_os_str());
+        let metadata = std::fs::symlink_metadata(&current).map_err(|err| {
+            format!(
+                "failed to inspect release-source path component {}: {err}",
+                current.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "release-source path traverses symlinked parent: {}",
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Capture the exact source commit and the SHA-256 of the canonical
+/// `git ls-tree -r -z --full-tree HEAD` byte stream. The worktree and index are
+/// independently proven byte-for-byte equal to that tree before evidence is
+/// allowed to record the digest.
+fn release_source_provenance(
+    root: &Path,
+    allowed_worktree_changes: &HashSet<&str>,
+) -> Result<(String, String), String> {
+    let head = git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if !head.status.success() {
+        return Err(format!(
+            "unable to resolve release-source HEAD: {}",
+            String::from_utf8_lossy(&head.stderr).trim()
+        ));
+    }
+    let git_commit = String::from_utf8(head.stdout)
+        .map_err(|err| format!("git rev-parse returned non-UTF-8 output: {err}"))?
+        .trim()
+        .to_string();
+    if !matches!(git_commit.len(), 40 | 64)
+        || !git_commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || git_commit.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "release-source HEAD is not a canonical full object ID: {git_commit}"
+        ));
+    }
+
+    let tree = git_output(root, &["ls-tree", "-r", "-z", "--full-tree", &git_commit])?;
+    if !tree.status.success() {
+        return Err(format!(
+            "unable to enumerate release-source tree: {}",
+            String::from_utf8_lossy(&tree.stderr).trim()
+        ));
+    }
+    let source_tree_sha256 = format!("{:x}", Sha256::digest(&tree.stdout));
+
+    let index = git_output(root, &["ls-files", "--stage", "-z"])?;
+    if !index.status.success() {
+        return Err("unable to inspect release-source index".to_string());
+    }
+    let flags = git_output(root, &["ls-files", "-v", "-z"])?;
+    if !flags.status.success() {
+        return Err("unable to inspect release-source index flags".to_string());
+    }
+    let untracked = git_output(root, &["ls-files", "--others", "--exclude-standard", "-z"])?;
+    if !untracked.status.success() {
+        return Err("unable to inspect untracked release-source paths".to_string());
+    }
+    if !untracked.stdout.is_empty() {
+        return Err("release-source worktree contains untracked non-ignored paths".to_string());
+    }
+
+    let tree_records = tree
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let separator = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| "malformed git ls-tree record".to_string())?;
+            let (metadata, path_with_separator) = record.split_at(separator);
+            let path = &path_with_separator[1..];
+            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 3 || fields[1] != b"blob" {
+                return Err("release-source tree contains a non-blob entry".to_string());
+            }
+            let mode = std::str::from_utf8(fields[0])
+                .map_err(|err| format!("non-UTF-8 Git mode: {err}"))?
+                .to_string();
+            let oid = std::str::from_utf8(fields[2])
+                .map_err(|err| format!("non-UTF-8 Git object ID: {err}"))?
+                .to_string();
+            let path = std::str::from_utf8(path)
+                .map_err(|err| format!("release-source path is not UTF-8: {err}"))?
+                .to_string();
+            Ok((path, (mode, oid)))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+
+    let index_records = index
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let separator = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| "malformed git index record".to_string())?;
+            let (metadata, path_with_separator) = record.split_at(separator);
+            let path = &path_with_separator[1..];
+            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 3 || fields[2] != b"0" {
+                return Err("release-source index contains a non-stage-zero entry".to_string());
+            }
+            let path = std::str::from_utf8(path)
+                .map_err(|err| format!("release-source index path is not UTF-8: {err}"))?
+                .to_string();
+            let mode = std::str::from_utf8(fields[0])
+                .map_err(|err| format!("non-UTF-8 index mode: {err}"))?
+                .to_string();
+            let oid = std::str::from_utf8(fields[1])
+                .map_err(|err| format!("non-UTF-8 index object ID: {err}"))?
+                .to_string();
+            Ok((path, (mode, oid)))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    if tree_records != index_records {
+        return Err("release-source index differs from HEAD".to_string());
+    }
+
+    let canonical_flags = flags
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .all(|record| record.starts_with(b"H "));
+    if !canonical_flags {
+        return Err(
+            "release-source index uses assume-unchanged, skip-worktree, or non-canonical flags"
+                .to_string(),
+        );
+    }
+
+    for (path, (mode, expected_oid)) in &index_records {
+        let relative = Path::new(path);
+        ensure_no_symlink_parent(root, relative)?;
+        let full_path = root.join(relative);
+        let metadata = std::fs::symlink_metadata(&full_path).map_err(|err| {
+            format!("failed to inspect release-source worktree path {path}: {err}")
+        })?;
+        let contents = match mode.as_str() {
+            "100644" | "100755" if metadata.file_type().is_file() => std::fs::read(&full_path)
+                .map_err(|err| format!("failed to read release-source path {path}: {err}"))?,
+            "120000" if metadata.file_type().is_symlink() => std::fs::read_link(&full_path)
+                .map_err(|err| format!("failed to read release-source symlink {path}: {err}"))?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+            _ => {
+                return Err(format!(
+                    "release-source worktree type differs from HEAD for {path}"
+                ));
+            }
+        };
+        let actual_oid = git_blob_oid(&contents, expected_oid.len())?;
+        if actual_oid != *expected_oid && !allowed_worktree_changes.contains(path.as_str()) {
+            return Err(format!(
+                "release-source worktree bytes differ from HEAD for {path}"
+            ));
+        }
+    }
+
+    let head_after = git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if !head_after.status.success()
+        || String::from_utf8_lossy(&head_after.stdout).trim() != git_commit
+    {
+        return Err("release-source HEAD changed during provenance capture".to_string());
+    }
+    Ok((git_commit, source_tree_sha256))
+}
+
+fn clean_release_source_provenance(root: &Path) -> Result<(String, String), String> {
+    release_source_provenance(root, &HashSet::new())
+}
 
 fn normalize_optional_env(value: Option<String>) -> Option<String> {
     value
@@ -356,7 +579,7 @@ fn update_trend_report(summary: &Value, reports: &Path) {
 
     std::fs::write(
         &trend_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
+        serde_json::to_string_pretty(&report).expect("serialize conformance trend report"),
     )
     .expect("write conformance_trend.json");
 }
@@ -717,7 +940,7 @@ fn generate_markdown(
     md.push_str("cargo test --test extensions_policy_negative\n\n");
     md.push_str("# 2. Generate this consolidated report\n");
     md.push_str(
-        "cargo test --test conformance_report generate_conformance_report -- --nocapture\n",
+        "PI_GENERATE_CONFORMANCE_REPORT=1 cargo test --locked --test conformance_report generate_conformance_report -- --exact --nocapture\n",
     );
     md.push_str("```\n\n");
     md.push_str("Report files:\n");
@@ -741,6 +964,10 @@ fn generate_markdown(
 
 #[allow(clippy::too_many_lines)]
 fn generate_conformance_report_impl() {
+    let (git_commit, source_tree_sha256) = clean_release_source_provenance(&project_root())
+        .unwrap_or_else(|err| {
+            panic!("refusing to generate release evidence from an unclean source tree: {err}")
+        });
     let reports = reports_dir();
     let _ = std::fs::create_dir_all(&reports);
 
@@ -824,7 +1051,7 @@ fn generate_conformance_report_impl() {
             "parity_mismatch": status.map_or(0, |s| s.parity_mismatch),
             "failures": status.map_or_else(Vec::new, |s| s.scenario_failures.clone()),
         });
-        jsonl_lines.push(serde_json::to_string(&entry).unwrap_or_default());
+        jsonl_lines.push(serde_json::to_string(&entry).expect("serialize conformance event"));
     }
     std::fs::write(&events_path, jsonl_lines.join("\n") + "\n")
         .expect("write conformance_events.jsonl");
@@ -901,6 +1128,8 @@ fn generate_conformance_report_impl() {
         "generated_at": summary_now.to_rfc3339_opts(SecondsFormat::Secs, true),
         "run_id": summary_run_id,
         "correlation_id": summary_correlation_id,
+        "git_commit": git_commit.clone(),
+        "source_tree_sha256": source_tree_sha256.clone(),
         "counts": {
             "total": total,
             "pass": pass,
@@ -925,7 +1154,7 @@ fn generate_conformance_report_impl() {
     let summary_path = reports.join("conformance_summary.json");
     std::fs::write(
         &summary_path,
-        serde_json::to_string_pretty(&summary).unwrap_or_default(),
+        serde_json::to_string_pretty(&summary).expect("serialize conformance summary"),
     )
     .expect("write conformance_summary.json");
 
@@ -942,6 +1171,22 @@ fn generate_conformance_report_impl() {
     );
     let md_path = reports.join("CONFORMANCE_REPORT.md");
     std::fs::write(&md_path, &md).expect("write CONFORMANCE_REPORT.md");
+
+    let allowed_outputs = HashSet::from([
+        "tests/ext_conformance/reports/CONFORMANCE_REPORT.md",
+        "tests/ext_conformance/reports/conformance_events.jsonl",
+        "tests/ext_conformance/reports/conformance_summary.json",
+        "tests/ext_conformance/reports/conformance_trend.json",
+    ]);
+    let final_provenance = release_source_provenance(&project_root(), &allowed_outputs)
+        .unwrap_or_else(|err| {
+            panic!("release source changed while conformance evidence was generated: {err}")
+        });
+    assert_eq!(
+        final_provenance,
+        (git_commit, source_tree_sha256),
+        "release-source commit or canonical tree changed during conformance evidence generation"
+    );
 
     // 6. Print summary
     eprintln!("\n=== Conformance Report Generated ===");
@@ -972,35 +1217,36 @@ fn generate_conformance_report_impl() {
     );
 }
 
-#[test]
-fn generate_conformance_report() {
-    // Skip on CI: the detailed conformance report inputs (load-time, scenario,
-    // smoke, parity JSONL files) are not generated during CI runs, so
-    // regenerating the summary would overwrite the committed summary with zeros
-    // and cause the release_evidence_gate threshold check to fail.
-    if std::env::var("CI").is_ok() {
-        eprintln!("[conformance_report] Skipping report generation on CI");
-        return;
+fn generate_conformance_report_when_requested(requested: bool) -> bool {
+    if !requested {
+        eprintln!(
+            "[conformance_report] Read-only by default. Generate tracked release evidence explicitly with: {GENERATE_CONFORMANCE_REPORT_ENV}=1 cargo test --locked --test conformance_report generate_conformance_report -- --exact --nocapture"
+        );
+        return false;
     }
     let _guard = CONFORMANCE_REPORT_IO_LOCK
         .lock()
         .expect("acquire conformance report IO lock");
     generate_conformance_report_impl();
+    true
 }
 
-fn read_or_regenerate_conformance_events() -> Vec<Value> {
+#[test]
+fn generate_conformance_report() {
+    let requested = report_generation_requested(
+        std::env::var(GENERATE_CONFORMANCE_REPORT_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let _ = generate_conformance_report_when_requested(requested);
+}
+
+fn read_conformance_events() -> Vec<Value> {
     let _guard = CONFORMANCE_REPORT_IO_LOCK
         .lock()
         .expect("acquire conformance report IO lock");
     let events_path = reports_dir().join("conformance_events.jsonl");
-    let mut events = read_jsonl_file(&events_path);
-    if events.is_empty() && std::env::var("CI").is_err() {
-        // Only regenerate locally; on CI the report inputs don't exist and
-        // regenerating would overwrite conformance_summary.json with zeros.
-        generate_conformance_report_impl();
-        events = read_jsonl_file(&events_path);
-    }
-    events
+    read_jsonl_file(&events_path)
 }
 
 #[test]
@@ -1134,7 +1380,7 @@ fn smoke_report_log_prefers_canonical_extensions_path() {
 #[test]
 fn evidence_links_valid() {
     // Verify that all evidence file links in JSONL point to files that actually exist
-    let events = read_or_regenerate_conformance_events();
+    let events = read_conformance_events();
     if events.is_empty() {
         // On CI the events JSONL is not committed (gitignored); skip gracefully.
         eprintln!("SKIP: conformance_events.jsonl is empty (CI)");
@@ -1331,7 +1577,7 @@ fn exception_policy_covers_full_conformance_failures() {
 
 #[test]
 fn events_jsonl_has_capabilities() {
-    let events = read_or_regenerate_conformance_events();
+    let events = read_conformance_events();
     if events.is_empty() {
         // On CI the events JSONL is not committed (gitignored); skip gracefully.
         eprintln!("SKIP: conformance_events.jsonl is empty (CI)");
@@ -1482,4 +1728,50 @@ fn conformance_summary_lineage_falls_back_to_local_run_id() {
         "unexpected local run_id format: {run_id}"
     );
     assert_eq!(correlation_id, format!("conformance-summary-{run_id}"));
+}
+
+#[test]
+fn conformance_report_generation_requires_exact_opt_in() {
+    assert!(report_generation_requested(Some("1")));
+    assert!(report_generation_requested(Some(" 1 ")));
+    for value in [
+        None,
+        Some(""),
+        Some("0"),
+        Some("true"),
+        Some("yes"),
+        Some("2"),
+    ] {
+        assert!(
+            !report_generation_requested(value),
+            "unexpected generation opt-in for {value:?}"
+        );
+    }
+}
+
+#[test]
+fn conformance_report_default_path_does_not_mutate_tracked_outputs() {
+    let paths = [
+        reports_dir().join("CONFORMANCE_REPORT.md"),
+        reports_dir().join("conformance_events.jsonl"),
+        reports_dir().join("conformance_summary.json"),
+        reports_dir().join("conformance_trend.json"),
+    ];
+    let before = paths
+        .iter()
+        .map(std::fs::read)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read tracked conformance outputs before read-only path");
+
+    assert!(!generate_conformance_report_when_requested(false));
+
+    let after = paths
+        .iter()
+        .map(std::fs::read)
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read tracked conformance outputs after read-only path");
+    assert_eq!(
+        before, after,
+        "ordinary tests must not freshen release evidence"
+    );
 }

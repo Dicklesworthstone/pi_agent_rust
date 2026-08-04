@@ -361,7 +361,7 @@ impl RegistrationSnapshot {
 
     /// Total number of registrations across all fields.
     #[must_use]
-    pub fn total_registrations(&self) -> usize {
+    pub const fn total_registrations(&self) -> usize {
         self.tools.len()
             + self.slash_commands.len()
             + self.shortcuts.len()

@@ -23,9 +23,14 @@ use serde_json::{Value, json};
 use similar::ChangeTag;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+#[cfg(feature = "internal-legacy-capture")]
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "internal-legacy-capture")]
+use std::path::PathBuf;
+#[cfg(feature = "internal-legacy-capture")]
 use std::process::Command;
+#[cfg(feature = "internal-legacy-capture")]
 use tempfile::NamedTempFile;
 use tracing::trace;
 
@@ -280,6 +285,7 @@ fn ui_method_aliases_normalize_identically_in_jsonl_diff() {
 }
 
 #[test]
+#[cfg(feature = "internal-legacy-capture")]
 fn trace_viewer_renders_pretty_and_exports_jsonl() {
     let mut log_file = NamedTempFile::new().expect("temp log file");
 

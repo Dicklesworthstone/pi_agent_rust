@@ -1125,10 +1125,10 @@ fn select_v2_open_mode_for_resume(
     threshold_override_raw: Option<&str>,
 ) -> (V2OpenMode, &'static str, u64) {
     let lazy_threshold = resolve_v2_lazy_hydration_threshold(threshold_override_raw);
-    if let Some(raw) = mode_override_raw {
-        if let Some(mode) = parse_v2_open_mode(raw) {
-            return (mode, "env_override", lazy_threshold);
-        }
+    if let Some(raw) = mode_override_raw
+        && let Some(mode) = parse_v2_open_mode(raw)
+    {
+        return (mode, "env_override", lazy_threshold);
     }
 
     if lazy_threshold > 0 && entry_count > lazy_threshold {
@@ -1322,10 +1322,11 @@ impl Session {
         // the `tui` feature there is no terminal picker, so library consumers
         // fall through to the non-interactive resolution path below.
         #[cfg(feature = "tui")]
-        if picker_input_override.is_none() && is_interactive {
-            if let Some(session) = crate::session_picker::pick_session(override_dir).await {
-                return Ok(session);
-            }
+        if picker_input_override.is_none()
+            && is_interactive
+            && let Some(session) = crate::session_picker::pick_session(override_dir).await
+        {
+            return Ok(session);
         }
 
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
@@ -1739,18 +1740,16 @@ impl Session {
         let mut entry_count = loaded_summary.total_entries;
         let mut branch_count = loaded_summary.branch_point_count;
 
-        if let Some(v2_root) = self.v2_sidecar_root.as_ref() {
-            if let Ok(store) = SessionStoreV2::create(v2_root, 64 * 1024 * 1024) {
-                entry_count =
-                    entry_count.max(usize::try_from(store.entry_count()).unwrap_or(usize::MAX));
-                if let Ok(Some(manifest)) = store.read_manifest() {
-                    branch_count = branch_count.max(
-                        usize::try_from(manifest.counters.branches_total).unwrap_or(usize::MAX),
-                    );
-                    entry_count = entry_count.max(
-                        usize::try_from(manifest.counters.entries_total).unwrap_or(usize::MAX),
-                    );
-                }
+        if let Some(v2_root) = self.v2_sidecar_root.as_ref()
+            && let Ok(store) = SessionStoreV2::create(v2_root, 64 * 1024 * 1024)
+        {
+            entry_count =
+                entry_count.max(usize::try_from(store.entry_count()).unwrap_or(usize::MAX));
+            if let Ok(Some(manifest)) = store.read_manifest() {
+                branch_count = branch_count
+                    .max(usize::try_from(manifest.counters.branches_total).unwrap_or(usize::MAX));
+                entry_count = entry_count
+                    .max(usize::try_from(manifest.counters.entries_total).unwrap_or(usize::MAX));
             }
         }
 
@@ -1970,13 +1969,15 @@ impl Session {
                 });
         }
 
-        let mut v2_message_count_offset = 0;
-        if matches!(mode, V2OpenMode::Tail(_) | V2OpenMode::ActivePath) {
-            if let Ok(Some(total)) = total_v2_message_count(store) {
+        let v2_message_count_offset =
+            if matches!(mode, V2OpenMode::Tail(_) | V2OpenMode::ActivePath)
+                && let Ok(Some(total)) = total_v2_message_count(store)
+            {
                 let loaded = finalized.message_count;
-                v2_message_count_offset = total.saturating_sub(loaded);
-            }
-        }
+                total.saturating_sub(loaded)
+            } else {
+                0
+            };
 
         let entry_count = entries.len();
         let natural_leaf_id = finalized.leaf_id.clone();
@@ -2976,10 +2977,10 @@ impl Session {
     pub fn to_messages(&self) -> Vec<Message> {
         let mut messages = Vec::new();
         for entry in &self.entries {
-            if let SessionEntry::Message(msg_entry) = entry {
-                if let Some(message) = session_message_to_model(&msg_entry.message) {
-                    messages.push(message);
-                }
+            if let SessionEntry::Message(msg_entry) = entry
+                && let Some(message) = session_message_to_model(&msg_entry.message)
+            {
+                messages.push(message);
             }
         }
         messages
@@ -3126,16 +3127,16 @@ impl Session {
     /// Returns entry IDs in order from root to the specified entry.
     pub fn get_path_to_entry(&self, entry_id: &str) -> Vec<String> {
         // Fast path: in linear sessions, every ancestor chain is a prefix of `entries`.
-        if self.is_linear {
-            if let Some(&idx) = self.entry_index.get(entry_id) {
-                let mut path = Vec::with_capacity(idx + 1);
-                for entry in &self.entries[..=idx] {
-                    if let Some(id) = entry.base_id() {
-                        path.push(id.clone());
-                    }
+        if self.is_linear
+            && let Some(&idx) = self.entry_index.get(entry_id)
+        {
+            let mut path = Vec::with_capacity(idx + 1);
+            for entry in &self.entries[..=idx] {
+                if let Some(id) = entry.base_id() {
+                    path.push(id.clone());
                 }
-                return path;
             }
+            return path;
         }
 
         let mut path = Vec::new();
@@ -3604,18 +3605,18 @@ impl Session {
             if matches!(entry, SessionEntry::Message(_)) {
                 count = count.saturating_add(1);
             }
-            if let SessionEntry::Message(msg) = entry {
-                if let SessionMessage::User { content, .. } = &msg.message {
-                    let text = user_content_to_text(content);
-                    let trimmed = text.trim();
-                    if !trimmed.is_empty() {
-                        preview = Some(if trimmed.chars().count() > 60 {
-                            let truncated: String = trimmed.chars().take(57).collect();
-                            format!("{truncated}...")
-                        } else {
-                            trimmed.to_string()
-                        });
-                    }
+            if let SessionEntry::Message(msg) = entry
+                && let SessionMessage::User { content, .. } = &msg.message
+            {
+                let text = user_content_to_text(content);
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    preview = Some(if trimmed.chars().count() > 60 {
+                        let truncated: String = trimmed.chars().take(57).collect();
+                        format!("{truncated}...")
+                    } else {
+                        trimmed.to_string()
+                    });
                 }
             }
             current.clone_from(&entry.base().parent_id);
@@ -3854,13 +3855,12 @@ async fn scan_sessions_on_disk(
                     if is_session_file_path(&path) {
                         // Optimization: if we already have this file indexed and both mtime and
                         // size match, reuse indexed metadata to avoid a full parse.
-                        if let Ok((disk_ms, disk_size)) = session_file_stats(&path) {
-                            if let Some(known_entry) = known_map.get(&path) {
-                                if can_reuse_known_entry(known_entry, disk_ms, disk_size) {
-                                    entries.push(known_entry.clone());
-                                    continue;
-                                }
-                            }
+                        if let Ok((disk_ms, disk_size)) = session_file_stats(&path)
+                            && let Some(known_entry) = known_map.get(&path)
+                            && can_reuse_known_entry(known_entry, disk_ms, disk_size)
+                        {
+                            entries.push(known_entry.clone());
+                            continue;
                         }
 
                         match load_session_meta(&path) {
@@ -5015,21 +5015,21 @@ fn open_from_v2_store_blocking(jsonl_path: PathBuf) -> Result<(Session, SessionO
     // - auto lazy mode for large sessions
     let mode_override_raw = std::env::var("PI_SESSION_V2_OPEN_MODE").ok();
     let threshold_override_raw = std::env::var("PI_SESSION_V2_LAZY_THRESHOLD").ok();
-    if let Some(raw) = mode_override_raw.as_deref() {
-        if parse_v2_open_mode(raw).is_none() {
-            tracing::warn!(
-                value = %raw,
-                "invalid PI_SESSION_V2_OPEN_MODE; using automatic hydration mode selection"
-            );
-        }
+    if let Some(raw) = mode_override_raw.as_deref()
+        && parse_v2_open_mode(raw).is_none()
+    {
+        tracing::warn!(
+            value = %raw,
+            "invalid PI_SESSION_V2_OPEN_MODE; using automatic hydration mode selection"
+        );
     }
-    if let Some(raw) = threshold_override_raw.as_deref() {
-        if raw.trim().parse::<u64>().is_err() {
-            tracing::warn!(
-                value = %raw,
-                "invalid PI_SESSION_V2_LAZY_THRESHOLD; using default lazy hydration threshold"
-            );
-        }
+    if let Some(raw) = threshold_override_raw.as_deref()
+        && raw.trim().parse::<u64>().is_err()
+    {
+        tracing::warn!(
+            value = %raw,
+            "invalid PI_SESSION_V2_LAZY_THRESHOLD; using default lazy hydration threshold"
+        );
     }
 
     let entry_count = store.entry_count();
@@ -5259,14 +5259,14 @@ pub fn migrate_jsonl_to_v2(
         return Err(crate::Error::Io(Box::new(err)));
     }
 
-    if let Some(backup_root) = backup_root {
-        if let Err(err) = cleanup_sidecar_root(&backup_root) {
-            tracing::warn!(
-                path = %backup_root.display(),
-                error = %err,
-                "V2 migration left backup sidecar after successful swap"
-            );
-        }
+    if let Some(backup_root) = backup_root
+        && let Err(err) = cleanup_sidecar_root(&backup_root)
+    {
+        tracing::warn!(
+            path = %backup_root.display(),
+            error = %err,
+            "V2 migration left backup sidecar after successful swap"
+        );
     }
 
     Ok(event)

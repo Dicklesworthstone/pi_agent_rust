@@ -2184,17 +2184,17 @@ impl PackageManager {
         target: &mut ResourceList,
         metadata: &PathMetadata,
     ) -> Result<()> {
-        if let Some(manifest) = read_pi_manifest(package_root)? {
-            if let Some(entries) = manifest.entries_for(resource_type) {
-                Self::add_manifest_entries(
-                    Some(&entries),
-                    package_root,
-                    resource_type,
-                    target,
-                    metadata,
-                );
-                return Ok(());
-            }
+        if let Some(manifest) = read_pi_manifest(package_root)?
+            && let Some(entries) = manifest.entries_for(resource_type)
+        {
+            Self::add_manifest_entries(
+                Some(&entries),
+                package_root,
+                resource_type,
+                target,
+                metadata,
+            );
+            return Ok(());
         }
 
         let dir = package_root.join(resource_type.as_str());
@@ -2235,30 +2235,30 @@ impl PackageManager {
         package_root: &Path,
         resource_type: ResourceType,
     ) -> Result<(Vec<PathBuf>, std::collections::HashSet<PathBuf>)> {
-        if let Some(manifest) = read_pi_manifest(package_root)? {
-            if let Some(entries) = manifest.entries_for(resource_type) {
-                if entries.is_empty() {
-                    return Ok((Vec::new(), std::collections::HashSet::new()));
-                }
-                let all_files =
-                    collect_files_from_manifest_entries(&entries, package_root, resource_type);
-                let patterns = entries
-                    .iter()
-                    .filter(|e| is_pattern(e))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let enabled_by_manifest = if patterns.is_empty() {
-                    all_files
-                        .iter()
-                        .cloned()
-                        .collect::<std::collections::HashSet<_>>()
-                } else {
-                    apply_patterns(&all_files, &patterns, package_root)
-                };
-                let mut enabled_vec = enabled_by_manifest.iter().cloned().collect::<Vec<_>>();
-                enabled_vec.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-                return Ok((enabled_vec, enabled_by_manifest));
+        if let Some(manifest) = read_pi_manifest(package_root)?
+            && let Some(entries) = manifest.entries_for(resource_type)
+        {
+            if entries.is_empty() {
+                return Ok((Vec::new(), std::collections::HashSet::new()));
             }
+            let all_files =
+                collect_files_from_manifest_entries(&entries, package_root, resource_type);
+            let patterns = entries
+                .iter()
+                .filter(|e| is_pattern(e))
+                .cloned()
+                .collect::<Vec<_>>();
+            let enabled_by_manifest = if patterns.is_empty() {
+                all_files
+                    .iter()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>()
+            } else {
+                apply_patterns(&all_files, &patterns, package_root)
+            };
+            let mut enabled_vec = enabled_by_manifest.iter().cloned().collect::<Vec<_>>();
+            enabled_vec.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
+            return Ok((enabled_vec, enabled_by_manifest));
         }
 
         let convention_dir = package_root.join(resource_type.as_str());
@@ -3159,10 +3159,10 @@ fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
             }
             continue;
         }
-        if stats.is_dir() {
-            if let Some(entries) = resolve_extension_entries(&path) {
-                out.extend(entries);
-            }
+        if stats.is_dir()
+            && let Some(entries) = resolve_extension_entries(&path)
+        {
+            out.extend(entries);
         }
     }
     out.sort();
@@ -3391,27 +3391,25 @@ fn normalize_remote_git_repo(repo_raw: &str) -> (String, String, String) {
 
     if !repo_raw.contains("://") {
         let first_slash = repo_raw.find('/');
-        if let Some(colon_idx) = repo_raw.find(':') {
-            if first_slash.is_none_or(|slash| colon_idx < slash) {
-                let host_part = &repo_raw[..colon_idx];
-                if let Some(at_idx) = host_part.rfind('@') {
-                    let host = host_part[at_idx + 1..].trim().to_string();
-                    let path = repo_raw[colon_idx + 1..]
-                        .trim()
-                        .trim_matches('/')
-                        .trim_end_matches(".git")
-                        .split('/')
-                        .filter(|s| !s.is_empty() && *s != "." && *s != "..")
-                        .collect::<Vec<_>>()
-                        .join("/");
-                    let repo = if path.is_empty() {
-                        host.clone()
-                    } else {
-                        format!("{host}/{path}")
-                    };
-                    return (repo, host, path);
-                }
-            }
+        if let Some(colon_idx) = repo_raw.find(':')
+            && first_slash.is_none_or(|slash| colon_idx < slash)
+            && let Some(at_idx) = repo_raw[..colon_idx].rfind('@')
+        {
+            let host = repo_raw[at_idx + 1..colon_idx].trim().to_string();
+            let path = repo_raw[colon_idx + 1..]
+                .trim()
+                .trim_matches('/')
+                .trim_end_matches(".git")
+                .split('/')
+                .filter(|s| !s.is_empty() && *s != "." && *s != "..")
+                .collect::<Vec<_>>()
+                .join("/");
+            let repo = if path.is_empty() {
+                host.clone()
+            } else {
+                format!("{host}/{path}")
+            };
+            return (repo, host, path);
         }
     }
 
@@ -3557,19 +3555,19 @@ fn file_url_local_path(path: &str) -> String {
     if path.eq_ignore_ascii_case("localhost") {
         return "/".to_string();
     }
-    if let Some((host, stripped)) = path.split_once('/') {
-        if host.eq_ignore_ascii_case("localhost") {
-            if looks_like_windows_drive_absolute_path(stripped) {
-                return stripped.to_string();
-            }
-            if let Some(drive_path) = stripped
-                .strip_prefix('/')
-                .filter(|drive_path| looks_like_windows_drive_absolute_path(drive_path))
-            {
-                return drive_path.to_string();
-            }
-            return format!("/{stripped}");
+    if let Some((host, stripped)) = path.split_once('/')
+        && host.eq_ignore_ascii_case("localhost")
+    {
+        if looks_like_windows_drive_absolute_path(stripped) {
+            return stripped.to_string();
         }
+        if let Some(drive_path) = stripped
+            .strip_prefix('/')
+            .filter(|drive_path| looks_like_windows_drive_absolute_path(drive_path))
+        {
+            return drive_path.to_string();
+        }
+        return format!("/{stripped}");
     }
 
     if !path.is_empty() && !path.starts_with('/') {

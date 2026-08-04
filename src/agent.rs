@@ -2553,12 +2553,10 @@ impl Agent {
                             raw.push_str(&delta);
                             if let Some(partial_args) =
                                 crate::providers::openai::complete_partial_json(raw)
-                            {
-                                if let Some(ContentBlock::ToolCall(tc)) =
+                                && let Some(ContentBlock::ToolCall(tc)) =
                                     msg.content.get_mut(content_index)
-                                {
-                                    tc.arguments = partial_args;
-                                }
+                            {
+                                tc.arguments = partial_args;
                             }
                         }
                         let shared = Arc::clone(msg_arc);
@@ -2649,29 +2647,27 @@ impl Agent {
         // If the stream ends without a Done/Error event, we may have a partial message.
         // Instead of discarding it, we finalize it with an error state so the user/session
         // retains the partial content.
-        if added_partial {
-            if let Some(Message::Assistant(last_msg)) = self
+        if added_partial
+            && let Some(Message::Assistant(last_msg)) = self
                 .messages
                 .iter()
                 .rev()
                 .find(|m| matches!(m, Message::Assistant(_)))
-            {
-                let mut final_msg = (**last_msg).clone();
-                // #148: same truncation check as the `Done` arm. A provider can
-                // stamp `Length` on a partial (via `Start`/deltas) and then drop
-                // the connection without a terminal event; the resulting error
-                // should name the truncated tool call rather than the generic
-                // missing-`Done` condition.
-                let truncated_tool_call =
-                    is_truncated_before_tool_call(&final_msg, tool_call_started);
-                final_msg.stop_reason = StopReason::Error;
-                final_msg.error_message = Some(if truncated_tool_call {
-                    TRUNCATED_TOOL_CALL_ERROR.to_string()
-                } else {
-                    "Stream ended without Done event".to_string()
-                });
-                return Ok(self.finalize_assistant_message(final_msg, &on_event, true));
-            }
+        {
+            let mut final_msg = (**last_msg).clone();
+            // #148: same truncation check as the `Done` arm. A provider can
+            // stamp `Length` on a partial (via `Start`/deltas) and then drop
+            // the connection without a terminal event; the resulting error
+            // should name the truncated tool call rather than the generic
+            // missing-`Done` condition.
+            let truncated_tool_call = is_truncated_before_tool_call(&final_msg, tool_call_started);
+            final_msg.stop_reason = StopReason::Error;
+            final_msg.error_message = Some(if truncated_tool_call {
+                TRUNCATED_TOOL_CALL_ERROR.to_string()
+            } else {
+                "Stream ended without Done event".to_string()
+            });
+            return Ok(self.finalize_assistant_message(final_msg, &on_event, true));
         }
         Err(Error::api("Stream ended without Done event"))
     }

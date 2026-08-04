@@ -3089,13 +3089,14 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                             break child.wait().map_err(|err| err.to_string())?;
                         }
 
-                        if let Some(timeout_ms) = timeout_ms {
-                            if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
-                                killed = true;
-                                crate::tools::kill_process_group_tree(Some(pid));
-                                let _ = child.kill();
-                                break child.wait().map_err(|err| err.to_string())?;
-                            }
+                        if let Some(timeout_ms) = timeout_ms
+                            && !killed
+                            && start.elapsed() >= Duration::from_millis(timeout_ms)
+                        {
+                            killed = true;
+                            crate::tools::kill_process_group_tree(Some(pid));
+                            let _ = child.kill();
+                            break child.wait().map_err(|err| err.to_string())?;
                         }
 
                         thread::sleep(Duration::from_millis(10));
@@ -3122,13 +3123,13 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     Ok(())
                 })();
 
-                if let Err(err) = result {
-                    if tx.send(ExecStreamFrame::Error(err)).is_err() {
-                        tracing::trace!(
-                            call_id = %call_id_for_error,
-                            "Exec hostcall stream result dropped before completion"
-                        );
-                    }
+                if let Err(err) = result
+                    && tx.send(ExecStreamFrame::Error(err)).is_err()
+                {
+                    tracing::trace!(
+                        call_id = %call_id_for_error,
+                        "Exec hostcall stream result dropped before completion"
+                    );
                 }
             });
 
@@ -3284,17 +3285,18 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                         break child.wait().map_err(|err| err.to_string())?;
                     }
 
-                    if let Some(timeout_ms) = timeout_ms {
-                        if !killed && start.elapsed() >= Duration::from_millis(timeout_ms) {
-                            killed = true;
-                            crate::tools::kill_process_group_tree(Some(pid));
-                            let _ = child.kill();
-                            break child.wait().map_err(|err| err.to_string())?;
-                        }
+                    if let Some(timeout_ms) = timeout_ms
+                        && !killed
+                        && start.elapsed() >= Duration::from_millis(timeout_ms)
+                    {
+                        killed = true;
+                        crate::tools::kill_process_group_tree(Some(pid));
+                        let _ = child.kill();
+                        break child.wait().map_err(|err| err.to_string())?;
                     }
 
-                    if let Ok(frame) = rx.recv_timeout(Duration::from_millis(10)) {
-                        if let Err(message) = handle_exec_capture_frame(
+                    if let Ok(frame) = rx.recv_timeout(Duration::from_millis(10))
+                        && let Err(message) = handle_exec_capture_frame(
                             frame,
                             &mut stdout_chunks,
                             &mut stdout_total_bytes,
@@ -3303,14 +3305,14 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                             &mut stderr_total_bytes,
                             &mut stderr_bytes_len,
                             max_bytes,
-                        ) {
-                            if !killed {
-                                crate::tools::kill_process_group_tree(Some(pid));
-                                let _ = child.kill();
-                            }
-                            let _ = child.wait();
-                            return Err(message);
+                        )
+                    {
+                        if !killed {
+                            crate::tools::kill_process_group_tree(Some(pid));
+                            let _ = child.kill();
                         }
+                        let _ = child.wait();
+                        return Err(message);
                     }
                 };
 
@@ -3958,11 +3960,11 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                     if let Some(code) = err.code {
                         message = format!("{code}: {message}");
                     }
-                    if let Some(stack) = err.stack {
-                        if !stack.is_empty() {
-                            message.push('\n');
-                            message.push_str(&stack);
-                        }
+                    if let Some(stack) = err.stack
+                        && !stack.is_empty()
+                    {
+                        message.push('\n');
+                        message.push_str(&stack);
                     }
                     return Err(crate::error::Error::extension(message));
                 }

@@ -2278,14 +2278,14 @@ pub fn replay_swarm_admission_from_jsonl(
             sample.live_load,
         );
 
-        if let Some(expected) = expected_action {
-            if !admission_actions_match(expected, decision.action) {
-                event_markers.push(replay_marker(
-                    SwarmAdmissionReplayDivergenceKind::ExpectedActionMismatch,
-                    entry,
-                    format!("expected {:?}, replayed {:?}", expected, decision.action),
-                ));
-            }
+        if let Some(expected) = expected_action
+            && !admission_actions_match(expected, decision.action)
+        {
+            event_markers.push(replay_marker(
+                SwarmAdmissionReplayDivergenceKind::ExpectedActionMismatch,
+                entry,
+                format!("expected {:?}, replayed {:?}", expected, decision.action),
+            ));
         }
 
         divergence_markers.extend(event_markers.clone());

@@ -856,18 +856,18 @@ impl ModelRegistry {
         let mut models = built_in_models(resolve_api_key, mode);
         let mut error = None;
 
-        if let Some(path) = models_path {
-            if path.exists() {
-                match std::fs::read_to_string(&path)
-                    .map_err(|e| Error::config(format!("Failed to read models.json: {e}")))
-                    .and_then(|s| serde_json::from_str::<ModelsConfig>(&s).map_err(Error::from))
-                {
-                    Ok(config) => {
-                        apply_custom_models(resolve_api_key, &mut models, &config, path.parent());
-                    }
-                    Err(e) => {
-                        error = Some(format!("{e}\n\nFile: {}", path.display()));
-                    }
+        if let Some(path) = models_path
+            && path.exists()
+        {
+            match std::fs::read_to_string(&path)
+                .map_err(|e| Error::config(format!("Failed to read models.json: {e}")))
+                .and_then(|s| serde_json::from_str::<ModelsConfig>(&s).map_err(Error::from))
+            {
+                Ok(config) => {
+                    apply_custom_models(resolve_api_key, &mut models, &config, path.parent());
+                }
+                Err(e) => {
+                    error = Some(format!("{e}\n\nFile: {}", path.display()));
                 }
             }
         }

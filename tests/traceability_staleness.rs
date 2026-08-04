@@ -77,12 +77,11 @@ fn load_matrix_test_stems(root: &Path) -> BTreeSet<String> {
             for category in &["unit_tests", "e2e_scripts"] {
                 if let Some(entries) = req.get(*category).and_then(|v| v.as_array()) {
                     for entry in entries {
-                        if let Some(p) = entry.get("path").and_then(|v| v.as_str()) {
-                            if let Some(stem) =
+                        if let Some(p) = entry.get("path").and_then(|v| v.as_str())
+                            && let Some(stem) =
                                 p.strip_prefix("tests/").and_then(|s| s.strip_suffix(".rs"))
-                            {
-                                stems.insert(stem.to_string());
-                            }
+                        {
+                            stems.insert(stem.to_string());
                         }
                     }
                 }
@@ -181,12 +180,11 @@ fn on_disk_test_stems(root: &Path) -> BTreeSet<String> {
     if let Ok(entries) = std::fs::read_dir(&tests_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().is_some_and(|e| e == "rs") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if !ignored.contains(stem) {
-                        stems.insert(stem.to_string());
-                    }
-                }
+            if path.extension().is_some_and(|e| e == "rs")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && !ignored.contains(stem)
+            {
+                stems.insert(stem.to_string());
             }
         }
     }
@@ -200,7 +198,7 @@ struct SourceInventoryDiff {
 }
 
 impl SourceInventoryDiff {
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.missing_from_matrix.is_empty() && self.stale_matrix_entries.is_empty()
     }
 }

@@ -105,6 +105,6 @@ jobs:
           manifest-path: pi_agent_rust/Cargo.toml
           package: pi_agent_rust
           baseline-rev: ${{ steps.baseline.outputs.rev }}
-          rust-toolchain: nightly
+          rust-toolchain: nightly-2026-07-05
           shared-key: pi-agent-rust-semver
           verbose: true

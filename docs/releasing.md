@@ -4,6 +4,13 @@ This repo ships:
 - A library crate: `pi` (Cargo `[lib].name`)
 - A binary: `pi` (Cargo `[[bin]].name`)
 
+The Cargo source package also retains the internal `pi_legacy_capture`
+conformance utility because integration tests execute it through
+`CARGO_BIN_EXE_pi_legacy_capture`. It is gated by the non-default
+`internal-legacy-capture` feature and is not a supported release artifact.
+Ordinary `cargo install pi_agent_rust --locked` therefore installs only `pi`;
+repository gates that cover the utility explicitly enable its internal feature.
+
 ## Versioning + tags (source of truth)
 **Source of truth:** `Cargo.toml` `[package].version`.
 
@@ -18,16 +25,20 @@ This repo ships:
 2) verify `Cargo.toml` version matches the tag version
 3) run `cargo publish --dry-run --locked`
 4) publish to crates.io **only** when:
-   - the tag is **not** a pre-release (workflow checks `tag` does **not** contain `-`)
+   - the parsed SemVer has no pre-release component
    - `CARGO_REGISTRY_TOKEN` is configured
 
-Note: dependencies that specify both `version` and `path` are expected to publish using the `version` constraint; ensure those versions exist on crates.io before tagging.
+Release and publish workflows resolve the sibling-project crates from crates.io
+under `Cargo.lock`; they do not build against arbitrary sibling repository
+checkouts. Per-target build manifests therefore record selected locked crate
+versions, registry sources, and checksums rather than unrelated repository HEADs.
 
 ### Publishing GitHub Releases binaries
 `.github/workflows/release.yml` is triggered on tag pushes matching `v*` and will:
 - build `pi` for Linux/macOS/Windows (release profile)
-- attach binaries, per-target build manifests, and `SHA256SUMS` to a GitHub Release
-- mark the GitHub Release as a pre-release if the tag contains `-` (e.g. `-rc.1`)
+- attach platform archives, per-target build manifests, and `SHA256SUMS` to a GitHub Release
+- mark the GitHub Release as a pre-release when the parsed SemVer has a
+  pre-release component (for example, `-rc.1`)
 
 Release notes are extracted from `CHANGELOG.md` on a best-effort basis; ensure the changelog contains a `##` heading with the version string for the tag you are cutting.
 
@@ -37,7 +48,7 @@ Goal: keep packaging and invocation ergonomics compatible enough for frictionles
 ### Supported distribution paths
 - **Installer path (`install.sh`)**: default channel for end users; installs GitHub release binary, verifies checksums, and manages migration state.
 - **Release artifact path (GitHub Releases)**: direct binary download per OS/arch with `SHA256SUMS` verification.
-- **Source path (`cargo build --release`)**: deterministic fallback for constrained/air-gapped environments.
+- **Source path (`cargo build --release --locked`)**: deterministic fallback for constrained/air-gapped environments.
 
 ### Executable compatibility path
 - Canonical command is `pi`.
@@ -118,7 +129,10 @@ We call it `1.0.0` when:
 - CI is green on Linux/macOS/Windows (`.github/workflows/ci.yml`)
 - Required execution surfaces are parity-stable (interactive + print + JSON mode + RPC + SDK contract) with conformance evidence green
 - Extension runtime surface and security policy are stable enough that we can commit to not breaking users without an intentional SemVer bump
-- Drop-in certification artifacts report `CERTIFIED` for strict replacement claims
+- Drop-in certification artifacts report `CERTIFIED` for the clean release
+  source commit, and the final release ref equals it or contains only
+  allowlisted evidence-only descendants, before strict replacement claims are
+  used
 
 Until then, `0.x` releases may still change behavior to improve correctness/parity, and release messaging must not claim strict drop-in replacement.
 
@@ -129,8 +143,9 @@ Until then, `0.x` releases may still change behavior to improve correctness/pari
 2) **Update version** in `Cargo.toml` (`[package].version`).
 3) **Run quality gates locally**:
    - `cargo fmt --check`
-   - `cargo clippy --all-targets -- -D warnings`
-   - `cargo test --all-targets`
+   - `cargo check --locked --all-targets --features internal-legacy-capture`
+   - `cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings`
+   - `cargo test --locked --all-targets --features internal-legacy-capture`
 4) **Update changelog**:
    - `br changelog --since-tag vX.Y.Z` (or use `--since YYYY-MM-DD` if no prior tags)
    - paste the output into `CHANGELOG.md` under a new version heading
@@ -141,6 +156,104 @@ Until then, `0.x` releases may still change behavior to improve correctness/pari
 7) **Verify** GitHub Actions:
    - `Publish` workflow (crates.io publish) behaves as expected
    - `Release (GitHub binaries)` workflow creates a GitHub Release with binaries + `SHA256SUMS`
+
+## Manual DSR lane (no GitHub Actions)
+
+Use this lane when the release is intentionally built and published from the
+operator hosts. It does not dispatch, rerun, or otherwise invoke a GitHub
+Actions workflow. Keep every pushed release-preparation, source, and evidence
+commit marked with `[skip actions]`; the commit ultimately referenced by the
+tag must contain that marker. Use an annotated tag with the marker as an
+additional auditable signal.
+
+1. Run the locked repository gates, including the internal capture target:
+
+   ```bash
+   cargo fmt --check
+   cargo check --locked --all-targets --features internal-legacy-capture
+   cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings
+   cargo test --locked --all-targets --features internal-legacy-capture
+   cargo package --locked
+   cargo publish --dry-run --locked
+   ```
+
+2. Commit the clean release source before generating tracked evidence. Every
+   commit message in this lane must end with `[skip actions]`:
+
+   ```bash
+   git commit -m "Prepare vX.Y.Z release source [skip actions]"
+   ```
+
+3. Generate source-bound conformance evidence explicitly, commit it, then run
+   the mandatory manual release gate. Ordinary test runs are read-only and do
+   not freshen these tracked artifacts. The v0.x lane does not make a strict
+   drop-in claim, while preflight and quality remain required:
+
+   ```bash
+   PI_GENERATE_CONFORMANCE_REPORT=1 \
+     cargo test --locked --test conformance_report \
+     generate_conformance_report -- --exact --nocapture
+   git commit -m "Record vX.Y.Z release evidence [skip actions]"
+
+   RELEASE_GATE_REQUIRE_PREFLIGHT=1 \
+   RELEASE_GATE_REQUIRE_QUALITY=1 \
+   RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED=0 \
+   RELEASE_GATE_CARGO_RUNNER=local \
+     ./scripts/release_gate.sh --no-rch --report
+   ```
+
+   The gate requires a clean repository at entry and revalidates the exact
+   HEAD, canonical source-tree digest, index, index flags, symlink topology,
+   untracked paths, and raw worktree bytes after every executable check. Push
+   only after it passes, then synchronize the legacy compatibility ref:
+
+   ```bash
+   git push origin main
+   git push origin main:master
+   ```
+
+4. Validate DSR and all configured native build hosts, then inspect the build
+   plan before executing it:
+
+   ```bash
+   dsr doctor
+   dsr repos validate
+   dsr health all
+   dsr build pi_agent_rust --version X.Y.Z --dry-run
+   ```
+
+   DSR source synchronization mirrors into its configured destinations. Never
+   sync into a shared or dirty checkout. Prepare dedicated host checkouts at
+   the exact release commit, verify each checkout's `HEAD`, and then build with
+   `--no-sync`:
+
+   ```bash
+   dsr build pi_agent_rust --version X.Y.Z --no-sync -o /path/to/release-artifacts
+   ```
+
+5. Verify the artifacts and `SHA256SUMS` locally. Create and push the annotated
+   tag only after the artifacts came from the exact clean release commit:
+
+   ```bash
+   git tag -a vX.Y.Z -m "vX.Y.Z manual DSR release [skip actions]"
+   git push origin vX.Y.Z
+   ```
+
+6. Upload a draft without dispatching any workflow, inspect the draft and its
+   complete five-platform asset set, then publish it and publish the crate
+   manually:
+
+   ```bash
+   dsr release pi_agent_rust X.Y.Z --draft --no-dispatch \
+     --artifacts /path/to/release-artifacts
+   gh release edit vX.Y.Z --draft=false
+   cargo publish --locked
+   ```
+
+7. Re-download the published assets, verify their checksums, smoke-test the
+   binaries and installer on their target platforms, and confirm crates.io
+   serves version `X.Y.Z`. Also confirm that no workflow run newer than the
+   recorded pre-release baseline was created.
 
 ## Pre-release flow (rc)
 Use a pre-release tag to exercise CI/publish validation without publishing to crates.io:
@@ -170,11 +283,13 @@ For branches opened before this gate was introduced:
 - CI is green on `main` (Linux/macOS/Windows).
 - Local gates are green:
   - `cargo fmt --check`
-  - `cargo clippy --all-targets -- -D warnings`
-  - `cargo test --all-targets`
+  - `cargo check --locked --all-targets --features internal-legacy-capture`
+  - `cargo clippy --locked --all-targets --features internal-legacy-capture -- -D warnings`
+  - `cargo test --locked --all-targets --features internal-legacy-capture`
 - Feature PRs merged since the previous tag satisfy the DoD evidence checklist (unit + e2e + extension + repro commands).
 - `CHANGELOG.md` updated for the version you’re tagging.
-- Benchmarks run if this release is performance-sensitive (see `BENCHMARKS.md`).
+- Benchmarks run if this release is performance-sensitive (see the
+  [benchmark guide](planning/BENCHMARKS.md)).
 - Distribution compatibility matrix (above) passes for all required paths.
 
 ## Post-release checklist

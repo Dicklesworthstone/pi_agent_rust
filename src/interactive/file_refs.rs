@@ -88,17 +88,16 @@ pub(super) fn unescape_dragged_path(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars().peekable();
     while let Some(ch) = chars.next() {
-        if ch == '\\' {
-            if let Some(next) = chars.peek().copied() {
-                if matches!(
-                    next,
-                    ' ' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '\\'
-                ) {
-                    out.push(next);
-                    let _ = chars.next();
-                    continue;
-                }
-            }
+        if ch == '\\'
+            && let Some(next) = chars.peek().copied()
+            && matches!(
+                next,
+                ' ' | '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | '\\'
+            )
+        {
+            out.push(next);
+            let _ = chars.next();
+            continue;
         }
         out.push(ch);
     }

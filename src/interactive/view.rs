@@ -840,17 +840,17 @@ impl PiApp {
                 );
 
                 // Render thinking if present
-                if self.thinking_visible {
-                    if let Some(thinking) = &msg.thinking {
-                        let truncated = truncate(thinking, 100);
-                        let _ = writeln!(
-                            output,
-                            "  {}",
-                            self.styles
-                                .muted_italic
-                                .render(&format!("Thinking: {truncated}"))
-                        );
-                    }
+                if self.thinking_visible
+                    && let Some(thinking) = &msg.thinking
+                {
+                    let truncated = truncate(thinking, 100);
+                    let _ = writeln!(
+                        output,
+                        "  {}",
+                        self.styles
+                            .muted_italic
+                            .render(&format!("Thinking: {truncated}"))
+                    );
                 }
 
                 // Render markdown content
@@ -1157,49 +1157,47 @@ impl PiApp {
                 border_style.render("│")
             );
 
-            if is_selected {
-                if let Some(desc) = &item.description {
-                    let max_desc_len = width.saturating_sub(4);
-                    let desc_width = desc.width();
-                    let truncated_desc = if desc_width > max_desc_len {
-                        let mut out = String::with_capacity(max_desc_len);
-                        let mut current_width = 0;
-                        for c in desc.chars() {
-                            let c = if c == '\n' { ' ' } else { c };
-                            let w = c.width().unwrap_or(0);
-                            if current_width + w > max_desc_len {
-                                while current_width > max_desc_len.saturating_sub(1) {
-                                    if let Some(last) = out.pop() {
-                                        current_width -= last.width().unwrap_or(0);
-                                    } else {
-                                        break;
-                                    }
+            if is_selected && let Some(desc) = &item.description {
+                let max_desc_len = width.saturating_sub(4);
+                let desc_width = desc.width();
+                let truncated_desc = if desc_width > max_desc_len {
+                    let mut out = String::with_capacity(max_desc_len);
+                    let mut current_width = 0;
+                    for c in desc.chars() {
+                        let c = if c == '\n' { ' ' } else { c };
+                        let w = c.width().unwrap_or(0);
+                        if current_width + w > max_desc_len {
+                            while current_width > max_desc_len.saturating_sub(1) {
+                                if let Some(last) = out.pop() {
+                                    current_width -= last.width().unwrap_or(0);
+                                } else {
+                                    break;
                                 }
-                                out.push('…');
-                                break;
                             }
-                            out.push(c);
-                            current_width += w;
+                            out.push('…');
+                            break;
                         }
-                        out
-                    } else {
-                        desc.replace('\n', " ")
-                    };
+                        out.push(c);
+                        current_width += w;
+                    }
+                    out
+                } else {
+                    desc.replace('\n', " ")
+                };
 
-                    let _ = write!(
-                        output,
-                        "\n  {}  {}{}",
-                        border_style.render("│"),
-                        desc_style.render(&truncated_desc),
-                        border_style.render(&format!(
-                            "{:>pad$}│",
-                            "",
-                            pad = width
-                                .saturating_sub(2)
-                                .saturating_sub(truncated_desc.width())
-                        ))
-                    );
-                }
+                let _ = write!(
+                    output,
+                    "\n  {}  {}{}",
+                    border_style.render("│"),
+                    desc_style.render(&truncated_desc),
+                    border_style.render(&format!(
+                        "{:>pad$}│",
+                        "",
+                        pad = width
+                            .saturating_sub(2)
+                            .saturating_sub(truncated_desc.width())
+                    ))
+                );
             }
         }
 

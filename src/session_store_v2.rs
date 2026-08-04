@@ -1556,13 +1556,13 @@ pub fn frame_to_session_entry(frame: &SegmentFrame) -> Result<SessionEntry> {
         ))
     })?;
 
-    if let Some(base_id) = entry.base_id() {
-        if base_id != &frame.entry_id {
-            return Err(Error::session(format!(
-                "frame entry_id mismatch: frame={} entry={}",
-                frame.entry_id, base_id
-            )));
-        }
+    if let Some(base_id) = entry.base_id()
+        && base_id != &frame.entry_id
+    {
+        return Err(Error::session(format!(
+            "frame entry_id mismatch: frame={} entry={}",
+            frame.entry_id, base_id
+        )));
     }
 
     Ok(entry)

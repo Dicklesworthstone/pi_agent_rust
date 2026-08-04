@@ -1,9 +1,9 @@
 //! Pi - High-performance AI coding agent CLI
 //!
 //! Rust port of pi-mono (TypeScript) with emphasis on:
-//! - Performance: Sub-100ms startup, smooth TUI at 60fps
-//! - Reliability: No panics in normal operation
-//! - Efficiency: Single binary, minimal dependencies
+//! - Performance-oriented native architecture with instrumented startup and TUI paths
+//! - Reliability through explicit errors, bounded cancellation, and conformance tests
+//! - Distribution through one supported end-user binary in official release archives
 
 #![forbid(unsafe_code)]
 
@@ -201,10 +201,10 @@ async fn resolve_selection_with_auth(
                         let canonical_provider =
                             pi::provider_metadata::canonical_provider_id(provider)
                                 .unwrap_or(provider.as_str());
-                        if canonical_provider.eq("sap-ai-core") {
-                            if let Some(token) = pi::auth::exchange_sap_access_token(auth).await? {
-                                return Ok(Some((selection, Some(token))));
-                            }
+                        if canonical_provider.eq("sap-ai-core")
+                            && let Some(token) = pi::auth::exchange_sap_access_token(auth).await?
+                        {
+                            return Ok(Some((selection, Some(token))));
                         }
                     }
 
@@ -467,64 +467,64 @@ fn main_impl() -> Result<()> {
     //
     // IMPORTANT: if extension compat scanning is enabled, or explicit CLI extensions are provided,
     // we must boot the normal startup path so the compat ledger can be emitted deterministically.
-    if cli.command.is_none() {
-        if let Some(pattern) = &cli.list_models {
-            let compat_scan_enabled = std::env::var("PI_EXT_COMPAT_SCAN").is_ok_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            });
-            let has_cli_extensions = !cli.extension.is_empty();
+    if cli.command.is_none()
+        && let Some(pattern) = &cli.list_models
+    {
+        let compat_scan_enabled = std::env::var("PI_EXT_COMPAT_SCAN").is_ok_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        });
+        let has_cli_extensions = !cli.extension.is_empty();
 
-            if !compat_scan_enabled && !has_cli_extensions {
-                // Note: we intentionally skip OAuth refresh here to keep this path fast and offline.
-                let models_path = default_models_path(&Config::global_dir());
-                if let Some(payload) = load_list_models_cache(&models_path) {
-                    if let Some(error) = &payload.error {
-                        eprintln!("Warning: models.json error: {error}");
-                    }
-                    list_models_from_cached_rows(&payload.rows, pattern.as_deref());
-                    return Ok(());
-                }
-
-                let auth = AuthStorage::load(Config::auth_path())?;
-                let registry = ModelRegistry::load_for_listing(&auth, Some(models_path.clone()));
-                let error = registry.error().map(std::string::ToString::to_string);
-                if let Some(error) = &error {
+        if !compat_scan_enabled && !has_cli_extensions {
+            // Note: we intentionally skip OAuth refresh here to keep this path fast and offline.
+            let models_path = default_models_path(&Config::global_dir());
+            if let Some(payload) = load_list_models_cache(&models_path) {
+                if let Some(error) = &payload.error {
                     eprintln!("Warning: models.json error: {error}");
                 }
-
-                let mut models = registry.available_models();
-                models.sort_by(|a, b| {
-                    let provider_cmp = a.model.provider.cmp(&b.model.provider);
-                    if matches!(provider_cmp, std::cmp::Ordering::Equal) {
-                        a.model.id.cmp(&b.model.id)
-                    } else {
-                        provider_cmp
-                    }
-                });
-                let rows = build_model_rows(&models);
-                let payload = ListModelsCachePayload {
-                    error,
-                    rows: rows
-                        .into_iter()
-                        .map(|(provider, model, context, max_out, thinking, images)| {
-                            CachedModelRow {
-                                provider,
-                                model,
-                                context,
-                                max_out,
-                                thinking,
-                                images,
-                            }
-                        })
-                        .collect(),
-                };
-                save_list_models_cache(&models_path, &payload);
                 list_models_from_cached_rows(&payload.rows, pattern.as_deref());
                 return Ok(());
             }
+
+            let auth = AuthStorage::load(Config::auth_path())?;
+            let registry = ModelRegistry::load_for_listing(&auth, Some(models_path.clone()));
+            let error = registry.error().map(std::string::ToString::to_string);
+            if let Some(error) = &error {
+                eprintln!("Warning: models.json error: {error}");
+            }
+
+            let mut models = registry.available_models();
+            models.sort_by(|a, b| {
+                let provider_cmp = a.model.provider.cmp(&b.model.provider);
+                if matches!(provider_cmp, std::cmp::Ordering::Equal) {
+                    a.model.id.cmp(&b.model.id)
+                } else {
+                    provider_cmp
+                }
+            });
+            let rows = build_model_rows(&models);
+            let payload = ListModelsCachePayload {
+                error,
+                rows: rows
+                    .into_iter()
+                    .map(
+                        |(provider, model, context, max_out, thinking, images)| CachedModelRow {
+                            provider,
+                            model,
+                            context,
+                            max_out,
+                            thinking,
+                            images,
+                        },
+                    )
+                    .collect(),
+            };
+            save_list_models_cache(&models_path, &payload);
+            list_models_from_cached_rows(&payload.rows, pattern.as_deref());
+            return Ok(());
         }
     }
 
@@ -628,10 +628,10 @@ fn is_usage_error(err: &anyhow::Error) -> bool {
 }
 
 fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> {
-    if let Some(theme_spec) = theme_spec {
-        if pi::theme::looks_like_theme_path(theme_spec) {
-            pi::theme::Theme::resolve_spec(theme_spec, cwd).map_err(anyhow::Error::new)?;
-        }
+    if let Some(theme_spec) = theme_spec
+        && pi::theme::looks_like_theme_path(theme_spec)
+    {
+        pi::theme::Theme::resolve_spec(theme_spec, cwd).map_err(anyhow::Error::new)?;
     }
     Ok(())
 }
@@ -1067,10 +1067,10 @@ async fn run(
     // Apply the persisted request-timeout setting at the lowest precedence:
     // only when neither the CLI flag nor the env var has already supplied one
     // (`cli.request_timeout` reflects both). See pi_agent_rust#90.
-    if cli.request_timeout.is_none() {
-        if let Some(secs) = config.request_timeout_secs {
-            pi::http::client::set_request_timeout_override(secs);
-        }
+    if cli.request_timeout.is_none()
+        && let Some(secs) = config.request_timeout_secs
+    {
+        pi::http::client::set_request_timeout_override(secs);
     }
 
     let startup_mode = cli.mode.clone().unwrap_or_else(|| {
@@ -1759,10 +1759,10 @@ async fn run(
     // (clippy::future_not_send).
     if !cli.no_session {
         let cx = pi::agent_cx::AgentCx::for_request();
-        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await {
-            if let Err(e) = guard.flush_autosave_on_shutdown().await {
-                eprintln!("Warning: Failed to flush session autosave: {e}");
-            }
+        if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&session_handle), &cx).await
+            && let Err(e) = guard.flush_autosave_on_shutdown().await
+        {
+            eprintln!("Warning: Failed to flush session autosave: {e}");
         }
     }
 
@@ -3631,7 +3631,7 @@ fn normalize_display_path(path: &Path) -> String {
 }
 
 fn spawn_session_index_maintenance() {
-    const MAX_INDEX_AGE: Duration = Duration::from_secs(60 * 30);
+    const MAX_INDEX_AGE: Duration = Duration::from_mins(30);
     let index = SessionIndex::new();
 
     // Always spawn the background thread to handle cleanup, regardless of reindexing needs.
@@ -3640,10 +3640,10 @@ fn spawn_session_index_maintenance() {
         // Clean up old bash tool logs in background
         pi::tools::cleanup_temp_files();
 
-        if index.should_reindex(MAX_INDEX_AGE) {
-            if let Err(err) = index.reindex_all() {
-                eprintln!("Warning: failed to reindex session index: {err}");
-            }
+        if index.should_reindex(MAX_INDEX_AGE)
+            && let Err(err) = index.reindex_all()
+        {
+            eprintln!("Warning: failed to reindex session index: {err}");
         }
     });
 }
@@ -4307,18 +4307,13 @@ fn extension_safety_for_source(
     source: &str,
     index: Option<&ExtensionIndex>,
 ) -> ExtensionSafetyProvenance {
-    if let Some(index) = index {
-        if let Some(entry) = index
+    if let Some(index) = index
+        && let Some(entry) = index
             .entries
             .iter()
             .find(|entry| entry.install_source.as_deref() == Some(source))
-        {
-            return ExtensionSafetyProvenance::from_index_entry(
-                entry,
-                index,
-                DEFAULT_INDEX_MAX_AGE,
-            );
-        }
+    {
+        return ExtensionSafetyProvenance::from_index_entry(entry, index, DEFAULT_INDEX_MAX_AGE);
     }
     ExtensionSafetyProvenance::from_install_source(source)
 }
@@ -4590,14 +4585,13 @@ impl ConfigUiApp {
     }
 
     fn toggle_selected(&mut self) {
-        if let Some((pkg_idx, res_idx)) = self.selected_coords() {
-            if let Some(resource) = self
+        if let Some((pkg_idx, res_idx)) = self.selected_coords()
+            && let Some(resource) = self
                 .packages
                 .get_mut(pkg_idx)
                 .and_then(|pkg| pkg.resources.get_mut(res_idx))
-            {
-                resource.enabled = !resource.enabled;
-            }
+        {
+            resource.enabled = !resource.enabled;
         }
     }
 
@@ -5514,11 +5508,11 @@ fn append_file_fingerprint(hasher: &mut Sha256, path: &Path) {
         Ok(meta) => {
             hasher.update([1]);
             hasher.update(meta.len().to_le_bytes());
-            if let Ok(modified) = meta.modified() {
-                if let Ok(duration) = modified.duration_since(UNIX_EPOCH) {
-                    hasher.update(duration.as_secs().to_le_bytes());
-                    hasher.update(duration.subsec_nanos().to_le_bytes());
-                }
+            if let Ok(modified) = meta.modified()
+                && let Ok(duration) = modified.duration_since(UNIX_EPOCH)
+            {
+                hasher.update(duration.as_secs().to_le_bytes());
+                hasher.update(duration.subsec_nanos().to_le_bytes());
             }
         }
         Err(_) => hasher.update([0]),
@@ -5626,18 +5620,17 @@ async fn handle_fetch_models(provider: &str, refresh: bool) -> Result<()> {
 }
 
 fn resolve_provider_api_key(provider: &str) -> String {
-    if let Ok(auth) = AuthStorage::load(Config::auth_path()) {
-        if let Some(key) = auth.api_key(provider) {
-            if !key.trim().is_empty() {
-                return key;
-            }
-        }
+    if let Ok(auth) = AuthStorage::load(Config::auth_path())
+        && let Some(key) = auth.api_key(provider)
+        && !key.trim().is_empty()
+    {
+        return key;
     }
     for env_key in provider_metadata::provider_auth_env_keys(provider) {
-        if let Ok(value) = std::env::var(env_key) {
-            if !value.trim().is_empty() {
-                return value;
-            }
+        if let Ok(value) = std::env::var(env_key)
+            && !value.trim().is_empty()
+        {
+            return value;
         }
     }
     String::new()
@@ -6415,10 +6408,10 @@ async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<P
     let html = pi::app::render_session_html(&session);
     let output_path = output_path.map_or_else(|| default_export_path(input), PathBuf::from);
 
-    if let Some(parent) = output_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            asupersync::fs::create_dir_all(parent).await?;
-        }
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        asupersync::fs::create_dir_all(parent).await?;
     }
     asupersync::fs::write(&output_path, html).await?;
     Ok(output_path)
@@ -6696,7 +6689,7 @@ impl PrintTextStreamState {
     }
 }
 
-fn streamed_text_delta(event: &AgentEvent) -> Option<&str> {
+const fn streamed_text_delta(event: &AgentEvent) -> Option<&str> {
     match event {
         AgentEvent::MessageUpdate {
             assistant_message_event: pi::model::AssistantMessageEvent::TextDelta { delta, .. },

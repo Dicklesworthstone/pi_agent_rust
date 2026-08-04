@@ -305,11 +305,11 @@ fn provider_config_or_skip(provider: &str, harness: &TestHarness) -> Option<Live
     }
 
     let config = discovery.configs.get(provider).cloned()?;
-    if is_azure_provider(provider) {
-        if let Err(reason) = resolve_azure_runtime_config(&config) {
-            eprintln!("SKIPPED: provider '{provider}' disabled ({reason})");
-            return None;
-        }
+    if is_azure_provider(provider)
+        && let Err(reason) = resolve_azure_runtime_config(&config)
+    {
+        eprintln!("SKIPPED: provider '{provider}' disabled ({reason})");
+        return None;
     }
     Some(config)
 }
@@ -446,10 +446,10 @@ fn resolve_api_key_with_source(
     entry: &ModelEntry,
 ) -> (Option<String>, String) {
     for env_var in provider_env_var_names(provider) {
-        if let Ok(value) = env::var(env_var) {
-            if !value.trim().is_empty() {
-                return (Some(value), format!("env:{env_var}"));
-            }
+        if let Ok(value) = env::var(env_var)
+            && !value.trim().is_empty()
+        {
+            return (Some(value), format!("env:{env_var}"));
         }
     }
 
@@ -457,10 +457,10 @@ fn resolve_api_key_with_source(
         return (Some(value), "auth_store".to_string());
     }
 
-    if let Some(value) = entry.api_key.clone() {
-        if !value.trim().is_empty() {
-            return (Some(value), "models_json".to_string());
-        }
+    if let Some(value) = entry.api_key.clone()
+        && !value.trim().is_empty()
+    {
+        return (Some(value), "models_json".to_string());
     }
 
     (None, "missing".to_string())
@@ -504,15 +504,15 @@ enum ModelSelection {
 type StreamingSummaryRow = (String, String, bool, bool, bool, u64, u64, usize, u128);
 
 fn select_model_entry_for_provider(registry: &ModelRegistry, provider: &str) -> ModelSelection {
-    if let Some(override_var) = provider_model_override_var(provider) {
-        if let Ok(override_model) = env::var(override_var) {
-            let override_model = override_model.trim().to_string();
-            if !override_model.is_empty() {
-                return registry.find(provider, &override_model).map_or(
-                    ModelSelection::RequestedModelMissing(override_model),
-                    |entry| ModelSelection::Selected(Box::new(entry)),
-                );
-            }
+    if let Some(override_var) = provider_model_override_var(provider)
+        && let Ok(override_model) = env::var(override_var)
+    {
+        let override_model = override_model.trim().to_string();
+        if !override_model.is_empty() {
+            return registry.find(provider, &override_model).map_or(
+                ModelSelection::RequestedModelMissing(override_model),
+                |entry| ModelSelection::Selected(Box::new(entry)),
+            );
         }
     }
 

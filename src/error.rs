@@ -244,19 +244,19 @@ impl Error {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         // Direct io::Error link (get_ref walk covers io-wrapping-io).
-        if let Self::Io(io_err) = self {
-            if io_error_chain_is_transient(io_err) {
-                return true;
-            }
+        if let Self::Io(io_err) = self
+            && io_error_chain_is_transient(io_err)
+        {
+            return true;
         }
         // Generic source chain: any link that is (or wraps) a transient
         // io::Error makes this retryable.
         let mut source = std::error::Error::source(self);
         while let Some(cause) = source {
-            if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-                if io_error_chain_is_transient(io_err) {
-                    return true;
-                }
+            if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+                && io_error_chain_is_transient(io_err)
+            {
+                return true;
             }
             source = cause.source();
         }
@@ -1005,10 +1005,10 @@ pub fn is_context_overflow(
     context_window: Option<u32>,
 ) -> bool {
     // Silent overflow: usage exceeds context window.
-    if let (Some(input_tokens), Some(window)) = (usage_input_tokens, context_window) {
-        if input_tokens > u64::from(window) {
-            return true;
-        }
+    if let (Some(input_tokens), Some(window)) = (usage_input_tokens, context_window)
+        && input_tokens > u64::from(window)
+    {
+        return true;
     }
 
     let lower = error_message.to_lowercase();

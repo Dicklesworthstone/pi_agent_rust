@@ -697,11 +697,11 @@ impl ScopedTimer<'_> {
 impl Drop for ScopedTimer<'_> {
     #[allow(clippy::cast_possible_truncation)]
     fn drop(&mut self) {
-        if !self.finished {
-            if let Some(counter) = self.counter {
-                let elapsed_us = self.start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
-                counter.record(elapsed_us);
-            }
+        if !self.finished
+            && let Some(counter) = self.counter
+        {
+            let elapsed_us = self.start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
+            counter.record(elapsed_us);
         }
     }
 }

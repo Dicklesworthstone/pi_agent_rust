@@ -178,10 +178,10 @@ impl PendingCompaction {
     }
 
     fn abort(&mut self) {
-        if let Some(abort_tx) = self.abort_tx.take() {
-            if abort_tx.send(()).is_err() {
-                tracing::debug!("abort signal receiver was already dropped");
-            }
+        if let Some(abort_tx) = self.abort_tx.take()
+            && abort_tx.send(()).is_err()
+        {
+            tracing::debug!("abort signal receiver was already dropped");
         }
     }
 }

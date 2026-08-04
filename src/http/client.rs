@@ -750,10 +750,10 @@ fn is_retryable_not_connected(err: &std::io::Error) -> bool {
     // each link back to `io::Error` where possible.
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if matches_not_connected(io_err) {
-                return true;
-            }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && matches_not_connected(io_err)
+        {
+            return true;
         }
         source = cause.source();
     }
@@ -771,19 +771,19 @@ fn is_retryable_not_connected(err: &std::io::Error) -> bool {
 /// the fresh-socket retry fires regardless of which variant the connector
 /// chose to report (pi_agent_rust#111 / #106).
 fn is_retryable_not_connected_tls(err: &TlsError) -> bool {
-    if let TlsError::Io(io_err) = err {
-        if is_retryable_not_connected(io_err) {
-            return true;
-        }
+    if let TlsError::Io(io_err) = err
+        && is_retryable_not_connected(io_err)
+    {
+        return true;
     }
     // Walk the generic source chain; any link that is (or wraps) a
     // "socket not connected" io::Error makes the connect retryable.
     let mut source = std::error::Error::source(err);
     while let Some(cause) = source {
-        if let Some(io_err) = cause.downcast_ref::<std::io::Error>() {
-            if is_retryable_not_connected(io_err) {
-                return true;
-            }
+        if let Some(io_err) = cause.downcast_ref::<std::io::Error>()
+            && is_retryable_not_connected(io_err)
+        {
+            return true;
         }
         source = cause.source();
     }
@@ -1237,10 +1237,10 @@ impl BodyStreamState {
     async fn read_more(&mut self) -> std::io::Result<usize> {
         let mut scratch = [0u8; READ_CHUNK_BYTES];
         let n = read_some(&mut self.transport, &mut scratch).await?;
-        if n > 0 {
-            if let Err(err) = self.buf.extend(&scratch[..n]) {
-                return Err(std::io::Error::other(err.to_string()));
-            }
+        if n > 0
+            && let Err(err) = self.buf.extend(&scratch[..n])
+        {
+            return Err(std::io::Error::other(err.to_string()));
         }
         Ok(n)
     }

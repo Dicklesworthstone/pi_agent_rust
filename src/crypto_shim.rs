@@ -621,10 +621,10 @@ fn hex_decode(hex: &str) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(hex.len() / 2);
     let mut chars = hex.chars();
     while let (Some(hi), Some(lo)) = (chars.next(), chars.next()) {
-        if let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16)) {
-            if let Ok(byte) = u8::try_from(h * 16 + l) {
-                bytes.push(byte);
-            }
+        if let (Some(h), Some(l)) = (hi.to_digit(16), lo.to_digit(16))
+            && let Ok(byte) = u8::try_from(h * 16 + l)
+        {
+            bytes.push(byte);
         }
     }
     bytes
@@ -637,10 +637,11 @@ fn ed25519_public_key_from_spki(der: &[u8]) -> rquickjs::Result<&[u8]> {
     if der.len() == 32 {
         return Ok(der);
     }
-    if der.len() == ED25519_SPKI_PREFIX.len() + 32 && der.starts_with(ED25519_SPKI_PREFIX) {
-        if let Some(raw) = der.get(ED25519_SPKI_PREFIX.len()..) {
-            return Ok(raw);
-        }
+    if der.len() == ED25519_SPKI_PREFIX.len() + 32
+        && der.starts_with(ED25519_SPKI_PREFIX)
+        && let Some(raw) = der.get(ED25519_SPKI_PREFIX.len()..)
+    {
+        return Ok(raw);
     }
     Err(rquickjs::Error::new_from_js(
         "key",

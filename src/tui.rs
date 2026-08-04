@@ -558,14 +558,12 @@ fn render_code_block_segments(
             if let Ok(items) = syntax.render(Some(width)) {
                 if require_variation && candidate != "text" && !has_multiple_non_none_styles(&items)
                 {
-                    if candidate == "javascript" {
-                        if let Some(line_items) = render_syntax_line_by_line(code, candidate, width)
-                        {
-                            if has_multiple_non_none_styles(&line_items) {
-                                rendered_items = Some(line_items);
-                                break;
-                            }
-                        }
+                    if candidate == "javascript"
+                        && let Some(line_items) = render_syntax_line_by_line(code, candidate, width)
+                        && has_multiple_non_none_styles(&line_items)
+                    {
+                        rendered_items = Some(line_items);
+                        break;
                     }
                     continue;
                 }

@@ -30,7 +30,7 @@ pub struct HostcallSuperinstructionPlan {
 
 impl HostcallSuperinstructionPlan {
     #[must_use]
-    pub fn width(&self) -> usize {
+    pub const fn width(&self) -> usize {
         self.opcode_window.len()
     }
 

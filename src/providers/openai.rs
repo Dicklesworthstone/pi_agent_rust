@@ -422,14 +422,14 @@ impl Provider for OpenAIProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -723,7 +723,7 @@ fn trailing_json_string_start(out: &str) -> Option<usize> {
                 backslashes += 1;
                 j -= 1;
             }
-            if backslashes % 2 == 0 {
+            if backslashes.is_multiple_of(2) {
                 return Some(i);
             }
         }
@@ -1031,12 +1031,11 @@ where
                         // JSON; on an un-completable fragment it returns None and
                         // we keep the last good value (never wrong data). The
                         // terminal event still sets the fully-parsed arguments.
-                        if let Some(partial_args) = complete_partial_json(&tc.arguments) {
-                            if let Some(ContentBlock::ToolCall(block)) =
+                        if let Some(partial_args) = complete_partial_json(&tc.arguments)
+                            && let Some(ContentBlock::ToolCall(block)) =
                                 self.partial.content.get_mut(content_index)
-                            {
-                                block.arguments = partial_args;
-                            }
+                        {
+                            block.arguments = partial_args;
                         }
 
                         // The delta is still emitted for streaming consumers.

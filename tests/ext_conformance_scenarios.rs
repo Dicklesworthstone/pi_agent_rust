@@ -608,7 +608,7 @@ fn discover_template_paths(extension_root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-fn execute_resource_discovery_scenario(extension_path: &Path) -> Result<Value, String> {
+fn execute_resource_discovery_scenario(extension_path: &Path) -> Value {
     let extension_root = extension_root_from_path(extension_path);
     let prompt_dir = extension_root.join("prompts");
     let skill_dir = extension_root.join("skills");
@@ -652,20 +652,20 @@ fn execute_resource_discovery_scenario(extension_path: &Path) -> Result<Value, S
     );
     let template_paths = relative_paths(&extension_root, discover_template_paths(&extension_root));
 
-    Ok(serde_json::json!({
+    serde_json::json!({
         "promptPaths": sorted_path_strings(prompt_paths),
         "skillPaths": sorted_path_strings(skill_paths),
         "themePaths": sorted_path_strings(theme_paths),
         "templatePaths": sorted_path_strings(template_paths),
-    }))
+    })
 }
 
-fn execute_template_scenario(extension_path: &Path) -> Result<Value, String> {
+fn execute_template_scenario(extension_path: &Path) -> Value {
     let extension_root = extension_root_from_path(extension_path);
     let template_paths = relative_paths(&extension_root, discover_template_paths(&extension_root));
-    Ok(serde_json::json!({
+    serde_json::json!({
         "templatePaths": sorted_path_strings(template_paths),
-    }))
+    })
 }
 
 /// Execute a tool scenario: call the tool and check expectations.
@@ -1185,12 +1185,12 @@ fn check_expectations_inner(
     }
 
     // Check returns_contains: deep partial match on result JSON
-    if let Some(expected) = &expect.returns_contains {
-        if !json_contains(result, expected) {
-            diffs.push(format!(
-                "returns_contains: expected {expected} to be contained in {result}"
-            ));
-        }
+    if let Some(expected) = &expect.returns_contains
+        && !json_contains(result, expected)
+    {
+        diffs.push(format!(
+            "returns_contains: expected {expected} to be contained in {result}"
+        ));
     }
 
     // Check action: check result action field (for input transforms)
@@ -1646,10 +1646,10 @@ impl MockSpecInterceptor {
             if rule.command != cmd {
                 continue;
             }
-            if let Some(expected_args) = &rule.args_pattern {
-                if *expected_args != args {
-                    continue;
-                }
+            if let Some(expected_args) = &rule.args_pattern
+                && *expected_args != args
+            {
+                continue;
             }
             return serde_json::json!({
                 "stdout": rule.result.get("stdout").and_then(Value::as_str).unwrap_or(""),
@@ -1670,15 +1670,15 @@ impl MockSpecInterceptor {
         let req_url = payload.get("url").and_then(Value::as_str).unwrap_or("");
 
         for rule in &self.http_rules {
-            if let Some(method) = &rule.method {
-                if !method.eq_ignore_ascii_case(req_method) {
-                    continue;
-                }
+            if let Some(method) = &rule.method
+                && !method.eq_ignore_ascii_case(req_method)
+            {
+                continue;
             }
-            if let Some(url_pat) = &rule.url_contains {
-                if !req_url.contains(url_pat.as_str()) {
-                    continue;
-                }
+            if let Some(url_pat) = &rule.url_contains
+                && !req_url.contains(url_pat.as_str())
+            {
+                continue;
             }
             return rule.response.clone();
         }
@@ -2177,44 +2177,41 @@ const fn needs_unsupported_setup(_scenario: &Scenario) -> Option<String> {
 
 /// Check whether a scenario needs mock infrastructure (interceptor, session, etc.).
 fn needs_mock_loader(scenario: &Scenario) -> bool {
-    if let Some(setup) = &scenario.setup {
-        if setup.get("mock_exec").is_some()
+    if let Some(setup) = &scenario.setup
+        && (setup.get("mock_exec").is_some()
             || setup.get("mock_http").is_some()
             || setup.get("mock_model_registry").is_some()
             || setup.get("session_branch").is_some()
             || setup.get("session_leaf_entry").is_some()
             || setup.get("flags").is_some()
-            || setup.get("state").is_some()
-        {
-            return true;
-        }
+            || setup.get("state").is_some())
+    {
+        return true;
     }
     // Scenarios with UI interaction responses
-    if let Some(input) = &scenario.input {
-        if input
+    if let Some(input) = &scenario.input
+        && input
             .pointer("/ctx/ui_responses")
             .is_some_and(|v| !v.is_null())
-        {
-            return true;
-        }
+    {
+        return true;
     }
     // Multi-step scenarios
     if scenario.steps.is_some() {
         return true;
     }
     // Scenarios that check interceptor-dependent expectations
-    if let Some(expect) = &scenario.expect {
-        if expect.ui_notify_contains.is_some()
+    if let Some(expect) = &scenario.expect
+        && (expect.ui_notify_contains.is_some()
             || expect.ui_status_key.is_some()
             || expect.ui_status_contains_sequence.is_some()
             || expect.exec_called.is_some()
             || expect.active_tools.is_some()
             || expect.returns_contains.is_some()
             || expect.action.is_some()
-            || expect.content_types.is_some()
-        {
-            return true;
-        }
+            || expect.content_types.is_some())
+    {
+        return true;
     }
     false
 }
@@ -2637,8 +2634,8 @@ fn run_scenario(
         }
         "command" => execute_command_scenario(&loaded, scenario, &ext_path),
         "event" => execute_event_scenario(&loaded, scenario, &ext_path),
-        "resource_discovery" => execute_resource_discovery_scenario(&ext_path),
-        "template" => execute_template_scenario(&ext_path),
+        "resource_discovery" => Ok(execute_resource_discovery_scenario(&ext_path)),
+        "template" => Ok(execute_template_scenario(&ext_path)),
         "mcp" => execute_mcp_scenario(
             &loaded.runtime,
             &loaded.manager,
@@ -2801,8 +2798,8 @@ fn run_scenario_with_mocks(
         }
         "command" => execute_command_scenario_with_mocks(&loaded, scenario, ext_path),
         "event" => execute_event_scenario_with_mocks(&loaded, scenario, ext_path),
-        "resource_discovery" => execute_resource_discovery_scenario(ext_path),
-        "template" => execute_template_scenario(ext_path),
+        "resource_discovery" => Ok(execute_resource_discovery_scenario(ext_path)),
+        "template" => Ok(execute_template_scenario(ext_path)),
         "mcp" => execute_mcp_scenario(
             &loaded.runtime,
             &loaded.manager,
@@ -3012,27 +3009,26 @@ fn write_triage_report(
             if let Some(ms) = obj.get("total_ms").and_then(Value::as_u64) {
                 obj.insert("total_ms".to_string(), Value::from(ms + r.duration_ms));
             }
-            if let Some(category) = &r.failure_category {
-                if let Some(category_map) = obj
+            if let Some(category) = &r.failure_category
+                && let Some(category_map) = obj
                     .get_mut("failure_categories")
                     .and_then(Value::as_object_mut)
-                {
-                    let count = category_map
-                        .get(category)
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
-                    category_map.insert(category.clone(), Value::from(count + 1));
-                }
+            {
+                let count = category_map
+                    .get(category)
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                category_map.insert(category.clone(), Value::from(count + 1));
             }
-            if r.status == "fail" || r.status == "error" {
-                if let Some(arr) = obj.get_mut("failures").and_then(Value::as_array_mut) {
-                    arr.push(serde_json::json!({
-                        "scenario_id": r.scenario_id,
-                        "diffs": r.diffs,
-                        "error": r.error,
-                        "failure_category": r.failure_category,
-                    }));
-                }
+            if (r.status == "fail" || r.status == "error")
+                && let Some(arr) = obj.get_mut("failures").and_then(Value::as_array_mut)
+            {
+                arr.push(serde_json::json!({
+                    "scenario_id": r.scenario_id,
+                    "diffs": r.diffs,
+                    "error": r.error,
+                    "failure_category": r.failure_category,
+                }));
             }
         }
     }
@@ -3630,7 +3626,7 @@ struct PiAiProviderBridgeHostActions {
 }
 
 impl PiAiProviderBridgeHostActions {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             completions: Mutex::new(Vec::new()),
         }

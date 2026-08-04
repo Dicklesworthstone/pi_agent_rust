@@ -51,7 +51,7 @@ pub enum License {
 impl License {
     /// Return the SPDX identifier string.
     #[must_use]
-    pub fn spdx(&self) -> &str {
+    pub const fn spdx(&self) -> &str {
         match self {
             Self::Mit => "MIT",
             Self::Apache2 => "Apache-2.0",

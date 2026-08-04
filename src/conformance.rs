@@ -563,7 +563,7 @@ fn array_order_insensitive(parent_key: Option<&str>) -> bool {
     matches!(parent_key, Some("required" | "input" | "event_hooks"))
 }
 
-fn missing_equals_null_or_empty_array(left: Option<&Value>, right: Option<&Value>) -> bool {
+const fn missing_equals_null_or_empty_array(left: Option<&Value>, right: Option<&Value>) -> bool {
     match (left, right) {
         (None | Some(Value::Null), None) | (None, Some(Value::Null)) => true,
         (None, Some(Value::Array(items))) | (Some(Value::Array(items)), None) => items.is_empty(),

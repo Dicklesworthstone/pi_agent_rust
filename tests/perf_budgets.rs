@@ -309,10 +309,10 @@ fn dedup_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
 
 fn perf_evidence_dirs(root: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(raw) = std::env::var_os("PERF_EVIDENCE_DIR") {
-        if let Some(path) = resolve_env_path(root, PathBuf::from(raw)) {
-            dirs.push(path);
-        }
+    if let Some(raw) = std::env::var_os("PERF_EVIDENCE_DIR")
+        && let Some(path) = resolve_env_path(root, PathBuf::from(raw))
+    {
+        dirs.push(path);
     }
     if let Some(raw) = std::env::var_os("PERF_EVIDENCE_DIRS") {
         for path in std::env::split_paths(&raw) {
@@ -646,10 +646,10 @@ fn context_intelligence_budget_candidate_paths(root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Ok(path) = std::env::var("PERF_CONTEXT_INTELLIGENCE_BUDGET_JSON") {
         let trimmed = path.trim();
-        if !trimmed.is_empty() {
-            if let Some(path) = resolve_env_path(root, PathBuf::from(trimmed)) {
-                paths.push(path);
-            }
+        if !trimmed.is_empty()
+            && let Some(path) = resolve_env_path(root, PathBuf::from(trimmed))
+        {
+            paths.push(path);
         }
     }
     for dir in perf_evidence_dirs(root) {
@@ -1526,10 +1526,9 @@ fn read_pijs_workload_latency(root: &Path) -> (Option<f64>, String) {
             .get("tool_calls_per_iteration")
             .and_then(Value::as_u64)
             == Some(1)
+            && let Some(us) = event.get("per_call_us").and_then(Value::as_f64)
         {
-            if let Some(us) = event.get("per_call_us").and_then(Value::as_f64) {
-                return (Some(us), source);
-            }
+            return (Some(us), source);
         }
     }
     (None, "no pijs_workload data".to_string())
@@ -1542,10 +1541,9 @@ fn read_pijs_workload_throughput(root: &Path) -> (Option<f64>, String) {
             .get("tool_calls_per_iteration")
             .and_then(Value::as_u64)
             == Some(10)
+            && let Some(cps) = event.get("calls_per_sec").and_then(Value::as_f64)
         {
-            if let Some(cps) = event.get("calls_per_sec").and_then(Value::as_f64) {
-                return (Some(cps), source);
-            }
+            return (Some(cps), source);
         }
     }
     (None, "no pijs_workload data".to_string())
@@ -1610,15 +1608,14 @@ fn read_criterion_load_time(root: &Path, ext: &str) -> (Option<f64>, String) {
     // Criterion stores results in target/criterion/<group>/<bench>/new/estimates.json
     let relative = format!("criterion/ext_load_init/load_init_cold/{ext}/new/estimates.json");
     for path in criterion_estimate_candidate_paths(root, &relative) {
-        if let Some(estimates) = read_json_file(&path) {
-            if let Some(mean_ns) = estimates
+        if let Some(estimates) = read_json_file(&path)
+            && let Some(mean_ns) = estimates
                 .get("mean")
                 .and_then(|m| m.get("point_estimate"))
                 .and_then(Value::as_f64)
-            {
-                let ms = mean_ns / 1_000_000.0;
-                return (Some(ms), display_source_path(root, &path));
-            }
+        {
+            let ms = mean_ns / 1_000_000.0;
+            return (Some(ms), display_source_path(root, &path));
         }
     }
     (None, format!("no criterion data for {ext}"))
@@ -1626,21 +1623,21 @@ fn read_criterion_load_time(root: &Path, ext: &str) -> (Option<f64>, String) {
 
 fn read_total_load_time(root: &Path) -> (Option<f64>, String) {
     let path = root.join("tests/ext_conformance/reports/load_time_benchmark.json");
-    if let Some(report) = read_json_file(&path) {
-        if let Some(results) = report.get("results").and_then(Value::as_array) {
-            let total_ms: f64 = results
-                .iter()
-                .filter_map(|r| {
-                    r.get("rust")
-                        .and_then(|rust| rust.get("load_time_ms"))
-                        .and_then(Value::as_f64)
-                })
-                .sum();
-            return (
-                Some(total_ms),
-                "load_time_benchmark.json (sum of Rust load times)".to_string(),
-            );
-        }
+    if let Some(report) = read_json_file(&path)
+        && let Some(results) = report.get("results").and_then(Value::as_array)
+    {
+        let total_ms: f64 = results
+            .iter()
+            .filter_map(|r| {
+                r.get("rust")
+                    .and_then(|rust| rust.get("load_time_ms"))
+                    .and_then(Value::as_f64)
+            })
+            .sum();
+        return (
+            Some(total_ms),
+            "load_time_benchmark.json (sum of Rust load times)".to_string(),
+        );
     }
     (None, "no load time benchmark data".to_string())
 }
@@ -1687,15 +1684,14 @@ fn read_criterion_startup(root: &Path, subcommand: &str) -> (Option<f64>, String
     // Criterion stores startup benchmarks at target/criterion/startup/<subcommand>/warm/new/estimates.json
     let relative = format!("criterion/startup/{subcommand}/warm/new/estimates.json");
     for path in criterion_estimate_candidate_paths(root, &relative) {
-        if let Some(estimates) = read_json_file(&path) {
-            if let Some(mean_ns) = estimates
+        if let Some(estimates) = read_json_file(&path)
+            && let Some(mean_ns) = estimates
                 .get("mean")
                 .and_then(|m| m.get("point_estimate"))
                 .and_then(Value::as_f64)
-            {
-                let ms = mean_ns / 1_000_000.0;
-                return (Some(ms), display_source_path(root, &path));
-            }
+        {
+            let ms = mean_ns / 1_000_000.0;
+            return (Some(ms), display_source_path(root, &path));
         }
     }
     (None, format!("no criterion data for startup/{subcommand}"))
@@ -1703,17 +1699,16 @@ fn read_criterion_startup(root: &Path, subcommand: &str) -> (Option<f64>, String
 
 fn read_criterion_context_intelligence(root: &Path, bench_name: &str) -> (Option<f64>, String) {
     for path in context_criterion_estimate_candidate_paths(root, bench_name) {
-        if let Some(estimates) = read_json_file(&path) {
-            if let Some(mean_ns) = estimates
+        if let Some(estimates) = read_json_file(&path)
+            && let Some(mean_ns) = estimates
                 .get("mean")
                 .and_then(|m| m.get("point_estimate"))
                 .and_then(Value::as_f64)
-            {
-                return (
-                    Some(mean_ns / 1_000_000.0),
-                    display_source_path(root, &path),
-                );
-            }
+        {
+            return (
+                Some(mean_ns / 1_000_000.0),
+                display_source_path(root, &path),
+            );
         }
     }
     (
@@ -1800,14 +1795,13 @@ fn read_criterion_policy_eval(root: &Path) -> (Option<f64>, String) {
         root,
         "criterion/ext_policy/evaluate",
     )) {
-        if let Some(estimates) = read_json_file(&path) {
-            if let Some(mean_ns) = estimates
+        if let Some(estimates) = read_json_file(&path)
+            && let Some(mean_ns) = estimates
                 .get("mean")
                 .and_then(|m| m.get("point_estimate"))
                 .and_then(Value::as_f64)
-            {
-                max_ns = Some(max_ns.map_or(mean_ns, |prev: f64| prev.max(mean_ns)));
-            }
+        {
+            max_ns = Some(max_ns.map_or(mean_ns, |prev: f64| prev.max(mean_ns)));
         }
     }
     max_ns.map_or_else(
@@ -1854,15 +1848,14 @@ fn read_criterion_protocol_parse(root: &Path) -> (Option<f64>, String) {
         root,
         "criterion/ext_protocol/parse_and_validate",
     )) {
-        if let Some(estimates) = read_json_file(&path) {
-            if let Some(mean_ns) = estimates
+        if let Some(estimates) = read_json_file(&path)
+            && let Some(mean_ns) = estimates
                 .get("mean")
                 .and_then(|m| m.get("point_estimate"))
                 .and_then(Value::as_f64)
-            {
-                let us = mean_ns / 1000.0;
-                max_us = Some(max_us.map_or(us, |prev: f64| prev.max(us)));
-            }
+        {
+            let us = mean_ns / 1000.0;
+            max_us = Some(max_us.map_or(us, |prev: f64| prev.max(us)));
         }
     }
     max_us.map_or_else(

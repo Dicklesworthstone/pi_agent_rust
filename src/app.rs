@@ -332,10 +332,10 @@ fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile>
     let mut current = cwd.to_path_buf();
 
     loop {
-        if let Some(context) = load_context_file_from_dir(&current) {
-            if seen.insert(context.path.clone()) {
-                ancestor_files.push(context);
-            }
+        if let Some(context) = load_context_file_from_dir(&current)
+            && seen.insert(context.path.clone())
+        {
+            ancestor_files.push(context);
         }
 
         if !current.pop() {
@@ -476,13 +476,12 @@ pub fn select_model_and_thinking(
             if matches.is_empty() {
                 bail!("Model {model_id} not found");
             }
-            if let Some(default_provider) = config.default_provider.as_deref() {
-                if let Some(found) = matches
+            if let Some(default_provider) = config.default_provider.as_deref()
+                && let Some(found) = matches
                     .iter()
                     .find(|m| provider_ids_match(&m.model.provider, default_provider))
-                {
-                    selected_model = Some(found.clone());
-                }
+            {
+                selected_model = Some(found.clone());
             }
             if selected_model.is_none() {
                 selected_model = select_preferred_exact_id_match(&matches);
@@ -492,15 +491,13 @@ pub fn select_model_and_thinking(
         if let (Some(default_provider), Some(default_model)) = (
             config.default_provider.as_deref(),
             config.default_model.as_deref(),
-        ) {
-            if let Some(found) = scoped_models.iter().find(|sm| {
-                provider_ids_match(&sm.model.model.provider, default_provider)
-                    && sm.model.model.id.eq_ignore_ascii_case(default_model)
-            }) {
-                selected_model = Some(found.model.clone());
-                if cli.thinking.is_none() {
-                    scoped_thinking = found.thinking_level;
-                }
+        ) && let Some(found) = scoped_models.iter().find(|sm| {
+            provider_ids_match(&sm.model.model.provider, default_provider)
+                && sm.model.model.id.eq_ignore_ascii_case(default_model)
+        }) {
+            selected_model = Some(found.model.clone());
+            if cli.thinking.is_none() {
+                scoped_thinking = found.thinking_level;
             }
         }
         if selected_model.is_none() {
@@ -512,37 +509,36 @@ pub fn select_model_and_thinking(
         }
     }
 
-    if selected_model.is_none() {
-        if let Some((provider, model_id)) = model_from_session_state(session) {
-            let restore = restore_model_from_session(&provider, &model_id, None, registry);
-            selected_model = restore.model;
-            fallback_message = restore.fallback_message;
-            deferred_restore_warning = restore.deferred_warning;
-        }
+    if selected_model.is_none()
+        && let Some((provider, model_id)) = model_from_session_state(session)
+    {
+        let restore = restore_model_from_session(&provider, &model_id, None, registry);
+        selected_model = restore.model;
+        fallback_message = restore.fallback_message;
+        deferred_restore_warning = restore.deferred_warning;
     }
 
-    if selected_model.is_none() {
-        if let (Some(default_provider), Some(default_model)) = (
+    if selected_model.is_none()
+        && let (Some(default_provider), Some(default_model)) = (
             config.default_provider.as_deref(),
             config.default_model.as_deref(),
-        ) {
-            if let Some(found) = registry.find(default_provider, default_model) {
-                selected_model = Some(found);
-            }
-        }
+        )
+        && let Some(found) = registry.find(default_provider, default_model)
+    {
+        selected_model = Some(found);
     }
 
     if selected_model.is_none() {
         let available = registry.get_available();
         if !available.is_empty() {
             let fallback = default_model_from_available(&available);
-            if fallback_message.is_none() {
-                if let Some(warning) = deferred_restore_warning.take() {
-                    fallback_message = Some(format!(
-                        "{warning} Using {}/{}.",
-                        fallback.model.provider, fallback.model.id
-                    ));
-                }
+            if fallback_message.is_none()
+                && let Some(warning) = deferred_restore_warning.take()
+            {
+                fallback_message = Some(format!(
+                    "{warning} Using {}/{}.",
+                    fallback.model.provider, fallback.model.id
+                ));
             }
             selected_model = Some(fallback);
         }
@@ -593,13 +589,13 @@ pub fn select_model_and_thinking(
     // and avoids the misleading "No models configured" path when built-ins exist.
     if selected_model.is_none() && !registry.models().is_empty() {
         let fallback = default_model_from_catalog(registry.models());
-        if fallback_message.is_none() {
-            if let Some(warning) = deferred_restore_warning.take() {
-                fallback_message = Some(format!(
-                    "{warning} Defaulting to {}/{} for setup.",
-                    fallback.model.provider, fallback.model.id
-                ));
-            }
+        if fallback_message.is_none()
+            && let Some(warning) = deferred_restore_warning.take()
+        {
+            fallback_message = Some(format!(
+                "{warning} Defaulting to {}/{} for setup.",
+                fallback.model.provider, fallback.model.id
+            ));
         }
         selected_model = Some(fallback);
     }
@@ -625,10 +621,8 @@ pub fn select_model_and_thinking(
         thinking_level = Some(parse_thinking_level(cli_thinking)?);
     } else if scoped_thinking.is_some() {
         thinking_level = scoped_thinking;
-    } else if is_continuing {
-        if let Some(saved) = thinking_level_from_session_state(session) {
-            thinking_level = Some(saved);
-        }
+    } else if is_continuing && let Some(saved) = thinking_level_from_session_state(session) {
+        thinking_level = Some(saved);
     }
 
     if thinking_level.is_none() {
@@ -991,11 +985,11 @@ pub fn resolve_model_scope(
         if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
             let mut glob_pattern = pattern.as_str();
             let mut thinking_level = None;
-            if let Some((prefix, suffix)) = pattern.rsplit_once(':') {
-                if let Some(parsed) = parse_thinking_level_opt(suffix) {
-                    thinking_level = Some(parsed);
-                    glob_pattern = prefix;
-                }
+            if let Some((prefix, suffix)) = pattern.rsplit_once(':')
+                && let Some(parsed) = parse_thinking_level_opt(suffix)
+            {
+                thinking_level = Some(parsed);
+                glob_pattern = prefix;
             }
 
             let glob = match Pattern::new(&glob_pattern.to_lowercase()) {
@@ -1058,20 +1052,20 @@ fn parse_model_pattern(pattern: &str, available_models: &[ModelEntry]) -> Parsed
     // Try stripping a valid thinking-level suffix FIRST. This prevents
     // `provider/model:high` from being swallowed by `ad_hoc_model_entry`
     // which would create a model with id `model:high` instead of `model`.
-    if let Some((prefix, suffix)) = pattern.rsplit_once(':') {
-        if let Some(thinking_level) = parse_thinking_level_opt(suffix) {
-            let result = parse_model_pattern(prefix, available_models);
-            if result.model.is_some() {
-                return ParsedModelResult {
-                    model: result.model,
-                    thinking_level: if result.warning.is_some() {
-                        None
-                    } else {
-                        Some(thinking_level)
-                    },
-                    warning: result.warning,
-                };
-            }
+    if let Some((prefix, suffix)) = pattern.rsplit_once(':')
+        && let Some(thinking_level) = parse_thinking_level_opt(suffix)
+    {
+        let result = parse_model_pattern(prefix, available_models);
+        if result.model.is_some() {
+            return ParsedModelResult {
+                model: result.model,
+                thinking_level: if result.warning.is_some() {
+                    None
+                } else {
+                    Some(thinking_level)
+                },
+                warning: result.warning,
+            };
         }
     }
 

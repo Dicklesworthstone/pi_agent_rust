@@ -1631,12 +1631,11 @@ pub async fn run(
                             };
 
                             // Persist session outside the guard scope
-                            if should_persist {
-                                if let Ok(mut guard) =
+                            if should_persist
+                                && let Ok(mut guard) =
                                     OwnedMutexGuard::lock(Arc::clone(&session), &bash_cx).await
-                                {
-                                    let _ = guard.persist_session().await;
-                                }
+                            {
+                                let _ = guard.persist_session().await;
                             }
 
                             response_ok(
@@ -1655,10 +1654,10 @@ pub async fn run(
                     };
 
                     let _ = out_tx.send(response);
-                    if let Ok(mut running) = bash_state.lock(&bash_cx).await {
-                        if running.as_ref().is_some_and(|r| r.id == run_id) {
-                            *running = None;
-                        }
+                    if let Ok(mut running) = bash_state.lock(&bash_cx).await
+                        && running.as_ref().is_some_and(|r| r.id == run_id)
+                    {
+                        *running = None;
                     }
                 });
             }
@@ -4593,16 +4592,15 @@ fn abandon_bash_rpc_spill_file(
 ) {
     *spill_failed = true;
     *temp_file = None;
-    if let Some(path) = temp_file_path.take() {
-        if let Err(e) = std::fs::remove_file(&path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::debug!(
-                "Failed to remove incomplete RPC bash spill file {}: {}",
-                path.display(),
-                e
-            );
-        }
+    if let Some(path) = temp_file_path.take()
+        && let Err(e) = std::fs::remove_file(&path)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        tracing::debug!(
+            "Failed to remove incomplete RPC bash spill file {}: {}",
+            path.display(),
+            e
+        );
     }
 }
 

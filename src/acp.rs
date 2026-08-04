@@ -634,10 +634,10 @@ async fn run(
                     continue;
                 };
 
-                if let Ok(guard) = active_prompts.lock(&cx).await {
-                    if let Some(handle) = guard.get(&session_id) {
-                        handle.abort();
-                    }
+                if let Ok(guard) = active_prompts.lock(&cx).await
+                    && let Some(handle) = guard.get(&session_id)
+                {
+                    handle.abort();
                 }
 
                 if request.id.is_some() {
@@ -1151,10 +1151,10 @@ async fn validate_file_path(
 
     // Canonicalize each cwd and check if the resolved path starts with it.
     for cwd in &allowed_cwds {
-        if let Ok(canonical_cwd) = cwd.canonicalize() {
-            if resolved.starts_with(&canonical_cwd) {
-                return Ok(());
-            }
+        if let Ok(canonical_cwd) = cwd.canonicalize()
+            && resolved.starts_with(&canonical_cwd)
+        {
+            return Ok(());
         }
         // Also check without canonicalization for cwd (it may not exist on disk).
         if resolved.starts_with(cwd) {
@@ -1207,31 +1207,27 @@ fn select_acp_model_entry(config: &Config, available_models: &[ModelEntry]) -> O
     if let (Some(default_provider), Some(default_model)) = (
         config.default_provider.as_deref(),
         config.default_model.as_deref(),
-    ) {
-        if let Some(entry) = available_models.iter().find(|entry| {
-            provider_ids_match(&entry.model.provider, default_provider)
-                && entry.model.id.eq_ignore_ascii_case(default_model)
-        }) {
-            return Some(entry.clone());
-        }
+    ) && let Some(entry) = available_models.iter().find(|entry| {
+        provider_ids_match(&entry.model.provider, default_provider)
+            && entry.model.id.eq_ignore_ascii_case(default_model)
+    }) {
+        return Some(entry.clone());
     }
 
-    if let Some(default_provider) = config.default_provider.as_deref() {
-        if let Some(entry) = available_models
+    if let Some(default_provider) = config.default_provider.as_deref()
+        && let Some(entry) = available_models
             .iter()
             .find(|entry| provider_ids_match(&entry.model.provider, default_provider))
-        {
-            return Some(entry.clone());
-        }
+    {
+        return Some(entry.clone());
     }
 
-    if let Some(default_model) = config.default_model.as_deref() {
-        if let Some(entry) = available_models
+    if let Some(default_model) = config.default_model.as_deref()
+        && let Some(entry) = available_models
             .iter()
             .find(|entry| entry.model.id.eq_ignore_ascii_case(default_model))
-        {
-            return Some(entry.clone());
-        }
+    {
+        return Some(entry.clone());
     }
 
     available_models.first().cloned()
@@ -1282,10 +1278,10 @@ fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> Str
     // Load project context files (pi.md, AGENTS.md) if they exist.
     for filename in &["pi.md", "AGENTS.md", ".pi"] {
         let path = cwd.join(filename);
-        if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let _ = write!(prompt, "\n## {filename}\n\n{content}\n\n");
-            }
+        if path.is_file()
+            && let Ok(content) = std::fs::read_to_string(&path)
+        {
+            let _ = write!(prompt, "\n## {filename}\n\n{content}\n\n");
         }
     }
 

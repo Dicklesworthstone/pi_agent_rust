@@ -73,7 +73,7 @@ impl FrameTimingStats {
             self.budget_exceeded_count
                 .set(self.budget_exceeded_count.get() + 1);
         }
-        if total % FRAME_TIMING_WINDOW as u64 == 0 {
+        if total.is_multiple_of(FRAME_TIMING_WINDOW as u64) {
             drop(times);
             self.emit_stats();
         }
@@ -818,18 +818,18 @@ impl PiApp {
             )
             .await;
 
-            if let Some(manager) = extensions {
-                if let Some(compaction_entry) = compaction_entry {
-                    let _ = manager
-                        .dispatch_event(
-                            crate::extensions::ExtensionEventName::SessionCompact,
-                            Some(json!({
-                                "compactionEntry": compaction_entry,
-                                "fromExtension": from_extension,
-                            })),
-                        )
-                        .await;
-                }
+            if let Some(manager) = extensions
+                && let Some(compaction_entry) = compaction_entry
+            {
+                let _ = manager
+                    .dispatch_event(
+                        crate::extensions::ExtensionEventName::SessionCompact,
+                        Some(json!({
+                            "compactionEntry": compaction_entry,
+                            "fromExtension": from_extension,
+                        })),
+                    )
+                    .await;
             }
         });
         None
@@ -984,10 +984,8 @@ impl MessageRenderCache {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
         msg.content.hash(&mut hasher);
-        if thinking_visible {
-            if let Some(thinking) = &msg.thinking {
-                thinking.hash(&mut hasher);
-            }
+        if thinking_visible && let Some(thinking) = &msg.thinking {
+            thinking.hash(&mut hasher);
         }
         // Include tools_expanded in hash for tool messages since it affects rendering
         if msg.role == MessageRole::Tool {
@@ -1007,7 +1005,7 @@ impl MessageRenderCache {
     /// - The message count changed (messages added/removed)
     /// - The render-cache generation advanced (theme/resize/toggle)
     /// - The prefix is empty and there are messages to render
-    pub(super) fn prefix_valid(&self, message_count: usize) -> bool {
+    pub(super) const fn prefix_valid(&self, message_count: usize) -> bool {
         message_count > 0
             && self.prefix_message_count.get() == message_count
             && self.prefix_generation.get() == self.generation.get()
@@ -1114,7 +1112,7 @@ impl RenderBuffers {
     }
 
     /// Get the capacity hint for the next frame's view assembly.
-    pub(super) fn view_capacity_hint(&self) -> usize {
+    pub(super) const fn view_capacity_hint(&self) -> usize {
         self.view_capacity_hint.get()
     }
 

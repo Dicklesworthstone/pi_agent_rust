@@ -105,14 +105,11 @@ impl PiApp {
                     cancelled: false,
                 };
                 // Record persistent decisions for "Always" choices.
-                if action.is_persistent() {
-                    if let Ok(mut store) = crate::permissions::PermissionStore::open_default() {
-                        let _ = store.record(
-                            &prompt.extension_id,
-                            &prompt.capability,
-                            action.is_allow(),
-                        );
-                    }
+                if action.is_persistent()
+                    && let Ok(mut store) = crate::permissions::PermissionStore::open_default()
+                {
+                    let _ =
+                        store.record(&prompt.extension_id, &prompt.capability, action.is_allow());
                 }
                 self.capability_prompt = None;
                 self.send_extension_ui_response(response);
@@ -351,11 +348,11 @@ impl PiApp {
             return (false, None);
         }
         let now = std::time::Instant::now();
-        if let Some(last_time) = self.last_escape_time {
-            if now.duration_since(last_time) < std::time::Duration::from_millis(500) {
-                self.last_escape_time = None;
-                return (true, self.trigger_double_escape_action());
-            }
+        if let Some(last_time) = self.last_escape_time
+            && now.duration_since(last_time) < std::time::Duration::from_millis(500)
+        {
+            self.last_escape_time = None;
+            return (true, self.trigger_double_escape_action());
         }
         self.last_escape_time = Some(now);
         (false, None)

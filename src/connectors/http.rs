@@ -197,12 +197,13 @@ fn normalize_host_entry(raw: &str) -> Option<String> {
         return None;
     }
 
-    let mut host = trimmed.to_string();
-    if trimmed.contains("://") {
-        if let Ok(parsed) = ParsedUrl::parse(trimmed) {
-            host = parsed.host;
-        }
-    }
+    let host = if trimmed.contains("://")
+        && let Ok(parsed) = ParsedUrl::parse(trimmed)
+    {
+        parsed.host
+    } else {
+        trimmed.to_string()
+    };
 
     let host = host.trim().trim_end_matches('.');
     let host = if host.starts_with('[') {
@@ -494,13 +495,14 @@ impl HttpConnector {
             None
         };
 
-        if let Some(ref bytes) = body {
-            if self.config.max_request_bytes > 0 && bytes.len() > self.config.max_request_bytes {
-                return Err(Box::new(invalid_request(
-                    &call.call_id,
-                    "request body too large",
-                )));
-            }
+        if let Some(ref bytes) = body
+            && self.config.max_request_bytes > 0
+            && bytes.len() > self.config.max_request_bytes
+        {
+            return Err(Box::new(invalid_request(
+                &call.call_id,
+                "request body too large",
+            )));
         }
 
         let timeout_ms_param = params

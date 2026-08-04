@@ -502,9 +502,9 @@ What failed and why. Reference specific controls:
 
 | Gate | Blocking | Artifact |
 |------|----------|----------|
-| Security compatibility | YES | `tests/security_compat/security_compat_dashboard.json` |
+| `sec_conformance` — SEC-6.4 security compatibility conformance | YES | `tests/full_suite_gate/sec_conformance_verdict.json` |
 | Conformance regression | YES | `tests/ext_conformance/reports/regression_verdict.json` |
-| Extension must-pass (208) | YES | `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` |
+| Extension must-pass (authoritative inclusion list) | YES | `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` |
 | Non-mock compliance | YES | `docs/non-mock-rubric.json` |
 | Suite classification | YES | `tests/suite_classification.toml` |
 | Waiver lifecycle | YES | `tests/full_suite_gate/waiver_audit.json` |
@@ -515,8 +515,8 @@ What failed and why. Reference specific controls:
 |----------|--------|---------|
 | `security_compat_dashboard.json` | `pi.security.compat_dashboard.v1` | Compatibility pass rates under hardened policy |
 | `full_suite_verdict.json` | `pi.ci.full_suite_gate.v1` | Aggregate CI gate verdict |
-| `conformance_summary.json` | - | Extension conformance pass rates |
-| `waiver_audit.json` | - | Gate waiver lifecycle status |
+| `conformance_summary.json` | `pi.ext.conformance_summary.v2` | Extension conformance pass rates |
+| `waiver_audit.json` | `pi.ci.waiver_audit.v1` | Gate waiver lifecycle status |
 
 ---
 

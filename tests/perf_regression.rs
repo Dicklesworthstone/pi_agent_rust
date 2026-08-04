@@ -435,10 +435,10 @@ fn measure_startup(binary: &Path, args: &[&str], runs: usize, warmup: usize) -> 
             .output();
         let elapsed = start.elapsed();
 
-        if let Ok(output) = result {
-            if output.status.success() {
-                samples.push(elapsed.as_secs_f64() * 1000.0);
-            }
+        if let Ok(output) = result
+            && output.status.success()
+        {
+            samples.push(elapsed.as_secs_f64() * 1000.0);
         }
     }
     samples
@@ -525,12 +525,12 @@ fn startup_version_latency() {
     eprintln!("  Status:    {status}");
 
     // Check for regression against baseline
-    if let Some(delta) = delta_pct {
-        if delta > REGRESSION_THRESHOLD_PCT {
-            eprintln!(
-                "  WARNING: {delta:+.1}% regression exceeds {REGRESSION_THRESHOLD_PCT}% threshold"
-            );
-        }
+    if let Some(delta) = delta_pct
+        && delta > REGRESSION_THRESHOLD_PCT
+    {
+        eprintln!(
+            "  WARNING: {delta:+.1}% regression exceeds {REGRESSION_THRESHOLD_PCT}% threshold"
+        );
     }
 
     assert_eq!(

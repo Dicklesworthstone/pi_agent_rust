@@ -312,10 +312,10 @@ fn build_run_request(
     pb::write_len_delim(&mut run_request, 2, &action);
     pb::write_len_delim(&mut run_request, 3, &model_details);
     pb::write_string(&mut run_request, 5, conversation_id);
-    if let Some(system) = system_prompt {
-        if !system.is_empty() {
-            pb::write_string(&mut run_request, 8, system);
-        }
+    if let Some(system) = system_prompt
+        && !system.is_empty()
+    {
+        pb::write_string(&mut run_request, 8, system);
     }
 
     // AgentClientMessage { run_request = 1 }
@@ -641,15 +641,15 @@ impl StreamState {
         }
         if frame.end_stream {
             // Terminal frame: JSON trailers, optionally carrying an error.
-            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame.payload) {
-                if let Some(error) = value.get("error") {
-                    let message = error
-                        .get("message")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("Cursor stream returned an error")
-                        .to_string();
-                    self.error_message = Some(message);
-                }
+            if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                && let Some(error) = value.get("error")
+            {
+                let message = error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Cursor stream returned an error")
+                    .to_string();
+                self.error_message = Some(message);
             }
             self.finalize();
             // The end-of-stream frame is the protocol terminator: stop reading so

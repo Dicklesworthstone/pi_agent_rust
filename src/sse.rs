@@ -372,7 +372,7 @@ impl SseParser {
     }
 
     /// Check if the parser has any pending data.
-    pub fn has_pending(&self) -> bool {
+    pub const fn has_pending(&self) -> bool {
         !self.buffer.is_empty() || self.has_data
     }
 

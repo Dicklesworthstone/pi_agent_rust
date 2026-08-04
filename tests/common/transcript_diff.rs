@@ -179,7 +179,7 @@ impl TranscriptDiff {
     }
 
     /// Whether any differences were found.
-    pub fn has_differences(&self) -> bool {
+    pub const fn has_differences(&self) -> bool {
         !self.diffs.is_empty()
     }
 

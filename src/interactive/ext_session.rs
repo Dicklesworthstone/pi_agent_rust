@@ -69,15 +69,15 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
         if is_streaming {
             // Queue into the agent loop; session persistence happens when the message is delivered.
             self.queue_custom_message(message.deliver_as, custom_message.clone())?;
-            if let ModelMessage::Custom(custom) = &custom_message {
-                if custom.display {
-                    let _ = enqueue_pi_event(
-                        &self.event_tx,
-                        &cx,
-                        PiMsg::SystemNote(custom.content.clone()),
-                    )
-                    .await;
-                }
+            if let ModelMessage::Custom(custom) = &custom_message
+                && custom.display
+            {
+                let _ = enqueue_pi_event(
+                    &self.event_tx,
+                    &cx,
+                    PiMsg::SystemNote(custom.content.clone()),
+                )
+                .await;
             }
             return Ok(());
         }
@@ -89,15 +89,15 @@ impl ExtensionHostActions for InteractiveExtensionHostActions {
             agent_guard.add_message(custom_message.clone());
         }
 
-        if let ModelMessage::Custom(custom) = &custom_message {
-            if custom.display {
-                let _ = enqueue_pi_event(
-                    &self.event_tx,
-                    &cx,
-                    PiMsg::SystemNote(custom.content.clone()),
-                )
-                .await;
-            }
+        if let ModelMessage::Custom(custom) = &custom_message
+            && custom.display
+        {
+            let _ = enqueue_pi_event(
+                &self.event_tx,
+                &cx,
+                PiMsg::SystemNote(custom.content.clone()),
+            )
+            .await;
         }
 
         if Self::should_trigger_turn(message.deliver_as, message.trigger_turn) {
@@ -573,32 +573,33 @@ pub fn parse_extension_ui_response(
                     "Invalid selection. Enter a number, label, or 'cancel'.".to_string()
                 })?;
 
-            if let Ok(index) = trimmed.parse::<usize>() {
-                if index > 0 && index <= options.len() {
-                    let chosen = &options[index - 1];
-                    let value = chosen
-                        .get("value")
-                        .cloned()
-                        .or_else(|| chosen.get("label").cloned())
-                        .or_else(|| chosen.as_str().map(|s| Value::String(s.to_string())));
-                    return Ok(ExtensionUiResponse {
-                        id: request.id.clone(),
-                        value,
-                        cancelled: false,
-                    });
-                }
+            if let Ok(index) = trimmed.parse::<usize>()
+                && index > 0
+                && index <= options.len()
+            {
+                let chosen = &options[index - 1];
+                let value = chosen
+                    .get("value")
+                    .cloned()
+                    .or_else(|| chosen.get("label").cloned())
+                    .or_else(|| chosen.as_str().map(|s| Value::String(s.to_string())));
+                return Ok(ExtensionUiResponse {
+                    id: request.id.clone(),
+                    value,
+                    cancelled: false,
+                });
             }
 
             let lowered = trimmed.to_lowercase();
             for option in options {
-                if let Some(value_str) = option.as_str() {
-                    if value_str.to_lowercase() == lowered {
-                        return Ok(ExtensionUiResponse {
-                            id: request.id.clone(),
-                            value: Some(Value::String(value_str.to_string())),
-                            cancelled: false,
-                        });
-                    }
+                if let Some(value_str) = option.as_str()
+                    && value_str.to_lowercase() == lowered
+                {
+                    return Ok(ExtensionUiResponse {
+                        id: request.id.clone(),
+                        value: Some(Value::String(value_str.to_string())),
+                        cancelled: false,
+                    });
                 }
 
                 let label = option.get("label").and_then(Value::as_str).unwrap_or("");
@@ -616,14 +617,14 @@ pub fn parse_extension_ui_response(
                     });
                 }
 
-                if let Some(value_str) = option.get("value").and_then(Value::as_str) {
-                    if value_str.to_lowercase() == lowered {
-                        return Ok(ExtensionUiResponse {
-                            id: request.id.clone(),
-                            value: Some(Value::String(value_str.to_string())),
-                            cancelled: false,
-                        });
-                    }
+                if let Some(value_str) = option.get("value").and_then(Value::as_str)
+                    && value_str.to_lowercase() == lowered
+                {
+                    return Ok(ExtensionUiResponse {
+                        id: request.id.clone(),
+                        value: Some(Value::String(value_str.to_string())),
+                        cancelled: false,
+                    });
                 }
             }
 

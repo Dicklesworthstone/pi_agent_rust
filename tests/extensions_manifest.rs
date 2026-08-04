@@ -21,11 +21,11 @@ fn register_message_json(overrides: serde_json::Value) -> String {
         }
     });
 
-    if let serde_json::Value::Object(dst) = &mut base {
-        if let serde_json::Value::Object(src) = overrides {
-            for (k, v) in src {
-                dst.insert(k, v);
-            }
+    if let serde_json::Value::Object(dst) = &mut base
+        && let serde_json::Value::Object(src) = overrides
+    {
+        for (k, v) in src {
+            dst.insert(k, v);
         }
     }
 

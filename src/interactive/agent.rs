@@ -161,7 +161,7 @@ impl UiStreamDeltaBatcher {
         self.flush(true);
     }
 
-    fn delta_bytes_for_msg(msg: &PiMsg) -> usize {
+    const fn delta_bytes_for_msg(msg: &PiMsg) -> usize {
         match msg {
             PiMsg::TextDelta(text) | PiMsg::ThinkingDelta(text) => text.len(),
             _ => 0,
@@ -1392,15 +1392,14 @@ After approving access in the browser, press Enter in Pi to complete login."
             return;
         }
 
-        if let Some((command, _args)) = parse_extension_command(trimmed) {
-            if let Some(manager) = &self.extensions {
-                if manager.has_command(&command) {
-                    self.status_message = Some(format!(
-                        "Extension command '/{command}' cannot be queued while busy"
-                    ));
-                    return;
-                }
-            }
+        if let Some((command, _args)) = parse_extension_command(trimmed)
+            && let Some(manager) = &self.extensions
+            && manager.has_command(&command)
+        {
+            self.status_message = Some(format!(
+                "Extension command '/{command}' cannot be queued while busy"
+            ));
+            return;
         }
 
         let expanded = self.resources.expand_input(trimmed);
@@ -1564,13 +1563,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
-            let mut save_error = None;
-
-            if save_enabled {
-                if let Err(err) = session_guard.save().await {
-                    save_error = Some(format!("Failed to save session: {err}"));
-                }
-            }
+            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
+                Some(format!("Failed to save session: {err}"))
+            } else {
+                None
+            };
             drop(session_guard);
 
             if let Some(err) = save_error {
@@ -1822,13 +1819,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
-            let mut save_error = None;
-
-            if save_enabled {
-                if let Err(err) = session_guard.save().await {
-                    save_error = Some(format!("Failed to save session: {err}"));
-                }
-            }
+            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
+                Some(format!("Failed to save session: {err}"))
+            } else {
+                None
+            };
             drop(session_guard);
 
             if let Some(err) = save_error {
@@ -1891,12 +1886,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             return self.handle_slash_command(cmd, args);
         }
 
-        if let Some((command, args)) = parse_extension_command(message) {
-            if let Some(manager) = &self.extensions {
-                if manager.has_command(&command) {
-                    return self.dispatch_extension_command(&command, args);
-                }
-            }
+        if let Some((command, args)) = parse_extension_command(message)
+            && let Some(manager) = &self.extensions
+            && manager.has_command(&command)
+        {
+            return self.dispatch_extension_command(&command, args);
         }
 
         if message.starts_with('/') && !message.starts_with("/skill:") {
@@ -2143,13 +2137,11 @@ After approving access in the browser, press Enter in Pi to complete login."
             for message in new_messages {
                 session_guard.append_model_message(message);
             }
-            let mut save_error = None;
-
-            if save_enabled {
-                if let Err(err) = session_guard.save().await {
-                    save_error = Some(format!("Failed to save session: {err}"));
-                }
-            }
+            let save_error = if save_enabled && let Err(err) = session_guard.save().await {
+                Some(format!("Failed to save session: {err}"))
+            } else {
+                None
+            };
             drop(session_guard);
 
             if let Some(err) = save_error {

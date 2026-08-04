@@ -1,8 +1,8 @@
 {
   "schema": "pi.dropin.certification_contract.v1",
   "bead_id": "bd-35t7i",
-  "version": "1.0.0",
-  "effective_date_utc": "2026-02-14T19:30:00Z",
+  "version": "1.0.1",
+  "effective_date_utc": "2026-08-04T19:03:36Z",
   "status": "active_blocking_policy",
   "policy_owner_issue": "bd-35t7i",
   "normative_statement": "Pi Rust MUST NOT be described as a strict drop-in replacement unless every hard gate in this contract is PASS with verifiable evidence.",
@@ -336,7 +336,7 @@
     "required_sequence": [
       {
         "step": 1,
-        "description": "Refresh baseline and parity artifacts to current commit.",
+        "description": "Refresh baseline and parity artifacts from a clean release source commit.",
         "required_outputs": [
           "docs/dropin-upstream-baseline.json",
           "docs/evidence/dropin-feature-inventory-matrix.json",
@@ -352,7 +352,7 @@
       },
       {
         "step": 3,
-        "description": "Block release if verdict is not CERTIFIED.",
+        "description": "Block strict drop-in replacement release language unless the verdict is CERTIFIED for the release source commit and the final release ref is either that commit or differs only through allowlisted evidence-only descendants.",
         "required_outputs": [
           "release gate log with explicit blocking reasons"
         ]
@@ -376,13 +376,15 @@
         "blocking_reasons",
         "evidence_index"
       ],
-      "blocking_rule": "overall_verdict MUST equal CERTIFIED for drop-in replacement release language to be allowed."
+      "blocking_rule": "overall_verdict MUST equal CERTIFIED, git_commit MUST identify the clean release source commit, and the final release ref MUST equal that commit or contain only allowlisted evidence-only descendants for drop-in replacement release language to be allowed."
     }
   },
   "immediate_status_snapshot": {
-    "overall_verdict_now": "CERTIFIED",
-    "reason": "docs/evidence/dropin-certification-verdict.json reports 22/22 hard gates pass, including all 16 blocking gates, with no blocking reasons.",
-    "open_critical_gate_domains": []
+    "overall_verdict_now": "NOT_CERTIFIED",
+    "reason": "The checked-in CERTIFIED verdict names historical source commit 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8, and later history includes non-evidence source changes. Strict drop-in language remains blocked until the contract is rerun from a clean release source commit and only allowlisted evidence-only commits follow it.",
+    "open_critical_gate_domains": [
+      "evidence-freshness-and-provenance"
+    ]
   },
   "maintenance_policy": {
     "update_trigger": "Any newly discovered mismatch or gate-topology change.",

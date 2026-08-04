@@ -383,7 +383,7 @@ impl Provider for RepeatedToolProvider {
         let index = self.call_count.fetch_add(1, Ordering::SeqCst);
         let path = self.file_path.lock().expect("lock path").clone();
 
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             // Even: issue a read tool call
             Ok(stream_done(make_assistant(
                 StopReason::ToolUse,
@@ -444,7 +444,7 @@ impl Provider for IntermittentErrorProvider {
         _options: &StreamOptions,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
         let index = self.call_count.fetch_add(1, Ordering::SeqCst);
-        if index % self.fail_every_n == 0 && index > 0 {
+        if index.is_multiple_of(self.fail_every_n) && index > 0 {
             return Err(Error::api(format!(
                 "soak intermittent error at call {index}"
             )));

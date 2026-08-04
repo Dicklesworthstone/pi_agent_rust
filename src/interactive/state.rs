@@ -175,7 +175,7 @@ impl AutocompleteState {
         self.replace_range = response.replace;
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.items.is_empty() {
             self.selected = Some(match self.selected {
                 Some(idx) => (idx + 1) % self.items.len(),
@@ -244,7 +244,7 @@ impl SessionPickerOverlay {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.sessions.is_empty() {
             self.selected = (self.selected + 1) % self.sessions.len();
         }
@@ -283,7 +283,7 @@ impl SessionPickerOverlay {
         &self.query
     }
 
-    pub(super) fn has_query(&self) -> bool {
+    pub(super) const fn has_query(&self) -> bool {
         !self.query.is_empty()
     }
 
@@ -433,7 +433,7 @@ impl ThemePickerOverlay {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.items.is_empty() {
             self.selected = (self.selected + 1) % self.items.len();
         }
@@ -503,7 +503,7 @@ impl SettingsUiState {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.entries.is_empty() {
             self.selected = (self.selected + 1) % self.entries.len();
         }
@@ -685,7 +685,7 @@ impl BranchPickerOverlay {
         }
     }
 
-    pub(super) fn select_next(&mut self) {
+    pub(super) const fn select_next(&mut self) {
         if !self.branches.is_empty() {
             self.selected = (self.selected + 1) % self.branches.len();
         }

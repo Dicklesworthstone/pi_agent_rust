@@ -555,17 +555,18 @@ fn split_third_party_slug(slug: &str) -> Option<(String, String)> {
         ("-agent-", "agent-"),
         ("-agents-", "agents-"),
     ] {
-        if let Some((owner, rest)) = slug.split_once(marker) {
-            if !owner.is_empty() && !rest.is_empty() {
-                return Some((owner.to_string(), format!("{repo_prefix}{rest}")));
-            }
+        if let Some((owner, rest)) = slug.split_once(marker)
+            && !owner.is_empty()
+            && !rest.is_empty()
+        {
+            return Some((owner.to_string(), format!("{repo_prefix}{rest}")));
         }
     }
 
-    if let Some(owner) = slug.strip_suffix("-agents") {
-        if !owner.is_empty() {
-            return Some((owner.to_string(), "agents".to_string()));
-        }
+    if let Some(owner) = slug.strip_suffix("-agents")
+        && !owner.is_empty()
+    {
+        return Some((owner.to_string(), "agents".to_string()));
     }
 
     if slug.matches('-').count() >= 2

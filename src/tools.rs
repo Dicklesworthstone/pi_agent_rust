@@ -2916,13 +2916,13 @@ impl Tool for ReadTool {
         let path = enforce_read_scope(&path, &self.cwd)?;
 
         let meta = asupersync::fs::metadata(&path).await.ok();
-        if let Some(meta) = &meta {
-            if !meta.is_file() {
-                return Err(Error::tool(
-                    "read",
-                    format!("Path {} is not a regular file", path.display()),
-                ));
-            }
+        if let Some(meta) = &meta
+            && !meta.is_file()
+        {
+            return Err(Error::tool(
+                "read",
+                format!("Path {} is not a regular file", path.display()),
+            ));
         }
 
         let cache_key = tool_cache_key("read", &self.cwd, &input_value);
@@ -2965,17 +2965,17 @@ impl Tool for ReadTool {
             // within the read-tool input bound; resize/re-encode may still
             // bring the API payload under IMAGE_MAX_BYTES.
             let max_image_input_bytes = usize::try_from(READ_TOOL_MAX_BYTES).unwrap_or(usize::MAX);
-            if let Some(meta) = &meta {
-                if meta.len() > READ_TOOL_MAX_BYTES {
-                    return Err(Error::tool(
-                        "read",
-                        format!(
-                            "Image is too large ({} bytes). Max allowed is {} bytes.",
-                            meta.len(),
-                            READ_TOOL_MAX_BYTES
-                        ),
-                    ));
-                }
+            if let Some(meta) = &meta
+                && meta.len() > READ_TOOL_MAX_BYTES
+            {
+                return Err(Error::tool(
+                    "read",
+                    format!(
+                        "Image is too large ({} bytes). Max allowed is {} bytes.",
+                        meta.len(),
+                        READ_TOOL_MAX_BYTES
+                    ),
+                ));
             }
             let mut all_bytes = Vec::with_capacity(initial_read);
             all_bytes.extend_from_slice(initial_bytes);
@@ -3025,23 +3025,22 @@ impl Tool for ReadTool {
                 base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &resized.bytes);
 
             let mut note = format!("Read image file [{}]", resized.mime_type);
-            if resized.resized {
-                if let (Some(ow), Some(oh), Some(w), Some(h)) = (
+            if resized.resized
+                && let (Some(ow), Some(oh), Some(w), Some(h)) = (
                     resized.original_width,
                     resized.original_height,
                     resized.width,
                     resized.height,
-                ) {
-                    if w > 0 {
-                        let scale = f64::from(ow) / f64::from(w);
-                        let _ = write!(
-                            note,
-                            "\n[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
-                        );
-                    } else {
-                        let _ =
-                            write!(note, "\n[Image: original {ow}x{oh}, displayed at {w}x{h}.]");
-                    }
+                )
+            {
+                if w > 0 {
+                    let scale = f64::from(ow) / f64::from(w);
+                    let _ = write!(
+                        note,
+                        "\n[Image: original {ow}x{oh}, displayed at {w}x{h}. Multiply coordinates by {scale:.2} to map to original image.]"
+                    );
+                } else {
+                    let _ = write!(note, "\n[Image: original {ow}x{oh}, displayed at {w}x{h}.]");
                 }
             }
 
@@ -3624,10 +3623,10 @@ pub(crate) async fn run_bash_command(
     // return, but calling wait() as a belt-and-suspenders ensures the zombie
     // is cleaned up even if try_wait missed it (observed on macOS when the
     // child is in its own process group).
-    if guard.child.is_some() {
-        if let Ok(status) = guard.wait() {
-            exit_code.get_or_insert_with(|| exit_status_code(status));
-        }
+    if guard.child.is_some()
+        && let Ok(status) = guard.wait()
+    {
+        exit_code.get_or_insert_with(|| exit_status_code(status));
     }
 
     drop(bash_output.temp_file.take());
@@ -5477,11 +5476,11 @@ impl Tool for GrepTool {
                     line_number
                 };
 
-                if let Some(last_block) = blocks.last_mut() {
-                    if start <= last_block.1.saturating_add(1) {
-                        last_block.1 = last_block.1.max(end);
-                        continue;
-                    }
+                if let Some(last_block) = blocks.last_mut()
+                    && start <= last_block.1.saturating_add(1)
+                {
+                    last_block.1 = last_block.1.max(end);
+                    continue;
                 }
                 blocks.push((start, end));
             }
@@ -6265,7 +6264,7 @@ pub fn cleanup_temp_files() {
                 && metadata.modified().is_ok_and(|modified| {
                     modified
                         .elapsed()
-                        .is_ok_and(|age| age > Duration::from_secs(24 * 60 * 60))
+                        .is_ok_and(|age| age > Duration::from_hours(24))
                 })
                 && let Err(e) = std::fs::remove_file(&path)
             {
@@ -6453,16 +6452,15 @@ impl BashOutputState {
     fn abandon_spill_file(&mut self) {
         self.spill_failed = true;
         self.temp_file = None;
-        if let Some(path) = self.temp_file_path.take() {
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::debug!(
-                    "Failed to remove incomplete bash spill file {}: {}",
-                    path.display(),
-                    e
-                );
-            }
+        if let Some(path) = self.temp_file_path.take()
+            && let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::debug!(
+                "Failed to remove incomplete bash spill file {}: {}",
+                path.display(),
+                e
+            );
         }
     }
 }
@@ -6668,13 +6666,12 @@ fn emit_bash_update(
             return Ok(());
         };
 
-        if let Some(timeout) = state.timeout_ms {
-            if let Some(progress) = details_map
+        if let Some(timeout) = state.timeout_ms
+            && let Some(progress) = details_map
                 .get_mut("progress")
                 .and_then(|v| v.as_object_mut())
-            {
-                progress.insert("timeoutMs".into(), serde_json::json!(timeout));
-            }
+        {
+            progress.insert("timeoutMs".into(), serde_json::json!(timeout));
         }
         if truncation.truncated {
             details_map.insert("truncation".into(), serde_json::to_value(&truncation)?);
@@ -7314,31 +7311,31 @@ fn collect_mismatches(
 ) -> std::result::Result<(), String> {
     let mut errors = Vec::new();
     for edit in edits {
-        if let Some(ref pos) = edit.pos {
-            if let Err(e) = validate_line_ref(pos, file_lines, had_bom) {
-                // Find the line index for context
-                if let Ok((line_num, _)) = parse_hashline_tag(pos) {
-                    let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
-                    errors.push(format!(
-                        "{e}\n{}",
-                        mismatch_context(file_lines, idx, 2, had_bom)
-                    ));
-                } else {
-                    errors.push(e);
-                }
+        if let Some(ref pos) = edit.pos
+            && let Err(e) = validate_line_ref(pos, file_lines, had_bom)
+        {
+            // Find the line index for context
+            if let Ok((line_num, _)) = parse_hashline_tag(pos) {
+                let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
+                errors.push(format!(
+                    "{e}\n{}",
+                    mismatch_context(file_lines, idx, 2, had_bom)
+                ));
+            } else {
+                errors.push(e);
             }
         }
-        if let Some(ref end) = edit.end {
-            if let Err(e) = validate_line_ref(end, file_lines, had_bom) {
-                if let Ok((line_num, _)) = parse_hashline_tag(end) {
-                    let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
-                    errors.push(format!(
-                        "{e}\n{}",
-                        mismatch_context(file_lines, idx, 2, had_bom)
-                    ));
-                } else {
-                    errors.push(e);
-                }
+        if let Some(ref end) = edit.end
+            && let Err(e) = validate_line_ref(end, file_lines, had_bom)
+        {
+            if let Ok((line_num, _)) = parse_hashline_tag(end) {
+                let idx = (line_num - 1).min(file_lines.len().saturating_sub(1));
+                errors.push(format!(
+                    "{e}\n{}",
+                    mismatch_context(file_lines, idx, 2, had_bom)
+                ));
+            } else {
+                errors.push(e);
             }
         }
     }

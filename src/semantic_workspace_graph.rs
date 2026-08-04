@@ -1040,15 +1040,14 @@ impl<'a> SemanticContextBundlePlanner<'a> {
             }
 
             estimated_bytes = estimated_bytes.saturating_add(candidate.estimated_bytes);
-            if candidate.node.node_type == SemanticNodeType::ValidationCommand {
-                if let Some(command) = candidate
+            if candidate.node.node_type == SemanticNodeType::ValidationCommand
+                && let Some(command) = candidate
                     .node
                     .metadata
                     .get("command")
                     .and_then(Value::as_str)
-                {
-                    suggested_validation_commands.insert(command.to_string());
-                }
+            {
+                suggested_validation_commands.insert(command.to_string());
             }
             selected_items.push(candidate.to_item());
         }

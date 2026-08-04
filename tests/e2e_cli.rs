@@ -328,10 +328,10 @@ impl CliTestHarness {
             buf
         });
 
-        if let Some(input) = stdin {
-            if let Some(mut child_stdin) = child.stdin.take() {
-                child_stdin.write_all(input).expect("write stdin");
-            }
+        if let Some(input) = stdin
+            && let Some(mut child_stdin) = child.stdin.take()
+        {
+            child_stdin.write_all(input).expect("write stdin");
         }
         let timeout = Self::cli_timeout();
         let mut timed_out = false;

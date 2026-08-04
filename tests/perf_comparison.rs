@@ -379,55 +379,55 @@ fn build_comparison_rows(
     }
 
     // Per-extension load time (hello + pirate) from real benchmarks.
-    if let Some(lh) = legacy_hello_load {
-        if let Some(ref s) = lh.summary {
-            let legacy_p50 = s.p50_ms.unwrap_or(0.0);
-            // Look up hello Rust load from load_bench.
-            let rust_hello_ms = load_bench
-                .as_ref()
-                .and_then(|lb| {
-                    lb.results
-                        .iter()
-                        .find(|r| r.extension.starts_with("hello/"))
-                })
-                .map_or(0.0, |r| r.rust.load_time_ms as f64);
+    if let Some(lh) = legacy_hello_load
+        && let Some(ref s) = lh.summary
+    {
+        let legacy_p50 = s.p50_ms.unwrap_or(0.0);
+        // Look up hello Rust load from load_bench.
+        let rust_hello_ms = load_bench
+            .as_ref()
+            .and_then(|lb| {
+                lb.results
+                    .iter()
+                    .find(|r| r.extension.starts_with("hello/"))
+            })
+            .map_or(0.0, |r| r.rust.load_time_ms as f64);
 
-            let pct = pct_change(rust_hello_ms, legacy_p50);
-            rows.push(ComparisonRow {
-                category: "Load Time".into(),
-                metric: "hello cold-start p50".into(),
-                rust_value: format!("{rust_hello_ms:.1}ms"),
-                legacy_value: format!("{legacy_p50:.1}ms"),
-                delta: format!("{:+.1}ms", rust_hello_ms - legacy_p50),
-                delta_pct: format!("{pct:+.0}%"),
-                verdict: verdict(pct).into(),
-            });
-        }
+        let pct = pct_change(rust_hello_ms, legacy_p50);
+        rows.push(ComparisonRow {
+            category: "Load Time".into(),
+            metric: "hello cold-start p50".into(),
+            rust_value: format!("{rust_hello_ms:.1}ms"),
+            legacy_value: format!("{legacy_p50:.1}ms"),
+            delta: format!("{:+.1}ms", rust_hello_ms - legacy_p50),
+            delta_pct: format!("{pct:+.0}%"),
+            verdict: verdict(pct).into(),
+        });
     }
 
-    if let Some(lp) = legacy_pirate_load {
-        if let Some(ref s) = lp.summary {
-            let legacy_p50 = s.p50_ms.unwrap_or(0.0);
-            let rust_pirate_ms = load_bench
-                .as_ref()
-                .and_then(|lb| {
-                    lb.results
-                        .iter()
-                        .find(|r| r.extension.starts_with("pirate/"))
-                })
-                .map_or(0.0, |r| r.rust.load_time_ms as f64);
+    if let Some(lp) = legacy_pirate_load
+        && let Some(ref s) = lp.summary
+    {
+        let legacy_p50 = s.p50_ms.unwrap_or(0.0);
+        let rust_pirate_ms = load_bench
+            .as_ref()
+            .and_then(|lb| {
+                lb.results
+                    .iter()
+                    .find(|r| r.extension.starts_with("pirate/"))
+            })
+            .map_or(0.0, |r| r.rust.load_time_ms as f64);
 
-            let pct = pct_change(rust_pirate_ms, legacy_p50);
-            rows.push(ComparisonRow {
-                category: "Load Time".into(),
-                metric: "pirate cold-start p50".into(),
-                rust_value: format!("{rust_pirate_ms:.1}ms"),
-                legacy_value: format!("{legacy_p50:.1}ms"),
-                delta: format!("{:+.1}ms", rust_pirate_ms - legacy_p50),
-                delta_pct: format!("{pct:+.0}%"),
-                verdict: verdict(pct).into(),
-            });
-        }
+        let pct = pct_change(rust_pirate_ms, legacy_p50);
+        rows.push(ComparisonRow {
+            category: "Load Time".into(),
+            metric: "pirate cold-start p50".into(),
+            rust_value: format!("{rust_pirate_ms:.1}ms"),
+            legacy_value: format!("{legacy_p50:.1}ms"),
+            delta: format!("{:+.1}ms", rust_pirate_ms - legacy_p50),
+            delta_pct: format!("{pct:+.0}%"),
+            verdict: verdict(pct).into(),
+        });
     }
 
     // --- Tool call throughput ---
@@ -504,32 +504,32 @@ fn build_comparison_rows(
     }
 
     // --- Hyperfine end-to-end process timing ---
-    if let Some(h1) = hyperfine_1 {
-        if let Some(entry) = h1.results.first() {
-            rows.push(ComparisonRow {
-                category: "E2E Process".into(),
-                metric: "200 iters x 1 tool (hyperfine median)".into(),
-                rust_value: format!("{:.1}ms", entry.median * 1000.0),
-                legacy_value: "N/A".into(),
-                delta: "-".into(),
-                delta_pct: "-".into(),
-                verdict: "INFO".into(),
-            });
-        }
+    if let Some(h1) = hyperfine_1
+        && let Some(entry) = h1.results.first()
+    {
+        rows.push(ComparisonRow {
+            category: "E2E Process".into(),
+            metric: "200 iters x 1 tool (hyperfine median)".into(),
+            rust_value: format!("{:.1}ms", entry.median * 1000.0),
+            legacy_value: "N/A".into(),
+            delta: "-".into(),
+            delta_pct: "-".into(),
+            verdict: "INFO".into(),
+        });
     }
 
-    if let Some(h10) = hyperfine_10 {
-        if let Some(entry) = h10.results.first() {
-            rows.push(ComparisonRow {
-                category: "E2E Process".into(),
-                metric: "200 iters x 10 tools (hyperfine median)".into(),
-                rust_value: format!("{:.1}ms", entry.median * 1000.0),
-                legacy_value: "N/A".into(),
-                delta: "-".into(),
-                delta_pct: "-".into(),
-                verdict: "INFO".into(),
-            });
-        }
+    if let Some(h10) = hyperfine_10
+        && let Some(entry) = h10.results.first()
+    {
+        rows.push(ComparisonRow {
+            category: "E2E Process".into(),
+            metric: "200 iters x 10 tools (hyperfine median)".into(),
+            rust_value: format!("{:.1}ms", entry.median * 1000.0),
+            legacy_value: "N/A".into(),
+            delta: "-".into(),
+            delta_pct: "-".into(),
+            verdict: "INFO".into(),
+        });
     }
 
     // --- Stress test stability ---

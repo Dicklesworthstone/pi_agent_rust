@@ -902,10 +902,10 @@ fn is_path_like(text: &str) -> bool {
 
 fn expand_tilde(text: &str) -> String {
     let text = text.trim();
-    if let Some(rest) = text.strip_prefix("~/") {
-        if let Some(home) = dirs::home_dir() {
-            return home.join(rest).display().to_string();
-        }
+    if let Some(rest) = text.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest).display().to_string();
     }
     text.to_string()
 }
@@ -1075,7 +1075,7 @@ fn clamp_cursor(text: &str, cursor: usize) -> usize {
     clamp_to_char_boundary(text, cursor.min(text.len()))
 }
 
-fn clamp_to_char_boundary(text: &str, mut idx: usize) -> usize {
+const fn clamp_to_char_boundary(text: &str, mut idx: usize) -> usize {
     while idx > 0 && !text.is_char_boundary(idx) {
         idx -= 1;
     }

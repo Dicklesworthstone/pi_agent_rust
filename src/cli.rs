@@ -184,15 +184,12 @@ fn preprocess_extension_flags(raw_args: &[String]) -> (Vec<String>, Vec<Extensio
             let mut value = inline_value;
             if value.is_none() {
                 let next = raw_args.get(index + 1);
-                if let Some(next) = next {
-                    if next.ne("--")
-                        && (!next.starts_with('-')
-                            || next.eq("-")
-                            || is_negative_numeric_token(next))
-                    {
-                        value = Some(next.clone());
-                        index += 1;
-                    }
+                if let Some(next) = next
+                    && next.ne("--")
+                    && (!next.starts_with('-') || next.eq("-") || is_negative_numeric_token(next))
+                {
+                    value = Some(next.clone());
+                    index += 1;
                 }
             }
             extracted.push(ExtensionCliFlag {

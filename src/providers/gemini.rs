@@ -344,14 +344,14 @@ impl Provider for GeminiProvider {
             }
 
             // Apply provider-specific custom headers from compat config.
-            if let Some(compat) = &self.compat {
-                if let Some(custom_headers) = &compat.custom_headers {
-                    request = super::apply_headers_ignoring_blank_auth_overrides(
-                        request,
-                        custom_headers,
-                        &["authorization", "x-goog-api-key"],
-                    );
-                }
+            if let Some(compat) = &self.compat
+                && let Some(custom_headers) = &compat.custom_headers
+            {
+                request = super::apply_headers_ignoring_blank_auth_overrides(
+                    request,
+                    custom_headers,
+                    &["authorization", "x-goog-api-key"],
+                );
             }
 
             // Per-request headers from StreamOptions (highest priority).
@@ -484,14 +484,14 @@ impl Provider for GeminiProvider {
         }
 
         // Apply provider-specific custom headers from compat config.
-        if let Some(compat) = &self.compat {
-            if let Some(custom_headers) = &compat.custom_headers {
-                request = super::apply_headers_ignoring_blank_auth_overrides(
-                    request,
-                    custom_headers,
-                    &["authorization", "x-goog-api-key"],
-                );
-            }
+        if let Some(compat) = &self.compat
+            && let Some(custom_headers) = &compat.custom_headers
+        {
+            request = super::apply_headers_ignoring_blank_auth_overrides(
+                request,
+                custom_headers,
+                &["authorization", "x-goog-api-key"],
+            );
         }
 
         // Per-request headers from StreamOptions (highest priority).
@@ -647,10 +647,10 @@ where
         }
 
         // Process candidates
-        if let Some(candidates) = response.candidates {
-            if let Some(candidate) = candidates.into_iter().next() {
-                self.process_candidate(candidate)?;
-            }
+        if let Some(candidates) = response.candidates
+            && let Some(candidate) = candidates.into_iter().next()
+        {
+            self.process_candidate(candidate)?;
         }
 
         Ok(())

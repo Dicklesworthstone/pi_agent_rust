@@ -344,36 +344,34 @@ impl CompatibilityScanner {
         text: &str,
         flagged: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
     ) {
-        if text.contains("Function") {
-            if let Some(column) = find_regex_column(text, new_function_regex()) {
-                let evidence =
-                    CompatEvidence::new(file.to_string(), line, column, text.to_string());
-                flagged
-                    .entry((
-                        "flagged_api".to_string(),
-                        "new Function(...)".to_string(),
-                        "Avoid dynamic code generation when possible; prefer static bundling. If required, ensure the function body is a literal and keep it minimal."
-                            .to_string(),
-                    ))
-                    .or_default()
-                    .push(evidence);
-            }
+        if text.contains("Function")
+            && let Some(column) = find_regex_column(text, new_function_regex())
+        {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            flagged
+                .entry((
+                    "flagged_api".to_string(),
+                    "new Function(...)".to_string(),
+                    "Avoid dynamic code generation when possible; prefer static bundling. If required, ensure the function body is a literal and keep it minimal."
+                        .to_string(),
+                ))
+                .or_default()
+                .push(evidence);
         }
 
-        if text.contains("eval") {
-            if let Some(column) = find_regex_column(text, eval_regex()) {
-                let evidence =
-                    CompatEvidence::new(file.to_string(), line, column, text.to_string());
-                flagged
-                    .entry((
-                        "flagged_api".to_string(),
-                        "eval(...)".to_string(),
-                        "Avoid eval; prefer parsing/dispatch on structured data. If unavoidable, keep the evaluated string literal and log evidence."
-                            .to_string(),
-                    ))
-                    .or_default()
-                    .push(evidence);
-            }
+        if text.contains("eval")
+            && let Some(column) = find_regex_column(text, eval_regex())
+        {
+            let evidence = CompatEvidence::new(file.to_string(), line, column, text.to_string());
+            flagged
+                .entry((
+                    "flagged_api".to_string(),
+                    "eval(...)".to_string(),
+                    "Avoid eval; prefer parsing/dispatch on structured data. If unavoidable, keep the evaluated string literal and log evidence."
+                        .to_string(),
+                ))
+                .or_default()
+                .push(evidence);
         }
     }
 
@@ -384,34 +382,34 @@ impl CompatibilityScanner {
         forbidden: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
     ) {
         if text.contains("process") {
-            if text.contains("binding") {
-                if let Some(column) = find_regex_column(text, binding_regex()) {
-                    let evidence =
-                        CompatEvidence::new(file.to_string(), line, column, text.to_string());
-                    forbidden
-                        .entry((
-                            "forbidden_api".to_string(),
-                            "process.binding(...)".to_string(),
-                            "Native module access is forbidden; remove this usage.".to_string(),
-                        ))
-                        .or_default()
-                        .push(evidence);
-                }
+            if text.contains("binding")
+                && let Some(column) = find_regex_column(text, binding_regex())
+            {
+                let evidence =
+                    CompatEvidence::new(file.to_string(), line, column, text.to_string());
+                forbidden
+                    .entry((
+                        "forbidden_api".to_string(),
+                        "process.binding(...)".to_string(),
+                        "Native module access is forbidden; remove this usage.".to_string(),
+                    ))
+                    .or_default()
+                    .push(evidence);
             }
 
-            if text.contains("dlopen") {
-                if let Some(column) = find_regex_column(text, dlopen_regex()) {
-                    let evidence =
-                        CompatEvidence::new(file.to_string(), line, column, text.to_string());
-                    forbidden
-                        .entry((
-                            "forbidden_api".to_string(),
-                            "process.dlopen(...)".to_string(),
-                            "Native addon loading is forbidden; remove this usage.".to_string(),
-                        ))
-                        .or_default()
-                        .push(evidence);
-                }
+            if text.contains("dlopen")
+                && let Some(column) = find_regex_column(text, dlopen_regex())
+            {
+                let evidence =
+                    CompatEvidence::new(file.to_string(), line, column, text.to_string());
+                forbidden
+                    .entry((
+                        "forbidden_api".to_string(),
+                        "process.dlopen(...)".to_string(),
+                        "Native addon loading is forbidden; remove this usage.".to_string(),
+                    ))
+                    .or_default()
+                    .push(evidence);
             }
         }
     }
@@ -711,16 +709,16 @@ fn extract_import_specifiers(line: &str) -> Vec<(String, usize)> {
     if let Some((specifier, column)) = &top_level {
         out.push((specifier.clone(), *column));
     } else {
-        if let Some(caps) = import_from_regex().captures(line) {
-            if let Some(m) = caps.get(1) {
-                out.push((m.as_str().to_string(), m.start() + 1));
-            }
+        if let Some(caps) = import_from_regex().captures(line)
+            && let Some(m) = caps.get(1)
+        {
+            out.push((m.as_str().to_string(), m.start() + 1));
         }
 
-        if let Some(caps) = import_side_effect_regex().captures(line) {
-            if let Some(m) = caps.get(1) {
-                out.push((m.as_str().to_string(), m.start() + 1));
-            }
+        if let Some(caps) = import_side_effect_regex().captures(line)
+            && let Some(m) = caps.get(1)
+        {
+            out.push((m.as_str().to_string(), m.start() + 1));
         }
     }
 
@@ -778,34 +776,34 @@ fn extract_pi_capabilities(line: &str) -> Vec<(String, String, usize)> {
         }
     }
 
-    if line.contains("pi.exec") {
-        if let Some(column) = find_regex_column(line, pi_exec_regex()) {
-            out.push(("exec".to_string(), "pi.exec".to_string(), column));
-        }
+    if line.contains("pi.exec")
+        && let Some(column) = find_regex_column(line, pi_exec_regex())
+    {
+        out.push(("exec".to_string(), "pi.exec".to_string(), column));
     }
 
-    if line.contains("pi.http") {
-        if let Some(column) = find_regex_column(line, pi_http_regex()) {
-            out.push(("http".to_string(), "pi.http".to_string(), column));
-        }
+    if line.contains("pi.http")
+        && let Some(column) = find_regex_column(line, pi_http_regex())
+    {
+        out.push(("http".to_string(), "pi.http".to_string(), column));
     }
 
-    if line.contains("pi.log") {
-        if let Some(column) = find_regex_column(line, pi_log_regex()) {
-            out.push(("log".to_string(), "pi.log".to_string(), column));
-        }
+    if line.contains("pi.log")
+        && let Some(column) = find_regex_column(line, pi_log_regex())
+    {
+        out.push(("log".to_string(), "pi.log".to_string(), column));
     }
 
-    if line.contains("pi.session") {
-        if let Some(column) = find_regex_column(line, pi_session_regex()) {
-            out.push(("session".to_string(), "pi.session.*".to_string(), column));
-        }
+    if line.contains("pi.session")
+        && let Some(column) = find_regex_column(line, pi_session_regex())
+    {
+        out.push(("session".to_string(), "pi.session.*".to_string(), column));
     }
 
-    if line.contains("pi.ui") {
-        if let Some(column) = find_regex_column(line, pi_ui_regex()) {
-            out.push(("ui".to_string(), "pi.ui.*".to_string(), column));
-        }
+    if line.contains("pi.ui")
+        && let Some(column) = find_regex_column(line, pi_ui_regex())
+    {
+        out.push(("ui".to_string(), "pi.ui.*".to_string(), column));
     }
 
     out

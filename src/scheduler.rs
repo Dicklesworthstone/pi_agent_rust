@@ -936,7 +936,7 @@ impl ReactorMesh {
 
     /// Number of shard lanes.
     #[must_use]
-    pub fn shard_count(&self) -> usize {
+    pub const fn shard_count(&self) -> usize {
         self.lanes.len()
     }
 
@@ -1010,7 +1010,7 @@ impl ReactorMesh {
         usize::try_from(slot).unwrap_or(0)
     }
 
-    fn rr_route(&mut self) -> usize {
+    const fn rr_route(&mut self) -> usize {
         if self.lanes.len() <= 1 {
             return 0;
         }
@@ -1333,13 +1333,13 @@ impl NumaSlab {
 
     /// Number of currently allocated slots.
     #[must_use]
-    pub fn in_use(&self) -> usize {
+    pub const fn in_use(&self) -> usize {
         self.capacity.saturating_sub(self.free_list.len())
     }
 
     /// Whether the slab has available capacity.
     #[must_use]
-    pub fn has_capacity(&self) -> bool {
+    pub const fn has_capacity(&self) -> bool {
         !self.free_list.is_empty()
     }
 
@@ -1458,7 +1458,7 @@ impl NumaSlabPool {
 
     /// Number of NUMA nodes in this pool.
     #[must_use]
-    pub fn node_count(&self) -> usize {
+    pub const fn node_count(&self) -> usize {
         self.slabs.len()
     }
 
@@ -1471,13 +1471,13 @@ impl NumaSlabPool {
         preferred_node: usize,
     ) -> Option<(NumaSlabHandle, Option<CrossNodeReason>)> {
         // Try preferred node first.
-        if let Some(slab) = self.slabs.iter_mut().find(|s| s.node_id == preferred_node) {
-            if let Some(handle) = slab.allocate() {
-                if self.hugepage_status.active {
-                    self.hugepage_backed_allocs = self.hugepage_backed_allocs.saturating_add(1);
-                }
-                return Some((handle, None));
+        if let Some(slab) = self.slabs.iter_mut().find(|s| s.node_id == preferred_node)
+            && let Some(handle) = slab.allocate()
+        {
+            if self.hugepage_status.active {
+                self.hugepage_backed_allocs = self.hugepage_backed_allocs.saturating_add(1);
             }
+            return Some((handle, None));
         }
         // Fallback: scan all nodes for available capacity.
         for slab in &mut self.slabs {
