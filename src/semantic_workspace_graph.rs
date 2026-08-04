@@ -1008,6 +1008,7 @@ impl<'a> SemanticContextBundlePlanner<'a> {
         let mut selected_items = Vec::new();
         let mut excluded_items = Vec::new();
         let mut stale_evidence_suppressions = Vec::new();
+        let mut stale_evidence_suppression_keys = BTreeSet::new();
         let mut suggested_validation_commands = BTreeSet::new();
         let mut estimated_bytes = 0_u64;
 
@@ -1020,7 +1021,10 @@ impl<'a> SemanticContextBundlePlanner<'a> {
                     suppression_reason
                 };
                 let exclusion = candidate.to_exclusion(exclusion_reason);
-                if suppression_reason == "suppressed_stale_or_unsafe_evidence" {
+                if suppression_reason == "suppressed_stale_or_unsafe_evidence"
+                    && stale_evidence_suppression_keys
+                        .insert((exclusion.source_path.clone(), exclusion.reason.clone()))
+                {
                     stale_evidence_suppressions.push(exclusion.clone());
                 }
                 excluded_items.push(exclusion);
