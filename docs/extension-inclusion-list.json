@@ -51,7 +51,7 @@
         "ui_header"
       ],
       "category": "tool",
-      "risk_level": "low",
+      "risk_level": "minimal",
       "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
     },
     {
@@ -73,7 +73,7 @@
         "export_default"
       ],
       "category": "exec",
-      "risk_level": "low",
+      "risk_level": "minimal",
       "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
     },
     {
@@ -95,7 +95,7 @@
         "registerTool"
       ],
       "category": "tool",
-      "risk_level": "low",
+      "risk_level": "minimal",
       "inclusion_rationale": "Official pi-mono extension (MIT license, score=60); canonical reference for conformance"
     },
     {
