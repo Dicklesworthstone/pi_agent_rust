@@ -66,6 +66,7 @@ const SWARM_RESOURCE_PREFLIGHT_RCH_QUEUE_JSON_ENV: &str = "PI_DOCTOR_RCH_QUEUE_J
 const SWARM_RESOURCE_PREFLIGHT_RCH_QUEUE_JSON_PATH_ENV: &str = "PI_DOCTOR_RCH_QUEUE_JSON_PATH";
 const SWARM_RESOURCE_PREFLIGHT_LOCAL_BUILD_PROCESS_COUNT_ENV: &str =
     "PI_DOCTOR_LOCAL_BUILD_PROCESS_COUNT";
+const SWARM_RESOURCE_PREFLIGHT_LOGICAL_CPU_CORES_ENV: &str = "PI_DOCTOR_LOGICAL_CPU_CORES";
 const SWARM_VALIDATION_BROKER_STORE_ENV: &str = "PI_VALIDATION_BROKER_STORE";
 const SWARM_PROGRESS_SLO_JSON_ENV: &str = "PI_SWARM_PROGRESS_SLO_JSON";
 const SWARM_BUILD_SLOT_SOON_EXPIRING_MINUTES: i64 = 30;
@@ -1838,9 +1839,13 @@ fn build_swarm_resource_preflight_snapshot(
     sample: &HostResourceSample,
 ) -> SwarmResourcePreflightSnapshot {
     let mut source_errors = Vec::new();
-    let logical_cpu_cores = std::thread::available_parallelism()
-        .ok()
-        .and_then(|value| u64::try_from(value.get()).ok())
+    let logical_cpu_cores = env_u64(SWARM_RESOURCE_PREFLIGHT_LOGICAL_CPU_CORES_ENV)
+        .filter(|cores| *cores > 0)
+        .or_else(|| {
+            std::thread::available_parallelism()
+                .ok()
+                .and_then(|value| u64::try_from(value.get()).ok())
+        })
         .unwrap_or(1);
     let cpu_quota = read_cgroup_cpu_quota(&mut source_errors);
     let cpuset = read_cpuset_snapshot(&mut source_errors);

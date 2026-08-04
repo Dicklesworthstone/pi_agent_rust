@@ -97,6 +97,7 @@ fn run_doctor_json(env_overrides: &[(&str, Option<&str>)]) -> TestResult<Value> 
         .env_remove("KIMI_API_KEY")
         .env_remove("AZURE_OPENAI_API_KEY")
         .env_remove("PI_VALIDATION_BROKER_STORE")
+        .env_remove("PI_DOCTOR_LOGICAL_CPU_CORES")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -142,6 +143,7 @@ fn run_doctor_text(env_overrides: &[(&str, Option<&str>)]) -> TestResult<String>
         .env_remove("KIMI_API_KEY")
         .env_remove("AZURE_OPENAI_API_KEY")
         .env_remove("PI_VALIDATION_BROKER_STORE")
+        .env_remove("PI_DOCTOR_LOGICAL_CPU_CORES")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -999,6 +1001,7 @@ fn doctor_swarm_resource_preflight_json_reports_constrained_profile() -> TestRes
         ("PI_DOCTOR_NUMA_ONLINE_PATH", Some(numa.as_str())),
         ("PI_DOCTOR_CGROUP_MEMORY_MAX_PATH", Some(memory.as_str())),
         ("PI_DOCTOR_MEMINFO_PATH", Some(meminfo.as_str())),
+        ("PI_DOCTOR_LOGICAL_CPU_CORES", Some("4")),
         ("PI_DOCTOR_LOCAL_BUILD_PROCESS_COUNT", Some("0")),
     ])?;
     let finding = finding_by_schema(&report, SWARM_RESOURCE_PREFLIGHT_SCHEMA)?;
@@ -1102,6 +1105,7 @@ fn doctor_swarm_resource_preflight_json_reports_high_capacity_profile() -> TestR
         ("PI_DOCTOR_NUMA_ONLINE_PATH", Some(numa.as_str())),
         ("PI_DOCTOR_CGROUP_MEMORY_MAX_PATH", Some(memory.as_str())),
         ("PI_DOCTOR_MEMINFO_PATH", Some(meminfo.as_str())),
+        ("PI_DOCTOR_LOGICAL_CPU_CORES", Some("64")),
         ("PI_DOCTOR_LOCAL_BUILD_PROCESS_COUNT", Some("0")),
     ])?;
     let finding = finding_by_schema(&report, SWARM_RESOURCE_PREFLIGHT_SCHEMA)?;
