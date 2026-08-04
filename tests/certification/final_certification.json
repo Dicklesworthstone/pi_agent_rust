@@ -1,31 +1,31 @@
 {
   "schema": "pi.qa.final_certification.v1",
-  "generated_at": "2026-08-04T07:11:40Z",
+  "generated_at": "2026-08-04T12:27:03Z",
   "certification_verdict": "FAIL",
   "evidence": [
     {
       "gate": "non_mock_compliance",
       "bead": "bd-1f42.2.6",
-      "status": "FAIL",
-      "detail": "Invalid non-mock rubric schema",
+      "status": "PASS",
+      "detail": "Non-mock rubric present: pi.qa.non_mock_rubric.v1",
       "artifact_path": "docs/non-mock-rubric.json",
-      "artifact_sha256": "content-hash-4b80fd5f5c5a7308-len-16034"
+      "artifact_sha256": "59a18419d4390e3f7262ca2fa85621fd4084791dc1b29cec0c42f698c73ae2d7"
     },
     {
       "gate": "e2e_evidence",
       "bead": "bd-1f42.3",
-      "status": "PASS",
-      "detail": "E2E conformance: 60/226 extensions tested",
+      "status": "FAIL",
+      "detail": "Current conformance incomplete: 60/226 tested, 166 not exercised",
       "artifact_path": "tests/ext_conformance/reports/conformance_summary.json",
-      "artifact_sha256": "content-hash-ab43537f12c3eaeb-len-1058"
+      "artifact_sha256": "e889d56c3155c3f2e5554ea447745e0498284f045f510eabd7241bfdc1b41b5f"
     },
     {
       "gate": "must_pass_208",
       "bead": "bd-1f42.4",
       "status": "FAIL",
-      "detail": "123/123 must-pass (pass)",
+      "detail": "123/123 must-pass artifact says pass, but certification requires at least 208 passing items",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
-      "artifact_sha256": "content-hash-a8426f0573466caf-len-1236"
+      "artifact_sha256": "b79bfeb96a98d8c0f9d200a28dc3b95675c4bf3a7912034f5cc1d51c25efed01"
     },
     {
       "gate": "evidence_bundle",
@@ -33,7 +33,7 @@
       "status": "FAIL",
       "detail": "Evidence bundle incomplete or missing (insufficient, artifacts=2004)",
       "artifact_path": "tests/evidence_bundle/index.json",
-      "artifact_sha256": "content-hash-f1ea9f6cdab11f8b-len-11495"
+      "artifact_sha256": "bf4034c60dcb47af0c1f3cb072bdb8b2870bb7c33b950089a7286a36cae524d1"
     },
     {
       "gate": "cross_platform",
@@ -41,15 +41,15 @@
       "status": "PASS",
       "detail": "10/10 platform checks pass",
       "artifact_path": "tests/cross_platform_reports/linux/platform_report.json",
-      "artifact_sha256": "content-hash-cb7e31afb88d69c1-len-4205"
+      "artifact_sha256": "e35e59ae379d36b9f775313ecdc92da49be9aa4075f47762584ac8ae9cdafdb2"
     },
     {
       "gate": "full_suite_gate",
       "bead": "bd-1f42.6.5",
-      "status": "WARN",
-      "detail": "17/0 gates pass (fail)",
+      "status": "FAIL",
+      "detail": "17/20 gates pass (fail; blocking 12/14)",
       "artifact_path": "tests/full_suite_gate/full_suite_verdict.json",
-      "artifact_sha256": "content-hash-b14831568ac4801f-len-8109"
+      "artifact_sha256": "57ee802c0f109b7fc5db64ea727317d32a74204737cadae88c11d82557ed9e1c"
     },
     {
       "gate": "extension_remediation_backlog",
@@ -57,7 +57,7 @@
       "status": "PASS",
       "detail": "Remediation backlog valid: 0 entries (0 actionable, 0 non-actionable)",
       "artifact_path": "tests/full_suite_gate/extension_remediation_backlog.json",
-      "artifact_sha256": "content-hash-a170ce6482e402e7-len-537"
+      "artifact_sha256": "7c48d35ace5e514949bdeefb0159b09b25afb46c9999b462a071b52309b07e1a"
     },
     {
       "gate": "practical_finish_checkpoint",
@@ -65,7 +65,7 @@
       "status": "FAIL",
       "detail": "Practical-finish checkpoint blocked: technical_open_count=43, docs_or_report_open_count=5",
       "artifact_path": "tests/full_suite_gate/practical_finish_checkpoint.json",
-      "artifact_sha256": "content-hash-d2dfc5a6b09643e9-len-16109"
+      "artifact_sha256": "68c18d5ac35e7bf079eae4360e9fad9dfb3694c3fbecb0ddd1c4e829e760d7e3"
     },
     {
       "gate": "parameter_sweeps_integrity",
@@ -73,7 +73,7 @@
       "status": "PASS",
       "detail": "Parameter sweeps contract valid: readiness=blocked, dimensions=3",
       "artifact_path": "tests/perf/reports/parameter_sweeps.json",
-      "artifact_sha256": "content-hash-96666dfa7dd4d66c-len-1076"
+      "artifact_sha256": "1161f179ece52f7263214af835653e51e921cbd6c787986797148f783b7276b3"
     },
     {
       "gate": "opportunity_matrix_integrity",
@@ -81,28 +81,28 @@
       "status": "PASS",
       "detail": "Opportunity matrix contract valid: readiness=blocked, ranked_opportunities=0",
       "artifact_path": "tests/perf/reports/opportunity_matrix.json",
-      "artifact_sha256": "content-hash-b1a7ca8c1bd94de6-len-706"
+      "artifact_sha256": "1c5f7f59ac5772221b7108f1d4d0342ff8c335277db636fc7eae436908cb1fb6"
     },
     {
       "gate": "health_delta",
       "bead": "bd-1f42.4.5",
-      "status": "PASS",
-      "detail": "Baseline: 223/223 (100.0%)",
-      "artifact_path": "tests/ext_conformance/reports/conformance_baseline.json",
-      "artifact_sha256": "content-hash-40d0fcf6e4177c41-len-5170"
+      "status": "FAIL",
+      "detail": "Current conformance incomplete: 60/226 tested, 166 not exercised",
+      "artifact_path": "tests/ext_conformance/reports/conformance_summary.json",
+      "artifact_sha256": "e889d56c3155c3f2e5554ea447745e0498284f045f510eabd7241bfdc1b41b5f"
     }
   ],
   "risk_register": [
     {
-      "id": "bd-1f42.2.6",
+      "id": "bd-1f42.3",
       "severity": "high",
-      "description": "non_mock_compliance: Invalid non-mock rubric schema",
-      "mitigation": "Investigate and fix before release (bead bd-1f42.2.6)"
+      "description": "e2e_evidence: Current conformance incomplete: 60/226 tested, 166 not exercised",
+      "mitigation": "Investigate and fix before release (bead bd-1f42.3)"
     },
     {
       "id": "bd-1f42.4",
       "severity": "high",
-      "description": "must_pass_208: 123/123 must-pass (pass)",
+      "description": "must_pass_208: 123/123 must-pass artifact says pass, but certification requires at least 208 passing items",
       "mitigation": "Investigate and fix before release (bead bd-1f42.4)"
     },
     {
@@ -113,15 +113,21 @@
     },
     {
       "id": "bd-1f42.6.5",
-      "severity": "medium",
-      "description": "full_suite_gate: 17/0 gates pass (fail)",
-      "mitigation": "Monitor and track in bead bd-1f42.6.5"
+      "severity": "high",
+      "description": "full_suite_gate: 17/20 gates pass (fail; blocking 12/14)",
+      "mitigation": "Investigate and fix before release (bead bd-1f42.6.5)"
     },
     {
       "id": "bd-3ar8v.6.9",
       "severity": "high",
       "description": "practical_finish_checkpoint: Practical-finish checkpoint blocked: technical_open_count=43, docs_or_report_open_count=5",
       "mitigation": "Investigate and fix before release (bead bd-3ar8v.6.9)"
+    },
+    {
+      "id": "bd-1f42.4.5",
+      "severity": "high",
+      "description": "health_delta: Current conformance incomplete: 60/226 tested, 166 not exercised",
+      "mitigation": "Investigate and fix before release (bead bd-1f42.4.5)"
     }
   ],
   "reproduce_commands": [

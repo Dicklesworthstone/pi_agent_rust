@@ -581,7 +581,7 @@ fn read_packed_ref(git_dir: &Path, reference: &str) -> Option<String> {
 fn normalize_git_hash(raw: &str) -> Option<String> {
     let hash = raw.trim();
     if matches!(hash.len(), 40 | 64) && hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
-        Some(hash.to_string())
+        Some(hash.to_ascii_lowercase())
     } else {
         None
     }
@@ -2107,6 +2107,14 @@ mod replay_cache_tests {
             .expect_err("abbreviated commits must fail closed");
         assert_eq!(refusal.class, "invalid_authoritative_git_commit");
         assert!(refusal.fail_closed);
+
+        let uppercase = TEST_GIT_COMMIT.to_ascii_uppercase();
+        assert_eq!(
+            select_provider_replay_git_commit(Some(&uppercase), None, None)
+                .expect("uppercase hexadecimal commit is valid"),
+            Some(TEST_GIT_COMMIT.to_string()),
+            "equivalent commit IDs must produce one canonical cache key"
+        );
     }
 
     #[test]

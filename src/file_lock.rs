@@ -121,6 +121,15 @@ fn reclaim_if_unchanged(lock_path: &Path, observed: &fs::Metadata) {
     }
 }
 
+fn remove_owned_dir(lock_path: &Path, expected: LockIdentity) {
+    let still_owned = fs::symlink_metadata(lock_path)
+        .and_then(|meta| lock_identity(&meta))
+        .is_ok_and(|identity| identity == expected);
+    if still_owned {
+        let _ = fs::remove_dir(lock_path);
+    }
+}
+
 fn refresh_identity(lock_path: &Path) -> io::Result<LockIdentity> {
     filetime::set_file_mtime(lock_path, filetime::FileTime::now())?;
     lock_identity(&fs::symlink_metadata(lock_path)?)
@@ -220,10 +229,11 @@ impl DirLock {
     }
 
     fn start_heartbeat(lock_path: &Path, update: Duration) -> io::Result<Self> {
+        let acquired_identity = lock_identity(&fs::symlink_metadata(lock_path)?)?;
         let initial_identity = match refresh_identity(lock_path) {
             Ok(identity) => identity,
             Err(error) => {
-                let _ = fs::remove_dir(lock_path);
+                remove_owned_dir(lock_path, acquired_identity);
                 return Err(error);
             }
         };
@@ -252,22 +262,19 @@ impl DirLock {
                         heartbeat_compromised.store(true, Ordering::Release);
                         break;
                     }
-                    match refresh_identity(&heartbeat_path) {
-                        Ok(identity) => {
-                            *heartbeat_expected
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
-                        }
-                        Err(_) => {
-                            heartbeat_compromised.store(true, Ordering::Release);
-                            break;
-                        }
+                    if let Ok(identity) = refresh_identity(&heartbeat_path) {
+                        *heartbeat_expected
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+                    } else {
+                        heartbeat_compromised.store(true, Ordering::Release);
+                        break;
                     }
                 }
             }) {
             Ok(handle) => handle,
             Err(error) => {
-                let _ = fs::remove_dir(lock_path);
+                remove_owned_dir(lock_path, initial_identity);
                 return Err(error);
             }
         };
@@ -319,12 +326,7 @@ impl Drop for DirLock {
             .expected_identity
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let still_owned = fs::symlink_metadata(&self.lock_path)
-            .and_then(|meta| lock_identity(&meta))
-            .is_ok_and(|identity| identity == expected);
-        if still_owned {
-            let _ = fs::remove_dir(&self.lock_path);
-        }
+        remove_owned_dir(&self.lock_path, expected);
     }
 }
 

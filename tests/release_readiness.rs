@@ -4,12 +4,14 @@
 //! into a single user-focused release-readiness summary.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use tempfile::tempdir;
 
 const REPORT_SCHEMA: &str = "pi.release_readiness.v1";
 const MUST_PASS_GATE_SCHEMA: &str = "pi.ext.must_pass_gate.v1";
+const CERTIFIED_MUST_PASS_MINIMUM: u64 = 208;
 const NON_MOCK_RUBRIC_SCHEMA: &str = "pi.qa.non_mock_rubric.v1";
 const FULL_SUITE_GATE_SCHEMA: &str = "pi.ci.full_suite_gate.v1";
 const EXT_REMEDIATION_BACKLOG_SCHEMA: &str = "pi.qa.extension_remediation_backlog.v1";
@@ -146,6 +148,41 @@ fn validate_must_pass_gate_metadata(v: &V) -> Vec<String> {
 
     if v.pointer("/observed").is_none() {
         errors.push("missing required object: /observed".to_string());
+        return errors;
+    }
+
+    let required_count = |name: &str| {
+        v.pointer(&format!("/observed/{name}"))
+            .and_then(V::as_u64)
+            .ok_or_else(|| format!("missing required unsigned count: /observed/{name}"))
+    };
+    let counts = (
+        required_count("must_pass_total"),
+        required_count("must_pass_tested"),
+        required_count("must_pass_passed"),
+        required_count("must_pass_failed"),
+        required_count("must_pass_skipped"),
+    );
+    match counts {
+        (Ok(total), Ok(tested), Ok(passed), Ok(failed), Ok(skipped)) => {
+            if passed.checked_add(failed) != Some(tested) {
+                errors.push(format!(
+                    "must-pass tested-count mismatch: passed({passed}) + failed({failed}) != tested({tested})"
+                ));
+            }
+            if tested.checked_add(skipped) != Some(total) {
+                errors.push(format!(
+                    "must-pass total-count mismatch: tested({tested}) + skipped({skipped}) != total({total})"
+                ));
+            }
+        }
+        counts => {
+            errors.extend(
+                [counts.0, counts.1, counts.2, counts.3, counts.4]
+                    .into_iter()
+                    .filter_map(Result::err),
+            );
+        }
     }
 
     errors
@@ -242,6 +279,7 @@ fn validate_current_conformance_summary(v: &V) -> (Signal, String) {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_full_suite_gate(v: &V) -> (Signal, String) {
     let schema = get_str(v, "/schema");
     if schema != FULL_SUITE_GATE_SCHEMA {
@@ -259,7 +297,15 @@ fn validate_full_suite_gate(v: &V) -> (Signal, String) {
             .and_then(V::as_u64)
             .ok_or_else(|| format!("Missing required unsigned count: {pointer}"))
     };
-    let counts = (
+    let (
+        Ok(total),
+        Ok(passed),
+        Ok(failed),
+        Ok(warned),
+        Ok(skipped),
+        Ok(blocking_pass),
+        Ok(blocking_total),
+    ) = (
         required_count("/summary/total_gates"),
         required_count("/summary/passed"),
         required_count("/summary/failed"),
@@ -267,40 +313,21 @@ fn validate_full_suite_gate(v: &V) -> (Signal, String) {
         required_count("/summary/skipped"),
         required_count("/summary/blocking_pass"),
         required_count("/summary/blocking_total"),
-    );
-    let (total, passed, failed, warned, skipped, blocking_pass, blocking_total) = match counts {
-        (
-            Ok(total),
-            Ok(passed),
-            Ok(failed),
-            Ok(warned),
-            Ok(skipped),
-            Ok(blocking_pass),
-            Ok(blocking_total),
-        ) => (
-            total,
-            passed,
-            failed,
-            warned,
-            skipped,
-            blocking_pass,
-            blocking_total,
-        ),
-        _ => {
-            let errors = [
-                required_count("/summary/total_gates"),
-                required_count("/summary/passed"),
-                required_count("/summary/failed"),
-                required_count("/summary/warned"),
-                required_count("/summary/skipped"),
-                required_count("/summary/blocking_pass"),
-                required_count("/summary/blocking_total"),
-            ]
-            .into_iter()
-            .filter_map(Result::err)
-            .collect::<Vec<_>>();
-            return (Signal::Fail, errors.join("; "));
-        }
+    )
+    else {
+        let errors = [
+            required_count("/summary/total_gates"),
+            required_count("/summary/passed"),
+            required_count("/summary/failed"),
+            required_count("/summary/warned"),
+            required_count("/summary/skipped"),
+            required_count("/summary/blocking_pass"),
+            required_count("/summary/blocking_total"),
+        ]
+        .into_iter()
+        .filter_map(Result::err)
+        .collect::<Vec<_>>();
+        return (Signal::Fail, errors.join("; "));
     };
 
     if total == 0 {
@@ -1147,7 +1174,10 @@ fn collect_conformance(root: &Path) -> DimensionScore {
     load_json(&path).map_or_else(
         || no_data(name, "conformance_summary.json not found"),
         |v| {
-            let run_id = v.pointer("/run_id").and_then(V::as_str).map_or("", str::trim);
+            let run_id = v
+                .pointer("/run_id")
+                .and_then(V::as_str)
+                .map_or("", str::trim);
             let correlation_id = v
                 .pointer("/correlation_id")
                 .and_then(V::as_str)
@@ -1170,26 +1200,15 @@ fn collect_conformance(root: &Path) -> DimensionScore {
                 };
             }
 
-            let pass_rate = get_f64(&v, "/pass_rate_pct");
-            let pass = get_u64(&v, "/counts/pass");
-            let fail = get_u64(&v, "/counts/fail");
-            let total = get_u64(&v, "/counts/total");
+            let (signal, validation_detail) = validate_current_conformance_summary(&v);
             let neg_pass = get_u64(&v, "/negative/pass");
             let neg_fail = get_u64(&v, "/negative/fail");
-
-            let signal = if fail == 0 {
-                Signal::Pass
-            } else if pass_rate >= 90.0 {
-                Signal::Warn
-            } else {
-                Signal::Fail
-            };
 
             DimensionScore {
                 name: name.to_string(),
                 signal,
                 detail: format!(
-                    "{pass}/{total} pass ({pass_rate:.1}%), {fail} fail; negative tests: {neg_pass} pass, {neg_fail} fail"
+                    "{validation_detail}; negative tests: {neg_pass} pass, {neg_fail} fail"
                 ),
             }
         },
@@ -1456,6 +1475,13 @@ fn generate_release_readiness_report() {
 fn conformance_dimension_has_data() {
     let dim = collect_conformance(&repo_root());
     assert_ne!(dim.signal, Signal::NoData, "conformance: {}", dim.detail);
+    assert_eq!(
+        dim.signal,
+        Signal::Fail,
+        "partial checked-in coverage must fail closed: {}",
+        dim.detail
+    );
+    assert!(dim.detail.contains("60/226 tested"), "{}", dim.detail);
 }
 
 #[test]
@@ -1469,7 +1495,7 @@ fn conformance_dimension_fail_closed_when_lineage_missing() {
         serde_json::to_string_pretty(&serde_json::json!({
             "schema": "pi.ext.conformance_summary.v2",
             "generated_at": "2026-02-17T06:00:00Z",
-            "counts": { "total": 10, "pass": 10, "fail": 0 },
+            "counts": { "total": 10, "tested": 10, "pass": 10, "fail": 0, "na": 0 },
             "pass_rate_pct": 100.0,
             "negative": { "pass": 1, "fail": 0 }
         }))
@@ -1557,7 +1583,7 @@ fn conformance_dimension_accepts_lineage_when_present() {
             "generated_at": "2026-02-17T06:00:00Z",
             "run_id": "run-123",
             "correlation_id": "corr-123",
-            "counts": { "total": 10, "pass": 10, "fail": 0 },
+            "counts": { "total": 10, "tested": 10, "pass": 10, "fail": 0, "na": 0 },
             "pass_rate_pct": 100.0,
             "negative": { "pass": 1, "fail": 0 }
         }))
@@ -1755,20 +1781,7 @@ fn build_phase5_go_no_go_snapshot(
 
 fn sha256_file(path: &Path) -> Option<String> {
     let data = std::fs::read(path).ok()?;
-    let digest = {
-        // Simple hash: use first 32 bytes of content + length as fingerprint.
-        // Full SHA-256 would require a crate; we use a content-hash proxy.
-        let len = data.len();
-        let mut hash = 0u64;
-        for (i, &b) in data.iter().enumerate() {
-            hash = hash.wrapping_mul(31).wrapping_add(u64::from(b));
-            if i > 4096 {
-                break;
-            }
-        }
-        format!("content-hash-{hash:016x}-len-{len}")
-    };
-    Some(digest)
+    Some(format!("{:x}", Sha256::digest(data)))
 }
 
 fn check_cert_gate(
@@ -1845,8 +1858,18 @@ fn generate_certification() -> FinalCertification {
             }
 
             let (verdict, passed, total) = parse_must_pass_gate_verdict(v);
-            if verdict == "pass" && passed >= 208 {
+            if verdict == "pass"
+                && passed >= CERTIFIED_MUST_PASS_MINIMUM
+                && total >= CERTIFIED_MUST_PASS_MINIMUM
+            {
                 (Signal::Pass, format!("{passed}/{total} must-pass: PASS"))
+            } else if verdict == "pass" {
+                (
+                    Signal::Fail,
+                    format!(
+                        "{passed}/{total} must-pass artifact says pass, but certification requires at least {CERTIFIED_MUST_PASS_MINIMUM} passing items"
+                    ),
+                )
             } else if verdict == "unknown" {
                 (
                     Signal::Fail,
@@ -2306,7 +2329,10 @@ fn parse_must_pass_gate_verdict_reads_current_schema() {
         "status": "pass",
         "observed": {
             "must_pass_total": 208,
-            "must_pass_passed": 208
+            "must_pass_tested": 208,
+            "must_pass_passed": 208,
+            "must_pass_failed": 0,
+            "must_pass_skipped": 0
         }
     });
 
@@ -2339,7 +2365,10 @@ fn validate_must_pass_gate_metadata_accepts_current_schema() {
         "correlation_id": "must-pass-gate-local-20260217T030608928Z",
         "observed": {
             "must_pass_total": 208,
-            "must_pass_passed": 208
+            "must_pass_tested": 208,
+            "must_pass_passed": 208,
+            "must_pass_failed": 0,
+            "must_pass_skipped": 0
         }
     });
 
@@ -2370,6 +2399,49 @@ fn validate_must_pass_gate_metadata_rejects_legacy_payload() {
     assert!(
         errors.iter().any(|msg| msg.contains("/run_id")),
         "expected run_id validation error, got: {errors:?}"
+    );
+}
+
+#[test]
+fn validate_must_pass_gate_metadata_rejects_incoherent_counts() {
+    let gate = serde_json::json!({
+        "schema": MUST_PASS_GATE_SCHEMA,
+        "generated_at": "2026-02-17T03:06:08.928Z",
+        "run_id": "local-20260217T030608928Z",
+        "correlation_id": "must-pass-gate-local-20260217T030608928Z",
+        "observed": {
+            "must_pass_total": 208,
+            "must_pass_tested": 207,
+            "must_pass_passed": 208,
+            "must_pass_failed": 0,
+            "must_pass_skipped": 0
+        }
+    });
+
+    let errors = validate_must_pass_gate_metadata(&gate);
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("tested-count mismatch")),
+        "incoherent observed counts must fail closed: {errors:?}"
+    );
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.contains("total-count mismatch")),
+        "incoherent observed totals must fail closed: {errors:?}"
+    );
+}
+
+#[test]
+fn artifact_sha256_is_a_real_full_content_digest() {
+    let dir = tempdir().expect("tempdir");
+    let artifact = dir.path().join("artifact.txt");
+    std::fs::write(&artifact, b"abc").expect("write digest fixture");
+
+    assert_eq!(
+        sha256_file(&artifact).as_deref(),
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
     );
 }
 

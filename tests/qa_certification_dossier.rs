@@ -17,6 +17,7 @@
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 const OPPORTUNITY_MATRIX_SCHEMA: &str = "pi.perf.opportunity_matrix.v1";
 const PRACTICAL_FINISH_CHECKPOINT_ARTIFACT: &str =
@@ -351,18 +352,24 @@ fn quarantine_waiver_counts(root: &Path) -> (usize, usize) {
     (quarantine, waiver)
 }
 
-/// Count all test files in tests/ directory.
-fn test_file_count(root: &Path) -> usize {
-    let tests_dir = root.join("tests");
-    let Ok(entries) = std::fs::read_dir(&tests_dir) else {
-        return 0;
+/// Count top-level tracked Rust test files, matching traceability governance.
+fn tracked_test_file_count(root: &Path, metadata_free_fallback: usize) -> usize {
+    let Ok(output) = Command::new("git")
+        .current_dir(root)
+        .args(["ls-files", "--", "tests/*.rs"])
+        .output()
+    else {
+        return metadata_free_fallback;
     };
-    entries
-        .filter_map(std::result::Result::ok)
-        .filter(|e| {
-            let name = e.file_name();
-            let name_str = name.to_string_lossy();
-            name_str.ends_with(".rs") && name_str != "mod.rs"
+    if !output.status.success() {
+        return metadata_free_fallback;
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|path| {
+            path.strip_prefix("tests/")
+                .is_some_and(|relative| relative != "mod.rs" && !relative.contains('/'))
         })
         .count()
 }
@@ -1039,11 +1046,16 @@ fn certification_dossier() {
     // ── Suite classification ──
     let (unit, vcr, e2e) = suite_counts(&root);
     let total_classified = unit + vcr + e2e;
-    let total_test_files = test_file_count(&root);
+    let total_test_files = tracked_test_file_count(&root, total_classified);
     let (quarantined, waivers) = quarantine_waiver_counts(&root);
 
+    assert_eq!(
+        total_test_files, total_classified,
+        "tracked test inventory and suite classification must stay one-to-one"
+    );
+
     eprintln!("Suite classification: {unit} unit, {vcr} vcr, {e2e} e2e ({total_classified} total)");
-    eprintln!("Test files on disk: {total_test_files}");
+    eprintln!("Tracked test files: {total_test_files}");
     eprintln!("Quarantined: {quarantined}, Active waivers: {waivers}");
 
     // ── Test double inventory ──
@@ -1247,7 +1259,7 @@ fn certification_dossier() {
         .as_ref()
         .and_then(|summary| summary.pointer("/counts/na"))
         .and_then(Value::as_u64)
-        .unwrap_or(conformance_total.saturating_sub(conformance_tested));
+        .unwrap_or_else(|| conformance_total.saturating_sub(conformance_tested));
     if conformance_total == 0 || conformance_tested < conformance_total {
         residual_gaps.push(ResidualGap {
             id: "ext_conformance_artifacts".to_string(),
