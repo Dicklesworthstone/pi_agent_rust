@@ -52,6 +52,18 @@
 // paths the same way integration tests do.
 extern crate self as pi;
 
+/// Serialize unit tests that temporarily change the process-wide current
+/// directory. Rust's test runner executes modules concurrently, so separate
+/// per-module locks do not prevent one module from observing another module's
+/// temporary directory.
+#[cfg(test)]
+pub(crate) fn test_current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // Gap H: jemalloc allocator for allocation-heavy paths.
 // Declared in the library so all project binaries/tests share allocator behavior.
 // BSD-family targets stay on their platform allocator to avoid allocator-domain

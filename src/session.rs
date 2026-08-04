@@ -5775,7 +5775,6 @@ mod tests {
     use std::env;
     use std::future::Future;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex as StdMutex, OnceLock};
     use std::time::Duration;
 
     macro_rules! test_fail {
@@ -5895,8 +5894,7 @@ mod tests {
     }
 
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| StdMutex::new(())).lock().expect("lock")
+        crate::test_current_dir_lock()
     }
 
     struct CurrentDirGuard {

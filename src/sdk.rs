@@ -1846,7 +1846,7 @@ mod tests {
     use asupersync::runtime::reactor::create_reactor;
     use asupersync::sync::Mutex as AsyncMutex;
     use std::env;
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     fn run_async<F>(future: F) -> F::Output
@@ -1862,10 +1862,7 @@ mod tests {
     }
 
     fn current_dir_lock() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::test_current_dir_lock()
     }
 
     struct CurrentDirGuard {
