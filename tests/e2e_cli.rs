@@ -4826,7 +4826,7 @@ fn e2e_cli_startup_migrations_run_by_default() {
     fs::write(&legacy_session, format!("{legacy_session_header}\n")).expect("write legacy session");
     fs::write(
         agent_dir.join("oauth.json"),
-        r#"{"anthropic":{"access_token":"a","refresh_token":"r","expires":1}}"#,
+        r#"{"anthropic":{"access_token":"a","refresh_token":"r","expires":4102444800000}}"#,
     )
     .expect("write oauth.json");
     fs::write(
