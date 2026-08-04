@@ -1,6 +1,6 @@
 {
   "schema": "pi.qa.final_certification.v1",
-  "generated_at": "2026-08-04T12:27:03Z",
+  "generated_at": "2026-08-04T12:34:04Z",
   "certification_verdict": "FAIL",
   "evidence": [
     {
@@ -57,7 +57,7 @@
       "status": "PASS",
       "detail": "Remediation backlog valid: 0 entries (0 actionable, 0 non-actionable)",
       "artifact_path": "tests/full_suite_gate/extension_remediation_backlog.json",
-      "artifact_sha256": "7c48d35ace5e514949bdeefb0159b09b25afb46c9999b462a071b52309b07e1a"
+      "artifact_sha256": "eb61dc72883061a7f013d848085bc44baa0e1502df5c39b05ee570debae18eb5"
     },
     {
       "gate": "practical_finish_checkpoint",
