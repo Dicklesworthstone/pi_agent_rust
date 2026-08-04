@@ -1,7 +1,7 @@
 {
   "schema": "pi.ci.full_suite_gate.v1",
-  "generated_at": "2026-05-14T19:59:36.564Z",
-  "verdict": "pass",
+  "generated_at": "2026-08-04T03:32:13.960Z",
+  "verdict": "fail",
   "policy": "Full-suite gate: all blocking gates must pass for release. Non-blocking gates produce warnings but do not block.",
   "gates": [
     {
@@ -25,9 +25,10 @@
       "id": "ext_must_pass",
       "name": "Extension must-pass gate",
       "bead": "bd-1f42.4.4",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
+      "detail": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json generated_at '2026-05-15T17:03:02.000Z' is stale (older than 7 days)",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact"
     },
     {
@@ -43,9 +44,10 @@
       "id": "evidence_bundle",
       "name": "Unified evidence bundle",
       "bead": "bd-1f42.6.8",
-      "status": "pass",
+      "status": "fail",
       "blocking": false,
       "artifact_path": "tests/evidence_bundle/index.json",
+      "detail": "summary.verdict = 'insufficient' (expected one of: [\"complete\", \"partial\"])",
       "reproduce_command": "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"
     },
     {
@@ -132,10 +134,10 @@
       "id": "practical_finish_checkpoint",
       "name": "Practical-finish checkpoint (docs-only residual filter)",
       "bead": "bd-3ar8v.6.9",
-      "status": "pass",
+      "status": "fail",
       "blocking": true,
       "artifact_path": "tests/full_suite_gate/practical_finish_checkpoint.json",
-      "detail": "Practical-finish checkpoint reached: no open PERF-3X issues remain.",
+      "detail": "Practical-finish checkpoint blocked: 43 technical PERF-3X issue(s) still open (bd-3ar8v.1.2, bd-3ar8v.2.12, bd-3ar8v.2.8, bd-3ar8v.3.11, bd-3ar8v.3.6, ...)",
       "reproduce_command": "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact"
     },
     {
@@ -187,12 +189,12 @@
   ],
   "summary": {
     "total_gates": 20,
-    "passed": 20,
-    "failed": 0,
+    "passed": 17,
+    "failed": 3,
     "warned": 0,
     "skipped": 0,
-    "blocking_pass": 14,
+    "blocking_pass": 12,
     "blocking_total": 14,
-    "all_blocking_pass": true
+    "all_blocking_pass": false
   }
 }

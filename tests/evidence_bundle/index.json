@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-05-12T19:26:21.441Z",
-  "git_ref": "80edf7ef9",
-  "ci_run_id": "local-20260512T192621Z",
+  "generated_at": "2026-08-04T03:32:13.863Z",
+  "git_ref": "d0df6e21",
+  "ci_run_id": "local-20260804T033213Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,7 +13,7 @@
       "schema": "pi.ext.conformance_summary.v2",
       "summary": {
         "fail": 0,
-        "generated_at": "2026-05-10T23:08:55Z",
+        "generated_at": "2026-08-04T03:31:34Z",
         "pass": 60,
         "pass_rate_pct": 100.0,
         "total": 224
@@ -29,14 +29,14 @@
       "artifact_path": "tests/ext_conformance/reports/conformance_baseline.json",
       "schema": "pi.ext.conformance_baseline.v2",
       "summary": {
-        "failed": 14,
-        "generated_at": "2026-02-07T23:31:53Z",
-        "pass_rate_pct": 93.7,
-        "passed": 209,
+        "failed": 0,
+        "generated_at": "2026-08-04T03:26:54Z",
+        "pass_rate_pct": 100.0,
+        "passed": 223,
         "tested": 223
       },
       "file_count": 1,
-      "total_bytes": 16247
+      "total_bytes": 5170
     },
     {
       "id": "conformance_events",
@@ -45,7 +45,7 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/conformance_events.jsonl",
       "file_count": 1,
-      "total_bytes": 223532
+      "total_bytes": 223505
     },
     {
       "id": "conformance_report_md",
@@ -87,18 +87,18 @@
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
       "schema": "pi.ext.must_pass_gate.v1",
       "summary": {
-        "correlation_id": "local-20260501T0316",
-        "generated_at": "2026-05-01T03:20:54.460Z",
+        "correlation_id": "must-pass-gate-local-20260515T170218075Z",
+        "generated_at": "2026-05-15T17:03:02.000Z",
         "must_pass_failed": 0,
         "must_pass_pass_rate_pct": 100.0,
         "must_pass_passed": 123,
         "must_pass_skipped": 0,
         "must_pass_total": 123,
-        "run_id": "local-20260501T0316",
+        "run_id": "local-20260515T170218075Z",
         "status": "pass"
       },
       "file_count": 1,
-      "total_bytes": 1206
+      "total_bytes": 1236
     },
     {
       "id": "must_pass_gate_events",
@@ -107,7 +107,7 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_events.jsonl",
       "file_count": 1,
-      "total_bytes": 56814
+      "total_bytes": 61962
     },
     {
       "id": "failure_dossiers",
@@ -130,10 +130,10 @@
       "artifact_path": "tests/ext_conformance/reports/health_delta",
       "summary": {
         "file_count": 3,
-        "total_bytes": 88320
+        "total_bytes": 80504
       },
       "file_count": 3,
-      "total_bytes": 88320
+      "total_bytes": 80504
     },
     {
       "id": "provider_compat",
@@ -169,7 +169,7 @@
       "artifact_path": "tests/ext_conformance/reports/journeys/journey_report.json",
       "schema": "pi.ext.journey_report.v1",
       "file_count": 1,
-      "total_bytes": 14742
+      "total_bytes": 778
     },
     {
       "id": "auto_repair_summary",
@@ -179,7 +179,7 @@
       "artifact_path": "tests/ext_conformance/reports/auto_repair_summary.json",
       "schema": "pi.ext.auto_repair_summary.v1",
       "file_count": 1,
-      "total_bytes": 56700
+      "total_bytes": 56652
     },
     {
       "id": "e2e_results",
@@ -293,7 +293,7 @@
       "artifact_path": "tests/ext_conformance/artifacts/RISK_REVIEW.json",
       "schema": "pi.ext.risk_review.v1",
       "file_count": 1,
-      "total_bytes": 86687
+      "total_bytes": 86698
     },
     {
       "id": "provenance_verification",
@@ -312,7 +312,7 @@
       "status": "present",
       "artifact_path": "docs/traceability_matrix.json",
       "file_count": 1,
-      "total_bytes": 89373
+      "total_bytes": 94721
     },
     {
       "id": "high_value_suite_artifact_inventory",
@@ -354,29 +354,21 @@
       "id": "perf3x_lineage_contract",
       "label": "PERF-3X lineage coherence contract",
       "category": "performance",
-      "status": "present",
+      "status": "invalid",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
-      "summary": {
-        "artifact_span_minutes": 14148,
-        "conformance_generated_at": "2026-05-10T23:08:55+00:00",
-        "correlation_id": "local-20260501T0316",
-        "max_allowed_span_days": 14,
-        "must_pass_generated_at": "2026-05-01T03:20:54.460+00:00",
-        "run_id": "local-20260501T0316",
-        "stress_generated_at": "2026-05-10T01:22:30+00:00"
-      },
+      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 03:31:34 UTC)",
       "file_count": 0,
       "total_bytes": 0
     }
   ],
   "summary": {
     "total_sections": 29,
-    "present_sections": 29,
+    "present_sections": 28,
     "missing_sections": 0,
-    "invalid_sections": 0,
+    "invalid_sections": 1,
     "total_artifacts": 2004,
-    "total_bytes": 185415411,
-    "verdict": "complete"
+    "total_bytes": 185393016,
+    "verdict": "insufficient"
   }
 }

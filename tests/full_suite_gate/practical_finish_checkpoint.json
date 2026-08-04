@@ -1,13 +1,649 @@
 {
   "schema": "pi.perf3x.practical_finish_checkpoint.v1",
-  "generated_at": "2026-05-14T19:59:37.050Z",
-  "status": "pass",
-  "detail": "Practical-finish checkpoint reached: no open PERF-3X issues remain.",
-  "technical_completion_reached": true,
-  "residual_open_scope": "none",
-  "open_perf3x_count": 0,
-  "technical_open_count": 0,
-  "docs_or_report_open_count": 0,
-  "technical_open_issues": [],
-  "docs_or_report_open_issues": []
+  "generated_at": "2026-08-04T03:32:13.872Z",
+  "status": "fail",
+  "detail": "Practical-finish checkpoint blocked: 43 technical PERF-3X issue(s) still open (bd-3ar8v.1.2, bd-3ar8v.2.12, bd-3ar8v.2.8, bd-3ar8v.3.11, bd-3ar8v.3.6, ...)",
+  "technical_completion_reached": false,
+  "residual_open_scope": "technical_remaining",
+  "open_perf3x_count": 48,
+  "technical_open_count": 43,
+  "docs_or_report_open_count": 5,
+  "technical_open_issues": [
+    {
+      "id": "bd-3ar8v.1.2",
+      "title": "[Phase 0] Enforce blocking CI matrix for realistic and matched-state workloads",
+      "status": "in_progress",
+      "issue_type": "task",
+      "labels": [
+        "benchmark",
+        "ci",
+        "perf-3x",
+        "phase-0"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.2.12",
+      "title": "[Phase 1] Build weighted E2E bottleneck attribution model for open/append/save/index",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "analytics",
+        "benchmark",
+        "perf-3x",
+        "phase-1",
+        "session"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.2.8",
+      "title": "[Phase 1] Validate phase-1 gains on 100k..5M realistic matrix",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "benchmark",
+        "perf-3x",
+        "phase-1"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.3.11",
+      "title": "[Phase 2] Validate resume/fork/export user experience with latency and consistency logs",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "perf-3x",
+        "phase-2",
+        "testing",
+        "ux"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.3.6",
+      "title": "[Phase 2] Make fork/export non-blocking with snapshot consistency guarantees",
+      "status": "in_progress",
+      "issue_type": "task",
+      "labels": [
+        "export",
+        "fork",
+        "perf-3x",
+        "phase-2"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.3.8",
+      "title": "[Phase 2] Validate correctness and performance under extreme long-session stress",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "benchmark",
+        "perf-3x",
+        "phase-2",
+        "reliability"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.10",
+      "title": "[Phase 3] Add security/policy regression e2e harness with decision logs",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "e2e",
+        "perf-3x",
+        "phase-3",
+        "security",
+        "testing"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.13",
+      "title": "[Phase 3] Implement zero-copy hostcall payload arena and atom interning for hot opcodes",
+      "status": "in_progress",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "serialization"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.15",
+      "title": "[Phase 3] Compile capability policy into immutable snapshots for O(1) hostcall authorization",
+      "status": "in_progress",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "policy",
+        "security"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.17",
+      "title": "[Phase 3] Implement extension budget controller with expected-loss fallback triggers",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "control",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "safety"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.18",
+      "title": "[Phase 3] Add interference and tail-latency decomposition harness for composed extension optimizations",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "tail-latency",
+        "testing"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.19",
+      "title": "[Phase 3] Enforce Bun-killer extension performance gates across micro, E2E, and resource envelopes",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "benchmark",
+        "bun-killer",
+        "extensions",
+        "gates",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.20",
+      "title": "[Phase 3] Build core-pinned URPC-style SPSC extension reactor mesh for hostcall traffic",
+      "status": "in_progress",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "concurrency",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "reactor"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.21",
+      "title": "[Phase 3] Introduce RCU/QSBR + seqlock metadata plane for extension registry lookups",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "metadata",
+        "perf-3x",
+        "phase-3",
+        "rcu",
+        "seqlock"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.22",
+      "title": "[Phase 3] Add e-graph hostcall rewrite engine for intrinsic fusion on hot traces",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "compiler",
+        "egraph",
+        "extensions",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.23",
+      "title": "[Phase 3] Implement AMAC-style interleaved hostcall batch executor with stall-aware toggling",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "amac",
+        "batching",
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.24",
+      "title": "[Phase 3] Wire anytime-valid e-process/SPRT rollout gate for extension optimization controls",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "gating",
+        "perf-3x",
+        "phase-3",
+        "statistics"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.25",
+      "title": "[Phase 3] Add BOCPD/CUSUM regime-shift detector for extension workload adaptation",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "adaptation",
+        "bocpd",
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.26",
+      "title": "[Phase 3] Add online-convex-optimization tuner for queue and batching budgets",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "control",
+        "extensions",
+        "oco",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.27",
+      "title": "[Phase 3] Build sampled dual-execution differential oracle with automatic fast-lane rollback",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "correctness",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "rollback"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.28",
+      "title": "[Phase 3] Prove lock-free queue memory-reclamation safety with EBR and loom model checks",
+      "status": "in_progress",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "ebr",
+        "extensions",
+        "loom",
+        "perf-3x",
+        "phase-3",
+        "safety"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.29",
+      "title": "[Phase 3] Add PMU-guided stall-cycle elimination loop with cache-miss budget gates",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "pmu",
+        "profiling"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.30",
+      "title": "[Phase 3] Build hostcall superinstruction compiler from hot opcode traces",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "compiler",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "superinstructions"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.31",
+      "title": "[Phase 3] Add NUMA-aware shard placement with hugepage slab allocators for extension hot paths",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "memory",
+        "numa",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.32",
+      "title": "[Phase 3] Implement io_uring-backed execution lane for IO-heavy extension hostcalls",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "io",
+        "io_uring",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.33",
+      "title": "[Phase 3] Add conformal plus PAC-Bayes safety envelopes for adaptive extension controllers",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "conformal",
+        "extensions",
+        "pac-bayes",
+        "perf-3x",
+        "phase-3",
+        "safety"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.34",
+      "title": "[Phase 3] Implement VOI-driven profiler and experiment-budget scheduler",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "profiling",
+        "voi"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.35",
+      "title": "[Phase 3] Build counterfactual off-policy evaluator for optimization policy changes",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "evaluation",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "policy"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.36",
+      "title": "[Phase 3] Introduce BRAVO-style read-biased fallback for mixed metadata contention regimes",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bravo",
+        "bun-killer",
+        "concurrency",
+        "extensions",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.37",
+      "title": "[Phase 3] Apply S3-FIFO-inspired admission and queue discipline for hostcall tail suppression",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "queues",
+        "tail-latency"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.38",
+      "title": "[Phase 3] Add tier-2 Cranelift trace-JIT for stabilized superinstruction plans",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "extensions",
+        "jit",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.39",
+      "title": "[Phase 3] Implement mean-field contention controller for extension reactor load balancing",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "control-theory",
+        "extensions",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.40",
+      "title": "[Phase 3] Build deterministic record-replay lane for extension runtime race and tail forensics",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "bun-killer",
+        "debugging",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "reliability"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.6",
+      "title": "[Phase 3] Prove security/policy invariants are unchanged post-optimization",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "conformance",
+        "perf-3x",
+        "phase-3",
+        "security"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.7",
+      "title": "[Phase 3] Validate extension runtime gains on real workload and conformance corpus",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "benchmark",
+        "conformance",
+        "perf-3x",
+        "phase-3"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.8",
+      "title": "[Phase 3] Add unit tests for typed hostcall protocol and serializer equivalence",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "perf-3x",
+        "phase-3",
+        "protocol",
+        "testing",
+        "unit"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.4.9",
+      "title": "[Phase 3] Add e2e extension lifecycle/perf scripts with per-extension diagnostics",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "e2e",
+        "extensions",
+        "perf-3x",
+        "phase-3",
+        "testing"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.1",
+      "title": "[Phase 5] Build automated opportunity matrix from benchmark deltas",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "analytics",
+        "perf-3x",
+        "phase-5"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.11",
+      "title": "[Phase 5] Enforce bead-to-test/log coverage audit across all PERF-3X implementation beads",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "audit",
+        "logging",
+        "perf-3x",
+        "phase-5",
+        "release",
+        "testing"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.2",
+      "title": "[Phase 5] Run parameter sweeps for flush/queue/compaction tuning",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "perf-3x",
+        "phase-5",
+        "tuning"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.3",
+      "title": "[Phase 5] Execute full-scale extension conformance plus perf stress certification",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "benchmark",
+        "conformance",
+        "perf-3x",
+        "phase-5"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.6",
+      "title": "[Phase 5] Build unified certification suite (unit+e2e+perf+conformance) with dossier output",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "certification",
+        "perf-3x",
+        "phase-5",
+        "testing"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.7",
+      "title": "[Phase 5] Deliver user-facing performance diagnostics workflow and troubleshooting guide",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "diagnostics",
+        "perf-3x",
+        "phase-5",
+        "ux"
+      ]
+    }
+  ],
+  "docs_or_report_open_issues": [
+    {
+      "id": "bd-3ar8v.6.10",
+      "title": "[Phase 5] Build automated evidence-adjudication matrix for conflicting claims",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "docs-last",
+        "methodology",
+        "perf-3x",
+        "phase-5",
+        "report"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.4",
+      "title": "[Phase 5] Harden permanent perf gates and regression triage runbook",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "ci",
+        "perf-3x",
+        "phase-5",
+        "runbook"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.5",
+      "title": "[Phase 5] Produce final >=3x certification report and go/no-go decision",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "perf-3x",
+        "phase-5",
+        "release",
+        "report"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.8",
+      "title": "[Phase 5] Generate extension shortfall remediation backlog from certification manifest",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "extensions",
+        "perf-3x",
+        "phase-5",
+        "runbook",
+        "testing"
+      ]
+    },
+    {
+      "id": "bd-3ar8v.6.9",
+      "title": "[Phase 5] Declare practical-finish checkpoint before documentation wrap-up",
+      "status": "open",
+      "issue_type": "task",
+      "labels": [
+        "docs-last",
+        "execution",
+        "perf-3x",
+        "phase-5",
+        "release"
+      ]
+    }
+  ]
 }

@@ -1,7 +1,7 @@
 {
   "schema": "pi.ci.preflight_lane.v1",
   "lane": "preflight",
-  "generated_at": "2026-05-12T19:26:21.567Z",
+  "generated_at": "2026-08-04T03:32:13.961Z",
   "verdict": "fail",
   "policy": "Preflight lane: evaluate blocking gates only, fail-fast on first failure. Waived gates are skipped with audit trail.",
   "gates_evaluated": 2,
@@ -12,7 +12,7 @@
     "status": "fail",
     "blocking": true,
     "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
-    "detail": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json generated_at '2026-05-01T03:20:54.460Z' is stale (older than 7 days)",
+    "detail": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json generated_at '2026-05-15T17:03:02.000Z' is stale (older than 7 days)",
     "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact"
   },
   "blocking_gates": [
@@ -32,7 +32,7 @@
       "status": "fail",
       "blocking": true,
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
-      "detail": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json generated_at '2026-05-01T03:20:54.460Z' is stale (older than 7 days)",
+      "detail": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json generated_at '2026-05-15T17:03:02.000Z' is stale (older than 7 days)",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact"
     }
   ],
