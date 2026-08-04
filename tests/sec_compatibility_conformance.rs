@@ -24,7 +24,7 @@ use pi::extensions::{
     ExtensionPolicyMode, ExtensionTrustState, PolicyDecision, PolicyExplanation, PolicyProfile,
     RuntimeRiskConfig,
 };
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 // ============================================================================
 // Conformance verdict artifact infrastructure
@@ -54,7 +54,7 @@ struct SecConformanceVerdict {
     pass_rate_pct: f64,
     threshold_pct: f64,
     checks: Vec<ConformanceCheck>,
-    categories: HashMap<String, CategorySummary>,
+    categories: BTreeMap<String, CategorySummary>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -76,7 +76,7 @@ fn write_verdict(checks: &[ConformanceCheck]) {
         100.0
     };
 
-    let mut categories: HashMap<String, CategorySummary> = HashMap::new();
+    let mut categories: BTreeMap<String, CategorySummary> = BTreeMap::new();
     for check in checks {
         let entry = categories
             .entry(check.category.clone())

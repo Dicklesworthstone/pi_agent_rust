@@ -52,6 +52,10 @@ fn compatibility_contracts_keep_their_public_type_identity() {
         std::any::type_name::<CompatLedger>(),
         "pi::extensions::CompatLedger"
     );
+    assert_eq!(
+        std::any::type_name::<CompatibilityScanner>(),
+        "pi::extensions::CompatibilityScanner"
+    );
 }
 
 #[test]
