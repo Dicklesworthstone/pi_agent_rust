@@ -1156,6 +1156,15 @@ fn assert_lock_released(lock_path: &Path) {
 }
 
 #[cfg(unix)]
+fn assert_dir_lock_released(lock_path: &Path) {
+    assert!(
+        !lock_path.exists(),
+        "directory lock should be removed after interrupted worker: {}",
+        lock_path.display()
+    );
+}
+
+#[cfg(unix)]
 fn count_tempish_files(root: &Path) -> usize {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
@@ -1616,7 +1625,7 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
             "restart worker index refresh should be clean: {restart_summary}"
         );
         assert_lock_released(&session_lock_path(&session_path));
-        assert_lock_released(&sessions_root.join("session-index.lock"));
+        assert_dir_lock_released(&sessions_root.join("session-index.lock"));
 
         let parent_session_path_display = crash_interrupt_display_path(&session_path);
         let parent_session_path_display_for_log = crash_interrupt_display_path(&session_path);
@@ -1690,7 +1699,7 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
         "temp artifact growth exceeded one file per cycle: tempish_files={tempish_files}, cycles={}",
         schedule.len()
     );
-    assert_lock_released(&sessions_root.join("session-index.lock"));
+    assert_dir_lock_released(&sessions_root.join("session-index.lock"));
 
     let summary_path = harness.temp_path("crash-interrupt-recovery-soak-summary.json");
     let summary = json!({
