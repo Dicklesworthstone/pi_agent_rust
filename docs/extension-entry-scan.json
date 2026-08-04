@@ -3,13 +3,13 @@
   "generated": "2026-02-05",
   "description": "Static scan of extension corpus entry points (bd-2u2s)",
   "summary": {
-    "total_files": 1346,
-    "entry_points": 388,
+    "total_files": 1349,
+    "entry_points": 391,
     "sub_modules": 841,
     "non_extensions": 111,
     "unknown": 6,
     "by_confidence": {
-      "high": 1242,
+      "high": 1245,
       "low": 14,
       "medium": 90
     },
@@ -35,8 +35,8 @@
         "sub_modules": 338
       },
       "official-pi-mono": {
-        "total_files": 88,
-        "entry_points": 81,
+        "total_files": 91,
+        "entry_points": 84,
         "sub_modules": 6
       },
       "third-party-github": {
@@ -343,6 +343,17 @@
         "export_default_function",
         "ExtensionAPI_import",
         "ExtensionAPI_type"
+      ]
+    },
+    {
+      "path": "base_fixtures/pi_ai_fail_closed/index.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
       ]
     },
     {
@@ -6948,6 +6959,28 @@
         "ExtensionAPI_type",
         "event_hook",
         "ui_api"
+      ]
+    },
+    {
+      "path": "pi_ai_fail_closed/pi_ai_fail_closed.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
+      ]
+    },
+    {
+      "path": "pi_ai_provider_bridge/pi_ai_provider_bridge.ts",
+      "classification": "entry_point",
+      "confidence": "high",
+      "patterns_found": [
+        "export_default_function",
+        "ExtensionAPI_import",
+        "ExtensionAPI_type",
+        "registerTool"
       ]
     },
     {
