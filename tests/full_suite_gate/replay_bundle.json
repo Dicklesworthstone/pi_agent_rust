@@ -1,7 +1,7 @@
 {
   "schema": "pi.e2e.replay_bundle.v1",
-  "generated_at": "2026-05-12T19:29:41.108Z",
-  "correlation_id": "replay-bundle-20260512T192941Z",
+  "generated_at": "2026-08-04T05:18:37.125Z",
+  "correlation_id": "replay-bundle-20260804T051837Z",
   "source_summary_path": "tests/full_suite_gate/full_suite_verdict.json",
   "one_command_replay": "cargo test --test ci_full_suite_gate -- full_suite_gate --nocapture --exact",
   "environment": {
@@ -9,10 +9,10 @@
     "shard_kind": "none",
     "shard_index": null,
     "shard_total": null,
-    "rustc_version": "rustc 1.97.0-nightly (f53b654a8 2026-04-30)",
-    "cargo_target_dir": "/data/tmp/pi_agent_rust_cargo/GoldenGlacier/target",
+    "rustc_version": "rustc 1.98.0-nightly (c397dae80 2026-07-02)",
+    "cargo_target_dir": "/data/tmp/pi_agent_rust_cargo/root/target",
     "vcr_mode": "unset",
-    "git_sha": "80edf7ef9",
+    "git_sha": "7487056d",
     "git_branch": "main",
     "os": "linux"
   },
@@ -23,12 +23,22 @@
       "gate_id": "ext_must_pass",
       "gate_name": "Extension must-pass gate",
       "reproduce_command": "cargo test --test ext_conformance_generated --features ext-conformance -- conformance_must_pass_gate --nocapture --exact"
+    },
+    {
+      "gate_id": "evidence_bundle",
+      "gate_name": "Unified evidence bundle",
+      "reproduce_command": "cargo test --test ci_evidence_bundle -- build_evidence_bundle --nocapture --exact"
+    },
+    {
+      "gate_id": "practical_finish_checkpoint",
+      "gate_name": "Practical-finish checkpoint (docs-only residual filter)",
+      "reproduce_command": "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact"
     }
   ],
   "summary": {
     "total_failed_suites": 0,
     "total_failed_units": 0,
-    "total_failed_gates": 1,
+    "total_failed_gates": 3,
     "all_commands_reference_valid_targets": true
   }
 }

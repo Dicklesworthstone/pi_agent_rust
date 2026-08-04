@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-08-04T03:44:37.546Z",
-  "git_ref": "9eaead83",
-  "ci_run_id": "local-20260804T034437Z",
+  "generated_at": "2026-08-04T05:17:03.429Z",
+  "git_ref": "7487056d",
+  "ci_run_id": "local-20260804T051703Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,10 +13,10 @@
       "schema": "pi.ext.conformance_summary.v2",
       "summary": {
         "fail": 0,
-        "generated_at": "2026-08-04T03:37:29Z",
+        "generated_at": "2026-08-04T05:03:21Z",
         "pass": 60,
         "pass_rate_pct": 100.0,
-        "total": 224
+        "total": 226
       },
       "file_count": 1,
       "total_bytes": 1058
@@ -45,7 +45,7 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/conformance_events.jsonl",
       "file_count": 1,
-      "total_bytes": 223505
+      "total_bytes": 225456
     },
     {
       "id": "conformance_report_md",
@@ -54,7 +54,7 @@
       "status": "present",
       "artifact_path": "tests/ext_conformance/reports/CONFORMANCE_REPORT.md",
       "file_count": 1,
-      "total_bytes": 48168
+      "total_bytes": 48656
     },
     {
       "id": "regression_verdict",
@@ -179,7 +179,7 @@
       "artifact_path": "tests/ext_conformance/reports/auto_repair_summary.json",
       "schema": "pi.ext.auto_repair_summary.v1",
       "file_count": 1,
-      "total_bytes": 56652
+      "total_bytes": 45398
     },
     {
       "id": "e2e_results",
@@ -345,10 +345,10 @@
       "artifact_path": "tests/ext_conformance/reports/inclusion_manifest",
       "summary": {
         "file_count": 4,
-        "total_bytes": 406062
+        "total_bytes": 405213
       },
       "file_count": 4,
-      "total_bytes": 406062
+      "total_bytes": 405213
     },
     {
       "id": "perf3x_lineage_contract",
@@ -357,7 +357,7 @@
       "status": "invalid",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
-      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 03:37:29 UTC)",
+      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 05:03:21 UTC)",
       "file_count": 0,
       "total_bytes": 0
     }
@@ -368,7 +368,7 @@
     "missing_sections": 0,
     "invalid_sections": 1,
     "total_artifacts": 2004,
-    "total_bytes": 185393016,
+    "total_bytes": 185383352,
     "verdict": "insufficient"
   }
 }

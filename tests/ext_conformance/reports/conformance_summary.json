@@ -1,20 +1,20 @@
 {
-  "correlation_id": "conformance-summary-local-20260804T034439346Z",
+  "correlation_id": "conformance-summary-local-20260804T051705213Z",
   "counts": {
     "fail": 0,
-    "na": 164,
+    "na": 166,
     "pass": 60,
     "tested": 60,
-    "total": 224
+    "total": 226
   },
-  "coverage_rate_pct": 26.785714285714285,
+  "coverage_rate_pct": 26.548672566371685,
   "evidence": {
-    "golden_fixtures": 60,
+    "golden_fixtures": 62,
     "load_time_benchmarks": 60,
     "parity_logs": 16,
     "smoke_logs": 16
   },
-  "generated_at": "2026-08-04T03:44:39Z",
+  "generated_at": "2026-08-04T05:17:05Z",
   "negative": {
     "fail": 0,
     "pass": 30
@@ -41,9 +41,9 @@
     },
     "official-pi-mono": {
       "fail": 0,
-      "na": 6,
+      "na": 8,
       "pass": 60,
-      "total": 66
+      "total": 68
     },
     "third-party-github": {
       "fail": 0,
@@ -52,6 +52,6 @@
       "total": 23
     }
   },
-  "run_id": "local-20260804T034439346Z",
+  "run_id": "local-20260804T051705213Z",
   "schema": "pi.ext.conformance_summary.v2"
 }

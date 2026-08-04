@@ -146,7 +146,8 @@
           "echo",
           "greet",
           "no-handler",
-          "orphan"
+          "orphan",
+          "pi_ai_contract"
         ],
         "commands": [
           "ping"
@@ -3710,7 +3711,7 @@
       "entry_path": "npm/marckrenn-pi-sub-core/index.ts",
       "source_tier": "npm-registry",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -6128,6 +6129,62 @@
       }
     },
     {
+      "id": "pi_ai_fail_closed",
+      "entry_path": "pi_ai_fail_closed/pi_ai_fail_closed.ts",
+      "source_tier": "official-pi-mono",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": false,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 1,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [
+          "pi_ai_contract"
+        ],
+        "commands": [],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
+      "id": "pi_ai_provider_bridge",
+      "entry_path": "pi_ai_provider_bridge/pi_ai_provider_bridge.ts",
+      "source_tier": "official-pi-mono",
+      "capabilities": {
+        "registers_tools": true,
+        "registers_commands": false,
+        "registers_flags": false,
+        "registers_providers": false,
+        "subscribes_events": [],
+        "uses_exec": false,
+        "uses_http": false,
+        "uses_ui": false,
+        "uses_session": false,
+        "is_multi_file": false,
+        "has_npm_deps": false
+      },
+      "conformance_tier": 1,
+      "mock_requirements": [],
+      "registrations": {
+        "tools": [
+          "pi_ai_provider_bridge"
+        ],
+        "commands": [],
+        "flags": [],
+        "event_handlers": []
+      }
+    },
+    {
       "id": "pirate",
       "entry_path": "pirate/pirate.ts",
       "source_tier": "official-pi-mono",
@@ -7322,7 +7379,7 @@
       "entry_path": "third-party/marckrenn-pi-sub/sub-bar/index.ts",
       "source_tier": "third-party-github",
       "capabilities": {
-        "registers_tools": false,
+        "registers_tools": true,
         "registers_commands": true,
         "registers_flags": false,
         "registers_providers": false,
@@ -7485,7 +7542,9 @@
       "registrations": {
         "tools": [],
         "commands": [
-          "diff"
+          "diff",
+          "files",
+          "tui"
         ],
         "flags": [],
         "event_handlers": [
@@ -7827,13 +7886,15 @@
           "rpbind",
           "sandbox",
           "session-ask",
+          "skill",
           "speedread",
           "steer",
           "todos",
           "tools",
           "ultrathink",
           "usage",
-          "vog"
+          "vog",
+          "ws"
         ],
         "flags": [],
         "event_handlers": [
