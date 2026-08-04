@@ -781,6 +781,25 @@ enum ModelRegistryLoadMode {
     ListingLite,
 }
 
+trait ModelCredentialResolver {
+    fn resolve_api_key(&self, provider: &str, override_key: Option<&str>) -> Option<String>;
+}
+
+impl ModelCredentialResolver for AuthStorage {
+    fn resolve_api_key(&self, provider: &str, override_key: Option<&str>) -> Option<String> {
+        AuthStorage::resolve_api_key(self, provider, override_key)
+    }
+}
+
+impl<F> ModelCredentialResolver for F
+where
+    F: Fn(&str) -> Option<String>,
+{
+    fn resolve_api_key(&self, provider: &str, _override_key: Option<&str>) -> Option<String> {
+        self(provider)
+    }
+}
+
 impl ModelRegistry {
     #[cfg(test)]
     pub(crate) fn from_entries_for_tests(entries: Vec<ModelEntry>) -> Self {
@@ -794,6 +813,24 @@ impl ModelRegistry {
         Self::load_with_mode(auth, models_path, ModelRegistryLoadMode::Full)
     }
 
+    /// Load models with caller-controlled provider credential resolution.
+    ///
+    /// This keeps deterministic harnesses and embedders independent of ambient
+    /// process credentials while leaving normal [`Self::load`] behavior intact.
+    pub fn load_with_credential_resolver<F>(
+        models_path: Option<PathBuf>,
+        resolve_api_key: F,
+    ) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        Self::load_with_mode_and_credential_resolver(
+            models_path,
+            ModelRegistryLoadMode::Full,
+            &resolve_api_key,
+        )
+    }
+
     pub fn load_for_listing(auth: &AuthStorage, models_path: Option<PathBuf>) -> Self {
         Self::load_with_mode(auth, models_path, ModelRegistryLoadMode::ListingLite)
     }
@@ -803,7 +840,20 @@ impl ModelRegistry {
         models_path: Option<PathBuf>,
         mode: ModelRegistryLoadMode,
     ) -> Self {
-        let mut models = built_in_models(auth, mode);
+        Self::load_with_mode_and_credential_resolver(models_path, mode, &|provider| {
+            auth.resolve_api_key(provider, None)
+        })
+    }
+
+    fn load_with_mode_and_credential_resolver<F>(
+        models_path: Option<PathBuf>,
+        mode: ModelRegistryLoadMode,
+        resolve_api_key: &F,
+    ) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let mut models = built_in_models(resolve_api_key, mode);
         let mut error = None;
 
         if let Some(path) = models_path {
@@ -813,7 +863,7 @@ impl ModelRegistry {
                     .and_then(|s| serde_json::from_str::<ModelsConfig>(&s).map_err(Error::from))
                 {
                     Ok(config) => {
-                        apply_custom_models(auth, &mut models, &config, path.parent());
+                        apply_custom_models(resolve_api_key, &mut models, &config, path.parent());
                     }
                     Err(e) => {
                         error = Some(format!("{e}\n\nFile: {}", path.display()));
@@ -1150,7 +1200,7 @@ fn legacy_provider_ids() -> HashSet<String> {
 }
 
 fn resolve_provider_api_key_cached(
-    auth: &AuthStorage,
+    auth: &impl ModelCredentialResolver,
     canonical_provider: &str,
     provider: &str,
     canonical_cache: &mut HashMap<String, Option<String>>,
@@ -1189,7 +1239,7 @@ fn provider_self_routes_without_base_url(canonical_provider: &str) -> bool {
 }
 
 fn append_upstream_nonlegacy_models(
-    auth: &AuthStorage,
+    auth: &impl ModelCredentialResolver,
     models: &mut Vec<ModelEntry>,
     seen: &mut HashSet<String>,
     canonical_api_key_cache: &mut HashMap<String, Option<String>>,
@@ -1284,7 +1334,10 @@ fn append_upstream_nonlegacy_models(
 }
 
 #[allow(clippy::too_many_lines)]
-fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<ModelEntry> {
+fn built_in_models(
+    auth: &impl ModelCredentialResolver,
+    mode: ModelRegistryLoadMode,
+) -> Vec<ModelEntry> {
     let mut models = Vec::with_capacity(legacy_generated_models().len() + 8);
     let mut seen = HashSet::new();
     let mut canonical_api_key_cache: HashMap<String, Option<String>> = HashMap::new();
@@ -2000,7 +2053,7 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
 
 #[allow(clippy::too_many_lines)]
 fn apply_custom_models(
-    auth: &AuthStorage,
+    auth: &impl ModelCredentialResolver,
     models: &mut Vec<ModelEntry>,
     config: &ModelsConfig,
     base_dir: Option<&Path>,

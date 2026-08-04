@@ -29,7 +29,8 @@ fn test_built_in_models_without_api_keys() {
     let auth = AuthStorage::load(auth_path).expect("load auth");
 
     harness.section("Load registry");
-    let registry = ModelRegistry::load(&auth, None);
+    let registry =
+        ModelRegistry::load_with_credential_resolver(None, |provider| auth.api_key(provider));
 
     harness.section("Verify");
     harness
@@ -79,7 +80,8 @@ fn test_built_in_models_with_anthropic_key() {
     let auth = AuthStorage::load(auth_path).expect("load auth");
 
     harness.section("Load registry");
-    let registry = ModelRegistry::load(&auth, None);
+    let registry =
+        ModelRegistry::load_with_credential_resolver(None, |provider| auth.api_key(provider));
 
     harness.section("Verify");
     // Anthropic models should have API keys
@@ -652,7 +654,8 @@ fn test_get_available_filters_by_api_key() {
     let auth_content = r#"{"openai": {"type": "api_key", "key": "sk-test-key"}}"#;
     let auth_path = harness.create_file("auth.json", auth_content);
     let auth = AuthStorage::load(auth_path).expect("load auth");
-    let registry = ModelRegistry::load(&auth, None);
+    let registry =
+        ModelRegistry::load_with_credential_resolver(None, |provider| auth.api_key(provider));
 
     harness.section("Verify");
     let available = registry.get_available();
@@ -858,7 +861,8 @@ fn test_multiple_providers_with_keys() {
     }"#;
     let auth_path = harness.create_file("auth.json", auth_content);
     let auth = AuthStorage::load(auth_path).expect("load auth");
-    let registry = ModelRegistry::load(&auth, None);
+    let registry =
+        ModelRegistry::load_with_credential_resolver(None, |provider| auth.api_key(provider));
 
     harness.section("Verify");
     let available = registry.get_available();
