@@ -1,8 +1,8 @@
 # Unified CI Evidence Bundle
 
-> Generated: 2026-08-04T05:17:03Z
-> Git ref: 7487056d
-> CI run: local-20260804T051703Z
+> Generated: 2026-08-04T07:06:47Z
+> Git ref: 320475bc
+> CI run: local-20260804T070647Z
 > Verdict: **INSUFFICIENT**
 
 ## Summary
@@ -14,7 +14,7 @@
 | Missing | 0 |
 | Invalid | 1 |
 | Total artifacts | 2004 |
-| Total size | 181038.4 KB |
+| Total size | 181049.4 KB |
 | Required present | 12/12 |
 
 ## Conformance (6)
@@ -39,7 +39,7 @@
 | Provider compatibility matrix | PASS | 753 | 375207 B | `tests/ext_conformance/reports/provider_compat` |
 | Sharded extension matrix reports | PASS | 12 | 280518 B | `tests/ext_conformance/reports/sharded` |
 | Extension journey report | PASS | 1 | 778 B | `tests/ext_conformance/reports/journeys/journey_report.json` |
-| Auto-repair summary | PASS | 1 | 45398 B | `tests/ext_conformance/reports/auto_repair_summary.json` |
+| Auto-repair summary | PASS | 1 | 45400 B | `tests/ext_conformance/reports/auto_repair_summary.json` |
 
 ## E2e (1)
 
@@ -58,7 +58,7 @@
 
 | Section | Status | Files | Size | Path |
 |---------|--------|-------|------|------|
-| Performance budget summary | PASS | 1 | 4082 B | `tests/perf/reports/budget_summary.json` |
+| Performance budget summary | PASS | 1 | 15361 B | `tests/perf/reports/budget_summary.json` |
 | PERF-3X comparison report | PASS | 1 | 6350 B | `tests/perf/reports/perf_comparison.json` |
 | PERF-3X parameter sweeps report | PASS | 1 | 1076 B | `tests/perf/reports/parameter_sweeps.json` |
 | PERF-3X stress triage report | PASS | 1 | 4829 B | `tests/perf/reports/stress_triage.json` |
@@ -88,6 +88,6 @@
 
 ## Missing / Invalid Sections
 
-- **PERF-3X lineage coherence contract** (invalid): PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 05:03:21 UTC)
+- **PERF-3X lineage coherence contract** (invalid): PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 06:56:22 UTC)
   Path: `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json`
 

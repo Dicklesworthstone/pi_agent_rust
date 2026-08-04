@@ -1,6 +1,6 @@
 {
   "schema": "pi.security.compat_dashboard.v1",
-  "generated_at": "2026-04-22T21:45:48.806Z",
+  "generated_at": "2026-08-04T07:11:45.579Z",
   "bead": "bd-1a2cu",
   "profiles_tested": [
     "safe",

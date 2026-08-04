@@ -1,7 +1,7 @@
 # Final QA Certification Report
 
 **Schema**: pi.qa.final_certification.v1
-**Generated**: 2026-03-12T02:21:56Z
+**Generated**: 2026-08-04T07:11:40Z
 **Certification Verdict**: FAIL
 
 ## Evidence Gates
@@ -9,27 +9,27 @@
 | Gate | Bead | Status | Artifact | Detail |
 |------|------|--------|----------|--------|
 | non_mock_compliance | bd-1f42.2.6 | FAIL | docs/non-mock-rubric.json | Invalid non-mock rubric schema |
-| e2e_evidence | bd-1f42.3 | PASS | tests/ext_conformance/reports/conformance_summary.json | E2E conformance: 60/224 extensions tested |
-| must_pass_208 | bd-1f42.4 | FAIL | tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | 125/125 must-pass (pass) |
-| evidence_bundle | bd-1f42.6.8 | FAIL | tests/evidence_bundle/index.json | Evidence bundle incomplete or missing (insufficient, artifacts=1553) |
+| e2e_evidence | bd-1f42.3 | PASS | tests/ext_conformance/reports/conformance_summary.json | E2E conformance: 60/226 extensions tested |
+| must_pass_208 | bd-1f42.4 | FAIL | tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | 123/123 must-pass (pass) |
+| evidence_bundle | bd-1f42.6.8 | FAIL | tests/evidence_bundle/index.json | Evidence bundle incomplete or missing (insufficient, artifacts=2004) |
 | cross_platform | bd-1f42.6.7 | PASS | tests/cross_platform_reports/linux/platform_report.json | 10/10 platform checks pass |
-| full_suite_gate | bd-1f42.6.5 | WARN | tests/full_suite_gate/full_suite_verdict.json | 18/0 gates pass (fail) |
-| extension_remediation_backlog | bd-3ar8v.6.8.3 | PASS | tests/full_suite_gate/extension_remediation_backlog.json | Remediation backlog valid: 36 entries (31 actionable, 5 non-actionable) |
-| practical_finish_checkpoint | bd-3ar8v.6.9 | PASS | tests/full_suite_gate/practical_finish_checkpoint.json | Practical-finish checkpoint satisfied: 0 docs/report residual issue(s) |
+| full_suite_gate | bd-1f42.6.5 | WARN | tests/full_suite_gate/full_suite_verdict.json | 17/0 gates pass (fail) |
+| extension_remediation_backlog | bd-3ar8v.6.8.3 | PASS | tests/full_suite_gate/extension_remediation_backlog.json | Remediation backlog valid: 0 entries (0 actionable, 0 non-actionable) |
+| practical_finish_checkpoint | bd-3ar8v.6.9 | FAIL | tests/full_suite_gate/practical_finish_checkpoint.json | Practical-finish checkpoint blocked: technical_open_count=43, docs_or_report_open_count=5 |
 | parameter_sweeps_integrity | bd-3ar8v.6.5.1 | PASS | tests/perf/reports/parameter_sweeps.json | Parameter sweeps contract valid: readiness=blocked, dimensions=3 |
 | opportunity_matrix_integrity | bd-3ar8v.6.5.3 | PASS | tests/perf/reports/opportunity_matrix.json | Opportunity matrix contract valid: readiness=blocked, ranked_opportunities=0 |
-| health_delta | bd-1f42.4.5 | WARN | tests/ext_conformance/reports/conformance_baseline.json | Baseline: 187/223 (83.9%) |
+| health_delta | bd-1f42.4.5 | PASS | tests/ext_conformance/reports/conformance_baseline.json | Baseline: 223/223 (100.0%) |
 
 ## Phase-5 Go/No-Go Snapshot
 
 | Gate | Status | Detail |
 |------|--------|--------|
-| practical_finish_checkpoint | PASS | Practical-finish checkpoint satisfied: 0 docs/report residual issue(s) |
-| extension_remediation_backlog | PASS | Remediation backlog valid: 36 entries (31 actionable, 5 non-actionable) |
+| practical_finish_checkpoint | FAIL | Practical-finish checkpoint blocked: technical_open_count=43, docs_or_report_open_count=5 |
+| extension_remediation_backlog | PASS | Remediation backlog valid: 0 entries (0 actionable, 0 non-actionable) |
 | parameter_sweeps_integrity | PASS | Parameter sweeps contract valid: readiness=blocked, dimensions=3 |
 | opportunity_matrix_integrity | PASS | Opportunity matrix contract valid: readiness=blocked, ranked_opportunities=0 |
 
-**Snapshot Decision**: GO
+**Snapshot Decision**: NO-GO
 **Fail-Closed Rule**: missing gate or non-PASS status => NO-GO
 
 ## Risk Register
@@ -37,10 +37,10 @@
 | ID | Severity | Description | Mitigation |
 |----|----------|-------------|------------|
 | bd-1f42.2.6 | high | non_mock_compliance: Invalid non-mock rubric schema | Investigate and fix before release (bead bd-1f42.2.6) |
-| bd-1f42.4 | high | must_pass_208: 125/125 must-pass (pass) | Investigate and fix before release (bead bd-1f42.4) |
-| bd-1f42.6.8 | high | evidence_bundle: Evidence bundle incomplete or missing (insufficient, artifacts=1553) | Investigate and fix before release (bead bd-1f42.6.8) |
-| bd-1f42.6.5 | medium | full_suite_gate: 18/0 gates pass (fail) | Monitor and track in bead bd-1f42.6.5 |
-| bd-1f42.4.5 | medium | health_delta: Baseline: 187/223 (83.9%) | Monitor and track in bead bd-1f42.4.5 |
+| bd-1f42.4 | high | must_pass_208: 123/123 must-pass (pass) | Investigate and fix before release (bead bd-1f42.4) |
+| bd-1f42.6.8 | high | evidence_bundle: Evidence bundle incomplete or missing (insufficient, artifacts=2004) | Investigate and fix before release (bead bd-1f42.6.8) |
+| bd-1f42.6.5 | medium | full_suite_gate: 17/0 gates pass (fail) | Monitor and track in bead bd-1f42.6.5 |
+| bd-3ar8v.6.9 | high | practical_finish_checkpoint: Practical-finish checkpoint blocked: technical_open_count=43, docs_or_report_open_count=5 | Investigate and fix before release (bead bd-3ar8v.6.9) |
 
 ## Reproduction Commands
 

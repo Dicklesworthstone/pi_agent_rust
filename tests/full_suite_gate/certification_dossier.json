@@ -1,12 +1,12 @@
 {
   "schema": "pi.qa.certification_dossier.v1",
-  "generated_at": "2026-03-12T02:21:56.103Z",
+  "generated_at": "2026-08-04T07:11:39.597Z",
   "bead": "bd-1f42.8.10",
   "verdict": "pass_with_residuals",
   "closure_questions": {
     "q1_non_mock_coverage": {
       "question": "Do we have full unit/integration coverage without mocks/fakes?",
-      "answer": "Yes, with quantified residuals. 252 test files classified (93 unit, 125 VCR, 34 E2E). Non-mock compliance gate passes (19 checks). Test double inventory: 267 entries across 21 modules. 7 allowlisted exceptions documented with owner and replacement plan. 3 tracked for active migration (Recording*/MockHostActions via bd-m9rk), 4 permanent with rationale.",
+      "answer": "Yes, with quantified residuals. 302 test files classified (124 unit, 139 VCR, 39 E2E). Non-mock compliance gate passes (19 checks). Test double inventory: 267 entries across 21 modules. 7 allowlisted exceptions documented with owner and replacement plan. 3 tracked for active migration (Recording*/MockHostActions via bd-m9rk), 4 permanent with rationale.",
       "status": "pass_with_residuals",
       "evidence": [
         "docs/non-mock-rubric.json",
@@ -22,7 +22,7 @@
     },
     "q2_e2e_logging": {
       "question": "Do we have complete E2E integration scripts with detailed logging?",
-      "answer": "Yes. 11/12 E2E workflows covered (92%), 1 waived (live-only, requires credentials). 34 E2E test files classified. Structured logging: failure_digest.v1, failure_timeline.v1, evidence_contract.json, replay_bundle.v1. CI gate lanes: preflight fast-fail + full certification. Waiver lifecycle enforced. Replay bundles with environment context.",
+      "answer": "Yes. 19/21 E2E workflows covered (90%), 2 waived (live-only, requires credentials). 39 E2E test files classified. Structured logging: failure_digest.v1, failure_timeline.v1, evidence_contract.json, replay_bundle.v1. CI gate lanes: preflight fast-fail + full certification. Waiver lifecycle enforced. Replay bundles with environment context.",
       "status": "pass_with_residuals",
       "evidence": [
         "docs/e2e_scenario_matrix.json",
@@ -34,17 +34,17 @@
       ],
       "quantified_residuals": [
         "1 waived workflow (live provider parity, requires credentials)",
-        "2 CI gate failure (cross_platform), 0 skipped (missing conformance artifacts)",
+        "3 CI gate failure (cross_platform), 0 skipped (missing conformance artifacts)",
         "Evidence bundle only generated during full E2E runs"
       ]
     }
   },
   "suite_classification": {
-    "unit_files": 93,
-    "vcr_files": 125,
-    "e2e_files": 34,
-    "total_classified": 252,
-    "total_test_files": 264,
+    "unit_files": 124,
+    "vcr_files": 139,
+    "e2e_files": 39,
+    "total_classified": 302,
+    "total_test_files": 303,
     "quarantined": 0,
     "active_waivers": 0
   },
@@ -56,18 +56,18 @@
     "low_risk": 36
   },
   "e2e_scenario_matrix": {
-    "total_workflows": 12,
-    "covered": 11,
-    "waived": 1,
+    "total_workflows": 21,
+    "covered": 19,
+    "waived": 2,
     "planned": 0,
-    "coverage_pct": 91.66666666666667
+    "coverage_pct": 90.47619047619048
   },
   "ci_gate_status": {
     "total_gates": 20,
-    "passed": 18,
-    "failed": 2,
+    "passed": 17,
+    "failed": 3,
     "skipped": 0,
-    "blocking_pass": 13,
+    "blocking_pass": 12,
     "blocking_total": 14
   },
   "opportunity_matrix_contract": {

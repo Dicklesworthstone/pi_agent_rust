@@ -1,6 +1,6 @@
 # QA Certification Dossier
 
-> Generated: 2026-03-12T02:21:56.103Z
+> Generated: 2026-08-04T07:11:39.597Z
 > Bead: bd-1f42.8.10
 > Verdict: **PASS_WITH_RESIDUALS**
 
@@ -8,7 +8,7 @@
 
 **Do we have full unit/integration coverage without mocks/fakes?**
 
-Yes, with quantified residuals. 252 test files classified (93 unit, 125 VCR, 34 E2E). Non-mock compliance gate passes (19 checks). Test double inventory: 267 entries across 21 modules. 7 allowlisted exceptions documented with owner and replacement plan. 3 tracked for active migration (Recording*/MockHostActions via bd-m9rk), 4 permanent with rationale.
+Yes, with quantified residuals. 302 test files classified (124 unit, 139 VCR, 39 E2E). Non-mock compliance gate passes (19 checks). Test double inventory: 267 entries across 21 modules. 7 allowlisted exceptions documented with owner and replacement plan. 3 tracked for active migration (Recording*/MockHostActions via bd-m9rk), 4 permanent with rationale.
 
 Evidence:
 - `docs/non-mock-rubric.json`
@@ -25,7 +25,7 @@ Residuals:
 
 **Do we have complete E2E integration scripts with detailed logging?**
 
-Yes. 11/12 E2E workflows covered (92%), 1 waived (live-only, requires credentials). 34 E2E test files classified. Structured logging: failure_digest.v1, failure_timeline.v1, evidence_contract.json, replay_bundle.v1. CI gate lanes: preflight fast-fail + full certification. Waiver lifecycle enforced. Replay bundles with environment context.
+Yes. 19/21 E2E workflows covered (90%), 2 waived (live-only, requires credentials). 39 E2E test files classified. Structured logging: failure_digest.v1, failure_timeline.v1, evidence_contract.json, replay_bundle.v1. CI gate lanes: preflight fast-fail + full certification. Waiver lifecycle enforced. Replay bundles with environment context.
 
 Evidence:
 - `docs/e2e_scenario_matrix.json`
@@ -37,17 +37,17 @@ Evidence:
 
 Residuals:
 - 1 waived workflow (live provider parity, requires credentials)
-- 2 CI gate failure (cross_platform), 0 skipped (missing conformance artifacts)
+- 3 CI gate failure (cross_platform), 0 skipped (missing conformance artifacts)
 - Evidence bundle only generated during full E2E runs
 
 ## Suite Classification
 
 | Suite | Files |
 |-------|-------|
-| Unit | 93 |
-| VCR | 125 |
-| E2E | 34 |
-| **Total** | **252** |
+| Unit | 124 |
+| VCR | 139 |
+| E2E | 39 |
+| **Total** | **302** |
 
 ## Allowlisted Exceptions
 
@@ -105,8 +105,8 @@ Residuals:
 
 ## Extension Remediation Backlog
 
-- Total non-pass extensions: 36
-- Actionable: 31
-- Non-actionable: 5
+- Total non-pass extensions: 0
+- Actionable: 0
+- Non-actionable: 0
 - Artifact: `tests/full_suite_gate/extension_remediation_backlog.json`
 - Markdown: `tests/full_suite_gate/extension_remediation_backlog.md`

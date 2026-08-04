@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-08-04T05:17:03.429Z",
-  "git_ref": "7487056d",
-  "ci_run_id": "local-20260804T051703Z",
+  "generated_at": "2026-08-04T07:06:47.649Z",
+  "git_ref": "320475bc",
+  "ci_run_id": "local-20260804T070647Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,7 +13,7 @@
       "schema": "pi.ext.conformance_summary.v2",
       "summary": {
         "fail": 0,
-        "generated_at": "2026-08-04T05:03:21Z",
+        "generated_at": "2026-08-04T06:56:22Z",
         "pass": 60,
         "pass_rate_pct": 100.0,
         "total": 226
@@ -179,7 +179,7 @@
       "artifact_path": "tests/ext_conformance/reports/auto_repair_summary.json",
       "schema": "pi.ext.auto_repair_summary.v1",
       "file_count": 1,
-      "total_bytes": 45398
+      "total_bytes": 45400
     },
     {
       "id": "e2e_results",
@@ -225,7 +225,7 @@
       "artifact_path": "tests/perf/reports/budget_summary.json",
       "schema": "pi.perf.budget_summary.v1",
       "file_count": 1,
-      "total_bytes": 4082
+      "total_bytes": 15361
     },
     {
       "id": "perf_comparison",
@@ -357,7 +357,7 @@
       "status": "invalid",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
-      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 05:03:21 UTC)",
+      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 06:56:22 UTC)",
       "file_count": 0,
       "total_bytes": 0
     }
@@ -368,7 +368,7 @@
     "missing_sections": 0,
     "invalid_sections": 1,
     "total_artifacts": 2004,
-    "total_bytes": 185383352,
+    "total_bytes": 185394633,
     "verdict": "insufficient"
   }
 }

@@ -293,6 +293,12 @@ fn extension_stub_reconciliation_matches_current_backlog_families() {
         .as_object()
         .expect("recorded backlog family counts must be an object");
 
+    assert_eq!(
+        recorded_families.len(),
+        family_counts.len(),
+        "reconciliation family inventory must not retain stale backlog families"
+    );
+
     for (family, count) in family_counts {
         assert_eq!(
             recorded_families.get(&family).and_then(Value::as_u64),
@@ -303,11 +309,38 @@ fn extension_stub_reconciliation_matches_current_backlog_families() {
 }
 
 #[test]
-fn runtime_api_gap_rows_point_to_audited_virtual_module_stubs() {
-    let backlog = load_extension_remediation_backlog();
-    let entries = backlog["entries"]
+fn runtime_api_compatibility_disposition_points_to_audited_virtual_module_stubs() {
+    let inventory = load_inventory();
+    let dispositions = inventory["extension_stub_placeholder_reconciliation"]["dispositions"]
         .as_array()
-        .expect("extension remediation backlog entries must be an array");
+        .expect("reconciliation dispositions must be an array");
+    let disposition = dispositions
+        .iter()
+        .find(|entry| entry["category"] == "runtime_api_gap")
+        .expect("runtime API compatibility disposition must exist");
+
+    assert_eq!(
+        disposition["status"].as_str(),
+        Some("production_compatibility_stub"),
+        "runtime API stubs must remain explicitly classified"
+    );
+    assert_eq!(
+        disposition["resolved_by_bead"].as_str(),
+        Some("bd-8t27h.14.1"),
+        "runtime API stub provenance must retain its resolution bead"
+    );
+    assert_eq!(
+        disposition["backlog_entries"].as_u64(),
+        Some(0),
+        "resolved compatibility stubs must not remain in the current-failure backlog"
+    );
+
+    let audited_extensions = disposition["audited_extensions"]
+        .as_array()
+        .expect("runtime API disposition must enumerate audited extensions");
+    let evidence_refs = disposition["evidence_refs"]
+        .as_array()
+        .expect("runtime API disposition must include evidence refs");
     let mut expected = BTreeMap::from([
         ("npm/pi-search-agent", ("openai", "openai_imports")),
         ("npm/pi-wakatime", ("adm-zip", "adm_zip_import")),
@@ -326,65 +359,33 @@ fn runtime_api_gap_rows_point_to_audited_virtual_module_stubs() {
     ]);
     let mut unexpected = Vec::new();
 
-    for entry in entries
-        .iter()
-        .filter(|entry| entry["root_cause_family"].as_str() == Some("runtime_api_gap"))
-    {
+    for entry in audited_extensions {
         let extension_id = entry["extension_id"]
             .as_str()
-            .expect("runtime API gap entry must name extension_id");
+            .expect("audited runtime API entry must name extension_id");
         let Some((package, test_name)) = expected.remove(extension_id) else {
             unexpected.push(extension_id);
             continue;
         };
 
         assert_eq!(
-            entry["status"].as_str(),
-            Some("tracked_non_actionable"),
-            "{extension_id} should stop being actionable once the virtual module stub is audited"
+            entry["virtual_module"].as_str(),
+            Some(package),
+            "{extension_id} must identify its audited virtual module"
         );
         assert_eq!(
-            entry["tracking_issue"].as_str(),
-            Some("bd-8t27h.14.1"),
-            "{extension_id} should point at the current runtime API stub bead"
+            entry["test_name"].as_str(),
+            Some(test_name),
+            "{extension_id} must identify its focused import test"
         );
-        assert_eq!(
-            entry["follow_up_bead"].as_str(),
-            Some("bd-8t27h.14.1"),
-            "{extension_id} should keep follow-up ownership with the runtime API stub bead"
-        );
-
-        let fallback_validation = entry["fallback_validation"]
-            .as_str()
-            .expect("runtime API gap entry must have fallback_validation");
-        assert!(
-            fallback_validation.contains("tracking_issue=bd-8t27h.14.1"),
-            "{extension_id} fallback validation must name the current child bead"
-        );
-        assert!(
-            !fallback_validation.contains("bd-k5q5.3.9"),
-            "{extension_id} fallback validation must not point at the closed historical bead"
-        );
-        assert!(
-            fallback_validation.contains(package),
-            "{extension_id} fallback validation must name the audited package"
-        );
-
-        let evidence_refs = entry["evidence_refs"]
-            .as_array()
-            .expect("runtime API gap entry must have evidence_refs");
         let has_impl_ref = evidence_refs
             .iter()
             .filter_map(Value::as_str)
-            .any(|evidence| evidence.contains("src/extensions_js.rs"));
+            .any(|evidence| evidence == format!("src/extensions_js.rs#virtual_module:{package}"));
         let has_stub_test_ref = evidence_refs
             .iter()
             .filter_map(Value::as_str)
-            .any(|evidence| evidence.contains("tests/npm_module_stubs.rs"));
-        let has_package_test_ref = evidence_refs
-            .iter()
-            .filter_map(Value::as_str)
-            .any(|evidence| evidence.contains(test_name));
+            .any(|evidence| evidence == format!("tests/npm_module_stubs.rs#{test_name}"));
         assert!(
             has_impl_ref,
             "{extension_id} must cite the production virtual module implementation"
@@ -393,16 +394,15 @@ fn runtime_api_gap_rows_point_to_audited_virtual_module_stubs() {
             has_stub_test_ref,
             "{extension_id} must cite focused npm module stub coverage"
         );
-        assert!(has_package_test_ref, "{extension_id} must cite {test_name}");
     }
 
     assert!(
         unexpected.is_empty(),
-        "runtime API gap backlog has unexpected entries: {unexpected:?}"
+        "runtime API disposition has unexpected entries: {unexpected:?}"
     );
     assert!(
         expected.is_empty(),
-        "runtime API gap backlog is missing audited entries for: {expected:?}"
+        "runtime API disposition is missing audited entries for: {expected:?}"
     );
 }
 

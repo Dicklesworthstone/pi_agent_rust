@@ -35,7 +35,7 @@
   "extension_stub_placeholder_reconciliation": {
     "schema": "pi.qa.extension_stub_placeholder_reconciliation.v1",
     "bead_id": "bd-8t27h.14",
-    "generated_at_utc": "2026-05-10T10:19:00Z",
+    "generated_at_utc": "2026-08-04T06:56:22Z",
     "purpose": "Classify extension-related stubs, mocks, placeholders, and temporary compatibility gaps against current conformance evidence without treating test fixtures as production placeholders.",
     "source_artifacts": [
       "docs/test_double_inventory.json",
@@ -61,24 +61,18 @@
     "current_conformance_snapshot": {
       "conformance_summary": {
         "artifact": "tests/ext_conformance/reports/conformance_summary.json",
-        "total": 224,
+        "total": 226,
         "tested": 60,
         "pass": 60,
         "fail": 0,
-        "not_applicable_or_not_run": 164
+        "not_applicable_or_not_run": 166
       },
       "extension_remediation_backlog": {
         "artifact": "tests/full_suite_gate/extension_remediation_backlog.json",
-        "total_non_pass_extensions": 36,
-        "actionable": 26,
-        "non_actionable": 10,
-        "families": {
-          "runtime_crash": 4,
-          "runtime_api_gap": 5,
-          "fixture_manifest_drift": 22,
-          "packaging_gap": 4,
-          "fixture_exclusion": 1
-        }
+        "total_non_pass_extensions": 0,
+        "actionable": 0,
+        "non_actionable": 0,
+        "families": {}
       }
     },
     "disposition_policy": {
@@ -140,10 +134,36 @@
       {
         "category": "runtime_api_gap",
         "status": "production_compatibility_stub",
-        "backlog_entries": 5,
+        "backlog_entries": 0,
         "resolved_by_bead": "bd-8t27h.14.1",
+        "audited_extensions": [
+          {
+            "extension_id": "npm/pi-search-agent",
+            "virtual_module": "openai",
+            "test_name": "openai_imports"
+          },
+          {
+            "extension_id": "npm/pi-wakatime",
+            "virtual_module": "adm-zip",
+            "test_name": "adm_zip_import"
+          },
+          {
+            "extension_id": "npm/pi-web-access",
+            "virtual_module": "linkedom",
+            "test_name": "linkedom_parse_html"
+          },
+          {
+            "extension_id": "npm/qualisero-pi-agent-scip",
+            "virtual_module": "@sourcegraph/scip-typescript",
+            "test_name": "scip_typescript_import"
+          },
+          {
+            "extension_id": "third-party/qualisero-pi-agent-scip",
+            "virtual_module": "@sourcegraph/scip-typescript",
+            "test_name": "scip_typescript_subpath_import"
+          }
+        ],
         "evidence_refs": [
-          "tests/full_suite_gate/extension_remediation_backlog.json#/entries",
           "src/extensions_js.rs#virtual_module:openai",
           "src/extensions_js.rs#virtual_module:adm-zip",
           "src/extensions_js.rs#virtual_module:linkedom",
@@ -155,37 +175,40 @@
           "tests/npm_module_stubs.rs#scip_typescript_subpath_import",
           "tests/npm_module_stubs.rs#scip_typescript_main_import"
         ],
-        "rationale": "Current high-severity missing npm package rows are backed by audited QuickJS virtual module stubs and focused import tests; the backlog keeps them visible as tracked non-actionable evidence until the conformance corpus is regenerated."
+        "rationale": "The high-severity package gaps were resolved by audited QuickJS virtual module stubs and focused import tests. Current conformance has no runtime API gap rows; this durable disposition preserves implementation and regression-test provenance without misusing the current-failure backlog as historical evidence."
       },
       {
         "category": "runtime_crash",
-        "status": "active_child_bead",
-        "backlog_entries": 4,
-        "child_bead": "bd-8t27h.14.2",
+        "status": "historically_remediated",
+        "backlog_entries": 0,
+        "resolved_by_bead": "bd-8t27h.14.2",
         "evidence_refs": [
-          "tests/full_suite_gate/extension_remediation_backlog.json#/entries"
+          "tests/ext_conformance/reports/conformance_baseline.json",
+          "bd-8t27h.14.2"
         ],
-        "rationale": "Current high-severity runtime crash rows need active runtime/shim/asset remediation or explicit waivers."
+        "rationale": "The runtime crash cases were remediated under bd-8t27h.14.2 and the current conformance baseline reports no runtime-error extensions."
       },
       {
         "category": "fixture_manifest_drift_and_exclusion",
-        "status": "active_child_bead",
-        "backlog_entries": 23,
-        "child_bead": "bd-8t27h.14.3",
+        "status": "historically_remediated",
+        "backlog_entries": 0,
+        "resolved_by_bead": "bd-8t27h.14.3",
         "evidence_refs": [
-          "tests/full_suite_gate/extension_remediation_backlog.json#/entries"
+          "tests/ext_conformance/reports/conformance_baseline.json",
+          "bd-8t27h.14.3"
         ],
-        "rationale": "Current manifest-drift and exclusion rows need active owner beads or refreshed time-boxed exceptions instead of closed historical refs."
+        "rationale": "The fixture-manifest drift and exclusion cases were rebaselined under bd-8t27h.14.3 and the current conformance baseline reports no corresponding failures."
       },
       {
         "category": "packaging_gap",
-        "status": "active_child_bead",
-        "backlog_entries": 4,
-        "child_bead": "bd-8t27h.14.4",
+        "status": "historically_remediated",
+        "backlog_entries": 0,
+        "resolved_by_bead": "bd-8t27h.14.4",
         "evidence_refs": [
-          "tests/full_suite_gate/extension_remediation_backlog.json#/entries"
+          "tests/ext_conformance/reports/conformance_baseline.json",
+          "bd-8t27h.14.4"
         ],
-        "rationale": "Current packaging gap rows need active package/asset remediation or explicit waivers."
+        "rationale": "The packaging gaps were remediated under bd-8t27h.14.4 and the current conformance baseline reports no packaging failures."
       }
     ]
   },
