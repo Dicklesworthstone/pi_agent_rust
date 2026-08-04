@@ -14,6 +14,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const MAX_JSONL_LINE_BYTES: usize = 100 * 1024 * 1024;
+// Directory locks become reclaimable after the proper-lockfile-compatible
+// 10-second stale horizon. Waiting longer than that is required for immediate
+// recovery when a process is killed while updating the session index.
+const SESSION_INDEX_LOCK_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
@@ -355,7 +359,7 @@ impl SessionIndex {
         // `self.lock_path` is `<sessions>/session-index.lock` — the same path
         // upstream TS pi locks with `proper-lockfile`. Use the directory-based
         // protocol (see `crate::file_lock`) so the two interoperate.
-        let _lock = crate::file_lock::DirLock::acquire(&self.lock_path, Duration::from_secs(5))
+        let _lock = crate::file_lock::DirLock::acquire(&self.lock_path, SESSION_INDEX_LOCK_TIMEOUT)
             .map_err(|e| Error::session(format!("session index lock: {e}")))?;
 
         let config = SqliteConfig::file(self.db_path.to_string_lossy())

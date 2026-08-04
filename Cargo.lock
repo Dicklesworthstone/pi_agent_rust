@@ -4512,6 +4512,7 @@ dependencies = [
  "serde_json",
  "sha1 0.10.6",
  "sha2 0.10.9",
+ "signal-hook 0.4.4",
  "similar",
  "sqlmodel-core",
  "sqlmodel-sqlite",

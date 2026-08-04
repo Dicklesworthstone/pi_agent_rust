@@ -481,6 +481,34 @@ async fn wait_for_streaming_state(
     Value::Null
 }
 
+async fn wait_for_non_streaming_state(
+    in_tx: &asupersync::channel::mpsc::Sender<String>,
+    out_rx: &Arc<Mutex<Receiver<String>>>,
+    command_id: &str,
+    label: &str,
+) -> Value {
+    let start = Instant::now();
+    let cmd = json!({
+        "id": command_id,
+        "type": "get_state",
+    })
+    .to_string();
+
+    loop {
+        let resp = send_recv(in_tx, out_rx, &cmd, label).await;
+        assert_ok(&resp, "get_state");
+        if matches!(is_streaming(&resp), Some(false)) {
+            return resp;
+        }
+
+        assert!(
+            start.elapsed() <= RPC_E2E_WAIT_TIMEOUT,
+            "{label}: RPC state remained streaming: {resp}"
+        );
+        asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
+    }
+}
+
 async fn wait_for_non_streaming_state_after_abort(
     in_tx: &asupersync::channel::mpsc::Sender<String>,
     out_rx: &Arc<Mutex<Receiver<String>>>,
@@ -880,9 +908,8 @@ impl CrashInterruptRecoveryMode {
 #[derive(Debug)]
 struct SpawnedCrashInterruptWorker {
     child: Child,
-    stdout_handle: JoinHandle<Vec<u8>>,
-    stderr_handle: JoinHandle<Vec<u8>>,
-    started_at: Instant,
+    stdout_handle: Option<JoinHandle<Vec<u8>>>,
+    stderr_handle: Option<JoinHandle<Vec<u8>>>,
 }
 
 #[cfg(unix)]
@@ -1001,10 +1028,29 @@ fn spawn_crash_interrupt_recovery_worker(
 
     SpawnedCrashInterruptWorker {
         child,
-        stdout_handle,
-        stderr_handle,
-        started_at: Instant::now(),
+        stdout_handle: Some(stdout_handle),
+        stderr_handle: Some(stderr_handle),
     }
+}
+
+#[cfg(unix)]
+fn collect_crash_interrupt_worker_output(
+    spawned: &mut SpawnedCrashInterruptWorker,
+) -> (String, String) {
+    let stdout = spawned
+        .stdout_handle
+        .take()
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    let stderr = spawned
+        .stderr_handle
+        .take()
+        .and_then(|handle| handle.join().ok())
+        .unwrap_or_default();
+    (
+        String::from_utf8_lossy(&stdout).to_string(),
+        String::from_utf8_lossy(&stderr).to_string(),
+    )
 }
 
 #[cfg(unix)]
@@ -1012,6 +1058,7 @@ fn wait_crash_interrupt_recovery_worker(
     mut spawned: SpawnedCrashInterruptWorker,
     timeout: Duration,
 ) -> CrashInterruptWorkerResult {
+    let started_at = Instant::now();
     let mut timed_out = false;
     let status = loop {
         match spawned.child.try_wait() {
@@ -1024,7 +1071,7 @@ fn wait_crash_interrupt_recovery_worker(
             }
         }
 
-        if spawned.started_at.elapsed() > timeout {
+        if started_at.elapsed() > timeout {
             timed_out = true;
             let _ = spawned.child.kill();
             break spawned.child.wait().ok();
@@ -1032,10 +1079,7 @@ fn wait_crash_interrupt_recovery_worker(
         std::thread::sleep(Duration::from_millis(20));
     };
 
-    let stdout =
-        String::from_utf8_lossy(&spawned.stdout_handle.join().unwrap_or_default()).to_string();
-    let mut stderr =
-        String::from_utf8_lossy(&spawned.stderr_handle.join().unwrap_or_default()).to_string();
+    let (stdout, mut stderr) = collect_crash_interrupt_worker_output(&mut spawned);
     if timed_out {
         stderr = format!("ERROR: timed out after {timeout:?}\n{stderr}");
     }
@@ -1079,6 +1123,49 @@ fn wait_for_crash_interrupt_checkpoint(path: &Path, timeout: Duration) -> Value 
             "timed out waiting for worker checkpoint {}",
             path.display()
         );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(unix)]
+fn wait_for_crash_interrupt_worker_checkpoint(
+    spawned: &mut SpawnedCrashInterruptWorker,
+    path: &Path,
+    timeout: Duration,
+) -> std::io::Result<Value> {
+    let started_at = Instant::now();
+    loop {
+        if path.exists() {
+            let raw = std::fs::read_to_string(path)?;
+            let checkpoint = serde_json::from_str(&raw).map_err(|source| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    CrashInterruptCheckpointParseError { path, source }.to_string(),
+                )
+            })?;
+            return Ok(checkpoint);
+        }
+
+        if let Some(status) = spawned.child.try_wait()? {
+            let (stdout, stderr) = collect_crash_interrupt_worker_output(spawned);
+            return Err(std::io::Error::other(format!(
+                "worker exited before checkpoint {}: status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                path.display()
+            )));
+        }
+
+        if started_at.elapsed() > timeout {
+            let _ = spawned.child.kill();
+            let _ = spawned.child.wait();
+            let (stdout, stderr) = collect_crash_interrupt_worker_output(spawned);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "timed out waiting for worker checkpoint {} after {timeout:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                    path.display()
+                ),
+            ));
+        }
         std::thread::sleep(Duration::from_millis(20));
     }
 }
@@ -1285,6 +1372,14 @@ fn run_crash_interrupt_recovery_active_worker(
             "active extension custom message",
         )
         .await;
+        let idle_state_id = format!("active-{cycle}-extension-idle");
+        let _idle_state = wait_for_non_streaming_state(
+            &in_tx,
+            &out_rx,
+            &idle_state_id,
+            "active extension completion",
+        )
+        .await;
 
         let prompt = json!({
             "id": format!("active-{cycle}-prompt"),
@@ -1416,13 +1511,14 @@ fn run_crash_interrupt_recovery_restart_worker(
         )
         .await;
 
-        let state_cmd = json!({
-            "id": format!("restart-{cycle}-state"),
-            "type": "get_state",
-        })
-        .to_string();
-        let state_after = send_recv(&in_tx, &out_rx, &state_cmd, "restart get_state").await;
-        assert_ok(&state_after, "get_state");
+        let state_id = format!("restart-{cycle}-state");
+        let state_after = wait_for_non_streaming_state(
+            &in_tx,
+            &out_rx,
+            &state_id,
+            "restart extension completion",
+        )
+        .await;
         let message_count_after =
             require_response_field_u64(&state_after, "messageCount", "restart get_state");
 
@@ -1475,6 +1571,7 @@ fn run_crash_interrupt_recovery_worker_from_env() {
             exit_crash_interrupt_worker(format!("unknown crash interrupt recovery mode {other}"))
         }
     };
+    install_crash_interrupt_recovery_signal_default(mode);
     let sessions_root = PathBuf::from(env_required(CRASH_INTERRUPT_RECOVERY_SESSIONS_ENV));
     let artifact_dir = PathBuf::from(env_required(CRASH_INTERRUPT_RECOVERY_ARTIFACT_ENV));
     let project_dir = PathBuf::from(env_required(CRASH_INTERRUPT_RECOVERY_PROJECT_ENV));
@@ -1503,6 +1600,24 @@ fn run_crash_interrupt_recovery_worker_from_env() {
 }
 
 #[cfg(unix)]
+fn install_crash_interrupt_recovery_signal_default(mode: CrashInterruptRecoveryMode) {
+    use std::sync::atomic::AtomicBool;
+
+    let signal = match mode {
+        CrashInterruptRecoveryMode::Crash => return,
+        CrashInterruptRecoveryMode::Sigint => signal_hook::consts::SIGINT,
+        CrashInterruptRecoveryMode::Sighup => signal_hook::consts::SIGHUP,
+    };
+    signal_hook::flag::register_conditional_default(signal, Arc::new(AtomicBool::new(true)))
+        .unwrap_or_else(|error| {
+            exit_crash_interrupt_worker(format!(
+                "install default {} handler: {error}",
+                mode.as_str()
+            ));
+        });
+}
+
+#[cfg(unix)]
 #[test]
 fn crash_interrupt_recovery_worker_process_entrypoint() {
     if std::env::var_os(CRASH_INTERRUPT_RECOVERY_WORKER_ENV).is_none() {
@@ -1514,7 +1629,7 @@ fn crash_interrupt_recovery_worker_process_entrypoint() {
 #[cfg(unix)]
 #[test]
 #[allow(clippy::too_many_lines)]
-fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
+fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() -> std::io::Result<()> {
     let harness = TestHarness::new("crash_interrupt_recovery_soak_harness");
     let logger = harness.log();
     let current_exe = std::env::current_exe().expect("current test binary path");
@@ -1533,7 +1648,7 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
             crash_interrupt_artifact_path(&artifact_dir, "active", cycle, mode, "json");
         let restart_summary_path =
             crash_interrupt_artifact_path(&artifact_dir, "restart", cycle, mode, "json");
-        let active_worker = spawn_crash_interrupt_recovery_worker(
+        let mut active_worker = spawn_crash_interrupt_recovery_worker(
             &current_exe,
             "active",
             cycle,
@@ -1545,10 +1660,11 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
             &active_summary_path,
             None,
         );
-        let ready = wait_for_crash_interrupt_checkpoint(
+        let ready = wait_for_crash_interrupt_worker_checkpoint(
+            &mut active_worker,
             &ready_path,
             CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT,
-        );
+        )?;
         signal_crash_interrupt_recovery_worker(&active_worker, mode);
         let active_result = wait_crash_interrupt_recovery_worker(
             active_worker,
@@ -1719,6 +1835,7 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() {
     });
     write_json_atomic(&summary_path, &summary);
     harness.record_artifact("crash-interrupt-recovery-soak-summary.json", &summary_path);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

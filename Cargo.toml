@@ -272,6 +272,7 @@ proptest = "1.10.0"
 wat = "1.245.1"
 toml = "1.0.3"
 loom = "0.7.2"
+signal-hook = "0.4.4"
 
 [[bench]]
 name = "tools"
