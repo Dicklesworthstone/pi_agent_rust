@@ -464,6 +464,7 @@ fn rpc_session_stats_counts_tool_calls_and_results() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },

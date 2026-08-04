@@ -129,6 +129,7 @@ impl KeylessReplayProvider {
             model: self.model_id.clone(),
             usage: Usage::default(),
             stop_reason,
+            stop_details: None,
             error_message: None,
             timestamp: chrono::Utc::now().timestamp_millis(),
         }
@@ -2258,6 +2259,7 @@ fn rpc_get_last_assistant_text_with_assistant() {
                 model: "test-model".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },
@@ -2791,6 +2793,7 @@ fn rpc_get_state_reflects_session_stats() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },

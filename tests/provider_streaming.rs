@@ -899,6 +899,7 @@ pub(crate) fn assistant_tool_call_message(
         model: model.to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     })
@@ -1011,6 +1012,7 @@ mod backpressure_tests {
             model: model.to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }
@@ -1033,6 +1035,7 @@ mod backpressure_tests {
             model: model.to_string(),
             usage,
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }

@@ -184,14 +184,18 @@ The Pi SDK virtual module provides the primary extension API surface.
 | `calculateCost()` | Function | Token cost calculation (uses `model.cost` × usage tokens) |
 | `getEnvApiKey(provider)` | Function | Capability-filtered environment key lookup |
 | `getOAuthApiKey(provider)` | Function | Unsupported in PiJS; fails closed |
-| `complete(model, messages, opts)` | Function | Unsupported in PiJS without a provider host bridge; fails closed |
-| `completeSimple(model, prompt, opts)` | Function | Unsupported in PiJS without a provider host bridge; fails closed |
+| `complete(model, messages, opts)` | Function | Runs through a registered API provider when `model.api` matches; otherwise uses the provider host bridge and fails closed if unavailable |
+| `completeSimple(model, prompt, opts)` | Function | Runs through a registered API provider when `model.api` matches; otherwise uses the provider host bridge and fails closed if unavailable |
+| `stream(model, context, opts)` | Function | Returns a registered API provider's assistant-message event stream, or a host-bridge stream for models without an API ID |
+| `streamSimple(model, context, opts)` | Function | Returns a registered API provider's simple assistant-message event stream, or a host-bridge stream for models without an API ID |
 | `createAssistantMessageEventStream()` | Function | Async-iterable assistant event stream factory for extension providers |
 | `streamSimpleAnthropic()` | Function | Unsupported in PiJS without a provider host bridge; fails closed |
 | `streamSimpleOpenAIResponses()` | Function | Unsupported in PiJS without a provider host bridge; fails closed |
 | `streamSimpleOpenAICompletions()` | Function | Unsupported in PiJS without a provider host bridge; fails closed |
 | `getProviders()`, `getModel(provider, modelId)`, `getModels(provider)` | Functions | Synchronous built-in registry lookup for bundled provider metadata; currently includes OpenAI Codex models needed by extension provider mirrors |
-| `getApiProvider(api)` | Function | Synchronous provider bridge for known API IDs; stream calls route through the host provider bridge and fail closed if unavailable |
+| `registerApiProvider(provider, sourceId)` | Function | Registers an extension-owned `{api, stream, streamSimple}` provider for compatibility-model routing |
+| `unregisterApiProviders(sourceId)` | Function | Removes only API providers registered by the calling extension with that source ID |
+| `getApiProvider(api)`, `getApiProviders()` | Function | Returns registered API providers; known built-in API IDs retain their synchronous host bridge fallback |
 | `getModel()`, `getApiProvider()`, `getModels()` with no lookup arguments | Functions | Session/model host-context helpers; fail closed when no host bridge is configured |
 
 ## Conformance Status

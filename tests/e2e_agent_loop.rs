@@ -97,6 +97,7 @@ impl ScriptedProvider {
                 ..Usage::default()
             },
             stop_reason,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }
@@ -439,6 +440,7 @@ impl Provider for ContextCaptureProvider {
                 ..Usage::default()
             },
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -1347,6 +1349,7 @@ impl Provider for StreamingToolCallProvider {
             model: self.model_id().to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -1362,6 +1365,7 @@ impl Provider for StreamingToolCallProvider {
             let done_message = AssistantMessage {
                 content: vec![ContentBlock::Text(TextContent::new("done streaming"))],
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 ..empty_partial.clone()
             };
             return Ok(Box::pin(futures::stream::iter(vec![
@@ -1378,6 +1382,7 @@ impl Provider for StreamingToolCallProvider {
         let final_message = AssistantMessage {
             content: vec![ContentBlock::ToolCall(tool_call.clone())],
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             ..empty_partial.clone()
         };
 

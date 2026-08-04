@@ -75,6 +75,7 @@ impl ScriptedProvider {
                 ..Usage::default()
             },
             stop_reason: stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }

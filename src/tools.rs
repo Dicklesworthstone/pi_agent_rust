@@ -1,6 +1,6 @@
 //! Built-in tool implementations.
 //!
-//! Pi provides 8 built-in tools: read, bash, edit, write, grep, find, ls, hashline_edit.
+//! Pi provides built-in file, shell, search, editing, and subagent delegation tools.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
@@ -2731,6 +2731,7 @@ impl ToolRegistry {
                 "find" => tools.push(Box::new(FindTool::new(cwd))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                "subagent" => tools.push(Box::new(crate::subagents::SubagentTool::new(cwd))),
                 _ => {}
             }
         }

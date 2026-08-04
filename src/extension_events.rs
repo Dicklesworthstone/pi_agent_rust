@@ -552,6 +552,7 @@ mod tests {
                 model: "test".to_string(),
                 usage: crate::model::Usage::default(),
                 stop_reason: crate::model::StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }

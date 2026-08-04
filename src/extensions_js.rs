@@ -8320,7 +8320,88 @@ function apiProviderBridge(api) {
   };
 }
 
-async function* streamSimple(name, model, context, opts = {}) {
+// The upstream compatibility API keeps a process-wide registry of API
+// implementations.  Extensions use it to introduce a wire protocol before
+// registering models that select that protocol through `pi.registerProvider`.
+// Keep the owner alongside the source ID so the extension registry can refuse
+// to silently bind one extension's provider to another extension's handler.
+const __piApiProviderRegistry =
+  globalThis.__pi_api_provider_registry_store instanceof Map
+    ? globalThis.__pi_api_provider_registry_store
+    : (globalThis.__pi_api_provider_registry_store = new Map());
+
+function apiProviderOwner() {
+  return String(globalThis.__pi_current_extension_id ?? "").trim();
+}
+
+function wrapRegisteredApiProvider(provider) {
+  if (!provider || typeof provider !== "object" || Array.isArray(provider)) {
+    throw new Error("registerApiProvider: provider must be an object");
+  }
+  const api = String(provider.api ?? "").trim();
+  if (!api) {
+    throw new Error("registerApiProvider: provider.api is required");
+  }
+  if (typeof provider.stream !== "function") {
+    throw new Error("registerApiProvider: provider.stream must be a function");
+  }
+  if (typeof provider.streamSimple !== "function") {
+    throw new Error("registerApiProvider: provider.streamSimple must be a function");
+  }
+
+  const ensureMatchingApi = (model) => {
+    if (model && typeof model === "object" && model.api !== undefined && String(model.api) !== api) {
+      throw new Error(`Mismatched api: ${String(model.api)} expected ${api}`);
+    }
+  };
+  return {
+    api,
+    stream: (model, context, options) => {
+      ensureMatchingApi(model);
+      return provider.stream(model, context, options);
+    },
+    streamSimple: (model, context, options) => {
+      ensureMatchingApi(model);
+      return provider.streamSimple(model, context, options);
+    },
+  };
+}
+
+export function registerApiProvider(provider, sourceId = undefined) {
+  const wrapped = wrapRegisteredApiProvider(provider);
+  __piApiProviderRegistry.set(wrapped.api, {
+    provider: wrapped,
+    extensionId: apiProviderOwner(),
+    sourceId: sourceId === undefined ? undefined : String(sourceId),
+  });
+}
+
+export function unregisterApiProviders(sourceId) {
+  const source = String(sourceId ?? "");
+  const owner = apiProviderOwner();
+  for (const [api, entry] of __piApiProviderRegistry.entries()) {
+    if (entry.sourceId === source && (!entry.extensionId || entry.extensionId === owner)) {
+      __piApiProviderRegistry.delete(api);
+    }
+  }
+}
+
+export function getApiProviders() {
+  return Array.from(__piApiProviderRegistry.values(), (entry) => entry.provider);
+}
+
+// These internals are deliberately capability-free: they expose only JS
+// handlers already registered by the active extension.  The host uses the
+// owner field to retain extension isolation when connecting a provider spec.
+globalThis.__pi_get_registered_api_provider = (api) => {
+  const entry = __piApiProviderRegistry.get(String(api ?? "").trim());
+  return entry || undefined;
+};
+globalThis.__pi_reset_api_provider_registry = () => {
+  __piApiProviderRegistry.clear();
+};
+
+async function* streamSimpleBridge(name, model, context, opts = {}) {
   const result = await callProviderBridge(name, "completeAi", {
     model,
     context,
@@ -8332,34 +8413,80 @@ async function* streamSimple(name, model, context, opts = {}) {
 }
 
 export function streamSimpleAnthropic(model, context, opts = {}) {
-  return streamSimple("streamSimpleAnthropic", model, context, opts);
+  return streamSimpleBridge("streamSimpleAnthropic", model, context, opts);
 }
 
 export function streamSimpleOpenAIResponses(model, context, opts = {}) {
-  return streamSimple("streamSimpleOpenAIResponses", model, context, opts);
+  return streamSimpleBridge("streamSimpleOpenAIResponses", model, context, opts);
 }
 
 export function streamSimpleOpenAICompletions(model, context, opts = {}) {
-  return streamSimple("streamSimpleOpenAICompletions", model, context, opts);
+  return streamSimpleBridge("streamSimpleOpenAICompletions", model, context, opts);
+}
+
+export function stream(model, context, opts = {}) {
+  const api = model && typeof model === "object" ? model.api : undefined;
+  if (!api) {
+    return providerBridgeStream("stream", model, context, opts || {}, false);
+  }
+  const provider = getApiProvider(api);
+  if (!provider) {
+    throw new Error(`No API provider registered for api: ${String(api ?? "")}`);
+  }
+  return provider.stream(model, context, opts || {});
+}
+
+export function streamSimple(model, context, opts = {}) {
+  const api = model && typeof model === "object" ? model.api : undefined;
+  if (!api) {
+    return providerBridgeStream("streamSimple", model, context, opts || {}, true);
+  }
+  const provider = getApiProvider(api);
+  if (!provider) {
+    throw new Error(`No API provider registered for api: ${String(api ?? "")}`);
+  }
+  return provider.streamSimple(model, context, opts || {});
 }
 
 export async function complete(model, messages, opts = {}) {
-  return await callProviderBridge("complete", "completeAi", {
-    model,
-    context: messages,
-    options: opts || {},
-    simple: false,
-  });
+  if (!model || typeof model !== "object" || !model.api) {
+    return await callProviderBridge("complete", "completeAi", {
+      model,
+      context: messages,
+      options: opts || {},
+      simple: false,
+    });
+  }
+  const eventStream = stream(model, messages, opts);
+  if (!eventStream || typeof eventStream.result !== "function") {
+    throw new Error("complete: provider.stream must return an AssistantMessageEventStream");
+  }
+  const result = await eventStream.result();
+  if (result && result.stopReason === "error" && result.errorMessage) {
+    throw new Error(String(result.errorMessage));
+  }
+  return result;
 }
 
 export async function completeSimple(model, prompt, opts = {}) {
   const args = completeSimpleArgs(model, prompt, opts);
-  return await callProviderBridge("completeSimple", "completeAi", {
-    model: args.model,
-    context: args.prompt,
-    options: args.opts || {},
-    simple: true,
-  });
+  if (!args.model || typeof args.model !== "object" || !args.model.api) {
+    return await callProviderBridge("completeSimple", "completeAi", {
+      model: args.model,
+      context: args.prompt,
+      options: args.opts || {},
+      simple: true,
+    });
+  }
+  const eventStream = streamSimple(args.model, args.prompt, args.opts || {});
+  if (!eventStream || typeof eventStream.result !== "function") {
+    throw new Error("completeSimple: provider.streamSimple must return an AssistantMessageEventStream");
+  }
+  const result = await eventStream.result();
+  if (result && result.stopReason === "error" && result.errorMessage) {
+    throw new Error(String(result.errorMessage));
+  }
+  return result;
 }
 
 export function getProviders() {
@@ -8379,7 +8506,8 @@ export function getModel(provider, modelId) {
 
 export function getApiProvider(api) {
   if (arguments.length >= 1) {
-    return apiProviderBridge(api);
+    const registered = __piApiProviderRegistry.get(String(api ?? "").trim());
+    return registered ? registered.provider : apiProviderBridge(api);
   }
   return (async () => {
     await callProviderBridge("getApiProvider", "getModels", {});
@@ -8403,7 +8531,7 @@ export async function refreshOpenAICodexToken(_refreshToken) {
   failClosedUnsupported("refreshOpenAICodexToken");
 }
 
-export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getModels, loginOpenAICodex, refreshOpenAICodexToken };
+export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken };
 "#
         .trim()
         .to_string(),
@@ -18744,6 +18872,9 @@ function __pi_reset_extension_runtime_state() {
     if (typeof __pi_provider_stream_seq === 'number') {
         __pi_provider_stream_seq = 0;
     }
+    if (typeof globalThis.__pi_reset_api_provider_registry === 'function') {
+        globalThis.__pi_reset_api_provider_registry();
+    }
 
     __pi_current_extension_id = null;
     __pi_extensions.clear();
@@ -19051,16 +19182,40 @@ function __pi_register_provider(provider_id, spec) {
         throw new Error('registerProvider: spec.streamSimple must be a function');
     }
 
+    const api = spec.api ? String(spec.api) : '';
+    const registeredApiProvider =
+        typeof globalThis.__pi_get_registered_api_provider === 'function'
+            ? globalThis.__pi_get_registered_api_provider(api)
+            : undefined;
+    if (
+        registeredApiProvider &&
+        registeredApiProvider.extensionId &&
+        registeredApiProvider.extensionId !== ext.id &&
+        !hasStreamSimple
+    ) {
+        throw new Error(
+            `registerProvider: api '${api}' is registered by extension '${registeredApiProvider.extensionId}', not '${ext.id}'`
+        );
+    }
+    const apiStreamSimple =
+        registeredApiProvider &&
+        registeredApiProvider.provider &&
+        typeof registeredApiProvider.provider.streamSimple === 'function'
+            ? registeredApiProvider.provider.streamSimple
+            : null;
+    const streamSimple = hasStreamSimple ? spec.streamSimple : apiStreamSimple;
+    const effectiveHasStreamSimple = typeof streamSimple === 'function';
+
     const providerSpec = {
         id: id,
         baseUrl: spec.baseUrl ? String(spec.baseUrl) : '',
         apiKey: spec.apiKey ? String(spec.apiKey) : '',
-        api: spec.api ? String(spec.api) : '',
+        api: api,
         models: models,
-        hasStreamSimple: hasStreamSimple,
+        hasStreamSimple: effectiveHasStreamSimple,
     };
 
-    if (hasStreamSimple && !providerSpec.api) {
+    if (effectiveHasStreamSimple && !providerSpec.api) {
         throw new Error('registerProvider: api is required when registering streamSimple');
     }
 
@@ -19074,7 +19229,7 @@ function __pi_register_provider(provider_id, spec) {
     const record = {
         extensionId: ext.id,
         spec: providerSpec,
-        streamSimple: hasStreamSimple ? spec.streamSimple : null,
+        streamSimple: streamSimple,
     };
     ext.providers.set(id, record);
     __pi_provider_index.set(id, record);
@@ -29531,6 +29686,98 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(r["streamType"], json!("function"));
             assert_eq!(r["streamSimpleType"], json!("function"));
             assert_eq!(r["modelId"], json!("gpt-5.5"));
+        });
+    }
+
+    #[test]
+    fn pijs_pi_ai_register_api_provider_dispatches_and_unregisters() {
+        futures::executor::block_on(async {
+            let clock = Arc::new(DeterministicClock::new(0));
+            let runtime = PiJsRuntime::with_clock(Arc::clone(&clock))
+                .await
+                .expect("create runtime");
+
+            runtime
+                .eval(
+                    r#"
+                    globalThis.piAiRegisteredApiProvider = {};
+                    (async () => {
+                        const ai = await import('@earendil-works/pi-ai/compat');
+                        const makeStream = (model, text) => {
+                            const events = ai.createAssistantMessageEventStream();
+                            events.push({ type: 'text_delta', delta: text });
+                            events.push({
+                                type: 'done',
+                                message: {
+                                    role: 'assistant',
+                                    content: [{ type: 'text', text }],
+                                    api: model.api,
+                                    provider: model.provider,
+                                    model: model.id,
+                                    stopReason: 'stop',
+                                },
+                            });
+                            return events;
+                        };
+                        ai.registerApiProvider({
+                            api: 'fixture-api',
+                            stream: (model) => makeStream(model, 'full'),
+                            streamSimple: (model) => makeStream(model, 'simple'),
+                        }, 'fixture-source');
+
+                        const model = { api: 'fixture-api', provider: 'fixture', id: 'fixture-model' };
+                        const provider = ai.getApiProvider('fixture-api');
+                        const events = [];
+                        for await (const event of ai.streamSimple(model, [])) {
+                            events.push(event.type + ':' + (event.delta || ''));
+                        }
+                        const completed = await ai.completeSimple(model, []);
+                        let mismatched = '';
+                        try {
+                            ai.streamSimple({ api: 'wrong-api' }, []);
+                        } catch (error) {
+                            mismatched = String((error && error.message) || error || '');
+                        }
+                        globalThis.piAiRegisteredApiProvider = {
+                            providerApi: provider && provider.api,
+                            providerStream: typeof (provider && provider.stream),
+                            providerStreamSimple: typeof (provider && provider.streamSimple),
+                            providersBeforeUnregister: ai.getApiProviders().length,
+                            events,
+                            completedText: completed.content[0].text,
+                            mismatched,
+                        };
+                        ai.unregisterApiProviders('fixture-source');
+                        globalThis.piAiRegisteredApiProvider.providersAfterUnregister = ai.getApiProviders().length;
+                    })().catch((error) => {
+                        globalThis.piAiRegisteredApiProvider.error = String((error && error.message) || error || '');
+                    });
+                    "#,
+                )
+                .await
+                .expect("eval registerApiProvider");
+
+            drain_until_idle(&runtime, &clock).await;
+
+            let result = get_global_json(&runtime, "piAiRegisteredApiProvider").await;
+            assert_eq!(
+                result["error"],
+                serde_json::Value::Null,
+                "unexpected error: {result:?}"
+            );
+            assert_eq!(result["providerApi"], json!("fixture-api"));
+            assert_eq!(result["providerStream"], json!("function"));
+            assert_eq!(result["providerStreamSimple"], json!("function"));
+            assert_eq!(result["providersBeforeUnregister"], json!(1));
+            assert_eq!(result["providersAfterUnregister"], json!(0));
+            assert_eq!(result["events"], json!(["text_delta:simple", "done:"]));
+            assert_eq!(result["completedText"], json!("simple"));
+            assert!(
+                result["mismatched"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("No API provider registered")),
+                "unregistered API lookup must fail closed: {result:?}"
+            );
         });
     }
 

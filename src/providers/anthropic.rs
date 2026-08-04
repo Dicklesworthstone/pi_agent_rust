@@ -7,8 +7,8 @@ use crate::auth::unmark_anthropic_oauth_bearer_token;
 use crate::error::{Error, Result};
 use crate::http::client::Client;
 use crate::model::{
-    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopReason, StreamEvent,
-    TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
+    AssistantMessage, ContentBlock, Message, RedactedThinkingContent, StopDetails, StopReason,
+    StreamEvent, TextContent, ThinkingContent, ThinkingLevel, ToolCall, Usage, UserContent,
 };
 use crate::models::CompatConfig;
 use crate::provider::{CacheRetention, Context, Provider, StreamOptions, ToolDef};
@@ -791,6 +791,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -820,7 +821,7 @@ where
                 Ok(self.handle_content_block_stop(index))
             }
             AnthropicStreamEvent::MessageDelta { delta, usage } => {
-                self.handle_message_delta(&delta, usage);
+                self.handle_message_delta(&delta, usage)?;
                 Ok(None)
             }
             AnthropicStreamEvent::MessageStop => {
@@ -1040,21 +1041,34 @@ where
         &mut self,
         delta: &AnthropicMessageDelta,
         usage: Option<AnthropicDeltaUsage>,
-    ) {
-        if let Some(stop_reason) = delta.stop_reason {
+    ) -> Result<()> {
+        if let Some(stop_reason) = delta.stop_reason.as_deref() {
             self.partial.stop_reason = match stop_reason {
-                AnthropicStopReason::MaxTokens => StopReason::Length,
-                AnthropicStopReason::ToolUse => StopReason::ToolUse,
-                AnthropicStopReason::EndTurn | AnthropicStopReason::StopSequence => {
-                    StopReason::Stop
+                "end_turn" | "stop_sequence" => StopReason::Stop,
+                "max_tokens" => StopReason::Length,
+                // Our normalized model has one truncation outcome; Anthropic's
+                // context-window stop is therefore intentionally represented as
+                // `Length`, alongside ordinary output-token exhaustion.
+                "model_context_window_exceeded" => StopReason::Length,
+                "tool_use" => StopReason::ToolUse,
+                "pause_turn" => StopReason::PauseTurn,
+                "refusal" => StopReason::Refusal,
+                unknown => {
+                    return Err(Error::provider(
+                        "anthropic",
+                        format!("unsupported Anthropic stop_reason `{unknown}`"),
+                    ));
                 }
             };
+            self.partial.stop_details = delta.stop_details.clone();
         }
 
         if let Some(u) = usage {
             self.partial.usage.output = u.output_tokens;
             self.recompute_total_tokens();
         }
+
+        Ok(())
     }
 }
 
@@ -1268,20 +1282,12 @@ enum AnthropicDelta {
 
 /// Stop reason from `message_delta`.
 ///
-/// Using an enum avoids allocating a `String` for the stop reason.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AnthropicStopReason {
-    EndTurn,
-    MaxTokens,
-    ToolUse,
-    StopSequence,
-}
-
 #[derive(Debug, Deserialize)]
 struct AnthropicMessageDelta {
     #[serde(default)]
-    stop_reason: Option<AnthropicStopReason>,
+    stop_reason: Option<String>,
+    #[serde(default)]
+    stop_details: Option<StopDetails>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1894,6 +1900,102 @@ mod tests {
         } else {
             panic!();
         }
+    }
+
+    #[test]
+    fn all_stable_anthropic_stop_reasons_are_handled() {
+        let cases = [
+            ("end_turn", StopReason::Stop),
+            ("max_tokens", StopReason::Length),
+            ("stop_sequence", StopReason::Stop),
+            ("tool_use", StopReason::ToolUse),
+            ("pause_turn", StopReason::PauseTurn),
+            ("refusal", StopReason::Refusal),
+            ("model_context_window_exceeded", StopReason::Length),
+        ];
+
+        for (wire_reason, expected_reason) in cases {
+            let mut delta = json!({ "stop_reason": wire_reason });
+            if wire_reason == "refusal" {
+                delta["stop_details"] = json!({
+                    "type": "refusal",
+                    "category": "cyber",
+                    "explanation": "The request could enable cyber harm."
+                });
+            }
+            let events = vec![
+                json!({
+                    "type": "message_start",
+                    "message": { "usage": { "input_tokens": 5 } }
+                }),
+                json!({
+                    "type": "message_delta",
+                    "delta": delta,
+                    "usage": { "output_tokens": 7 }
+                }),
+                json!({ "type": "message_stop" }),
+            ];
+
+            let out = collect_events(&events);
+            assert_eq!(out.len(), 2, "{wire_reason}");
+            let StreamEvent::Done { reason, message } = &out[1] else {
+                panic!("expected terminal Done event for {wire_reason}");
+            };
+            assert_eq!(*reason, expected_reason, "{wire_reason}");
+            assert_eq!(message.stop_reason, expected_reason, "{wire_reason}");
+            assert_eq!(message.usage.total_tokens, 12, "{wire_reason}");
+
+            if wire_reason == "refusal" {
+                assert_eq!(
+                    message.stop_details.as_ref().map(|details| (
+                        details.kind.as_str(),
+                        details.category.as_deref(),
+                        details.explanation.as_deref(),
+                    )),
+                    Some((
+                        "refusal",
+                        Some("cyber"),
+                        Some("The request could enable cyber harm."),
+                    )),
+                );
+            } else {
+                assert!(message.stop_details.is_none(), "{wire_reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_anthropic_stop_reason_is_an_explicit_protocol_error() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        runtime.block_on(async {
+            let byte_stream = stream::iter(vec![Ok::<_, std::io::Error>(
+                b"data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"future_reason\"}}\n\n"
+                    .to_vec(),
+            )]);
+            let mut state = StreamState::new(
+                crate::sse::SseStream::new(Box::pin(byte_stream)),
+                "claude-test".to_string(),
+                "anthropic-messages".to_string(),
+                "anthropic".to_string(),
+            );
+            let event = state
+                .event_source
+                .next()
+                .await
+                .expect("event")
+                .expect("SSE event");
+            let error = state
+                .process_event(&event.data)
+                .expect_err("unknown stop reason must fail the protocol");
+            assert!(
+                error
+                    .to_string()
+                    .contains("unsupported Anthropic stop_reason `future_reason`"),
+                "unexpected error: {error}"
+            );
+        });
     }
 
     #[test]
@@ -2758,6 +2860,8 @@ mod tests {
             StopReason::Stop => "stop",
             StopReason::Length => "length",
             StopReason::ToolUse => "tool_use",
+            StopReason::PauseTurn => "pause_turn",
+            StopReason::Refusal => "refusal",
             StopReason::Error => "error",
             StopReason::Aborted => "aborted",
         }

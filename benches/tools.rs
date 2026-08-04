@@ -220,6 +220,7 @@ fn bench_streaming_arc(c: &mut Criterion) {
                 model: "claude-sonnet-4".into(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -254,6 +255,7 @@ fn bench_streaming_arc(c: &mut Criterion) {
                 model: "claude-sonnet-4".into(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };

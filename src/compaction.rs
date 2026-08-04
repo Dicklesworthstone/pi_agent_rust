@@ -2382,6 +2382,7 @@ mod tests {
                 provider: String::new(),
                 model: String::new(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
                 usage: Usage {
@@ -2409,6 +2410,7 @@ mod tests {
                 provider: String::new(),
                 model: String::new(),
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
                 usage: Usage::default(),
@@ -3047,6 +3049,7 @@ mod tests {
                 provider: String::new(),
                 model: String::new(),
                 stop_reason: StopReason::Aborted,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
                 usage: Usage {
@@ -3069,6 +3072,7 @@ mod tests {
                 provider: String::new(),
                 model: String::new(),
                 stop_reason: StopReason::Error,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
                 usage: Usage::default(),
@@ -3325,6 +3329,7 @@ mod tests {
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         })];
@@ -3345,6 +3350,7 @@ mod tests {
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         })];
@@ -3365,6 +3371,7 @@ mod tests {
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         })];

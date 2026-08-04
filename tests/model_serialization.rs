@@ -56,6 +56,7 @@ fn make_assistant_message(content: Vec<ContentBlock>) -> AssistantMessage {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     }
@@ -172,6 +173,7 @@ fn test_assistant_message_round_trip() {
             },
         },
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     });
@@ -207,6 +209,7 @@ fn test_assistant_message_with_error() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Error,
+        stop_details: None,
         error_message: Some("Rate limit exceeded".to_string()),
         timestamp: 1_700_000_000,
     });
@@ -981,6 +984,7 @@ fn test_empty_content_blocks() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     });
@@ -1139,6 +1143,7 @@ fn test_mixed_content_sequence() {
         model: "claude-3-5-sonnet-20241022".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     });

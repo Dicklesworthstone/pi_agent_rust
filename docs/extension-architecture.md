@@ -338,6 +338,15 @@ Extensions can register custom LLM providers via
 `pi.events("registerProvider", spec)`. The provider implements
 `streamSimple(model, context, options)` returning `AsyncIterable<string>`.
 
+Extensions that follow the `@mariozechner/pi-ai/compat` API can instead call
+`registerApiProvider({ api, stream, streamSimple }, sourceId)` before they call
+`pi.registerProvider`. The runtime keeps that API provider scoped to the
+registering extension, exposes it through `getApiProvider` and
+`getApiProviders`, and binds its `streamSimple` handler to matching provider
+models. `unregisterApiProviders(sourceId)` removes only entries owned by the
+calling extension. This lets compatibility providers supply a protocol handler
+without granting another extension access to it.
+
 Rust side: `ExtensionStreamSimpleProvider` in `src/providers/mod.rs`
 implements the `Provider` trait. Each chunk from JS becomes a
 `StreamEvent::TextDelta`. Cancellation is via `Drop` on the stream state.

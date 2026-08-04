@@ -322,6 +322,7 @@ impl Provider for GitLabProvider {
             model: self.model.clone(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: chrono::Utc::now().timestamp_millis(),
         };
@@ -425,6 +426,7 @@ mod tests {
                     model: String::new(),
                     usage: Usage::default(),
                     stop_reason: StopReason::default(),
+                    stop_details: None,
                     error_message: None,
                     timestamp: 0,
                 }),

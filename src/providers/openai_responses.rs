@@ -673,6 +673,7 @@ where
                 model,
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: chrono::Utc::now().timestamp_millis(),
             },
@@ -3098,6 +3099,8 @@ mod tests {
             StopReason::Stop => "stop".to_string(),
             StopReason::ToolUse => "tool_use".to_string(),
             StopReason::Length => "length".to_string(),
+            StopReason::PauseTurn => "pause_turn".to_string(),
+            StopReason::Refusal => "refusal".to_string(),
             StopReason::Error => "error".to_string(),
             StopReason::Aborted => "aborted".to_string(),
         }

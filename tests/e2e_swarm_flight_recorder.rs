@@ -121,6 +121,7 @@ impl FlightProvider {
                 ..Usage::default()
             },
             stop_reason,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }
@@ -279,6 +280,7 @@ impl Provider for HangingStreamProvider {
             model: self.model_id().into(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };

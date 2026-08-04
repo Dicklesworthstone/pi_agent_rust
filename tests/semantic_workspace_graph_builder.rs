@@ -439,6 +439,7 @@ fn e2e_assistant_message(text: &str) -> AssistantMessage {
         model: "context-e2e-model".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     }

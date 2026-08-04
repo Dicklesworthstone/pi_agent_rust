@@ -556,6 +556,7 @@ mod tests {
                 model: "gpt-4o-mini".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }),

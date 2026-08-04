@@ -179,6 +179,7 @@ fn build_assistant_message(text: String) -> AssistantMessage {
         model: "benchmark".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: chrono::Utc::now().timestamp_millis(),
     }

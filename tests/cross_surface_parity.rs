@@ -334,6 +334,7 @@ mod session_invariants {
             model: "test-model".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         })
@@ -556,6 +557,7 @@ mod message_serde_invariants {
             model: "claude-opus-4-5".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });

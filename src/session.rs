@@ -5808,6 +5808,7 @@ mod tests {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             },
@@ -5833,6 +5834,7 @@ mod tests {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             },
@@ -5869,6 +5871,7 @@ mod tests {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Aborted,
+                stop_details: None,
                 error_message: Some("interrupted by local abort".to_string()),
                 timestamp: 0,
             },
@@ -7336,6 +7339,7 @@ mod tests {
             model: "claude-test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -8154,6 +8158,7 @@ mod tests {
             model: "claude-test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -8563,6 +8568,7 @@ mod tests {
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -8604,6 +8610,7 @@ mod tests {
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -8842,6 +8849,7 @@ mod tests {
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -8873,6 +8881,7 @@ mod tests {
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -10077,6 +10086,7 @@ mod tests {
                 cost: Cost::default(),
             },
             stop_reason: StopReason::ToolUse,
+            stop_details: None,
             error_message: None,
             timestamp: 12345,
         };

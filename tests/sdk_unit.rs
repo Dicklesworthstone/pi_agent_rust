@@ -194,6 +194,7 @@ fn transport_session_prompt_result_variants() {
         model: "test".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     };

@@ -513,6 +513,14 @@ pub const MAX_TOOL_ITERATIONS_DEFAULT: usize = 50;
 /// spec implementations).
 pub const MAX_TOOL_ITERATIONS_CEILING: usize = 1_000;
 
+/// Maximum automatic continuations after an Anthropic `pause_turn` stop.
+///
+/// Anthropic documents `pause_turn` as a successful, resumable response from
+/// long-running server tools. Retrying indefinitely would let a broken remote
+/// tool turn one user request into an unbounded loop, so keep the provider's
+/// recommended retry budget explicit and small.
+pub const MAX_PAUSE_TURN_CONTINUATIONS: usize = 3;
+
 /// Threshold (as a fraction of `max_tool_iterations`) at which the runtime
 /// emits a one-shot soft-handoff steering message so the agent can begin a
 /// graceful incomplete-handoff rather than being silently killed at the cap.
@@ -1417,6 +1425,7 @@ impl Agent {
             model: self.provider.model_id().to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Aborted,
+            stop_details: None,
             error_message: Some("Aborted".to_string()),
             timestamp: Utc::now().timestamp_millis(),
         });
@@ -1439,6 +1448,7 @@ impl Agent {
             model: self.provider.model_id().to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Error,
+            stop_details: None,
             error_message: Some(error_message.clone()),
             timestamp: Utc::now().timestamp_millis(),
         });
@@ -1465,6 +1475,7 @@ impl Agent {
             .unwrap_or("")
             .into();
         let mut iterations = 0usize;
+        let mut pause_turn_continuations = 0usize;
         let mut warned_at_handoff_threshold = false;
         let mut turn_index: usize = 0;
         let mut new_messages: Vec<Message> = Vec::with_capacity(prompts.len() + 8);
@@ -1661,10 +1672,31 @@ impl Agent {
                 }
 
                 let tool_calls = extract_tool_calls(&assistant_arc.content);
-                has_more_tool_calls = !tool_calls.is_empty();
+                let pause_turn = assistant_arc.stop_reason == StopReason::PauseTurn;
+                // A paused Anthropic server-tool turn must be resubmitted
+                // verbatim. Its content can contain tool-use blocks, but those
+                // are not a request to execute our local tool registry.
+                let execute_local_tools = !pause_turn && !tool_calls.is_empty();
+                has_more_tool_calls = execute_local_tools;
+                if pause_turn {
+                    pause_turn_continuations = pause_turn_continuations.saturating_add(1);
+                    if pause_turn_continuations <= MAX_PAUSE_TURN_CONTINUATIONS {
+                        // The completed assistant message is already in history. The
+                        // next stream request therefore resubmits it verbatim with
+                        // the same model, tools, and stream options, as Anthropic
+                        // requires. No synthetic user message is introduced.
+                        has_more_tool_calls = true;
+                    } else {
+                        tracing::warn!(
+                            pause_turn_continuations,
+                            max = MAX_PAUSE_TURN_CONTINUATIONS,
+                            "pause_turn continuation limit reached"
+                        );
+                    }
+                }
 
                 let mut tool_results: Vec<Arc<ToolResultMessage>> = Vec::new();
-                if has_more_tool_calls {
+                if execute_local_tools {
                     iterations += 1;
                     // Soft handoff: at >=80% of the cap, push a one-shot
                     // steering message so the agent has room to write an
@@ -2660,6 +2692,7 @@ impl Agent {
             model: self.provider.model_id().to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: Utc::now().timestamp_millis(),
         };
@@ -3827,6 +3860,7 @@ fn push_pi_ai_assistant_message(text: &str, messages: &mut Vec<Message>) {
     messages.push(Message::assistant(AssistantMessage {
         content: vec![ContentBlock::Text(TextContent::new(text.to_string()))],
         timestamp: Utc::now().timestamp_millis(),
+        stop_details: None,
         ..AssistantMessage::default()
     }));
 }
@@ -4608,6 +4642,7 @@ mod extensions_integration_tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -4620,6 +4655,7 @@ mod extensions_integration_tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -4696,6 +4732,7 @@ mod extensions_integration_tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }
@@ -5208,6 +5245,7 @@ mod extensions_integration_tests {
                 model: "capture-model".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -6601,6 +6639,7 @@ mod abort_tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -6665,6 +6704,7 @@ mod abort_tests {
                 model: "test-model".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }
@@ -6755,6 +6795,7 @@ mod abort_tests {
                 model: "test-model".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -7284,6 +7325,7 @@ mod turn_event_tests {
             model: "test-model".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }
@@ -7323,6 +7365,70 @@ mod turn_event_tests {
                 }),
             ];
             Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    struct PauseThenStopProvider {
+        calls: AtomicUsize,
+        pause_turns: usize,
+        pause_has_tool_call: bool,
+        contexts: std::sync::Mutex<Vec<Vec<Message>>>,
+    }
+
+    #[async_trait]
+    #[allow(clippy::unnecessary_literal_bound)]
+    impl Provider for PauseThenStopProvider {
+        fn name(&self) -> &str {
+            "test-provider"
+        }
+
+        fn api(&self) -> &str {
+            "test-api"
+        }
+
+        fn model_id(&self) -> &str {
+            "test-model"
+        }
+
+        async fn stream(
+            &self,
+            context: &Context<'_>,
+            _options: &StreamOptions,
+        ) -> crate::error::Result<
+            Pin<Box<dyn Stream<Item = crate::error::Result<StreamEvent>> + Send>>,
+        > {
+            self.contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(context.messages.to_vec());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let partial = assistant_message("");
+            let mut done = if call < self.pause_turns {
+                assistant_message("server tool is still working")
+            } else {
+                assistant_message("completed after pause")
+            };
+            done.stop_reason = if call < self.pause_turns {
+                StopReason::PauseTurn
+            } else {
+                StopReason::Stop
+            };
+            if call < self.pause_turns && self.pause_has_tool_call {
+                done.content = vec![ContentBlock::ToolCall(ToolCall {
+                    id: "server-tool-1".to_string(),
+                    name: "server_tool".to_string(),
+                    arguments: json!({}),
+                    thought_signature: None,
+                })];
+            }
+
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(StreamEvent::Start { partial }),
+                Ok(StreamEvent::Done {
+                    reason: done.stop_reason,
+                    message: done,
+                }),
+            ])))
         }
     }
 
@@ -7414,6 +7520,7 @@ mod turn_event_tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }
@@ -7469,6 +7576,111 @@ mod turn_event_tests {
                 }),
             ])))
         }
+    }
+
+    #[test]
+    fn pause_turn_resubmits_the_assistant_response_without_a_synthetic_user_message() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(PauseThenStopProvider {
+            calls: AtomicUsize::new(0),
+            pause_turns: 1,
+            pause_has_tool_call: false,
+            contexts: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider_for_assertions = Arc::clone(&provider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+        runtime.block_on(async move {
+            let result = agent
+                .run("search for current news", |_| {})
+                .await
+                .expect("pause continuation succeeds");
+            assert_eq!(result.stop_reason, StopReason::Stop);
+            assert!(matches!(
+                result.content.as_slice(),
+                [ContentBlock::Text(text)] if text.text == "completed after pause"
+            ));
+        });
+
+        assert_eq!(provider_for_assertions.calls.load(Ordering::SeqCst), 2);
+        let contexts = provider_for_assertions
+            .contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(contexts.len(), 2);
+        assert!(matches!(contexts[0].as_slice(), [Message::User(_)]));
+        assert!(matches!(
+            contexts[1].as_slice(),
+            [Message::User(_), Message::Assistant(message)]
+                if message.stop_reason == StopReason::PauseTurn
+                    && matches!(message.content.as_slice(), [ContentBlock::Text(text)] if text.text == "server tool is still working")
+        ));
+    }
+
+    #[test]
+    fn pause_turn_never_executes_its_tool_call_as_a_local_tool() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(PauseThenStopProvider {
+            calls: AtomicUsize::new(0),
+            pause_turns: 1,
+            pause_has_tool_call: true,
+            contexts: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider_for_assertions = Arc::clone(&provider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+        runtime.block_on(async move {
+            let result = agent
+                .run("wait for the server tool", |_| {})
+                .await
+                .expect("pause continuation succeeds without local tool execution");
+            assert_eq!(result.stop_reason, StopReason::Stop);
+        });
+
+        let contexts = provider_for_assertions
+            .contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(
+            contexts[1].as_slice(),
+            [Message::User(_), Message::Assistant(message)]
+                if matches!(message.content.as_slice(), [ContentBlock::ToolCall(call)] if call.name == "server_tool")
+        ));
+    }
+
+    #[test]
+    fn pause_turn_continuation_budget_stops_an_unbounded_server_tool_loop() {
+        let runtime = RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+        let provider = Arc::new(PauseThenStopProvider {
+            calls: AtomicUsize::new(0),
+            pause_turns: MAX_PAUSE_TURN_CONTINUATIONS + 1,
+            pause_has_tool_call: false,
+            contexts: std::sync::Mutex::new(Vec::new()),
+        });
+        let provider_for_assertions = Arc::clone(&provider);
+        let tools = ToolRegistry::new(&[], Path::new("."), None);
+        let mut agent = Agent::new(provider, tools, AgentConfig::default());
+
+        runtime.block_on(async move {
+            let result = agent
+                .run("run the server tool", |_| {})
+                .await
+                .expect("bounded pause continuation succeeds");
+            assert_eq!(result.stop_reason, StopReason::PauseTurn);
+        });
+
+        assert_eq!(
+            provider_for_assertions.calls.load(Ordering::SeqCst),
+            MAX_PAUSE_TURN_CONTINUATIONS + 1
+        );
     }
 
     #[test]
@@ -10589,6 +10801,7 @@ mod tests {
             model: "test-model".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         }
@@ -11571,6 +11784,7 @@ mod tests {
                 model: "test".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             })),

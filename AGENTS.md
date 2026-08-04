@@ -214,7 +214,7 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 | `src/providers/cohere.rs` | Cohere API implementation |
 | `src/providers/azure.rs` | Azure OpenAI API implementation |
 | `src/providers/mod.rs` | Provider factory and extension stream-simple bridge |
-| `src/tools.rs` | 8 built-in tools |
+| `src/tools.rs` | 9 built-in tools (`subagent` is opt-in) |
 | `src/interactive.rs` | Interactive TUI application state and event loop |
 | `src/rpc.rs` | RPC/stdin server mode |
 | `src/extensions.rs` | Extension protocol, policy, and host integration |
@@ -250,6 +250,7 @@ Session persistence + index (JSONL, default-enabled SQLite backend support)
 - `find` - File discovery with glob patterns
 - `ls` - Directory listing
 - `hashline_edit` - Precise edits using `LINE#HASH` tags from `read`/`grep` with `hashline=true`
+- `subagent` - Native isolated Rust Pi child-agent delegation (opt-in via `--tools ...subagent`)
 
 **Session Management:**
 - JSONL format (version 3)

@@ -2527,6 +2527,7 @@ mod tests {
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });
@@ -2560,6 +2561,7 @@ mod tests {
             model: String::new(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });

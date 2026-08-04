@@ -308,6 +308,7 @@ impl BedrockProvider {
             model: self.model.clone(),
             usage,
             stop_reason,
+            stop_details: None,
             error_message: None,
             timestamp: Utc::now().timestamp_millis(),
         }
@@ -1031,6 +1032,7 @@ mod tests {
                     model: "m".to_string(),
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
+                    stop_details: None,
                     error_message: None,
                     timestamp: 0,
                 }),

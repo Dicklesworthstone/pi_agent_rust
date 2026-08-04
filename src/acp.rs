@@ -1643,7 +1643,9 @@ const ACP_STOP_REASON_ERROR: &str = "end_turn";
 const fn map_stop_reason(reason: crate::model::StopReason) -> &'static str {
     use crate::model::StopReason;
     match reason {
-        StopReason::Stop | StopReason::ToolUse => ACP_STOP_REASON_END_TURN,
+        StopReason::Stop | StopReason::ToolUse | StopReason::PauseTurn | StopReason::Refusal => {
+            ACP_STOP_REASON_END_TURN
+        }
         StopReason::Length => ACP_STOP_REASON_MAX_TOKENS,
         StopReason::Aborted => ACP_STOP_REASON_CANCELLED,
         StopReason::Error => ACP_STOP_REASON_ERROR,

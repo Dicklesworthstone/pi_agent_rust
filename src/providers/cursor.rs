@@ -905,6 +905,7 @@ impl Provider for CursorProvider {
             provider: self.provider.clone(),
             model: self.model.clone(),
             timestamp: Utc::now().timestamp_millis(),
+            stop_details: None,
             ..AssistantMessage::default()
         };
 

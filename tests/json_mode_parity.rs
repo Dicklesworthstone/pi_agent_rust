@@ -77,6 +77,7 @@ fn test_assistant_message() -> AssistantMessage {
             ..Usage::default()
         },
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     }
@@ -3325,6 +3326,7 @@ fn json_parity_assistant_message_mixed_content() {
         model: "claude-sonnet-4-20250514".to_string(),
         usage: Usage::default(),
         stop_reason: StopReason::ToolUse,
+        stop_details: None,
         error_message: None,
         timestamp: 1_700_000_000,
     };

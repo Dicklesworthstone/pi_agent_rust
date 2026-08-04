@@ -3158,6 +3158,7 @@ mod retry_tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -3229,6 +3230,7 @@ mod retry_tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Error,
+                stop_details: None,
                 error_message: Some("server error".to_string()),
                 timestamp: 0,
             };
@@ -5536,6 +5538,7 @@ mod tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -5570,6 +5573,7 @@ mod tests {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }
@@ -5652,6 +5656,7 @@ mod tests {
             model: "test-model".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         })
@@ -7629,6 +7634,7 @@ export default function init(pi) {
                         ..Usage::default()
                     },
                     stop_reason: StopReason::Stop,
+                    stop_details: None,
                     error_message: None,
                     timestamp: 0,
                 },
@@ -7648,6 +7654,7 @@ export default function init(pi) {
                         ..Usage::default()
                     },
                     stop_reason: StopReason::Stop,
+                    stop_details: None,
                     error_message: None,
                     timestamp: 0,
                 },

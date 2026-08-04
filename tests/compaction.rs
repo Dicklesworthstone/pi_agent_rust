@@ -88,6 +88,7 @@ impl Provider for ScriptedProvider {
             model: "scripted-model".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -200,6 +201,7 @@ fn assistant_message(
             model: "test-model".to_string(),
             usage,
             stop_reason,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         },
@@ -1737,6 +1739,7 @@ fn compact_returns_error_when_provider_stops_with_error() {
                 model: "error-provider".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Error,
+                stop_details: None,
                 error_message: Some("provider failed".to_string()),
                 timestamp: 0,
             };

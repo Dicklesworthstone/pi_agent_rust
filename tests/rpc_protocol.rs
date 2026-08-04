@@ -268,6 +268,7 @@ fn rpc_get_messages_preserves_tool_call_identity_and_args() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },

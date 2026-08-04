@@ -81,6 +81,7 @@ fn make_assistant(
             ..Usage::default()
         },
         stop_reason,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     }
@@ -94,6 +95,7 @@ fn stream_done(msg: AssistantMessage) -> Pin<Box<dyn Stream<Item = Result<Stream
         model: msg.model.clone(),
         usage: Usage::default(),
         stop_reason: StopReason::Stop,
+        stop_details: None,
         error_message: None,
         timestamp: 0,
     };

@@ -151,6 +151,7 @@ fn prepopulated_session() -> Session {
                 ..Usage::default()
             },
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: now,
         },
@@ -215,6 +216,7 @@ fn large_fork_session() -> (Session, String, String) {
                 model: "gpt-4o-mini".to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: now + idx,
             },
@@ -727,6 +729,7 @@ fn rpc_get_session_stats_with_tool_calls() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },
@@ -754,6 +757,7 @@ fn rpc_get_session_stats_with_tool_calls() {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: now,
             },

@@ -8097,6 +8097,7 @@ mod tests {
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Error,
+            stop_details: None,
             error_message: Some("429 rate limit exceeded".to_string()),
             timestamp: 0,
         };
@@ -8104,12 +8105,14 @@ mod tests {
 
         let not_retryable = AssistantMessage {
             error_message: Some("invalid api key".to_string()),
+            stop_details: None,
             ..retryable.clone()
         };
         assert!(!is_retryable_prompt_result(&not_retryable));
 
         let success = AssistantMessage {
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             ..retryable
         };
@@ -8136,6 +8139,7 @@ mod tests {
             model: "test".to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Error,
+            stop_details: None,
             error_message: Some(flattened),
             timestamp: 0,
         };
@@ -8206,6 +8210,7 @@ mod tests {
             model: "test-model".to_string(),
             usage: pi::model::Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         });
@@ -8227,6 +8232,7 @@ mod tests {
                 model: "test-model".to_string(),
                 usage: pi::model::Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             }),

@@ -24,6 +24,7 @@ fn test_compaction_usage_double_counting_bug() {
             model: "test".to_string(),
             usage,
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         },

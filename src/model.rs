@@ -63,6 +63,14 @@ pub struct AssistantMessage {
     pub model: String,
     pub usage: Usage,
     pub stop_reason: StopReason,
+    /// Provider-supplied structured details for a terminal stop reason.
+    ///
+    /// Anthropic currently emits these for `refusal` stops. Keeping the
+    /// provider response structured (rather than flattening it into
+    /// `error_message`) lets callers make an informed policy decision and
+    /// preserves the complete response in persisted sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_details: Option<StopDetails>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
     pub timestamp: i64,
@@ -121,10 +129,32 @@ pub enum StopReason {
     Length,
     /// The provider requested tool execution.
     ToolUse,
+    /// The provider paused a long-running turn and expects the assistant
+    /// response to be resubmitted unchanged to continue it.
+    PauseTurn,
+    /// The provider completed the request but declined it for policy reasons.
+    Refusal,
     /// The stream terminated due to an error.
     Error,
     /// The request was aborted locally.
     Aborted,
+}
+
+/// Provider-supplied structured details for a terminal stop reason.
+///
+/// The category is deliberately represented as a string. Providers may add
+/// categories without changing the response envelope, and preserving the
+/// received value is safer than turning an otherwise valid refusal into a
+/// deserialization failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopDetails {
+    /// Discriminator supplied by the provider (currently `"refusal"`).
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Provider policy category, if one is available.
+    pub category: Option<String>,
+    /// Human-readable provider explanation, if one is available.
+    pub explanation: Option<String>,
 }
 
 // ============================================================================
@@ -484,6 +514,7 @@ mod tests {
             model: "claude-sonnet-4".to_string(),
             usage: sample_usage(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 1_700_000_000,
         }
@@ -855,6 +886,8 @@ mod tests {
             StopReason::Stop,
             StopReason::Length,
             StopReason::ToolUse,
+            StopReason::PauseTurn,
+            StopReason::Refusal,
             StopReason::Error,
             StopReason::Aborted,
         ];
@@ -875,6 +908,27 @@ mod tests {
             serde_json::to_string(&StopReason::Stop).unwrap(),
             "\"stop\""
         );
+        assert_eq!(
+            serde_json::to_string(&StopReason::PauseTurn).unwrap(),
+            "\"pauseTurn\""
+        );
+    }
+
+    #[test]
+    fn refusal_stop_details_roundtrip_and_are_optional() {
+        let mut message = sample_assistant_message();
+        message.stop_reason = StopReason::Refusal;
+        message.stop_details = Some(StopDetails {
+            kind: "refusal".to_string(),
+            category: Some("cyber".to_string()),
+            explanation: Some("The request could enable cyber harm.".to_string()),
+        });
+
+        let json = serde_json::to_string(&message).expect("serialize");
+        assert!(json.contains("stopDetails"));
+        let parsed: AssistantMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.stop_reason, StopReason::Refusal);
+        assert_eq!(parsed.stop_details, message.stop_details);
     }
 
     // ── ContentBlock ───────────────────────────────────────────────────
@@ -943,6 +997,7 @@ mod tests {
                 }),
                 ContentBlock::Text(TextContent::new("After.")),
             ],
+            stop_details: None,
             ..AssistantMessage::default()
         };
         let json = serde_json::to_value(&original).expect("serialize");
@@ -1466,6 +1521,8 @@ mod tests {
             Just(StopReason::Stop),
             Just(StopReason::Length),
             Just(StopReason::ToolUse),
+            Just(StopReason::PauseTurn),
+            Just(StopReason::Refusal),
             Just(StopReason::Error),
             Just(StopReason::Aborted),
         ]
@@ -1617,6 +1674,7 @@ mod tests {
                         model,
                         usage,
                         stop_reason,
+                        stop_details: None,
                         error_message,
                         timestamp,
                     }

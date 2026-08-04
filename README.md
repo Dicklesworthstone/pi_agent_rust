@@ -42,7 +42,7 @@ You want an AI coding assistant in your terminal, but existing tools are:
 
 ## The Solution
 
-**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, stable streaming, and 8 built-in tools.
+**pi_agent_rust** is a from-scratch Rust port of [Pi Agent](https://github.com/badlogic/pi) by [Mario Zechner](https://github.com/badlogic) (made with his blessing!). Single binary, instant startup, stable streaming, and 9 built-in tools.
 
 Rather than a direct line-by-line translation, this port builds on two purpose-built Rust libraries:
 - **[asupersync](https://github.com/Dicklesworthstone/asupersync)**: A structured concurrency async runtime with built-in HTTP, TLS, and SQLite
@@ -307,7 +307,7 @@ pi "Write a quicksort implementation"
 
 Watch the response appear token-by-token, with thinking blocks shown inline.
 
-### 8 Built-in Tools
+### 9 Built-in Tools
 
 | Tool | Description | Example |
 |------|-------------|---------|
@@ -319,11 +319,56 @@ Watch the response appear token-by-token, with thinking blocks shown inline.
 | `grep` | Search file contents with context | Find all TODO comments |
 | `find` | Discover files by pattern | Find all *.rs files |
 | `ls` | List directory contents | What's in src/? |
+| `subagent` | Delegate isolated work to a named Rust Pi child agent | Ask a scout to inspect a provider |
 
 All tools include:
 - Automatic truncation for large outputs (2000 lines / 1MB)
 - Detailed metadata in responses
 - Process tree cleanup for bash (no orphaned processes)
+
+`subagent` is intentionally opt-in because it can start additional coding-agent
+processes. Enable it explicitly with `--tools` (or in the tools setting):
+
+```bash
+pi --tools read,bash,edit,write,grep,find,ls,hashline_edit,subagent \
+  "Use the scout agent to inspect the provider implementation."
+```
+
+### Native Subagents and Orchestration
+
+Rust Pi includes a native `subagent` tool; it does not depend on a QuickJS
+extension and never resolves a child executable by assuming a `pi` binary on
+`PATH`. By default it starts the current Rust Pi executable. Set
+`PI_SUBAGENT_PI_BINARY=/absolute/path/to/rpi` only when an explicit binary
+override is needed.
+
+Agent definitions are Markdown files in `$PI_CODING_AGENT_DIR/agents/*.md`
+(normally `~/.pi/agent/agents/*.md`) or the nearest
+`.pi/agents/*.md`. Project definitions take precedence over same-named user
+definitions. The process inherits the parent's provider, router, authentication,
+and model-registry environment, including `PI_CODING_AGENT_DIR`.
+
+```markdown
+---
+name: scout
+description: Inspect code and return concise, evidence-backed findings.
+model: ai-router/gpt-5.6-sol
+reasoning: low
+tools: read,grep,find,ls
+skills: ../skills/codebase-archaeology/SKILL.md
+---
+
+Read relevant code before answering. Do not edit files.
+```
+
+The tool accepts exactly one workflow shape: a single `{ agent, task }`, a
+bounded parallel `tasks` array (up to 8, default concurrency 4), or a sequential
+`chain` array. In chains, `{previous}` in a task is replaced by the preceding
+child's final output. Children run headlessly in isolated ephemeral sessions,
+stream progress into the parent TUI/JSON output, return structured status and
+stderr details, and are killed/reaped if the parent is cancelled. Child agents
+receive the declared tool allowlist; the default child allowlist deliberately
+excludes `subagent` to prevent accidental recursive delegation.
 
 ### Session Management
 
@@ -833,6 +878,7 @@ When multiple resources share the same name, the first occurrence wins. Collisio
 | `XAI_API_KEY` | xAI API key (OpenAI-compatible) |
 | `PI_CONFIG_PATH` | Custom config file path |
 | `PI_CODING_AGENT_DIR` | Override the global config directory |
+| `PI_SUBAGENT_PI_BINARY` | Explicit Rust Pi executable for native child agents; defaults to the current executable |
 | `PI_PACKAGE_DIR` | Override the packages directory |
 | `PI_SESSIONS_DIR` | Custom sessions directory |
 
@@ -2605,7 +2651,7 @@ A: Yes. Point any provider at a custom base URL via `models.json`. Pi normalizes
 | **Startup** | <100ms | ~1s | ~2s | ~5s |
 | **Memory** | <50MB | ~200MB | ~150MB | ~500MB |
 | **Providers** | 11 native provider implementation modules + OpenAI-compatible presets | Anthropic | Many | Many |
-| **Tools** | 8 built-in | Many | File-focused | IDE-integrated |
+| **Tools** | 9 built-in | Many | File-focused | IDE-integrated |
 | **Sessions** | JSONL tree | Proprietary | Git-based | Proprietary |
 | **Open source** | Yes | Yes | Yes | No |
 

@@ -286,6 +286,7 @@ impl Provider for MixedToolCallProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -296,6 +297,7 @@ impl Provider for MixedToolCallProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -355,6 +357,7 @@ impl Provider for MixedToolCallProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -365,6 +368,7 @@ impl Provider for MixedToolCallProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1029,6 +1033,7 @@ impl Provider for FailingToolProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::ToolUse,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1039,6 +1044,7 @@ impl Provider for FailingToolProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1086,6 +1092,7 @@ impl Provider for FailingToolProvider {
                     ..Usage::default()
                 },
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1096,6 +1103,7 @@ impl Provider for FailingToolProvider {
                 model: self.model_id().to_string(),
                 usage: Usage::default(),
                 stop_reason: StopReason::Stop,
+                stop_details: None,
                 error_message: None,
                 timestamp: 0,
             };
@@ -1308,6 +1316,7 @@ impl Provider for SimpleStopProvider {
                 ..Usage::default()
             },
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };
@@ -1318,6 +1327,7 @@ impl Provider for SimpleStopProvider {
             model: self.model_id().to_string(),
             usage: Usage::default(),
             stop_reason: StopReason::Stop,
+            stop_details: None,
             error_message: None,
             timestamp: 0,
         };

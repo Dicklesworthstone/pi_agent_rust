@@ -241,6 +241,10 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
             "hashline_edit",
             "Apply precise file edits using LINE#HASH tags from read or grep with hashline=true",
         ),
+        (
+            "subagent",
+            "Delegate isolated work to a named Rust Pi child agent; supports single, bounded parallel, and chained workflows",
+        ),
     ];
 
     let mut tools = Vec::new();

@@ -206,6 +206,8 @@ pub mod session_store_v2;
 #[doc(hidden)]
 pub mod sse;
 #[doc(hidden)]
+pub mod subagents;
+#[doc(hidden)]
 pub mod swarm_activity_ledger;
 #[doc(hidden)]
 pub mod swarm_flight_recorder;
