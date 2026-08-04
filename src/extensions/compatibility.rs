@@ -1332,10 +1332,15 @@ pi.exec("echo hello");
 
     #[test]
     fn compatibility_scanner_keeps_late_requires_in_minified_lines() {
-        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let sample =
-            repo_root.join("tests/ext_conformance/artifacts/doom-overlay/doom/build/doom.js");
-        let sample_content = fs::read_to_string(&sample).expect("read minified sample bundle");
+        let mut sample_content = String::from(
+            r#"const endpoint="https://example.invalid/assets";const matcher=/https?:\/\//;"#,
+        );
+        sample_content.push_str(&"const bundledValue=0;".repeat(512));
+        sample_content.push_str(r#"const cp=require("child_process");cp.spawnSync("true");"#);
+        assert!(
+            sample_content.len() > 4096,
+            "sample must exercise the long minified-line path"
+        );
 
         let temp = tempfile::tempdir().expect("tempdir");
         let entry = temp.path().join("bundle.js");

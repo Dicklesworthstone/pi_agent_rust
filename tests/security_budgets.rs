@@ -180,9 +180,30 @@ fn interrupt_budget_preserves_state_after_trip() {
 #[test]
 fn memory_limit_prevents_large_allocation() {
     futures::executor::block_on(async {
+        // Measure the bridge's initialized footprint first. The embedded bridge
+        // grows as compatibility shims are added, so a fixed limit can fail
+        // during runtime construction and never exercise allocation control.
+        let baseline_runtime = PiJsRuntime::with_clock_and_config(
+            DeterministicClock::new(0),
+            PiJsRuntimeConfig::default(),
+        )
+        .await
+        .expect("create baseline runtime");
+        let baseline_bytes = baseline_runtime
+            .tick()
+            .await
+            .expect("sample baseline memory")
+            .memory_used_bytes;
+        assert!(baseline_bytes > 0, "baseline memory should be measurable");
+        drop(baseline_runtime);
+
+        let memory_limit_bytes = usize::try_from(baseline_bytes)
+            .expect("QuickJS memory usage fits usize")
+            .saturating_add(2 * 1024 * 1024);
         let config = config_with_limits(PiJsRuntimeLimits {
-            // 1MB memory limit
-            memory_limit_bytes: Some(1024 * 1024),
+            // Leave modest headroom for the eval itself while keeping the
+            // attempted allocation far beyond the permitted heap.
+            memory_limit_bytes: Some(memory_limit_bytes),
             ..Default::default()
         });
 
@@ -196,7 +217,7 @@ fn memory_limit_prevents_large_allocation() {
             .await;
         assert!(
             result.is_err(),
-            "expected OOM error from 1GB allocation attempt"
+            "expected OOM error from allocation beyond the measured bridge baseline"
         );
     });
 }
