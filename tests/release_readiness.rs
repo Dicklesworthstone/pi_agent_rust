@@ -10,6 +10,8 @@ use tempfile::tempdir;
 
 const REPORT_SCHEMA: &str = "pi.release_readiness.v1";
 const MUST_PASS_GATE_SCHEMA: &str = "pi.ext.must_pass_gate.v1";
+const NON_MOCK_RUBRIC_SCHEMA: &str = "pi.qa.non_mock_rubric.v1";
+const FULL_SUITE_GATE_SCHEMA: &str = "pi.ci.full_suite_gate.v1";
 const EXT_REMEDIATION_BACKLOG_SCHEMA: &str = "pi.qa.extension_remediation_backlog.v1";
 const PRACTICAL_FINISH_CHECKPOINT_SCHEMA: &str = "pi.perf3x.practical_finish_checkpoint.v1";
 const PARAMETER_SWEEPS_SCHEMA: &str = "pi.perf.parameter_sweeps.v1";
@@ -147,6 +149,276 @@ fn validate_must_pass_gate_metadata(v: &V) -> Vec<String> {
     }
 
     errors
+}
+
+fn validate_non_mock_rubric(v: &V) -> (Signal, String) {
+    let schema = get_str(v, "/schema");
+    if schema == NON_MOCK_RUBRIC_SCHEMA {
+        (Signal::Pass, format!("Non-mock rubric present: {schema}"))
+    } else {
+        (
+            Signal::Fail,
+            format!("Invalid schema: expected {NON_MOCK_RUBRIC_SCHEMA}, found {schema}"),
+        )
+    }
+}
+
+fn validate_current_conformance_summary(v: &V) -> (Signal, String) {
+    const SCHEMA: &str = "pi.ext.conformance_summary.v2";
+    let schema = get_str(v, "/schema");
+    if schema != SCHEMA {
+        return (
+            Signal::Fail,
+            format!("Invalid schema: expected {SCHEMA}, found {schema}"),
+        );
+    }
+
+    let count = |name: &str| {
+        v.pointer(&format!("/counts/{name}"))
+            .and_then(V::as_u64)
+            .ok_or_else(|| format!("Missing required unsigned count: /counts/{name}"))
+    };
+    let (total, tested, passed, failed, not_applicable) = match (
+        count("total"),
+        count("tested"),
+        count("pass"),
+        count("fail"),
+        count("na"),
+    ) {
+        (Ok(total), Ok(tested), Ok(passed), Ok(failed), Ok(not_applicable)) => {
+            (total, tested, passed, failed, not_applicable)
+        }
+        counts => {
+            let errors = [counts.0, counts.1, counts.2, counts.3, counts.4]
+                .into_iter()
+                .filter_map(Result::err)
+                .collect::<Vec<_>>();
+            return (Signal::Fail, errors.join("; "));
+        }
+    };
+
+    if total == 0 {
+        return (
+            Signal::Fail,
+            "Conformance summary total must be greater than zero".to_string(),
+        );
+    }
+    if passed.checked_add(failed) != Some(tested) {
+        return (
+            Signal::Fail,
+            format!(
+                "Conformance tested-count mismatch: pass({passed}) + fail({failed}) != tested({tested})"
+            ),
+        );
+    }
+    if tested.checked_add(not_applicable) != Some(total) {
+        return (
+            Signal::Fail,
+            format!(
+                "Conformance total-count mismatch: tested({tested}) + na({not_applicable}) != total({total})"
+            ),
+        );
+    }
+    if failed > 0 {
+        return (
+            Signal::Fail,
+            format!(
+                "Current conformance: {passed}/{total} pass, {failed} fail, {not_applicable} not exercised"
+            ),
+        );
+    }
+    if tested != total || not_applicable != 0 {
+        return (
+            Signal::Fail,
+            format!(
+                "Current conformance incomplete: {tested}/{total} tested, {not_applicable} not exercised"
+            ),
+        );
+    }
+
+    (
+        Signal::Pass,
+        format!("Current conformance complete: {passed}/{total} pass"),
+    )
+}
+
+fn validate_full_suite_gate(v: &V) -> (Signal, String) {
+    let schema = get_str(v, "/schema");
+    if schema != FULL_SUITE_GATE_SCHEMA {
+        return (
+            Signal::Fail,
+            format!("Invalid schema: expected {FULL_SUITE_GATE_SCHEMA}, found {schema}"),
+        );
+    }
+
+    let Some(gates) = v.pointer("/gates").and_then(V::as_array) else {
+        return (Signal::Fail, "Missing required gates array".to_string());
+    };
+    let required_count = |pointer: &str| {
+        v.pointer(pointer)
+            .and_then(V::as_u64)
+            .ok_or_else(|| format!("Missing required unsigned count: {pointer}"))
+    };
+    let counts = (
+        required_count("/summary/total_gates"),
+        required_count("/summary/passed"),
+        required_count("/summary/failed"),
+        required_count("/summary/warned"),
+        required_count("/summary/skipped"),
+        required_count("/summary/blocking_pass"),
+        required_count("/summary/blocking_total"),
+    );
+    let (total, passed, failed, warned, skipped, blocking_pass, blocking_total) = match counts {
+        (
+            Ok(total),
+            Ok(passed),
+            Ok(failed),
+            Ok(warned),
+            Ok(skipped),
+            Ok(blocking_pass),
+            Ok(blocking_total),
+        ) => (
+            total,
+            passed,
+            failed,
+            warned,
+            skipped,
+            blocking_pass,
+            blocking_total,
+        ),
+        _ => {
+            let errors = [
+                required_count("/summary/total_gates"),
+                required_count("/summary/passed"),
+                required_count("/summary/failed"),
+                required_count("/summary/warned"),
+                required_count("/summary/skipped"),
+                required_count("/summary/blocking_pass"),
+                required_count("/summary/blocking_total"),
+            ]
+            .into_iter()
+            .filter_map(Result::err)
+            .collect::<Vec<_>>();
+            return (Signal::Fail, errors.join("; "));
+        }
+    };
+
+    if total == 0 {
+        return (
+            Signal::Fail,
+            "Full-suite summary total_gates must be greater than zero".to_string(),
+        );
+    }
+    if u64::try_from(gates.len()) != Ok(total) {
+        return (
+            Signal::Fail,
+            format!(
+                "Full-suite gate count mismatch: summary total_gates={total}, gates={}",
+                gates.len()
+            ),
+        );
+    }
+
+    let mut observed_passed = 0u64;
+    let mut observed_failed = 0u64;
+    let mut observed_warned = 0u64;
+    let mut observed_skipped = 0u64;
+    let mut observed_blocking_pass = 0u64;
+    let mut observed_blocking_total = 0u64;
+    for (index, gate) in gates.iter().enumerate() {
+        let status = gate.get("status").and_then(V::as_str).unwrap_or("unknown");
+        match status {
+            "pass" => observed_passed += 1,
+            "fail" => observed_failed += 1,
+            "warn" => observed_warned += 1,
+            "skip" => observed_skipped += 1,
+            other => {
+                return (
+                    Signal::Fail,
+                    format!("Invalid status for gate {index}: {other}"),
+                );
+            }
+        }
+        let Some(blocking) = gate.get("blocking").and_then(V::as_bool) else {
+            return (
+                Signal::Fail,
+                format!("Missing boolean blocking flag for gate {index}"),
+            );
+        };
+        if blocking {
+            observed_blocking_total += 1;
+            if status == "pass" {
+                observed_blocking_pass += 1;
+            }
+        }
+    }
+
+    let summary_counts = (
+        passed,
+        failed,
+        warned,
+        skipped,
+        blocking_pass,
+        blocking_total,
+    );
+    let observed_counts = (
+        observed_passed,
+        observed_failed,
+        observed_warned,
+        observed_skipped,
+        observed_blocking_pass,
+        observed_blocking_total,
+    );
+    if summary_counts != observed_counts {
+        return (
+            Signal::Fail,
+            format!(
+                "Full-suite summary mismatch: summary={summary_counts:?}, observed={observed_counts:?}"
+            ),
+        );
+    }
+
+    let Some(all_blocking_pass) = v.pointer("/summary/all_blocking_pass").and_then(V::as_bool)
+    else {
+        return (
+            Signal::Fail,
+            "Missing required boolean: /summary/all_blocking_pass".to_string(),
+        );
+    };
+    let observed_all_blocking_pass = blocking_pass == blocking_total;
+    if all_blocking_pass != observed_all_blocking_pass {
+        return (
+            Signal::Fail,
+            format!(
+                "Full-suite blocking verdict mismatch: all_blocking_pass={all_blocking_pass}, observed={observed_all_blocking_pass}"
+            ),
+        );
+    }
+
+    let expected_verdict = if all_blocking_pass && failed == 0 {
+        "pass"
+    } else if all_blocking_pass {
+        "warn"
+    } else {
+        "fail"
+    };
+    let verdict = get_str(v, "/verdict");
+    if verdict != expected_verdict {
+        return (
+            Signal::Fail,
+            format!("Full-suite verdict mismatch: expected {expected_verdict}, found {verdict}"),
+        );
+    }
+
+    let detail = format!(
+        "{passed}/{total} gates pass ({verdict}; blocking {blocking_pass}/{blocking_total})"
+    );
+    match verdict {
+        "pass" => (Signal::Pass, detail),
+        "warn" => (Signal::Warn, detail),
+        "fail" => (Signal::Fail, detail),
+        _ => unreachable!("verdict was validated against the computed verdict"),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1422,6 +1694,20 @@ struct FinalCertification {
     ci_run_link_template: String,
 }
 
+fn aggregate_certification_signals(signals: &[Signal]) -> Signal {
+    if signals.is_empty() {
+        Signal::NoData
+    } else if signals.contains(&Signal::Fail) {
+        Signal::Fail
+    } else if signals.contains(&Signal::Warn) {
+        Signal::Warn
+    } else if signals.contains(&Signal::NoData) {
+        Signal::NoData
+    } else {
+        Signal::Pass
+    }
+}
+
 const PHASE5_GO_NO_GO_GATES: &[&str] = &[
     "practical_finish_checkpoint",
     "extension_remediation_backlog",
@@ -1528,14 +1814,7 @@ fn generate_certification() -> FinalCertification {
         "non_mock_compliance",
         "bd-1f42.2.6",
         "docs/non-mock-rubric.json",
-        |v| {
-            let schema = get_str(v, "/schema");
-            if schema.starts_with("pi.test.non_mock_rubric") {
-                (Signal::Pass, format!("Non-mock rubric present: {schema}"))
-            } else {
-                (Signal::Fail, "Invalid non-mock rubric schema".to_string())
-            }
-        },
+        validate_non_mock_rubric,
     ));
 
     // 2. Full E2E evidence
@@ -1544,18 +1823,7 @@ fn generate_certification() -> FinalCertification {
         "e2e_evidence",
         "bd-1f42.3",
         "tests/ext_conformance/reports/conformance_summary.json",
-        |v| {
-            let total = get_u64(v, "/counts/total");
-            let pass = get_u64(v, "/counts/pass");
-            if total > 0 {
-                (
-                    Signal::Pass,
-                    format!("E2E conformance: {pass}/{total} extensions tested"),
-                )
-            } else {
-                (Signal::Fail, "No extensions tested".to_string())
-            }
-        },
+        validate_current_conformance_summary,
     ));
 
     // 3. 208/208 must-pass proof
@@ -1657,19 +1925,7 @@ fn generate_certification() -> FinalCertification {
         "full_suite_gate",
         "bd-1f42.6.5",
         "tests/full_suite_gate/full_suite_verdict.json",
-        |v| {
-            let verdict = get_str(v, "/verdict");
-            let passed = get_u64(v, "/summary/passed");
-            let total = get_u64(v, "/summary/total");
-            if verdict == "pass" {
-                (Signal::Pass, format!("All {passed}/{total} gates pass"))
-            } else {
-                (
-                    Signal::Warn,
-                    format!("{passed}/{total} gates pass ({verdict})"),
-                )
-            }
-        },
+        validate_full_suite_gate,
     ));
 
     // 7. Conformance baseline delta
@@ -1737,33 +1993,13 @@ fn generate_certification() -> FinalCertification {
     // 10. Opportunity-matrix certification linkage
     evidence.push(check_opportunity_matrix_cert_gate(&root));
 
-    // 11. Conformance baseline delta
+    // 11. Current conformance health
     evidence.push(check_cert_gate(
         &root,
         "health_delta",
         "bd-1f42.4.5",
-        "tests/ext_conformance/reports/conformance_baseline.json",
-        |v| {
-            let pass_rate = get_f64(v, "/extension_conformance/pass_rate_pct");
-            let passed = get_u64(v, "/extension_conformance/passed");
-            let total = get_u64(v, "/extension_conformance/manifest_count");
-            if pass_rate >= 90.0 {
-                (
-                    Signal::Pass,
-                    format!("Baseline: {passed}/{total} ({pass_rate:.1}%)"),
-                )
-            } else if pass_rate >= 70.0 {
-                (
-                    Signal::Warn,
-                    format!("Baseline: {passed}/{total} ({pass_rate:.1}%)"),
-                )
-            } else {
-                (
-                    Signal::Fail,
-                    format!("Baseline: {passed}/{total} ({pass_rate:.1}%)"),
-                )
-            }
-        },
+        "tests/ext_conformance/reports/conformance_summary.json",
+        validate_current_conformance_summary,
     ));
 
     // Build risk register from any non-pass evidence
@@ -1800,15 +2036,8 @@ fn generate_certification() -> FinalCertification {
         }
     }
 
-    let cert_verdict = if evidence.iter().any(|e| e.status == Signal::Fail) {
-        Signal::Fail
-    } else if evidence.iter().any(|e| e.status == Signal::Warn) {
-        Signal::Warn
-    } else if evidence.iter().all(|e| e.status == Signal::NoData) {
-        Signal::NoData
-    } else {
-        Signal::Pass
-    };
+    let evidence_signals = evidence.iter().map(|item| item.status).collect::<Vec<_>>();
+    let cert_verdict = aggregate_certification_signals(&evidence_signals);
 
     FinalCertification {
         schema: CERT_SCHEMA.to_string(),
@@ -2142,6 +2371,112 @@ fn validate_must_pass_gate_metadata_rejects_legacy_payload() {
         errors.iter().any(|msg| msg.contains("/run_id")),
         "expected run_id validation error, got: {errors:?}"
     );
+}
+
+#[test]
+fn non_mock_rubric_accepts_current_schema() {
+    let rubric: V = serde_json::from_str(include_str!("../docs/non-mock-rubric.json"))
+        .expect("parse checked-in non-mock rubric");
+
+    let (signal, detail) = validate_non_mock_rubric(&rubric);
+    assert_eq!(signal, Signal::Pass, "{detail}");
+}
+
+#[test]
+fn non_mock_rubric_rejects_legacy_schema() {
+    let rubric = serde_json::json!({"schema": "pi.test.non_mock_rubric.v1"});
+
+    let (signal, detail) = validate_non_mock_rubric(&rubric);
+    assert_eq!(signal, Signal::Fail);
+    assert!(detail.contains(NON_MOCK_RUBRIC_SCHEMA), "{detail}");
+}
+
+#[test]
+fn current_conformance_summary_fails_closed_on_partial_coverage() {
+    let summary: V = serde_json::from_str(include_str!(
+        "ext_conformance/reports/conformance_summary.json"
+    ))
+    .expect("parse checked-in conformance summary");
+
+    let (signal, detail) = validate_current_conformance_summary(&summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("60/226 tested"), "{detail}");
+    assert!(detail.contains("166 not exercised"), "{detail}");
+}
+
+#[test]
+fn current_conformance_summary_accepts_complete_reconciled_counts() {
+    let summary = serde_json::json!({
+        "schema": "pi.ext.conformance_summary.v2",
+        "counts": {"total": 2, "tested": 2, "pass": 2, "fail": 0, "na": 0}
+    });
+
+    let (signal, detail) = validate_current_conformance_summary(&summary);
+    assert_eq!(signal, Signal::Pass, "{detail}");
+    assert!(detail.contains("2/2 pass"), "{detail}");
+}
+
+#[test]
+fn current_conformance_summary_rejects_incoherent_counts() {
+    let summary = serde_json::json!({
+        "schema": "pi.ext.conformance_summary.v2",
+        "counts": {"total": 2, "tested": 2, "pass": 1, "fail": 0, "na": 0}
+    });
+
+    let (signal, detail) = validate_current_conformance_summary(&summary);
+    assert_eq!(signal, Signal::Fail);
+    assert!(detail.contains("tested-count mismatch"), "{detail}");
+}
+
+#[test]
+fn certification_signal_does_not_turn_partial_no_data_into_pass() {
+    assert_eq!(aggregate_certification_signals(&[]), Signal::NoData);
+    assert_eq!(
+        aggregate_certification_signals(&[Signal::Pass, Signal::NoData, Signal::Pass]),
+        Signal::NoData
+    );
+    assert_eq!(
+        aggregate_certification_signals(&[Signal::Pass, Signal::NoData, Signal::Warn]),
+        Signal::Warn
+    );
+    assert_eq!(
+        aggregate_certification_signals(&[Signal::Pass, Signal::NoData, Signal::Fail]),
+        Signal::Fail
+    );
+}
+
+#[test]
+fn full_suite_gate_reads_current_total_gates_field() {
+    let gate: V = serde_json::from_str(include_str!("full_suite_gate/full_suite_verdict.json"))
+        .expect("parse checked-in full-suite verdict");
+
+    let (signal, detail) = validate_full_suite_gate(&gate);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("17/20 gates pass"), "{detail}");
+    assert!(!detail.contains("17/0"), "{detail}");
+}
+
+#[test]
+fn full_suite_gate_fails_closed_without_total_gates() {
+    let gate = serde_json::json!({
+        "schema": FULL_SUITE_GATE_SCHEMA,
+        "verdict": "fail",
+        "gates": [{"status": "pass", "blocking": true}],
+        "summary": {
+            "passed": 1,
+            "failed": 0,
+            "warned": 0,
+            "skipped": 0,
+            "blocking_pass": 1,
+            "blocking_total": 1,
+            "all_blocking_pass": true
+        }
+    });
+
+    let (signal, detail) = validate_full_suite_gate(&gate);
+    assert_eq!(signal, Signal::Fail);
+    assert!(detail.contains("/summary/total_gates"), "{detail}");
+    assert!(!detail.contains("1/0 gates pass"), "{detail}");
 }
 
 #[test]

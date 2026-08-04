@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -47,6 +48,39 @@ fn run_pi_in(cwd: &Path, args: &[&str]) -> Result<Output, std::io::Error> {
         .current_dir(cwd)
         .args(args)
         .output()
+}
+
+fn run_git_in(cwd: &Path, args: &[&str]) -> TestResult<Output> {
+    let output = Command::new("git").current_dir(cwd).args(args).output()?;
+    if output.status.success() {
+        Ok(output)
+    } else {
+        Err(format!("git {} failed\n{}", args.join(" "), output_debug(&output)).into())
+    }
+}
+
+fn snapshot_files(root: &Path) -> TestResult<BTreeMap<PathBuf, Vec<u8>>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        snapshot: &mut BTreeMap<PathBuf, Vec<u8>>,
+    ) -> TestResult {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                visit(root, &path, snapshot)?;
+            } else {
+                snapshot.insert(path.strip_prefix(root)?.to_path_buf(), fs::read(&path)?);
+            }
+        }
+        Ok(())
+    }
+
+    let mut snapshot = BTreeMap::new();
+    visit(root, root, &mut snapshot)?;
+    Ok(snapshot)
 }
 
 fn output_text(output: &[u8]) -> String {
@@ -291,14 +325,21 @@ fn swarm_progress_stdout_does_not_mutate_git_or_beads_files() -> TestResult {
     let temp = test_workspace("read-only")?;
     let input_path = temp.join("progress-input.json");
     write_input(&input_path, healthy_metrics())?;
-    let git_head_path = temp.join(".git").join("HEAD");
+    run_git_in(&temp, &["init", "-b", "main"])?;
+    run_git_in(&temp, &["config", "user.email", "pi-test@example.invalid"])?;
+    run_git_in(&temp, &["config", "user.name", "Pi Test"])?;
+    let marker_path = temp.join("tracked.txt");
+    fs::write(&marker_path, "tracked fixture\n")?;
+    run_git_in(&temp, &["add", path_str(&marker_path)?])?;
+    run_git_in(&temp, &["commit", "-m", "initial fixture"])?;
+
+    let git_dir = temp.join(".git");
+    let beads_dir = temp.join(".beads");
     let beads_path = temp.join(".beads").join("issues.jsonl");
-    fs::create_dir_all(git_head_path.parent().ok_or("git HEAD has no parent")?)?;
-    fs::create_dir_all(beads_path.parent().ok_or("Beads ledger has no parent")?)?;
-    fs::write(&git_head_path, "ref: refs/heads/main\n")?;
+    fs::create_dir_all(&beads_dir)?;
     fs::write(&beads_path, "{\"id\":\"pi-test\",\"status\":\"open\"}\n")?;
-    let git_head_before = fs::read(&git_head_path)?;
-    let beads_before = fs::read(&beads_path)?;
+    let git_before = snapshot_files(&git_dir)?;
+    let beads_before = snapshot_files(&beads_dir)?;
 
     let output = run_pi_in(
         &temp,
@@ -312,7 +353,7 @@ fn swarm_progress_stdout_does_not_mutate_git_or_beads_files() -> TestResult {
     )?;
 
     assert!(output.status.success(), "{}", output_debug(&output));
-    assert_eq!(fs::read(&git_head_path)?, git_head_before);
-    assert_eq!(fs::read(&beads_path)?, beads_before);
+    assert_eq!(snapshot_files(&git_dir)?, git_before);
+    assert_eq!(snapshot_files(&beads_dir)?, beads_before);
     Ok(())
 }

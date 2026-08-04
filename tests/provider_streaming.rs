@@ -11,15 +11,23 @@
 //! VCR_MODE=playback VCR_CASSETTE_DIR=tests/fixtures/vcr \
 //!   cargo test provider_streaming::anthropic_
 //! ```
+//!
+//! RCH omits repository metadata, so full replay-lineage runs must pass the
+//! authoritative source commit explicitly:
+//! ```bash
+//! PI_PROVIDER_REPLAY_GIT_COMMIT="$(git rev-parse HEAD)" \
+//!   rch exec -- cargo test --test provider_streaming
+//! ```
 mod common;
 
-use common::TestHarness;
+use common::{MockHttpResponse, TestHarness};
 use futures::{Stream, StreamExt};
 use pi::model::{
     AssistantMessage, ContentBlock, Cost, Message, StopReason, StreamEvent, ToolCall,
     ToolResultMessage, Usage, UserContent, UserMessage,
 };
-use pi::provider::ToolDef;
+use pi::provider::{Context, Provider, StreamOptions, ToolDef};
+use pi::providers::cursor::CursorProvider;
 use pi::vcr::{Cassette, VcrMode};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -71,6 +79,7 @@ pub(crate) fn vcr_strict() -> bool {
 
 const PROVIDER_REPLAY_CACHE_SCHEMA: &str = "pi.test.provider_replay_cache.v1";
 const PROVIDER_REPLAY_CACHE_CASSETTE_VERSION: &str = "1.0";
+const PROVIDER_REPLAY_GIT_COMMIT_ENV: &str = "PI_PROVIDER_REPLAY_GIT_COMMIT";
 
 pub(crate) struct ProviderReplayCacheSpec<'a> {
     pub provider: &'a str,
@@ -130,13 +139,12 @@ pub(crate) fn provider_request_schema_hash(
 pub(crate) fn build_provider_replay_cache_entry(
     spec: &ProviderReplayCacheSpec<'_>,
 ) -> Result<ProviderReplayCacheEntry, ProviderReplayCacheRefusal> {
-    let git_commit = current_git_commit();
-    build_provider_replay_cache_entry_with_git_commit(spec, git_commit.as_deref())
+    build_provider_replay_cache_entry_with_git_commit(spec, resolve_provider_replay_git_commit())
 }
 
 fn build_provider_replay_cache_entry_with_git_commit(
     spec: &ProviderReplayCacheSpec<'_>,
-    git_commit: Option<&str>,
+    git_commit: Result<Option<String>, ProviderReplayCacheRefusal>,
 ) -> Result<ProviderReplayCacheEntry, ProviderReplayCacheRefusal> {
     if spec.request_schema_hash.trim().is_empty() {
         return Err(replay_cache_refusal(
@@ -198,11 +206,13 @@ fn build_provider_replay_cache_entry_with_git_commit(
         ));
     }
 
-    let git_commit = git_commit.and_then(normalize_git_hash).ok_or_else(|| {
+    let git_commit = git_commit?.and_then(|hash| normalize_git_hash(&hash)).ok_or_else(|| {
         replay_cache_refusal(
             "ambiguous_git_commit",
-            "could not resolve the current git commit",
-            "refuse_cache_reuse",
+            format!(
+                "could not resolve an authoritative full git commit; set {PROVIDER_REPLAY_GIT_COMMIT_ENV} when repository metadata is unavailable"
+            ),
+            format!("set_{PROVIDER_REPLAY_GIT_COMMIT_ENV}_or_restore_git_metadata"),
             true,
         )
     })?;
@@ -266,7 +276,20 @@ pub(crate) fn record_provider_replay_cache_artifact(
         format!("provider-replay-cache/{}:{}", spec.provider, spec.scenario),
         &artifact_path,
     );
+    assert_recorded_provider_replay_cache_verdict(&report);
     report
+}
+
+fn assert_recorded_provider_replay_cache_verdict(report: &Value) {
+    let verdict = report.get("verdict").and_then(Value::as_str);
+    let cache_reusable = report.get("cacheReusable").and_then(Value::as_bool);
+    let fail_closed = report.get("failClosed").and_then(Value::as_bool);
+
+    assert_eq!(
+        (verdict, cache_reusable, fail_closed),
+        (Some("hit"), Some(true), Some(false)),
+        "provider replay artifact did not prove reusable authoritative lineage: {report}"
+    );
 }
 
 fn provider_replay_cache_report_with_current(
@@ -426,6 +449,63 @@ fn sanitize_artifact_part(value: &str) -> String {
     }
 }
 
+fn resolve_provider_replay_git_commit() -> Result<Option<String>, ProviderReplayCacheRefusal> {
+    let explicit = match env::var(PROVIDER_REPLAY_GIT_COMMIT_ENV) {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err(invalid_authoritative_git_commit(
+                PROVIDER_REPLAY_GIT_COMMIT_ENV,
+                "value is not valid Unicode",
+            ));
+        }
+    };
+    select_provider_replay_git_commit(
+        explicit.as_deref(),
+        current_git_commit().as_deref(),
+        option_env!("VERGEN_GIT_SHA"),
+    )
+}
+
+fn select_provider_replay_git_commit(
+    explicit: Option<&str>,
+    worktree: Option<&str>,
+    compiled: Option<&str>,
+) -> Result<Option<String>, ProviderReplayCacheRefusal> {
+    if let Some(raw) = explicit {
+        return normalize_git_hash(raw).map(Some).ok_or_else(|| {
+            invalid_authoritative_git_commit(
+                PROVIDER_REPLAY_GIT_COMMIT_ENV,
+                "value must be a full 40- or 64-character hexadecimal commit",
+            )
+        });
+    }
+    if let Some(commit) = worktree.and_then(normalize_git_hash) {
+        return Ok(Some(commit));
+    }
+    if let Some(raw) = compiled
+        && !raw.trim().is_empty()
+        && raw != "VERGEN_IDEMPOTENT_OUTPUT"
+    {
+        return normalize_git_hash(raw).map(Some).ok_or_else(|| {
+            invalid_authoritative_git_commit(
+                "VERGEN_GIT_SHA",
+                "build metadata must be a full 40- or 64-character hexadecimal commit",
+            )
+        });
+    }
+    Ok(None)
+}
+
+fn invalid_authoritative_git_commit(source: &str, reason: &str) -> ProviderReplayCacheRefusal {
+    replay_cache_refusal(
+        "invalid_authoritative_git_commit",
+        format!("invalid authoritative commit from {source}: {reason}"),
+        format!("set_{PROVIDER_REPLAY_GIT_COMMIT_ENV}_to_full_commit"),
+        true,
+    )
+}
+
 fn current_git_commit() -> Option<String> {
     let git_dir = resolve_git_dir(Path::new(env!("CARGO_MANIFEST_DIR")))?;
     let head_path = git_dir.join("HEAD");
@@ -500,7 +580,7 @@ fn read_packed_ref(git_dir: &Path, reference: &str) -> Option<String> {
 
 fn normalize_git_hash(raw: &str) -> Option<String> {
     let hash = raw.trim();
-    if hash.len() >= 7 && hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
+    if matches!(hash.len(), 40 | 64) && hash.chars().all(|ch| ch.is_ascii_hexdigit()) {
         Some(hash.to_string())
     } else {
         None
@@ -1714,6 +1794,120 @@ mod backpressure_tests {
     }
 }
 
+fn cursor_connect_smoke_response() -> MockHttpResponse {
+    fn len_delimited(field: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(field < 16, "single-byte protobuf field required");
+        assert!(payload.len() < 128, "single-byte protobuf length required");
+        let mut encoded = Vec::with_capacity(payload.len() + 2);
+        encoded.push((field << 3) | 2);
+        encoded.push(u8::try_from(payload.len()).expect("payload length checked above"));
+        encoded.extend_from_slice(payload);
+        encoded
+    }
+
+    fn connect_frame(flags: u8, payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(payload.len() + 5);
+        frame.push(flags);
+        frame.extend_from_slice(
+            &u32::try_from(payload.len())
+                .expect("smoke payload fits in u32")
+                .to_be_bytes(),
+        );
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    let text_delta = len_delimited(1, b"pong");
+    let interaction_update = len_delimited(1, &text_delta);
+    let server_message = len_delimited(1, &interaction_update);
+    let mut body = connect_frame(0, &server_message);
+    body.extend(connect_frame(0b0000_0010, b"{}"));
+
+    MockHttpResponse {
+        status: 200,
+        headers: vec![(
+            "Content-Type".to_string(),
+            "application/connect+proto".to_string(),
+        )],
+        body,
+    }
+}
+
+#[test]
+fn cursor_streaming_smoke_proves_text_done_and_connect_request() {
+    let harness = TestHarness::new("cursor_streaming_smoke_proves_text_done_and_connect_request");
+    let server = harness.start_mock_http_server();
+    let path = "/agent.v1.AgentService/Run";
+    server.add_route("POST", path, cursor_connect_smoke_response());
+
+    let provider = CursorProvider::new("cursor-smoke-model")
+        .with_base_url(format!("{}{path}", server.base_url()));
+    let context = Context::owned(
+        Some("Reply briefly.".to_string()),
+        vec![user_text("Ping")],
+        Vec::new(),
+    );
+    let options = StreamOptions {
+        api_key: Some("cursor-smoke-token".to_string()),
+        ..StreamOptions::default()
+    };
+
+    let events = common::run_async(async move {
+        let mut stream = provider
+            .stream(&context, &options)
+            .await
+            .expect("Cursor smoke stream should start");
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            events.push(event.expect("Cursor smoke stream should not error"));
+        }
+        events
+    });
+
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta { delta, .. } if delta == "pong")),
+        "Cursor smoke stream did not emit the expected text delta: {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            StreamEvent::Done {
+                reason: StopReason::Stop,
+                ..
+            }
+        )),
+        "Cursor smoke stream did not terminate successfully: {events:?}"
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error { .. })),
+        "Cursor smoke stream emitted an error event: {events:?}"
+    );
+
+    let requests = server.requests();
+    assert_eq!(requests.len(), 1, "Cursor smoke must issue one request");
+    let request = &requests[0];
+    assert_eq!(request.method, "POST");
+    assert_eq!(request.path, path);
+    assert!(
+        !request.body.is_empty(),
+        "Cursor request body must be framed"
+    );
+    let header = |name: &str| {
+        request
+            .headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    assert_eq!(header("authorization"), Some("Bearer cursor-smoke-token"));
+    assert_eq!(header("content-type"), Some("application/connect+proto"));
+    assert_eq!(header("connect-protocol-version"), Some("1"));
+}
+
 #[cfg(test)]
 mod replay_cache_tests {
     use super::*;
@@ -1764,7 +1958,10 @@ mod replay_cache_tests {
     fn build_test_cache_entry(
         spec: &ProviderReplayCacheSpec<'_>,
     ) -> Result<ProviderReplayCacheEntry, ProviderReplayCacheRefusal> {
-        build_provider_replay_cache_entry_with_git_commit(spec, Some(TEST_GIT_COMMIT))
+        build_provider_replay_cache_entry_with_git_commit(
+            spec,
+            Ok(Some(TEST_GIT_COMMIT.to_string())),
+        )
     }
 
     fn test_cache_report(
@@ -1815,7 +2012,7 @@ mod replay_cache_tests {
             provider_request_schema_hash(&[user_text("hello")], &[], &json!({"maxTokens": 16}));
         let spec = test_spec(&cassette_path, &request_schema_hash);
 
-        let report = record_provider_replay_cache_artifact(&harness, &spec);
+        let report = provider_replay_cache_report(None, &spec);
 
         assert_eq!(report.get("verdict"), Some(&json!("miss")));
         assert_eq!(report.get("cacheReusable"), Some(&json!(false)));
@@ -1868,6 +2065,76 @@ mod replay_cache_tests {
         assert_eq!(
             report.pointer("/refusal/class"),
             Some(&json!("ambiguous_request_schema"))
+        );
+    }
+
+    #[test]
+    fn provider_replay_cache_rejects_missing_authoritative_commit() {
+        let harness =
+            TestHarness::new("provider_replay_cache_rejects_missing_authoritative_commit");
+        let cassette_path = harness.temp_path("missing_commit_cassette.json");
+        write_test_cassette(&cassette_path, "first-response");
+        let request_schema_hash =
+            provider_request_schema_hash(&[user_text("hello")], &[], &json!({"maxTokens": 16}));
+        let spec = test_spec(&cassette_path, &request_schema_hash);
+
+        let current = build_provider_replay_cache_entry_with_git_commit(&spec, Ok(None));
+        let report = provider_replay_cache_report_with_current(&spec, None, current);
+
+        assert_eq!(report.get("verdict"), Some(&json!("stale")));
+        assert_eq!(report.get("cacheReusable"), Some(&json!(false)));
+        assert_eq!(report.get("failClosed"), Some(&json!(true)));
+        assert_eq!(
+            report.pointer("/refusal/class"),
+            Some(&json!("ambiguous_git_commit"))
+        );
+    }
+
+    #[test]
+    fn provider_replay_commit_selection_validates_authoritative_inputs() {
+        assert_eq!(
+            select_provider_replay_git_commit(Some(TEST_GIT_COMMIT), None, None)
+                .expect("valid explicit commit"),
+            Some(TEST_GIT_COMMIT.to_string())
+        );
+        assert_eq!(
+            select_provider_replay_git_commit(None, None, Some("VERGEN_IDEMPOTENT_OUTPUT"))
+                .expect("vergen fallback marker is not a commit"),
+            None
+        );
+
+        let refusal = select_provider_replay_git_commit(Some("0123456"), None, None)
+            .expect_err("abbreviated commits must fail closed");
+        assert_eq!(refusal.class, "invalid_authoritative_git_commit");
+        assert!(refusal.fail_closed);
+    }
+
+    #[test]
+    fn provider_replay_artifact_assertion_rejects_stale_verdict() {
+        let report = json!({
+            "verdict": "stale",
+            "cacheReusable": false,
+            "failClosed": true,
+            "refusal": {"class": "ambiguous_git_commit"}
+        });
+
+        let result = std::panic::catch_unwind(|| {
+            assert_recorded_provider_replay_cache_verdict(&report);
+        });
+        assert!(result.is_err(), "stale replay proof must fail its caller");
+
+        let missing = json!({
+            "verdict": "miss",
+            "cacheReusable": false,
+            "failClosed": false,
+            "refusal": {"class": "missing_cassette"}
+        });
+        let result = std::panic::catch_unwind(|| {
+            assert_recorded_provider_replay_cache_verdict(&missing);
+        });
+        assert!(
+            result.is_err(),
+            "a missing cassette must fail a scenario that records replay proof"
         );
     }
 }

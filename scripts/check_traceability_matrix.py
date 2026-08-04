@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager, redirect_stdout
+import fnmatch
 import glob
 from io import StringIO
 import json
@@ -202,13 +203,14 @@ def _git_tracked_test_stems(tests_dir: Path) -> set[str] | None:
     return stems
 
 
-def _literal_gitignored_test_stems() -> set[str]:
-    """Return top-level test stems named by literal `.gitignore` entries.
+def _gitignored_top_level_test_stems(tests_dir: Path) -> set[str]:
+    """Return top-level test stems ignored by ordered `.gitignore` rules.
 
     RCH worker overlays intentionally omit `.git` metadata and can retain a
-    previously transferred ignored repro. In that fallback environment the
-    literal ignore rules preserve the same inventory boundary as
-    `git ls-files`, without trying to reimplement wildcard matching.
+    previously transferred ignored repro. This metadata-free fallback applies
+    the repository's ordered wildcard and negation rules to the deliberately
+    narrow `tests/*.rs` inventory instead of treating wildcard rules as if they
+    did not exist.
     """
 
     ignore_path = REPO_ROOT / ".gitignore"
@@ -217,19 +219,41 @@ def _literal_gitignored_test_stems() -> set[str]:
     except OSError:
         return set()
 
-    stems: set[str] = set()
-    for raw in lines:
-        line = raw.strip()
-        if (
-            not line
-            or line.startswith(("#", "!"))
-            or any(char in line for char in "*?[")
-        ):
-            continue
-        stem = extract_test_stem(line)
-        if stem is not None and "/" not in stem:
-            stems.add(stem)
-    return stems
+    ignored: set[str] = set()
+    for test_path in sorted(tests_dir.glob("*.rs")):
+        relative = test_path.relative_to(REPO_ROOT).as_posix()
+        is_ignored = False
+        for raw in lines:
+            rule = raw.strip()
+            if not rule or rule.startswith("#"):
+                continue
+
+            negated = rule.startswith("!")
+            if negated:
+                rule = rule[1:]
+            elif rule.startswith(r"\!"):
+                rule = rule[1:]
+            if rule.startswith(r"\#"):
+                rule = rule[1:]
+            if not rule:
+                continue
+
+            directory_rule = rule.endswith("/")
+            rule = rule.lstrip("/").rstrip("/")
+            if not rule:
+                continue
+            if "/" in rule:
+                matches = fnmatch.fnmatchcase(relative, rule)
+                if directory_rule:
+                    matches = relative.startswith(f"{rule}/")
+            else:
+                matches = fnmatch.fnmatchcase(test_path.name, rule)
+            if matches:
+                is_ignored = not negated
+
+        if is_ignored:
+            ignored.add(test_path.stem)
+    return ignored
 
 
 def check_stale_mappings(
@@ -270,7 +294,7 @@ def check_stale_mappings(
     tracked_stems = _git_tracked_test_stems(tests_dir)
     if tracked_stems is None:
         # Not a git checkout (or git unavailable): fall back to filesystem scan.
-        ignored_stems = _literal_gitignored_test_stems()
+        ignored_stems = _gitignored_top_level_test_stems(tests_dir)
         for f in sorted(tests_dir.glob("*.rs")):
             if f.stem not in ignored_stems:
                 on_disk_stems.add(f.stem)
@@ -862,6 +886,41 @@ def run_self_test() -> int:
         code, output = run_fixture_check(repo_root)
     assert_self_test(code == 0, "valid fixture should pass")
     assert_self_test("TRACEABILITY CHECK PASSED" in output, "pass output should report success")
+
+    with TemporaryDirectory(prefix="traceability-gitignore-wildcard-") as tmp:
+        repo_root = Path(tmp)
+        write_fixture_repo(repo_root)
+        (repo_root / "tests" / "ignored_repro.rs").write_text(
+            "// ignored fixture repro\n", encoding="utf-8"
+        )
+        (repo_root / ".gitignore").write_text(
+            "/tests/*.rs\n!/tests/unit_one.rs\n!/tests/e2e_one.rs\n",
+            encoding="utf-8",
+        )
+        code, output = run_fixture_check(repo_root)
+    assert_self_test(code == 0, "wildcard-ignored repro should not enter test inventory")
+    assert_self_test(
+        "TRACEABILITY CHECK PASSED" in output,
+        "wildcard-ignore fixture should report success",
+    )
+
+    def add_negated_unclassified_test(repo_root: Path) -> None:
+        (repo_root / "tests" / "reincluded.rs").write_text(
+            "// explicitly reincluded fixture\n", encoding="utf-8"
+        )
+        (repo_root / ".gitignore").write_text(
+            "/tests/*.rs\n"
+            "!/tests/unit_one.rs\n"
+            "!/tests/e2e_one.rs\n"
+            "!/tests/reincluded.rs\n",
+            encoding="utf-8",
+        )
+
+    run_self_test_case(
+        "gitignore-negation",
+        add_negated_unclassified_test,
+        "tests/reincluded.rs is on disk but missing from suite_classification.toml",
+    )
 
     def remove_required_category(repo_root: Path) -> None:
         matrix = read_fixture_json(repo_root, "docs/traceability_matrix.json")

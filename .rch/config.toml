@@ -67,3 +67,9 @@ exclude_patterns = [
   "secrets.properties",
   "secrets.xml",
 ]
+
+[environment]
+# Provider replay artifacts require a full source commit when RCH intentionally
+# omits `.git/`. Callers can export this from the local checkout before an RCH
+# gate; the test fails closed rather than accepting ambiguous lineage.
+allowlist = ["PI_PROVIDER_REPLAY_GIT_COMMIT"]

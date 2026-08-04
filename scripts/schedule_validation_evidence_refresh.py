@@ -952,7 +952,10 @@ def run_self_test() -> int:
                         "source_artifact": "docs/evidence/high-value-suite-artifact-inventory.json#provider",
                         "freshness_reasons": ["high_value_inventory"],
                         "value": "high",
-                        "selected_command": "rch exec -- cargo test --test provider_streaming",
+                        "selected_command": (
+                            "PI_PROVIDER_REPLAY_GIT_COMMIT=$(git rev-parse HEAD) "
+                            "rch exec -- cargo test --test provider_streaming"
+                        ),
                         "changed_surfaces": ["tests/provider_streaming.rs"],
                         "dedupe_key": "provider_streaming",
                     },

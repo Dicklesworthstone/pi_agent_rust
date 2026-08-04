@@ -16,12 +16,16 @@ use pi::auth::AuthStorage;
 use pi::config::Config;
 use pi::extensions::{ExtensionManager, ExtensionRegion, ExtensionUiRequest};
 use pi::http::client::Client;
+#[cfg(unix)]
+use pi::model::Message;
 use pi::model::{AssistantMessage, ContentBlock, StopReason, TextContent, Usage, UserContent};
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamEvent, StreamOptions};
 use pi::providers::openai::OpenAIProvider;
 use pi::resources::ResourceLoader;
 use pi::rpc::{RpcOptions, RpcScopedModel, run};
+#[cfg(unix)]
+use pi::session::SessionEntry;
 use pi::session::{Session, SessionMessage};
 use pi::session_index::SessionIndex;
 use pi::tools::ToolRegistry;
@@ -913,6 +917,20 @@ struct SpawnedCrashInterruptWorker {
 }
 
 #[cfg(unix)]
+impl Drop for SpawnedCrashInterruptWorker {
+    fn drop(&mut self) {
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) | Err(_) => {
+                let _ = self.child.kill();
+            }
+        }
+        let _ = self.child.wait();
+        let _ = collect_crash_interrupt_worker_output(self);
+    }
+}
+
+#[cfg(unix)]
 #[derive(Debug)]
 struct CrashInterruptWorkerResult {
     exit_code: i32,
@@ -1010,9 +1028,15 @@ fn spawn_crash_interrupt_recovery_worker(
         command.env(CRASH_INTERRUPT_RECOVERY_SESSION_ENV, session_path);
     }
 
-    let mut child = command
+    let child = command
         .spawn()
         .expect("spawn crash interrupt recovery worker");
+
+    capture_crash_interrupt_worker(child)
+}
+
+#[cfg(unix)]
+fn capture_crash_interrupt_worker(mut child: Child) -> SpawnedCrashInterruptWorker {
     let mut child_stdout = child.stdout.take().expect("child stdout piped");
     let mut child_stderr = child.stderr.take().expect("child stderr piped");
     let stdout_handle = std::thread::spawn(move || {
@@ -1451,7 +1475,28 @@ fn run_crash_interrupt_recovery_restart_worker(
             diagnostics.skipped_entries.is_empty(),
             "restart should not skip interrupted session entries: {diagnostics:?}"
         );
-        let message_count_before = loaded.to_messages_for_current_path().len();
+        let loaded_messages = loaded.to_messages_for_current_path();
+        let message_count_before = loaded
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
+        let recovered_session_id = loaded.header.id.clone();
+        let pre_interrupt_prompt = format!("interrupt recovery streaming prompt {cycle}");
+        let pre_interrupt_prompt_preserved = loaded_messages.iter().any(|message| {
+            matches!(
+                message,
+                Message::User(user)
+                    if matches!(
+                        &user.content,
+                        UserContent::Text(text) if text == &pre_interrupt_prompt
+                    )
+            )
+        });
+        assert!(
+            pre_interrupt_prompt_preserved,
+            "restart should preserve the pre-interrupt prompt {pre_interrupt_prompt:?}"
+        );
 
         let extension_entry = artifact_dir.join(format!("restart-{cycle}-{}.mjs", mode.as_str()));
         std::fs::write(&extension_entry, RPC_PROMPT_EXTENSION_COMMAND_EXT)
@@ -1519,7 +1564,7 @@ fn run_crash_interrupt_recovery_restart_worker(
             "restart extension completion",
         )
         .await;
-        let message_count_after =
+        let rpc_message_count_after =
             require_response_field_u64(&state_after, "messageCount", "restart get_state");
 
         drop(in_tx);
@@ -1527,6 +1572,28 @@ fn run_crash_interrupt_recovery_restart_worker(
         assert!(
             server_result.is_ok(),
             "restart rpc server error: {server_result:?}"
+        );
+
+        let (persisted_after_restart, restart_diagnostics) =
+            Session::open_with_diagnostics(session_path.to_string_lossy().as_ref())
+                .await
+                .expect("restart worker reopens session after RPC shutdown");
+        assert!(
+            restart_diagnostics.skipped_entries.is_empty(),
+            "restart shutdown should leave a clean session: {restart_diagnostics:?}"
+        );
+        assert_eq!(
+            persisted_after_restart.header.id, recovered_session_id,
+            "restart shutdown must preserve the recovered session ID"
+        );
+        let message_count_after = persisted_after_restart
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
+        assert!(
+            message_count_after > message_count_before,
+            "restart work should persistently grow the recovered session: before={message_count_before}, after={message_count_after}"
         );
 
         let index = SessionIndex::for_sessions_root(&sessions_root);
@@ -1545,8 +1612,11 @@ fn run_crash_interrupt_recovery_restart_worker(
                 "cycle": cycle,
                 "interrupt": mode.as_str(),
                 "sessionPath": session_path.display().to_string(),
+                "sessionIdBeforeRestart": recovered_session_id,
                 "messageCountBeforeRestart": message_count_before,
                 "messageCountAfterRestart": message_count_after,
+                "rpcMessageCountAfterRestart": rpc_message_count_after,
+                "preInterruptPromptPreserved": pre_interrupt_prompt_preserved,
                 "indexFailedFiles": index_summary.failed_files,
                 "indexedSessionCount": indexed.len(),
                 "markerPath": marker_path.display().to_string(),
@@ -1740,6 +1810,37 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() -> std:
             Some(0),
             "restart worker index refresh should be clean: {restart_summary}"
         );
+        let ready_session_id = ready
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .expect("ready session ID");
+        let recovered_session_id = restart_summary
+            .get("sessionIdBeforeRestart")
+            .and_then(Value::as_str)
+            .expect("recovered session ID");
+        assert_eq!(
+            recovered_session_id, ready_session_id,
+            "restart must continue the exact interrupted session"
+        );
+        let message_count_before_interrupt = ready
+            .get("messageCountBeforeInterrupt")
+            .and_then(Value::as_u64)
+            .expect("ready message count");
+        let message_count_before_restart = restart_summary
+            .get("messageCountBeforeRestart")
+            .and_then(Value::as_u64)
+            .expect("recovered message count");
+        assert_eq!(
+            message_count_before_restart, message_count_before_interrupt,
+            "restart must preserve the exact pre-interrupt message count"
+        );
+        assert_eq!(
+            restart_summary
+                .get("preInterruptPromptPreserved")
+                .and_then(Value::as_bool),
+            Some(true),
+            "restart must preserve the pre-interrupt prompt"
+        );
         assert_lock_released(&session_lock_path(&session_path));
         assert_dir_lock_released(&sessions_root.join("session-index.lock"));
 
@@ -1755,14 +1856,23 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() -> std:
             "parent reopen should not skip entries after {}: {diagnostics:?}",
             mode.as_str()
         );
-        let parent_message_count = reopened.to_messages_for_current_path().len();
+        let parent_message_count = reopened
+            .entries_for_current_path()
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count();
         let restart_message_count = restart_summary
             .get("messageCountAfterRestart")
             .and_then(Value::as_u64)
             .expect("restart message count");
         assert!(
-            restart_message_count >= 1,
-            "restart should observe messages after recovery"
+            restart_message_count > message_count_before_restart,
+            "restart should append messages after the recovered baseline"
+        );
+        assert_eq!(
+            u64::try_from(parent_message_count).unwrap_or(u64::MAX),
+            restart_message_count,
+            "parent reopen must observe the exact post-restart message count"
         );
 
         harness.record_artifact(
@@ -1835,6 +1945,158 @@ fn crash_interrupt_recovery_soak_harness_survives_signals_and_restarts() -> std:
     });
     write_json_atomic(&summary_path, &summary);
     harness.record_artifact("crash-interrupt-recovery-soak-summary.json", &summary_path);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rpc_binary_sigint_exits_orderly_and_preserves_session() -> std::io::Result<()> {
+    let harness = TestHarness::new("rpc_binary_sigint_orderly_shutdown");
+    let project_dir = harness.temp_path("project");
+    let sessions_root = harness.temp_path("sessions");
+    let agent_dir = harness.temp_path("agent");
+    let package_dir = harness.temp_path("packages");
+    let config_path = harness.temp_path("settings.json");
+    let marker_path = harness.temp_path("sigint-marker.txt");
+    std::fs::create_dir_all(&project_dir)?;
+    std::fs::create_dir_all(&sessions_root)?;
+    std::fs::create_dir_all(&agent_dir)?;
+    std::fs::create_dir_all(&package_dir)?;
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_pi")); // ubs:ignore Cargo-provided test binary path, not user input.
+    command
+        .args([
+            "--rpc",
+            "--provider",
+            "ollama",
+            "--model",
+            "qwen2.5:0.5b",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-migrations",
+            "--session-dir",
+        ])
+        .arg(&sessions_root)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env("PI_CONFIG_PATH", &config_path)
+        .env("PI_SESSIONS_DIR", &sessions_root)
+        .env("PI_PACKAGE_DIR", &package_dir)
+        .env("PI_TEST_MODE", "1")
+        .current_dir(&project_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn()?;
+    let mut worker = capture_crash_interrupt_worker(child);
+
+    let marker_content = "real-rpc-sigint-persistence";
+    let bash_command = format!(
+        "printf {} > {}",
+        shell_single_quote(marker_content),
+        shell_single_quote(&marker_path.display().to_string())
+    );
+    let bash_request = json!({
+        "id": "real-rpc-sigint-bash",
+        "type": "bash",
+        "command": bash_command,
+    });
+    {
+        use std::io::Write as _;
+
+        let stdin = worker.child.stdin.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::BrokenPipe, "pi RPC stdin was not piped")
+        })?;
+        writeln!(stdin, "{bash_request}")?;
+        stdin.flush()?;
+    }
+
+    let index = SessionIndex::for_sessions_root(&sessions_root);
+    let cwd = project_dir.display().to_string();
+    let started_at = Instant::now();
+    let persisted_meta = loop {
+        if marker_path.exists()
+            && let Ok(indexed) = index.list_sessions(Some(&cwd))
+            && let Some(meta) = indexed.into_iter().find(|meta| meta.message_count >= 1)
+        {
+            break meta;
+        }
+
+        if let Some(status) = worker.child.try_wait()? {
+            let (stdout, stderr) = collect_crash_interrupt_worker_output(&mut worker);
+            return Err(std::io::Error::other(format!(
+                "pi --rpc exited before persisting the SIGINT fixture: status={status}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            )));
+        }
+        if started_at.elapsed() > CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out waiting for pi --rpc to persist the SIGINT fixture",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // The soak worker intentionally restores default signal death. This sends
+    // SIGINT to the real binary so `run_rpc_mode` takes its orderly Ctrl-C path.
+    signal_crash_interrupt_recovery_worker(&worker, CrashInterruptRecoveryMode::Sigint);
+    let result =
+        wait_crash_interrupt_recovery_worker(worker, CRASH_INTERRUPT_RECOVERY_DEFAULT_TIMEOUT);
+    assert!(
+        !result.timed_out,
+        "real pi --rpc SIGINT shutdown timed out: {}",
+        result.stderr
+    );
+    assert_eq!(
+        result.exit_signal, None,
+        "real pi --rpc must handle SIGINT instead of dying by signal: stdout={} stderr={}",
+        result.stdout, result.stderr
+    );
+    assert_eq!(
+        result.exit_code, 0,
+        "real pi --rpc SIGINT shutdown should succeed: stdout={} stderr={}",
+        result.stdout, result.stderr
+    );
+
+    let session_path = PathBuf::from(&persisted_meta.path);
+    let (reopened, diagnostics) = common::run_async(async move {
+        Session::open_with_diagnostics(session_path.to_string_lossy().as_ref()).await
+    })
+    .expect("reopen session after orderly RPC SIGINT");
+    assert!(
+        diagnostics.skipped_entries.is_empty(),
+        "orderly RPC SIGINT should leave a clean session: {diagnostics:?}"
+    );
+    assert_eq!(
+        reopened.header.id, persisted_meta.id,
+        "orderly RPC SIGINT must preserve the indexed session identity"
+    );
+    assert_eq!(
+        u64::try_from(reopened.to_messages_for_current_path().len()).unwrap_or(u64::MAX),
+        persisted_meta.message_count,
+        "orderly RPC SIGINT must preserve the indexed message count"
+    );
+    assert!(
+        reopened
+            .entries_for_current_path()
+            .iter()
+            .copied()
+            .any(|entry| {
+                matches!(
+                    entry,
+                    SessionEntry::Message(message)
+                        if matches!(
+                            &message.message,
+                            SessionMessage::BashExecution { command, .. }
+                                if command == &bash_command
+                        )
+                )
+            }),
+        "orderly RPC SIGINT must preserve the completed bash message"
+    );
+    assert_eq!(std::fs::read_to_string(marker_path)?, marker_content);
+
     Ok(())
 }
 

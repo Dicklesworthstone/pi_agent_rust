@@ -10425,18 +10425,28 @@ fn push_semantic_context_exclusions(
         "Suppressed or excluded context:",
         stats,
     );
-    if bundle.stale_evidence_suppressions.is_empty() && bundle.excluded_items.is_empty() {
+    let mut seen = std::collections::BTreeSet::new();
+    let unique_exclusions = bundle
+        .stale_evidence_suppressions
+        .iter()
+        .chain(bundle.excluded_items.iter())
+        .filter(|item| {
+            seen.insert((
+                item.node_type,
+                item.source_path.as_str(),
+                item.title.as_str(),
+                item.reason.as_str(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    if unique_exclusions.is_empty() {
         push_semantic_context_line(prompt, budget.max_bytes, "- (none)", stats);
         return;
     }
 
-    for (index, item) in bundle
-        .stale_evidence_suppressions
-        .iter()
-        .chain(bundle.excluded_items.iter())
-        .take(8)
-        .enumerate()
-    {
+    let mut included = 0_usize;
+    for item in unique_exclusions.iter().take(8) {
         let line = format!(
             "- {:?} {} :: {} reason={}",
             item.node_type,
@@ -10445,16 +10455,15 @@ fn push_semantic_context_exclusions(
             safe_context_field(&item.reason)
         );
         if push_semantic_context_line(prompt, budget.max_bytes, &line, stats) {
-            stats.exclusions_included = stats.exclusions_included.saturating_add(1);
+            included = included.saturating_add(1);
         } else {
-            stats.exclusions_omitted = bundle
-                .stale_evidence_suppressions
-                .len()
-                .saturating_add(bundle.excluded_items.len())
-                .saturating_sub(index);
             break;
         }
     }
+    stats.exclusions_included = stats.exclusions_included.saturating_add(included);
+    stats.exclusions_omitted = stats
+        .exclusions_omitted
+        .saturating_add(unique_exclusions.len().saturating_sub(included));
 }
 
 fn push_semantic_context_item(
@@ -11021,6 +11030,48 @@ mod tests {
             estimated_bytes: 1100,
             estimated_tokens: 275,
         }
+    }
+
+    #[test]
+    fn semantic_context_exclusion_prompt_deduplicates_before_row_cap() {
+        let mut bundle = sample_semantic_context_bundle();
+        let duplicate = bundle.excluded_items[0].clone();
+        bundle.stale_evidence_suppressions.push(duplicate);
+
+        for index in 0..8 {
+            let mut exclusion = bundle.excluded_items[0].clone();
+            exclusion.node_id = format!("excluded-{index}");
+            exclusion.source_path = format!("docs/evidence/excluded-{index}.json");
+            exclusion.title = format!("excluded evidence {index}");
+            bundle.excluded_items.push(exclusion);
+        }
+
+        let mut prompt = String::new();
+        let mut stats = SemanticContextPromptStats::default();
+        push_semantic_context_exclusions(
+            &mut prompt,
+            &mut stats,
+            SemanticContextPromptBudget {
+                max_items: 16,
+                max_bytes: 64 * 1024,
+            },
+            &bundle,
+        );
+
+        assert_eq!(
+            prompt
+                .matches(
+                    "README.md :: obsolete drop-in claim reason=suppressed_stale_or_unsafe_evidence",
+                )
+                .count(),
+            1,
+            "the same exclusion from both bundle collections must render once"
+        );
+        assert_eq!(stats.exclusions_included, 8);
+        assert_eq!(
+            stats.exclusions_omitted, 1,
+            "the row cap must count omitted unique exclusions, not raw duplicate records"
+        );
     }
 
     #[test]

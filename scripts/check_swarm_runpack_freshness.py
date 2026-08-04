@@ -861,7 +861,7 @@ def run_runpack_smoke(repo_root: Path) -> int:
         cwd=repo_root,
         text=True,
         capture_output=True,
-        timeout=120,
+        timeout=300,
         check=False,
     )
     if completed.returncode != 0:

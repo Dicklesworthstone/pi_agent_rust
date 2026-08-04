@@ -133,8 +133,6 @@ impl CompatibilityScanner {
         forbidden: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
         flagged: &mut BTreeMap<(String, String, String), Vec<CompatEvidence>>,
     ) -> Result<()> {
-        const LONG_LINE_COMMENT_BYPASS_LEN: usize = 4096;
-
         let content = fs::read_to_string(path).map_err(|err| {
             Error::extension(format!(
                 "Failed to read extension source file {}: {err}",
@@ -162,20 +160,7 @@ impl CompatibilityScanner {
             } else {
                 Cow::Borrowed(raw_line)
             };
-            let trimmed = stripped.trim_end();
-            let raw_trimmed = raw_line.trim_end();
-
-            // Comment stripping is line-oriented and intentionally lightweight. For very long
-            // minified lines, regex literals can confuse comment stripping and truncate the line
-            // before later import/require calls. For those cases, prefer raw text to avoid
-            // dropping capability evidence from bundled artifacts.
-            let scan_text = if raw_trimmed.len() >= LONG_LINE_COMMENT_BYPASS_LEN
-                && trimmed.len() < raw_trimmed.len()
-            {
-                raw_trimmed
-            } else {
-                trimmed
-            };
+            let scan_text = stripped.trim_end();
 
             if scan_text.is_empty() {
                 continue;
@@ -1339,7 +1324,18 @@ pi.exec("echo hello");
         sample_content.push_str(r#"const cp=require("child_process");cp.spawnSync("true");"#);
         assert!(
             sample_content.len() > 4096,
-            "sample must exercise the long minified-line path"
+            "sample must exercise scanning beyond the former long-line fallback threshold"
+        );
+
+        let mut state = ScannerState {
+            in_block_comment: false,
+            in_template: false,
+            last_significant_char: None,
+        };
+        let stripped = strip_js_comments(&sample_content, &mut state);
+        assert_eq!(
+            stripped, sample_content,
+            "quoted URLs and escaped regex slashes must not truncate live minified code"
         );
 
         let temp = tempfile::tempdir().expect("tempdir");
@@ -1356,6 +1352,71 @@ pi.exec("echo hello");
                 .any(|cap| cap.capability == "exec" && cap.reason == "import:child_process"),
             "minified bundle should still infer exec capability from child_process require"
         );
+    }
+
+    #[test]
+    fn compatibility_scanner_ignores_commented_patterns_on_long_minified_lines() {
+        let mut sample_content = "const bundledValue=0;".repeat(512);
+        sample_content.push_str(
+            r#"// require("child_process");pi.exec("false");eval("bad");process.binding("fs");"#,
+        );
+        assert!(sample_content.len() > 4096, "sample must be a long line");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("commented-bundle.js");
+        fs::write(&entry, sample_content).expect("write commented bundle sample");
+
+        let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
+        let ledger = scanner.scan_path(&entry).expect("scan");
+
+        assert!(ledger.capabilities.is_empty());
+        assert!(ledger.rewrites.is_empty());
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
+    }
+
+    #[test]
+    fn compatibility_scanner_keeps_live_api_after_long_inline_block_comment() {
+        let mut sample_content = "const bundledValue=0;".repeat(512);
+        sample_content.push_str(
+            r#"/* require("fs");eval("bad");process.binding("fs"); */const cp=require("child_process");cp.spawnSync("true");"#,
+        );
+        assert!(sample_content.len() > 4096, "sample must be a long line");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let entry = temp.path().join("mixed-bundle.js");
+        fs::write(&entry, sample_content).expect("write mixed bundle sample");
+
+        let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
+        let ledger = scanner.scan_path(&entry).expect("scan");
+
+        assert!(
+            ledger
+                .capabilities
+                .iter()
+                .any(|cap| cap.capability == "exec" && cap.reason == "import:child_process"),
+            "live child_process require after a long comment must remain visible"
+        );
+        assert!(
+            !ledger
+                .capabilities
+                .iter()
+                .any(|cap| cap.reason == "import:fs"),
+            "commented fs require must stay ignored"
+        );
+        assert!(
+            ledger
+                .rewrites
+                .iter()
+                .any(|rewrite| rewrite.from == "child_process"),
+            "live child_process require must retain its rewrite evidence"
+        );
+        assert!(
+            !ledger.rewrites.iter().any(|rewrite| rewrite.from == "fs"),
+            "commented fs require must not create rewrite evidence"
+        );
+        assert!(ledger.forbidden.is_empty());
+        assert!(ledger.flagged.is_empty());
     }
 
     #[test]

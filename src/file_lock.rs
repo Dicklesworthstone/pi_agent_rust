@@ -25,22 +25,25 @@
 //! encounters a stale leftover regular file (from an older pi_agent_rust build) it
 //! removes it, healing the poisoning for the TS side as well.
 //!
-//! Constants mirror proper-lockfile's defaults: `stale = 10_000ms` (minimum
-//! 2_000ms in proper-lockfile; we use the default 10s). pi_agent_rust holds these
-//! locks only for the duration of a small read or an atomic temp-file rename —
-//! orders of magnitude below the stale threshold — so, unlike proper-lockfile, it
-//! does not run a background mtime "updater" thread. If any future caller holds a
-//! shared-file lock across slow or networked I/O, add periodic mtime refresh here
-//! to keep a concurrent proper-lockfile holder from reclaiming it as stale.
+//! Constants mirror proper-lockfile's defaults: `stale = 10_000ms` and
+//! `update = stale / 2`. Refreshing the lock-directory mtime is required even for
+//! usually-short critical sections: a delayed writer must never become stealable
+//! merely because scheduling or filesystem I/O exceeded the stale threshold.
 
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 /// proper-lockfile default `stale` threshold. A lock directory whose mtime is
 /// older than this is considered abandoned and may be reclaimed.
 const STALE: Duration = Duration::from_secs(10);
+
+/// proper-lockfile's default refresh interval (`stale / 2`).
+const UPDATE: Duration = Duration::from_secs(5);
 
 /// ENOTDIR raw errno (a component of the path — here the lock path itself — is a
 /// regular file). `io::ErrorKind::NotADirectory` is unstable, so match the errno.
@@ -60,11 +63,11 @@ pub fn lock_path_for(target: &Path) -> PathBuf {
 /// Mirrors proper-lockfile's `isLockStale`: `stat.mtime < Date.now() - stale`.
 /// A future mtime (clock skew) or an unreadable mtime is treated as *fresh*
 /// (i.e. held) so we never steal a lock we cannot prove is abandoned.
-fn is_stale(meta: &fs::Metadata) -> bool {
+fn is_stale(meta: &fs::Metadata, stale: Duration) -> bool {
     meta.modified().is_ok_and(|mtime| {
         SystemTime::now()
             .duration_since(mtime)
-            .is_ok_and(|age| age > STALE)
+            .is_ok_and(|age| age > stale)
     })
 }
 
@@ -75,12 +78,52 @@ fn is_stale(meta: &fs::Metadata) -> bool {
 /// pi_agent_rust build (proper-lockfile never creates one); remove it too so the
 /// path stops poisoning the TS side. Errors are ignored: a concurrent acquirer
 /// may have already removed it, and the subsequent `mkdir` is the real arbiter.
-fn reclaim(lock_path: &Path, meta: &fs::Metadata) {
-    if meta.is_dir() {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LockIdentity {
+    modified: SystemTime,
+    is_dir: bool,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+fn lock_identity(meta: &fs::Metadata) -> io::Result<LockIdentity> {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+
+    Ok(LockIdentity {
+        modified: meta.modified()?,
+        is_dir: meta.is_dir(),
+        #[cfg(unix)]
+        device: meta.dev(),
+        #[cfg(unix)]
+        inode: meta.ino(),
+    })
+}
+
+fn reclaim_if_unchanged(lock_path: &Path, observed: &fs::Metadata) {
+    let Ok(current) = fs::symlink_metadata(lock_path) else {
+        return;
+    };
+    let (Ok(current_identity), Ok(observed_identity)) =
+        (lock_identity(&current), lock_identity(observed))
+    else {
+        return;
+    };
+    if current_identity != observed_identity {
+        return;
+    }
+    if current.is_dir() {
         let _ = fs::remove_dir(lock_path);
     } else {
         let _ = fs::remove_file(lock_path);
     }
+}
+
+fn refresh_identity(lock_path: &Path) -> io::Result<LockIdentity> {
+    filetime::set_file_mtime(lock_path, filetime::FileTime::now())?;
+    lock_identity(&fs::symlink_metadata(lock_path)?)
 }
 
 /// Exponential backoff with light jitter, capped, mirroring the previous
@@ -106,6 +149,10 @@ fn backoff(attempt: u32) -> Duration {
 #[must_use = "the lock is released as soon as the DirLock is dropped"]
 pub struct DirLock {
     lock_path: PathBuf,
+    stop_heartbeat: Option<mpsc::Sender<()>>,
+    heartbeat: Option<JoinHandle<()>>,
+    expected_identity: Arc<Mutex<LockIdentity>>,
+    compromised: Arc<AtomicBool>,
 }
 
 impl DirLock {
@@ -115,6 +162,15 @@ impl DirLock {
     /// Semantics match proper-lockfile: `mkdir` to acquire; on `EEXIST`, reclaim
     /// the lock if its mtime is stale, otherwise wait and retry until `timeout`.
     pub fn acquire(lock_path: &Path, timeout: Duration) -> io::Result<Self> {
+        Self::acquire_with_timing(lock_path, timeout, STALE, UPDATE)
+    }
+
+    fn acquire_with_timing(
+        lock_path: &Path,
+        timeout: Duration,
+        stale: Duration,
+        update: Duration,
+    ) -> io::Result<Self> {
         if let Some(parent) = lock_path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -131,17 +187,15 @@ impl DirLock {
                         use std::os::unix::fs::PermissionsExt as _;
                         let _ = fs::set_permissions(lock_path, fs::Permissions::from_mode(0o700));
                     }
-                    return Ok(Self {
-                        lock_path: lock_path.to_path_buf(),
-                    });
+                    return Self::start_heartbeat(lock_path, update);
                 }
                 Err(e) if is_already_exists(&e) => {
                     // Something occupies the path. Decide held-vs-stale exactly as
                     // proper-lockfile does, via the mtime of whatever is there.
                     match fs::symlink_metadata(lock_path) {
                         Ok(meta) => {
-                            if is_stale(&meta) {
-                                reclaim(lock_path, &meta);
+                            if is_stale(&meta, stale) {
+                                reclaim_if_unchanged(lock_path, &meta);
                                 attempt = 0; // reclaimed: retry promptly
                             }
                             // fresh: fall through to wait/retry
@@ -163,6 +217,67 @@ impl DirLock {
             std::thread::sleep(backoff(attempt));
             attempt = attempt.saturating_add(1);
         }
+    }
+
+    fn start_heartbeat(lock_path: &Path, update: Duration) -> io::Result<Self> {
+        let initial_identity = match refresh_identity(lock_path) {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = fs::remove_dir(lock_path);
+                return Err(error);
+            }
+        };
+        let expected_identity = Arc::new(Mutex::new(initial_identity));
+        let compromised = Arc::new(AtomicBool::new(false));
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let heartbeat_path = lock_path.to_path_buf();
+        let heartbeat_expected = Arc::clone(&expected_identity);
+        let heartbeat_compromised = Arc::clone(&compromised);
+        let heartbeat = match thread::Builder::new()
+            .name("pi-file-lock-heartbeat".to_string())
+            .spawn(move || {
+                loop {
+                    match stop_rx.recv_timeout(update) {
+                        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+
+                    let expected = *heartbeat_expected
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let current =
+                        fs::symlink_metadata(&heartbeat_path).and_then(|meta| lock_identity(&meta));
+                    let still_owned = current.is_ok_and(|identity| identity == expected);
+                    if !still_owned {
+                        heartbeat_compromised.store(true, Ordering::Release);
+                        break;
+                    }
+                    match refresh_identity(&heartbeat_path) {
+                        Ok(identity) => {
+                            *heartbeat_expected
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner) = identity;
+                        }
+                        Err(_) => {
+                            heartbeat_compromised.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+            }) {
+            Ok(handle) => handle,
+            Err(error) => {
+                let _ = fs::remove_dir(lock_path);
+                return Err(error);
+            }
+        };
+        Ok(Self {
+            lock_path: lock_path.to_path_buf(),
+            stop_heartbeat: Some(stop_tx),
+            heartbeat: Some(heartbeat),
+            expected_identity,
+            compromised,
+        })
     }
 
     /// Acquire the directory lock for a `target` file, computing the
@@ -191,10 +306,25 @@ fn is_already_exists(e: &io::Error) -> bool {
 
 impl Drop for DirLock {
     fn drop(&mut self) {
-        // Release == rmdir, matching proper-lockfile. Ignore errors: the only
-        // failure modes are "already gone" (a stale-reclaim beat us) or a
-        // transient FS error, neither of which we can act on here.
-        let _ = fs::remove_dir(&self.lock_path);
+        if let Some(stop) = self.stop_heartbeat.take() {
+            let _ = stop.send(());
+        }
+        if let Some(heartbeat) = self.heartbeat.take() {
+            let _ = heartbeat.join();
+        }
+        if self.compromised.load(Ordering::Acquire) {
+            return;
+        }
+        let expected = *self
+            .expected_identity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let still_owned = fs::symlink_metadata(&self.lock_path)
+            .and_then(|meta| lock_identity(&meta))
+            .is_ok_and(|identity| identity == expected);
+        if still_owned {
+            let _ = fs::remove_dir(&self.lock_path);
+        }
     }
 }
 
@@ -233,6 +363,47 @@ mod tests {
         let err = DirLock::acquire(&lp, Duration::from_millis(200))
             .expect_err("second acquire must time out while held");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[test]
+    fn heartbeat_prevents_reclaiming_a_live_long_held_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lp = dir.path().join("session-index.lock");
+        let guard = DirLock::acquire_with_timing(
+            &lp,
+            Duration::from_secs(1),
+            Duration::from_millis(180),
+            Duration::from_millis(40),
+        )
+        .expect("first acquire");
+
+        std::thread::sleep(Duration::from_millis(260));
+        let err = DirLock::acquire_with_timing(
+            &lp,
+            Duration::from_millis(120),
+            Duration::from_millis(180),
+            Duration::from_millis(40),
+        )
+        .expect_err("a refreshed live lock must not be reclaimed");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn displaced_owner_does_not_remove_the_replacement_lock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lp = dir.path().join("session-index.lock");
+        let guard = DirLock::acquire(&lp, Duration::from_secs(1)).expect("first acquire");
+
+        fs::remove_dir(&lp).expect("displace original lock");
+        fs::create_dir(&lp).expect("create replacement lock");
+        drop(guard);
+
+        assert!(
+            lp.is_dir(),
+            "dropping a displaced owner must preserve the replacement lock"
+        );
     }
 
     #[test]
