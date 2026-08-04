@@ -787,7 +787,7 @@ trait ModelCredentialResolver {
 
 impl ModelCredentialResolver for AuthStorage {
     fn resolve_api_key(&self, provider: &str, override_key: Option<&str>) -> Option<String> {
-        AuthStorage::resolve_api_key(self, provider, override_key)
+        Self::resolve_api_key(self, provider, override_key)
     }
 }
 
