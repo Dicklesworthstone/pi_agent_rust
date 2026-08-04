@@ -1089,8 +1089,6 @@ fn strip_js_comments(line: &str, state: &mut ScannerState) -> String {
 mod compatibility_scanner_comment_tests {
     use super::{CompatibilityScanner, ScannerState, strip_js_comments};
     use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn strip_js_comments_keeps_comment_markers_inside_strings() {
@@ -1263,52 +1261,34 @@ pi.exec("echo hello");
         assert!(ledger.flagged.is_empty());
     }
 
-    #[cfg(unix)]
     #[test]
-    fn compatibility_scanner_scan_path_fails_on_unreadable_nested_dir() {
+    fn compatibility_scanner_scan_path_fails_on_missing_directory() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let entry = temp.path().join("clean.js");
-        fs::write(&entry, "export default {};\n").expect("write clean file");
-
-        let blocked_dir = temp.path().join("blocked");
-        fs::create_dir_all(&blocked_dir).expect("mkdir blocked dir");
-        fs::write(blocked_dir.join("hidden.js"), "import fs from 'fs';\n")
-            .expect("write blocked file");
-        fs::set_permissions(&blocked_dir, PermissionsExt::from_mode(0o000))
-            .expect("chmod blocked dir");
+        let missing_dir = temp.path().join("missing");
 
         let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
         let err = scanner
-            .scan_path(temp.path())
+            .scan_path(&missing_dir)
             .expect_err("scan should fail closed");
-
-        fs::set_permissions(&blocked_dir, PermissionsExt::from_mode(0o755))
-            .expect("restore blocked dir perms");
 
         let err_text = err.to_string();
         assert!(err_text.contains("Failed to read extension source directory"));
-        assert!(err_text.contains(&blocked_dir.display().to_string()));
+        assert!(err_text.contains(&missing_dir.display().to_string()));
     }
 
-    #[cfg(unix)]
     #[test]
-    fn compatibility_scanner_scan_path_fails_on_unreadable_file() {
+    fn compatibility_scanner_scan_path_fails_on_non_utf8_source_file() {
         let temp = tempfile::tempdir().expect("tempdir");
         let clean = temp.path().join("clean.js");
         fs::write(&clean, "export default {};\n").expect("write clean file");
 
         let blocked = temp.path().join("blocked.js");
-        fs::write(&blocked, "import fs from 'fs';\n").expect("write blocked file");
-        fs::set_permissions(&blocked, PermissionsExt::from_mode(0o000))
-            .expect("chmod blocked file");
+        fs::write(&blocked, [0xff, 0xfe, 0xfd]).expect("write non-UTF-8 source file");
 
         let scanner = CompatibilityScanner::new(temp.path().to_path_buf());
         let err = scanner
             .scan_path(temp.path())
             .expect_err("scan should fail closed");
-
-        fs::set_permissions(&blocked, PermissionsExt::from_mode(0o644))
-            .expect("restore blocked file perms");
 
         let err_text = err.to_string();
         assert!(err_text.contains("Failed to read extension source file"));
