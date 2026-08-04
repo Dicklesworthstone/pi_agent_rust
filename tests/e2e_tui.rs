@@ -60,6 +60,7 @@ const VCR_BASIC_CHAT_TEST_NAME: &str = "e2e_tui_basic_chat";
 const VCR_MULTI_TOOL_CHAIN_TEST_NAME: &str = "e2e_tui_multi_tool_chain";
 const VCR_SCROLL_FINALIZE_TEST_NAME: &str = "e2e_tui_scroll_finalize";
 const VCR_MODEL: &str = "claude-sonnet-4-20250514";
+const VCR_MODEL_MAX_TOKENS: u32 = 64_000;
 const VCR_PROMPT: &str = "Read sample.txt";
 const VCR_BASIC_CHAT_PROMPT: &str = "Say hello";
 const VCR_BASIC_CHAT_RESPONSE: &str = "Hello! How can I help you today?";
@@ -292,7 +293,7 @@ fn write_vcr_basic_chat_cassette(dir: &Path, system_prompt: &str) -> PathBuf {
             { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
 
@@ -382,7 +383,7 @@ fn write_vcr_scroll_finalize_cassette(dir: &Path, system_prompt: &str) -> PathBu
             { "role": "user", "content": [ { "type": "text", "text": VCR_SCROLL_FINALIZE_PROMPT } ] }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
 
@@ -542,7 +543,7 @@ fn write_vcr_cassette_for_read(
             { "role": "user", "content": [ { "type": "text", "text": prompt } ] }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
         "tools": [tool_schema],
     });
@@ -575,7 +576,7 @@ fn write_vcr_cassette_for_read(
             }
         ],
         "system": system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
         "tools": [tool_schema],
     });
@@ -1740,7 +1741,7 @@ fn e2e_tui_basic_chat_vcr() {
             { "role": "user", "content": [ { "type": "text", "text": VCR_BASIC_CHAT_PROMPT } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
     std::fs::write(
@@ -2859,7 +2860,7 @@ fn e2e_scenario_error_api_failure() {
             { "role": "user", "content": [ { "type": "text", "text": error_prompt } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
 
@@ -3463,7 +3464,7 @@ fn e2e_scenario_prompt_loop_multi_round() {
             { "role": "user", "content": [ { "type": "text", "text": prompt_1 } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
 
@@ -3478,7 +3479,7 @@ fn e2e_scenario_prompt_loop_multi_round() {
             { "role": "user", "content": [ { "type": "text", "text": prompt_2 } ] }
         ],
         "system": &system_prompt,
-        "max_tokens": 8192,
+        "max_tokens": VCR_MODEL_MAX_TOKENS,
         "stream": true,
     });
 

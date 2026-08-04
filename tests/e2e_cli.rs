@@ -33,6 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const DEFAULT_CLI_TIMEOUT_SECS: u64 = 120;
+const VCR_CLAUDE_SONNET_MAX_TOKENS: u32 = 64_000;
 const FAKE_NPM_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 
@@ -2939,7 +2940,7 @@ fn e2e_cli_print_mode_vcr_roundtrip() {
             {"role": "user", "content": [{"type": "text", "text": "Reply with the single word: pong."}]}
         ],
         "system": expected_system_prompt("You are a test harness model."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -3002,7 +3003,7 @@ fn e2e_cli_print_mode_stdin_sends_to_provider() {
             {"role": "user", "content": [{"type": "text", "text": "Hello from stdin pipe content."}]}
         ],
         "system": expected_system_prompt("Echo test."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -3234,7 +3235,7 @@ fn e2e_cli_json_mode_print_flag_emits_header_and_events() {
             {"role": "user", "content": [{"type": "text", "text": "Reply with JSON mode pong."}]}
         ],
         "system": expected_system_prompt("JSON mode event stream test."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -3284,7 +3285,7 @@ fn e2e_cli_json_mode_fragmented_sse_chunks_preserve_delta_text() {
             {"role": "user", "content": [{"type": "text", "text": "Handle fragmented SSE frames."}]}
         ],
         "system": expected_system_prompt("JSON mode fragmented SSE test."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
     let chunks = build_anthropic_response_chunks_from_parts(&response_parts);
@@ -3341,7 +3342,7 @@ fn e2e_cli_json_mode_high_volume_stream_preserves_event_count_and_order() {
             {"role": "user", "content": [{"type": "text", "text": "Stream a lot of tiny JSON mode deltas."}]}
         ],
         "system": expected_system_prompt("JSON mode throughput regression test."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
     let chunks = build_anthropic_response_chunks_from_parts(&part_refs);
@@ -3394,7 +3395,7 @@ fn e2e_cli_json_mode_stdin_emits_header_and_events() {
             {"role": "user", "content": [{"type": "text", "text": "JSON stdin body"}]}
         ],
         "system": expected_system_prompt("JSON stdin test."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -3505,7 +3506,7 @@ fn e2e_cli_print_mode_file_ref_reads_file() {
             {"role": "user", "content": [{"type": "text", "text": user_text}]}
         ],
         "system": expected_system_prompt("File test."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -3572,7 +3573,7 @@ fn e2e_cli_no_tools_omits_tool_definitions() {
             {"role": "user", "content": [{"type": "text", "text": "Say ok."}]}
         ],
         "system": expected_system_prompt(system_prompt),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -3631,7 +3632,7 @@ fn e2e_cli_specific_tools_enables_subset() {
         ],
         "system": expected_system_prompt(system_prompt),
         "tools": expected_anthropic_tools(&expected_tools),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -3699,7 +3700,7 @@ fn e2e_cli_default_tools_when_no_flag() {
         ],
         "system": expected_system_prompt(system_prompt),
         "tools": expected_anthropic_tools(&expected_tools),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -4026,7 +4027,7 @@ fn e2e_cli_no_tools_handles_tool_use_response_gracefully() {
             {"role": "user", "content": [{"type": "text", "text": "Read a file for me."}]}
         ],
         "system": expected_system_prompt("Test no-tools graceful."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
 
@@ -4309,7 +4310,7 @@ fn e2e_interactive_session_creates_valid_jsonl_tmux() {
             {"role": "user", "content": [{"type": "text", "text": "Say hello session test."}]}
         ],
         "system": expected_system_prompt("Session test."),
-        "max_tokens": 8192,
+        "max_tokens": VCR_CLAUDE_SONNET_MAX_TOKENS,
         "stream": true
     });
     setup_vcr_anthropic(
