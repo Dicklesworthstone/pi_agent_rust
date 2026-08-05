@@ -539,7 +539,10 @@ proof is not proof of an empty bypass list.
    claim. Structural, schema, count, status, or readiness contradictions remain
    hard failures in either mode. A future release that makes such a claim must
    set the flag to `1`; the gate then also requires fresh source-bound lineage
-   and independently reruns the canonical strict perf contract.
+   and the pinned canonical budget-inventory digest. It proves the exact strict
+   perf test is listed once, runs once, is not ignored, and freshly recomputes
+   and deep-compares the checked-in definitions, results, failures, counts, and
+   readiness.
 
    The gate requires a clean repository at entry and revalidates the exact
    HEAD, canonical source-tree digest, index, index flags, symlink topology,

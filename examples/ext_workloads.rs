@@ -476,9 +476,11 @@ fn run() -> Result<()> {
             source_dirty,
             build_profile: &build_profile,
             executable_build_profile: executable_build_profile.as_deref().unwrap_or("unknown"),
-            executable_profile_verified,
-            build_fingerprint_verified,
-            build_profile_verified,
+            verification: perf_build::BenchmarkBuildVerification {
+                executable_profile: executable_profile_verified,
+                build_fingerprint: build_fingerprint_verified,
+                build_profile: build_profile_verified,
+            },
             build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT,
             compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY,
             compiled_opt_level: perf_build::COMPILED_OPT_LEVEL,
@@ -2067,9 +2069,11 @@ fn parse_profile_record(record: &Value) -> Option<ParsedProfileRecord> {
             source_dirty,
             build_profile: &build_profile,
             executable_build_profile: &executable_build_profile,
-            executable_profile_verified: reported_executable_profile_verified,
-            build_fingerprint_verified: reported_build_fingerprint_verified,
-            build_profile_verified: reported_build_profile_verified,
+            verification: perf_build::BenchmarkBuildVerification {
+                executable_profile: reported_executable_profile_verified,
+                build_fingerprint: reported_build_fingerprint_verified,
+                build_profile: reported_build_profile_verified,
+            },
             build_fingerprint_contract: &build_fingerprint_contract,
             compiled_profile_family: &compiled_profile_family,
             compiled_opt_level: &compiled_opt_level,
@@ -3489,18 +3493,20 @@ fn validate_hotspot_matrix_schema(matrix: &Value) -> Result<()> {
                         .get("executable_build_profile")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown"),
-                    executable_profile_verified: row_obj
-                        .get("executable_profile_verified")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    build_fingerprint_verified: row_obj
-                        .get("build_fingerprint_verified")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    build_profile_verified: row_obj
-                        .get("build_profile_verified")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
+                    verification: perf_build::BenchmarkBuildVerification {
+                        executable_profile: row_obj
+                            .get("executable_profile_verified")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        build_fingerprint: row_obj
+                            .get("build_fingerprint_verified")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        build_profile: row_obj
+                            .get("build_profile_verified")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    },
                     build_fingerprint_contract: row_obj
                         .get("build_fingerprint_contract")
                         .and_then(Value::as_str)
@@ -4171,9 +4177,11 @@ mod tests {
             source_dirty: false,
             build_profile: "perf",
             executable_build_profile: "perf",
-            executable_profile_verified: true,
-            build_fingerprint_verified: true,
-            build_profile_verified: true,
+            verification: perf_build::BenchmarkBuildVerification {
+                executable_profile: true,
+                build_fingerprint: true,
+                build_profile: true,
+            },
             build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT,
             compiled_profile_family: "release",
             compiled_opt_level: "3",

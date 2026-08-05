@@ -216,9 +216,11 @@ fn env_fingerprint() -> Value {
             source_dirty,
             build_profile: &build_profile,
             executable_build_profile: executable_build_profile.as_deref().unwrap_or("unknown"),
-            executable_profile_verified,
-            build_fingerprint_verified,
-            build_profile_verified,
+            verification: perf_build::BenchmarkBuildVerification {
+                executable_profile: executable_profile_verified,
+                build_fingerprint: build_fingerprint_verified,
+                build_profile: build_profile_verified,
+            },
             build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT,
             compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY,
             compiled_opt_level: perf_build::COMPILED_OPT_LEVEL,
@@ -1754,18 +1756,20 @@ fn assert_env_fingerprint_fields(obj: &Map<String, Value>) {
                 .get("executable_build_profile")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown"),
-            executable_profile_verified: env
-                .get("executable_profile_verified")
-                .and_then(Value::as_bool)
-                .expect("env.executable_profile_verified boolean"),
-            build_fingerprint_verified: env
-                .get("build_fingerprint_verified")
-                .and_then(Value::as_bool)
-                .expect("env.build_fingerprint_verified boolean"),
-            build_profile_verified: env
-                .get("build_profile_verified")
-                .and_then(Value::as_bool)
-                .expect("env.build_profile_verified boolean"),
+            verification: perf_build::BenchmarkBuildVerification {
+                executable_profile: env
+                    .get("executable_profile_verified")
+                    .and_then(Value::as_bool)
+                    .expect("env.executable_profile_verified boolean"),
+                build_fingerprint: env
+                    .get("build_fingerprint_verified")
+                    .and_then(Value::as_bool)
+                    .expect("env.build_fingerprint_verified boolean"),
+                build_profile: env
+                    .get("build_profile_verified")
+                    .and_then(Value::as_bool)
+                    .expect("env.build_profile_verified boolean"),
+            },
             build_fingerprint_contract: env
                 .get("build_fingerprint_contract")
                 .and_then(Value::as_str)

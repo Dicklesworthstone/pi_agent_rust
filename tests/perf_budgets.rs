@@ -70,7 +70,7 @@ struct Budget {
     metric: &'static str,
     /// Unit of measurement (ms, us, MB, count).
     unit: &'static str,
-    /// Budget threshold (must not exceed this value).
+    /// Comparison boundary interpreted according to `comparison`.
     threshold: f64,
     /// Whether passing requires the measured value to stay at or below the
     /// threshold, or at or above it.
@@ -596,6 +596,100 @@ fn claim_readiness_blockers(
         blockers.insert("data_contract_failure");
     }
     blockers.into_iter().collect()
+}
+
+fn budget_definitions_value() -> Vec<Value> {
+    BUDGETS
+        .iter()
+        .map(|budget| {
+            json!({
+                "name": budget.name,
+                "category": budget.category,
+                "metric": budget.metric,
+                "unit": budget.unit,
+                "threshold": budget.threshold,
+                "comparison": budget.comparison,
+                "ci_enforced": budget.ci_enforced,
+                "methodology": budget.methodology,
+            })
+        })
+        .collect()
+}
+
+struct BudgetSummaryLineage<'a> {
+    generated_at: &'a str,
+    source_commit: Option<&'a str>,
+    run_id: Option<&'a str>,
+    correlation_id: Option<&'a str>,
+    strict_mode: bool,
+}
+
+fn budget_summary_value(
+    lineage: &BudgetSummaryLineage<'_>,
+    results: &[BudgetResult],
+    data_contract_failures: &[DataContractFailure],
+) -> Value {
+    let pass_count = results.iter().filter(|result| result.status == "PASS").count();
+    let fail_count = results.iter().filter(|result| result.status == "FAIL").count();
+    let no_data_count = results
+        .iter()
+        .filter(|result| result.status == "NO_DATA")
+        .count();
+    let ci_enforced_count = BUDGETS.iter().filter(|budget| budget.ci_enforced).count();
+    let ci_results = results
+        .iter()
+        .filter(|result| result.ci_enforced)
+        .collect::<Vec<_>>();
+    let ci_with_data_count = ci_results
+        .iter()
+        .filter(|result| result.actual.is_some())
+        .count();
+    let ci_fail_count = ci_results
+        .iter()
+        .filter(|result| result.status == "FAIL")
+        .count();
+    let ci_no_data_count = ci_results
+        .iter()
+        .filter(|result| result.status == "NO_DATA")
+        .count();
+    let readiness_blockers = claim_readiness_blockers(
+        lineage.strict_mode,
+        lineage.source_commit,
+        lineage.run_id,
+        lineage.correlation_id,
+        ci_enforced_count,
+        ci_with_data_count,
+        ci_fail_count,
+        ci_no_data_count,
+        data_contract_failures.len(),
+    );
+    let claims_authorized = readiness_blockers.is_empty();
+
+    json!({
+        "schema": "pi.perf.budget_summary.v2",
+        "generated_at": lineage.generated_at,
+        "source_commit": lineage.source_commit,
+        "run_id": lineage.run_id,
+        "correlation_id": lineage.correlation_id,
+        "strict_mode": lineage.strict_mode,
+        "total_budgets": BUDGETS.len(),
+        "ci_enforced": ci_enforced_count,
+        "ci_with_data": ci_with_data_count,
+        "ci_fail": ci_fail_count,
+        "ci_no_data": ci_no_data_count,
+        "pass": pass_count,
+        "fail": fail_count,
+        "no_data": no_data_count,
+        "data_contract_failures_count": data_contract_failures.len(),
+        "failing_data_contracts": data_contract_failures,
+        "budgets": budget_definitions_value(),
+        "budget_results": results,
+        "claim_readiness": {
+            "status": if claims_authorized { "claim_ready" } else { "blocked" },
+            "performance_claims_authorized": claims_authorized,
+            "blocking_reason_codes": readiness_blockers,
+        },
+    })
 }
 
 fn classify_budget_status(budget: &Budget, actual: Option<f64>, strict: bool) -> &'static str {
@@ -1880,9 +1974,11 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
         source_dirty: false,
         build_profile: "perf",
         executable_build_profile: "perf",
-        executable_profile_verified: true,
-        build_fingerprint_verified: true,
-        build_profile_verified: true,
+        verification: BenchmarkBuildVerification {
+            executable_profile: true,
+            build_fingerprint: true,
+            build_profile: true,
+        },
         build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
         compiled_profile_family: "release",
         compiled_opt_level: "3",
@@ -2999,9 +3095,11 @@ fn valid_pijs_gate_record(root: &Path, tool_calls_per_iteration: u64) -> Value {
         source_dirty: false,
         build_profile: "perf",
         executable_build_profile: "perf",
-        executable_profile_verified: true,
-        build_fingerprint_verified: true,
-        build_profile_verified: true,
+        verification: BenchmarkBuildVerification {
+            executable_profile: true,
+            build_fingerprint: true,
+            build_profile: true,
+        },
         build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
         compiled_profile_family: "release",
         compiled_opt_level: "3",
@@ -3011,7 +3109,7 @@ fn valid_pijs_gate_record(root: &Path, tool_calls_per_iteration: u64) -> Value {
         binary_sha256: &binary_sha256,
         debug_assertions: false,
     });
-    json!({
+    let mut record = json!({
         "schema": "pi.perf.workload.v1",
         "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         "run_id": "pijs-test-run",
@@ -3029,6 +3127,8 @@ fn valid_pijs_gate_record(root: &Path, tool_calls_per_iteration: u64) -> Value {
         "per_call_us": elapsed_us / total_calls,
         "per_call_us_f64": 49.5,
         "calls_per_sec": total_calls * 1_000_000 / elapsed_us,
+    });
+    let provenance = json!({
         "build_profile": "perf",
         "build_profile_verified": true,
         "build_fingerprint_contract": BUILD_FINGERPRINT_CONTRACT,
@@ -3056,7 +3156,17 @@ fn valid_pijs_gate_record(root: &Path, tool_calls_per_iteration: u64) -> Value {
         "allocator_request_source": "env",
         "allocator_effective": "system",
         "allocator_fallback_reason": null
-    })
+    });
+    record
+        .as_object_mut()
+        .expect("PiJS fixture record")
+        .extend(
+            provenance
+                .as_object()
+                .expect("PiJS fixture provenance")
+                .clone(),
+        );
+    record
 }
 
 fn write_pijs_workload_records(path: &Path, records: &[Value]) {
@@ -3098,15 +3208,17 @@ fn refresh_pijs_test_config_hash(record: &mut Value) {
         executable_build_profile: record["executable_build_profile"]
             .as_str()
             .expect("executable build profile"),
-        executable_profile_verified: record["executable_profile_verified"]
-            .as_bool()
-            .expect("executable profile verified"),
-        build_fingerprint_verified: record["build_fingerprint_verified"]
-            .as_bool()
-            .expect("build fingerprint verified"),
-        build_profile_verified: record["build_profile_verified"]
-            .as_bool()
-            .expect("build profile verified"),
+        verification: BenchmarkBuildVerification {
+            executable_profile: record["executable_profile_verified"]
+                .as_bool()
+                .expect("executable profile verified"),
+            build_fingerprint: record["build_fingerprint_verified"]
+                .as_bool()
+                .expect("build fingerprint verified"),
+            build_profile: record["build_profile_verified"]
+                .as_bool()
+                .expect("build profile verified"),
+        },
         build_fingerprint_contract: record["build_fingerprint_contract"]
             .as_str()
             .expect("build fingerprint contract"),

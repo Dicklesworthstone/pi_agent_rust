@@ -1767,10 +1767,9 @@ fn perf_generated_at(value: &Value) -> Result<DateTime<Utc>, String> {
         && bytes[16] == b':'
         && bytes[19] == b'.'
         && bytes[23] == b'Z'
-        && bytes
-            .iter()
-            .enumerate()
-            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit());
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit()
+        });
     if !millisecond_utc_shape {
         return Err(
             "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
@@ -1824,11 +1823,8 @@ fn perf_budget_inventory_sha256(budgets: &[Value]) -> Result<String, String> {
             &format!("{label}.unit"),
         )?)
         .map_err(|err| format!("failed to serialize {label}.unit: {err}"))?;
-        let threshold = perf_finite_number(
-            &object["threshold"],
-            &format!("{label}.threshold"),
-            true,
-        )?;
+        let threshold =
+            perf_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
         let rounded_threshold = (threshold * 1_000_000.0).round() / 1_000_000.0;
         if threshold.total_cmp(&rounded_threshold).is_ne() {
             return Err(format!(
@@ -2381,7 +2377,13 @@ fn exact_libtest_output_proves_one(
                     parts.next(),
                     parts.next(),
                 ),
-                (Some(_), Some("test," | "tests,"), Some(_), Some("benchmark" | "benchmarks"), None)
+                (
+                    Some(_),
+                    Some("test," | "tests,"),
+                    Some(_),
+                    Some("benchmark" | "benchmarks"),
+                    None
+                )
             )
         })
         .collect();
@@ -2525,16 +2527,14 @@ fn claim_ready_performance_summary_fixture(now: DateTime<Utc>) -> Value {
 #[test]
 fn performance_budgets_report_has_exact_v2_contract() {
     let summary = require_json("tests/perf/reports/budget_summary.json");
-    let source_binding_valid = if let Some(source_commit) = summary
-        .get("source_commit")
-        .and_then(Value::as_str)
-    {
-        validate_performance_source_binding(source_commit)
-            .unwrap_or_else(|err| panic!("invalid asserted performance source binding: {err}"));
-        true
-    } else {
-        false
-    };
+    let source_binding_valid =
+        if let Some(source_commit) = summary.get("source_commit").and_then(Value::as_str) {
+            validate_performance_source_binding(source_commit)
+                .unwrap_or_else(|err| panic!("invalid asserted performance source binding: {err}"));
+            true
+        } else {
+            false
+        };
     let validated = validate_performance_budget_summary(
         &summary,
         Utc::now(),
@@ -2573,13 +2573,8 @@ fn performance_contract_accepts_coherent_blocked_no_data() {
         "strict_mode_disabled"
     ]);
     assert!(
-        validate_performance_budget_summary(
-            &forged_source,
-            now,
-            Duration::hours(168),
-            false,
-        )
-        .is_err(),
+        validate_performance_budget_summary(&forged_source, now, Duration::hours(168), false,)
+            .is_err(),
         "a blocked artifact may omit source binding, but must not assert a fabricated binding"
     );
 
@@ -2655,13 +2650,9 @@ fn performance_contract_rejects_forged_inventory_and_comparison_semantics() {
     let mut forged_comparison = claim_ready_performance_summary_fixture(now);
     forged_comparison["budgets"][0]["comparison"] = json!("minimum");
     forged_comparison["budget_results"][0]["comparison"] = json!("minimum");
-    let error = validate_performance_budget_summary(
-        &forged_comparison,
-        now,
-        Duration::hours(168),
-        true,
-    )
-    .expect_err("self-consistent forged comparison semantics must not authorize claims");
+    let error =
+        validate_performance_budget_summary(&forged_comparison, now, Duration::hours(168), true)
+            .expect_err("self-consistent forged comparison semantics must not authorize claims");
     assert!(error.contains("canonical producer contract"), "{error}");
 
     let mut threshold_drift = claim_ready_performance_summary_fixture(now);
@@ -2671,13 +2662,9 @@ fn performance_contract_rejects_forged_inventory_and_comparison_semantics() {
     threshold_drift["budgets"][0]["threshold"] = json!(threshold + 0.000_000_1);
     threshold_drift["budget_results"][0]["threshold"] = json!(threshold + 0.000_000_1);
     threshold_drift["budget_results"][0]["actual"] = json!(threshold);
-    let error = validate_performance_budget_summary(
-        &threshold_drift,
-        now,
-        Duration::hours(168),
-        true,
-    )
-    .expect_err("sub-canonical threshold precision drift must not authorize claims");
+    let error =
+        validate_performance_budget_summary(&threshold_drift, now, Duration::hours(168), true)
+            .expect_err("sub-canonical threshold precision drift must not authorize claims");
     assert!(error.contains("six-decimal precision"), "{error}");
 }
 
@@ -2775,6 +2762,10 @@ fn release_gate_exposes_performance_claim_policy_in_report() {
         "pi.perf.budget_summary.v2",
         "performance_claim_readiness",
         "performance_claim_canonical_contract",
+        "CANONICAL_BUDGET_INVENTORY_SHA256",
+        "validate_exact_libtest_output",
+        "--list --format terse",
+        "0 ignored",
         "ci_enforced_budgets_fail_on_regression_or_missing_data",
         "\"require_performance_claim_ready\"",
         "release must make no quantitative or global performance claims",
