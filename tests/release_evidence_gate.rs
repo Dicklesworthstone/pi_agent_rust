@@ -10,7 +10,8 @@
 //! See also: `tests/release_readiness.rs` for the readiness report generator.
 #![allow(clippy::too_many_lines)]
 
-use serde_json::{Map, Value};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -1595,16 +1596,878 @@ fn failure_count_within_release_threshold() {
     );
 }
 
-#[test]
-fn performance_budgets_report_exists_and_valid() {
-    let budget = require_json("tests/perf/reports/budget_summary.json");
+const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
+const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
+    "schema",
+    "generated_at",
+    "source_commit",
+    "run_id",
+    "correlation_id",
+    "strict_mode",
+    "total_budgets",
+    "ci_enforced",
+    "ci_with_data",
+    "ci_fail",
+    "ci_no_data",
+    "pass",
+    "fail",
+    "no_data",
+    "data_contract_failures_count",
+    "failing_data_contracts",
+    "budgets",
+    "budget_results",
+    "claim_readiness",
+];
+const PERF_BUDGET_FIELDS: &[&str] = &[
+    "name",
+    "category",
+    "metric",
+    "unit",
+    "threshold",
+    "methodology",
+    "ci_enforced",
+];
+const PERF_RESULT_REQUIRED_FIELDS: &[&str] = &[
+    "budget_name",
+    "category",
+    "threshold",
+    "unit",
+    "actual",
+    "status",
+    "source",
+    "ci_enforced",
+];
+const PERF_FAILURE_REQUIRED_FIELDS: &[&str] = &["contract_id", "detail", "remediation"];
+const PERF_CLAIM_READINESS_FIELDS: &[&str] = &[
+    "status",
+    "performance_claims_authorized",
+    "blocking_reason_codes",
+];
 
+#[derive(Debug)]
+struct PerformanceClaimValidation {
+    claim_ready: bool,
+}
+
+#[derive(Debug)]
+struct PerformanceBudgetDefinition {
+    category: String,
+    unit: String,
+    threshold: f64,
+    ci_enforced: bool,
+}
+
+fn perf_exact_object<'a>(
+    value: &'a Value,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<&'a Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{label} must be an object"))?;
+    let missing: Vec<_> = required
+        .iter()
+        .filter(|field| !object.contains_key(**field))
+        .copied()
+        .collect();
+    let unexpected: Vec<_> = object
+        .keys()
+        .filter(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .cloned()
+        .collect();
+    if missing.is_empty() && unexpected.is_empty() {
+        Ok(object)
+    } else {
+        Err(format!(
+            "{label} fields are not exact (missing={missing:?}, unexpected={unexpected:?})"
+        ))
+    }
+}
+
+fn perf_nonempty_string<'a>(value: &'a Value, label: &str) -> Result<&'a str, String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("{label} must be a string"))?;
+    if raw.is_empty() || raw.trim() != raw {
+        Err(format!(
+            "{label} must be non-empty and free of surrounding whitespace"
+        ))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn perf_uint(value: &Value, label: &str) -> Result<u64, String> {
+    value
+        .as_u64()
+        .filter(|number| *number <= i64::MAX.unsigned_abs())
+        .ok_or_else(|| format!("{label} must be a non-negative signed 64-bit integer"))
+}
+
+fn perf_finite_number(value: &Value, label: &str, positive: bool) -> Result<f64, String> {
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("{label} must be a finite number"))?;
+    if positive && number <= 0.0 {
+        Err(format!("{label} must be a positive finite number"))
+    } else {
+        Ok(number)
+    }
+}
+
+fn perf_nullable_lineage<'a>(value: &'a Value, label: &str) -> Result<Option<&'a str>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = perf_nonempty_string(value, label)?;
+    let mut chars = raw.chars();
+    let valid_start = chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric());
+    let valid_rest =
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '/' | '-'));
+    if valid_start && valid_rest && raw.len() <= 256 {
+        Ok(Some(raw))
+    } else {
+        Err(format!("{label} must be a canonical lineage identifier"))
+    }
+}
+
+fn perf_source_commit(value: &Value) -> Result<Option<&str>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = perf_nonempty_string(value, "source_commit")?;
+    if matches!(raw.len(), 40 | 64)
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(Some(raw))
+    } else {
+        Err("source_commit must be null or a canonical full lowercase Git object ID".to_string())
+    }
+}
+
+fn perf_generated_at(value: &Value) -> Result<DateTime<Utc>, String> {
+    let raw = perf_nonempty_string(value, "generated_at")?;
+    if !raw.ends_with('Z') {
+        return Err("generated_at must be canonical UTC RFC3339 ending in Z".to_string());
+    }
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .map_err(|err| format!("generated_at is not valid RFC3339: {err}"))?;
+    if parsed.offset().local_minus_utc() != 0 {
+        return Err("generated_at must use UTC".to_string());
+    }
+    let utc = parsed.with_timezone(&Utc);
+    if utc.to_rfc3339_opts(SecondsFormat::AutoSi, true) != raw {
+        return Err("generated_at is not in canonical UTC RFC3339 form".to_string());
+    }
+    Ok(utc)
+}
+
+fn perf_usize_as_u64(value: usize, label: &str) -> Result<u64, String> {
+    u64::try_from(value).map_err(|_| format!("derived {label} exceeds u64"))
+}
+
+fn validate_performance_budget_summary(
+    summary: &Value,
+    now: DateTime<Utc>,
+    maximum_age: Duration,
+    source_binding_valid: bool,
+) -> Result<PerformanceClaimValidation, String> {
+    let top = perf_exact_object(summary, PERF_TOP_LEVEL_FIELDS, &[], "performance summary")?;
+    if top.get("schema").and_then(Value::as_str) != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
+        return Err(format!(
+            "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {:?}",
+            top.get("schema")
+        ));
+    }
+
+    let generated_at = perf_generated_at(&top["generated_at"])?;
+    let source_commit = perf_source_commit(&top["source_commit"])?;
+    let run_id = perf_nullable_lineage(&top["run_id"], "run_id")?;
+    let correlation_id = perf_nullable_lineage(&top["correlation_id"], "correlation_id")?;
+    if run_id.is_some() && correlation_id.is_some() && run_id != correlation_id {
+        return Err("run_id and correlation_id must match when both are present".to_string());
+    }
+    let strict_mode = top["strict_mode"]
+        .as_bool()
+        .ok_or_else(|| "strict_mode must be a boolean".to_string())?;
+
+    let count_names = [
+        "total_budgets",
+        "ci_enforced",
+        "ci_with_data",
+        "ci_fail",
+        "ci_no_data",
+        "pass",
+        "fail",
+        "no_data",
+        "data_contract_failures_count",
+    ];
+    let mut counts = HashMap::new();
+    for name in count_names {
+        counts.insert(name, perf_uint(&top[name], name)?);
+    }
+
+    let budgets = top["budgets"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budgets must be a non-empty array".to_string())?;
+    let results = top["budget_results"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budget_results must be a non-empty array".to_string())?;
+    let failures = top["failing_data_contracts"]
+        .as_array()
+        .ok_or_else(|| "failing_data_contracts must be an array".to_string())?;
+
+    let mut definitions = HashMap::new();
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = perf_exact_object(budget, PERF_BUDGET_FIELDS, &[], &label)?;
+        let name = perf_nonempty_string(&object["name"], &format!("{label}.name"))?;
+        for field in ["category", "metric", "unit", "methodology"] {
+            perf_nonempty_string(&object[field], &format!("{label}.{field}"))?;
+        }
+        let definition = PerformanceBudgetDefinition {
+            category: perf_nonempty_string(&object["category"], &format!("{label}.category"))?
+                .to_string(),
+            unit: perf_nonempty_string(&object["unit"], &format!("{label}.unit"))?.to_string(),
+            threshold: perf_finite_number(
+                &object["threshold"],
+                &format!("{label}.threshold"),
+                true,
+            )?,
+            ci_enforced: object["ci_enforced"]
+                .as_bool()
+                .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?,
+        };
+        if definitions.insert(name.to_string(), definition).is_some() {
+            return Err(format!("duplicate budget name: {name}"));
+        }
+    }
+
+    let mut result_names = HashSet::new();
+    let mut pass_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut no_data_count = 0usize;
+    let mut ci_with_data = 0usize;
+    let mut ci_fail = 0usize;
+    let mut ci_no_data = 0usize;
+    for (index, result) in results.iter().enumerate() {
+        let label = format!("budget_results[{index}]");
+        let object = perf_exact_object(
+            result,
+            PERF_RESULT_REQUIRED_FIELDS,
+            &["failure_reason"],
+            &label,
+        )?;
+        let name = perf_nonempty_string(&object["budget_name"], &format!("{label}.budget_name"))?;
+        if !result_names.insert(name.to_string()) {
+            return Err(format!("duplicate budget result: {name}"));
+        }
+        let definition = definitions
+            .get(name)
+            .ok_or_else(|| format!("budget result has no matching definition: {name}"))?;
+        let category = perf_nonempty_string(&object["category"], &format!("{label}.category"))?;
+        let unit = perf_nonempty_string(&object["unit"], &format!("{label}.unit"))?;
+        let threshold =
+            perf_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        if category != definition.category
+            || unit != definition.unit
+            || threshold.total_cmp(&definition.threshold).is_ne()
+            || ci_enforced != definition.ci_enforced
+        {
+            return Err(format!(
+                "budget result {name} does not match its category/unit/threshold/CI definition"
+            ));
+        }
+        perf_nonempty_string(&object["source"], &format!("{label}.source"))?;
+
+        let status = object["status"]
+            .as_str()
+            .ok_or_else(|| format!("{label}.status must be a string"))?;
+        if !matches!(status, "PASS" | "FAIL" | "NO_DATA") {
+            return Err(format!(
+                "budget result {name} has unsupported status: {status}"
+            ));
+        }
+        let failure_reason = object.get("failure_reason");
+        if let Some(reason) = failure_reason {
+            perf_nonempty_string(reason, &format!("{label}.failure_reason"))?;
+        }
+
+        if object["actual"].is_null() {
+            if strict_mode && definition.ci_enforced {
+                if status != "FAIL"
+                    || failure_reason.and_then(Value::as_str) != Some("missing_measurement_data")
+                {
+                    return Err(format!(
+                        "strict CI budget {name} without data must be FAIL with failure_reason=missing_measurement_data"
+                    ));
+                }
+            } else if status != "NO_DATA" || failure_reason.is_some() {
+                return Err(format!(
+                    "budget {name} without data must be NO_DATA without a failure reason"
+                ));
+            }
+        } else {
+            let actual = perf_finite_number(&object["actual"], &format!("{label}.actual"), false)?;
+            if actual < 0.0 {
+                return Err(format!("{label}.actual must be non-negative"));
+            }
+            let passes = if name == "tool_call_throughput_min" {
+                actual >= threshold
+            } else {
+                actual <= threshold
+            };
+            let expected_status = if passes { "PASS" } else { "FAIL" };
+            if status != expected_status || failure_reason.is_some() {
+                return Err(format!(
+                    "budget result {name} is inconsistent with actual={actual}, threshold={threshold}, and expected status={expected_status}"
+                ));
+            }
+        }
+
+        match status {
+            "PASS" => pass_count += 1,
+            "FAIL" => fail_count += 1,
+            "NO_DATA" => no_data_count += 1,
+            _ => unreachable!("status enum validated above"),
+        }
+        if definition.ci_enforced {
+            ci_with_data += usize::from(!object["actual"].is_null());
+            ci_fail += usize::from(status == "FAIL");
+            ci_no_data += usize::from(status == "NO_DATA");
+        }
+    }
+
+    let definition_names: HashSet<_> = definitions.keys().cloned().collect();
+    if result_names != definition_names {
+        let missing: Vec<_> = definition_names
+            .difference(&result_names)
+            .cloned()
+            .collect();
+        return Err(format!(
+            "budget_results do not cover every budget definition (missing={missing:?})"
+        ));
+    }
+
+    let mut failure_fingerprints = HashSet::new();
+    for (index, failure) in failures.iter().enumerate() {
+        let label = format!("failing_data_contracts[{index}]");
+        let object = perf_exact_object(
+            failure,
+            PERF_FAILURE_REQUIRED_FIELDS,
+            &["budget_name"],
+            &label,
+        )?;
+        let contract_id =
+            perf_nonempty_string(&object["contract_id"], &format!("{label}.contract_id"))?;
+        let detail = perf_nonempty_string(&object["detail"], &format!("{label}.detail"))?;
+        let remediation =
+            perf_nonempty_string(&object["remediation"], &format!("{label}.remediation"))?;
+        let budget_name = match object.get("budget_name") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let name = perf_nonempty_string(value, &format!("{label}.budget_name"))?;
+                if !definitions.contains_key(name) {
+                    return Err(format!(
+                        "data-contract failure references unknown budget: {name}"
+                    ));
+                }
+                Some(name)
+            }
+        };
+        if !failure_fingerprints.insert((contract_id, detail, remediation, budget_name)) {
+            return Err(format!("duplicate data-contract failure at index {index}"));
+        }
+    }
+
+    let derived_counts = [
+        ("total_budgets", budgets.len()),
+        (
+            "ci_enforced",
+            definitions
+                .values()
+                .filter(|definition| definition.ci_enforced)
+                .count(),
+        ),
+        ("ci_with_data", ci_with_data),
+        ("ci_fail", ci_fail),
+        ("ci_no_data", ci_no_data),
+        ("pass", pass_count),
+        ("fail", fail_count),
+        ("no_data", no_data_count),
+        ("data_contract_failures_count", failures.len()),
+    ];
+    for (name, expected) in derived_counts {
+        let expected = perf_usize_as_u64(expected, name)?;
+        if counts[name] != expected {
+            return Err(format!(
+                "{name}={} is inconsistent with derived value {expected}",
+                counts[name]
+            ));
+        }
+    }
+    if counts["pass"] + counts["fail"] + counts["no_data"] != counts["total_budgets"] {
+        return Err("pass + fail + no_data must equal total_budgets".to_string());
+    }
+
+    let claim = perf_exact_object(
+        &top["claim_readiness"],
+        PERF_CLAIM_READINESS_FIELDS,
+        &[],
+        "claim_readiness",
+    )?;
+    let reasons = claim["blocking_reason_codes"]
+        .as_array()
+        .ok_or_else(|| "claim_readiness.blocking_reason_codes must be an array".to_string())?;
+    let reported_reasons: Vec<_> = reasons
+        .iter()
+        .enumerate()
+        .map(|(index, reason)| {
+            perf_nonempty_string(
+                reason,
+                &format!("claim_readiness.blocking_reason_codes[{index}]"),
+            )
+        })
+        .collect::<Result<_, _>>()?;
+    if !reported_reasons.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(
+            "claim_readiness.blocking_reason_codes must be sorted and duplicate-free".to_string(),
+        );
+    }
+
+    let mut expected_reasons = Vec::new();
+    if counts["ci_with_data"] != counts["ci_enforced"] || counts["ci_no_data"] != 0 {
+        expected_reasons.push("ci_budget_data_missing");
+    }
+    if counts["ci_fail"] != 0 {
+        expected_reasons.push("ci_budget_failed");
+    }
+    if correlation_id.is_none() {
+        expected_reasons.push("correlation_id_missing");
+    }
+    if counts["data_contract_failures_count"] != 0 {
+        expected_reasons.push("data_contract_failure");
+    }
+    if run_id.is_none() {
+        expected_reasons.push("run_id_missing");
+    }
+    if source_commit.is_none() {
+        expected_reasons.push("source_commit_unbound");
+    }
+    if !strict_mode {
+        expected_reasons.push("strict_mode_disabled");
+    }
+    if reported_reasons != expected_reasons {
+        return Err(format!(
+            "claim_readiness blockers disagree with derived blockers (reported={reported_reasons:?}, expected={expected_reasons:?})"
+        ));
+    }
+
+    let claim_ready = expected_reasons.is_empty();
+    let expected_status = if claim_ready {
+        "claim_ready"
+    } else {
+        "blocked"
+    };
+    if claim["status"].as_str() != Some(expected_status) {
+        return Err(format!(
+            "claim_readiness.status must be {expected_status:?}"
+        ));
+    }
+    if claim["performance_claims_authorized"].as_bool() != Some(claim_ready) {
+        return Err(format!(
+            "claim_readiness.performance_claims_authorized must be {claim_ready}"
+        ));
+    }
+
+    if claim_ready {
+        if generated_at > now + Duration::minutes(5) {
+            return Err(
+                "performance summary timestamp is more than five minutes in the future".to_string(),
+            );
+        }
+        if now.signed_duration_since(generated_at) > maximum_age {
+            return Err("performance summary is too stale to authorize claims".to_string());
+        }
+        if !source_binding_valid {
+            return Err(
+                "claim-ready performance evidence is not bound to the release source".to_string(),
+            );
+        }
+    }
+
+    Ok(PerformanceClaimValidation { claim_ready })
+}
+
+fn perf_git_output(args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root())
+        .args(args)
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .output()
+        .map_err(|err| format!("failed to execute git {}: {err}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn performance_followup_path_allowed(path: &str, packaged: bool) -> bool {
+    path.starts_with("tests/perf/reports/")
+        || path.starts_with("tests/e2e_results/")
+        || path.starts_with("tests/ext_conformance/reports/")
+        || path.starts_with("tests/certification/")
+        || (path.starts_with("docs/evidence/") && !packaged)
+}
+
+fn performance_path_is_packaged(source_commit: &str, path: &str) -> Result<bool, String> {
+    let cargo_expression = format!("{source_commit}:Cargo.toml");
+    let cargo_toml = String::from_utf8(perf_git_output(&["show", &cargo_expression])?)
+        .map_err(|err| format!("source Cargo.toml is not UTF-8: {err}"))?;
+    let document: toml::Value = toml::from_str(&cargo_toml).map_err(|err| {
+        format!("unable to parse source Cargo.toml package include policy: {err}")
+    })?;
+    let patterns = document
+        .get("package")
+        .and_then(|package| package.get("include"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "source Cargo.toml package.include must be an array".to_string())?;
+    for value in patterns {
+        let raw = value
+            .as_str()
+            .filter(|pattern| !pattern.is_empty())
+            .ok_or_else(|| {
+                "source Cargo.toml package.include entries must be non-empty strings".to_string()
+            })?;
+        let normalized = raw.strip_prefix('/').unwrap_or(raw);
+        let pattern = glob::Pattern::new(normalized)
+            .map_err(|err| format!("invalid package.include pattern {raw:?}: {err}"))?;
+        if pattern.matches(path)
+            || normalized.strip_suffix("/**").is_some_and(|prefix| {
+                path.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_performance_source_binding(source_commit: &str) -> Result<(), String> {
+    let head = String::from_utf8(perf_git_output(&[
+        "rev-parse",
+        "--verify",
+        "HEAD^{commit}",
+    ])?)
+    .map_err(|err| format!("HEAD object ID is not UTF-8: {err}"))?;
+    let head = head.trim();
+    let source_expression = format!("{source_commit}^{{commit}}");
+    let resolved = String::from_utf8(perf_git_output(&[
+        "rev-parse",
+        "--verify",
+        &source_expression,
+    ])?)
+    .map_err(|err| format!("source object ID is not UTF-8: {err}"))?;
+    if resolved.trim() != source_commit {
+        return Err("source_commit does not resolve to the exact recorded commit".to_string());
+    }
+
+    let ancestor = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_root())
+        .args(["merge-base", "--is-ancestor", source_commit, head])
+        .output()
+        .map_err(|err| format!("failed to verify performance source ancestry: {err}"))?;
+    if !ancestor.status.success() {
+        return Err(if ancestor.status.code() == Some(1) {
+            "performance source commit is not an ancestor of release HEAD".to_string()
+        } else {
+            format!(
+                "unable to verify performance source ancestry: {}",
+                String::from_utf8_lossy(&ancestor.stderr).trim()
+            )
+        });
+    }
+    if source_commit == head {
+        return Ok(());
+    }
+
+    let changed = perf_git_output(&[
+        "diff",
+        "--name-only",
+        "-z",
+        "--no-renames",
+        source_commit,
+        head,
+    ])?;
+    let paths: Vec<_> = changed
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path).map_err(|err| format!("changed path is not UTF-8: {err}"))
+        })
+        .collect::<Result<_, _>>()?;
+    if paths.is_empty() {
+        return Err(
+            "source_commit differs from HEAD but the source-to-release diff is empty".to_string(),
+        );
+    }
+    for path in paths {
+        let packaged = path.starts_with("docs/evidence/")
+            && performance_path_is_packaged(source_commit, path)?;
+        if !performance_followup_path_allowed(path, packaged) {
+            return Err(format!(
+                "non-evidence or packaged path changed after source_commit: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn performance_fixture_timestamp(now: DateTime<Utc>) -> String {
+    now.to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
+    json!({
+        "schema": PERF_BUDGET_SUMMARY_SCHEMA,
+        "generated_at": performance_fixture_timestamp(now),
+        "source_commit": null,
+        "run_id": null,
+        "correlation_id": null,
+        "strict_mode": false,
+        "total_budgets": 1,
+        "ci_enforced": 1,
+        "ci_with_data": 0,
+        "ci_fail": 0,
+        "ci_no_data": 1,
+        "pass": 0,
+        "fail": 0,
+        "no_data": 1,
+        "data_contract_failures_count": 1,
+        "failing_data_contracts": [{
+            "contract_id": "missing_or_stale_budget_artifact",
+            "budget_name": "latency",
+            "detail": "measurement missing",
+            "remediation": "regenerate the measurement"
+        }],
+        "budgets": [{
+            "name": "latency",
+            "category": "test",
+            "metric": "latency",
+            "unit": "ms",
+            "threshold": 10.0,
+            "methodology": "fixture",
+            "ci_enforced": true
+        }],
+        "budget_results": [{
+            "budget_name": "latency",
+            "category": "test",
+            "threshold": 10.0,
+            "unit": "ms",
+            "actual": null,
+            "status": "NO_DATA",
+            "source": "fixture has no measurement",
+            "ci_enforced": true
+        }],
+        "claim_readiness": {
+            "status": "blocked",
+            "performance_claims_authorized": false,
+            "blocking_reason_codes": [
+                "ci_budget_data_missing",
+                "correlation_id_missing",
+                "data_contract_failure",
+                "run_id_missing",
+                "source_commit_unbound",
+                "strict_mode_disabled"
+            ]
+        }
+    })
+}
+
+fn claim_ready_performance_summary_fixture(now: DateTime<Utc>) -> Value {
+    let mut summary = blocked_performance_summary_fixture(now);
+    summary["source_commit"] = Value::String("a".repeat(40));
+    summary["run_id"] = json!("perf-run-1");
+    summary["correlation_id"] = json!("perf-run-1");
+    summary["strict_mode"] = json!(true);
+    summary["ci_with_data"] = json!(1);
+    summary["ci_no_data"] = json!(0);
+    summary["pass"] = json!(1);
+    summary["no_data"] = json!(0);
+    summary["data_contract_failures_count"] = json!(0);
+    summary["failing_data_contracts"] = json!([]);
+    summary["budget_results"][0]["actual"] = json!(5.0);
+    summary["budget_results"][0]["status"] = json!("PASS");
+    summary["claim_readiness"] = json!({
+        "status": "claim_ready",
+        "performance_claims_authorized": true,
+        "blocking_reason_codes": []
+    });
+    summary
+}
+
+#[test]
+fn performance_budgets_report_has_exact_v2_contract() {
+    let summary = require_json("tests/perf/reports/budget_summary.json");
+    let declared_claim_ready = summary
+        .pointer("/claim_readiness/status")
+        .and_then(Value::as_str)
+        == Some("claim_ready");
+    let source_binding_valid = if declared_claim_ready {
+        let source_commit = summary
+            .get("source_commit")
+            .and_then(Value::as_str)
+            .expect("claim-ready summary must declare source_commit");
+        validate_performance_source_binding(source_commit)
+            .unwrap_or_else(|err| panic!("invalid claim-ready source binding: {err}"));
+        true
+    } else {
+        false
+    };
+    let validated = validate_performance_budget_summary(
+        &summary,
+        Utc::now(),
+        Duration::hours(168),
+        source_binding_valid,
+    )
+    .unwrap_or_else(|err| panic!("invalid performance budget summary: {err}"));
+
+    if env!("CARGO_PKG_VERSION") == "0.2.0" {
+        assert!(
+            !validated.claim_ready,
+            "v0.2.0 must remain explicitly performance-claims-NOT-authorized"
+        );
+    }
+}
+
+#[test]
+fn performance_contract_accepts_coherent_blocked_no_data() {
+    let now = Utc::now();
+    let validated = validate_performance_budget_summary(
+        &blocked_performance_summary_fixture(now),
+        now,
+        Duration::hours(168),
+        false,
+    )
+    .expect("coherent blocked evidence must remain admissible for a no-claims release");
+    assert!(!validated.claim_ready);
+}
+
+#[test]
+fn performance_contract_rejects_count_or_status_inconsistency() {
+    let now = Utc::now();
+    let mut bad_count = blocked_performance_summary_fixture(now);
+    bad_count["ci_no_data"] = json!(0);
     assert!(
-        budget.get("schema").is_some()
-            || budget.get("budgets").is_some()
-            || budget.get("summary").is_some(),
-        "performance budget report must have recognizable structure"
+        validate_performance_budget_summary(&bad_count, now, Duration::hours(168), false).is_err()
     );
+
+    let mut bad_status = blocked_performance_summary_fixture(now);
+    bad_status["budget_results"][0]["status"] = json!("PASS");
+    assert!(
+        validate_performance_budget_summary(&bad_status, now, Duration::hours(168), false).is_err()
+    );
+
+    let mut negative_actual = claim_ready_performance_summary_fixture(now);
+    negative_actual["budget_results"][0]["actual"] = json!(-1.0);
+    assert!(
+        validate_performance_budget_summary(&negative_actual, now, Duration::hours(168), true)
+            .is_err(),
+        "negative measurements must never satisfy maximum-style budgets"
+    );
+}
+
+#[test]
+fn performance_contract_rejects_forged_claim_readiness() {
+    let now = Utc::now();
+    let mut forged = blocked_performance_summary_fixture(now);
+    forged["claim_readiness"]["performance_claims_authorized"] = json!(true);
+    assert!(
+        validate_performance_budget_summary(&forged, now, Duration::hours(168), false).is_err()
+    );
+
+    let mut mismatched_lineage = claim_ready_performance_summary_fixture(now);
+    mismatched_lineage["correlation_id"] = json!("different-run");
+    assert!(
+        validate_performance_budget_summary(&mismatched_lineage, now, Duration::hours(168), true)
+            .is_err()
+    );
+}
+
+#[test]
+fn performance_claim_ready_requires_source_binding_and_fresh_timestamp() {
+    let now = Utc::now();
+    let ready = claim_ready_performance_summary_fixture(now);
+    assert!(validate_performance_budget_summary(&ready, now, Duration::hours(168), true).is_ok());
+    assert!(validate_performance_budget_summary(&ready, now, Duration::hours(168), false).is_err());
+
+    let stale_time = now - Duration::hours(169);
+    let stale = claim_ready_performance_summary_fixture(stale_time);
+    assert!(validate_performance_budget_summary(&stale, now, Duration::hours(168), true).is_err());
+
+    let future_time = now + Duration::minutes(6);
+    let future = claim_ready_performance_summary_fixture(future_time);
+    assert!(validate_performance_budget_summary(&future, now, Duration::hours(168), true).is_err());
+}
+
+#[test]
+fn release_gate_exposes_performance_claim_policy_in_report() {
+    let script = require_text("scripts/release_gate.sh");
+    for required in [
+        "RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY",
+        "pi.perf.budget_summary.v2",
+        "performance_claim_readiness",
+        "performance_claim_canonical_contract",
+        "ci_enforced_budgets_fail_on_regression_or_missing_data",
+        "\"require_performance_claim_ready\"",
+        "release must make no quantitative or global performance claims",
+    ] {
+        assert!(
+            script.contains(required),
+            "release gate is missing performance-claim policy token: {required}"
+        );
+    }
+}
+
+#[test]
+fn performance_source_descendants_are_evidence_only_and_not_packaged() {
+    for path in [
+        "tests/perf/reports/budget_summary.json",
+        "tests/e2e_results/20260805T010203Z/summary.json",
+        "tests/ext_conformance/reports/conformance_summary.json",
+        "tests/certification/verdict.json",
+        "docs/evidence/dropin-certification-verdict.json",
+    ] {
+        assert!(
+            performance_followup_path_allowed(path, false),
+            "expected evidence-only follow-up path to be allowed: {path}"
+        );
+    }
+    assert!(!performance_followup_path_allowed("src/agent.rs", false));
+    assert!(!performance_followup_path_allowed(
+        "scripts/release_gate.sh",
+        false
+    ));
+    assert!(!performance_followup_path_allowed(
+        "docs/evidence/tool-output-context-cache.jsonl",
+        true
+    ));
 }
 
 // ============================================================================

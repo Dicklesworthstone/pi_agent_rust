@@ -18,6 +18,8 @@
 #   RELEASE_GATE_MAX_NA_COUNT      Maximum N/A scenarios (default: 170)
 #   RELEASE_GATE_MAX_EVIDENCE_AGE_HOURS Maximum source-bound evidence age (default: 168)
 #   RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED  Set to 1 to require CERTIFIED drop-in verdict
+#   RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY Set to 1 only when release copy makes
+#                                      quantitative/global performance claims (default: 0)
 #   RELEASE_GATE_REQUIRE_PREFLIGHT Set to 1 to require preflight analyzer (default: 0)
 #   RELEASE_GATE_REQUIRE_QUALITY   Set to 1 to require quality pipeline pass (default: 0)
 #   RELEASE_GATE_CARGO_RUNNER      Cargo runner mode: rch | auto | local (default: rch)
@@ -34,6 +36,7 @@ MAX_FAIL_COUNT="${RELEASE_GATE_MAX_FAIL_COUNT:-36}"
 MAX_NA_COUNT="${RELEASE_GATE_MAX_NA_COUNT:-170}"
 MAX_EVIDENCE_AGE_HOURS="${RELEASE_GATE_MAX_EVIDENCE_AGE_HOURS:-168}"
 REQUIRE_DROPIN_CERTIFIED="${RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED:-0}"
+REQUIRE_PERFORMANCE_CLAIM_READY="${RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY:-0}"
 REQUIRE_PREFLIGHT="${RELEASE_GATE_REQUIRE_PREFLIGHT:-0}"
 REQUIRE_QUALITY="${RELEASE_GATE_REQUIRE_QUALITY:-0}"
 CARGO_RUNNER_REQUEST="${RELEASE_GATE_CARGO_RUNNER:-rch}" # rch | auto | local
@@ -45,7 +48,7 @@ EVIDENCE_DIR_SELECTION_DETAIL=""
 SEEN_NO_RCH=false
 SEEN_REQUIRE_RCH=false
 
-for toggle_name in REQUIRE_DROPIN_CERTIFIED REQUIRE_PREFLIGHT REQUIRE_QUALITY; do
+for toggle_name in REQUIRE_DROPIN_CERTIFIED REQUIRE_PERFORMANCE_CLAIM_READY REQUIRE_PREFLIGHT REQUIRE_QUALITY; do
     toggle_value="${!toggle_name}"
     if [[ "$toggle_value" != "0" && "$toggle_value" != "1" ]]; then
         echo "Invalid $toggle_name value: $toggle_value (expected: 0|1)" >&2
@@ -1084,21 +1087,518 @@ else
     check_warn "conformance_baseline" "No baseline (first run?)"
 fi
 
-# Gate 6: Compilation check (cargo check)
+# Gate 6: Performance-claim readiness. The evidence contract itself is always
+# fail-closed. A coherent BLOCKED result is a warning only when this release is
+# explicitly configured to make no quantitative or global performance claim.
+PERFORMANCE_SUMMARY="$PROJECT_ROOT/tests/perf/reports/budget_summary.json"
+if [[ -f "$PERFORMANCE_SUMMARY" ]]; then
+    if PERFORMANCE_CHECK=$(python3 - "$PROJECT_ROOT" "$PERFORMANCE_SUMMARY" "$REQUIRE_PERFORMANCE_CLAIM_READY" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'
+import fnmatch
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import tomllib
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+project_root = Path(sys.argv[1])
+summary_path = Path(sys.argv[2])
+claim_ready_required = sys.argv[3] == "1"
+maximum_age = timedelta(hours=int(sys.argv[4]))
+
+TOP_LEVEL_FIELDS = {
+    "schema",
+    "generated_at",
+    "source_commit",
+    "run_id",
+    "correlation_id",
+    "strict_mode",
+    "total_budgets",
+    "ci_enforced",
+    "ci_with_data",
+    "ci_fail",
+    "ci_no_data",
+    "pass",
+    "fail",
+    "no_data",
+    "data_contract_failures_count",
+    "failing_data_contracts",
+    "budgets",
+    "budget_results",
+    "claim_readiness",
+}
+BUDGET_FIELDS = {
+    "name",
+    "category",
+    "metric",
+    "unit",
+    "threshold",
+    "methodology",
+    "ci_enforced",
+}
+RESULT_REQUIRED_FIELDS = {
+    "budget_name",
+    "category",
+    "threshold",
+    "unit",
+    "actual",
+    "status",
+    "source",
+    "ci_enforced",
+}
+RESULT_OPTIONAL_FIELDS = {"failure_reason"}
+FAILURE_REQUIRED_FIELDS = {"contract_id", "detail", "remediation"}
+FAILURE_OPTIONAL_FIELDS = {"budget_name"}
+CLAIM_READINESS_FIELDS = {
+    "status",
+    "performance_claims_authorized",
+    "blocking_reason_codes",
+}
+LINEAGE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
+OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
+TIMESTAMP_RE = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z"
+)
+
+
+class ContractError(ValueError):
+    pass
+
+
+def finish(status, detail):
+    print(f"{status}|{str(detail).replace(chr(10), ' ')}")
+    raise SystemExit(0)
+
+
+def fail(detail):
+    raise ContractError(detail)
+
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            fail(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
+
+def exact_fields(value, expected, label, optional=frozenset()):
+    if not isinstance(value, dict):
+        fail(f"{label} must be an object")
+    actual = set(value)
+    missing = expected - actual
+    extra = actual - expected - optional
+    if missing or extra:
+        fail(
+            f"{label} fields are not exact "
+            f"(missing={sorted(missing)}, unexpected={sorted(extra)})"
+        )
+    return value
+
+
+def nonempty_string(value, label):
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        fail(f"{label} must be a non-empty, surrounding-whitespace-free string")
+    return value
+
+
+def uint(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
+        fail(f"{label} must be a non-negative signed 64-bit integer")
+    return value
+
+
+def finite_number(value, label, *, positive=False):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        fail(f"{label} must be a finite number")
+    result = float(value)
+    if not math.isfinite(result) or (positive and result <= 0.0):
+        qualifier = "positive finite" if positive else "finite"
+        fail(f"{label} must be a {qualifier} number")
+    return result
+
+
+def nullable_lineage(value, label):
+    if value is None:
+        return None
+    if not isinstance(value, str) or LINEAGE_RE.fullmatch(value) is None:
+        fail(f"{label} must be null or a canonical lineage identifier")
+    return value
+
+
+def run_git(*args):
+    env = os.environ.copy()
+    env["GIT_LITERAL_PATHSPECS"] = "1"
+    result = subprocess.run(
+        ["git", "-C", str(project_root), *args],
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    if result.returncode != 0:
+        diagnostic = result.stderr.decode("utf-8", "replace").strip()
+        fail(f"git {' '.join(args)} failed: {diagnostic}")
+    return result.stdout
+
+
+def package_includes(path, patterns):
+    for raw_pattern in patterns:
+        if not isinstance(raw_pattern, str) or not raw_pattern:
+            fail("source Cargo.toml package.include entries must be non-empty strings")
+        pattern = raw_pattern.removeprefix("/")
+        if fnmatch.fnmatchcase(path, pattern):
+            return True
+        if pattern.endswith("/**") and path.startswith(pattern[:-3].rstrip("/") + "/"):
+            return True
+    return False
+
+
+def verify_claim_source_binding(source_commit):
+    head = run_git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip()
+    resolved = run_git("rev-parse", "--verify", f"{source_commit}^{{commit}}").decode(
+        "ascii", "strict"
+    ).strip()
+    if resolved != source_commit:
+        fail("source_commit does not resolve to the exact recorded commit")
+    ancestor = subprocess.run(
+        ["git", "-C", str(project_root), "merge-base", "--is-ancestor", source_commit, head],
+        capture_output=True,
+        check=False,
+    )
+    if ancestor.returncode == 1:
+        fail("performance source commit is not an ancestor of release HEAD")
+    if ancestor.returncode != 0:
+        fail("unable to verify performance source ancestry")
+    if source_commit == head:
+        return
+    try:
+        cargo_document = tomllib.loads(
+            run_git("show", f"{source_commit}:Cargo.toml").decode("utf-8", "strict")
+        )
+    except (UnicodeError, tomllib.TOMLDecodeError) as exc:
+        fail(f"unable to parse source Cargo.toml package include policy: {exc}")
+    package_patterns = cargo_document.get("package", {}).get("include", [])
+    if not isinstance(package_patterns, list):
+        fail("source Cargo.toml package.include must be an array")
+    changed_paths = [
+        os.fsdecode(path)
+        for path in run_git("diff", "--name-only", "-z", "--no-renames", source_commit, head).split(b"\0")
+        if path
+    ]
+    if not changed_paths:
+        fail("source_commit differs from HEAD but the source-to-release diff is empty")
+    for path in changed_paths:
+        evidence_only = (
+            path.startswith("tests/perf/reports/")
+            or path.startswith("tests/e2e_results/")
+            or path.startswith("tests/ext_conformance/reports/")
+            or path.startswith("tests/certification/")
+            or path.startswith("docs/evidence/")
+        )
+        if not evidence_only:
+            fail(f"non-evidence path changed after source_commit: {path}")
+        if path.startswith("docs/evidence/") and package_includes(path, package_patterns):
+            fail(f"packaged or product-consumed evidence changed after source_commit: {path}")
+
+
+try:
+    if summary_path.is_symlink() or not summary_path.is_file():
+        fail("performance summary must be a regular file, not a symlink")
+    raw = summary_path.read_text(encoding="utf-8")
+    data = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
+    exact_fields(data, TOP_LEVEL_FIELDS, "performance summary")
+    if data["schema"] != "pi.perf.budget_summary.v2":
+        fail(f"unsupported performance summary schema: {data['schema']!r}")
+
+    generated_at_raw = data["generated_at"]
+    if not isinstance(generated_at_raw, str) or TIMESTAMP_RE.fullmatch(generated_at_raw) is None:
+        fail("generated_at must be canonical UTC RFC3339 ending in Z")
+    generated_at = datetime.fromisoformat(generated_at_raw.removesuffix("Z") + "+00:00")
+    if generated_at.utcoffset() != timedelta(0):
+        fail("generated_at must use UTC")
+
+    source_commit = data["source_commit"]
+    if source_commit is not None and (
+        not isinstance(source_commit, str) or OBJECT_ID_RE.fullmatch(source_commit) is None
+    ):
+        fail("source_commit must be null or a canonical full lowercase Git object ID")
+    run_id = nullable_lineage(data["run_id"], "run_id")
+    correlation_id = nullable_lineage(data["correlation_id"], "correlation_id")
+    if run_id is not None and correlation_id is not None and run_id != correlation_id:
+        fail("run_id and correlation_id must match when both are present")
+    strict_mode = data["strict_mode"]
+    if not isinstance(strict_mode, bool):
+        fail("strict_mode must be a boolean")
+
+    count_names = (
+        "total_budgets",
+        "ci_enforced",
+        "ci_with_data",
+        "ci_fail",
+        "ci_no_data",
+        "pass",
+        "fail",
+        "no_data",
+        "data_contract_failures_count",
+    )
+    counts = {name: uint(data[name], name) for name in count_names}
+
+    budgets = data["budgets"]
+    results = data["budget_results"]
+    failures = data["failing_data_contracts"]
+    if not isinstance(budgets, list) or not budgets:
+        fail("budgets must be a non-empty array")
+    if not isinstance(results, list) or not results:
+        fail("budget_results must be a non-empty array")
+    if not isinstance(failures, list):
+        fail("failing_data_contracts must be an array")
+
+    budgets_by_name = {}
+    for index, budget in enumerate(budgets):
+        exact_fields(budget, BUDGET_FIELDS, f"budgets[{index}]")
+        name = nonempty_string(budget["name"], f"budgets[{index}].name")
+        if name in budgets_by_name:
+            fail(f"duplicate budget name: {name}")
+        for field in ("category", "metric", "unit", "methodology"):
+            nonempty_string(budget[field], f"budgets[{index}].{field}")
+        finite_number(budget["threshold"], f"budgets[{index}].threshold", positive=True)
+        if not isinstance(budget["ci_enforced"], bool):
+            fail(f"budgets[{index}].ci_enforced must be a boolean")
+        budgets_by_name[name] = budget
+
+    results_by_name = {}
+    status_counts = {"PASS": 0, "FAIL": 0, "NO_DATA": 0}
+    ci_with_data = 0
+    ci_fail = 0
+    ci_no_data = 0
+    for index, result in enumerate(results):
+        exact_fields(
+            result,
+            RESULT_REQUIRED_FIELDS,
+            f"budget_results[{index}]",
+            RESULT_OPTIONAL_FIELDS,
+        )
+        name = nonempty_string(result["budget_name"], f"budget_results[{index}].budget_name")
+        if name in results_by_name:
+            fail(f"duplicate budget result: {name}")
+        budget = budgets_by_name.get(name)
+        if budget is None:
+            fail(f"budget result has no matching definition: {name}")
+        for field in ("category", "unit"):
+            nonempty_string(result[field], f"budget_results[{index}].{field}")
+            if result[field] != budget[field]:
+                fail(f"budget result {name} has mismatched {field}")
+        threshold = finite_number(
+            result["threshold"], f"budget_results[{index}].threshold", positive=True
+        )
+        if threshold != float(budget["threshold"]):
+            fail(f"budget result {name} has mismatched threshold")
+        if not isinstance(result["ci_enforced"], bool):
+            fail(f"budget_results[{index}].ci_enforced must be a boolean")
+        if result["ci_enforced"] is not budget["ci_enforced"]:
+            fail(f"budget result {name} has mismatched ci_enforced")
+        nonempty_string(result["source"], f"budget_results[{index}].source")
+        status = result["status"]
+        if status not in status_counts:
+            fail(f"budget result {name} has unsupported status: {status!r}")
+        failure_reason_present = "failure_reason" in result
+        failure_reason = result.get("failure_reason")
+        if failure_reason_present:
+            nonempty_string(failure_reason, f"budget_results[{index}].failure_reason")
+        actual = result["actual"]
+        if actual is None:
+            if strict_mode and budget["ci_enforced"]:
+                if status != "FAIL" or failure_reason != "missing_measurement_data":
+                    fail(
+                        f"strict CI budget {name} without data must be FAIL with "
+                        "failure_reason=missing_measurement_data"
+                    )
+            elif status != "NO_DATA" or failure_reason_present:
+                fail(f"budget {name} without data must be NO_DATA without a failure reason")
+        else:
+            actual_value = finite_number(actual, f"budget_results[{index}].actual")
+            if actual_value < 0.0:
+                fail(f"budget_results[{index}].actual must be non-negative")
+            expected_status = (
+                "PASS"
+                if (
+                    actual_value >= threshold
+                    if name == "tool_call_throughput_min"
+                    else actual_value <= threshold
+                )
+                else "FAIL"
+            )
+            if status != expected_status:
+                fail(
+                    f"budget result {name} status={status} is inconsistent with "
+                    f"actual={actual_value} and threshold={threshold}"
+                )
+            if failure_reason_present:
+                fail(f"budget result {name} with data must not contain failure_reason")
+        status_counts[status] += 1
+        if budget["ci_enforced"]:
+            ci_with_data += int(actual is not None)
+            ci_fail += int(status == "FAIL")
+            ci_no_data += int(status == "NO_DATA")
+        results_by_name[name] = result
+
+    if set(results_by_name) != set(budgets_by_name):
+        missing = sorted(set(budgets_by_name) - set(results_by_name))
+        fail(f"budget_results do not cover every budget definition (missing={missing})")
+
+    failure_fingerprints = set()
+    for index, failure in enumerate(failures):
+        exact_fields(
+            failure,
+            FAILURE_REQUIRED_FIELDS,
+            f"failing_data_contracts[{index}]",
+            FAILURE_OPTIONAL_FIELDS,
+        )
+        values = []
+        for field in ("contract_id", "detail", "remediation"):
+            values.append(nonempty_string(failure[field], f"failing_data_contracts[{index}].{field}"))
+        budget_name = failure.get("budget_name")
+        if budget_name is not None:
+            budget_name = nonempty_string(
+                budget_name, f"failing_data_contracts[{index}].budget_name"
+            )
+            if budget_name not in budgets_by_name:
+                fail(f"data-contract failure references unknown budget: {budget_name}")
+        fingerprint = (*values, budget_name)
+        if fingerprint in failure_fingerprints:
+            fail(f"duplicate data-contract failure at index {index}")
+        failure_fingerprints.add(fingerprint)
+
+    derived_counts = {
+        "total_budgets": len(budgets),
+        "ci_enforced": sum(int(budget["ci_enforced"]) for budget in budgets),
+        "ci_with_data": ci_with_data,
+        "ci_fail": ci_fail,
+        "ci_no_data": ci_no_data,
+        "pass": status_counts["PASS"],
+        "fail": status_counts["FAIL"],
+        "no_data": status_counts["NO_DATA"],
+        "data_contract_failures_count": len(failures),
+    }
+    for name, expected in derived_counts.items():
+        if counts[name] != expected:
+            fail(f"{name}={counts[name]} is inconsistent with derived value {expected}")
+    if counts["pass"] + counts["fail"] + counts["no_data"] != counts["total_budgets"]:
+        fail("pass + fail + no_data must equal total_budgets")
+
+    claim = exact_fields(data["claim_readiness"], CLAIM_READINESS_FIELDS, "claim_readiness")
+    reasons = claim["blocking_reason_codes"]
+    if not isinstance(reasons, list) or any(not isinstance(reason, str) or not reason for reason in reasons):
+        fail("claim_readiness.blocking_reason_codes must be an array of non-empty strings")
+    if reasons != sorted(set(reasons)):
+        fail("claim_readiness.blocking_reason_codes must be sorted and duplicate-free")
+
+    expected_reasons = []
+    if counts["ci_with_data"] != counts["ci_enforced"] or counts["ci_no_data"] != 0:
+        expected_reasons.append("ci_budget_data_missing")
+    if counts["ci_fail"] != 0:
+        expected_reasons.append("ci_budget_failed")
+    if correlation_id is None:
+        expected_reasons.append("correlation_id_missing")
+    if counts["data_contract_failures_count"] != 0:
+        expected_reasons.append("data_contract_failure")
+    if run_id is None:
+        expected_reasons.append("run_id_missing")
+    if source_commit is None:
+        expected_reasons.append("source_commit_unbound")
+    if not strict_mode:
+        expected_reasons.append("strict_mode_disabled")
+    expected_reasons.sort()
+    if reasons != expected_reasons:
+        fail(
+            "claim_readiness.blocking_reason_codes do not match derived blockers "
+            f"(reported={reasons}, expected={expected_reasons})"
+        )
+
+    claim_ready = not expected_reasons
+    expected_status = "claim_ready" if claim_ready else "blocked"
+    if claim["status"] != expected_status:
+        fail(f"claim_readiness.status must be {expected_status!r}")
+    if claim["performance_claims_authorized"] is not claim_ready:
+        fail(f"claim_readiness.performance_claims_authorized must be {claim_ready}")
+
+    if claim_ready:
+        now = datetime.now(timezone.utc)
+        if generated_at > now + timedelta(minutes=5):
+            fail("performance summary timestamp is more than five minutes in the future")
+        if now - generated_at > maximum_age:
+            fail(f"performance summary is stale ({now - generated_at} old; maximum {maximum_age})")
+        verify_claim_source_binding(source_commit)
+        finish(
+            "pass",
+            f"performance claims authorized: strict v2 evidence source={source_commit} "
+            f"run={run_id} correlation={correlation_id} age<={sys.argv[4]}h",
+        )
+
+    detail = (
+        "performance claims are NOT authorized; valid blocked/NO_DATA evidence "
+        f"(blocking_reason_codes={','.join(expected_reasons)})"
+    )
+    if claim_ready_required:
+        finish("fail", f"{detail}; RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=1")
+    finish("warn", f"{detail}; release must make no quantitative or global performance claims")
+except (ContractError, OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+    finish("fail", f"invalid performance budget summary: {exc}")
+PY
+    ); then
+        :
+    else
+        PERFORMANCE_CHECK="fail|unexpected performance summary validator error: $PERFORMANCE_CHECK"
+    fi
+else
+    PERFORMANCE_CHECK="fail|tests/perf/reports/budget_summary.json not found"
+fi
+
+PERFORMANCE_STATUS="${PERFORMANCE_CHECK%%|*}"
+PERFORMANCE_DETAIL="${PERFORMANCE_CHECK#*|}"
+case "$PERFORMANCE_STATUS" in
+    pass)
+        check_pass "performance_claim_readiness" "$PERFORMANCE_DETAIL"
+        if (
+            export PI_PERF_STRICT=1
+            run_cargo_gate test --locked --test perf_budgets \
+                ci_enforced_budgets_fail_on_regression_or_missing_data -- --exact
+        ) >/dev/null 2>&1; then
+            check_pass "performance_claim_canonical_contract" "Canonical strict perf data readers independently confirm every CI-enforced budget and linked data contract"
+        else
+            check_fail "performance_claim_canonical_contract" "Canonical strict perf contract test failed; summary cannot authorize performance claims"
+        fi
+        ;;
+    warn)
+        check_warn "performance_claim_readiness" "$PERFORMANCE_DETAIL"
+        ;;
+    fail)
+        check_fail "performance_claim_readiness" "$PERFORMANCE_DETAIL"
+        ;;
+    *)
+        check_fail "performance_claim_readiness" "unexpected performance summary validation result: $PERFORMANCE_CHECK"
+        ;;
+esac
+
+# Gate 7: Compilation check (cargo check)
 if run_cargo_gate check --locked --lib --quiet 2>/dev/null; then
     check_pass "cargo_check" "Library compiles cleanly"
 else
     check_fail "cargo_check" "cargo check --lib failed"
 fi
 
-# Gate 7: Clippy lint
+# Gate 8: Clippy lint
 if run_cargo_gate clippy --locked --lib --quiet -- -D warnings 2>/dev/null; then
     check_pass "clippy" "No clippy warnings"
 else
     check_fail "clippy" "Clippy has warnings"
 fi
 
-# Gate 8: Preflight analyzer (optional)
+# Gate 9: Preflight analyzer (optional)
 if [[ "$REQUIRE_PREFLIGHT" -eq 1 ]]; then
     if run_cargo_gate test --locked --lib extension_preflight --quiet 2>/dev/null; then
         check_pass "preflight_tests" "Extension preflight tests pass"
@@ -1107,7 +1607,7 @@ if [[ "$REQUIRE_PREFLIGHT" -eq 1 ]]; then
     fi
 fi
 
-# Gate 9: Quality pipeline (optional)
+# Gate 10: Quality pipeline (optional)
 if [[ "$REQUIRE_QUALITY" -eq 1 ]]; then
     quality_runner_flag=()
     if [[ "$CARGO_RUNNER_MODE" == "rch" ]]; then
@@ -1122,7 +1622,7 @@ if [[ "$REQUIRE_QUALITY" -eq 1 ]]; then
     fi
 fi
 
-# Gate 10: Suite classification guard
+# Gate 11: Suite classification guard
 CLASSIFICATION="$PROJECT_ROOT/tests/suite_classification.toml"
 if [[ -f "$CLASSIFICATION" ]]; then
     check_pass "suite_classification" "suite_classification.toml exists"
@@ -1130,7 +1630,7 @@ else
     check_fail "suite_classification" "suite_classification.toml missing"
 fi
 
-# Gate 11: Traceability matrix
+# Gate 12: Traceability matrix
 TRACEABILITY="$PROJECT_ROOT/docs/traceability_matrix.json"
 if [[ -f "$TRACEABILITY" ]]; then
     check_pass "traceability_matrix" "traceability_matrix.json exists"
@@ -1138,7 +1638,7 @@ else
     check_warn "traceability_matrix" "traceability_matrix.json not found"
 fi
 
-# Gate 12: Drop-in certification contract artifact
+# Gate 13: Drop-in certification contract artifact
 DROPIN_CONTRACT="$PROJECT_ROOT/docs/contracts/dropin-certification-contract.json"
 if [[ -f "$DROPIN_CONTRACT" ]]; then
     if CONTRACT_CHECK=$(python3 - "$DROPIN_CONTRACT" 2>&1 <<'PY'
@@ -1214,7 +1714,7 @@ else
     check_fail "dropin_contract" "docs/contracts/dropin-certification-contract.json not found"
 fi
 
-# Gate 13: Drop-in certification verdict (required for strict claim mode)
+# Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
 if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" 2>&1 <<'PY'
 import fnmatch
@@ -1683,7 +2183,7 @@ case "$DROPIN_STATUS" in
         ;;
 esac
 
-# Gate 14: Re-capture the same raw-byte repository fingerprint after every
+# Gate 15: Re-capture the same raw-byte repository fingerprint after every
 # executable gate. This detects HEAD/index changes, special index flags,
 # symlink substitution, untracked files, and worktree modifications hidden by
 # clean/smudge filters.
@@ -1728,6 +2228,7 @@ if [[ "$REPORT_JSON" -eq 1 ]]; then
     "max_na_count": $MAX_NA_COUNT,
     "max_evidence_age_hours": $MAX_EVIDENCE_AGE_HOURS,
     "require_dropin_certified": $REQUIRE_DROPIN_CERTIFIED,
+    "require_performance_claim_ready": $REQUIRE_PERFORMANCE_CLAIM_READY,
     "require_preflight": $REQUIRE_PREFLIGHT,
     "require_quality": $REQUIRE_QUALITY
   },
@@ -1753,7 +2254,7 @@ else
     echo "  Release Gate — Conformance Evidence Bundle"
     echo "═══════════════════════════════════════════════════════════"
     echo "  Pass: $PASS_COUNT  Fail: $FAIL_COUNT  Warn: $WARN_COUNT  Total: $TOTAL_CHECKS"
-    echo "  Thresholds: pass_rate>=${MIN_PASS_RATE}%, fail<=${MAX_FAIL_COUNT}, na<=${MAX_NA_COUNT}, evidence_age<=${MAX_EVIDENCE_AGE_HOURS}h"
+    echo "  Thresholds: pass_rate>=${MIN_PASS_RATE}%, fail<=${MAX_FAIL_COUNT}, na<=${MAX_NA_COUNT}, evidence_age<=${MAX_EVIDENCE_AGE_HOURS}h, performance_claim_ready_required=${REQUIRE_PERFORMANCE_CLAIM_READY}"
     echo "═══════════════════════════════════════════════════════════"
 
     if [[ $FAIL_COUNT -gt 0 ]]; then

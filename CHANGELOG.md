@@ -94,8 +94,18 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   manifest metadata, source-tree/inclusion-list/manifest digests, run lineage,
   non-skipped per-extension events, and exact declared runtime registrations.
   Stale, smaller, or identity-expanded historical evidence cannot certify a
-  release. Release builds and publication are now blocked on the same gate,
-  and the producer and validator share the canonical G01–G12 contract.
+  release. PiJS tool-call regression inputs now require exactly 2,000
+  executable-path-verified perf-profile QuickJS iterations through the
+  production extension manager; the 1-call lane gates arithmetic mean latency
+  and the 10-call lane gates
+  aggregate throughput. Debug, unverified-profile, preview, native-comparison,
+  explicitly ineligible, malformed, stale, and uncontrolled host-page-cache
+  load records cannot satisfy their respective gates. These checks gate
+  performance-claim admission. v0.2.0 remains explicitly
+  performance-claims-NOT-authorized because its checked-in budget summary is a
+  valid blocked/NO_DATA artifact; publication may proceed only without
+  quantitative or global performance claims. The producer and validator share
+  the canonical G01–G12 contract.
   Per-target build manifests now identify selected sibling-project crates by
   their locked registry version, source, and checksum instead of attributing
   binaries to unrelated sibling repository HEADs.

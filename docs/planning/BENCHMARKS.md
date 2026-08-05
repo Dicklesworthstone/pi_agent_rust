@@ -232,9 +232,11 @@ jobs:
       - name: Generate PiJS workload perf data (JSONL)
         run: |
           set -euxo pipefail
-          mkdir -p target/perf/perf
-          PI_BENCH_BUILD_PROFILE=perf cargo run --profile perf --example pijs_workload -- --iterations 2000 --tool-calls 1 > target/perf/perf/pijs_workload_perf.jsonl
-          PI_BENCH_BUILD_PROFILE=perf cargo run --profile perf --example pijs_workload -- --iterations 2000 --tool-calls 10 >> target/perf/perf/pijs_workload_perf.jsonl
+          BENCH_ALLOCATORS_CSV=system \
+          BENCH_PGO_MODE=off \
+          ITERATIONS=2000 \
+          TOOL_CALLS_CSV=1,10 \
+          scripts/bench_extension_workloads.sh
 
       - name: Perf budget gate
         run: cargo test --test perf_budgets -- --nocapture
@@ -347,7 +349,13 @@ hyperfine --warmup 3 --runs 10 'target/release/pi --version'
 scripts/bench_extension_workloads.sh
 ```
 
-#### Baseline Captures (2026-02-05)
+#### Historical Diagnostic Baseline Captures (2026-02-05)
+
+These 200-iteration direct-binary captures predate the release-evidence contract.
+They are diagnostic only and are not eligible for regression-gate or release
+claims. Generate authoritative PiJS evidence through the canonical harness above,
+which binds the source commit, run identity, exact shipping feature set, allocator,
+Cargo fingerprint, executable path, and executable checksum.
 
 Commands:
 

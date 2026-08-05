@@ -5,7 +5,7 @@
 <h1 align="center">pi_agent_rust</h1>
 
 <p align="center">
-  <strong>pi_agent_rust - High-performance AI coding agent CLI written in Rust</strong>
+  <strong>pi_agent_rust - Native AI coding agent CLI written in Rust</strong>
 </p>
 
 <p align="center">
@@ -2307,9 +2307,15 @@ multi-agent runs, see [docs/swarm-operations-runbook.md](docs/swarm-operations-r
 
 Pi's perf pipeline includes strict evidence checks so global speed claims cannot be based on partial or stale data.
 
+**v0.2.0 performance-claim status: NOT authorized.** Its checked-in
+`pi.perf.budget_summary.v2` artifact is an explicit blocked/NO_DATA result, so
+this release may ship only without quantitative or global performance claims.
+That blocked state is not a passing benchmark result.
+
 - `scripts/perf/orchestrate.sh` generates artifacts tied to a shared `correlation_id` for the same run.
 - `scripts/e2e/run_all.sh` validates required schemas, freshness, and `correlation_id` alignment before considering claims valid.
-- `tests/release_evidence_gate.rs` fails closed when conformance/perf artifacts are missing `run_id` or `correlation_id`, or when lineage fields disagree across linked artifacts.
+- `tests/release_evidence_gate.rs` and `scripts/release_gate.sh` always reject malformed schemas, duplicate or mismatched budgets, inconsistent counts/statuses, or forged readiness fields. A coherent `blocked` summary is only a release warning when `RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=0`; it still cannot authorize performance copy.
+- A `claim_ready` summary must come from strict mode with complete CI data, no regressions or data-contract failures, one matching `run_id`/`correlation_id`, fresh source-bound evidence, and an independent rerun of the canonical strict perf contract.
 - `scripts/e2e/run_all.sh` emits an evidence-adjudication matrix and only treats evidence as canonical when freshness and lineage checks both pass.
 - Key release-facing artifacts include:
   - `pi.perf.extension_benchmark_stratification.v1`

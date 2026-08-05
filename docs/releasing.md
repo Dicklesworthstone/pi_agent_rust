@@ -451,8 +451,10 @@ proof is not proof of an empty bypass list.
    regenerate an honest `NOT_CERTIFIED` verdict with an explicit blocker. This
    is a fail-closed release claim, not a waiver. Commit the generated evidence,
    then run the mandatory manual release gate. Ordinary test runs are read-only
-   and do not freshen these tracked artifacts. The v0.x lane does not make a
-   strict drop-in claim, while preflight and quality remain required:
+   and do not freshen these tracked artifacts. The v0.2.0 lane makes neither a
+   strict drop-in claim nor a quantitative/global performance claim: its valid
+   performance summary is explicitly `blocked`/`NO_DATA` and
+   performance-claims-NOT-authorized. Preflight and quality remain required:
 
    ```bash
    set -euo pipefail
@@ -517,15 +519,27 @@ proof is not proof of an empty bypass list.
      RELEASE_GATE_REQUIRE_PREFLIGHT=1 \
      RELEASE_GATE_REQUIRE_QUALITY=1 \
      RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED=0 \
+     RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=0 \
      RELEASE_GATE_CARGO_RUNNER=local \
        ./scripts/release_gate.sh --no-rch --report > "$release_gate_report"
    )
    jq -e '
      .schema == "pi.release_gate.v1" and .verdict == "pass" and
+     .thresholds.require_performance_claim_ready == 0 and
      .counts.fail == 0 and .counts.total == (.checks | length) and
+     any(.checks[];
+       .name == "performance_claim_readiness" and .status == "warn" and
+       (.detail | contains("performance claims are NOT authorized"))) and
      all(.checks[]; .status != "fail")
    ' "$release_gate_report" >/dev/null
    ```
+
+   The performance warning is admissible only because the explicit mode is
+   `0` and the v0.2.0 release copy makes no quantitative or global performance
+   claim. Structural, schema, count, status, or readiness contradictions remain
+   hard failures in either mode. A future release that makes such a claim must
+   set the flag to `1`; the gate then also requires fresh source-bound lineage
+   and independently reruns the canonical strict perf contract.
 
    The gate requires a clean repository at entry and revalidates the exact
    HEAD, canonical source-tree digest, index, index flags, symlink topology,
