@@ -69,6 +69,12 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   the direct `sysinfo` dependency now matches the version already used by the
   runtime. This preserves process-tree behavior while reducing binary-size
   pressure.
+- **Embedded release resources are losslessly size-optimized** — deterministic
+  gzip and compile-time LZSS encoding preserve the exact source bytes while
+  avoiding duplicate large text literals in the executable. The release-only
+  LLVM machine outliner further reduces repeated instruction sequences without
+  changing development/test profiles; round-trip, CLI-parity, and executable
+  hardening checks guard the shipping path.
 - **Extension filesystem fallback is more robust** — a denied host `readdir`
   no longer aborts the filesystem shim before later fallback paths are checked.
 - **Context-evidence suppression is deterministic** — duplicate stale/unsafe
