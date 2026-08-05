@@ -108,6 +108,41 @@ fn eval_crypto(js_expr: &str) -> String {
         .unwrap_or_else(|| "NO_RESPONSE".to_string())
 }
 
+/// Evaluate the production `node:crypto` module in a bare QuickJS context.
+///
+/// The full extension runtime intentionally installs non-configurable native
+/// crypto bridges, so tests must not mutate those production capabilities to
+/// simulate an initialization failure. A bare context provides the honest
+/// missing-hostcall state while exercising the exact shipped module source.
+fn eval_crypto_without_hostcalls(js_expr: &str) -> String {
+    let runtime = rquickjs::Runtime::new().expect("create bare QuickJS runtime");
+    let context = rquickjs::Context::full(&runtime).expect("create bare QuickJS context");
+
+    context
+        .with(|ctx| -> rquickjs::Result<String> {
+            let (module, evaluation) = rquickjs::Module::declare(
+                ctx.clone(),
+                "node:crypto",
+                pi::crypto_shim::NODE_CRYPTO_JS,
+            )?
+            .eval()?;
+            evaluation.finish::<()>()?;
+
+            let namespace = module.namespace()?;
+            let globals = ctx.globals();
+            for name in ["createHash", "randomBytes", "randomUUID", "randomInt"] {
+                let function: rquickjs::Function<'_> = namespace.get(name)?;
+                globals.set(name, function)?;
+            }
+
+            ctx.eval::<(), _>(format!(
+                "globalThis.__crypto_missing_hostcall_result = String({js_expr});"
+            ))?;
+            globals.get("__crypto_missing_hostcall_result")
+        })
+        .expect("evaluate node:crypto without native hostcalls")
+}
+
 // ─── SHA-256 Tests ──────────────────────────────────────────────────────────
 
 #[test]
@@ -993,12 +1028,57 @@ MC4CAQAwBQYDK2VwBCIEIKdNGarTy3x3BLKmHN/4JHUxgXyGLoYEwCQk5lMDT0Wc
 }
 
 #[test]
-fn create_hash_without_hostcall_throws() {
+fn native_crypto_bridges_cannot_be_replaced_by_extension_code() {
     let result = eval_crypto(
         r#"(() => {
-        globalThis.__pi_crypto_hash_native = undefined;
+        const names = [
+          "__pi_crypto_aes_gcm_decrypt_native",
+          "__pi_crypto_aes_gcm_encrypt_native",
+          "__pi_crypto_ed25519_sign_native",
+          "__pi_crypto_ed25519_verify_native",
+          "__pi_crypto_hash_native",
+          "__pi_crypto_hmac_native",
+          "__pi_crypto_pbkdf2_native",
+          "__pi_crypto_random_bytes_native",
+          "__pi_crypto_random_uuid_native",
+          "__pi_crypto_random_int_native",
+          "__pi_crypto_scrypt_native",
+          "__pi_crypto_timing_safe_equal_native",
+        ];
+        const originals = names.map((name) => globalThis[name]);
+        for (const name of names) {
+          try { globalThis[name] = undefined; } catch (_) {}
+          try { Object.defineProperty(globalThis, name, { value: undefined }); } catch (_) {}
+          try { delete globalThis[name]; } catch (_) {}
+        }
+        const intact = names.every(
+          (name, index) => typeof globalThis[name] === "function" && globalThis[name] === originals[index],
+        );
+        const hash = createHash("sha256").update("hello").digest("hex");
+        const bytes = randomBytes(8);
+        const uuid = randomUUID();
+        const integer = randomInt(1, 3);
+        return [
+          intact,
+          hash === "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+          bytes.length === 8,
+          /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(uuid),
+          integer >= 1 && integer < 3,
+        ].join(":");
+    })()"#,
+    );
+    assert_eq!(
+        result, "true:true:true:true:true",
+        "native crypto bridges must remain immutable and operational"
+    );
+}
+
+#[test]
+fn create_hash_without_hostcall_throws() {
+    let result = eval_crypto_without_hostcalls(
+        r#"(() => {
         try {
-            createHash("sha256").update("hello").digest("hex");
+            createHash("sha256").digest("hex");
             return "no-throw";
         } catch (e) {
             return "threw:" + e.message;
@@ -1013,9 +1093,8 @@ fn create_hash_without_hostcall_throws() {
 
 #[test]
 fn random_bytes_without_hostcall_throws() {
-    let result = eval_crypto(
+    let result = eval_crypto_without_hostcalls(
         r#"(() => {
-        globalThis.__pi_crypto_random_bytes_native = undefined;
         try {
             randomBytes(8);
             return "no-throw";
@@ -1032,9 +1111,8 @@ fn random_bytes_without_hostcall_throws() {
 
 #[test]
 fn random_uuid_without_hostcall_throws() {
-    let result = eval_crypto(
+    let result = eval_crypto_without_hostcalls(
         r#"(() => {
-        globalThis.__pi_crypto_random_uuid_native = undefined;
         try {
             randomUUID();
             return "no-throw";
@@ -1051,9 +1129,8 @@ fn random_uuid_without_hostcall_throws() {
 
 #[test]
 fn random_int_without_hostcall_throws() {
-    let result = eval_crypto(
+    let result = eval_crypto_without_hostcalls(
         r#"(() => {
-        globalThis.__pi_crypto_random_int_native = undefined;
         try {
             randomInt(1, 3);
             return "no-throw";

@@ -393,12 +393,10 @@ fn hostcall_completions_processed_before_timers() {
 
         runtime.eval(r"globalThis.order = [];").await.expect("init");
 
-        // Create a timer at delay=0 (fires immediately when clock >= creation time)
-        let timer_id = runtime.set_timeout(0);
+        // Create a timer at delay=0 (fires immediately when clock >= creation time).
+        // Exercise the public JS timer shim, including its private bridge handoff.
         runtime
-            .eval(&format!(
-                r#"__pi_register_timer({timer_id}, () => globalThis.order.push("timer"));"#
-            ))
+            .eval(r#"setTimeout(() => globalThis.order.push("timer"), 0);"#)
             .await
             .expect("register timer");
 
@@ -444,19 +442,15 @@ fn timers_fire_in_deadline_order() {
 
         runtime.eval(r"globalThis.fired = [];").await.expect("init");
 
-        // Create timers with different delays
-        let t1 = runtime.set_timeout(30); // fires at 30ms
-        let t2 = runtime.set_timeout(10); // fires at 10ms
-        let t3 = runtime.set_timeout(20); // fires at 20ms
-
+        // Create timers with different delays through the public JS shim.
         runtime
-            .eval(&format!(
+            .eval(
                 r#"
-                __pi_register_timer({t1}, () => globalThis.fired.push("30ms"));
-                __pi_register_timer({t2}, () => globalThis.fired.push("10ms"));
-                __pi_register_timer({t3}, () => globalThis.fired.push("20ms"));
-            "#
-            ))
+                setTimeout(() => globalThis.fired.push("30ms"), 30);
+                setTimeout(() => globalThis.fired.push("10ms"), 10);
+                setTimeout(() => globalThis.fired.push("20ms"), 20);
+            "#,
+            )
             .await
             .expect("register timers");
 
@@ -486,18 +480,14 @@ fn same_deadline_timers_fire_in_creation_order() {
 
         runtime.eval(r"globalThis.fired = [];").await.expect("init");
 
-        let t1 = runtime.set_timeout(10);
-        let t2 = runtime.set_timeout(10);
-        let t3 = runtime.set_timeout(10);
-
         runtime
-            .eval(&format!(
+            .eval(
                 r#"
-                __pi_register_timer({t1}, () => globalThis.fired.push("first"));
-                __pi_register_timer({t2}, () => globalThis.fired.push("second"));
-                __pi_register_timer({t3}, () => globalThis.fired.push("third"));
-            "#
-            ))
+                setTimeout(() => globalThis.fired.push("first"), 10);
+                setTimeout(() => globalThis.fired.push("second"), 10);
+                setTimeout(() => globalThis.fired.push("third"), 10);
+            "#,
+            )
             .await
             .expect("register timers");
 
@@ -526,19 +516,15 @@ fn clear_timeout_prevents_callback() {
         let (runtime, clock) = make_runtime().await;
 
         runtime
-            .eval(r"globalThis.fired = false;")
+            .eval(
+                r"
+                globalThis.fired = false;
+                const timerId = setTimeout(() => { globalThis.fired = true; }, 10);
+                clearTimeout(timerId);
+                ",
+            )
             .await
-            .expect("init");
-
-        let timer_id = runtime.set_timeout(10);
-        runtime
-            .eval(&format!(
-                r"__pi_register_timer({timer_id}, () => {{ globalThis.fired = true; }});"
-            ))
-            .await
-            .expect("register timer");
-
-        assert!(runtime.clear_timeout(timer_id));
+            .expect("register and clear timer");
 
         clock.set(10);
         let stats = runtime.tick().await.expect("tick");
@@ -609,9 +595,8 @@ fn has_pending_reflects_timer_state() {
 
         assert!(!runtime.has_pending());
 
-        let timer_id = runtime.set_timeout(10);
         runtime
-            .eval(&format!(r"__pi_register_timer({timer_id}, () => {{}});"))
+            .eval(r"setTimeout(() => {}, 10);")
             .await
             .expect("register timer");
 
@@ -635,15 +620,14 @@ fn microtasks_drain_before_next_macrotask() {
 
         runtime.eval(r"globalThis.order = [];").await.expect("init");
 
-        // Timer that spawns a microtask
-        let timer_id = runtime.set_timeout(10);
+        // Timer that spawns a microtask, registered through the public JS shim.
         runtime
-            .eval(&format!(
-                r#"__pi_register_timer({timer_id}, () => {{
+            .eval(
+                r#"setTimeout(() => {
                     globalThis.order.push("timer");
                     Promise.resolve().then(() => globalThis.order.push("timer-micro"));
-                }});"#
-            ))
+                }, 10);"#,
+            )
             .await
             .expect("register timer");
 

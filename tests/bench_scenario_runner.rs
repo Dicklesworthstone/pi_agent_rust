@@ -18,9 +18,11 @@
 
 use futures::executor::block_on;
 use pi::error::Result;
-use pi::extensions::JsExtensionLoadSpec;
-use pi::extensions_js::{HostcallKind, PiJsRuntime, PiJsRuntimeConfig};
-use pi::scheduler::{HostcallOutcome, WallClock};
+use pi::extensions::{
+    ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+};
+use pi::extensions_js::PiJsRuntimeConfig;
+use pi::tools::ToolRegistry;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -28,6 +30,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 
@@ -43,16 +46,19 @@ const PARTITION_REALISTIC: &str = "realistic";
 const MATRIX_SCENARIO_SESSION_WORKLOAD: &str = "session_workload_matrix";
 const MATRIX_SESSION_SIZES: &[u64] = &[100_000, 200_000, 500_000, 1_000_000, 5_000_000];
 const EVIDENCE_CLASS_MEASURED: &str = "measured";
+const EVIDENCE_CLASS_INFERRED: &str = "inferred";
 const CONFIDENCE_HIGH: &str = "high";
+const CONFIDENCE_LOW: &str = "low";
+const MEASUREMENT_BOUNDARY: &str = "production_extension_manager";
+const MEASUREMENT_CONTRACT_VERSION: &str = "production_extension_manager.v1";
+const SYNTHETIC_MEASUREMENT_BOUNDARY: &str = "synthetic_seed_projection";
+const SYNTHETIC_MEASUREMENT_CONTRACT_VERSION: &str = "synthetic_seed_projection.v1";
 
 /// Iterations for cold/warm start scenarios.
 const LOAD_RUNS: usize = 5;
 
 /// Iterations for tool-call and event-hook scenarios.
 const DISPATCH_ITERATIONS: u32 = 500;
-
-/// Sentinel tool name for benchmark reporting.
-const BENCH_REPORT_TOOL: &str = "__bench_report";
 
 // ─── Environment Fingerprint ────────────────────────────────────────────────
 
@@ -273,223 +279,79 @@ fn matrix_swarm_metrics(
             "observed_cpu_cores": observed_cpu_cores,
             "mem_total_mb": mem_total_mb,
         },
+        "derivation": {
+            "method": "deterministic_seed_projection",
+            "latency_quantiles": "derived_from_seed_stage_totals_using_fixed_multipliers",
+            "queue_depth": "derived_from_session_messages_using_fixed_multipliers",
+            "resource_usage": "rss_sampled_at_generation_time_cpu_placeholder_zero",
+        },
     })
 }
 
 // ─── Runtime Helpers ────────────────────────────────────────────────────────
 
-async fn new_runtime(js_cwd: &str) -> Result<PiJsRuntime> {
+struct BenchRuntime {
+    manager: ExtensionManager,
+    runtime: JsExtensionRuntimeHandle,
+}
+
+async fn new_runtime(js_cwd: &str, disk_cache_dir: Option<PathBuf>) -> Result<BenchRuntime> {
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], Path::new(js_cwd), None));
     let config = PiJsRuntimeConfig {
         cwd: js_cwd.to_string(),
+        disk_cache_dir,
         ..Default::default()
     };
-    PiJsRuntime::with_clock_and_config(WallClock, config).await
+    let runtime = JsExtensionRuntimeHandle::start(config, tools, manager.clone()).await?;
+    manager.set_js_runtime(runtime.clone());
+    Ok(BenchRuntime { manager, runtime })
 }
 
-fn js_literal(value: &impl Serialize) -> Result<String> {
-    serde_json::to_string(value).map_err(|err| pi::error::Error::Json(Box::new(err)))
+fn unique_warm_cache_dir(extension_id: &str) -> PathBuf {
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let raw = format!("{extension_id}|{}|{now_nanos}", std::process::id());
+    let suffix = sha256_hex(&raw);
+    perf_output_path("module-cache").join(format!("warm-{}", &suffix[..16]))
 }
 
-/// Run JS code and pump hostcall requests until a `__bench_report` tool call
-/// is received (signaling completion) or the budget expires.
-async fn run_bench_js(
-    runtime: &PiJsRuntime,
-    js: &str,
-    budget: Duration,
-) -> Result<(Value, BTreeMap<String, u64>, Duration)> {
-    let started_at = Instant::now();
-    runtime.eval(js).await?;
-
-    let mut report: Option<Value> = None;
-    let mut unexpected: BTreeMap<String, u64> = BTreeMap::new();
-
-    while started_at.elapsed() < budget {
-        let mut requests = runtime.drain_hostcall_requests();
-        while let Some(req) = requests.pop_front() {
-            let (key, outcome) = match &req.kind {
-                HostcallKind::Tool { name } if name == BENCH_REPORT_TOOL => {
-                    report = Some(req.payload.clone());
-                    (String::new(), HostcallOutcome::Success(json!({})))
-                }
-                HostcallKind::Tool { name } => (
-                    format!("tool.{name}"),
-                    HostcallOutcome::Error {
-                        code: "UNSUPPORTED_TOOL".to_string(),
-                        message: format!("bench harness does not implement tool {name}"),
-                    },
-                ),
-                HostcallKind::Ui { op } => (
-                    format!("ui.{op}"),
-                    HostcallOutcome::Success(json!({"ok": true})),
-                ),
-                HostcallKind::Events { op } => (
-                    format!("events.{op}"),
-                    HostcallOutcome::Success(json!({"ok": true})),
-                ),
-                HostcallKind::Session { op } => (
-                    format!("session.{op}"),
-                    HostcallOutcome::Success(json!({"ok": true})),
-                ),
-                HostcallKind::Exec { cmd } => (
-                    format!("exec.{cmd}"),
-                    HostcallOutcome::Error {
-                        code: "EXEC_DISABLED".to_string(),
-                        message: "bench harness forbids exec".to_string(),
-                    },
-                ),
-                HostcallKind::Http => (
-                    "http".to_string(),
-                    HostcallOutcome::Error {
-                        code: "HTTP_DISABLED".to_string(),
-                        message: "bench harness forbids http".to_string(),
-                    },
-                ),
-                HostcallKind::Log => (
-                    "log".to_string(),
-                    HostcallOutcome::Success(json!({"logged": true})),
-                ),
-            };
-
-            if !key.is_empty() {
-                *unexpected.entry(key).or_insert(0) += 1;
-            }
-
-            runtime.complete_hostcall(req.call_id, outcome);
-            let _ = runtime.tick().await?;
-        }
-
-        let _ = runtime.drain_microtasks().await?;
-
-        if let Some(r) = report.take() {
-            let ok = r.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            if !ok {
-                let msg = r.get("error").and_then(Value::as_str).unwrap_or("unknown");
-                return Err(pi::error::Error::extension(format!(
-                    "js bench failed: {msg}"
-                )));
-            }
-            return Ok((r, unexpected, started_at.elapsed()));
-        }
-
-        if runtime.has_pending() {
-            let _ = runtime.tick().await?;
-        }
-    }
-
-    Err(pi::error::Error::extension(format!(
-        "benchmark timed out after {}ms",
-        budget.as_millis()
-    )))
-}
-
-async fn load_extension(runtime: &PiJsRuntime, spec: &JsExtensionLoadSpec) -> Result<()> {
-    if let Some(parent) = spec.entry_path.parent() {
-        runtime.add_extension_root(parent.to_path_buf());
-    }
-
-    let ext_id = js_literal(&spec.extension_id)?;
-    let entry = js_literal(&spec.entry_path.display().to_string().replace('\\', "/"))?;
-    let meta = js_literal(&json!({
-        "name": spec.name,
-        "version": spec.version,
-        "apiVersion": spec.api_version,
-    }))?;
-    let bench_tool = js_literal(&BENCH_REPORT_TOOL)?;
-
-    let js = format!(
-        r"
-(async () => {{
-  try {{
-    await __pi_load_extension({ext_id}, {entry}, {meta});
-    await pi.tool({bench_tool}, {{ ok: true }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-"
-    );
-
-    let (_report, _unexpected, _elapsed) =
-        run_bench_js(runtime, &js, Duration::from_secs(10)).await?;
-    Ok(())
+async fn load_extension(runtime: &BenchRuntime, spec: &JsExtensionLoadSpec) -> Result<()> {
+    runtime.manager.load_js_extensions(vec![spec.clone()]).await
 }
 
 async fn resolve_extension_callable(
-    runtime: &PiJsRuntime,
+    runtime: &BenchRuntime,
     extension_id: &str,
 ) -> Result<(String, String)> {
-    let ext_id = js_literal(&extension_id)?;
-    let bench_tool = js_literal(&BENCH_REPORT_TOOL)?;
-    let js = format!(
-        r"
-(async () => {{
-  try {{
-    const extId = {ext_id};
-    let invokeKind = null;
-    let invokeName = null;
-
-    if (typeof __pi_tool_index !== 'undefined' && __pi_tool_index && __pi_tool_index.has(extId)) {{
-      invokeKind = 'tool';
-      invokeName = extId;
-    }} else if (typeof __pi_command_index !== 'undefined' && __pi_command_index && __pi_command_index.has(extId)) {{
-      invokeKind = 'command';
-      invokeName = extId;
-    }}
-
-    if (!invokeKind && typeof __pi_tool_index !== 'undefined' && __pi_tool_index) {{
-      for (const [name, record] of __pi_tool_index.entries()) {{
-        if (record && record.extensionId === extId) {{
-          invokeKind = 'tool';
-          invokeName = name;
-          break;
-        }}
-      }}
-    }}
-
-    if (!invokeKind && typeof __pi_command_index !== 'undefined' && __pi_command_index) {{
-      for (const [name, record] of __pi_command_index.entries()) {{
-        if (record && record.extensionId === extId) {{
-          invokeKind = 'command';
-          invokeName = name;
-          break;
-        }}
-      }}
-    }}
-
-    if (!invokeKind || !invokeName) {{
-      throw new Error(`No callable tool/command registered for extension: ${{extId}}`);
-    }}
-
-    await pi.tool({bench_tool}, {{
-      ok: true,
-      invoke_kind: invokeKind,
-      invoke_name: invokeName
-    }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-"
-    );
-
-    let (report, _unexpected, _elapsed) =
-        run_bench_js(runtime, &js, Duration::from_secs(10)).await?;
-    let invoke_kind = report
-        .get("invoke_kind")
-        .and_then(Value::as_str)
-        .ok_or_else(|| pi::error::Error::extension("missing invoke_kind in callable report"))?;
-    let invoke_name = report
-        .get("invoke_name")
-        .and_then(Value::as_str)
-        .ok_or_else(|| pi::error::Error::extension("missing invoke_name in callable report"))?;
-    if invoke_kind != "tool" && invoke_kind != "command" {
-        return Err(pi::error::Error::extension(format!(
-            "unsupported invoke_kind from callable report: {invoke_kind}"
-        )));
+    let tools = runtime.runtime.get_registered_tools().await?;
+    if let Some(tool) = tools.iter().find(|tool| tool.name == extension_id) {
+        return Ok(("tool".to_string(), tool.name.clone()));
     }
-    Ok((invoke_kind.to_string(), invoke_name.to_string()))
+
+    let commands = runtime.manager.list_commands();
+    if let Some(command_name) = commands
+        .iter()
+        .filter_map(|command| command.get("name").and_then(Value::as_str))
+        .find(|name| *name == extension_id)
+    {
+        return Ok(("command".to_string(), command_name.to_string()));
+    }
+
+    if let Some(tool) = tools.first() {
+        return Ok(("tool".to_string(), tool.name.clone()));
+    }
+    if let Some(command_name) = commands
+        .iter()
+        .find_map(|command| command.get("name").and_then(Value::as_str))
+    {
+        return Ok(("command".to_string(), command_name.to_string()));
+    }
+
+    Err(pi::error::Error::extension(format!(
+        "No callable tool/command registered for extension: {extension_id}"
+    )))
 }
 
 // ─── Scenarios ──────────────────────────────────────────────────────────────
@@ -503,9 +365,14 @@ async fn scenario_cold_start(
     let mut timings = Vec::with_capacity(runs);
     for _ in 0..runs {
         let start = Instant::now();
-        let runtime = new_runtime(js_cwd).await?;
+        let runtime = new_runtime(js_cwd, None).await?;
         load_extension(&runtime, spec).await?;
         timings.push(start.elapsed());
+        if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+            return Err(pi::error::Error::extension(
+                "benchmark runtime did not shut down after cold start",
+            ));
+        }
     }
 
     let stats = compute_stats(&timings);
@@ -516,27 +383,41 @@ async fn scenario_cold_start(
         "extension": spec.extension_id,
         "runs": runs,
         "stats": stats,
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
     }))
 }
 
-/// Warm start: reuse an existing runtime, load the extension again.
+/// Warm start: create fresh runtimes after warming filesystem/transpile caches.
 async fn scenario_warm_start(
     spec: &JsExtensionLoadSpec,
     js_cwd: &str,
     runs: usize,
 ) -> Result<Value> {
     // Create one runtime and load the extension once (warmup).
-    let runtime = new_runtime(js_cwd).await?;
+    let warm_cache_dir = unique_warm_cache_dir(&spec.extension_id);
+    let runtime = new_runtime(js_cwd, Some(warm_cache_dir.clone())).await?;
     load_extension(&runtime, spec).await?;
+    if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+        return Err(pi::error::Error::extension(
+            "benchmark warmup runtime did not shut down",
+        ));
+    }
 
-    // Now re-load the same extension repeatedly (warm path).
+    // Fresh isolated shards retain honest startup semantics while host-level
+    // filesystem and transpilation caches remain warm.
     let mut timings = Vec::with_capacity(runs);
     for _ in 0..runs {
         let start = Instant::now();
-        // Create a fresh runtime but the filesystem cache is warm.
-        let warm_rt = new_runtime(js_cwd).await?;
+        let warm_rt = new_runtime(js_cwd, Some(warm_cache_dir.clone())).await?;
         load_extension(&warm_rt, spec).await?;
         timings.push(start.elapsed());
+        if !warm_rt.manager.shutdown(Duration::from_secs(5)).await {
+            return Err(pi::error::Error::extension(
+                "benchmark runtime did not shut down after warm start",
+            ));
+        }
     }
 
     let stats = compute_stats(&timings);
@@ -547,6 +428,10 @@ async fn scenario_warm_start(
         "extension": spec.extension_id,
         "runs": runs,
         "stats": stats,
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "unique_per_scenario_shared_across_warmup_and_runs",
+        "warm_state": "shared_pi_js_disk_module_cache",
     }))
 }
 
@@ -556,61 +441,63 @@ async fn scenario_tool_call(
     js_cwd: &str,
     iterations: u32,
 ) -> Result<Value> {
-    let runtime = new_runtime(js_cwd).await?;
+    let runtime = new_runtime(js_cwd, None).await?;
     load_extension(&runtime, spec).await?;
 
     // Extensions may expose either a tool or a command with the extension name.
     let (invoke_kind, invoke_name) =
         resolve_extension_callable(&runtime, &spec.extension_id).await?;
-    let invoke_kind_js = js_literal(&invoke_kind)?;
-    let invoke_name_js = js_literal(&invoke_name)?;
-    let call_id = js_literal(&"bench-call-1")?;
-    let input = js_literal(&json!({"name": "bench"}))?;
-    let command_args = js_literal(&json!([]))?;
-    let ctx = js_literal(&json!({"hasUI": false, "cwd": js_cwd}))?;
-    let iterations_js = js_literal(&iterations)?;
-    let bench_tool = js_literal(&BENCH_REPORT_TOOL)?;
-
-    let js = format!(
-        r"
-(async () => {{
-  try {{
-    const invokeKind = {invoke_kind_js};
-    const invokeName = {invoke_name_js};
-    const commandArgs = {command_args};
-    const N = {iterations_js};
-    for (let i = 0; i < N; i++) {{
-      if (invokeKind === 'tool') {{
-        await __pi_execute_tool(invokeName, {call_id}, {input}, {ctx});
-      }} else if (invokeKind === 'command') {{
-        await __pi_execute_command(invokeName, commandArgs, {ctx});
-      }} else {{
-        throw new Error(`Unsupported invoke kind: ${{invokeKind}}`);
-      }}
-    }}
-    await pi.tool({bench_tool}, {{
-      ok: true,
-      invoke_kind: invokeKind,
-      invoke_name: invokeName
-    }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-"
-    );
-
-    let (report, unexpected, elapsed) =
-        run_bench_js(&runtime, &js, Duration::from_secs(60)).await?;
-    let record_invoke_kind = report
-        .get("invoke_kind")
-        .and_then(Value::as_str)
-        .unwrap_or(invoke_kind.as_str());
-    let record_invoke_name = report
-        .get("invoke_name")
-        .and_then(Value::as_str)
-        .unwrap_or(invoke_name.as_str());
+    let ctx = Arc::new(json!({"hasUI": false, "cwd": js_cwd}));
+    let budget = Duration::from_secs(60);
+    let started_at = Instant::now();
+    for _ in 0..iterations {
+        if started_at.elapsed() >= budget {
+            let _ = runtime.manager.shutdown(Duration::from_secs(5)).await;
+            return Err(pi::error::Error::extension(format!(
+                "tool-call benchmark timed out after {}ms",
+                budget.as_millis()
+            )));
+        }
+        let remaining_ms = u64::try_from(
+            budget
+                .saturating_sub(started_at.elapsed())
+                .as_millis()
+                .max(1),
+        )
+        .unwrap_or(u64::MAX);
+        match invoke_kind.as_str() {
+            "tool" => {
+                let _ = runtime
+                    .runtime
+                    .execute_tool(
+                        invoke_name.clone(),
+                        "bench-call-1".to_string(),
+                        json!({"name": "bench"}),
+                        Arc::clone(&ctx),
+                        remaining_ms,
+                    )
+                    .await?;
+            }
+            "command" => {
+                let _ = runtime
+                    .runtime
+                    .execute_command(
+                        invoke_name.clone(),
+                        String::new(),
+                        Arc::clone(&ctx),
+                        remaining_ms,
+                    )
+                    .await?;
+            }
+            _ => unreachable!("callable resolver returned an unsupported kind"),
+        }
+    }
+    let elapsed = started_at.elapsed();
+    if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+        return Err(pi::error::Error::extension(
+            "benchmark runtime did not shut down after callable dispatch",
+        ));
+    }
 
     let elapsed_us = elapsed.as_secs_f64() * 1_000_000.0;
     let iters_f = f64::from(iterations.max(1));
@@ -626,9 +513,13 @@ async fn scenario_tool_call(
         "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
         "per_call_us": per_call_us,
         "calls_per_sec": calls_per_sec,
-        "invoke_kind": record_invoke_kind,
-        "invoke_name": record_invoke_name,
-        "unexpected_hostcalls": unexpected,
+        "invoke_kind": invoke_kind,
+        "invoke_name": invoke_name,
+        "unexpected_hostcalls": null,
+        "unexpected_hostcalls_observable": false,
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
     }))
 }
 
@@ -638,34 +529,42 @@ async fn scenario_event_dispatch(
     js_cwd: &str,
     iterations: u32,
 ) -> Result<Value> {
-    let runtime = new_runtime(js_cwd).await?;
+    let runtime = new_runtime(js_cwd, None).await?;
     load_extension(&runtime, spec).await?;
 
-    let event_name = js_literal(&"before_agent_start")?;
-    let event_payload = js_literal(&json!({"systemPrompt": "You are Pi."}))?;
-    let ctx = js_literal(&json!({"hasUI": false, "cwd": js_cwd}))?;
-    let iterations_js = js_literal(&iterations)?;
-    let bench_tool = js_literal(&BENCH_REPORT_TOOL)?;
-
-    let js = format!(
-        r"
-(async () => {{
-  try {{
-    const N = {iterations_js};
-    for (let i = 0; i < N; i++) {{
-      await __pi_dispatch_extension_event({event_name}, {event_payload}, {ctx});
-    }}
-    await pi.tool({bench_tool}, {{ ok: true }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-"
-    );
-
-    let (_report, unexpected, elapsed) =
-        run_bench_js(&runtime, &js, Duration::from_secs(60)).await?;
+    let event_payload = json!({"systemPrompt": "You are Pi."});
+    let budget = Duration::from_secs(60);
+    let started_at = Instant::now();
+    for _ in 0..iterations {
+        if started_at.elapsed() >= budget {
+            let _ = runtime.manager.shutdown(Duration::from_secs(5)).await;
+            return Err(pi::error::Error::extension(format!(
+                "event-dispatch benchmark timed out after {}ms",
+                budget.as_millis()
+            )));
+        }
+        let remaining_ms = u64::try_from(
+            budget
+                .saturating_sub(started_at.elapsed())
+                .as_millis()
+                .max(1),
+        )
+        .unwrap_or(u64::MAX);
+        let _ = runtime
+            .manager
+            .dispatch_event_with_response(
+                ExtensionEventName::BeforeAgentStart,
+                Some(event_payload.clone()),
+                remaining_ms,
+            )
+            .await?;
+    }
+    let elapsed = started_at.elapsed();
+    if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+        return Err(pi::error::Error::extension(
+            "benchmark runtime did not shut down after event dispatch",
+        ));
+    }
 
     let elapsed_us = elapsed.as_secs_f64() * 1_000_000.0;
     let iters_f = f64::from(iterations.max(1));
@@ -679,7 +578,11 @@ async fn scenario_event_dispatch(
         "iterations": iterations,
         "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
         "per_call_us": per_call_us,
-        "unexpected_hostcalls": unexpected,
+        "unexpected_hostcalls": null,
+        "unexpected_hostcalls_observable": false,
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
     }))
 }
 
@@ -705,13 +608,21 @@ fn phase1_matrix_seed_rows(env: &Value) -> Vec<Value> {
         (PARTITION_REALISTIC, realistic.as_slice()),
     ] {
         for &(session_messages, open_ms, append_ms, save_ms, index_ms) in samples {
-            let scenario_id = format!("{partition}/session_{session_messages}");
+            let scenario_id = format!(
+                "{partition}/{SYNTHETIC_MEASUREMENT_CONTRACT_VERSION}/session_{session_messages}"
+            );
             rows.push(json!({
                 "schema": "pi.ext.rust_bench.v1",
                 "runtime": "pi_agent_rust",
                 "scenario": MATRIX_SCENARIO_SESSION_WORKLOAD,
                 "extension": "core",
                 "partition": partition,
+                "evidence_class": EVIDENCE_CLASS_INFERRED,
+                "confidence": CONFIDENCE_LOW,
+                "measurement_method": "synthetic_seed_projection",
+                "eligible_for_regression_gate": false,
+                "measurement_boundary": SYNTHETIC_MEASUREMENT_BOUNDARY,
+                "measurement_contract_version": SYNTHETIC_MEASUREMENT_CONTRACT_VERSION,
                 "session_messages": session_messages,
                 "open_ms": open_ms,
                 "append_ms": append_ms,
@@ -807,12 +718,23 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             .and_then(Value::as_str)
             .unwrap_or(PARTITION_MATCHED_STATE)
             .to_owned();
+        let measurement_contract_version = map
+            .get("measurement_contract_version")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                panic!(
+                    "benchmark record is missing measurement_contract_version: extension={extension} scenario={scenario}"
+                )
+            })
+            .to_owned();
+        let default_scenario_id =
+            format!("{partition}/{measurement_contract_version}/{scenario}");
         let scenario_id_for_hash = map
             .get("scenario_metadata")
             .and_then(Value::as_object)
             .and_then(|meta| meta.get("scenario_id"))
             .and_then(Value::as_str)
-            .map_or_else(|| format!("{partition}/{scenario}"), ToString::to_string);
+            .map_or_else(|| default_scenario_id.clone(), ToString::to_string);
         let scenario_correlation = sha256_hex(&format!(
             "{run_correlation_id}|{extension}|{scenario}|{scenario_id_for_hash}"
         ));
@@ -839,7 +761,7 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             .or_insert_with(|| host_metadata_from_env(env));
         scenario_metadata
             .entry("scenario_id".to_string())
-            .or_insert_with(|| Value::String(format!("{partition}/{scenario}")));
+            .or_insert_with(|| Value::String(default_scenario_id));
         scenario_metadata
             .entry("replay_input".to_string())
             .or_insert(replay_input);
@@ -865,6 +787,9 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
                 "confidence".to_string(),
                 Value::String(CONFIDENCE_HIGH.to_string()),
             );
+        }
+        if !map.contains_key("eligible_for_regression_gate") {
+            map.insert("eligible_for_regression_gate".to_string(), Value::Bool(true));
         }
         map.insert(
             "correlation_id".to_string(),
@@ -1097,9 +1022,24 @@ fn scenario_output_has_stable_structure() {
 fn assert_record_structure(obj: &Map<String, Value>) {
     assert_record_required_fields(obj);
     assert_protocol_and_partition_contract(obj);
+    assert_unexpected_hostcall_contract(obj);
     assert_env_fingerprint_fields(obj);
     let metadata = assert_scenario_metadata_fields(obj);
     assert_matrix_scenario_structure(obj, metadata);
+}
+
+fn assert_unexpected_hostcall_contract(obj: &Map<String, Value>) {
+    if obj
+        .get("unexpected_hostcalls_observable")
+        .and_then(Value::as_bool)
+        == Some(false)
+    {
+        assert_eq!(
+            obj.get("unexpected_hostcalls"),
+            Some(&Value::Null),
+            "unobservable unexpected-hostcall evidence must be null, not an empty observation"
+        );
+    }
 }
 
 fn assert_record_required_fields(obj: &Map<String, Value>) {
@@ -1119,6 +1059,18 @@ fn assert_record_required_fields(obj: &Map<String, Value>) {
     assert!(obj.contains_key("partition"), "missing partition");
     assert!(obj.contains_key("evidence_class"), "missing evidence_class");
     assert!(obj.contains_key("confidence"), "missing confidence");
+    assert!(
+        obj.contains_key("eligible_for_regression_gate"),
+        "missing eligible_for_regression_gate"
+    );
+    assert!(
+        obj.contains_key("measurement_boundary"),
+        "missing measurement_boundary"
+    );
+    assert!(
+        obj.contains_key("measurement_contract_version"),
+        "missing measurement_contract_version"
+    );
     assert!(obj.contains_key("correlation_id"), "missing correlation_id");
     assert!(
         obj.contains_key("scenario_metadata"),
@@ -1142,15 +1094,57 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
         matches!(partition, PARTITION_MATCHED_STATE | PARTITION_REALISTIC),
         "unexpected partition: {partition}"
     );
+    let is_matrix = obj.get("scenario").and_then(Value::as_str)
+        == Some(MATRIX_SCENARIO_SESSION_WORKLOAD);
+    let (
+        expected_evidence_class,
+        expected_confidence,
+        expected_gate_eligibility,
+        expected_boundary,
+        expected_contract_version,
+    ) = if is_matrix {
+        (
+            EVIDENCE_CLASS_INFERRED,
+            CONFIDENCE_LOW,
+            false,
+            SYNTHETIC_MEASUREMENT_BOUNDARY,
+            SYNTHETIC_MEASUREMENT_CONTRACT_VERSION,
+        )
+    } else {
+        (
+            EVIDENCE_CLASS_MEASURED,
+            CONFIDENCE_HIGH,
+            true,
+            MEASUREMENT_BOUNDARY,
+            MEASUREMENT_CONTRACT_VERSION,
+        )
+    };
     assert_eq!(
         obj.get("evidence_class").and_then(Value::as_str),
-        Some(EVIDENCE_CLASS_MEASURED),
+        Some(expected_evidence_class),
         "unexpected evidence_class",
     );
     assert_eq!(
         obj.get("confidence").and_then(Value::as_str),
-        Some(CONFIDENCE_HIGH),
+        Some(expected_confidence),
         "unexpected confidence",
+    );
+    assert_eq!(
+        obj.get("eligible_for_regression_gate")
+            .and_then(Value::as_bool),
+        Some(expected_gate_eligibility),
+        "unexpected eligible_for_regression_gate",
+    );
+    assert_eq!(
+        obj.get("measurement_boundary").and_then(Value::as_str),
+        Some(expected_boundary),
+        "unexpected measurement_boundary",
+    );
+    assert_eq!(
+        obj.get("measurement_contract_version")
+            .and_then(Value::as_str),
+        Some(expected_contract_version),
+        "unexpected measurement_contract_version",
     );
     let correlation_id = obj
         .get("correlation_id")
@@ -1195,6 +1189,18 @@ fn assert_scenario_metadata_fields(obj: &Map<String, Value>) -> &Map<String, Val
             "scenario_metadata missing field: {field}"
         );
     }
+    let scenario_id = metadata
+        .get("scenario_id")
+        .and_then(Value::as_str)
+        .expect("scenario_metadata.scenario_id must be a string");
+    let contract_version = obj
+        .get("measurement_contract_version")
+        .and_then(Value::as_str)
+        .expect("measurement_contract_version must be a string");
+    assert!(
+        scenario_id.contains(contract_version),
+        "scenario_id must bind the measurement contract version: {scenario_id}"
+    );
     metadata
 }
 
@@ -1208,9 +1214,16 @@ fn assert_matrix_scenario_structure(obj: &Map<String, Value>, metadata: &Map<Str
         .and_then(Value::as_str)
         .expect("matrix scenario_id must be a string");
     assert!(
-        scenario_id.starts_with("matched-state/session_")
-            || scenario_id.starts_with("realistic/session_"),
+        scenario_id.starts_with(&format!(
+            "matched-state/{SYNTHETIC_MEASUREMENT_CONTRACT_VERSION}/session_"
+        )) || scenario_id.starts_with(&format!(
+            "realistic/{SYNTHETIC_MEASUREMENT_CONTRACT_VERSION}/session_"
+        )),
         "unexpected matrix scenario_id: {scenario_id}"
+    );
+    assert_eq!(
+        obj.get("measurement_method").and_then(Value::as_str),
+        Some("synthetic_seed_projection")
     );
     let replay_input = metadata
         .get("replay_input")
@@ -1320,6 +1333,14 @@ fn assert_matrix_swarm_metrics(obj: &Map<String, Value>) {
         "stage_breakdown_ms",
         &["open", "append", "save", "index"],
         "swarm_metrics",
+    );
+    let derivation = metrics
+        .get("derivation")
+        .and_then(Value::as_object)
+        .expect("synthetic swarm_metrics must disclose derivation");
+    assert_eq!(
+        derivation.get("method").and_then(Value::as_str),
+        Some("deterministic_seed_projection")
     );
 }
 

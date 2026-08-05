@@ -6,7 +6,7 @@
 //! `pi.*`, drains the resulting `HostcallRequest`, and verifies the
 //! `HostcallKind`, payload, and JS-side result when completed.
 
-use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime};
+use pi::extensions_js::{HostcallKind, HostcallRequest, PiJsRuntime, PiJsRuntimeConfig};
 use pi::scheduler::{DeterministicClock, HostcallOutcome};
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -1024,20 +1024,19 @@ fn ui_denied_error() {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn hostcall_includes_extension_id_when_set() {
+fn hostcall_includes_extension_id_from_runtime_owner() {
     futures::executor::block_on(async {
-        let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
-            .await
-            .expect("create runtime");
+        let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            DeterministicClock::new(0),
+            PiJsRuntimeConfig::default(),
+            None,
+            "my-test-extension".to_string(),
+        )
+        .await
+        .expect("create owned runtime");
 
-        // Set the extension id global that the bridge reads
         runtime
-            .eval(
-                r#"
-globalThis.__pi_current_extension_id = "my-test-extension";
-pi.exec("echo", ["hi"]);
-"#,
-            )
+            .eval(r#"pi.exec("echo", ["hi"]);"#)
             .await
             .expect("eval");
 
@@ -1045,28 +1044,21 @@ pi.exec("echo", ["hi"]);
         assert_eq!(
             req.extension_id.as_deref(),
             Some("my-test-extension"),
-            "expected extension_id to be set from global"
+            "expected extension_id to come from the immutable runtime owner"
         );
     });
 }
 
 #[test]
-fn hostcall_extension_id_none_when_not_set() {
+fn hostcall_extension_id_is_none_when_runtime_has_no_owner() {
     futures::executor::block_on(async {
+        // The ordinary constructor is an explicit low-level harness principal:
+        // it has no production extension owner and therefore emits no owner id.
         let runtime = PiJsRuntime::with_clock(DeterministicClock::new(0))
             .await
             .expect("create runtime");
 
-        // Ensure no extension id is set (clear it in case of prior state)
-        runtime
-            .eval(
-                r#"
-globalThis.__pi_current_extension_id = undefined;
-pi.exec("ls");
-"#,
-            )
-            .await
-            .expect("eval");
+        runtime.eval(r#"pi.exec("ls");"#).await.expect("eval");
 
         let req = drain_one(&runtime);
         assert!(
@@ -1127,16 +1119,28 @@ pi.http({ url: "https://example.com", method: "GET" });
             .expect("eval");
 
         let reqs = drain_all(&runtime);
-        let count = reqs.len();
-        assert!(
-            count >= 2,
-            "expected at least 2 hostcall requests, got {count}"
+        let kinds = reqs
+            .iter()
+            .map(|request| request.kind.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            vec![
+                HostcallKind::Exec {
+                    cmd: "cmd1".to_string(),
+                },
+                HostcallKind::Exec {
+                    cmd: "cmd2".to_string(),
+                },
+                HostcallKind::Http,
+            ],
+            "all three connector calls must be queued once and in JavaScript issue order"
         );
 
         let pending_before = runtime.pending_hostcall_count();
-        assert!(
-            pending_before >= 2,
-            "expected at least 2 pending, got {pending_before}"
+        assert_eq!(
+            pending_before, 3,
+            "each queued connector call must have one pending tracker entry"
         );
 
         // Complete all and tick after each to process completions

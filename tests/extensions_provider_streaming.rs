@@ -23,6 +23,7 @@ use pi::provider::{Context, StreamOptions};
 use pi::providers::create_provider;
 use pi::tools::ToolRegistry;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tempfile::tempdir;
 
 // ---------------------------------------------------------------------------
@@ -894,4 +895,173 @@ fn stream_simple_done_message_contains_model_info() {
         }
         panic!("no Done event found");
     });
+}
+
+#[test]
+fn two_extension_streams_with_colliding_inner_ids_stay_routed_to_their_owner() {
+    let scenario = async move {
+        let dir = tempdir().expect("tempdir");
+        let workspace = dir.path().join("workspace");
+        let ext_a_dir = dir.path().join("stream-a");
+        let ext_b_dir = dir.path().join("stream-b");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::create_dir_all(&ext_a_dir).expect("extension A dir");
+        std::fs::create_dir_all(&ext_b_dir).expect("extension B dir");
+
+        let ext_a = ext_a_dir.join("index.mjs");
+        let ext_b = ext_b_dir.join("index.mjs");
+        std::fs::write(
+            &ext_a,
+            r#"
+export default function init(pi) {
+  pi.registerProvider("collision-provider-a", {
+    baseUrl: "https://a.example.test",
+    apiKey: "EXAMPLE_KEY_A",
+    api: "custom-api",
+    models: [{ id: "collision-model-a", name: "A", contextWindow: 100, maxTokens: 10, input: ["text"] }],
+    streamSimple: async function* () {
+      yield "A-1";
+      await Promise.resolve();
+      yield "A-2";
+    },
+  });
+}
+"#,
+        )
+        .expect("write extension A");
+        std::fs::write(
+            &ext_b,
+            r#"
+export default function init(pi) {
+  pi.registerProvider("collision-provider-b", {
+    baseUrl: "https://b.example.test",
+    apiKey: "EXAMPLE_KEY_B",
+    api: "custom-api",
+    models: [{ id: "collision-model-b", name: "B", contextWindow: 100, maxTokens: 10, input: ["text"] }],
+    streamSimple: async function* () {
+      yield "B-1";
+      await Promise.resolve();
+      yield "B-2";
+    },
+  });
+}
+"#,
+        )
+        .expect("write extension B");
+
+        let manager = ExtensionManager::new();
+        let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+        let runtime = JsExtensionRuntimeHandle::start(
+            PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..Default::default()
+            },
+            Arc::clone(&tools),
+            manager.clone(),
+        )
+        .await
+        .expect("start isolated runtime coordinator");
+        manager.set_js_runtime(runtime);
+        manager
+            .load_js_extensions(vec![
+                JsExtensionLoadSpec::from_entry_path(&ext_a).expect("extension A spec"),
+                JsExtensionLoadSpec::from_entry_path(&ext_b).expect("extension B spec"),
+            ])
+            .await
+            .expect("load both stream providers");
+
+        let entries = manager.extension_model_entries();
+        let entry_a = entries
+            .iter()
+            .find(|entry| entry.model.provider == "collision-provider-a")
+            .expect("provider A entry");
+        let entry_b = entries
+            .iter()
+            .find(|entry| entry.model.provider == "collision-provider-b")
+            .expect("provider B entry");
+        let provider_a = create_provider(entry_a, Some(&manager)).expect("provider A");
+        let provider_b = create_provider(entry_b, Some(&manager)).expect("provider B");
+        let context = basic_context();
+        let options = basic_options();
+
+        // Start both before polling either. Each fresh shard allocates its
+        // first JS-local id (`provider-stream-1`); the coordinator must expose
+        // distinct opaque routes and keep next/cancel operations owner-bound.
+        let mut stream_a = provider_a
+            .stream(&context, &options)
+            .await
+            .expect("start provider A stream");
+        let mut stream_b = provider_b
+            .stream(&context, &options)
+            .await
+            .expect("start provider B stream");
+
+        let mut text_a = String::new();
+        let mut text_b = String::new();
+        for _ in 0..8 {
+            let event = stream_a
+                .next()
+                .await
+                .expect("provider A event")
+                .expect("provider A event result");
+            if let StreamEvent::TextDelta { delta, .. } = event {
+                text_a.push_str(&delta);
+            }
+            if text_a == "A-1" {
+                break;
+            }
+        }
+        for _ in 0..8 {
+            let event = stream_b
+                .next()
+                .await
+                .expect("provider B event")
+                .expect("provider B event result");
+            if let StreamEvent::TextDelta { delta, .. } = event {
+                text_b.push_str(&delta);
+            }
+            if text_b == "B-1" {
+                break;
+            }
+        }
+        assert_eq!(text_a, "A-1", "provider A received a peer chunk");
+        assert_eq!(text_b, "B-1", "provider B received a peer chunk");
+
+        // Dropping A enqueues cancellation for its opaque route. The next B
+        // poll follows that cancellation on the same coordinator channel, so
+        // a route keyed only by the colliding inner id would cancel B here.
+        drop(stream_a);
+
+        let mut done_b = false;
+        for _ in 0..12 {
+            let event = stream_b
+                .next()
+                .await
+                .expect("provider B event after peer cancellation")
+                .expect("provider B event result after peer cancellation");
+            match event {
+                StreamEvent::TextDelta { delta, .. } => text_b.push_str(&delta),
+                StreamEvent::Done { .. } => done_b = true,
+                _ => {}
+            }
+            if done_b {
+                break;
+            }
+        }
+
+        assert!(done_b, "provider B must survive cancellation of provider A");
+        assert_eq!(text_b, "B-1B-2", "provider B received peer chunks");
+        assert!(manager.shutdown(Duration::from_secs(3)).await);
+    };
+
+    make_runtime()
+        .block_on(async move {
+            asupersync::time::timeout(
+                asupersync::time::wall_now(),
+                Duration::from_secs(8),
+                scenario,
+            )
+            .await
+        })
+        .expect("provider collision isolation scenario exceeded its independent 8-second bound");
 }

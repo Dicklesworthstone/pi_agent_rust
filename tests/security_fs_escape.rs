@@ -2,7 +2,7 @@
 //!
 //! Tests verify that extensions cannot escape their allowed filesystem scope
 //! via path traversal (`..`), absolute paths, or other techniques. Tests cover
-//! the VFS normalization, host read fallback, and tool-level path resolution.
+//! the VFS normalization, host-backed reads, and tool-level path resolution.
 
 mod common;
 
@@ -11,6 +11,7 @@ use pi::extensions::{
 };
 use pi::extensions_js::PiJsRuntimeConfig;
 use pi::tools::ToolRegistry;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -72,10 +73,9 @@ export default function activate(pi) {{
     )
 }
 
-fn eval_fs(js_expr: &str) -> String {
-    let harness = common::TestHarness::new("fs_escape");
+fn eval_fs_in_harness(harness: &common::TestHarness, js_expr: &str) -> String {
     let source = fs_ext_source(js_expr);
-    let mgr = load_ext(&harness, &source);
+    let mgr = load_ext(harness, &source);
 
     let response = common::run_async(async move {
         mgr.dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10000)
@@ -86,6 +86,11 @@ fn eval_fs(js_expr: &str) -> String {
     response
         .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
         .unwrap_or_else(|| "NO_RESPONSE".to_string())
+}
+
+fn eval_fs(js_expr: &str) -> String {
+    let harness = common::TestHarness::new("fs_escape");
+    eval_fs_in_harness(&harness, js_expr)
 }
 
 fn eval_fs_with_setup<F>(setup: F, js_expr: &str) -> String
@@ -94,91 +99,120 @@ where
 {
     let harness = common::TestHarness::new("fs_escape");
     setup(&harness);
-    let source = fs_ext_source(js_expr);
-    let mgr = load_ext(&harness, &source);
+    eval_fs_in_harness(&harness, js_expr)
+}
 
-    let response = common::run_async(async move {
-        mgr.dispatch_event_with_response(ExtensionEventName::AgentStart, None, 10000)
-            .await
-            .expect("dispatch agent_start")
-    });
+fn js_path(path: &Path) -> String {
+    serde_json::to_string(&path.display().to_string()).expect("serialize path for JavaScript")
+}
 
-    response
-        .and_then(|v| v.get("result").and_then(|r| r.as_str()).map(String::from))
-        .unwrap_or_else(|| "NO_RESPONSE".to_string())
+/// Create a real, retained canary outside the runtime workspace. An escape
+/// test must target a file that demonstrably exists: otherwise an `ENOENT`
+/// from a missing fixture can masquerade as successful confinement.
+fn retained_outside_canary(
+    harness: &common::TestHarness,
+    name: &str,
+    contents: &str,
+) -> (tempfile::TempDir, PathBuf) {
+    let process_cwd = std::env::current_dir().expect("resolve test process cwd");
+    let outside_dir = tempfile::Builder::new()
+        .prefix(".pi-fs-escape-canary-")
+        .tempdir_in(process_cwd)
+        .expect("create retained outside-root canary directory");
+    let canary_path = outside_dir.path().join(name);
+    std::fs::write(&canary_path, contents).expect("write outside-root canary");
+    assert!(
+        !canary_path.starts_with(harness.temp_dir()),
+        "outside-root canary unexpectedly landed in the runtime workspace: {}",
+        canary_path.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&canary_path).expect("read outside-root canary"),
+        contents
+    );
+    (outside_dir, canary_path)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// VFS normalizePath: path traversal via ..
+// VFS path normalization through the supported node:fs surface
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn vfs_normalize_resolves_dot_dot() {
-    // Verify that normalizePath collapses .. segments
     let result = eval_fs(
         r"(() => {
-        const vfs = globalThis.__pi_vfs_state;
-        return vfs.normalizePath('/home/user/../etc/passwd');
+        fs.mkdirSync('/tmp/pi-normalize-one/etc', { recursive: true });
+        fs.writeFileSync('/tmp/pi-normalize-one/etc/passwd', 'normalized');
+        const content = fs.readFileSync('/tmp/pi-normalize-one/user/../etc/passwd', 'utf8');
+        return path.normalize('/home/user/../etc/passwd') + ':' + content;
     })()",
     );
-    // After normalization, .. should be collapsed
-    assert_eq!(result, "/home/etc/passwd");
+    assert_eq!(result, "/home/etc/passwd:normalized");
 }
 
 #[test]
 fn vfs_normalize_multiple_dot_dots() {
     let result = eval_fs(
         r"(() => {
-        const vfs = globalThis.__pi_vfs_state;
-        return vfs.normalizePath('/a/b/c/../../../etc/passwd');
+        fs.mkdirSync('/tmp/pi-normalize-many/etc', { recursive: true });
+        fs.writeFileSync('/tmp/pi-normalize-many/etc/passwd', 'normalized');
+        const content = fs.readFileSync('/tmp/pi-normalize-many/a/b/c/../../../etc/passwd', 'utf8');
+        return path.normalize('/a/b/c/../../../etc/passwd') + ':' + content;
     })()",
     );
-    assert_eq!(result, "/etc/passwd");
+    assert_eq!(result, "/etc/passwd:normalized");
 }
 
 #[test]
 fn vfs_normalize_dot_dot_at_root_stays_at_root() {
     let result = eval_fs(
         r"(() => {
-        const vfs = globalThis.__pi_vfs_state;
-        return vfs.normalizePath('/../../../etc/passwd');
+        fs.mkdirSync('/tmp/pi-normalize-root', { recursive: true });
+        fs.writeFileSync('/tmp/pi-normalize-root/value.txt', 'root-bounded');
+        const content = fs.readFileSync('/../../../tmp/pi-normalize-root/value.txt', 'utf8');
+        return path.normalize('/../../../etc/passwd') + ':' + content;
     })()",
     );
-    // Should not go above root
-    assert_eq!(result, "/etc/passwd");
+    assert_eq!(result, "/etc/passwd:root-bounded");
 }
 
 #[test]
 fn vfs_normalize_absolute_path_preserved() {
     let result = eval_fs(
         r"(() => {
-        const vfs = globalThis.__pi_vfs_state;
-        return vfs.normalizePath('/etc/shadow');
+        fs.mkdirSync('/tmp/pi-normalize-absolute', { recursive: true });
+        fs.writeFileSync('/tmp/pi-normalize-absolute/value.txt', 'absolute');
+        const content = fs.readFileSync('/tmp/pi-normalize-absolute/value.txt', 'utf8');
+        return path.normalize('/etc/shadow') + ':' + content;
     })()",
     );
-    assert_eq!(result, "/etc/shadow");
+    assert_eq!(result, "/etc/shadow:absolute");
 }
 
 #[test]
 fn vfs_normalize_dot_segments_removed() {
     let result = eval_fs(
         r"(() => {
-        const vfs = globalThis.__pi_vfs_state;
-        return vfs.normalizePath('/home/./user/./file');
+        fs.mkdirSync('/tmp/pi-normalize-dot/user', { recursive: true });
+        fs.writeFileSync('/tmp/pi-normalize-dot/user/file', 'dot-segments');
+        const content = fs.readFileSync('/tmp/pi-normalize-dot/./user/./file', 'utf8');
+        return path.normalize('/home/./user/./file') + ':' + content;
     })()",
     );
-    assert_eq!(result, "/home/user/file");
+    assert_eq!(result, "/home/user/file:dot-segments");
 }
 
 #[test]
 fn vfs_normalize_empty_segments_collapsed() {
     let result = eval_fs(
         r"(() => {
-        const vfs = globalThis.__pi_vfs_state;
-        return vfs.normalizePath('/home//user///file');
+        fs.mkdirSync('/tmp/pi-normalize-empty/user', { recursive: true });
+        fs.writeFileSync('/tmp/pi-normalize-empty/user/file', 'empty-segments');
+        const content = fs.readFileSync('/tmp//pi-normalize-empty///user//file', 'utf8');
+        return path.normalize('/home//user///file') + ':' + content;
     })()",
     );
-    assert_eq!(result, "/home/user/file");
+    assert_eq!(result, "/home/user/file:empty-segments");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -187,68 +221,88 @@ fn vfs_normalize_empty_segments_collapsed() {
 
 #[test]
 fn vfs_write_does_not_create_real_file() {
-    let result = eval_fs(
+    let harness = common::TestHarness::new("fs_escape_relative_tmp");
+    let host_canary =
+        harness.create_file("tmp/vfs_escape_test_canary.txt", b"HOST_CANARY_UNCHANGED");
+    let result = eval_fs_in_harness(
+        &harness,
         r"(() => {
-        // Write to VFS
         fs.writeFileSync('tmp/vfs_escape_test_canary.txt', 'escape attempt');
-        // Verify it exists in VFS
-        const exists_vfs = fs.existsSync('tmp/vfs_escape_test_canary.txt');
-        return String(exists_vfs);
+        return fs.readFileSync('tmp/vfs_escape_test_canary.txt', 'utf8');
     })()",
     );
-    assert_eq!(result, "true");
+    assert_eq!(result, "escape attempt");
 
-    // Verify no real file was created
-    assert!(
-        !std::path::Path::new("/tmp/vfs_escape_test_canary.txt").exists(),
-        "VFS write should NOT create a real file on disk"
+    assert_eq!(
+        std::fs::read_to_string(&host_canary).expect("read retained relative-path canary"),
+        "HOST_CANARY_UNCHANGED",
+        "a relative `tmp/...` VFS write must not mutate the corresponding host path"
     );
 }
 
 #[test]
 fn vfs_write_with_traversal_is_denied() {
-    let result = eval_fs(
-        r"(() => {
-        try {
-            // Attempt path traversal write
-            fs.writeFileSync('../../../../../../../../tmp/vfs_traversal_canary.txt', 'escape');
-            return 'wrote';
-        } catch (e) {
-            return 'ERROR:' + e.message;
-        }
-    })()",
+    let harness = common::TestHarness::new("fs_escape_traversal_write");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "traversal-write.txt", "HOST_CANARY_UNCHANGED");
+    let canary_js = js_path(&canary);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r"(() => {{
+        const canary = {canary_js};
+        const attackPath = path.dirname(canary) + path.sep + 'missing' + path.sep + '..' + path.sep + path.basename(canary);
+        try {{
+            fs.writeFileSync(attackPath, 'MUTATED');
+            return 'UNEXPECTED_WRITE';
+        }} catch (e) {{
+            return 'DENIED:' + e.message;
+        }}
+    }})()"
+        ),
     );
     assert!(
-        result.contains("host write denied"),
-        "expected traversal write denial, got: {result}"
+        result.starts_with("DENIED:") && result.contains("host write denied"),
+        "expected an exact traversal write denial, got: {result}"
     );
-
-    // Verify no real file was created
-    assert!(
-        !std::path::Path::new("/tmp/vfs_traversal_canary.txt").exists(),
-        "VFS traversal write should NOT create a real file"
+    assert_eq!(
+        std::fs::read_to_string(&canary).expect("read traversal write canary"),
+        "HOST_CANARY_UNCHANGED",
+        "a denied traversal write must not mutate its existing host target"
     );
 }
 
 #[test]
 fn vfs_mkdir_absolute_tmp_is_scoped_virtual() {
-    let unique_dir = format!("/tmp/pi_scoped_{}_dir", std::process::id());
-    let result = eval_fs(&format!(
-        r"(() => {{
+    let harness = common::TestHarness::new("fs_escape_scoped_absolute_tmp");
+    let retained_host_dir = tempfile::Builder::new()
+        .prefix("pi-scoped-host-canary-")
+        .tempdir()
+        .expect("create retained system-temp canary directory");
+    let host_result = retained_host_dir.path().join("result.txt");
+    std::fs::write(&host_result, "HOST_CANARY_UNCHANGED").expect("seed system-temp canary");
+    let unique_dir = js_path(retained_host_dir.path());
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r"(() => {{
+        const tempRoot = {unique_dir};
         try {{
-            fs.mkdirSync('{unique_dir}', {{ recursive: true }});
-            fs.writeFileSync('{unique_dir}/result.txt', 'scoped');
-            return fs.readFileSync('{unique_dir}/result.txt', 'utf8') + ':' + fs.existsSync('{unique_dir}');
+            fs.mkdirSync(tempRoot, {{ recursive: true }});
+            fs.writeFileSync(tempRoot + path.sep + 'result.txt', 'scoped');
+            return fs.readFileSync(tempRoot + path.sep + 'result.txt', 'utf8') + ':' + fs.existsSync(tempRoot);
         }} catch (e) {{
             return 'ERROR:' + e.message;
         }}
     }})()"
-    ));
+        ),
+    );
     assert_eq!(result, "scoped:true");
 
-    assert!(
-        !std::path::Path::new(&unique_dir).exists(),
-        "absolute /tmp writes must stay in the extension VFS namespace"
+    assert_eq!(
+        std::fs::read_to_string(&host_result).expect("read system-temp canary"),
+        "HOST_CANARY_UNCHANGED",
+        "absolute temporary-directory writes must stay in the extension VFS namespace"
     );
 }
 
@@ -271,28 +325,34 @@ fn scoped_tmp_namespace_rejects_direct_peer_namespace() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// Host read fallback: __pi_host_read_file_sync behavior
+// Host-backed read fallback behavior
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn host_read_fallback_denies_outside_workspace() {
-    let result = eval_fs(
-        r"(() => {
-        try {
-            // Use /etc/hosts (exists on all POSIX; /etc/hostname is Linux-only)
-            const content = fs.readFileSync('/etc/hosts', 'utf8');
-            return content.length > 0 ? 'read_ok' : 'empty';
-        } catch (e) {
-            return 'ERROR:' + e.message;
-        }
-    })()",
+    let harness = common::TestHarness::new("fs_escape_outside_read");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "outside-read.txt", "KNOWN_OUTSIDE_SECRET");
+    let canary_js = js_path(&canary);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r"(() => {{
+        try {{
+            return 'LEAKED:' + fs.readFileSync({canary_js}, 'utf8');
+        }} catch (e) {{
+            return 'DENIED:' + e.message;
+        }}
+    }})()"
+        ),
     );
     assert!(
-        result.contains("ERROR:")
-            && (result.contains("outside extension root")
-                || result.contains("ENOENT")
-                || result.contains("os error")),
-        "expected host read deny error, got: {result}"
+        result.starts_with("DENIED:") && result.contains("host read denied"),
+        "an existing outside-root canary must be rejected by policy, got: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&canary).expect("read retained outside-read canary"),
+        "KNOWN_OUTSIDE_SECRET"
     );
 }
 
@@ -340,23 +400,31 @@ fn vfs_write_then_read_roundtrips_without_host_fs() {
 
 #[test]
 fn read_file_traversal_with_dot_dot() {
-    let result = eval_fs(
-        r"(() => {
-        try {
-            // Attempt to read /etc/hosts via path traversal (/etc/hosts exists on all POSIX)
-            const content = fs.readFileSync('/fake/../etc/hosts', 'utf8');
-            return 'read:' + content.trim().length;
-        } catch (e) {
-            return 'ERROR:' + e.message;
-        }
-    })()",
+    let harness = common::TestHarness::new("fs_escape_traversal_read");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "traversal-read.txt", "KNOWN_OUTSIDE_SECRET");
+    let canary_js = js_path(&canary);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r"(() => {{
+        const canary = {canary_js};
+        const attackPath = path.dirname(canary) + path.sep + 'missing' + path.sep + '..' + path.sep + path.basename(canary);
+        try {{
+            return 'LEAKED:' + fs.readFileSync(attackPath, 'utf8');
+        }} catch (e) {{
+            return 'DENIED:' + e.message;
+        }}
+    }})()"
+        ),
     );
     assert!(
-        result.contains("ERROR:")
-            && (result.contains("outside extension root")
-                || result.contains("ENOENT")
-                || result.contains("os error")),
-        "expected traversal read denial, got: {result}"
+        result.starts_with("DENIED:") && result.contains("host read denied"),
+        "an existing traversal target must be rejected by policy, got: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&canary).expect("read retained traversal-read canary"),
+        "KNOWN_OUTSIDE_SECRET"
     );
 }
 
@@ -366,31 +434,38 @@ fn read_file_traversal_with_dot_dot() {
 
 #[test]
 fn exists_sync_absolute_sensitive_path() {
-    let result = eval_fs(
-        r"(() => {
-        // /etc/passwd always exists on Linux
-        return String(fs.existsSync('/etc/passwd'));
-    })()",
+    let harness = common::TestHarness::new("fs_escape_exists_absolute");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "exists-absolute.txt", "KNOWN_TO_EXIST");
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!("(() => String(fs.existsSync({})))()", js_path(&canary)),
     );
-    // Documents current behavior: existsSync with host fallback
-    // may reveal existence of sensitive files
-    assert!(
-        result == "true" || result == "false",
-        "expected boolean string, got: {result}"
+    assert_eq!(
+        result, "false",
+        "existsSync must not disclose an existing outside-root path"
     );
 }
 
 #[test]
 fn exists_sync_traversal_probe() {
-    let result = eval_fs(
-        r"(() => {
-        return String(fs.existsSync('/nonexistent/../etc/passwd'));
-    })()",
+    let harness = common::TestHarness::new("fs_escape_exists_traversal");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "exists-traversal.txt", "KNOWN_TO_EXIST");
+    let canary_js = js_path(&canary);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r"(() => {{
+        const canary = {canary_js};
+        const attackPath = path.dirname(canary) + path.sep + 'missing' + path.sep + '..' + path.sep + path.basename(canary);
+        return String(fs.existsSync(attackPath));
+    }})()"
+        ),
     );
-    // After normalization: /etc/passwd
-    assert!(
-        result == "true" || result == "false",
-        "expected boolean string, got: {result}"
+    assert_eq!(
+        result, "false",
+        "existsSync must not disclose an existing outside-root traversal target"
     );
 }
 
@@ -400,55 +475,62 @@ fn exists_sync_traversal_probe() {
 
 #[test]
 fn write_file_absolute_path_outside_workspace_is_denied() {
-    let unique_name = format!("/etc/vfs_escape_abs_{}", std::process::id());
-    let result = eval_fs(&format!(
-        r#"(() => {{
+    let harness = common::TestHarness::new("fs_escape_absolute_write");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "absolute-write.txt", "HOST_CANARY_UNCHANGED");
+    let canary_js = js_path(&canary);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r#"(() => {{
         try {{
-            fs.writeFileSync("{unique_name}", "escape attempt");
-            return "wrote";
+            fs.writeFileSync({canary_js}, "MUTATED");
+            return "UNEXPECTED_WRITE";
         }} catch (e) {{
-            return "ERROR:" + e.message;
+            return "DENIED:" + e.message;
         }}
     }})()"#,
-    ));
-    assert!(
-        result.contains("host write denied"),
-        "expected absolute write denial, got: {result}"
+        ),
     );
-
-    // Critical: file must NOT exist on real FS
     assert!(
-        !std::path::Path::new(&unique_name).exists(),
-        "writeFileSync to absolute path must NOT create real file: {unique_name}"
+        result.starts_with("DENIED:") && result.contains("host write denied"),
+        "expected absolute outside-root write denial, got: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&canary).expect("read absolute-write canary"),
+        "HOST_CANARY_UNCHANGED",
+        "a denied absolute write must not mutate its existing host target"
     );
 }
 
 #[test]
 fn unlink_sync_cannot_delete_real_file() {
-    // Create a real temp file
-    let temp = tempfile::NamedTempFile::new().expect("create temp file");
-    let real_path = temp.path().to_str().expect("temp path").to_string();
-
-    let result = eval_fs(&format!(
-        r#"(() => {{
+    let harness = common::TestHarness::new("fs_escape_unlink");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "unlink.txt", "HOST_CANARY_UNCHANGED");
+    let canary_js = js_path(&canary);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r#"(() => {{
         try {{
-            fs.unlinkSync("{real_path}");
-            return "unlinked";
+            fs.unlinkSync({canary_js});
+            return "UNEXPECTED_UNLINK";
         }} catch (e) {{
-            return "ERROR:" + e.message;
+            return "DENIED:" + e.message;
         }}
     }})()"#,
-    ));
-
-    // The VFS unlink should only affect VFS state, not real files
-    assert!(
-        temp.path().exists(),
-        "VFS unlinkSync must NOT delete real files: {real_path}"
+        ),
     );
-    // Result may be "unlinked" (VFS silently accepts) or ERROR (ENOENT from VFS)
+
     assert!(
-        result == "unlinked" || result.contains("ERROR:"),
-        "unexpected unlink result: {result}"
+        result.starts_with("DENIED:") && result.contains("host write denied"),
+        "expected outside-root unlink denial, got: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&canary).expect("read retained unlink canary"),
+        "HOST_CANARY_UNCHANGED",
+        "a denied unlink must retain the existing host file and contents"
     );
 }
 
@@ -506,19 +588,29 @@ fn path_normalize_removes_traversal() {
 
 #[test]
 fn null_byte_in_path_handled() {
-    let result = eval_fs(
-        r"(() => {
-        try {
-            return fs.readFileSync('/etc/passwd\x00.txt', 'utf8');
-        } catch (e) {
-            return 'ERROR:' + e.message;
-        }
-    })()",
+    let harness = common::TestHarness::new("fs_escape_null_byte");
+    let (_outside_dir, canary) =
+        retained_outside_canary(&harness, "null-byte.txt", "KNOWN_OUTSIDE_SECRET");
+    let canary_js = js_path(&canary);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r"(() => {{
+        try {{
+            return 'LEAKED:' + fs.readFileSync({canary_js} + '\x00.txt', 'utf8');
+        }} catch (e) {{
+            return 'DENIED:' + e.message;
+        }}
+    }})()"
+        ),
     );
-    // Null byte should cause an error, not bypass security
     assert!(
-        result.contains("ERROR:"),
-        "null byte in path should cause error, got: {result}"
+        result.starts_with("DENIED:"),
+        "a null byte must not expose the retained outside-root canary, got: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&canary).expect("read null-byte canary"),
+        "KNOWN_OUTSIDE_SECRET"
     );
 }
 
@@ -526,13 +618,12 @@ fn null_byte_in_path_handled() {
 fn backslash_path_normalized() {
     let result = eval_fs(
         r"(() => {
-        const vfs = globalThis.__pi_vfs_state;
-        // Backslashes should be normalized to forward slashes
-        return vfs.normalizePath('\\etc\\passwd');
+        fs.mkdirSync('/tmp/pi-backslash-path', { recursive: true });
+        fs.writeFileSync('/tmp/pi-backslash-path/value.txt', 'backslash');
+        return fs.readFileSync('\\tmp\\pi-backslash-path\\value.txt', 'utf8');
     })()",
     );
-    // On non-Windows, backslashes become forward slashes
-    assert_eq!(result, "/etc/passwd");
+    assert_eq!(result, "backslash");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -635,19 +726,47 @@ fn readdir_sync_root_only_shows_vfs_dirs() {
 
 #[test]
 fn copy_file_sync_stays_in_vfs() {
-    let unique_dest = format!("vfs_copy_escape_{}", std::process::id());
-    let result = eval_fs(&format!(
-        r#"(() => {{
-        fs.writeFileSync("src.txt", "original");
-        fs.copyFileSync("src.txt", "{unique_dest}");
-        return fs.readFileSync("{unique_dest}", "utf8");
-    }})()"#,
-    ));
-    assert_eq!(result, "original");
-
+    let harness = common::TestHarness::new("fs_escape_copy");
+    let host_source = harness.create_file("copy/src.txt", b"HOST_SOURCE_UNCHANGED");
+    let host_dest = harness.create_file("copy/dest.txt", b"HOST_DEST_UNCHANGED");
+    let (_outside_dir, outside_dest) =
+        retained_outside_canary(&harness, "copy-outside.txt", "OUTSIDE_DEST_UNCHANGED");
+    let outside_dest_js = js_path(&outside_dest);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r#"(() => {{
+        fs.writeFileSync("copy/src.txt", "VFS_SOURCE");
+        fs.copyFileSync("copy/src.txt", "copy/dest.txt");
+        let outsideDisposition = "UNEXPECTED_COPY";
+        try {{
+            fs.copyFileSync("copy/src.txt", {outside_dest_js});
+        }} catch (e) {{
+            outsideDisposition = "DENIED:" + e.message;
+        }}
+        return fs.readFileSync("copy/dest.txt", "utf8") + ":" + outsideDisposition;
+    }})()"#
+        ),
+    );
     assert!(
-        !std::path::Path::new(&unique_dest).exists(),
-        "copyFileSync should NOT create real files"
+        result.starts_with("VFS_SOURCE:DENIED:") && result.contains("host write denied"),
+        "copyFileSync must preserve its VFS copy and deny an outside-root destination: {result}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&host_source).expect("read retained copy source"),
+        "HOST_SOURCE_UNCHANGED",
+        "copyFileSync must not mutate the corresponding host source"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&host_dest).expect("read retained copy destination"),
+        "HOST_DEST_UNCHANGED",
+        "copyFileSync must not mutate the corresponding host destination"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside_dest).expect("read retained outside copy destination"),
+        "OUTSIDE_DEST_UNCHANGED",
+        "a denied copyFileSync must not mutate its existing outside-root destination"
     );
 }
 
@@ -657,19 +776,48 @@ fn copy_file_sync_stays_in_vfs() {
 
 #[test]
 fn rename_sync_stays_in_vfs() {
-    let unique_dest = format!("vfs_rename_escape_{}", std::process::id());
-    let result = eval_fs(&format!(
-        r#"(() => {{
-        fs.writeFileSync("rename_src.txt", "data");
-        fs.renameSync("rename_src.txt", "{unique_dest}");
-        return fs.readFileSync("{unique_dest}", "utf8");
-    }})()"#,
-    ));
-    assert_eq!(result, "data");
-
+    let harness = common::TestHarness::new("fs_escape_rename");
+    let host_source = harness.create_file("rename/src.txt", b"HOST_SOURCE_UNCHANGED");
+    let host_dest = harness.create_file("rename/dest.txt", b"HOST_DEST_UNCHANGED");
+    let (_outside_dir, outside_dest) =
+        retained_outside_canary(&harness, "rename-outside.txt", "OUTSIDE_DEST_UNCHANGED");
+    let outside_dest_js = js_path(&outside_dest);
+    let result = eval_fs_in_harness(
+        &harness,
+        &format!(
+            r#"(() => {{
+        fs.writeFileSync("rename/src.txt", "VFS_SOURCE");
+        fs.renameSync("rename/src.txt", "rename/dest.txt");
+        fs.writeFileSync("rename/escape-src.txt", "ESCAPE_SOURCE");
+        let outsideDisposition = "UNEXPECTED_RENAME";
+        try {{
+            fs.renameSync("rename/escape-src.txt", {outside_dest_js});
+        }} catch (e) {{
+            outsideDisposition = "DENIED:" + e.message;
+        }}
+        return fs.readFileSync("rename/dest.txt", "utf8") + ":" + outsideDisposition;
+    }})()"#
+        ),
+    );
     assert!(
-        !std::path::Path::new(&unique_dest).exists(),
-        "renameSync should NOT create real files"
+        result.starts_with("VFS_SOURCE:DENIED:") && result.contains("host write denied"),
+        "renameSync must preserve its VFS rename and deny an outside-root destination: {result}"
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(&host_source).expect("read retained rename source"),
+        "HOST_SOURCE_UNCHANGED",
+        "renameSync must not remove or mutate the corresponding host source"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&host_dest).expect("read retained rename destination"),
+        "HOST_DEST_UNCHANGED",
+        "renameSync must not mutate the corresponding host destination"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&outside_dest).expect("read retained outside rename destination"),
+        "OUTSIDE_DEST_UNCHANGED",
+        "a denied renameSync must not mutate its existing outside-root destination"
     );
 }
 
