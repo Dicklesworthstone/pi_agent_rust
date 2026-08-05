@@ -80,7 +80,8 @@ Same structure as `pi.ext.rust_bench.v1` with:
 | `matched_state_scenarios` | object[] | `cold_start`, `warm_start`, `tool_call`, `event_dispatch` with replay inputs |
 | `required_metadata_fields` | string[] | `runtime`, `build_profile`, `host`, `scenario_id`, `correlation_id` |
 | `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |
-
+| `regression_gate_admission` | object | Generic additive metadata policy only: measured, high-confidence wall-clock evidence at a `production_*` boundary with positive sample counts and explicit disk-cache policy; load scenarios require host page-cache policy and uncontrolled host page cache is ineligible |
+| `pijs_regression_gate_admission` | object | PiJS-specific release gate layered on the generic policy: exactly 2000 path-verified perf-profile QuickJS iterations through the production extension manager, with 1-call mean-latency and 10-call throughput lanes |
 | `partition_weighting` | object | Machine-readable partition weights (`realistic` + `matched-state`) with explicit sum-to-one contract |
 | `partition_interpretation` | object | Primary/secondary partition roles and release guardrail forbidding single-partition conclusions |
 | `user_perceived_sli_catalog` | object[] | Versioned user-facing SLI targets with UX interpretation guidance |

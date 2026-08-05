@@ -3,6 +3,8 @@
 //! These helpers keep profile and allocator reporting consistent across
 //! benchmark binaries, regression tests, and shell harnesses.
 
+use sha2::{Digest as _, Sha256};
+use std::io::Read as _;
 use std::path::Path;
 
 /// Environment variable that overrides benchmark build-profile metadata.
@@ -13,6 +15,52 @@ pub const BENCH_ALLOCATOR_ENV: &str = "PI_BENCH_ALLOCATOR";
 
 /// Release binary-size budget (MB) shared by perf regression and budget gates.
 pub const BINARY_SIZE_RELEASE_BUDGET_MB: f64 = 22.0;
+
+/// Cargo profile family embedded by `build.rs` (`PROFILE`; custom release-derived
+/// profiles are reported by Cargo as `release`).
+pub const COMPILED_PROFILE_FAMILY: &str = env!("PI_BUILD_PROFILE_FAMILY");
+
+/// Cargo optimization level embedded by `build.rs` (`OPT_LEVEL`).
+pub const COMPILED_OPT_LEVEL: &str = env!("PI_BUILD_OPT_LEVEL");
+
+/// Cargo debug-info switch embedded by `build.rs` (`DEBUG`).
+pub const COMPILED_DEBUG: &str = env!("PI_BUILD_DEBUG");
+
+/// Sorted, comma-separated package feature set embedded by `build.rs`.
+pub const COMPILED_FEATURES_CSV: &str = env!("PI_BUILD_FEATURES");
+
+/// Exact package feature set for the canonical shipping/system PiJS perf lane.
+pub const CANONICAL_PIJS_PERF_FEATURES: &[&str] =
+    &[
+        "clipboard",
+        "image",
+        "image-resize",
+        "sqlite-sessions",
+        "wasm-host",
+    ];
+
+/// Versioned name for the authoritative Cargo build fingerprint contract.
+pub const BUILD_FINGERPRINT_CONTRACT: &str = "cargo_build_fingerprint.v1";
+
+/// Inputs covered by the benchmark provenance configuration hash.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchmarkProvenance<'a> {
+    pub source_commit: &'a str,
+    pub source_dirty: bool,
+    pub build_profile: &'a str,
+    pub executable_build_profile: &'a str,
+    pub executable_profile_verified: bool,
+    pub build_fingerprint_verified: bool,
+    pub build_profile_verified: bool,
+    pub build_fingerprint_contract: &'a str,
+    pub compiled_profile_family: &'a str,
+    pub compiled_opt_level: &'a str,
+    pub compiled_debug: &'a str,
+    pub compiled_features: &'a [&'a str],
+    pub binary_path: &'a str,
+    pub binary_sha256: &'a str,
+    pub debug_assertions: bool,
+}
 
 /// Effective allocator compiled into the current binary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,32 +211,115 @@ pub fn detect_build_profile_from(
     }
 }
 
-/// Attempts to derive Cargo profile from a binary path under `target/`.
+/// Returns the sorted package features compiled into this binary.
+#[must_use]
+pub fn compiled_feature_set() -> Vec<&'static str> {
+    if COMPILED_FEATURES_CSV.is_empty() {
+        Vec::new()
+    } else {
+        COMPILED_FEATURES_CSV.split(',').collect()
+    }
+}
+
+/// Returns whether Cargo's authoritative build settings match the custom
+/// `perf` profile fingerprint. The profile's directory name is deliberately
+/// not trusted because Cargo reports release-inheriting custom profiles through
+/// `PROFILE=release`.
+#[must_use]
+pub fn has_canonical_perf_build_fingerprint() -> bool {
+    matches_canonical_perf_build_fingerprint(
+        COMPILED_PROFILE_FAMILY,
+        COMPILED_OPT_LEVEL,
+        COMPILED_DEBUG,
+    )
+}
+
+/// Checks an injected Cargo build fingerprint against the canonical `perf`
+/// settings. This is public so evidence consumers and tests use one contract.
+#[must_use]
+pub fn matches_canonical_perf_build_fingerprint(
+    profile_family: &str,
+    opt_level: &str,
+    debug: &str,
+) -> bool {
+    profile_family == "release" && opt_level == "3" && debug == "true"
+}
+
+/// Returns whether this binary has the exact package features used by the
+/// canonical shipping/system PiJS performance lane.
+#[must_use]
+pub fn has_canonical_pijs_perf_features() -> bool {
+    matches_canonical_pijs_perf_features(&compiled_feature_set())
+}
+
+/// Checks an injected sorted feature set against the canonical shipping/system
+/// PiJS lane. `image-resize` also enables the package's implicit `image`
+/// feature, so both are intentionally present.
+#[must_use]
+pub fn matches_canonical_pijs_perf_features(features: &[&str]) -> bool {
+    features == CANONICAL_PIJS_PERF_FEATURES
+}
+
+/// Computes the lowercase SHA-256 digest of a file without loading it all into
+/// memory.
+pub fn sha256_file(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Hashes the complete asserted build/source/binary provenance as compact
+/// canonical JSON. Both evidence producers and consumers use this helper so a
+/// field omission or serialization-order drift fails closed.
+#[must_use]
+pub fn benchmark_provenance_config_hash(provenance: &BenchmarkProvenance<'_>) -> String {
+    let canonical = serde_json::json!({
+        "binary_path": provenance.binary_path,
+        "binary_sha256": provenance.binary_sha256,
+        "build_fingerprint_contract": provenance.build_fingerprint_contract,
+        "build_fingerprint_verified": provenance.build_fingerprint_verified,
+        "build_profile": provenance.build_profile,
+        "build_profile_verified": provenance.build_profile_verified,
+        "compiled_debug": provenance.compiled_debug,
+        "compiled_features": provenance.compiled_features,
+        "compiled_opt_level": provenance.compiled_opt_level,
+        "compiled_profile_family": provenance.compiled_profile_family,
+        "debug_assertions": provenance.debug_assertions,
+        "executable_build_profile": provenance.executable_build_profile,
+        "executable_profile_verified": provenance.executable_profile_verified,
+        "source_commit": provenance.source_commit,
+        "source_dirty": provenance.source_dirty,
+    });
+    let bytes = serde_json::to_vec(&canonical)
+        .expect("benchmark provenance contains only JSON-serializable primitives");
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Attempts to derive the Cargo profile from an executable artifact layout.
+///
+/// This works with both the default `target/` directory and arbitrary
+/// `CARGO_TARGET_DIR` values. Example/test artifacts live one level below the
+/// profile in `examples/` or `deps/`; ordinary binaries live directly below it.
 #[must_use]
 pub fn profile_from_target_path(path: &Path) -> Option<String> {
-    let components: Vec<String> = path
-        .components()
-        .filter_map(|component| match component {
-            std::path::Component::Normal(part) => Some(part.to_string_lossy().into_owned()),
-            _ => None,
-        })
-        .collect();
-
-    let target_idx = components
-        .iter()
-        .rposition(|component| component == "target")?;
-    let tail = components.get(target_idx + 1..)?;
-    if tail.len() < 2 {
-        return None;
-    }
-
-    let profile_idx = if tail.len() >= 3 && tail[tail.len() - 2] == "deps" {
-        tail.len().checked_sub(3)?
+    let artifact_parent = path.parent()?;
+    let artifact_parent_name = artifact_parent.file_name()?.to_str()?;
+    let profile_dir = if matches!(artifact_parent_name, "deps" | "examples") {
+        artifact_parent.parent()?
     } else {
-        tail.len().checked_sub(2)?
+        artifact_parent
     };
-
-    let candidate = tail.get(profile_idx)?.trim();
+    let candidate = profile_dir.file_name()?.to_str()?.trim();
     if candidate.is_empty() {
         return None;
     }
@@ -199,8 +330,10 @@ pub fn profile_from_target_path(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocatorKind, BENCH_ALLOCATOR_ENV, detect_build_profile_from, profile_from_target_path,
-        resolve_bench_allocator_from,
+        AllocatorKind, BENCH_ALLOCATOR_ENV, detect_build_profile_from,
+        BenchmarkProvenance, benchmark_provenance_config_hash,
+        matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
+        profile_from_target_path, resolve_bench_allocator_from,
     };
     use std::path::Path;
 
@@ -230,9 +363,104 @@ mod tests {
     }
 
     #[test]
-    fn profile_from_target_path_returns_none_outside_target() {
-        let path = Path::new("/tmp/repo/bin/pijs_workload");
+    fn profile_from_target_path_detects_perf_example_binary() {
+        let path = Path::new("/tmp/repo/target/perf/examples/pijs_workload");
+        assert_eq!(profile_from_target_path(path).as_deref(), Some("perf"));
+    }
+
+    #[test]
+    fn profile_from_target_path_detects_cross_target_perf_example_binary() {
+        let path =
+            Path::new("/tmp/repo/target/x86_64-unknown-linux-gnu/perf/examples/pijs_workload");
+        assert_eq!(profile_from_target_path(path).as_deref(), Some("perf"));
+    }
+
+    #[test]
+    fn profile_from_target_path_rejects_moved_example_binary() {
+        let path = Path::new("/tmp/repo/pijs_workload");
         assert_eq!(profile_from_target_path(path), None);
+    }
+
+    #[test]
+    fn profile_from_target_path_uses_direct_artifact_parent_as_profile_hint() {
+        let path = Path::new("/tmp/repo/bin/pijs_workload");
+        assert_eq!(profile_from_target_path(path).as_deref(), Some("bin"));
+    }
+
+    #[test]
+    fn profile_from_target_path_supports_arbitrary_cargo_target_dir() {
+        let path = Path::new("/tmp/pi-build/perf/examples/pijs_workload");
+        assert_eq!(profile_from_target_path(path).as_deref(), Some("perf"));
+    }
+
+    #[test]
+    fn canonical_perf_fingerprint_distinguishes_perf_from_release() {
+        assert!(matches_canonical_perf_build_fingerprint(
+            "release", "3", "true"
+        ));
+        assert!(!matches_canonical_perf_build_fingerprint(
+            "release", "z", "false"
+        ));
+        assert!(!matches_canonical_perf_build_fingerprint(
+            "release", "3", "false"
+        ));
+        assert!(!matches_canonical_perf_build_fingerprint(
+            "perf", "3", "true"
+        ));
+    }
+
+    #[test]
+    fn canonical_pijs_features_include_transitively_enabled_image_feature() {
+        let canonical = [
+            "clipboard",
+            "image",
+            "image-resize",
+            "sqlite-sessions",
+            "wasm-host",
+        ];
+        assert!(matches_canonical_pijs_perf_features(&canonical));
+
+        let missing_implicit_image = [
+            "clipboard",
+            "image-resize",
+            "sqlite-sessions",
+            "wasm-host",
+        ];
+        assert!(!matches_canonical_pijs_perf_features(
+            &missing_implicit_image
+        ));
+    }
+
+    #[test]
+    fn benchmark_provenance_hash_binds_every_asserted_field() {
+        let features = ["clipboard", "image"];
+        let canonical = BenchmarkProvenance {
+            source_commit: "0123456789abcdef0123456789abcdef01234567",
+            source_dirty: false,
+            build_profile: "perf",
+            executable_build_profile: "perf",
+            executable_profile_verified: true,
+            build_fingerprint_verified: true,
+            build_profile_verified: true,
+            build_fingerprint_contract: "cargo_build_fingerprint.v1",
+            compiled_profile_family: "release",
+            compiled_opt_level: "3",
+            compiled_debug: "true",
+            compiled_features: &features,
+            binary_path: "/tmp/pi-build/perf/examples/pijs_workload",
+            binary_sha256:
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            debug_assertions: false,
+        };
+        let first = benchmark_provenance_config_hash(&canonical);
+        assert_eq!(first, benchmark_provenance_config_hash(&canonical));
+
+        let dirty = BenchmarkProvenance {
+            source_dirty: true,
+            ..canonical
+        };
+        assert_ne!(first, benchmark_provenance_config_hash(&dirty));
+        assert_eq!(first.len(), 64);
     }
 
     #[test]
@@ -356,16 +584,15 @@ mod tests {
             }
 
             #[test]
-            fn profile_from_target_path_requires_target_dir(
+            fn profile_from_target_path_uses_artifact_parent_for_custom_target_dirs(
                 dir in "[a-z]{1,10}",
                 binary in "[a-z_]{1,10}",
             ) {
-                // Paths without "target" component always return None
                 let path_str = format!("/{dir}/{binary}");
                 let path = Path::new(&path_str);
                 assert!(
-                    profile_from_target_path(path).is_none(),
-                    "path without 'target' should return None: {path_str}"
+                    profile_from_target_path(path).as_deref() == Some(dir.as_str()),
+                    "direct artifact should use its parent as profile: {path_str}"
                 );
             }
 

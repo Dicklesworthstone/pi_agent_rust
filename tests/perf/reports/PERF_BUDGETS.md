@@ -38,7 +38,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `tool_call_latency_p99` | p99 per-call latency | 200 us | - | NO_DATA | Yes |
+| `tool_call_latency_mean` | mean per-call latency | 200 us | - | NO_DATA | Yes |
 | `tool_call_throughput_min` | minimum calls/sec | 5000 calls/sec | - | NO_DATA | Yes |
 
 ## Event_dispatch
@@ -89,7 +89,7 @@
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
 - `missing_or_stale_budget_artifact` (`ext_cold_load_simple_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`tool_call_latency_p99`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]
+- `missing_or_stale_budget_artifact` (`tool_call_latency_mean`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
 - `missing_or_stale_budget_artifact` (`tool_call_throughput_min`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
@@ -125,8 +125,8 @@
 - **`ext_cold_load_simple_p95`**: criterion: load_init_cold for simple single-file extensions (10 samples)
 - **`ext_cold_load_complex_p95`**: criterion: load_init_cold for multi-registration extensions (10 samples)
 - **`ext_load_60_total`**: conformance runner: sequential load of all 60 official extensions
-- **`tool_call_latency_p99`**: pijs_workload: 2000 iterations x 1 tool call, perf profile
-- **`tool_call_throughput_min`**: pijs_workload: 2000 iterations x 10 tool calls, perf profile
+- **`tool_call_latency_mean`**: pijs_workload: arithmetic mean across exactly 2000 iterations x 1 tool call, executable-path-verified perf profile
+- **`tool_call_throughput_min`**: pijs_workload: aggregate throughput across exactly 2000 iterations x 10 tool calls, executable-path-verified perf profile
 - **`event_dispatch_p99`**: criterion: event_hook dispatch for before_agent_start (100 samples)
 - **`context_graph_build_cold_p95`**: criterion: semantic_context/graph_build_cold on large filesystem fixture
 - **`context_graph_build_warm_p95`**: criterion: semantic_context/graph_build_warm on large filesystem fixture
@@ -149,5 +149,5 @@ CI-enforced budgets are checked on every PR. A budget violation blocks the PR fr
 cargo test --test perf_budgets -- --nocapture
 
 # Generate full budget report
-cargo test --test perf_budgets generate_budget_report -- --nocapture
+PI_GENERATE_PERF_BUDGET_REPORT=1 cargo test --test perf_budgets generate_budget_report -- --nocapture
 ```

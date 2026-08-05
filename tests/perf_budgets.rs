@@ -12,12 +12,26 @@
     clippy::unreadable_literal
 )]
 
-use pi::perf_build::BINARY_SIZE_RELEASE_BUDGET_MB;
+use pi::perf_build::{
+    BINARY_SIZE_RELEASE_BUDGET_MB, BUILD_FINGERPRINT_CONTRACT, CANONICAL_PIJS_PERF_FEATURES,
+    BenchmarkProvenance, benchmark_provenance_config_hash,
+    matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
+    profile_from_target_path, sha256_file,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::SystemTime;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum BudgetComparison {
+    Maximum,
+    Minimum,
+}
 
 // ─── Budget Definitions ──────────────────────────────────────────────────────
 
@@ -34,6 +48,9 @@ struct Budget {
     unit: &'static str,
     /// Budget threshold (must not exceed this value).
     threshold: f64,
+    /// Whether passing requires the measured value to stay at or below the
+    /// threshold, or at or above it.
+    comparison: BudgetComparison,
     /// Measurement methodology.
     methodology: &'static str,
     /// Whether this budget is enforced in CI.
@@ -91,12 +108,12 @@ const BUDGETS: &[Budget] = &[
     },
     // ── Tool Call ─────────────────────────────────────────────────────────
     Budget {
-        name: "tool_call_latency_p99",
+        name: "tool_call_latency_mean",
         category: "tool_call",
-        metric: "p99 per-call latency",
+        metric: "mean per-call latency",
         unit: "us",
         threshold: 200.0,
-        methodology: "pijs_workload: 2000 iterations x 1 tool call, perf profile",
+        methodology: "pijs_workload: arithmetic mean across exactly 2000 iterations x 1 tool call, executable-path-verified perf profile",
         ci_enforced: true,
     },
     Budget {
@@ -105,7 +122,7 @@ const BUDGETS: &[Budget] = &[
         metric: "minimum calls/sec",
         unit: "calls/sec",
         threshold: 5000.0, // Must exceed 5k calls/sec
-        methodology: "pijs_workload: 2000 iterations x 10 tool calls, perf profile",
+        methodology: "pijs_workload: aggregate throughput across exactly 2000 iterations x 10 tool calls, executable-path-verified perf profile",
         ci_enforced: true,
     },
     // ── Event Dispatch ───────────────────────────────────────────────────
@@ -253,6 +270,7 @@ const CONTEXT_INTELLIGENCE_BUDGET_METRICS: &[(&str, &str)] = &[
 ];
 const CONTEXT_INTELLIGENCE_CACHE_FIELDS: &[&str] =
     &["cold_graph_build", "warm_graph_build", "incremental_update"];
+const PIJS_REGRESSION_GATE_ITERATIONS: u64 = 2_000;
 
 // ─── Data Readers ────────────────────────────────────────────────────────────
 
@@ -408,6 +426,18 @@ fn perf_strict_mode() -> bool {
     std::env::var("PI_PERF_STRICT").is_ok_and(|v| v == "1")
 }
 
+fn budget_report_generation_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
+fn budget_report_generation_requested() -> bool {
+    budget_report_generation_enabled(
+        std::env::var("PI_GENERATE_PERF_BUDGET_REPORT")
+            .ok()
+            .as_deref(),
+    )
+}
+
 fn max_artifact_age_hours() -> f64 {
     std::env::var("PI_PERF_MAX_ARTIFACT_AGE_HOURS")
         .ok()
@@ -429,6 +459,66 @@ fn perf_run_id() -> Option<String> {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
     })
+}
+
+fn clean_source_commit(root: &Path) -> Option<String> {
+    let status = Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !status.status.success() || !status.stdout.is_empty() {
+        return None;
+    }
+    let revision = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !revision.status.success() {
+        return None;
+    }
+    let commit = String::from_utf8(revision.stdout).ok()?;
+    let commit = commit.trim();
+    (commit.len() == 40 && commit.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| commit.to_ascii_lowercase())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn claim_readiness_blockers(
+    strict_mode: bool,
+    source_commit: Option<&str>,
+    run_id: Option<&str>,
+    correlation_id: Option<&str>,
+    ci_enforced: usize,
+    ci_with_data: usize,
+    ci_fail: usize,
+    ci_no_data: usize,
+    data_contract_failures: usize,
+) -> Vec<&'static str> {
+    let mut blockers = BTreeSet::new();
+    if !strict_mode {
+        blockers.insert("strict_mode_disabled");
+    }
+    if source_commit.is_none() {
+        blockers.insert("source_commit_unbound");
+    }
+    if run_id.is_none() {
+        blockers.insert("run_id_missing");
+    }
+    if correlation_id.is_none() || run_id != correlation_id {
+        blockers.insert("correlation_id_missing");
+    }
+    if ci_with_data != ci_enforced || ci_no_data != 0 {
+        blockers.insert("ci_budget_data_missing");
+    }
+    if ci_fail != 0 {
+        blockers.insert("ci_budget_failed");
+    }
+    if data_contract_failures != 0 {
+        blockers.insert("data_contract_failure");
+    }
+    blockers.into_iter().collect()
 }
 
 fn classify_budget_status(budget: &Budget, actual: Option<f64>, strict: bool) -> &'static str {
@@ -506,7 +596,9 @@ fn evaluate_artifact_contract(paths: &[PathBuf], max_age_hours: f64) -> Option<S
 
 fn budget_artifact_candidates(root: &Path, budget_name: &str) -> Vec<PathBuf> {
     match budget_name {
-        "tool_call_latency_p99" | "tool_call_throughput_min" => pijs_workload_candidate_paths(root),
+        "tool_call_latency_mean" | "tool_call_throughput_min" => {
+            pijs_workload_candidate_paths(root)
+        }
         "ext_cold_load_simple_p95" => criterion_estimate_candidate_paths(
             root,
             "criterion/ext_load_init/load_init_cold/hello/new/estimates.json",
@@ -1422,6 +1514,14 @@ fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
     let mut failures = Vec::new();
 
     for budget in BUDGETS.iter().filter(|budget| budget.ci_enforced) {
+        if matches!(
+            budget.name,
+            "tool_call_latency_mean" | "tool_call_throughput_min"
+        ) {
+            // PiJS selects one canonical artifact by precedence. Its dedicated
+            // contract below binds freshness and parsing to that exact source.
+            continue;
+        }
         let candidates = budget_artifact_candidates(root, budget.name);
         if candidates.is_empty() {
             continue;
@@ -1446,6 +1546,7 @@ fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
         root,
         max_age_hours,
     ));
+    failures.extend(evaluate_pijs_workload_gate_contract(root, max_age_hours));
     failures
 }
 
@@ -1455,7 +1556,7 @@ fn check_budget(budget: &Budget) -> BudgetResult {
 
     // Try to find actual measurement for this budget
     let (actual, source) = match budget.name {
-        "tool_call_latency_p99" => read_pijs_workload_latency(&root),
+        "tool_call_latency_mean" => read_pijs_workload_mean_latency(&root),
         "tool_call_throughput_min" => read_pijs_workload_throughput(&root),
         "ext_cold_load_simple_p95" => read_criterion_load_time(&root, "hello"),
         "ext_cold_load_complex_p95" => read_criterion_load_time(&root, "pirate"),
@@ -1519,44 +1620,594 @@ fn check_budget(budget: &Budget) -> BudgetResult {
     }
 }
 
-fn read_pijs_workload_latency(root: &Path) -> (Option<f64>, String) {
-    let (events, source) = read_pijs_workload_events(root);
-    for event in &events {
-        if event
-            .get("tool_calls_per_iteration")
-            .and_then(Value::as_u64)
-            == Some(1)
-            && let Some(us) = event.get("per_call_us").and_then(Value::as_f64)
-        {
-            return (Some(us), source);
+fn require_pijs_string(record: &Value, field: &str, expected: &str) -> Result<(), String> {
+    let observed = record.get(field).and_then(Value::as_str);
+    if observed == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{field} must equal {expected:?} (observed={observed:?})"
+        ))
+    }
+}
+
+fn require_pijs_perf_binary_path(record: &Value) -> Result<(), String> {
+    let binary_path = record
+        .get("binary_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "binary_path must be a non-empty string".to_string())?;
+    let path = Path::new(binary_path);
+    if !path.is_absolute() {
+        return Err("binary_path must be absolute".to_string());
+    }
+    if path.file_stem().and_then(|name| name.to_str()) != Some("pijs_workload") {
+        return Err(format!(
+            "binary_path must identify the pijs_workload executable (observed={binary_path:?})"
+        ));
+    }
+    let derived_profile = profile_from_target_path(path);
+    if derived_profile.as_deref() != Some("perf") {
+        return Err(format!(
+            "binary_path must resolve to Cargo profile \"perf\" (observed={binary_path:?}, derived_profile={derived_profile:?})"
+        ));
+    }
+    require_pijs_string(record, "executable_build_profile", "perf")?;
+    let canonical_path = std::fs::canonicalize(path)
+        .map_err(|err| format!("binary_path must resolve to an existing executable: {err}"))?;
+    if canonical_path != path {
+        return Err(format!(
+            "binary_path must be canonical (observed={binary_path:?}, canonical={:?})",
+            canonical_path.display().to_string()
+        ));
+    }
+    let claimed_sha256 = record
+        .get("binary_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "binary_sha256 must be a 64-character hexadecimal string".to_string())?;
+    let observed_sha256 = sha256_file(path)
+        .map_err(|err| format!("failed to hash binary_path {binary_path:?}: {err}"))?;
+    if claimed_sha256 != observed_sha256 {
+        return Err(format!(
+            "binary_sha256 does not match binary_path (claimed={claimed_sha256}, observed={observed_sha256})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result<(), String> {
+    for (field, expected) in [
+        ("schema", "pi.perf.workload.v1"),
+        ("tool", "pijs_workload"),
+        ("scenario", "tool_call_roundtrip"),
+        ("runtime_engine", "quickjs"),
+        ("build_profile", "perf"),
+        ("build_fingerprint_contract", BUILD_FINGERPRINT_CONTRACT),
+        ("compiled_profile_family", "release"),
+        ("compiled_opt_level", "3"),
+        ("compiled_debug", "true"),
+        ("evidence_class", "measured"),
+        ("confidence", "high"),
+        ("measurement_method", "wall_clock_observation"),
+        ("measurement_boundary", "production_extension_manager"),
+        (
+            "measurement_contract_version",
+            "production_extension_manager.v1",
+        ),
+        ("disk_cache_policy", "disabled"),
+        ("host_page_cache_policy", "not_applicable_measured_region"),
+        ("allocator_requested", "system"),
+        ("allocator_request_source", "env"),
+        ("allocator_effective", "system"),
+    ] {
+        require_pijs_string(record, field, expected)?;
+    }
+
+    if record
+        .get("eligible_for_regression_gate")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("eligible_for_regression_gate must equal true".to_string());
+    }
+    if record
+        .get("build_profile_verified")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("build_profile_verified must equal true".to_string());
+    }
+    for field in ["build_fingerprint_verified", "executable_profile_verified"] {
+        if record.get(field).and_then(Value::as_bool) != Some(true) {
+            return Err(format!("{field} must equal true"));
         }
     }
-    (None, "no pijs_workload data".to_string())
+    if record.get("debug_assertions").and_then(Value::as_bool) != Some(false) {
+        return Err("debug_assertions must equal false".to_string());
+    }
+    require_pijs_perf_binary_path(record)?;
+
+    if !matches_canonical_perf_build_fingerprint(
+        record
+            .get("compiled_profile_family")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        record
+            .get("compiled_opt_level")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        record
+            .get("compiled_debug")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+    ) {
+        return Err("compiled Cargo settings do not match the canonical perf fingerprint".to_string());
+    }
+    let compiled_features = record
+        .get("compiled_features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "compiled_features must be an array".to_string())?
+        .iter()
+        .map(|feature| {
+            feature
+                .as_str()
+                .ok_or_else(|| "compiled_features entries must be strings".to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !matches_canonical_pijs_perf_features(&compiled_features) {
+        return Err(format!(
+            "compiled_features must equal canonical shipping feature set {CANONICAL_PIJS_PERF_FEATURES:?} (observed={compiled_features:?})"
+        ));
+    }
+    if record.get("allocator_fallback_reason").is_some_and(|value| !value.is_null()) {
+        return Err("allocator_fallback_reason must be null for the canonical system lane".to_string());
+    }
+    if record.get("source_dirty").and_then(Value::as_bool) != Some(false) {
+        return Err("source_dirty must equal false".to_string());
+    }
+    let source_commit = record
+        .get("source_commit")
+        .and_then(Value::as_str)
+        .filter(|value| value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| "source_commit must be a full 40-character Git SHA".to_string())?;
+    if source_commit.bytes().all(|byte| byte == b'0') {
+        return Err("source_commit must not be the all-zero Git SHA".to_string());
+    }
+    let run_id = record
+        .get("run_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "run_id must be a non-empty string".to_string())?;
+    let correlation_id = record
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "correlation_id must be a non-empty string".to_string())?;
+    if run_id != correlation_id {
+        return Err("run_id and correlation_id must be identical".to_string());
+    }
+    let binary_path = record["binary_path"]
+        .as_str()
+        .expect("validated binary_path");
+    let binary_sha256 = record["binary_sha256"]
+        .as_str()
+        .expect("validated binary_sha256");
+    let expected_config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+        source_commit,
+        source_dirty: false,
+        build_profile: "perf",
+        executable_build_profile: "perf",
+        executable_profile_verified: true,
+        build_fingerprint_verified: true,
+        build_profile_verified: true,
+        build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
+        compiled_profile_family: "release",
+        compiled_opt_level: "3",
+        compiled_debug: "true",
+        compiled_features: &compiled_features,
+        binary_path,
+        binary_sha256,
+        debug_assertions: false,
+    });
+    let claimed_config_hash = record
+        .get("config_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "config_hash must be a string".to_string())?;
+    if claimed_config_hash != expected_config_hash {
+        return Err(format!(
+            "config_hash does not match asserted provenance (claimed={claimed_config_hash}, expected={expected_config_hash})"
+        ));
+    }
+
+    let iterations = record
+        .get("iterations")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "iterations must be an integer".to_string())?;
+    if iterations != PIJS_REGRESSION_GATE_ITERATIONS {
+        return Err(format!(
+            "iterations must equal {PIJS_REGRESSION_GATE_ITERATIONS} (observed={iterations})"
+        ));
+    }
+    let tool_calls = record
+        .get("tool_calls_per_iteration")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "tool_calls_per_iteration must be a positive integer".to_string())?;
+    if tool_calls != expected_tool_calls {
+        return Err(format!(
+            "tool_calls_per_iteration must equal {expected_tool_calls} (observed={tool_calls})"
+        ));
+    }
+    let total_calls = record
+        .get("total_calls")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "total_calls must be a positive integer".to_string())?;
+    let expected_total = iterations
+        .checked_mul(tool_calls)
+        .ok_or_else(|| "iterations * tool_calls_per_iteration overflows u64".to_string())?;
+    if total_calls != expected_total {
+        return Err(format!(
+            "total_calls must equal iterations * tool_calls_per_iteration ({expected_total}); observed={total_calls}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_positive_pijs_float(record: &Value, field: &str) -> Result<f64, String> {
+    record
+        .get(field)
+        .and_then(Value::as_f64)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| format!("{field} must contain a finite positive metric"))
+}
+
+fn pijs_float_matches(claimed: f64, derived: f64) -> bool {
+    let serialization_tolerance = derived.abs().max(1.0) * f64::EPSILON * 16.0;
+    (claimed - derived).abs() <= serialization_tolerance
+}
+
+fn derive_and_validate_pijs_metrics(record: &Value) -> Result<(f64, f64), String> {
+    let total_calls = record
+        .get("total_calls")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "total_calls must be a positive integer".to_string())?;
+    let elapsed_us = record
+        .get("elapsed_us")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "elapsed_us must be a positive integer".to_string())?;
+    let elapsed_us_f64 = require_positive_pijs_float(record, "elapsed_us_f64")?;
+    if elapsed_us_f64.floor() != elapsed_us as f64 {
+        return Err(format!(
+            "elapsed_us must equal floor(elapsed_us_f64) (elapsed_us={elapsed_us}, elapsed_us_f64={elapsed_us_f64})"
+        ));
+    }
+
+    let total_calls_f64 = total_calls as f64;
+    let derived_mean_latency = elapsed_us_f64 / total_calls_f64;
+    let claimed_mean_latency = require_positive_pijs_float(record, "per_call_us_f64")?;
+    if !pijs_float_matches(claimed_mean_latency, derived_mean_latency) {
+        return Err(format!(
+            "per_call_us_f64 is inconsistent with elapsed_us_f64 / total_calls (claimed={claimed_mean_latency}, derived={derived_mean_latency})"
+        ));
+    }
+
+    let claimed_integer_latency = record
+        .get("per_call_us")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "per_call_us must be an integer".to_string())?;
+    let expected_integer_latency = elapsed_us / total_calls;
+    if claimed_integer_latency != expected_integer_latency {
+        return Err(format!(
+            "per_call_us must equal elapsed_us / total_calls with integer truncation ({expected_integer_latency}); observed={claimed_integer_latency}"
+        ));
+    }
+
+    let claimed_throughput = record
+        .get("calls_per_sec")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "calls_per_sec must be a positive integer".to_string())?;
+    let expected_throughput = u128::from(total_calls)
+        .checked_mul(1_000_000)
+        .ok_or_else(|| "total_calls * 1_000_000 overflows u128".to_string())?
+        / u128::from(elapsed_us);
+    if u128::from(claimed_throughput) != expected_throughput {
+        return Err(format!(
+            "calls_per_sec must equal total_calls * 1_000_000 / elapsed_us with integer truncation ({expected_throughput}); observed={claimed_throughput}"
+        ));
+    }
+
+    let derived_throughput = total_calls_f64 * 1_000_000.0 / elapsed_us_f64;
+    Ok((derived_mean_latency, derived_throughput))
+}
+
+fn validate_pijs_timestamp(
+    record: &Value,
+    max_age_hours: f64,
+) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let raw = record
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "timestamp must be a non-empty RFC3339 string".to_string())?;
+    let timestamp = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|err| format!("timestamp must be valid RFC3339: {err}"))?
+        .with_timezone(&chrono::Utc);
+    let age = chrono::Utc::now().signed_duration_since(timestamp);
+    if age < chrono::TimeDelta::minutes(-5) {
+        return Err("timestamp is more than five minutes in the future".to_string());
+    }
+    let max_age_ms = max_age_hours * 60.0 * 60.0 * 1_000.0;
+    if age.num_milliseconds() as f64 > max_age_ms {
+        return Err(format!(
+            "timestamp is stale ({:.2}h old; maximum {max_age_hours:.2}h)",
+            age.num_milliseconds() as f64 / 3_600_000.0
+        ));
+    }
+    Ok(timestamp)
+}
+
+#[derive(Debug, Clone)]
+struct ValidatedPijsGatePair {
+    mean_latency_us: f64,
+    throughput_calls_per_sec: f64,
+}
+
+fn validate_pijs_gate_pair(
+    events: &[Value],
+    max_age_hours: f64,
+) -> Result<ValidatedPijsGatePair, String> {
+    let mut admitted = Vec::new();
+    for event in events.iter().filter(|event| {
+        event
+            .get("eligible_for_regression_gate")
+            .and_then(Value::as_bool)
+            == Some(true)
+    }) {
+        let tool_calls = event
+            .get("tool_calls_per_iteration")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                "eligible PiJS record tool_calls_per_iteration must be an integer".to_string()
+            })?;
+        if !matches!(tool_calls, 1 | 10) {
+            return Err(format!(
+                "eligible PiJS record uses unsupported tool_calls_per_iteration={tool_calls}"
+            ));
+        }
+        validate_pijs_gate_record(event, tool_calls)?;
+        let metrics = derive_and_validate_pijs_metrics(event)?;
+        let timestamp = validate_pijs_timestamp(event, max_age_hours)?;
+        admitted.push((tool_calls, event, metrics, timestamp));
+    }
+
+    if admitted.len() != 2 {
+        return Err(format!(
+            "PiJS regression gate requires exactly two eligible records (one 1-call lane and one 10-call lane); observed {}",
+            admitted.len()
+        ));
+    }
+    admitted.sort_by_key(|(tool_calls, ..)| *tool_calls);
+    if admitted[0].0 != 1 || admitted[1].0 != 10 {
+        return Err("PiJS regression gate requires exactly one 1-call lane and one 10-call lane"
+            .to_string());
+    }
+
+    let latency_record = admitted[0].1;
+    let throughput_record = admitted[1].1;
+    for field in [
+        "run_id",
+        "correlation_id",
+        "source_commit",
+        "binary_path",
+        "binary_sha256",
+        "build_fingerprint_contract",
+        "config_hash",
+        "compiled_profile_family",
+        "compiled_opt_level",
+        "compiled_debug",
+        "allocator_requested",
+        "allocator_effective",
+    ] {
+        if latency_record.get(field) != throughput_record.get(field) {
+            return Err(format!(
+                "PiJS 1-call and 10-call lanes must share {field}"
+            ));
+        }
+    }
+    if latency_record.get("compiled_features") != throughput_record.get("compiled_features") {
+        return Err("PiJS 1-call and 10-call lanes must share compiled_features".to_string());
+    }
+    let timestamp_span = admitted[1]
+        .3
+        .signed_duration_since(admitted[0].3)
+        .abs();
+    if timestamp_span > chrono::TimeDelta::minutes(15) {
+        return Err("PiJS lane timestamps must be within 15 minutes of one another".to_string());
+    }
+
+    Ok(ValidatedPijsGatePair {
+        mean_latency_us: admitted[0].2.0,
+        throughput_calls_per_sec: admitted[1].2.1,
+    })
+}
+
+fn read_pijs_gate_pair(root: &Path, max_age_hours: f64) -> (Option<ValidatedPijsGatePair>, String) {
+    let (events, source) = match load_pijs_workload_artifact(root) {
+        PijsWorkloadArtifact::Missing => {
+            return (None, "no pijs_workload data".to_string());
+        }
+        PijsWorkloadArtifact::Invalid { source, detail, .. } => {
+            return (
+                None,
+                format!("invalid pijs_workload artifact {source}: {detail}"),
+            );
+        }
+        PijsWorkloadArtifact::Loaded {
+            path,
+            source,
+            events,
+        } => {
+            if let Err(detail) =
+                validate_selected_pijs_freshness(&path, &source, max_age_hours)
+            {
+                return (None, detail);
+            }
+            (events, source)
+        }
+    };
+    match validate_pijs_gate_pair(&events, max_age_hours) {
+        Ok(pair) => (Some(pair), source),
+        Err(detail) => (None, format!("no admissible pijs_workload pair in {source}: {detail}")),
+    }
+}
+
+fn read_pijs_workload_mean_latency(root: &Path) -> (Option<f64>, String) {
+    let (pair, source) = read_pijs_gate_pair(root, max_artifact_age_hours());
+    (pair.map(|pair| pair.mean_latency_us), source)
 }
 
 fn read_pijs_workload_throughput(root: &Path) -> (Option<f64>, String) {
-    let (events, source) = read_pijs_workload_events(root);
-    for event in &events {
-        if event
-            .get("tool_calls_per_iteration")
-            .and_then(Value::as_u64)
-            == Some(10)
-            && let Some(cps) = event.get("calls_per_sec").and_then(Value::as_f64)
-        {
-            return (Some(cps), source);
-        }
-    }
-    (None, "no pijs_workload data".to_string())
+    let (pair, source) = read_pijs_gate_pair(root, max_artifact_age_hours());
+    (pair.map(|pair| pair.throughput_calls_per_sec), source)
 }
 
-fn read_pijs_workload_events(root: &Path) -> (Vec<Value>, String) {
-    for path in pijs_workload_candidate_paths(root) {
-        let events = read_jsonl_file(&path);
-        if !events.is_empty() {
-            return (events, display_source_path(root, &path));
+fn evaluate_pijs_workload_gate_contract(
+    root: &Path,
+    max_age_hours: f64,
+) -> Vec<DataContractFailure> {
+    let (contract_id, detail, remediation) = match load_pijs_workload_artifact(root) {
+        PijsWorkloadArtifact::Missing => (
+            "missing_or_stale_budget_artifact",
+            format!(
+                "missing artifacts; expected one of [{}]",
+                format_path_list(&pijs_workload_candidate_paths(root))
+            ),
+            "Generate the canonical PiJS workload artifact in the current perf run.".to_string(),
+        ),
+        PijsWorkloadArtifact::Invalid { source, detail } => (
+            "invalid_pijs_workload_artifact",
+            format!("invalid selected artifact {source}: {detail}"),
+            "Regenerate the selected PiJS JSONL artifact; every nonblank line must be valid JSON."
+                .to_string(),
+        ),
+        PijsWorkloadArtifact::Loaded {
+            path,
+            source,
+            events,
+        } => {
+            if let Err(detail) = validate_selected_pijs_freshness(&path, &source, max_age_hours) {
+                (
+                    "missing_or_stale_budget_artifact",
+                    detail,
+                    "Regenerate the selected PiJS workload artifact in the current perf run."
+                        .to_string(),
+                )
+            } else if let Err(detail) = validate_pijs_gate_pair(&events, max_age_hours) {
+                (
+                    "ineligible_pijs_workload_artifact",
+                    format!("no admissible PiJS pair in {source}: {detail}"),
+                    format!(
+                        "Generate one same-run pair of exactly {PIJS_REGRESSION_GATE_ITERATIONS}-iteration canonical perf-profile QuickJS measurements through the production extension manager."
+                    ),
+                )
+            } else {
+                return Vec::new();
+            }
         }
+    };
+
+    ["tool_call_latency_mean", "tool_call_throughput_min"]
+        .into_iter()
+        .map(|budget_name| DataContractFailure {
+            contract_id: contract_id.to_string(),
+            budget_name: Some(budget_name.to_string()),
+            detail: detail.clone(),
+            remediation: remediation.clone(),
+        })
+        .collect()
+}
+
+#[derive(Debug)]
+enum PijsWorkloadArtifact {
+    Missing,
+    Invalid {
+        source: String,
+        detail: String,
+    },
+    Loaded {
+        path: PathBuf,
+        source: String,
+        events: Vec<Value>,
+    },
+}
+
+fn load_pijs_workload_artifact(root: &Path) -> PijsWorkloadArtifact {
+    for path in pijs_workload_candidate_paths(root) {
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                let source = display_source_path(root, &path);
+                return PijsWorkloadArtifact::Invalid {
+                    source,
+                    detail: format!("could not read selected artifact: {err}"),
+                };
+            }
+        };
+        let source = display_source_path(root, &path);
+        let mut events = Vec::new();
+        for (line_index, line) in content.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str(line) {
+                Ok(event) => events.push(event),
+                Err(err) => {
+                    return PijsWorkloadArtifact::Invalid {
+                        source,
+                        detail: format!("line {} is not valid JSON: {err}", line_index + 1),
+                    };
+                }
+            }
+        }
+        if events.is_empty() {
+            return PijsWorkloadArtifact::Invalid {
+                source,
+                detail: "artifact contains no nonblank JSON records".to_string(),
+            };
+        }
+        return PijsWorkloadArtifact::Loaded {
+            path,
+            source,
+            events,
+        };
     }
-    (Vec::new(), "no pijs_workload data".to_string())
+    PijsWorkloadArtifact::Missing
+}
+
+fn validate_selected_pijs_freshness(
+    path: &Path,
+    source: &str,
+    max_age_hours: f64,
+) -> Result<(), String> {
+    match artifact_age_hours(path) {
+        Some(age_hours) if age_hours <= max_age_hours => Ok(()),
+        Some(age_hours) => Err(format!(
+            "selected artifact {source} is stale ({age_hours:.2}h old; maximum {max_age_hours:.2}h)"
+        )),
+        None => Err(format!(
+            "selected artifact {source} has unavailable or invalid modification time"
+        )),
+    }
 }
 
 fn pijs_workload_candidate_paths(root: &Path) -> Vec<PathBuf> {
@@ -2108,11 +2759,11 @@ fn ci_enforced_budgets_fail_on_regression_or_missing_data() {
 }
 
 #[test]
-fn check_tool_call_budget() {
+fn check_tool_call_mean_latency_budget() {
     let budget = BUDGETS
         .iter()
-        .find(|b| b.name == "tool_call_latency_p99")
-        .expect("tool_call_latency_p99 budget should exist");
+        .find(|b| b.name == "tool_call_latency_mean")
+        .expect("tool_call_latency_mean budget should exist");
 
     let result = check_budget(budget);
     eprintln!(
@@ -2128,7 +2779,7 @@ fn check_tool_call_budget() {
     if let Some(actual) = result.actual {
         assert!(
             actual <= budget.threshold,
-            "tool call latency {actual}us exceeds budget {}us",
+            "mean tool call latency {actual}us exceeds budget {}us",
             budget.threshold
         );
     }
@@ -2164,11 +2815,16 @@ fn check_tool_call_throughput_budget() {
 #[test]
 fn pijs_workload_profile_field_is_present_when_data_exists() {
     let root = project_root();
-    let (events, source) = read_pijs_workload_events(&root);
-    if events.is_empty() {
-        eprintln!("[budget] No pijs_workload data — skipping profile field check");
-        return;
-    }
+    let (events, source) = match load_pijs_workload_artifact(&root) {
+        PijsWorkloadArtifact::Missing => {
+            eprintln!("[budget] No pijs_workload data — skipping profile field check");
+            return;
+        }
+        PijsWorkloadArtifact::Invalid { source, detail } => {
+            panic!("invalid pijs_workload artifact {source}: {detail}");
+        }
+        PijsWorkloadArtifact::Loaded { events, source, .. } => (events, source),
+    };
 
     for event in &events {
         let profile = event
@@ -2179,7 +2835,166 @@ fn pijs_workload_profile_field_is_present_when_data_exists() {
             !profile.trim().is_empty(),
             "pijs_workload event missing non-empty build_profile in {source}: {event}"
         );
+        assert!(
+            event
+                .get("build_profile_verified")
+                .and_then(Value::as_bool)
+                .is_some(),
+            "pijs_workload event missing boolean build_profile_verified in {source}: {event}"
+        );
     }
+}
+
+fn valid_pijs_gate_record(root: &Path, tool_calls_per_iteration: u64) -> Value {
+    let iterations = PIJS_REGRESSION_GATE_ITERATIONS;
+    let total_calls = iterations * tool_calls_per_iteration;
+    let elapsed_us_f64 = total_calls as f64 * 49.5;
+    let elapsed_us = elapsed_us_f64 as u64;
+    let binary_path = root.join("target/perf/examples/pijs_workload");
+    std::fs::create_dir_all(binary_path.parent().expect("PiJS binary parent"))
+        .expect("create PiJS binary parent");
+    if !binary_path.exists() {
+        std::fs::write(&binary_path, b"canonical-pijs-test-binary")
+            .expect("write PiJS test binary");
+    }
+    let binary_path = std::fs::canonicalize(binary_path).expect("canonicalize PiJS test binary");
+    let binary_sha256 = sha256_file(&binary_path).expect("hash PiJS test binary");
+    let binary_path = binary_path.display().to_string();
+    let source_commit = "0123456789abcdef0123456789abcdef01234567";
+    let config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+        source_commit,
+        source_dirty: false,
+        build_profile: "perf",
+        executable_build_profile: "perf",
+        executable_profile_verified: true,
+        build_fingerprint_verified: true,
+        build_profile_verified: true,
+        build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
+        compiled_profile_family: "release",
+        compiled_opt_level: "3",
+        compiled_debug: "true",
+        compiled_features: CANONICAL_PIJS_PERF_FEATURES,
+        binary_path: &binary_path,
+        binary_sha256: &binary_sha256,
+        debug_assertions: false,
+    });
+    json!({
+        "schema": "pi.perf.workload.v1",
+        "timestamp": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "run_id": "pijs-test-run",
+        "correlation_id": "pijs-test-run",
+        "source_commit": source_commit,
+        "source_dirty": false,
+        "tool": "pijs_workload",
+        "scenario": "tool_call_roundtrip",
+        "iterations": iterations,
+        "tool_calls_per_iteration": tool_calls_per_iteration,
+        "total_calls": total_calls,
+        "elapsed_ms": elapsed_us / 1_000,
+        "elapsed_us": elapsed_us,
+        "elapsed_us_f64": elapsed_us_f64,
+        "per_call_us": elapsed_us / total_calls,
+        "per_call_us_f64": 49.5,
+        "calls_per_sec": total_calls * 1_000_000 / elapsed_us,
+        "build_profile": "perf",
+        "build_profile_verified": true,
+        "build_fingerprint_contract": BUILD_FINGERPRINT_CONTRACT,
+        "build_fingerprint_verified": true,
+        "compiled_profile_family": "release",
+        "compiled_opt_level": "3",
+        "compiled_debug": "true",
+        "compiled_features": CANONICAL_PIJS_PERF_FEATURES,
+        "executable_build_profile": "perf",
+        "executable_profile_verified": true,
+        "debug_assertions": false,
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "config_hash": config_hash,
+        "runtime_engine": "quickjs",
+        "evidence_class": "measured",
+        "confidence": "high",
+        "eligible_for_regression_gate": true,
+        "measurement_method": "wall_clock_observation",
+        "measurement_boundary": "production_extension_manager",
+        "measurement_contract_version": "production_extension_manager.v1",
+        "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "not_applicable_measured_region",
+        "allocator_requested": "system",
+        "allocator_request_source": "env",
+        "allocator_effective": "system",
+        "allocator_fallback_reason": null
+    })
+}
+
+fn write_pijs_workload_records(path: &Path, records: &[Value]) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create pijs workload artifact directory");
+    }
+    let payload = records
+        .iter()
+        .map(Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(path, format!("{payload}\n")).expect("write pijs workload artifact");
+}
+
+fn retarget_pijs_record(record: &mut Value, binary_path: &Path, contents: &[u8]) {
+    std::fs::create_dir_all(binary_path.parent().expect("PiJS binary parent"))
+        .expect("create PiJS binary parent");
+    std::fs::write(binary_path, contents).expect("write retargeted PiJS binary");
+    let binary_path = std::fs::canonicalize(binary_path).expect("canonicalize PiJS binary");
+    record["binary_path"] = json!(binary_path.display().to_string());
+    record["executable_build_profile"] = json!(
+        profile_from_target_path(&binary_path).expect("derive retargeted binary profile")
+    );
+    record["binary_sha256"] =
+        json!(sha256_file(&binary_path).expect("hash retargeted PiJS binary"));
+    refresh_pijs_test_config_hash(record);
+}
+
+fn refresh_pijs_test_config_hash(record: &mut Value) {
+    let features = record["compiled_features"]
+        .as_array()
+        .expect("compiled features")
+        .iter()
+        .map(|value| value.as_str().expect("compiled feature string"))
+        .collect::<Vec<_>>();
+    let hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+        source_commit: record["source_commit"].as_str().expect("source commit"),
+        source_dirty: record["source_dirty"].as_bool().expect("source dirty"),
+        build_profile: record["build_profile"].as_str().expect("build profile"),
+        executable_build_profile: record["executable_build_profile"]
+            .as_str()
+            .expect("executable build profile"),
+        executable_profile_verified: record["executable_profile_verified"]
+            .as_bool()
+            .expect("executable profile verified"),
+        build_fingerprint_verified: record["build_fingerprint_verified"]
+            .as_bool()
+            .expect("build fingerprint verified"),
+        build_profile_verified: record["build_profile_verified"]
+            .as_bool()
+            .expect("build profile verified"),
+        build_fingerprint_contract: record["build_fingerprint_contract"]
+            .as_str()
+            .expect("build fingerprint contract"),
+        compiled_profile_family: record["compiled_profile_family"]
+            .as_str()
+            .expect("compiled profile family"),
+        compiled_opt_level: record["compiled_opt_level"]
+            .as_str()
+            .expect("compiled opt level"),
+        compiled_debug: record["compiled_debug"]
+            .as_str()
+            .expect("compiled debug"),
+        compiled_features: &features,
+        binary_path: record["binary_path"].as_str().expect("binary path"),
+        binary_sha256: record["binary_sha256"].as_str().expect("binary sha256"),
+        debug_assertions: record["debug_assertions"]
+            .as_bool()
+            .expect("debug assertions"),
+    });
+    record["config_hash"] = json!(hash);
 }
 
 #[test]
@@ -2188,27 +3003,437 @@ fn pijs_workload_reader_prefers_profile_labeled_artifact_path() {
     let profile_dir = tmp.path().join("target/perf/perf");
     std::fs::create_dir_all(&profile_dir).expect("create profile perf dir");
     let path = profile_dir.join("pijs_workload_perf.jsonl");
-    let payload = json!({
-        "schema": "pi.perf.workload.v1",
-        "tool": "pijs_workload",
-        "scenario": "tool_call_roundtrip",
-        "iterations": 200,
-        "tool_calls_per_iteration": 1,
-        "total_calls": 200,
-        "elapsed_ms": 10,
-        "per_call_us": 50.0,
-        "calls_per_sec": 20000.0,
-        "build_profile": "perf"
-    });
-    std::fs::write(
+    write_pijs_workload_records(
         &path,
-        format!("{}\n", serde_json::to_string(&payload).unwrap_or_default()),
-    )
-    .expect("write pijs workload profile artifact");
+        &[
+            valid_pijs_gate_record(tmp.path(), 1),
+            valid_pijs_gate_record(tmp.path(), 10),
+        ],
+    );
 
-    let (latency, source) = read_pijs_workload_latency(tmp.path());
-    assert_eq!(latency, Some(50.0));
+    let (latency, source) = read_pijs_workload_mean_latency(tmp.path());
+    assert_eq!(latency, Some(49.5));
     assert_eq!(source, "target/perf/perf/pijs_workload_perf.jsonl");
+}
+
+#[test]
+fn pijs_gate_reader_accepts_perf_quickjs_production_record() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    write_pijs_workload_records(
+        &path,
+        &[
+            valid_pijs_gate_record(tmp.path(), 1),
+            valid_pijs_gate_record(tmp.path(), 10),
+        ],
+    );
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, Some(49.5));
+    let throughput = read_pijs_workload_throughput(tmp.path())
+        .0
+        .expect("canonical throughput");
+    assert!((throughput - (1_000_000.0 / 49.5)).abs() < 1e-9);
+    assert!(
+        evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS).is_empty()
+    );
+}
+
+#[test]
+fn pijs_gate_reader_accepts_custom_cargo_target_dir_layout() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let artifact = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let binary = tmp.path().join("pi-build/perf/examples/pijs_workload");
+    let mut latency = valid_pijs_gate_record(tmp.path(), 1);
+    let mut throughput = valid_pijs_gate_record(tmp.path(), 10);
+    retarget_pijs_record(&mut latency, &binary, b"custom-target-pijs-binary");
+    retarget_pijs_record(&mut throughput, &binary, b"custom-target-pijs-binary");
+    write_pijs_workload_records(&artifact, &[latency, throughput]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, Some(49.5));
+}
+
+#[test]
+fn pijs_gate_reader_rejects_forged_metrics() {
+    let cases = [
+        (1_u64, "per_call_us_f64", json!(0.01), "per_call_us_f64 is inconsistent"),
+        (
+            10_u64,
+            "calls_per_sec",
+            json!(9_999_999),
+            "calls_per_sec must equal",
+        ),
+    ];
+    for (lane, field, forged_value, expected_error) in cases {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+        let mut latency = valid_pijs_gate_record(tmp.path(), 1);
+        let mut throughput = valid_pijs_gate_record(tmp.path(), 10);
+        if lane == 1 {
+            latency[field] = forged_value;
+        } else {
+            throughput[field] = forged_value;
+        }
+        write_pijs_workload_records(&path, &[latency, throughput]);
+
+        let failures =
+            evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+        assert_eq!(failures.len(), 2);
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.detail.contains(expected_error))
+        );
+    }
+}
+
+#[test]
+fn pijs_gate_reader_rejects_stale_timestamp_even_when_artifact_mtime_is_fresh() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let stale = (chrono::Utc::now() - chrono::TimeDelta::hours(48)).to_rfc3339();
+    let mut latency = valid_pijs_gate_record(tmp.path(), 1);
+    let mut throughput = valid_pijs_gate_record(tmp.path(), 10);
+    latency["timestamp"] = json!(stale);
+    throughput["timestamp"] = latency["timestamp"].clone();
+    write_pijs_workload_records(&path, &[latency, throughput]);
+
+    let failures = evaluate_pijs_workload_gate_contract(tmp.path(), 24.0);
+    assert_eq!(failures.len(), 2);
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.detail.contains("timestamp is stale"))
+    );
+}
+
+#[test]
+fn pijs_gate_reader_rejects_mixed_run_identity_and_duplicate_lanes() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let latency = valid_pijs_gate_record(tmp.path(), 1);
+    let mut throughput = valid_pijs_gate_record(tmp.path(), 10);
+    throughput["run_id"] = json!("other-run");
+    throughput["correlation_id"] = json!("other-run");
+    write_pijs_workload_records(&path, &[latency.clone(), throughput]);
+    assert!(read_pijs_workload_mean_latency(tmp.path()).1.contains("must share run_id"));
+
+    write_pijs_workload_records(
+        &path,
+        &[
+            latency.clone(),
+            latency,
+            valid_pijs_gate_record(tmp.path(), 10),
+        ],
+    );
+    assert!(
+        read_pijs_workload_mean_latency(tmp.path())
+            .1
+            .contains("exactly two eligible records")
+    );
+}
+
+#[test]
+fn pijs_gate_reader_rejects_binary_hash_allocator_and_feature_conflicts() {
+    for (field, value, expected_error) in [
+        (
+            "binary_sha256",
+            json!("0".repeat(64)),
+            "binary_sha256 does not match",
+        ),
+        (
+            "allocator_effective",
+            json!("jemalloc"),
+            "allocator_effective must equal \"system\"",
+        ),
+        (
+            "compiled_features",
+            json!(["sqlite-sessions"]),
+            "compiled_features must equal canonical shipping feature set",
+        ),
+        (
+            "compiled_opt_level",
+            json!("z"),
+            "compiled_opt_level must equal \"3\"",
+        ),
+        (
+            "source_dirty",
+            json!(true),
+            "source_dirty must equal false",
+        ),
+    ] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+        let mut latency = valid_pijs_gate_record(tmp.path(), 1);
+        latency[field] = value;
+        write_pijs_workload_records(
+            &path,
+            &[latency, valid_pijs_gate_record(tmp.path(), 10)],
+        );
+        let failures =
+            evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+        assert!(
+            failures
+                .iter()
+                .all(|failure| failure.detail.contains(expected_error)),
+            "unexpected failures: {failures:?}"
+        );
+    }
+}
+
+#[test]
+fn pijs_gate_reader_rejects_zero_work() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let mut record = valid_pijs_gate_record(tmp.path(), 1);
+    record["iterations"] = json!(0);
+    record["total_calls"] = json!(0);
+    write_pijs_workload_records(&path, &[record]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+    let failures = evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+    assert!(failures.iter().any(|failure| {
+        failure.contract_id == "ineligible_pijs_workload_artifact"
+            && failure.budget_name.as_deref() == Some("tool_call_latency_mean")
+            && failure
+                .detail
+                .contains("iterations must equal 2000 (observed=0)")
+    }));
+}
+
+#[test]
+fn pijs_gate_reader_requires_exact_canonical_iteration_count() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let mut record = valid_pijs_gate_record(tmp.path(), 1);
+    record["iterations"] = json!(PIJS_REGRESSION_GATE_ITERATIONS - 1);
+    record["total_calls"] = json!(PIJS_REGRESSION_GATE_ITERATIONS - 1);
+    write_pijs_workload_records(&path, &[record]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+    let failures = evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+    assert!(failures.iter().any(|failure| {
+        failure.budget_name.as_deref() == Some("tool_call_latency_mean")
+            && failure
+                .detail
+                .contains("iterations must equal 2000 (observed=1999)")
+    }));
+}
+
+#[test]
+fn pijs_gate_reader_rejects_unverified_perf_profile_claim() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let mut record = valid_pijs_gate_record(tmp.path(), 1);
+    record["build_profile_verified"] = json!(false);
+    write_pijs_workload_records(&path, &[record]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+    let failures = evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+    assert!(failures.iter().any(|failure| {
+        failure.budget_name.as_deref() == Some("tool_call_latency_mean")
+            && failure
+                .detail
+                .contains("build_profile_verified must equal true")
+    }));
+}
+
+#[test]
+fn pijs_gate_reader_requires_nonempty_binary_path() {
+    for binary_path in [None, Some("")] {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+        let mut record = valid_pijs_gate_record(tmp.path(), 1);
+        match binary_path {
+            Some(value) => record["binary_path"] = json!(value),
+            None => {
+                record
+                    .as_object_mut()
+                    .expect("PiJS fixture object")
+                    .remove("binary_path");
+            }
+        }
+        write_pijs_workload_records(&path, &[record]);
+
+        assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+        let failures =
+            evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+        assert!(failures.iter().any(|failure| {
+            failure.budget_name.as_deref() == Some("tool_call_latency_mean")
+                && failure
+                    .detail
+                    .contains("binary_path must be a non-empty string")
+        }));
+    }
+}
+
+#[test]
+fn pijs_gate_reader_derives_perf_profile_from_binary_path() {
+    let cases = [
+        (
+            "/tmp/pi_agent_rust/target/release/examples/pijs_workload",
+            "derived_profile=Some(\"release\")",
+        ),
+        (
+            "/tmp/pi_agent_rust/bin/pijs_workload",
+            "derived_profile=Some(\"bin\")",
+        ),
+        (
+            "/tmp/pi_agent_rust/target/perf/examples",
+            "must identify the pijs_workload executable",
+        ),
+    ];
+
+    for (binary_path, expected_error) in cases {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+        let mut record = valid_pijs_gate_record(tmp.path(), 1);
+        record["binary_path"] = json!(binary_path);
+        write_pijs_workload_records(&path, &[record]);
+
+        assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+        let failures =
+            evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+        assert!(failures.iter().any(|failure| {
+            failure.budget_name.as_deref() == Some("tool_call_latency_mean")
+                && failure.detail.contains(expected_error)
+        }));
+    }
+}
+
+#[test]
+fn pijs_gate_reader_requires_precise_mean_latency_metric() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let mut record = valid_pijs_gate_record(tmp.path(), 1);
+    record
+        .as_object_mut()
+        .expect("PiJS fixture object")
+        .remove("per_call_us_f64");
+    write_pijs_workload_records(&path, &[record]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+    let failures = evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+    assert!(failures.iter().any(|failure| {
+        failure.budget_name.as_deref() == Some("tool_call_latency_mean")
+            && failure
+                .detail
+                .contains("per_call_us_f64 must contain a finite positive metric")
+    }));
+}
+
+#[test]
+fn pijs_gate_reader_rejects_debug_preview_native_and_explicitly_ineligible_rows() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let mut debug = valid_pijs_gate_record(tmp.path(), 1);
+    debug["build_profile"] = json!("debug");
+    let mut preview = valid_pijs_gate_record(tmp.path(), 1);
+    preview["runtime_engine"] = json!("native_rust_preview");
+    let mut native = valid_pijs_gate_record(tmp.path(), 1);
+    native["runtime_engine"] = json!("native_rust_runtime");
+    let mut ineligible = valid_pijs_gate_record(tmp.path(), 1);
+    ineligible["eligible_for_regression_gate"] = json!(false);
+    write_pijs_workload_records(&path, &[debug, preview, native, ineligible]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+}
+
+#[test]
+fn pijs_gate_reader_rejects_invalid_eligible_row_even_with_valid_quickjs_row() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let mut preview = valid_pijs_gate_record(tmp.path(), 1);
+    preview["runtime_engine"] = json!("native_rust_preview");
+    preview["per_call_us_f64"] = json!(0.01);
+    let valid = valid_pijs_gate_record(tmp.path(), 1);
+    write_pijs_workload_records(&path, &[preview, valid]);
+
+    assert_eq!(read_pijs_workload_mean_latency(tmp.path()).0, None);
+}
+
+#[test]
+fn pijs_gate_reader_fails_closed_on_invalid_canonical_artifact() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let canonical = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let fallback = tmp
+        .path()
+        .join("target/perf/release/pijs_workload_release.jsonl");
+    let mut invalid = valid_pijs_gate_record(tmp.path(), 1);
+    invalid["confidence"] = json!("medium");
+    write_pijs_workload_records(&canonical, &[invalid]);
+    write_pijs_workload_records(
+        &fallback,
+        &[valid_pijs_gate_record(tmp.path(), 1)],
+    );
+
+    let (latency, source) = read_pijs_workload_mean_latency(tmp.path());
+    assert_eq!(latency, None);
+    assert_eq!(
+        source,
+        "no admissible pijs_workload pair in target/perf/perf/pijs_workload_perf.jsonl: confidence must equal \"high\" (observed=Some(\"medium\"))"
+    );
+}
+
+#[test]
+fn pijs_gate_reader_rejects_mixed_valid_and_corrupt_jsonl() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let latency = valid_pijs_gate_record(tmp.path(), 1);
+    let throughput = valid_pijs_gate_record(tmp.path(), 10);
+    std::fs::create_dir_all(path.parent().expect("artifact parent"))
+        .expect("create artifact directory");
+    std::fs::write(&path, format!("{latency}\n{{not-json\n{throughput}\n"))
+        .expect("write mixed-validity artifact");
+
+    let (actual, source) = read_pijs_workload_mean_latency(tmp.path());
+    assert_eq!(actual, None);
+    assert!(source.contains("line 2 is not valid JSON"), "{source}");
+    let failures = evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().all(|failure| {
+        failure.contract_id == "invalid_pijs_workload_artifact"
+            && failure.detail.contains("line 2 is not valid JSON")
+    }));
+}
+
+#[test]
+fn pijs_gate_freshness_is_bound_to_selected_canonical_artifact() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let canonical = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
+    let fallback = tmp
+        .path()
+        .join("target/perf/release/pijs_workload_release.jsonl");
+    write_pijs_workload_records(
+        &canonical,
+        &[
+            valid_pijs_gate_record(tmp.path(), 1),
+            valid_pijs_gate_record(tmp.path(), 10),
+        ],
+    );
+    write_pijs_workload_records(
+        &fallback,
+        &[
+            valid_pijs_gate_record(tmp.path(), 1),
+            valid_pijs_gate_record(tmp.path(), 10),
+        ],
+    );
+    filetime::set_file_mtime(&canonical, filetime::FileTime::from_unix_time(1, 0))
+        .expect("make canonical artifact stale");
+
+    let (actual, source) = read_pijs_workload_mean_latency(tmp.path());
+    assert_eq!(actual, None);
+    assert!(
+        source.contains("selected artifact target/perf/perf/pijs_workload_perf.jsonl is stale"),
+        "{source}"
+    );
+    let failures = evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
+    assert_eq!(failures.len(), 2);
+    assert!(failures.iter().all(|failure| {
+        failure.contract_id == "missing_or_stale_budget_artifact"
+            && failure
+                .detail
+                .contains("target/perf/perf/pijs_workload_perf.jsonl is stale")
+    }));
 }
 
 #[test]
@@ -2239,8 +3464,53 @@ fn check_extension_load_budget() {
 }
 
 #[test]
+fn budget_report_generation_is_explicitly_opt_in() {
+    assert!(!budget_report_generation_enabled(None));
+    assert!(!budget_report_generation_enabled(Some("")));
+    assert!(!budget_report_generation_enabled(Some("0")));
+    assert!(budget_report_generation_enabled(Some("1")));
+}
+
+#[test]
+fn claim_readiness_requires_complete_strict_same_run_evidence() {
+    assert!(
+        claim_readiness_blockers(
+            true,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            Some("release-run"),
+            Some("release-run"),
+            4,
+            4,
+            0,
+            0,
+            0,
+        )
+        .is_empty()
+    );
+
+    assert_eq!(
+        claim_readiness_blockers(false, None, None, Some("different-run"), 4, 3, 1, 1, 2),
+        vec![
+            "ci_budget_data_missing",
+            "ci_budget_failed",
+            "correlation_id_missing",
+            "data_contract_failure",
+            "run_id_missing",
+            "source_commit_unbound",
+            "strict_mode_disabled",
+        ]
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn generate_budget_report() {
+    if !budget_report_generation_requested() {
+        eprintln!(
+            "[budget] Report generation skipped; set PI_GENERATE_PERF_BUDGET_REPORT=1 to write tracked reports"
+        );
+        return;
+    }
     let root = project_root();
     let results: Vec<BudgetResult> = BUDGETS.iter().map(check_budget).collect();
     let data_contract_failures = collect_data_contract_failures(&root);
@@ -2275,15 +3545,38 @@ fn generate_budget_report() {
         .filter(|result| result.status == "NO_DATA")
         .count();
     let data_contract_failures_count = data_contract_failures.len();
+    let strict_mode = perf_strict_mode();
+    let source_commit = clean_source_commit(&root);
     let run_id = perf_run_id();
     let run_id_json = run_id.as_deref();
     let run_id_label = run_id.as_deref().unwrap_or("not set").to_string();
+    let correlation_id = run_id.as_deref();
+    let readiness_blockers = claim_readiness_blockers(
+        strict_mode,
+        source_commit.as_deref(),
+        run_id_json,
+        correlation_id,
+        ci_enforced_count,
+        ci_with_data_count,
+        ci_fail_count,
+        ci_no_data_count,
+        data_contract_failures_count,
+    );
+    let claims_authorized = readiness_blockers.is_empty();
+    let claim_readiness_status = if claims_authorized {
+        "claim_ready"
+    } else {
+        "blocked"
+    };
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let summary = json!({
-        "schema": "pi.perf.budget_summary.v1",
-        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "schema": "pi.perf.budget_summary.v2",
+        "generated_at": generated_at,
+        "source_commit": source_commit,
         "run_id": run_id_json,
-        "correlation_id": run_id_json,
+        "correlation_id": correlation_id,
+        "strict_mode": strict_mode,
         "total_budgets": BUDGETS.len(),
         "ci_enforced": ci_enforced_count,
         "ci_with_data": ci_with_data_count,
@@ -2308,6 +3601,12 @@ fn generate_budget_report() {
             "ci_enforced": b.ci_enforced,
             "methodology": b.methodology,
         })).collect::<Vec<_>>(),
+        "budget_results": results,
+        "claim_readiness": {
+            "status": claim_readiness_status,
+            "performance_claims_authorized": claims_authorized,
+            "blocking_reason_codes": readiness_blockers,
+        },
     });
 
     let summary_path = reports_dir.join("budget_summary.json");
@@ -2324,9 +3623,16 @@ fn generate_budget_report() {
     let _ = writeln!(
         md,
         "> Generated: {}\n",
-        chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ")
+        generated_at
     );
     let _ = writeln!(md, "> Run ID: {run_id_label}\n");
+    let _ = writeln!(
+        md,
+        "> Source commit: {}\n",
+        source_commit.as_deref().unwrap_or("not bound (dirty tree)")
+    );
+    let _ = writeln!(md, "> Strict mode: {strict_mode}\n");
+    let _ = writeln!(md, "> Claim readiness: {claim_readiness_status}\n");
 
     md.push_str("## Summary\n\n");
     md.push_str("| Metric | Value |\n");
@@ -2343,6 +3649,17 @@ fn generate_budget_report() {
         md,
         "| Failing data contracts | {data_contract_failures_count} |\n"
     );
+
+    md.push_str("## Claim Readiness\n\n");
+    if claims_authorized {
+        md.push_str("Performance claims are authorized by this evidence set.\n\n");
+    } else {
+        md.push_str("Performance claims are blocked. Blocking reason codes:\n\n");
+        for blocker in &readiness_blockers {
+            let _ = writeln!(md, "- `{blocker}`");
+        }
+        md.push('\n');
+    }
 
     // Group by category
     let categories = [
@@ -2431,7 +3748,7 @@ fn generate_budget_report() {
     md.push_str("# Run budget checks\n");
     md.push_str("cargo test --test perf_budgets -- --nocapture\n\n");
     md.push_str("# Generate full budget report\n");
-    md.push_str("cargo test --test perf_budgets generate_budget_report -- --nocapture\n");
+    md.push_str("PI_GENERATE_PERF_BUDGET_REPORT=1 cargo test --test perf_budgets generate_budget_report -- --nocapture\n");
     md.push_str("```\n");
 
     let md_path = reports_dir.join("PERF_BUDGETS.md");
@@ -2471,8 +3788,8 @@ fn format_value(val: f64, unit: &str) -> String {
 fn classify_budget_status_promotes_ci_no_data_to_fail_under_strict() {
     let budget = BUDGETS
         .iter()
-        .find(|budget| budget.name == "tool_call_latency_p99")
-        .expect("tool_call_latency_p99 budget exists");
+        .find(|budget| budget.name == "tool_call_latency_mean")
+        .expect("tool_call_latency_mean budget exists");
     assert_eq!(classify_budget_status(budget, None, false), "NO_DATA");
     assert_eq!(classify_budget_status(budget, None, true), "FAIL");
 }

@@ -22,6 +22,7 @@ use pi::extensions::{
     ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
 };
 use pi::extensions_js::PiJsRuntimeConfig;
+use pi::perf_build;
 use pi::tools::ToolRegistry;
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -30,7 +31,8 @@ use std::collections::{BTreeMap, HashSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sysinfo::System;
 
@@ -48,11 +50,30 @@ const MATRIX_SESSION_SIZES: &[u64] = &[100_000, 200_000, 500_000, 1_000_000, 5_0
 const EVIDENCE_CLASS_MEASURED: &str = "measured";
 const EVIDENCE_CLASS_INFERRED: &str = "inferred";
 const CONFIDENCE_HIGH: &str = "high";
+const CONFIDENCE_MEDIUM: &str = "medium";
 const CONFIDENCE_LOW: &str = "low";
 const MEASUREMENT_BOUNDARY: &str = "production_extension_manager";
 const MEASUREMENT_CONTRACT_VERSION: &str = "production_extension_manager.v1";
 const SYNTHETIC_MEASUREMENT_BOUNDARY: &str = "synthetic_seed_projection";
 const SYNTHETIC_MEASUREMENT_CONTRACT_VERSION: &str = "synthetic_seed_projection.v1";
+const BUILD_PROVENANCE_FIELDS: &[&str] = &[
+    "source_commit",
+    "source_dirty",
+    "build_profile",
+    "executable_build_profile",
+    "executable_profile_verified",
+    "build_fingerprint_verified",
+    "build_profile_verified",
+    "build_fingerprint_contract",
+    "compiled_profile_family",
+    "compiled_opt_level",
+    "compiled_debug",
+    "compiled_features",
+    "binary_path",
+    "binary_sha256",
+    "debug_assertions",
+    "config_hash",
+];
 
 /// Iterations for cold/warm start scenarios.
 const LOAD_RUNS: usize = 5;
@@ -60,12 +81,56 @@ const LOAD_RUNS: usize = 5;
 /// Iterations for tool-call and event-hook scenarios.
 const DISPATCH_ITERATIONS: u32 = 500;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct RegressionEvidence {
+    confidence: &'static str,
+    eligible: bool,
+}
+
+fn classify_regression_evidence(
+    build_profile: &str,
+    build_profile_verified: bool,
+    provenance_identity_verified: bool,
+    debug_assertions: bool,
+    host_page_cache_uncontrolled: bool,
+) -> RegressionEvidence {
+    let eligible = !host_page_cache_uncontrolled
+        && !debug_assertions
+        && build_profile == "perf"
+        && build_profile_verified
+        && provenance_identity_verified;
+    RegressionEvidence {
+        confidence: if eligible {
+            CONFIDENCE_HIGH
+        } else {
+            CONFIDENCE_MEDIUM
+        },
+        eligible,
+    }
+}
+
 // ─── Environment Fingerprint ────────────────────────────────────────────────
 
 fn sha256_hex(input: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(input.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        && !value.bytes().all(|byte| byte == b'0')
+}
+
+fn is_lower_hex_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && !value.bytes().all(|byte| byte == b'0')
 }
 
 fn env_fingerprint() -> Value {
@@ -83,15 +148,44 @@ fn env_fingerprint() -> Value {
     let arch = std::env::consts::ARCH.to_string();
     let git_commit =
         option_env!("VERGEN_GIT_SHA").map_or_else(|| "unknown".to_string(), ToString::to_string);
-    let build_profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-
-    let config_str =
-        format!("{os}|{arch}|{cpu_model}|{cpu_cores}|{mem_total_mb}|{build_profile}|{git_commit}");
-    let config_hash = sha256_hex(&config_str);
+    let source_commit = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
+    let source_dirty = option_env!("VERGEN_GIT_DIRTY") != Some("false");
+    let build_profile = perf_build::detect_build_profile();
+    let current_exe = std::env::current_exe()
+        .ok()
+        .map(|path| fs::canonicalize(&path).unwrap_or(path));
+    let executable_build_profile = current_exe
+        .as_deref()
+        .and_then(perf_build::profile_from_target_path);
+    let executable_profile_verified = executable_build_profile.as_deref() == Some("perf");
+    let build_fingerprint_verified = perf_build::has_canonical_perf_build_fingerprint();
+    let build_profile_verified = executable_profile_verified && build_fingerprint_verified;
+    let binary_path = current_exe
+        .as_ref()
+        .map_or_else(|| "unknown".to_string(), |path| path.display().to_string());
+    let binary_sha256 = current_exe
+        .as_deref()
+        .and_then(|path| perf_build::sha256_file(path).ok())
+        .unwrap_or_else(|| "unknown".to_string());
+    let compiled_features = perf_build::compiled_feature_set();
+    let config_hash =
+        perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {
+            source_commit,
+            source_dirty,
+            build_profile: &build_profile,
+            executable_build_profile: executable_build_profile.as_deref().unwrap_or("unknown"),
+            executable_profile_verified,
+            build_fingerprint_verified,
+            build_profile_verified,
+            build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT,
+            compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY,
+            compiled_opt_level: perf_build::COMPILED_OPT_LEVEL,
+            compiled_debug: perf_build::COMPILED_DEBUG,
+            compiled_features: &compiled_features,
+            binary_path: &binary_path,
+            binary_sha256: &binary_sha256,
+            debug_assertions: cfg!(debug_assertions),
+        });
 
     json!({
         "os": os,
@@ -100,8 +194,22 @@ fn env_fingerprint() -> Value {
         "cpu_cores": cpu_cores,
         "mem_total_mb": mem_total_mb,
         "build_profile": build_profile,
+        "executable_build_profile": executable_build_profile,
+        "executable_profile_verified": executable_profile_verified,
+        "build_fingerprint_verified": build_fingerprint_verified,
+        "build_profile_verified": build_profile_verified,
+        "build_fingerprint_contract": perf_build::BUILD_FINGERPRINT_CONTRACT,
+        "compiled_profile_family": perf_build::COMPILED_PROFILE_FAMILY,
+        "compiled_opt_level": perf_build::COMPILED_OPT_LEVEL,
+        "compiled_debug": perf_build::COMPILED_DEBUG,
+        "compiled_features": compiled_features,
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "debug_assertions": cfg!(debug_assertions),
+        "source_commit": source_commit,
+        "source_dirty": source_dirty,
         "git_commit": git_commit,
-        "features": [],
+        "features": compiled_features,
         "config_hash": config_hash,
     })
 }
@@ -361,6 +469,7 @@ async fn scenario_cold_start(
     spec: &JsExtensionLoadSpec,
     js_cwd: &str,
     runs: usize,
+    evidence: RegressionEvidence,
 ) -> Result<Value> {
     let mut timings = Vec::with_capacity(runs);
     for _ in 0..runs {
@@ -383,9 +492,14 @@ async fn scenario_cold_start(
         "extension": spec.extension_id,
         "runs": runs,
         "stats": stats,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": evidence.confidence,
+        "eligible_for_regression_gate": evidence.eligible,
+        "measurement_method": "wall_clock_observation",
         "measurement_boundary": MEASUREMENT_BOUNDARY,
         "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
         "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "uncontrolled",
     }))
 }
 
@@ -394,6 +508,7 @@ async fn scenario_warm_start(
     spec: &JsExtensionLoadSpec,
     js_cwd: &str,
     runs: usize,
+    evidence: RegressionEvidence,
 ) -> Result<Value> {
     // Create one runtime and load the extension once (warmup).
     let warm_cache_dir = unique_warm_cache_dir(&spec.extension_id);
@@ -428,9 +543,14 @@ async fn scenario_warm_start(
         "extension": spec.extension_id,
         "runs": runs,
         "stats": stats,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": evidence.confidence,
+        "eligible_for_regression_gate": evidence.eligible,
+        "measurement_method": "wall_clock_observation",
         "measurement_boundary": MEASUREMENT_BOUNDARY,
         "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
         "disk_cache_policy": "unique_per_scenario_shared_across_warmup_and_runs",
+        "host_page_cache_policy": "uncontrolled",
         "warm_state": "shared_pi_js_disk_module_cache",
     }))
 }
@@ -440,6 +560,7 @@ async fn scenario_tool_call(
     spec: &JsExtensionLoadSpec,
     js_cwd: &str,
     iterations: u32,
+    evidence: RegressionEvidence,
 ) -> Result<Value> {
     let runtime = new_runtime(js_cwd, None).await?;
     load_extension(&runtime, spec).await?;
@@ -515,11 +636,16 @@ async fn scenario_tool_call(
         "calls_per_sec": calls_per_sec,
         "invoke_kind": invoke_kind,
         "invoke_name": invoke_name,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": evidence.confidence,
+        "eligible_for_regression_gate": evidence.eligible,
+        "measurement_method": "wall_clock_observation",
         "unexpected_hostcalls": null,
         "unexpected_hostcalls_observable": false,
         "measurement_boundary": MEASUREMENT_BOUNDARY,
         "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
         "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "not_applicable_measured_region",
     }))
 }
 
@@ -528,6 +654,7 @@ async fn scenario_event_dispatch(
     spec: &JsExtensionLoadSpec,
     js_cwd: &str,
     iterations: u32,
+    evidence: RegressionEvidence,
 ) -> Result<Value> {
     let runtime = new_runtime(js_cwd, None).await?;
     load_extension(&runtime, spec).await?;
@@ -578,11 +705,16 @@ async fn scenario_event_dispatch(
         "iterations": iterations,
         "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
         "per_call_us": per_call_us,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": evidence.confidence,
+        "eligible_for_regression_gate": evidence.eligible,
+        "measurement_method": "wall_clock_observation",
         "unexpected_hostcalls": null,
         "unexpected_hostcalls_observable": false,
         "measurement_boundary": MEASUREMENT_BOUNDARY,
         "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
         "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "not_applicable_measured_region",
     }))
 }
 
@@ -623,6 +755,7 @@ fn phase1_matrix_seed_rows(env: &Value) -> Vec<Value> {
                 "eligible_for_regression_gate": false,
                 "measurement_boundary": SYNTHETIC_MEASUREMENT_BOUNDARY,
                 "measurement_contract_version": SYNTHETIC_MEASUREMENT_CONTRACT_VERSION,
+                "disk_cache_policy": "not_applicable_synthetic",
                 "session_messages": session_messages,
                 "open_ms": open_ms,
                 "append_ms": append_ms,
@@ -657,6 +790,54 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
     let js_cwd = cwd.display().to_string();
     let env = env_fingerprint();
     let run_correlation_id = new_run_correlation_id(&env);
+    let build_profile = env
+        .get("build_profile")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let debug_assertions = env
+        .get("debug_assertions")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let build_profile_verified = env
+        .get("build_profile_verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let source_identity_verified = env
+        .get("source_commit")
+        .and_then(Value::as_str)
+        .is_some_and(is_full_git_sha)
+        && env.get("source_dirty").and_then(Value::as_bool) == Some(false);
+    let compiled_features_verified = env
+        .get("compiled_features")
+        .and_then(Value::as_array)
+        .is_some_and(|features| {
+            !features.is_empty()
+                && features.iter().all(Value::is_string)
+                && features.windows(2).all(|pair| {
+                    pair[0].as_str().expect("checked string")
+                        < pair[1].as_str().expect("checked string")
+                })
+        });
+    let provenance_identity_verified = source_identity_verified
+        && compiled_features_verified
+        && env
+            .get("binary_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(is_lower_hex_sha256);
+    let measured_evidence = classify_regression_evidence(
+        build_profile,
+        build_profile_verified,
+        provenance_identity_verified,
+        debug_assertions,
+        false,
+    );
+    let load_evidence = classify_regression_evidence(
+        build_profile,
+        build_profile_verified,
+        provenance_identity_verified,
+        debug_assertions,
+        true,
+    );
 
     let mut records: Vec<Value> = Vec::new();
 
@@ -670,21 +851,41 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
         let spec = JsExtensionLoadSpec::from_entry_path(&entry)?;
 
         eprintln!("[bench] {ext_name}: cold_start ({LOAD_RUNS} runs)");
-        let cold = block_on(scenario_cold_start(&spec, &js_cwd, LOAD_RUNS))?;
+        let cold = block_on(scenario_cold_start(
+            &spec,
+            &js_cwd,
+            LOAD_RUNS,
+            load_evidence,
+        ))?;
         records.push(attach_contract(cold, &env, &run_correlation_id));
 
         eprintln!("[bench] {ext_name}: warm_start ({LOAD_RUNS} runs)");
-        let warm = block_on(scenario_warm_start(&spec, &js_cwd, LOAD_RUNS))?;
+        let warm = block_on(scenario_warm_start(
+            &spec,
+            &js_cwd,
+            LOAD_RUNS,
+            load_evidence,
+        ))?;
         records.push(attach_contract(warm, &env, &run_correlation_id));
 
         eprintln!("[bench] {ext_name}: tool_call ({DISPATCH_ITERATIONS} iters)");
-        match block_on(scenario_tool_call(&spec, &js_cwd, DISPATCH_ITERATIONS)) {
+        match block_on(scenario_tool_call(
+            &spec,
+            &js_cwd,
+            DISPATCH_ITERATIONS,
+            measured_evidence,
+        )) {
             Ok(tc) => records.push(attach_contract(tc, &env, &run_correlation_id)),
             Err(e) => eprintln!("[warn] {ext_name}: tool_call failed: {e}"),
         }
 
         eprintln!("[bench] {ext_name}: event_dispatch ({DISPATCH_ITERATIONS} iters)");
-        match block_on(scenario_event_dispatch(&spec, &js_cwd, DISPATCH_ITERATIONS)) {
+        match block_on(scenario_event_dispatch(
+            &spec,
+            &js_cwd,
+            DISPATCH_ITERATIONS,
+            measured_evidence,
+        )) {
             Ok(ed) => records.push(attach_contract(ed, &env, &run_correlation_id)),
             Err(e) => eprintln!("[warn] {ext_name}: event_dispatch failed: {e}"),
         }
@@ -695,6 +896,19 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
     }
 
     Ok(records)
+}
+
+static SHARED_SCENARIO_RECORDS: OnceLock<std::result::Result<Vec<Value>, String>> = OnceLock::new();
+static SCENARIO_SUITE_EXECUTIONS: AtomicUsize = AtomicUsize::new(0);
+
+fn shared_scenario_records() -> &'static [Value] {
+    match SHARED_SCENARIO_RECORDS.get_or_init(|| {
+        SCENARIO_SUITE_EXECUTIONS.fetch_add(1, Ordering::SeqCst);
+        run_all_scenarios().map_err(|error| error.to_string())
+    }) {
+        Ok(records) => records,
+        Err(error) => panic!("scenario suite should complete: {error}"),
+    }
 }
 
 fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> Value {
@@ -744,6 +958,50 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             .get("build_profile")
             .cloned()
             .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let executable_build_profile = env
+            .get("executable_build_profile")
+            .cloned()
+            .unwrap_or(Value::Null);
+        let executable_profile_verified = env
+            .get("executable_profile_verified")
+            .cloned()
+            .unwrap_or(Value::Bool(false));
+        let build_fingerprint_verified = env
+            .get("build_fingerprint_verified")
+            .cloned()
+            .unwrap_or(Value::Bool(false));
+        let build_profile_verified = env
+            .get("build_profile_verified")
+            .cloned()
+            .unwrap_or(Value::Bool(false));
+        let build_fingerprint_contract = env
+            .get("build_fingerprint_contract")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let compiled_profile_family = env
+            .get("compiled_profile_family")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let compiled_opt_level = env
+            .get("compiled_opt_level")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let compiled_debug = env
+            .get("compiled_debug")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let binary_path = env
+            .get("binary_path")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let binary_sha256 = env
+            .get("binary_sha256")
+            .cloned()
+            .unwrap_or_else(|| Value::String("unknown".to_string()));
+        let debug_assertions = env
+            .get("debug_assertions")
+            .cloned()
+            .unwrap_or(Value::Bool(true));
         let mut scenario_metadata = map
             .get("scenario_metadata")
             .and_then(Value::as_object)
@@ -756,6 +1014,39 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             .entry("build_profile".to_string())
             .or_insert(build_profile);
         scenario_metadata
+            .entry("executable_build_profile".to_string())
+            .or_insert(executable_build_profile);
+        scenario_metadata
+            .entry("executable_profile_verified".to_string())
+            .or_insert(executable_profile_verified);
+        scenario_metadata
+            .entry("build_fingerprint_verified".to_string())
+            .or_insert(build_fingerprint_verified);
+        scenario_metadata
+            .entry("build_profile_verified".to_string())
+            .or_insert(build_profile_verified);
+        scenario_metadata
+            .entry("build_fingerprint_contract".to_string())
+            .or_insert(build_fingerprint_contract);
+        scenario_metadata
+            .entry("compiled_profile_family".to_string())
+            .or_insert(compiled_profile_family);
+        scenario_metadata
+            .entry("compiled_opt_level".to_string())
+            .or_insert(compiled_opt_level);
+        scenario_metadata
+            .entry("compiled_debug".to_string())
+            .or_insert(compiled_debug);
+        scenario_metadata
+            .entry("binary_path".to_string())
+            .or_insert(binary_path);
+        scenario_metadata
+            .entry("binary_sha256".to_string())
+            .or_insert(binary_sha256);
+        scenario_metadata
+            .entry("debug_assertions".to_string())
+            .or_insert(debug_assertions);
+        scenario_metadata
             .entry("host".to_string())
             .or_insert_with(|| host_metadata_from_env(env));
         scenario_metadata
@@ -764,6 +1055,12 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
         scenario_metadata
             .entry("replay_input".to_string())
             .or_insert(replay_input);
+
+        for field in BUILD_PROVENANCE_FIELDS {
+            let value = env.get(*field).cloned().unwrap_or(Value::Null);
+            scenario_metadata.insert((*field).to_string(), value.clone());
+            map.insert((*field).to_string(), value);
+        }
 
         map.insert("env".to_string(), env.clone());
         map.insert(
@@ -775,22 +1072,15 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             Value::String(BENCH_PROTOCOL_VERSION.to_string()),
         );
         map.insert("partition".to_string(), Value::String(partition));
-        if !map.contains_key("evidence_class") {
-            map.insert(
-                "evidence_class".to_string(),
-                Value::String(EVIDENCE_CLASS_MEASURED.to_string()),
-            );
-        }
-        if !map.contains_key("confidence") {
-            map.insert(
-                "confidence".to_string(),
-                Value::String(CONFIDENCE_HIGH.to_string()),
-            );
-        }
-        if !map.contains_key("eligible_for_regression_gate") {
-            map.insert(
-                "eligible_for_regression_gate".to_string(),
-                Value::Bool(true),
+        for field in [
+            "evidence_class",
+            "confidence",
+            "eligible_for_regression_gate",
+            "measurement_method",
+        ] {
+            assert!(
+                map.contains_key(field),
+                "benchmark record must explicitly classify {field}: extension={extension} scenario={scenario}"
             );
         }
         map.insert(
@@ -989,32 +1279,104 @@ fn print_scenario_summary(records: &[Value]) {
 
 #[test]
 fn run_scenario_suite_and_emit_jsonl() {
-    let records = run_all_scenarios().expect("scenario suite should complete");
+    let records = shared_scenario_records();
 
-    assert_expected_benchmarked_extensions(&records);
-    assert_required_scenarios(&records);
-    assert_per_extension_scenarios(&records);
-    assert_matrix_rows(&records);
-    assert_records_have_schema(&records);
+    assert_expected_benchmarked_extensions(records);
+    assert_required_scenarios(records);
+    assert_per_extension_scenarios(records);
+    assert_matrix_rows(records);
+    assert_records_have_schema(records);
 
     // Write JSONL output
     let output_path = perf_output_path("scenario_runner.jsonl");
-    write_jsonl(&records, &output_path);
+    write_jsonl(records, &output_path);
     eprintln!(
         "\n[output] {} records written to {}",
         records.len(),
         output_path.display()
     );
 
-    print_scenario_summary(&records);
+    print_scenario_summary(records);
 }
 
-/// Verify output stability: re-run and compare structure (not timing values).
+#[test]
+fn concurrent_test_consumers_share_one_benchmark_execution() {
+    let correlation_ids = std::thread::scope(|scope| {
+        let handles = (0..4)
+            .map(|_| {
+                scope.spawn(|| {
+                    shared_scenario_records()
+                        .first()
+                        .and_then(|record| record.get("correlation_id"))
+                        .and_then(Value::as_str)
+                        .expect("shared benchmark record correlation_id")
+                        .to_string()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("shared benchmark consumer thread"))
+            .collect::<Vec<_>>()
+    });
+
+    assert!(
+        correlation_ids.windows(2).all(|pair| pair[0] == pair[1]),
+        "all concurrent consumers must observe the same benchmark run"
+    );
+    assert_eq!(
+        SCENARIO_SUITE_EXECUTIONS.load(Ordering::SeqCst),
+        1,
+        "the benchmark workload must execute exactly once per test process"
+    );
+}
+
+#[test]
+fn regression_eligibility_rejects_an_unverified_perf_label() {
+    // Join the shared suite before running even this lightweight assertion so
+    // no test body in this benchmark binary overlaps the timed workload.
+    let _records = shared_scenario_records();
+
+    assert!(is_full_git_sha(
+        "0123456789abcdef0123456789abcdef01234567"
+    ));
+    assert!(!is_full_git_sha(
+        "0123456789ABCDEF0123456789ABCDEF01234567"
+    ));
+    assert!(!is_full_git_sha(
+        "0000000000000000000000000000000000000000"
+    ));
+
+    assert_eq!(
+        classify_regression_evidence("perf", false, true, false, false),
+        RegressionEvidence {
+            confidence: CONFIDENCE_MEDIUM,
+            eligible: false,
+        }
+    );
+    assert_eq!(
+        classify_regression_evidence("perf", true, false, false, false),
+        RegressionEvidence {
+            confidence: CONFIDENCE_MEDIUM,
+            eligible: false,
+        },
+        "dirty or unidentified source must not become gate-eligible"
+    );
+    assert_eq!(
+        classify_regression_evidence("perf", true, true, false, false),
+        RegressionEvidence {
+            confidence: CONFIDENCE_HIGH,
+            eligible: true,
+        }
+    );
+}
+
+/// Verify output stability from the single process-wide benchmark run.
 #[test]
 fn scenario_output_has_stable_structure() {
-    let records = run_all_scenarios().expect("scenario suite should complete");
+    let records = shared_scenario_records();
 
-    for record in &records {
+    for record in records {
         let obj = record.as_object().expect("record should be object");
 
         assert_record_structure(obj);
@@ -1073,6 +1435,16 @@ fn assert_record_required_fields(obj: &Map<String, Value>) {
         obj.contains_key("measurement_contract_version"),
         "missing measurement_contract_version"
     );
+    assert!(
+        obj.contains_key("measurement_method"),
+        "missing measurement_method"
+    );
+    assert!(
+        obj.get("disk_cache_policy")
+            .and_then(Value::as_str)
+            .is_some_and(|policy| !policy.trim().is_empty()),
+        "missing non-empty disk_cache_policy"
+    );
     assert!(obj.contains_key("correlation_id"), "missing correlation_id");
     assert!(
         obj.contains_key("scenario_metadata"),
@@ -1096,8 +1468,30 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
         matches!(partition, PARTITION_MATCHED_STATE | PARTITION_REALISTIC),
         "unexpected partition: {partition}"
     );
-    let is_matrix =
-        obj.get("scenario").and_then(Value::as_str) == Some(MATRIX_SCENARIO_SESSION_WORKLOAD);
+    let scenario = obj.get("scenario").and_then(Value::as_str).unwrap_or("");
+    let is_matrix = scenario == MATRIX_SCENARIO_SESSION_WORKLOAD;
+    let is_load = matches!(scenario, "cold_start" | "warm_start");
+    let env = obj.get("env").and_then(Value::as_object);
+    let perf_optimized = env
+        .and_then(|value| value.get("build_profile"))
+        .and_then(Value::as_str)
+        == Some("perf")
+        && env
+            .and_then(|value| value.get("debug_assertions"))
+            .and_then(Value::as_bool)
+            == Some(false)
+        && env
+            .and_then(|value| value.get("build_profile_verified"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        && env
+            .and_then(|value| value.get("source_commit"))
+            .and_then(Value::as_str)
+            .is_some_and(is_full_git_sha)
+        && env
+            .and_then(|value| value.get("source_dirty"))
+            .and_then(Value::as_bool)
+            == Some(false);
     let (
         expected_evidence_class,
         expected_confidence,
@@ -1112,11 +1506,23 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
             SYNTHETIC_MEASUREMENT_BOUNDARY,
             SYNTHETIC_MEASUREMENT_CONTRACT_VERSION,
         )
+    } else if is_load {
+        (
+            EVIDENCE_CLASS_MEASURED,
+            CONFIDENCE_MEDIUM,
+            false,
+            MEASUREMENT_BOUNDARY,
+            MEASUREMENT_CONTRACT_VERSION,
+        )
     } else {
         (
             EVIDENCE_CLASS_MEASURED,
-            CONFIDENCE_HIGH,
-            true,
+            if perf_optimized {
+                CONFIDENCE_HIGH
+            } else {
+                CONFIDENCE_MEDIUM
+            },
+            perf_optimized,
             MEASUREMENT_BOUNDARY,
             MEASUREMENT_CONTRACT_VERSION,
         )
@@ -1148,6 +1554,23 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
         Some(expected_contract_version),
         "unexpected measurement_contract_version",
     );
+    let expected_measurement_method = if is_matrix {
+        "synthetic_seed_projection"
+    } else {
+        "wall_clock_observation"
+    };
+    assert_eq!(
+        obj.get("measurement_method").and_then(Value::as_str),
+        Some(expected_measurement_method),
+        "unexpected measurement_method",
+    );
+    if is_load {
+        assert_eq!(
+            obj.get("host_page_cache_policy").and_then(Value::as_str),
+            Some("uncontrolled"),
+            "load records must disclose uncontrolled host page cache state",
+        );
+    }
     let correlation_id = obj
         .get("correlation_id")
         .and_then(Value::as_str)
@@ -1167,10 +1590,195 @@ fn assert_env_fingerprint_fields(obj: &Map<String, Value>) {
         "cpu_cores",
         "mem_total_mb",
         "build_profile",
+        "executable_build_profile",
+        "executable_profile_verified",
+        "build_fingerprint_verified",
+        "build_profile_verified",
+        "build_fingerprint_contract",
+        "compiled_profile_family",
+        "compiled_opt_level",
+        "compiled_debug",
+        "compiled_features",
+        "binary_path",
+        "binary_sha256",
+        "debug_assertions",
+        "source_commit",
+        "source_dirty",
         "git_commit",
         "config_hash",
     ] {
         assert!(env.get(field).is_some(), "env missing field: {field}");
+    }
+    assert!(
+        env.get("executable_profile_verified")
+            .and_then(Value::as_bool)
+            .is_some(),
+        "env.executable_profile_verified must be boolean"
+    );
+    assert!(
+        env.get("build_fingerprint_verified")
+            .and_then(Value::as_bool)
+            .is_some(),
+        "env.build_fingerprint_verified must be boolean"
+    );
+    assert!(
+        env.get("build_profile_verified")
+            .and_then(Value::as_bool)
+            .is_some(),
+        "env.build_profile_verified must be boolean"
+    );
+    assert!(
+        env.get("debug_assertions")
+            .and_then(Value::as_bool)
+            .is_some(),
+        "env.debug_assertions must be boolean"
+    );
+    assert!(
+        env.get("source_dirty").and_then(Value::as_bool).is_some(),
+        "env.source_dirty must be boolean"
+    );
+    assert!(
+        env.get("binary_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| !path.trim().is_empty()),
+        "env.binary_path must be a non-empty string"
+    );
+    let binary_path = env
+        .get("binary_path")
+        .and_then(Value::as_str)
+        .expect("env.binary_path string");
+    let binary_sha256 = env
+        .get("binary_sha256")
+        .and_then(Value::as_str)
+        .expect("env.binary_sha256 string");
+    assert!(
+        binary_sha256.len() == 64
+            && binary_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "env.binary_sha256 must be a lowercase SHA-256 digest"
+    );
+    assert_eq!(
+        perf_build::sha256_file(Path::new(binary_path)).expect("hash benchmark test executable"),
+        binary_sha256,
+        "env.binary_sha256 must identify the executable that produced the evidence"
+    );
+    let executable_profile_matches = env.get("executable_build_profile").and_then(Value::as_str)
+        == Some("perf")
+        && perf_build::profile_from_target_path(Path::new(binary_path)).as_deref() == Some("perf");
+    assert_eq!(
+        env.get("executable_profile_verified")
+            .and_then(Value::as_bool),
+        Some(executable_profile_matches),
+        "executable verification must be derived from the actual artifact path"
+    );
+    assert_eq!(
+        env.get("build_fingerprint_contract")
+            .and_then(Value::as_str),
+        Some(perf_build::BUILD_FINGERPRINT_CONTRACT)
+    );
+    let build_fingerprint_matches = perf_build::matches_canonical_perf_build_fingerprint(
+        env.get("compiled_profile_family")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        env.get("compiled_opt_level")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        env.get("compiled_debug")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+    );
+    assert_eq!(
+        env.get("build_fingerprint_verified")
+            .and_then(Value::as_bool),
+        Some(build_fingerprint_matches),
+        "build fingerprint verification must match embedded Cargo settings"
+    );
+    assert_eq!(
+        env.get("build_profile_verified").and_then(Value::as_bool),
+        Some(executable_profile_matches && build_fingerprint_matches),
+        "aggregate profile verification must require both independent components"
+    );
+    let compiled_features = env
+        .get("compiled_features")
+        .and_then(Value::as_array)
+        .expect("env.compiled_features array")
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .expect("env.compiled_features entries must be strings")
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        compiled_features.windows(2).all(|pair| pair[0] < pair[1]),
+        "env.compiled_features must be sorted and deduplicated"
+    );
+    let expected_config_hash =
+        perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {
+            source_commit: env
+                .get("source_commit")
+                .and_then(Value::as_str)
+                .expect("env.source_commit string"),
+            source_dirty: env
+                .get("source_dirty")
+                .and_then(Value::as_bool)
+                .expect("env.source_dirty boolean"),
+            build_profile: env
+                .get("build_profile")
+                .and_then(Value::as_str)
+                .expect("env.build_profile string"),
+            executable_build_profile: env
+                .get("executable_build_profile")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+            executable_profile_verified: env
+                .get("executable_profile_verified")
+                .and_then(Value::as_bool)
+                .expect("env.executable_profile_verified boolean"),
+            build_fingerprint_verified: env
+                .get("build_fingerprint_verified")
+                .and_then(Value::as_bool)
+                .expect("env.build_fingerprint_verified boolean"),
+            build_profile_verified: env
+                .get("build_profile_verified")
+                .and_then(Value::as_bool)
+                .expect("env.build_profile_verified boolean"),
+            build_fingerprint_contract: env
+                .get("build_fingerprint_contract")
+                .and_then(Value::as_str)
+                .expect("env.build_fingerprint_contract string"),
+            compiled_profile_family: env
+                .get("compiled_profile_family")
+                .and_then(Value::as_str)
+                .expect("env.compiled_profile_family string"),
+            compiled_opt_level: env
+                .get("compiled_opt_level")
+                .and_then(Value::as_str)
+                .expect("env.compiled_opt_level string"),
+            compiled_debug: env
+                .get("compiled_debug")
+                .and_then(Value::as_str)
+                .expect("env.compiled_debug string"),
+            compiled_features: &compiled_features,
+            binary_path,
+            binary_sha256,
+            debug_assertions: env
+                .get("debug_assertions")
+                .and_then(Value::as_bool)
+                .expect("env.debug_assertions boolean"),
+        });
+    assert_eq!(
+        env.get("config_hash").and_then(Value::as_str),
+        Some(expected_config_hash.as_str()),
+        "env.config_hash must bind every asserted provenance field"
+    );
+    for field in BUILD_PROVENANCE_FIELDS {
+        assert_eq!(
+            obj.get(*field),
+            env.get(*field),
+            "top-level {field} must equal env.{field}"
+        );
     }
 }
 
@@ -1182,6 +1790,21 @@ fn assert_scenario_metadata_fields(obj: &Map<String, Value>) -> &Map<String, Val
     for field in &[
         "runtime",
         "build_profile",
+        "executable_build_profile",
+        "executable_profile_verified",
+        "build_fingerprint_verified",
+        "build_profile_verified",
+        "build_fingerprint_contract",
+        "compiled_profile_family",
+        "compiled_opt_level",
+        "compiled_debug",
+        "compiled_features",
+        "binary_path",
+        "binary_sha256",
+        "debug_assertions",
+        "source_commit",
+        "source_dirty",
+        "config_hash",
         "host",
         "scenario_id",
         "replay_input",
@@ -1189,6 +1812,34 @@ fn assert_scenario_metadata_fields(obj: &Map<String, Value>) -> &Map<String, Val
         assert!(
             metadata.contains_key(*field),
             "scenario_metadata missing field: {field}"
+        );
+    }
+    let env = obj
+        .get("env")
+        .and_then(Value::as_object)
+        .expect("env must be object");
+    for field in [
+        "build_profile",
+        "executable_build_profile",
+        "executable_profile_verified",
+        "build_fingerprint_verified",
+        "build_profile_verified",
+        "build_fingerprint_contract",
+        "compiled_profile_family",
+        "compiled_opt_level",
+        "compiled_debug",
+        "compiled_features",
+        "binary_path",
+        "binary_sha256",
+        "debug_assertions",
+        "source_commit",
+        "source_dirty",
+        "config_hash",
+    ] {
+        assert_eq!(
+            metadata.get(field),
+            env.get(field),
+            "scenario_metadata.{field} must preserve environment provenance"
         );
     }
     let scenario_id = metadata
@@ -1349,7 +2000,7 @@ fn assert_matrix_swarm_metrics(obj: &Map<String, Value>) {
 /// Verify cold start is slower than warm start (sanity check).
 #[test]
 fn cold_start_not_faster_than_warm_start() {
-    let records = run_all_scenarios().expect("scenario suite should complete");
+    let records = shared_scenario_records();
 
     for ext in BENCH_EXTENSIONS {
         let cold_p50 = records

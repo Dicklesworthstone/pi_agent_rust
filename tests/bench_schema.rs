@@ -14,6 +14,11 @@
     dead_code
 )]
 
+use pi::perf_build::{
+    BUILD_FINGERPRINT_CONTRACT, CANONICAL_PIJS_PERF_FEATURES,
+    BenchmarkProvenance, benchmark_provenance_config_hash,
+    matches_canonical_perf_build_fingerprint, profile_from_target_path, sha256_file,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -121,8 +126,8 @@ const SCHEMAS: &[(&str, &str)] = &[
     ),
     ("pi.perf.budget.v1", "Performance budget check result"),
     (
-        "pi.perf.budget_summary.v1",
-        "Aggregate budget summary with pass/fail counts",
+        "pi.perf.budget_summary.v2",
+        "Strict provenance-bound budget summary with per-budget results and claim readiness",
     ),
     (
         "pi.ext.conformance_report.v2",
@@ -186,6 +191,97 @@ const EVIDENCE_CLASS_INFERRED: &str = "inferred";
 const CONFIDENCE_HIGH: &str = "high";
 const CONFIDENCE_MEDIUM: &str = "medium";
 const CONFIDENCE_LOW: &str = "low";
+const MEASUREMENT_METHOD_WALL_CLOCK: &str = "wall_clock_observation";
+const MEASUREMENT_METHOD_SYNTHETIC: &str = "synthetic_seed_projection";
+const HOST_PAGE_CACHE_UNCONTROLLED: &str = "uncontrolled";
+const REGRESSION_GATE_ALLOWED_BOUNDARIES: &[&str] = &[
+    "in_process_preview",
+    "production_extension_manager",
+    "production_extension_runtime",
+    "synthetic_seed_generation",
+    "synthetic_seed_projection",
+];
+const REGRESSION_GATE_ALLOWED_DISK_CACHE_POLICIES: &[&str] = &[
+    "disabled",
+    "not_applicable",
+    "not_applicable_synthetic",
+    "unique_per_scenario_shared_across_warmup_and_runs",
+];
+const REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES: &[&str] = &[
+    "not_applicable_measured_region",
+    "not_applicable_synthetic",
+    HOST_PAGE_CACHE_UNCONTROLLED,
+];
+const REGRESSION_GATE_ELIGIBLE_BOUNDARIES: &[&str] =
+    &["production_extension_manager", "production_extension_runtime"];
+const REGRESSION_GATE_REQUIRED_RECORD_FIELDS: &[&str] = &[
+    "evidence_class",
+    "confidence",
+    "eligible_for_regression_gate",
+    "measurement_method",
+    "measurement_boundary",
+    "measurement_contract_version",
+    "disk_cache_policy",
+];
+const REGRESSION_GATE_REQUIRED_ELIGIBLE_PROVENANCE_FIELDS: &[&str] = &[
+    "source_commit",
+    "source_dirty",
+    "build_profile",
+    "executable_build_profile",
+    "executable_profile_verified",
+    "build_fingerprint_verified",
+    "build_profile_verified",
+    "build_fingerprint_contract",
+    "compiled_profile_family",
+    "compiled_opt_level",
+    "compiled_debug",
+    "compiled_features",
+    "binary_path",
+    "binary_sha256",
+    "debug_assertions",
+    "config_hash",
+];
+const REGRESSION_GATE_LOAD_REQUIRED_RECORD_FIELDS: &[&str] =
+    &["disk_cache_policy", "host_page_cache_policy"];
+const REGRESSION_GATE_POSITIVE_SAMPLE_FIELDS: &[&str] = &["runs", "iterations", "total_calls"];
+const REGRESSION_GATE_GENERIC_SCOPE: &str = "generic_benchmark_record";
+const PIJS_GATE_SCOPE: &str = "pi.perf.workload.v1/pijs_workload";
+const PIJS_GATE_SCHEMA: &str = "pi.perf.workload.v1";
+const PIJS_GATE_TOOL: &str = "pijs_workload";
+const PIJS_GATE_SCENARIO: &str = "tool_call_roundtrip";
+const PIJS_GATE_RUNTIME_ENGINE: &str = "quickjs";
+const PIJS_GATE_BUILD_PROFILE: &str = "perf";
+const PIJS_GATE_ITERATIONS: u64 = 2_000;
+const PIJS_GATE_TOOL_CALL_COUNTS: &[u64] = &[1, 10];
+const PIJS_GATE_MEASUREMENT_BOUNDARY: &str = "production_extension_manager";
+const PIJS_GATE_MEASUREMENT_CONTRACT_VERSION: &str = "production_extension_manager.v1";
+const PIJS_GATE_REQUIRED_RECORD_FIELDS: &[&str] = &[
+    "timestamp",
+    "run_id",
+    "correlation_id",
+    "source_commit",
+    "source_dirty",
+    "binary_path",
+    "executable_build_profile",
+    "executable_profile_verified",
+    "binary_sha256",
+    "build_profile_verified",
+    "build_fingerprint_contract",
+    "build_fingerprint_verified",
+    "debug_assertions",
+    "compiled_profile_family",
+    "compiled_opt_level",
+    "compiled_debug",
+    "compiled_features",
+    "config_hash",
+    "allocator_requested",
+    "allocator_request_source",
+    "allocator_effective",
+    "allocator_fallback_reason",
+    "elapsed_us",
+    "elapsed_us_f64",
+    "per_call_us_f64",
+];
 const EXT_STRATIFICATION_SCHEMA: &str = "pi.perf.extension_benchmark_stratification.v1";
 const PHASE1_MATRIX_SCHEMA: &str = "pi.perf.phase1_matrix_validation.v1";
 const RESOURCE_GOVERNOR_ADMISSION_SCHEMA: &str = "pi.resource_governor.admission.v1";
@@ -212,15 +308,148 @@ fn project_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn read_jsonl_file(path: &Path) -> Vec<Value> {
-    let Ok(content) = std::fs::read_to_string(path) else {
-        return Vec::new();
+fn schema_doc_generation_enabled(raw: Option<&str>) -> bool {
+    raw.is_some_and(|value| value.trim() == "1")
+}
+
+fn schema_doc_generation_requested() -> bool {
+    schema_doc_generation_enabled(
+        std::env::var("PI_GENERATE_BENCH_SCHEMA_DOCS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn read_jsonl_file(path: &Path) -> Result<Vec<Value>, String> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("failed to read {}: {err}", path.display())),
     };
-    content
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
+    let mut records = Vec::new();
+    for (line_index, line) in content.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let record = serde_json::from_str(line).map_err(|err| {
+            format!(
+                "{} line {} is not valid JSON: {err}",
+                path.display(),
+                line_index + 1
+            )
+        })?;
+        records.push(record);
+    }
+    Ok(records)
+}
+
+fn read_jsonl_file_or_panic(path: &Path) -> Vec<Value> {
+    read_jsonl_file(path).unwrap_or_else(|err| panic!("{err}"))
+}
+
+fn resolve_bench_target_dir(root: &Path, raw_target_dir: Option<&std::ffi::OsStr>) -> PathBuf {
+    raw_target_dir.map_or_else(
+        || root.join("target"),
+        |raw| {
+            let path = PathBuf::from(raw);
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        },
+    )
+}
+
+fn dedup_bench_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    paths
+}
+
+fn pijs_schema_candidate_paths_in_target_dir(target_dir: &Path) -> Vec<PathBuf> {
+    let perf_dir = target_dir.join("perf");
+    [
+        "perf/pijs_workload_perf.jsonl",
+        "release/pijs_workload_release.jsonl",
+        "debug/pijs_workload_debug.jsonl",
+        "pijs_workload.jsonl",
+        "results/pijs_workload.jsonl",
+    ]
+    .into_iter()
+    .map(|relative| perf_dir.join(relative))
+    .collect()
+}
+
+fn pijs_schema_candidate_paths(root: &Path) -> Vec<PathBuf> {
+    let resolved = resolve_bench_target_dir(
+        root,
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    );
+    let default = root.join("target");
+    let mut paths = Vec::new();
+    let mut evidence_dirs = std::env::var_os("PERF_EVIDENCE_DIR")
+        .map(PathBuf::from)
+        .into_iter()
+        .collect::<Vec<_>>();
+    if let Some(raw) = std::env::var_os("PERF_EVIDENCE_DIRS") {
+        evidence_dirs.extend(std::env::split_paths(&raw));
+    }
+    for raw in evidence_dirs {
+        let dir = if raw.is_absolute() {
+            raw
+        } else {
+            root.join(raw)
+        };
+        for relative in [
+            "pijs_workload_perf.jsonl",
+            "pijs_workload_release.jsonl",
+            "pijs_workload_debug.jsonl",
+            "pijs_workload.jsonl",
+            "results/pijs_workload.jsonl",
+            "perf/pijs_workload_perf.jsonl",
+            "perf/pijs_workload_release.jsonl",
+            "perf/pijs_workload_debug.jsonl",
+            "perf/pijs_workload.jsonl",
+            "perf/results/pijs_workload.jsonl",
+        ] {
+            paths.push(dir.join(relative));
+        }
+    }
+    let target_dirs = if root == project_root() {
+        vec![resolved, default]
+    } else {
+        vec![default, resolved]
+    };
+    for target_dir in dedup_bench_paths(target_dirs) {
+        paths.extend(pijs_schema_candidate_paths_in_target_dir(&target_dir));
+    }
+    dedup_bench_paths(paths)
+}
+
+fn load_selected_pijs_schema_artifact(
+    root: &Path,
+) -> Result<Option<(PathBuf, Vec<Value>)>, String> {
+    load_selected_pijs_schema_artifact_from_paths(&pijs_schema_candidate_paths(root))
+}
+
+fn load_selected_pijs_schema_artifact_from_paths(
+    paths: &[PathBuf],
+) -> Result<Option<(PathBuf, Vec<Value>)>, String> {
+    for path in paths {
+        if !path.exists() {
+            continue;
+        }
+        let events = read_jsonl_file(path)?;
+        if events.is_empty() {
+            return Err(format!(
+                "selected PiJS artifact {} contains no nonblank JSON records",
+                path.display()
+            ));
+        }
+        return Ok(Some((path.clone(), events)));
+    }
+    Ok(None)
 }
 
 fn has_required_fields(record: &Value, fields: &[&str]) -> Vec<String> {
@@ -231,6 +460,60 @@ fn has_required_fields(record: &Value, fields: &[&str]) -> Vec<String> {
         }
     }
     missing
+}
+
+#[test]
+fn strict_jsonl_reader_rejects_every_nonblank_malformed_line() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let path = tmp.path().join("artifact.jsonl");
+    fs::write(&path, "{\"ok\":true}\n\n{not-json\n{\"later\":true}\n")
+        .expect("write malformed JSONL fixture");
+
+    let err = read_jsonl_file(&path).expect_err("malformed nonblank line must fail closed");
+    assert!(err.contains("line 3 is not valid JSON"), "{err}");
+}
+
+#[test]
+fn schema_doc_generation_is_explicitly_opt_in() {
+    assert!(!schema_doc_generation_enabled(None));
+    assert!(!schema_doc_generation_enabled(Some("")));
+    assert!(!schema_doc_generation_enabled(Some("0")));
+    assert!(schema_doc_generation_enabled(Some("1")));
+}
+
+#[test]
+fn pijs_schema_selection_rejects_empty_or_malformed_canonical_before_fallback() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let canonical = tmp.path().join("pijs_workload_perf.jsonl");
+    let fallback = tmp.path().join("pijs_workload.jsonl");
+    fs::write(&fallback, "{\"schema\":\"fallback\"}\n").expect("write fallback");
+
+    fs::write(&canonical, " \n\n").expect("write empty canonical");
+    let err = load_selected_pijs_schema_artifact_from_paths(&[
+        canonical.clone(),
+        fallback.clone(),
+    ])
+    .expect_err("empty selected canonical must not fall back");
+    assert!(err.contains("contains no nonblank JSON records"), "{err}");
+
+    fs::write(&canonical, "{not-json\n").expect("write malformed canonical");
+    let err = load_selected_pijs_schema_artifact_from_paths(&[canonical, fallback])
+        .expect_err("malformed selected canonical must not fall back");
+    assert!(err.contains("line 1 is not valid JSON"), "{err}");
+}
+
+#[test]
+fn pijs_schema_candidates_prioritize_canonical_perf_artifact() {
+    let target_dir = Path::new("/tmp/pi-target");
+    let paths = pijs_schema_candidate_paths_in_target_dir(target_dir);
+    assert_eq!(
+        paths.first(),
+        Some(&target_dir.join("perf/perf/pijs_workload_perf.jsonl"))
+    );
+    assert_eq!(
+        paths.get(3),
+        Some(&target_dir.join("perf/pijs_workload.jsonl"))
+    );
 }
 
 #[cfg(unix)]
@@ -623,6 +906,42 @@ fn canonical_protocol_contract() -> Value {
             "evidence_class": [EVIDENCE_CLASS_MEASURED, EVIDENCE_CLASS_INFERRED],
             "confidence": [CONFIDENCE_HIGH, CONFIDENCE_MEDIUM, CONFIDENCE_LOW],
         },
+        "regression_gate_admission": {
+            "scope": REGRESSION_GATE_GENERIC_SCOPE,
+            "required_record_fields": REGRESSION_GATE_REQUIRED_RECORD_FIELDS,
+            "load_scenario_required_fields": REGRESSION_GATE_LOAD_REQUIRED_RECORD_FIELDS,
+            "allowed_measurement_methods": [
+                MEASUREMENT_METHOD_WALL_CLOCK,
+                MEASUREMENT_METHOD_SYNTHETIC,
+            ],
+            "allowed_measurement_boundaries": REGRESSION_GATE_ALLOWED_BOUNDARIES,
+            "eligible_measurement_boundaries": REGRESSION_GATE_ELIGIBLE_BOUNDARIES,
+            "allowed_disk_cache_policies": REGRESSION_GATE_ALLOWED_DISK_CACHE_POLICIES,
+            "allowed_host_page_cache_policies": REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES,
+            "required_eligible_provenance_fields": REGRESSION_GATE_REQUIRED_ELIGIBLE_PROVENANCE_FIELDS,
+            "eligible_evidence_class": EVIDENCE_CLASS_MEASURED,
+            "eligible_confidence": CONFIDENCE_HIGH,
+            "eligible_measurement_method": MEASUREMENT_METHOD_WALL_CLOCK,
+            "required_eligible_host_page_cache_policy": "not_applicable_measured_region",
+            "positive_sample_count_fields": REGRESSION_GATE_POSITIVE_SAMPLE_FIELDS,
+            "require_positive_sample_count": true,
+            "uncontrolled_host_page_cache_eligible": false,
+        },
+        "pijs_regression_gate_admission": {
+            "scope": PIJS_GATE_SCOPE,
+            "inherits": "regression_gate_admission",
+            "required_record_fields": PIJS_GATE_REQUIRED_RECORD_FIELDS,
+            "required_schema": PIJS_GATE_SCHEMA,
+            "required_tool": PIJS_GATE_TOOL,
+            "required_scenario": PIJS_GATE_SCENARIO,
+            "required_runtime_engine": PIJS_GATE_RUNTIME_ENGINE,
+            "required_build_profile": PIJS_GATE_BUILD_PROFILE,
+            "required_build_profile_verified": true,
+            "required_iterations": PIJS_GATE_ITERATIONS,
+            "required_tool_calls_per_iteration": PIJS_GATE_TOOL_CALL_COUNTS,
+            "required_measurement_boundary": PIJS_GATE_MEASUREMENT_BOUNDARY,
+            "required_measurement_contract_version": PIJS_GATE_MEASUREMENT_CONTRACT_VERSION,
+        },
         "partition_weighting": {
             PARTITION_MATCHED_STATE: PARTITION_WEIGHT_MATCHED_STATE,
             PARTITION_REALISTIC: PARTITION_WEIGHT_REALISTIC,
@@ -944,6 +1263,597 @@ fn require_string_array_eq(
     Ok(())
 }
 
+fn regression_provenance_field<'a>(record: &'a Value, field: &str) -> Option<&'a Value> {
+    record
+        .get(field)
+        .or_else(|| record.get("env").and_then(|env| env.get(field)))
+}
+
+fn validate_eligible_build_provenance(record: &Value) -> Result<(), String> {
+    for field in [
+        "source_commit",
+        "source_dirty",
+        "build_profile",
+        "executable_build_profile",
+        "executable_profile_verified",
+        "build_fingerprint_verified",
+        "build_profile_verified",
+        "build_fingerprint_contract",
+        "compiled_profile_family",
+        "compiled_opt_level",
+        "compiled_debug",
+        "compiled_features",
+        "binary_path",
+        "binary_sha256",
+        "debug_assertions",
+        "config_hash",
+    ] {
+        if let (Some(top_level), Some(env_value)) = (
+            record.get(field),
+            record.get("env").and_then(|env| env.get(field)),
+        ) && top_level != env_value
+        {
+            return Err(format!(
+                "regression-gate top-level {field} must match env.{field}"
+            ));
+        }
+    }
+    for (field, expected) in [
+        ("build_profile", "perf"),
+        ("executable_build_profile", "perf"),
+        ("build_fingerprint_contract", BUILD_FINGERPRINT_CONTRACT),
+        ("compiled_profile_family", "release"),
+        ("compiled_opt_level", "3"),
+        ("compiled_debug", "true"),
+    ] {
+        let observed = regression_provenance_field(record, field).and_then(Value::as_str);
+        if observed != Some(expected) {
+            return Err(format!(
+                "regression-gate eligible evidence {field} must equal {expected:?} (observed={observed:?})"
+            ));
+        }
+    }
+    if !matches_canonical_perf_build_fingerprint("release", "3", "true") {
+        return Err("canonical perf build fingerprint contract is internally invalid".to_string());
+    }
+    for field in [
+        "executable_profile_verified",
+        "build_fingerprint_verified",
+        "build_profile_verified",
+    ] {
+        if regression_provenance_field(record, field).and_then(Value::as_bool) != Some(true) {
+            return Err(format!(
+                "regression-gate eligible evidence {field} must equal true"
+            ));
+        }
+    }
+    if regression_provenance_field(record, "debug_assertions").and_then(Value::as_bool)
+        != Some(false)
+    {
+        return Err(
+            "regression-gate eligible evidence debug_assertions must equal false".to_string(),
+        );
+    }
+
+    let binary_path = regression_provenance_field(record, "binary_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "regression-gate eligible evidence binary_path must be non-empty".to_string()
+        })?;
+    let binary_path = Path::new(binary_path);
+    if !binary_path.is_absolute() {
+        return Err("regression-gate eligible evidence binary_path must be absolute".to_string());
+    }
+    let derived_profile = profile_from_target_path(binary_path);
+    if derived_profile.as_deref() != Some("perf") {
+        return Err(format!(
+            "regression-gate eligible evidence binary_path must derive perf profile (observed={derived_profile:?})"
+        ));
+    }
+    let canonical_path = fs::canonicalize(binary_path).map_err(|err| {
+        format!("regression-gate eligible evidence binary_path must exist: {err}")
+    })?;
+    if canonical_path != binary_path {
+        return Err(
+            "regression-gate eligible evidence binary_path must be canonical".to_string(),
+        );
+    }
+    let claimed_sha256 = regression_provenance_field(record, "binary_sha256")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 64
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        })
+        .ok_or_else(|| {
+            "regression-gate eligible evidence binary_sha256 must be lowercase SHA-256"
+                .to_string()
+        })?;
+    let observed_sha256 = sha256_file(binary_path)
+        .map_err(|err| format!("failed to hash regression-gate binary_path: {err}"))?;
+    if claimed_sha256 != observed_sha256 {
+        return Err(
+            "regression-gate eligible evidence binary_sha256 does not match binary_path"
+                .to_string(),
+        );
+    }
+    let source_commit = regression_provenance_field(record, "source_commit")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            value.len() == 40
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && !value.bytes().all(|byte| byte == b'0')
+        })
+        .ok_or_else(|| {
+            "regression-gate eligible evidence source_commit must be a full lowercase Git SHA"
+                .to_string()
+        })?;
+    if regression_provenance_field(record, "source_dirty").and_then(Value::as_bool) != Some(false)
+    {
+        return Err("regression-gate eligible evidence source_dirty must equal false".to_string());
+    }
+    let compiled_features = regression_provenance_field(record, "compiled_features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            "regression-gate eligible evidence compiled_features must be an array".to_string()
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().ok_or_else(|| {
+                "regression-gate eligible evidence compiled_features entries must be strings"
+                    .to_string()
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if compiled_features.is_empty()
+        || compiled_features.windows(2).any(|pair| pair[0] >= pair[1])
+    {
+        return Err(
+            "regression-gate eligible evidence compiled_features must be non-empty, sorted, and unique"
+                .to_string(),
+        );
+    }
+    let expected_config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+        source_commit,
+        source_dirty: false,
+        build_profile: "perf",
+        executable_build_profile: "perf",
+        executable_profile_verified: true,
+        build_fingerprint_verified: true,
+        build_profile_verified: true,
+        build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
+        compiled_profile_family: "release",
+        compiled_opt_level: "3",
+        compiled_debug: "true",
+        compiled_features: &compiled_features,
+        binary_path: binary_path.to_str().ok_or_else(|| {
+            "regression-gate eligible evidence binary_path must be UTF-8".to_string()
+        })?,
+        binary_sha256: claimed_sha256,
+        debug_assertions: false,
+    });
+    let claimed_config_hash = regression_provenance_field(record, "config_hash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "regression-gate eligible evidence config_hash must be a string".to_string()
+        })?;
+    if claimed_config_hash != expected_config_hash {
+        return Err(
+            "regression-gate eligible evidence config_hash does not match asserted provenance"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_regression_gate_admission_record(record: &Value) -> Result<(), String> {
+    let missing = has_required_fields(record, REGRESSION_GATE_REQUIRED_RECORD_FIELDS);
+    if !missing.is_empty() {
+        return Err(format!(
+            "regression-gate admission is missing required fields: {missing:?}"
+        ));
+    }
+
+    let evidence_class = record
+        .get("evidence_class")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "regression-gate evidence_class must be a string".to_string())?;
+    if !matches!(
+        evidence_class,
+        EVIDENCE_CLASS_MEASURED | EVIDENCE_CLASS_INFERRED
+    ) {
+        return Err(format!(
+            "invalid regression-gate evidence_class: {evidence_class}"
+        ));
+    }
+    let confidence = record
+        .get("confidence")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "regression-gate confidence must be a string".to_string())?;
+    if !matches!(
+        confidence,
+        CONFIDENCE_HIGH | CONFIDENCE_MEDIUM | CONFIDENCE_LOW
+    ) {
+        return Err(format!("invalid regression-gate confidence: {confidence}"));
+    }
+
+    let eligible = record
+        .get("eligible_for_regression_gate")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| {
+            "regression-gate eligible_for_regression_gate must be a boolean".to_string()
+        })?;
+    let measurement_method = record
+        .get("measurement_method")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "regression-gate measurement_method must be a string".to_string())?;
+    if !matches!(
+        measurement_method,
+        MEASUREMENT_METHOD_WALL_CLOCK | MEASUREMENT_METHOD_SYNTHETIC
+    ) {
+        return Err(format!(
+            "invalid regression-gate measurement_method: {measurement_method}"
+        ));
+    }
+
+    let measurement_boundary = record
+        .get("measurement_boundary")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "regression-gate measurement_boundary must be a non-empty string".to_string()
+        })?;
+    let measurement_contract_version = record
+        .get("measurement_contract_version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "regression-gate measurement_contract_version must be a non-empty string".to_string()
+        })?;
+    let disk_cache_policy = record
+        .get("disk_cache_policy")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            "regression-gate disk_cache_policy must be a non-empty string".to_string()
+        })?;
+    if !REGRESSION_GATE_ALLOWED_BOUNDARIES.contains(&measurement_boundary) {
+        return Err(format!(
+            "invalid regression-gate measurement_boundary token: {measurement_boundary}"
+        ));
+    }
+    let expected_contract = format!("{measurement_boundary}.v1");
+    if measurement_contract_version != expected_contract {
+        return Err(format!(
+            "regression-gate measurement_contract_version must equal {expected_contract:?} for boundary {measurement_boundary:?}"
+        ));
+    }
+    if !REGRESSION_GATE_ALLOWED_DISK_CACHE_POLICIES.contains(&disk_cache_policy) {
+        return Err(format!(
+            "invalid regression-gate disk_cache_policy token: {disk_cache_policy}"
+        ));
+    }
+    if let Some(host_page_cache_policy) = record.get("host_page_cache_policy") {
+        let host_page_cache_policy = host_page_cache_policy.as_str().ok_or_else(|| {
+            "regression-gate host_page_cache_policy must be a string".to_string()
+        })?;
+        if !REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES.contains(&host_page_cache_policy) {
+            return Err(format!(
+                "invalid regression-gate host_page_cache_policy token: {host_page_cache_policy}"
+            ));
+        }
+    }
+
+    let scenario = record
+        .get("scenario")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_load_scenario = matches!(
+        scenario,
+        "cold_start" | "warm_start" | "ext_load_init/load_init_cold"
+    );
+    if is_load_scenario {
+        let missing = has_required_fields(record, REGRESSION_GATE_LOAD_REQUIRED_RECORD_FIELDS);
+        if !missing.is_empty() {
+            return Err(format!(
+                "regression-gate load scenario is missing cache-policy fields: {missing:?}"
+            ));
+        }
+        for field in REGRESSION_GATE_LOAD_REQUIRED_RECORD_FIELDS {
+            let policy = record
+                .get(*field)
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    format!("regression-gate load scenario {field} must be a non-empty string")
+                })?;
+            let allowed = if *field == "disk_cache_policy" {
+                REGRESSION_GATE_ALLOWED_DISK_CACHE_POLICIES
+            } else {
+                REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES
+            };
+            if !allowed.contains(&policy) {
+                return Err(format!(
+                    "invalid regression-gate load scenario {field} token: {policy}"
+                ));
+            }
+        }
+    }
+
+    if !eligible {
+        return Ok(());
+    }
+    validate_eligible_build_provenance(record)?;
+    let host_page_cache_policy = record
+        .get("host_page_cache_policy")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "regression-gate eligible evidence requires host_page_cache_policy".to_string()
+        })?;
+    if host_page_cache_policy != "not_applicable_measured_region" {
+        return Err(format!(
+            "regression-gate eligible evidence requires host_page_cache_policy=\"not_applicable_measured_region\", got: {host_page_cache_policy}"
+        ));
+    }
+    if evidence_class != EVIDENCE_CLASS_MEASURED {
+        return Err("regression-gate eligible evidence must be measured".to_string());
+    }
+    if confidence != CONFIDENCE_HIGH {
+        return Err("regression-gate eligible evidence must have high confidence".to_string());
+    }
+    if measurement_method != MEASUREMENT_METHOD_WALL_CLOCK {
+        return Err(
+            "regression-gate eligible evidence must use wall_clock_observation".to_string(),
+        );
+    }
+    if !matches!(
+        measurement_boundary,
+        "production_extension_manager" | "production_extension_runtime"
+    ) {
+        return Err(format!(
+            "regression-gate eligible evidence requires a production boundary, got: {measurement_boundary}"
+        ));
+    }
+    let mut has_sample_count = false;
+    for field in REGRESSION_GATE_POSITIVE_SAMPLE_FIELDS {
+        let Some(raw_value) = record.get(*field) else {
+            continue;
+        };
+        has_sample_count = true;
+        if raw_value.as_u64().is_none_or(|value| value == 0) {
+            return Err(format!(
+                "regression-gate eligible evidence {field} must be a positive integer"
+            ));
+        }
+    }
+    if !has_sample_count {
+        return Err(format!(
+            "regression-gate eligible evidence requires a positive sample count in one of {REGRESSION_GATE_POSITIVE_SAMPLE_FIELDS:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn require_pijs_gate_string(record: &Value, field: &str, expected: &str) -> Result<(), String> {
+    let observed = record.get(field).and_then(Value::as_str);
+    if observed == Some(expected) {
+        Ok(())
+    } else {
+        Err(format!(
+            "PiJS regression-gate {field} must equal {expected:?} (observed={observed:?})"
+        ))
+    }
+}
+
+fn is_pijs_workload_record(record: &Value) -> bool {
+    record.get("tool").and_then(Value::as_str) == Some(PIJS_GATE_TOOL)
+}
+
+fn validate_pijs_regression_gate_admission_record(record: &Value) -> Result<(), String> {
+    validate_regression_gate_admission_record(record)?;
+    if record
+        .get("eligible_for_regression_gate")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Ok(());
+    }
+
+    let missing = has_required_fields(record, PIJS_GATE_REQUIRED_RECORD_FIELDS);
+    if !missing.is_empty() {
+        return Err(format!(
+            "PiJS regression-gate record is missing required fields: {missing:?}"
+        ));
+    }
+
+    for (field, expected) in [
+        ("schema", PIJS_GATE_SCHEMA),
+        ("tool", PIJS_GATE_TOOL),
+        ("scenario", PIJS_GATE_SCENARIO),
+        ("runtime_engine", PIJS_GATE_RUNTIME_ENGINE),
+        ("build_profile", PIJS_GATE_BUILD_PROFILE),
+        ("build_fingerprint_contract", BUILD_FINGERPRINT_CONTRACT),
+        ("compiled_profile_family", "release"),
+        ("compiled_opt_level", "3"),
+        ("compiled_debug", "true"),
+        ("executable_build_profile", "perf"),
+        ("allocator_requested", "system"),
+        ("allocator_request_source", "env"),
+        ("allocator_effective", "system"),
+        ("measurement_boundary", PIJS_GATE_MEASUREMENT_BOUNDARY),
+        (
+            "measurement_contract_version",
+            PIJS_GATE_MEASUREMENT_CONTRACT_VERSION,
+        ),
+    ] {
+        require_pijs_gate_string(record, field, expected)?;
+    }
+
+    if record
+        .get("build_profile_verified")
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Err("PiJS regression-gate build_profile_verified must equal true".to_string());
+    }
+    for field in ["build_fingerprint_verified", "executable_profile_verified"] {
+        if record.get(field).and_then(Value::as_bool) != Some(true) {
+            return Err(format!("PiJS regression-gate {field} must equal true"));
+        }
+    }
+    if record.get("debug_assertions").and_then(Value::as_bool) != Some(false) {
+        return Err("PiJS regression-gate debug_assertions must equal false".to_string());
+    }
+    if record.get("source_dirty").and_then(Value::as_bool) != Some(false) {
+        return Err("PiJS regression-gate source_dirty must equal false".to_string());
+    }
+    if !record
+        .get("allocator_fallback_reason")
+        .is_some_and(Value::is_null)
+    {
+        return Err(
+            "PiJS regression-gate allocator_fallback_reason must equal null".to_string(),
+        );
+    }
+    let features = record
+        .get("compiled_features")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "PiJS regression-gate compiled_features must be an array".to_string())?
+        .iter()
+        .map(|feature| {
+            feature.as_str().ok_or_else(|| {
+                "PiJS regression-gate compiled_features entries must be strings".to_string()
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if features != CANONICAL_PIJS_PERF_FEATURES {
+        return Err(format!(
+            "PiJS regression-gate compiled_features must equal {CANONICAL_PIJS_PERF_FEATURES:?}"
+        ));
+    }
+    let run_id = record
+        .get("run_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "PiJS regression-gate run_id must be non-empty".to_string())?;
+    let correlation_id = record
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "PiJS regression-gate correlation_id must be non-empty".to_string())?;
+    if run_id != correlation_id {
+        return Err(
+            "PiJS regression-gate run_id and correlation_id must be identical".to_string(),
+        );
+    }
+    let timestamp = record
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "PiJS regression-gate timestamp must be a string".to_string())?;
+    chrono::DateTime::parse_from_rfc3339(timestamp)
+        .map_err(|err| format!("PiJS regression-gate timestamp must be RFC3339: {err}"))?;
+    for (field, expected_len) in [("source_commit", 40), ("binary_sha256", 64)] {
+        let value = record
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() == expected_len
+                    && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .ok_or_else(|| {
+                format!(
+                    "PiJS regression-gate {field} must be a {expected_len}-character hexadecimal string"
+                )
+            })?;
+        if value.bytes().all(|byte| byte == b'0') {
+            return Err(format!("PiJS regression-gate {field} must not be all zeros"));
+        }
+    }
+    record
+        .get("binary_path")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "PiJS regression-gate binary_path must be non-empty".to_string())?;
+
+    let iterations = record
+        .get("iterations")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "PiJS regression-gate iterations must be an integer".to_string())?;
+    if iterations != PIJS_GATE_ITERATIONS {
+        return Err(format!(
+            "PiJS regression-gate iterations must equal {PIJS_GATE_ITERATIONS} (observed={iterations})"
+        ));
+    }
+
+    let tool_calls = record
+        .get("tool_calls_per_iteration")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            "PiJS regression-gate tool_calls_per_iteration must be an integer".to_string()
+        })?;
+    if !PIJS_GATE_TOOL_CALL_COUNTS.contains(&tool_calls) {
+        return Err(format!(
+            "PiJS regression-gate tool_calls_per_iteration must be one of {PIJS_GATE_TOOL_CALL_COUNTS:?} (observed={tool_calls})"
+        ));
+    }
+
+    let total_calls = record
+        .get("total_calls")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "PiJS regression-gate total_calls must be an integer".to_string())?;
+    let expected_total = iterations
+        .checked_mul(tool_calls)
+        .ok_or_else(|| "PiJS regression-gate sample count overflows u64".to_string())?;
+    if total_calls != expected_total {
+        return Err(format!(
+            "PiJS regression-gate total_calls must equal iterations * tool_calls_per_iteration ({expected_total}); observed={total_calls}"
+        ));
+    }
+    record
+        .get("elapsed_us")
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            "PiJS regression-gate elapsed_us must be a positive integer".to_string()
+        })?;
+    for field in ["elapsed_us_f64", "per_call_us_f64"] {
+        record
+            .get(field)
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .ok_or_else(|| {
+                format!("PiJS regression-gate {field} must be a finite positive number")
+            })?;
+    }
+
+    Ok(())
+}
+
+fn validate_workload_record(record: &Value) -> Result<(), String> {
+    let missing = has_required_fields(record, WORKLOAD_REQUIRED);
+    if !missing.is_empty() {
+        return Err(format!(
+            "workload event missing required fields: {missing:?}"
+        ));
+    }
+    if record.get("eligible_for_regression_gate").is_some() {
+        if is_pijs_workload_record(record) {
+            validate_pijs_regression_gate_admission_record(record)?;
+        } else {
+            validate_regression_gate_admission_record(record)?;
+        }
+    }
+    Ok(())
+}
+
 fn validate_protocol_record(record: &Value) -> Result<(), String> {
     let required = [
         "protocol_schema",
@@ -1003,6 +1913,12 @@ fn validate_protocol_record(record: &Value) -> Result<(), String> {
         CONFIDENCE_HIGH | CONFIDENCE_MEDIUM | CONFIDENCE_LOW
     ) {
         return Err(format!("invalid confidence: {confidence}"));
+    }
+
+    // The v1 admission overlay is additive. Historical records without the
+    // opt-in eligibility marker retain their original validation semantics.
+    if record.get("eligible_for_regression_gate").is_some() {
+        validate_regression_gate_admission_record(record)?;
     }
 
     let correlation_id = record
@@ -2958,6 +3874,158 @@ fn swarm_metrics_fixture(
     })
 }
 
+fn generic_test_binary_provenance(root: &Path) -> (String, String) {
+    let binary_path = root.join("target/perf/examples/bench_schema_fixture");
+    fs::create_dir_all(binary_path.parent().expect("generic binary parent"))
+        .expect("create generic binary parent");
+    fs::write(&binary_path, b"generic-benchmark-test-binary")
+        .expect("write generic benchmark binary");
+    let binary_path = fs::canonicalize(binary_path).expect("canonicalize generic binary");
+    let binary_sha256 = sha256_file(&binary_path).expect("hash generic benchmark binary");
+    (binary_path.display().to_string(), binary_sha256)
+}
+
+fn regression_gate_protocol_fixture(root: &Path) -> Value {
+    let (binary_path, binary_sha256) = generic_test_binary_provenance(root);
+    let source_commit = "0123456789abcdef0123456789abcdef01234567";
+    let compiled_features = ["sqlite-sessions", "tui"];
+    let config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+        source_commit,
+        source_dirty: false,
+        build_profile: "perf",
+        executable_build_profile: "perf",
+        executable_profile_verified: true,
+        build_fingerprint_verified: true,
+        build_profile_verified: true,
+        build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
+        compiled_profile_family: "release",
+        compiled_opt_level: "3",
+        compiled_debug: "true",
+        compiled_features: &compiled_features,
+        binary_path: &binary_path,
+        binary_sha256: &binary_sha256,
+        debug_assertions: false,
+    });
+    json!({
+        "schema": "pi.ext.rust_bench.v1",
+        "runtime": "pi_agent_rust",
+        "scenario": "tool_call",
+        "extension": "hello",
+        "iterations": 500,
+        "protocol_schema": BENCH_PROTOCOL_SCHEMA,
+        "protocol_version": BENCH_PROTOCOL_VERSION,
+        "partition": PARTITION_MATCHED_STATE,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "eligible_for_regression_gate": true,
+        "measurement_method": MEASUREMENT_METHOD_WALL_CLOCK,
+        "measurement_boundary": "production_extension_manager",
+        "measurement_contract_version": "production_extension_manager.v1",
+        "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "not_applicable_measured_region",
+        "build_profile": "perf",
+        "executable_build_profile": "perf",
+        "executable_profile_verified": true,
+        "build_fingerprint_verified": true,
+        "build_profile_verified": true,
+        "build_fingerprint_contract": BUILD_FINGERPRINT_CONTRACT,
+        "compiled_profile_family": "release",
+        "compiled_opt_level": "3",
+        "compiled_debug": "true",
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "debug_assertions": false,
+        "source_commit": source_commit,
+        "source_dirty": false,
+        "compiled_features": compiled_features,
+        "config_hash": config_hash,
+        "correlation_id": "0123456789abcdef0123456789abcdef",
+        "scenario_metadata": {
+            "runtime": "pi_agent_rust",
+            "build_profile": "release",
+            "host": {
+                "os": "linux",
+                "arch": "x86_64",
+                "cpu_model": "test-cpu",
+                "cpu_cores": 8,
+            },
+            "scenario_id": "tool_call",
+            "replay_input": { "iterations": 500 },
+        },
+    })
+}
+
+fn pijs_gate_workload_fixture(root: &Path, tool_calls_per_iteration: u64) -> Value {
+    let total_calls = PIJS_GATE_ITERATIONS * tool_calls_per_iteration;
+    let elapsed_us_f64 = total_calls as f64 * 49.5;
+    let elapsed_us = elapsed_us_f64 as u64;
+    let (binary_path, binary_sha256) = generic_test_binary_provenance(root);
+    let source_commit = "0123456789abcdef0123456789abcdef01234567";
+    let config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+        source_commit,
+        source_dirty: false,
+        build_profile: "perf",
+        executable_build_profile: "perf",
+        executable_profile_verified: true,
+        build_fingerprint_verified: true,
+        build_profile_verified: true,
+        build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
+        compiled_profile_family: "release",
+        compiled_opt_level: "3",
+        compiled_debug: "true",
+        compiled_features: CANONICAL_PIJS_PERF_FEATURES,
+        binary_path: &binary_path,
+        binary_sha256: &binary_sha256,
+        debug_assertions: false,
+    });
+    json!({
+        "schema": PIJS_GATE_SCHEMA,
+        "timestamp": "2026-08-05T16:00:00Z",
+        "run_id": "pijs-schema-test-run",
+        "correlation_id": "pijs-schema-test-run",
+        "source_commit": source_commit,
+        "source_dirty": false,
+        "tool": PIJS_GATE_TOOL,
+        "scenario": PIJS_GATE_SCENARIO,
+        "runtime_engine": PIJS_GATE_RUNTIME_ENGINE,
+        "build_profile": PIJS_GATE_BUILD_PROFILE,
+        "build_profile_verified": true,
+        "build_fingerprint_contract": BUILD_FINGERPRINT_CONTRACT,
+        "build_fingerprint_verified": true,
+        "compiled_profile_family": "release",
+        "compiled_opt_level": "3",
+        "compiled_debug": "true",
+        "compiled_features": CANONICAL_PIJS_PERF_FEATURES,
+        "binary_path": binary_path,
+        "executable_build_profile": "perf",
+        "executable_profile_verified": true,
+        "debug_assertions": false,
+        "binary_sha256": binary_sha256,
+        "config_hash": config_hash,
+        "iterations": PIJS_GATE_ITERATIONS,
+        "tool_calls_per_iteration": tool_calls_per_iteration,
+        "total_calls": total_calls,
+        "elapsed_ms": elapsed_us / 1_000,
+        "elapsed_us": elapsed_us,
+        "elapsed_us_f64": elapsed_us_f64,
+        "per_call_us": elapsed_us / total_calls,
+        "per_call_us_f64": 49.5,
+        "calls_per_sec": total_calls * 1_000_000 / elapsed_us,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "eligible_for_regression_gate": true,
+        "measurement_method": MEASUREMENT_METHOD_WALL_CLOCK,
+        "measurement_boundary": PIJS_GATE_MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": PIJS_GATE_MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "not_applicable_measured_region",
+        "allocator_requested": "system",
+        "allocator_request_source": "env",
+        "allocator_effective": "system",
+        "allocator_fallback_reason": null,
+    })
+}
+
 fn phase1_matrix_validation_golden_fixture() -> Value {
     json!({
         "schema": PHASE1_MATRIX_SCHEMA,
@@ -3456,6 +4524,161 @@ fn protocol_contract_labels_evidence_and_confidence() {
 }
 
 #[test]
+fn protocol_contract_defines_regression_gate_admission() {
+    let contract = canonical_protocol_contract();
+    let admission = contract["regression_gate_admission"]
+        .as_object()
+        .expect("regression_gate_admission object");
+
+    assert_eq!(
+        admission["scope"].as_str(),
+        Some(REGRESSION_GATE_GENERIC_SCOPE),
+        "generic admission metadata must not imply a workload-specific gate"
+    );
+
+    require_string_array_eq(
+        admission,
+        "required_record_fields",
+        REGRESSION_GATE_REQUIRED_RECORD_FIELDS,
+        "regression_gate_admission",
+    )
+    .expect("canonical regression-gate record fields");
+    require_string_array_eq(
+        admission,
+        "load_scenario_required_fields",
+        REGRESSION_GATE_LOAD_REQUIRED_RECORD_FIELDS,
+        "regression_gate_admission",
+    )
+    .expect("canonical regression-gate load fields");
+    require_string_array_eq(
+        admission,
+        "allowed_measurement_methods",
+        &[MEASUREMENT_METHOD_WALL_CLOCK, MEASUREMENT_METHOD_SYNTHETIC],
+        "regression_gate_admission",
+    )
+    .expect("canonical measurement methods");
+    require_string_array_eq(
+        admission,
+        "allowed_measurement_boundaries",
+        REGRESSION_GATE_ALLOWED_BOUNDARIES,
+        "regression_gate_admission",
+    )
+    .expect("canonical measurement boundaries");
+    require_string_array_eq(
+        admission,
+        "eligible_measurement_boundaries",
+        REGRESSION_GATE_ELIGIBLE_BOUNDARIES,
+        "regression_gate_admission",
+    )
+    .expect("canonical eligible measurement boundaries");
+    require_string_array_eq(
+        admission,
+        "allowed_disk_cache_policies",
+        REGRESSION_GATE_ALLOWED_DISK_CACHE_POLICIES,
+        "regression_gate_admission",
+    )
+    .expect("canonical disk-cache policies");
+    require_string_array_eq(
+        admission,
+        "allowed_host_page_cache_policies",
+        REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES,
+        "regression_gate_admission",
+    )
+    .expect("canonical host-page-cache policies");
+    require_string_array_eq(
+        admission,
+        "required_eligible_provenance_fields",
+        REGRESSION_GATE_REQUIRED_ELIGIBLE_PROVENANCE_FIELDS,
+        "regression_gate_admission",
+    )
+    .expect("canonical eligible provenance fields");
+    require_string_array_eq(
+        admission,
+        "positive_sample_count_fields",
+        REGRESSION_GATE_POSITIVE_SAMPLE_FIELDS,
+        "regression_gate_admission",
+    )
+    .expect("canonical positive sample fields");
+
+    assert_eq!(
+        admission["eligible_evidence_class"].as_str(),
+        Some(EVIDENCE_CLASS_MEASURED)
+    );
+    assert_eq!(
+        admission["eligible_confidence"].as_str(),
+        Some(CONFIDENCE_HIGH)
+    );
+    assert_eq!(
+        admission["eligible_measurement_method"].as_str(),
+        Some(MEASUREMENT_METHOD_WALL_CLOCK)
+    );
+    assert_eq!(
+        admission["required_eligible_host_page_cache_policy"].as_str(),
+        Some("not_applicable_measured_region")
+    );
+    assert_eq!(
+        admission["require_positive_sample_count"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        admission["uncontrolled_host_page_cache_eligible"].as_bool(),
+        Some(false)
+    );
+}
+
+#[test]
+fn protocol_contract_defines_separate_pijs_regression_gate_admission() {
+    let contract = canonical_protocol_contract();
+    let admission = contract["pijs_regression_gate_admission"]
+        .as_object()
+        .expect("pijs_regression_gate_admission object");
+
+    require_string_array_eq(
+        admission,
+        "required_record_fields",
+        PIJS_GATE_REQUIRED_RECORD_FIELDS,
+        "pijs_regression_gate_admission",
+    )
+    .expect("canonical PiJS regression-gate record fields");
+
+    for (field, expected) in [
+        ("scope", PIJS_GATE_SCOPE),
+        ("inherits", "regression_gate_admission"),
+        ("required_schema", PIJS_GATE_SCHEMA),
+        ("required_tool", PIJS_GATE_TOOL),
+        ("required_scenario", PIJS_GATE_SCENARIO),
+        ("required_runtime_engine", PIJS_GATE_RUNTIME_ENGINE),
+        ("required_build_profile", PIJS_GATE_BUILD_PROFILE),
+        (
+            "required_measurement_boundary",
+            PIJS_GATE_MEASUREMENT_BOUNDARY,
+        ),
+        (
+            "required_measurement_contract_version",
+            PIJS_GATE_MEASUREMENT_CONTRACT_VERSION,
+        ),
+    ] {
+        assert_eq!(
+            admission[field].as_str(),
+            Some(expected),
+            "unexpected PiJS admission field {field}"
+        );
+    }
+    assert_eq!(
+        admission["required_iterations"].as_u64(),
+        Some(PIJS_GATE_ITERATIONS)
+    );
+    assert_eq!(
+        admission["required_build_profile_verified"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        admission["required_tool_calls_per_iteration"],
+        json!(PIJS_GATE_TOOL_CALL_COUNTS)
+    );
+}
+
+#[test]
 fn protocol_contract_exposes_user_perceived_sli_matrix() {
     let contract = canonical_protocol_contract();
     let catalog = contract["user_perceived_sli_catalog"]
@@ -3583,6 +4806,349 @@ fn protocol_record_validator_accepts_golden_fixture() {
         validate_protocol_record(&golden).is_ok(),
         "golden protocol fixture should pass validation"
     );
+}
+
+#[test]
+fn regression_gate_admission_accepts_measured_production_evidence() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let fixture = regression_gate_protocol_fixture(tmp.path());
+    if let Err(err) = validate_protocol_record(&fixture) {
+        panic!("eligible production evidence should pass validation: {err}");
+    }
+}
+
+#[test]
+fn regression_gate_admission_rejects_unsupported_eligibility_claims() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let cases = [
+        (
+            "evidence_class",
+            json!(EVIDENCE_CLASS_INFERRED),
+            "must be measured",
+        ),
+        (
+            "confidence",
+            json!(CONFIDENCE_MEDIUM),
+            "must have high confidence",
+        ),
+        (
+            "measurement_method",
+            json!(MEASUREMENT_METHOD_SYNTHETIC),
+            "must use wall_clock_observation",
+        ),
+        (
+            "measurement_boundary",
+            json!("test_harness"),
+            "invalid regression-gate measurement_boundary token",
+        ),
+        (
+            "iterations",
+            json!(0),
+            "iterations must be a positive integer",
+        ),
+        (
+            "total_calls",
+            json!(0),
+            "total_calls must be a positive integer",
+        ),
+    ];
+
+    for (field, value, expected_error) in cases {
+        let mut fixture = regression_gate_protocol_fixture(tmp.path());
+        fixture[field] = value;
+        let err = match validate_protocol_record(&fixture) {
+            Ok(()) => panic!("eligible record with invalid {field} must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains(expected_error),
+            "invalid {field} returned unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn regression_gate_admission_recomputes_generic_build_provenance() {
+    let cases = [
+        (
+            "build_profile_verified",
+            json!(false),
+            "build_profile_verified must equal true",
+        ),
+        (
+            "compiled_opt_level",
+            json!("z"),
+            "compiled_opt_level must equal \"3\"",
+        ),
+        (
+            "binary_sha256",
+            json!("0".repeat(64)),
+            "binary_sha256 does not match binary_path",
+        ),
+        (
+            "source_dirty",
+            json!(true),
+            "source_dirty must equal false",
+        ),
+        (
+            "config_hash",
+            json!("0".repeat(64)),
+            "config_hash does not match asserted provenance",
+        ),
+    ];
+    for (field, value, expected_error) in cases {
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let mut fixture = regression_gate_protocol_fixture(tmp.path());
+        fixture[field] = value;
+        let err = validate_protocol_record(&fixture)
+            .expect_err("forged generic provenance must fail closed");
+        assert!(err.contains(expected_error), "unexpected error: {err}");
+    }
+}
+
+#[test]
+fn regression_gate_admission_requires_controlled_load_cache_policy() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let mut fixture = regression_gate_protocol_fixture(tmp.path());
+    fixture["scenario"] = json!("cold_start");
+    fixture["scenario_metadata"]["scenario_id"] = json!("cold_start");
+    fixture["runs"] = json!(5);
+    fixture
+        .as_object_mut()
+        .expect("regression fixture object")
+        .remove("host_page_cache_policy");
+
+    let missing_policy_err = validate_protocol_record(&fixture)
+        .expect_err("eligible load record without cache policy must fail");
+    assert!(
+        missing_policy_err.contains("cache-policy fields"),
+        "unexpected missing cache-policy error: {missing_policy_err}"
+    );
+
+    fixture["disk_cache_policy"] = json!("disabled");
+    fixture["host_page_cache_policy"] = json!(HOST_PAGE_CACHE_UNCONTROLLED);
+    let uncontrolled_err = validate_protocol_record(&fixture)
+        .expect_err("uncontrolled host page cache must be gate-ineligible");
+    assert!(
+        uncontrolled_err.contains("requires host_page_cache_policy"),
+        "unexpected uncontrolled-cache error: {uncontrolled_err}"
+    );
+
+    fixture["eligible_for_regression_gate"] = json!(false);
+    validate_protocol_record(&fixture)
+        .expect("explicitly ineligible load evidence may document uncontrolled host cache");
+}
+
+#[test]
+fn regression_gate_admission_allows_explicitly_ineligible_diagnostics() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let mut fixture = regression_gate_protocol_fixture(tmp.path());
+    fixture["evidence_class"] = json!(EVIDENCE_CLASS_INFERRED);
+    fixture["confidence"] = json!(CONFIDENCE_LOW);
+    fixture["eligible_for_regression_gate"] = json!(false);
+    fixture["measurement_method"] = json!(MEASUREMENT_METHOD_SYNTHETIC);
+    fixture["measurement_boundary"] = json!("synthetic_seed_generation");
+    fixture["measurement_contract_version"] = json!("synthetic_seed_generation.v1");
+    fixture["iterations"] = json!(0);
+
+    validate_protocol_record(&fixture)
+        .expect("explicitly ineligible diagnostics should remain valid evidence records");
+}
+
+#[test]
+fn generic_workload_record_validator_applies_generic_regression_gate_admission() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let (binary_path, binary_sha256) = generic_test_binary_provenance(tmp.path());
+    let source_commit = "0123456789abcdef0123456789abcdef01234567";
+    let compiled_features = ["sqlite-sessions", "tui"];
+    let config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {
+        source_commit,
+        source_dirty: false,
+        build_profile: "perf",
+        executable_build_profile: "perf",
+        executable_profile_verified: true,
+        build_fingerprint_verified: true,
+        build_profile_verified: true,
+        build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
+        compiled_profile_family: "release",
+        compiled_opt_level: "3",
+        compiled_debug: "true",
+        compiled_features: &compiled_features,
+        binary_path: &binary_path,
+        binary_sha256: &binary_sha256,
+        debug_assertions: false,
+    });
+    let mut fixture = json!({
+        "scenario": "tool_call_roundtrip",
+        "iterations": 200,
+        "tool_calls_per_iteration": 1,
+        "total_calls": 200,
+        "elapsed_ms": 10,
+        "per_call_us": 50,
+        "calls_per_sec": 20_000,
+        "evidence_class": EVIDENCE_CLASS_MEASURED,
+        "confidence": CONFIDENCE_HIGH,
+        "eligible_for_regression_gate": true,
+        "measurement_method": MEASUREMENT_METHOD_WALL_CLOCK,
+        "measurement_boundary": "production_extension_manager",
+        "measurement_contract_version": "production_extension_manager.v1",
+        "disk_cache_policy": "disabled",
+        "host_page_cache_policy": "not_applicable_measured_region",
+        "build_profile": "perf",
+        "executable_build_profile": "perf",
+        "executable_profile_verified": true,
+        "build_fingerprint_verified": true,
+        "build_profile_verified": true,
+        "build_fingerprint_contract": BUILD_FINGERPRINT_CONTRACT,
+        "compiled_profile_family": "release",
+        "compiled_opt_level": "3",
+        "compiled_debug": "true",
+        "compiled_features": compiled_features,
+        "binary_path": binary_path,
+        "binary_sha256": binary_sha256,
+        "debug_assertions": false,
+        "source_commit": source_commit,
+        "source_dirty": false,
+        "config_hash": config_hash,
+    });
+    validate_workload_record(&fixture)
+        .expect("generic eligible production workload should be valid without PiJS-only fields");
+
+    fixture["schema"] = json!(PIJS_GATE_SCHEMA);
+    fixture["tool"] = json!("another_workload");
+    validate_workload_record(&fixture).expect(
+        "the shared workload schema must not impose PiJS-only rules on another workload tool",
+    );
+
+    let mut missing_disk_policy = fixture.clone();
+    missing_disk_policy
+        .as_object_mut()
+        .expect("workload fixture object")
+        .remove("disk_cache_policy");
+    let err = validate_workload_record(&missing_disk_policy)
+        .expect_err("workload admission must require disk-cache policy metadata");
+    assert!(
+        err.contains("disk_cache_policy"),
+        "unexpected missing disk-cache policy error: {err}"
+    );
+
+    let mut null_disk_policy = fixture.clone();
+    null_disk_policy["disk_cache_policy"] = Value::Null;
+    let err = validate_workload_record(&null_disk_policy)
+        .expect_err("workload admission must reject null disk-cache policy metadata");
+    assert!(
+        err.contains("disk_cache_policy must be a non-empty string"),
+        "unexpected null disk-cache policy error: {err}"
+    );
+
+    for (field, value, expected_error) in [
+        (
+            "measurement_boundary",
+            json!("production_bogus"),
+            "invalid regression-gate measurement_boundary token",
+        ),
+        (
+            "disk_cache_policy",
+            json!("trust_me_cached"),
+            "invalid regression-gate disk_cache_policy token",
+        ),
+        (
+            "host_page_cache_policy",
+            json!("mostly_controlled"),
+            "invalid regression-gate host_page_cache_policy token",
+        ),
+    ] {
+        let mut bogus = fixture.clone();
+        bogus[field] = value;
+        let err = validate_workload_record(&bogus)
+            .expect_err("unknown regression-gate enum token must fail closed");
+        assert!(err.contains(expected_error), "unexpected error: {err}");
+    }
+
+    fixture["total_calls"] = json!(0);
+    let err = validate_workload_record(&fixture)
+        .expect_err("workload admission must reject a zero secondary sample count");
+    assert!(
+        err.contains("total_calls must be a positive integer"),
+        "unexpected workload admission error: {err}"
+    );
+}
+
+#[test]
+fn pijs_workload_admission_requires_exact_quickjs_perf_contract() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    for tool_calls in PIJS_GATE_TOOL_CALL_COUNTS {
+        validate_workload_record(&pijs_gate_workload_fixture(tmp.path(), *tool_calls))
+            .expect("canonical PiJS gate lane should be valid");
+    }
+
+    let cases = [
+        (
+            "runtime_engine",
+            json!("native_rust_runtime"),
+            "runtime_engine must equal \"quickjs\"",
+        ),
+        (
+            "build_profile",
+            json!("release"),
+            "build_profile must equal \"perf\"",
+        ),
+        (
+            "build_profile_verified",
+            json!(false),
+            "build_profile_verified must equal true",
+        ),
+        (
+            "binary_path",
+            json!(""),
+            "binary_path must be non-empty",
+        ),
+        (
+            "binary_sha256",
+            json!("not-a-digest"),
+            "binary_sha256 must be a 64-character hexadecimal string",
+        ),
+        (
+            "allocator_effective",
+            json!("jemalloc"),
+            "allocator_effective must equal \"system\"",
+        ),
+        (
+            "iterations",
+            json!(PIJS_GATE_ITERATIONS - 1),
+            "iterations must equal 2000",
+        ),
+        (
+            "tool_calls_per_iteration",
+            json!(2),
+            "tool_calls_per_iteration must be one of [1, 10]",
+        ),
+    ];
+    for (field, value, expected_error) in cases {
+        let mut fixture = pijs_gate_workload_fixture(tmp.path(), 1);
+        fixture[field] = value;
+        let err = validate_workload_record(&fixture)
+            .expect_err("non-canonical PiJS eligibility claim must fail");
+        assert!(
+            err.contains(expected_error),
+            "invalid PiJS {field} returned unexpected error: {err}"
+        );
+    }
+}
+
+#[test]
+fn pijs_workload_admission_allows_explicitly_ineligible_native_diagnostics() {
+    let tmp = tempfile::tempdir().expect("create tempdir");
+    let mut fixture = pijs_gate_workload_fixture(tmp.path(), 1);
+    fixture["runtime_engine"] = json!("native_rust_runtime");
+    fixture["measurement_boundary"] = json!("production_extension_runtime");
+    fixture["measurement_contract_version"] = json!("production_extension_runtime.v1");
+    fixture["disk_cache_policy"] = json!("not_applicable");
+    fixture["confidence"] = json!(CONFIDENCE_MEDIUM);
+    fixture["eligible_for_regression_gate"] = json!(false);
+
+    validate_workload_record(&fixture)
+        .expect("explicitly ineligible native comparison remains valid diagnostic evidence");
 }
 
 #[test]
@@ -4679,6 +6245,201 @@ fn evidence_contract_schema_includes_benchmark_protocol_definition() {
         required_fields.contains(&"partition_interpretation"),
         "benchmark protocol schema must require partition_interpretation"
     );
+    assert!(
+        !required_fields.contains(&"regression_gate_admission"),
+        "regression-gate admission must remain an optional v1 overlay"
+    );
+    assert!(
+        !required_fields.contains(&"pijs_regression_gate_admission"),
+        "PiJS-specific admission must remain an optional v1 overlay"
+    );
+
+    let admission = benchmark_protocol["properties"]["regression_gate_admission"]
+        .as_object()
+        .expect("benchmark protocol must define regression_gate_admission");
+    assert_eq!(
+        admission["additionalProperties"].as_bool(),
+        Some(false),
+        "regression-gate admission schema must reject unknown policy keys"
+    );
+    let admission_required = admission["required"]
+        .as_array()
+        .expect("regression_gate_admission.required array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<HashSet<_>>();
+    for field in [
+        "scope",
+        "required_record_fields",
+        "load_scenario_required_fields",
+        "allowed_measurement_methods",
+        "allowed_measurement_boundaries",
+        "eligible_measurement_boundaries",
+        "allowed_disk_cache_policies",
+        "allowed_host_page_cache_policies",
+        "required_eligible_provenance_fields",
+        "eligible_evidence_class",
+        "eligible_confidence",
+        "eligible_measurement_method",
+        "required_eligible_host_page_cache_policy",
+        "positive_sample_count_fields",
+        "require_positive_sample_count",
+        "uncontrolled_host_page_cache_eligible",
+    ] {
+        assert!(
+            admission_required.contains(field),
+            "regression-gate schema must require {field}"
+        );
+    }
+    assert_eq!(
+        admission["properties"]["scope"]["const"].as_str(),
+        Some(REGRESSION_GATE_GENERIC_SCOPE)
+    );
+    assert_eq!(
+        admission["properties"]["eligible_evidence_class"]["const"].as_str(),
+        Some(EVIDENCE_CLASS_MEASURED)
+    );
+    assert_eq!(
+        admission["properties"]["eligible_confidence"]["const"].as_str(),
+        Some(CONFIDENCE_HIGH)
+    );
+    assert_eq!(
+        admission["properties"]["eligible_measurement_method"]["const"].as_str(),
+        Some(MEASUREMENT_METHOD_WALL_CLOCK)
+    );
+    for (field, expected) in [
+        (
+            "allowed_measurement_boundaries",
+            REGRESSION_GATE_ALLOWED_BOUNDARIES,
+        ),
+        (
+            "eligible_measurement_boundaries",
+            REGRESSION_GATE_ELIGIBLE_BOUNDARIES,
+        ),
+        (
+            "allowed_disk_cache_policies",
+            REGRESSION_GATE_ALLOWED_DISK_CACHE_POLICIES,
+        ),
+        (
+            "allowed_host_page_cache_policies",
+            REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES,
+        ),
+        (
+            "required_eligible_provenance_fields",
+            REGRESSION_GATE_REQUIRED_ELIGIBLE_PROVENANCE_FIELDS,
+        ),
+    ] {
+        let values = admission["properties"][field]["items"]["enum"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{field} must expose an enum"))
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(values, expected, "unexpected {field} enum");
+        assert_eq!(
+            admission["properties"][field]["minItems"].as_u64(),
+            Some(expected.len() as u64),
+            "unexpected {field} minItems"
+        );
+        assert_eq!(
+            admission["properties"][field]["maxItems"].as_u64(),
+            Some(expected.len() as u64),
+            "unexpected {field} maxItems"
+        );
+    }
+    assert_eq!(
+        admission["properties"]["required_eligible_host_page_cache_policy"]["const"].as_str(),
+        Some("not_applicable_measured_region")
+    );
+    assert_eq!(
+        admission["properties"]["required_record_fields"]["minItems"].as_u64(),
+        Some(REGRESSION_GATE_REQUIRED_RECORD_FIELDS.len() as u64)
+    );
+    assert_eq!(
+        admission["properties"]["required_record_fields"]["maxItems"].as_u64(),
+        Some(REGRESSION_GATE_REQUIRED_RECORD_FIELDS.len() as u64)
+    );
+    let required_record_field_values =
+        admission["properties"]["required_record_fields"]["items"]["enum"]
+            .as_array()
+            .expect("regression-gate required record field enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<HashSet<_>>();
+    assert!(
+        required_record_field_values.contains("disk_cache_policy"),
+        "regression-gate schema must require explicit disk-cache policy metadata"
+    );
+    assert_eq!(
+        admission["properties"]["require_positive_sample_count"]["const"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        admission["properties"]["uncontrolled_host_page_cache_eligible"]["const"].as_bool(),
+        Some(false)
+    );
+
+    let pijs_admission = benchmark_protocol["properties"]["pijs_regression_gate_admission"]
+        .as_object()
+        .expect("benchmark protocol must define pijs_regression_gate_admission");
+    assert_eq!(
+        pijs_admission["additionalProperties"].as_bool(),
+        Some(false)
+    );
+    let pijs_admission_required = pijs_admission["required"]
+        .as_array()
+        .expect("pijs_regression_gate_admission.required array");
+    assert!(
+        pijs_admission_required
+            .iter()
+            .any(|field| field.as_str() == Some("required_record_fields")),
+        "PiJS admission schema must require its complete record-field inventory"
+    );
+    assert!(
+        pijs_admission_required
+            .iter()
+            .any(|field| field.as_str() == Some("required_build_profile_verified")),
+        "PiJS admission schema must require executable-path profile verification"
+    );
+    assert_eq!(
+        pijs_admission["properties"]["scope"]["const"].as_str(),
+        Some(PIJS_GATE_SCOPE)
+    );
+    assert_eq!(
+        pijs_admission["properties"]["required_runtime_engine"]["const"].as_str(),
+        Some(PIJS_GATE_RUNTIME_ENGINE)
+    );
+    assert_eq!(
+        pijs_admission["properties"]["required_build_profile"]["const"].as_str(),
+        Some(PIJS_GATE_BUILD_PROFILE)
+    );
+    assert_eq!(
+        pijs_admission["properties"]["required_build_profile_verified"]["const"].as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        pijs_admission["properties"]["required_iterations"]["const"].as_u64(),
+        Some(PIJS_GATE_ITERATIONS)
+    );
+    assert_eq!(
+        pijs_admission["properties"]["required_record_fields"]["minItems"].as_u64(),
+        Some(PIJS_GATE_REQUIRED_RECORD_FIELDS.len() as u64)
+    );
+    assert_eq!(
+        pijs_admission["properties"]["required_record_fields"]["maxItems"].as_u64(),
+        Some(PIJS_GATE_REQUIRED_RECORD_FIELDS.len() as u64)
+    );
+    let pijs_required_record_fields = pijs_admission["properties"]["required_record_fields"]
+        ["items"]["enum"]
+        .as_array()
+        .expect("PiJS required record field enum")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pijs_required_record_fields, PIJS_GATE_REQUIRED_RECORD_FIELDS,
+        "PiJS admission schema must enumerate every required record field exactly"
+    );
 
     assert_eq!(
         benchmark_protocol["properties"]["partition_interpretation"]["properties"]
@@ -5563,7 +7324,7 @@ fn orchestrate_phase1_weighted_attribution_missing_when_no_stage_cells_are_valid
 #[test]
 fn validate_rust_bench_schema() {
     let root = project_root();
-    let events = read_jsonl_file(&root.join("target/perf/scenario_runner.jsonl"));
+    let events = read_jsonl_file_or_panic(&root.join("target/perf/scenario_runner.jsonl"));
     if events.is_empty() {
         eprintln!("[schema] No scenario_runner.jsonl data — skipping");
         return;
@@ -5587,18 +7348,17 @@ fn validate_rust_bench_schema() {
 #[test]
 fn validate_workload_schema() {
     let root = project_root();
-    let events = read_jsonl_file(&root.join("target/perf/pijs_workload.jsonl"));
-    if events.is_empty() {
+    let Some((source, events)) = load_selected_pijs_schema_artifact(&root)
+        .unwrap_or_else(|err| panic!("{err}"))
+    else {
         eprintln!("[schema] No pijs_workload.jsonl data — skipping");
         return;
-    }
+    };
 
     for event in &events {
-        let missing = has_required_fields(event, WORKLOAD_REQUIRED);
-        assert!(
-            missing.is_empty(),
-            "workload event missing required fields: {missing:?}"
-        );
+        if let Err(err) = validate_workload_record(event) {
+            panic!("invalid workload event in {}: {err}", source.display());
+        }
     }
     eprintln!("[schema] Validated {} pijs_workload events", events.len());
 }
@@ -5606,7 +7366,8 @@ fn validate_workload_schema() {
 #[test]
 fn validate_legacy_bench_schema() {
     let root = project_root();
-    let events = read_jsonl_file(&root.join("target/perf/legacy_extension_workloads.jsonl"));
+    let events =
+        read_jsonl_file_or_panic(&root.join("target/perf/legacy_extension_workloads.jsonl"));
     if events.is_empty() {
         eprintln!("[schema] No legacy benchmark data — skipping");
         return;
@@ -5630,7 +7391,7 @@ fn validate_legacy_bench_schema() {
 #[test]
 fn validate_budget_events_schema() {
     let root = project_root();
-    let events = read_jsonl_file(&root.join("tests/perf/reports/budget_events.jsonl"));
+    let events = read_jsonl_file_or_panic(&root.join("tests/perf/reports/budget_events.jsonl"));
     if events.is_empty() {
         eprintln!("[schema] No budget events — skipping");
         return;
@@ -5658,8 +7419,9 @@ fn validate_budget_events_schema() {
 #[test]
 fn validate_conformance_events_schema() {
     let root = project_root();
-    let events =
-        read_jsonl_file(&root.join("tests/ext_conformance/reports/conformance_events.jsonl"));
+    let events = read_jsonl_file_or_panic(
+        &root.join("tests/ext_conformance/reports/conformance_events.jsonl"),
+    );
     if events.is_empty() {
         eprintln!("[schema] No conformance events — skipping");
         return;
@@ -5686,7 +7448,7 @@ fn validate_conformance_events_schema() {
 #[test]
 fn validate_scenario_runner_protocol_contract() {
     let root = project_root();
-    let events = read_jsonl_file(&root.join("target/perf/scenario_runner.jsonl"));
+    let events = read_jsonl_file_or_panic(&root.join("target/perf/scenario_runner.jsonl"));
     if events.is_empty() {
         eprintln!("[schema] No scenario_runner.jsonl data — skipping");
         return;
@@ -5708,7 +7470,8 @@ fn jsonl_records_have_stable_key_ordering() {
     let root = project_root();
 
     // Check that legacy bench records have deterministic key ordering
-    let events = read_jsonl_file(&root.join("target/perf/legacy_extension_workloads.jsonl"));
+    let events =
+        read_jsonl_file_or_panic(&root.join("target/perf/legacy_extension_workloads.jsonl"));
     if !events.is_empty() {
         // All records with same schema should have same top-level key set
         let first_keys: Vec<String> = events[0]
@@ -5735,7 +7498,9 @@ fn jsonl_records_have_stable_key_ordering() {
     }
 
     // Check workload records
-    let events = read_jsonl_file(&root.join("target/perf/pijs_workload.jsonl"));
+    let events = load_selected_pijs_schema_artifact(&root)
+        .unwrap_or_else(|err| panic!("{err}"))
+        .map_or_else(Vec::new, |(_, events)| events);
     if events.len() >= 2 {
         let keys_0: Vec<String> = events[0]
             .as_object()
@@ -5755,6 +7520,12 @@ fn jsonl_records_have_stable_key_ordering() {
 
 #[test]
 fn generate_schema_doc() {
+    if !schema_doc_generation_requested() {
+        eprintln!(
+            "[schema] Documentation generation skipped; set PI_GENERATE_BENCH_SCHEMA_DOCS=1 to write tracked schema files"
+        );
+        return;
+    }
     let root = project_root();
     let reports_dir = root.join("tests/perf/reports");
     let _ = std::fs::create_dir_all(&reports_dir);
@@ -5816,17 +7587,17 @@ fn generate_schema_doc() {
     md.push_str("| Field | Type | Description |\n");
     md.push_str("|---|---|---|\n");
     for field in WORKLOAD_REQUIRED {
-        let desc = match *field {
-            "scenario" => "Workload scenario name",
-            "iterations" => "Number of outer iterations",
-            "tool_calls_per_iteration" => "Tool calls per iteration",
-            "total_calls" => "Total tool calls executed",
-            "elapsed_ms" => "Total elapsed milliseconds",
-            "per_call_us" => "Per-call latency in microseconds",
-            "calls_per_sec" => "Throughput (calls per second)",
-            _ => "",
+        let (typ, desc) = match *field {
+            "scenario" => ("string", "Workload scenario name"),
+            "iterations" => ("integer", "Number of outer iterations"),
+            "tool_calls_per_iteration" => ("integer", "Tool calls per iteration"),
+            "total_calls" => ("integer", "Total tool calls executed"),
+            "elapsed_ms" => ("number", "Total elapsed milliseconds"),
+            "per_call_us" => ("number", "Per-call latency in microseconds"),
+            "calls_per_sec" => ("number", "Throughput (calls per second)"),
+            _ => ("unknown", ""),
         };
-        let _ = writeln!(md, "| `{field}` | number | {desc} |");
+        let _ = writeln!(md, "| `{field}` | {typ} | {desc} |");
     }
     md.push('\n');
 
@@ -5848,7 +7619,13 @@ fn generate_schema_doc() {
         "| `required_metadata_fields` | string[] | `runtime`, `build_profile`, `host`, `scenario_id`, `correlation_id` |\n",
     );
     md.push_str(
-        "| `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |\n\n",
+        "| `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |\n",
+    );
+    md.push_str(
+        "| `regression_gate_admission` | object | Generic additive metadata policy only: measured, high-confidence wall-clock evidence at an enumerated production boundary with a positive sample count, exact cache-policy tokens, a clean source commit, and a verified canonical perf executable/config fingerprint |\n",
+    );
+    md.push_str(
+        "| `pijs_regression_gate_admission` | object | PiJS-specific release gate layered on the generic policy: exactly 2000 path-verified perf-profile QuickJS iterations through the production extension manager, with 1-call mean-latency and 10-call throughput lanes |\n",
     );
     md.push_str(
         "| `partition_weighting` | object | Machine-readable partition weights (`realistic` + `matched-state`) with explicit sum-to-one contract |\n",
@@ -5970,11 +7747,9 @@ fn generate_schema_doc() {
     });
 
     let registry_path = reports_dir.join("bench_schema_registry.json");
-    std::fs::write(
-        &registry_path,
-        serde_json::to_string_pretty(&registry).unwrap_or_default(),
-    )
-    .expect("write bench_schema_registry.json");
+    let mut registry_json = serde_json::to_string_pretty(&registry).unwrap_or_default();
+    registry_json.push('\n');
+    std::fs::write(&registry_path, registry_json).expect("write bench_schema_registry.json");
 
     eprintln!("[schema] Generated:");
     eprintln!("  {}", md_path.display());

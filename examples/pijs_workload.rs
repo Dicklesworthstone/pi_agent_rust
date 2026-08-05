@@ -15,11 +15,17 @@ use pi::tools::ToolRegistry;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::fs;
+use std::num::NonZeroUsize;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 const QUICKJS_RUNTIME_TOOL_NAME: &str = "hello";
 const NATIVE_RUNTIME_TOOL_NAME: &str = "bench_tool";
+const REGRESSION_GATE_ITERATIONS: usize = 2_000;
+const REGRESSION_GATE_TOOL_CALLS: [usize; 2] = [1, 10];
+const BENCH_RUN_ID_ENV: &str = "PI_BENCH_RUN_ID";
+const BENCH_CORRELATION_ID_ENV: &str = "PI_BENCH_CORRELATION_ID";
 
 const NATIVE_RUNTIME_DESCRIPTOR: &str = r#"
 {
@@ -56,11 +62,15 @@ const NATIVE_RUNTIME_DESCRIPTOR: &str = r#"
 #[command(about = "Deterministic PiJS workload runner for perf baselines")]
 struct Args {
     /// Outer loop iterations.
-    #[arg(long, default_value_t = 200)]
-    iterations: usize,
+    #[arg(
+        long,
+        default_value_t = NonZeroUsize::new(REGRESSION_GATE_ITERATIONS)
+            .expect("regression-gate iteration count is nonzero")
+    )]
+    iterations: NonZeroUsize,
     /// Tool calls per iteration.
-    #[arg(long, default_value_t = 1)]
-    tool_calls: usize,
+    #[arg(long, default_value_t = NonZeroUsize::MIN)]
+    tool_calls: NonZeroUsize,
     /// Runtime engine used by the benchmark harness.
     #[arg(long, value_enum, default_value_t = WorkloadRuntimeEngine::Quickjs)]
     runtime_engine: WorkloadRuntimeEngine,
@@ -97,6 +107,75 @@ impl WorkloadRuntimeEngine {
             Self::NativeRustPreview => "in_process_preview.v1",
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct RegressionGateInputs<'a> {
+    runtime_engine: WorkloadRuntimeEngine,
+    build_profile: &'a str,
+    build_fingerprint_verified: bool,
+    binary_profile_verified: bool,
+    canonical_features: bool,
+    canonical_allocator: bool,
+    run_identity_verified: bool,
+    source_identity_verified: bool,
+    debug_assertions: bool,
+    iterations: usize,
+    tool_calls: usize,
+}
+
+fn is_regression_gate_eligible(inputs: RegressionGateInputs<'_>) -> bool {
+    !inputs.debug_assertions
+        && inputs.build_profile == "perf"
+        && inputs.build_fingerprint_verified
+        && inputs.binary_profile_verified
+        && inputs.canonical_features
+        && inputs.canonical_allocator
+        && inputs.run_identity_verified
+        && inputs.source_identity_verified
+        && inputs.runtime_engine == WorkloadRuntimeEngine::Quickjs
+        && inputs.iterations == REGRESSION_GATE_ITERATIONS
+        && REGRESSION_GATE_TOOL_CALLS.contains(&inputs.tool_calls)
+}
+
+fn nonempty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn run_identity_is_canonical(run_id: Option<&str>, correlation_id: Option<&str>) -> bool {
+    matches!(
+        (run_id.map(str::trim), correlation_id.map(str::trim)),
+        (Some(run_id), Some(correlation_id))
+            if !run_id.is_empty() && run_id == correlation_id
+    )
+}
+
+fn canonical_executable_path(path: &Path) -> Result<std::path::PathBuf> {
+    std::fs::canonicalize(path).map_err(|err| {
+        Error::extension(format!(
+            "failed to canonicalize workload executable {}: {err}",
+            path.display()
+        ))
+    })
+}
+
+fn is_full_git_sha(value: &str) -> bool {
+    value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn checked_total_calls(iterations: usize, tool_calls: usize) -> Result<(usize, u32)> {
+    let total_calls = iterations
+        .checked_mul(tool_calls)
+        .ok_or_else(|| Error::extension("iterations * tool-calls exceeds usize"))?;
+    let total_calls_u32 = u32::try_from(total_calls).map_err(|_| {
+        Error::extension(format!(
+            "iterations * tool-calls ({total_calls}) exceeds the exact u32 evidence range"
+        ))
+    })?;
+    Ok((total_calls, total_calls_u32))
 }
 
 #[derive(Debug)]
@@ -182,10 +261,76 @@ fn main() {
 fn run() -> Result<()> {
     let args = Args::parse();
     let build_profile = perf_build::detect_build_profile();
+    let current_exe = std::env::current_exe().map_err(|err| {
+        Error::extension(format!("failed to resolve current workload executable: {err}"))
+    })?;
+    let current_exe = canonical_executable_path(&current_exe)?;
+    let binary_path_profile = perf_build::profile_from_target_path(&current_exe);
+    let binary_profile_verified = binary_path_profile.as_deref() == Some("perf");
+    let build_fingerprint_verified = perf_build::has_canonical_perf_build_fingerprint();
+    let canonical_features = perf_build::has_canonical_pijs_perf_features();
+    let build_profile_verified = build_fingerprint_verified && binary_profile_verified;
     let allocator = perf_build::resolve_bench_allocator();
-    let binary_path = std::env::current_exe()
-        .ok()
-        .map_or_else(|| "unknown".to_string(), |path| path.display().to_string());
+    let canonical_allocator = allocator.requested == "system"
+        && allocator.requested_source == "env"
+        && allocator.effective == perf_build::AllocatorKind::System
+        && allocator.fallback_reason.is_none();
+    let supplied_run_id = nonempty_env(BENCH_RUN_ID_ENV);
+    let supplied_correlation_id = nonempty_env(BENCH_CORRELATION_ID_ENV);
+    let run_identity_verified = run_identity_is_canonical(
+        supplied_run_id.as_deref(),
+        supplied_correlation_id.as_deref(),
+    );
+    let fallback_run_id = uuid::Uuid::new_v4().to_string();
+    let run_id = supplied_run_id.unwrap_or_else(|| fallback_run_id.clone());
+    let correlation_id = supplied_correlation_id.unwrap_or(fallback_run_id);
+    let source_commit = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
+    let source_dirty = option_env!("VERGEN_GIT_DIRTY") != Some("false");
+    let source_identity_verified = is_full_git_sha(source_commit) && !source_dirty;
+    let eligible_for_regression_gate = is_regression_gate_eligible(RegressionGateInputs {
+        runtime_engine: args.runtime_engine,
+        build_profile: &build_profile,
+        build_fingerprint_verified,
+        binary_profile_verified,
+        canonical_features,
+        canonical_allocator,
+        run_identity_verified,
+        source_identity_verified,
+        debug_assertions: cfg!(debug_assertions),
+        iterations: args.iterations.get(),
+        tool_calls: args.tool_calls.get(),
+    });
+    let (total_calls, total_calls_u32) =
+        checked_total_calls(args.iterations.get(), args.tool_calls.get())?;
+    let binary_sha256 = perf_build::sha256_file(&current_exe).map_err(|err| {
+        Error::extension(format!(
+            "failed to hash workload executable {}: {err}",
+            current_exe.display()
+        ))
+    })?;
+    let binary_path = current_exe.display().to_string();
+    let compiled_features = perf_build::compiled_feature_set();
+    let executable_build_profile = binary_path_profile.as_deref().unwrap_or("unknown");
+    let config_hash = perf_build::benchmark_provenance_config_hash(
+        &perf_build::BenchmarkProvenance {
+            source_commit,
+            source_dirty,
+            build_profile: &build_profile,
+            executable_build_profile,
+            executable_profile_verified: binary_profile_verified,
+            build_fingerprint_verified,
+            build_profile_verified,
+            build_fingerprint_contract: perf_build::BUILD_FINGERPRINT_CONTRACT,
+            compiled_profile_family: perf_build::COMPILED_PROFILE_FAMILY,
+            compiled_opt_level: perf_build::COMPILED_OPT_LEVEL,
+            compiled_debug: perf_build::COMPILED_DEBUG,
+            compiled_features: &compiled_features,
+            binary_path: &binary_path,
+            binary_sha256: &binary_sha256,
+            debug_assertions: cfg!(debug_assertions),
+        },
+    );
+    let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let quickjs_runtime = if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
         Some(setup_quickjs_runtime()?)
@@ -204,8 +349,8 @@ fn run() -> Result<()> {
     };
 
     let start = Instant::now();
-    for _ in 0..args.iterations {
-        for _ in 0..args.tool_calls {
+    for _ in 0..args.iterations.get() {
+        for _ in 0..args.tool_calls.get() {
             match args.runtime_engine {
                 WorkloadRuntimeEngine::Quickjs => {
                     if let Some(runtime) = quickjs_runtime.as_ref() {
@@ -239,18 +384,17 @@ fn run() -> Result<()> {
     }
     let elapsed = start.elapsed();
 
-    let total_calls = args.iterations.saturating_mul(args.tool_calls);
     let elapsed_millis = elapsed.as_millis();
     let elapsed_micros = elapsed.as_micros();
+    let elapsed_micros_f64 = elapsed.as_secs_f64() * 1_000_000.0;
     let total_calls_u128 = total_calls as u128;
 
     let per_call_us = elapsed_micros.checked_div(total_calls_u128).unwrap_or(0);
-    let calls_count_u32 = u32::try_from(total_calls_u128).unwrap_or(u32::MAX);
-    let calls_count_float = f64::from(calls_count_u32);
+    let calls_count_float = f64::from(total_calls_u32);
     let per_call_micros_f64 = if total_calls_u128 == 0 {
         0.0
     } else {
-        elapsed.as_secs_f64() * 1_000_000.0 / calls_count_float
+        elapsed_micros_f64 / calls_count_float
     };
     let per_call_nanos_f64 = if total_calls_u128 == 0 {
         0.0
@@ -262,38 +406,63 @@ fn run() -> Result<()> {
         .checked_div(elapsed_micros)
         .unwrap_or(0);
 
-    if let Some(runtime) = native_runtime_handle {
-        if !block_on(runtime.shutdown(Duration::from_secs(5))) {
-            return Err(Error::extension(
-                "native workload runtime did not shut down",
-            ));
-        }
+    if let Some(runtime) = native_runtime_handle
+        && !block_on(runtime.shutdown(Duration::from_secs(5)))
+    {
+        return Err(Error::extension(
+            "native workload runtime did not shut down",
+        ));
     }
-    if let Some(runtime) = quickjs_runtime {
-        if !block_on(runtime.manager.shutdown(Duration::from_secs(5))) {
-            return Err(Error::extension(
-                "quickjs workload runtime did not shut down",
-            ));
-        }
+    if let Some(runtime) = quickjs_runtime
+        && !block_on(runtime.manager.shutdown(Duration::from_secs(5)))
+    {
+        return Err(Error::extension(
+            "quickjs workload runtime did not shut down",
+        ));
     }
 
     println!(
         "{}",
         json!({
             "schema": "pi.perf.workload.v1",
+            "timestamp": timestamp,
+            "run_id": run_id,
+            "correlation_id": correlation_id,
+            "source_commit": source_commit,
+            "source_dirty": source_dirty,
             "tool": "pijs_workload",
             "scenario": "tool_call_roundtrip",
-            "iterations": args.iterations,
-            "tool_calls_per_iteration": args.tool_calls,
+            "iterations": args.iterations.get(),
+            "tool_calls_per_iteration": args.tool_calls.get(),
             "total_calls": total_calls,
             "elapsed_ms": elapsed_millis,
             "elapsed_us": elapsed_micros,
+            "elapsed_us_f64": elapsed_micros_f64,
             "per_call_us": per_call_us,
             "per_call_us_f64": per_call_micros_f64,
             "per_call_ns_f64": per_call_nanos_f64,
             "calls_per_sec": calls_per_sec,
             "build_profile": build_profile,
+            "build_profile_verified": build_profile_verified,
+            "build_fingerprint_contract": perf_build::BUILD_FINGERPRINT_CONTRACT,
+            "build_fingerprint_verified": build_fingerprint_verified,
+            "compiled_profile_family": perf_build::COMPILED_PROFILE_FAMILY,
+            "compiled_opt_level": perf_build::COMPILED_OPT_LEVEL,
+            "compiled_debug": perf_build::COMPILED_DEBUG,
+            "compiled_features": compiled_features,
+            "executable_build_profile": executable_build_profile,
+            "executable_profile_verified": binary_profile_verified,
+            "debug_assertions": cfg!(debug_assertions),
+            "config_hash": config_hash,
             "runtime_engine": args.runtime_engine.as_str(),
+            "evidence_class": "measured",
+            "confidence": if eligible_for_regression_gate {
+                "high"
+            } else {
+                "medium"
+            },
+            "eligible_for_regression_gate": eligible_for_regression_gate,
+            "measurement_method": "wall_clock_observation",
             "measurement_boundary": args.runtime_engine.measurement_boundary(),
             "measurement_contract_version": args.runtime_engine.measurement_contract_version(),
             "disk_cache_policy": if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
@@ -301,11 +470,13 @@ fn run() -> Result<()> {
             } else {
                 "not_applicable"
             },
+            "host_page_cache_policy": "not_applicable_measured_region",
             "allocator_requested": allocator.requested,
             "allocator_request_source": allocator.requested_source,
             "allocator_effective": allocator.effective.as_str(),
             "allocator_fallback_reason": allocator.fallback_reason,
             "binary_path": binary_path,
+            "binary_sha256": binary_sha256,
         })
     );
 
@@ -410,14 +581,137 @@ fn run_tool_roundtrip_native_runtime(runtime: &ExtensionRuntimeHandle) -> Result
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
     use pi::perf_build::profile_from_target_path;
     use std::path::Path;
     use std::time::Duration;
 
     use crate::{
-        NativeBenchRuntime, run_tool_roundtrip_native, run_tool_roundtrip_native_runtime,
-        setup_native_runtime_bench_handle,
+        Args, NativeBenchRuntime, REGRESSION_GATE_ITERATIONS, RegressionGateInputs,
+        WorkloadRuntimeEngine, checked_total_calls, is_regression_gate_eligible,
+        is_full_git_sha, run_identity_is_canonical, run_tool_roundtrip_native,
+        run_tool_roundtrip_native_runtime, setup_native_runtime_bench_handle,
     };
+
+    #[test]
+    fn workload_args_reject_zero_work() {
+        assert!(
+            Args::try_parse_from(["pijs_workload", "--iterations", "0"]).is_err(),
+            "zero outer iterations must not produce benchmark evidence"
+        );
+        assert!(
+            Args::try_parse_from(["pijs_workload", "--tool-calls", "0"]).is_err(),
+            "zero tool calls must not produce benchmark evidence"
+        );
+    }
+
+    #[test]
+    fn total_call_count_rejects_inexact_evidence_range() {
+        assert_eq!(
+            checked_total_calls(2_000, 10).expect("canonical count"),
+            (20_000, 20_000)
+        );
+
+        if let Ok(too_many_calls) = usize::try_from(u64::from(u32::MAX) + 1) {
+            let err = checked_total_calls(too_many_calls, 1)
+                .expect_err("counts beyond u32 must fail rather than clamp");
+            assert!(
+                err.to_string()
+                    .contains("exceeds the exact u32 evidence range")
+            );
+        }
+    }
+
+    #[test]
+    fn regression_gate_eligibility_requires_perf_production_runtime() {
+        let canonical = RegressionGateInputs {
+            runtime_engine: WorkloadRuntimeEngine::Quickjs,
+            build_profile: "perf",
+            build_fingerprint_verified: true,
+            binary_profile_verified: true,
+            canonical_features: true,
+            canonical_allocator: true,
+            run_identity_verified: true,
+            source_identity_verified: true,
+            debug_assertions: false,
+            iterations: REGRESSION_GATE_ITERATIONS,
+            tool_calls: 1,
+        };
+        assert!(is_regression_gate_eligible(canonical));
+
+        for invalid in [
+            RegressionGateInputs {
+                runtime_engine: WorkloadRuntimeEngine::NativeRustRuntime,
+                ..canonical
+            },
+            RegressionGateInputs {
+                runtime_engine: WorkloadRuntimeEngine::NativeRustPreview,
+                ..canonical
+            },
+            RegressionGateInputs {
+                build_profile: "release",
+                ..canonical
+            },
+            RegressionGateInputs {
+                build_fingerprint_verified: false,
+                ..canonical
+            },
+            RegressionGateInputs {
+                binary_profile_verified: false,
+                ..canonical
+            },
+            RegressionGateInputs {
+                canonical_features: false,
+                ..canonical
+            },
+            RegressionGateInputs {
+                canonical_allocator: false,
+                ..canonical
+            },
+            RegressionGateInputs {
+                run_identity_verified: false,
+                ..canonical
+            },
+            RegressionGateInputs {
+                source_identity_verified: false,
+                ..canonical
+            },
+            RegressionGateInputs {
+                debug_assertions: true,
+                ..canonical
+            },
+            RegressionGateInputs {
+                iterations: REGRESSION_GATE_ITERATIONS - 1,
+                ..canonical
+            },
+            RegressionGateInputs {
+                tool_calls: 2,
+                ..canonical
+            },
+        ] {
+            assert!(!is_regression_gate_eligible(invalid));
+        }
+    }
+
+    #[test]
+    fn release_identity_requires_one_nonempty_shared_identifier() {
+        assert!(run_identity_is_canonical(Some("run-123"), Some("run-123")));
+        assert!(!run_identity_is_canonical(
+            Some("run-123"),
+            Some("other-run")
+        ));
+        assert!(!run_identity_is_canonical(Some(""), Some("")));
+        assert!(!run_identity_is_canonical(Some("run-123"), None));
+    }
+
+    #[test]
+    fn release_source_identity_requires_full_git_sha() {
+        assert!(is_full_git_sha("0123456789abcdef0123456789abcdef01234567"));
+        assert!(!is_full_git_sha("abc123"));
+        assert!(!is_full_git_sha(
+            "0123456789abcdef0123456789abcdef0123456g"
+        ));
+    }
 
     #[test]
     fn profile_from_target_path_detects_perf() {
@@ -447,7 +741,13 @@ mod tests {
     #[test]
     fn profile_from_target_path_returns_none_outside_target() {
         let path = Path::new("/tmp/repo/bin/pijs_workload");
-        assert_eq!(profile_from_target_path(path), None);
+        assert_eq!(profile_from_target_path(path).as_deref(), Some("bin"));
+    }
+
+    #[test]
+    fn profile_from_target_path_supports_custom_target_dir() {
+        let path = Path::new("/tmp/pi-build/perf/examples/pijs_workload");
+        assert_eq!(profile_from_target_path(path).as_deref(), Some("perf"));
     }
 
     #[test]

@@ -113,6 +113,23 @@
       "realistic": 0.7,
       "weights_sum_to": 1.0
     },
+    "pijs_regression_gate_admission": {
+      "inherits": "regression_gate_admission",
+      "required_build_profile": "perf",
+      "required_build_profile_verified": true,
+      "required_iterations": 2000,
+      "required_measurement_boundary": "production_extension_manager",
+      "required_measurement_contract_version": "production_extension_manager.v1",
+      "required_runtime_engine": "quickjs",
+      "required_scenario": "tool_call_roundtrip",
+      "required_schema": "pi.perf.workload.v1",
+      "required_tool": "pijs_workload",
+      "required_tool_calls_per_iteration": [
+        1,
+        10
+      ],
+      "scope": "pi.perf.workload.v1/pijs_workload"
+    },
     "realistic_replay_inputs": [
       {
         "partition": "realistic",
@@ -172,6 +189,37 @@
       1000000,
       5000000
     ],
+    "regression_gate_admission": {
+      "allowed_measurement_methods": [
+        "wall_clock_observation",
+        "synthetic_seed_projection"
+      ],
+      "eligible_boundary_prefix": "production_",
+      "eligible_confidence": "high",
+      "eligible_evidence_class": "measured",
+      "eligible_measurement_method": "wall_clock_observation",
+      "load_scenario_required_fields": [
+        "disk_cache_policy",
+        "host_page_cache_policy"
+      ],
+      "positive_sample_count_fields": [
+        "runs",
+        "iterations",
+        "total_calls"
+      ],
+      "require_positive_sample_count": true,
+      "required_record_fields": [
+        "evidence_class",
+        "confidence",
+        "eligible_for_regression_gate",
+        "measurement_method",
+        "measurement_boundary",
+        "measurement_contract_version",
+        "disk_cache_policy"
+      ],
+      "scope": "generic_benchmark_record",
+      "uncontrolled_host_page_cache_eligible": false
+    },
     "required_metadata_fields": [
       "runtime",
       "build_profile",

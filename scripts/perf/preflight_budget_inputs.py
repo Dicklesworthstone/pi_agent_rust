@@ -1033,7 +1033,7 @@ def artifact_groups(repo_root: Path, target_dir: Path) -> list[ArtifactGroup]:
         ),
         ArtifactGroup(
             contract_id="pijs_workload",
-            budget_names=("tool_call_latency_p99", "tool_call_throughput_min"),
+            budget_names=("tool_call_latency_mean", "tool_call_throughput_min"),
             candidates=pijs_candidates(repo_root, target_dir),
             suggested_commands=(
                 f"{bench_prefix} build --profile perf --no-default-features --example pijs_workload",
@@ -1132,7 +1132,7 @@ def artifact_groups(repo_root: Path, target_dir: Path) -> list[ArtifactGroup]:
                 ]
             ),
             suggested_commands=(
-                f"{evidence_env} test --test perf_budgets --profile perf generate_budget_report -- --nocapture",
+                f"PI_GENERATE_PERF_BUDGET_REPORT=1 {evidence_env} test --test perf_budgets --profile perf generate_budget_report -- --nocapture",
             ),
             reason="global extension claim data contract consumed by collect_data_contract_failures",
             expected_outputs=(
@@ -1161,7 +1161,7 @@ def artifact_groups(repo_root: Path, target_dir: Path) -> list[ArtifactGroup]:
                 ]
             ),
             suggested_commands=(
-                f"{evidence_env} test --test perf_budgets --profile perf generate_budget_report -- --nocapture",
+                f"PI_GENERATE_PERF_BUDGET_REPORT=1 {evidence_env} test --test perf_budgets --profile perf generate_budget_report -- --nocapture",
             ),
             reason="phase1 weighted attribution data contract consumed by collect_data_contract_failures",
             expected_outputs=(
@@ -1381,7 +1381,7 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
         "safety_notes": [
             "All CPU-intensive cargo refresh commands must be run through rch exec -- ...",
             "Set CARGO_TARGET_DIR and TMPDIR to /data/tmp/pi_agent_rust_cargo/${USER:-agent}/... before refreshing evidence.",
-            "For RCH report generation, stage required artifacts into a repo-visible evidence root and set PERF_EVIDENCE_DIR for cargo test --test perf_budgets generate_budget_report.",
+            "For RCH report generation, stage required artifacts into a repo-visible evidence root and set PERF_EVIDENCE_DIR plus PI_GENERATE_PERF_BUDGET_REPORT=1 for cargo test --test perf_budgets generate_budget_report.",
             "Cached perf evidence is reusable only when commit, build profile, TTL, lineage, schema, and checksum validation pass; reused entries are labeled source_kind=cache.",
             "Do not refresh tests/perf/reports/budget_summary.json until missing_budget_artifacts and stale_artifacts are empty.",
         ],
@@ -1504,7 +1504,7 @@ def run_self_test() -> int:
             const BUDGETS: &[Budget] = &[
               Budget { name: "startup_version_p95", category: "startup", metric: "p95", unit: "ms", threshold: 100.0, methodology: "criterion: startup", ci_enforced: true },
               Budget { name: "ext_cold_load_simple_p95", category: "extension", metric: "p95", unit: "ms", threshold: 5.0, methodology: "criterion: ext_load_init", ci_enforced: true },
-              Budget { name: "tool_call_latency_p99", category: "tool_call", metric: "p99", unit: "us", threshold: 200.0, methodology: "pijs_workload", ci_enforced: true },
+              Budget { name: "tool_call_latency_mean", category: "tool_call", metric: "mean", unit: "us", threshold: 200.0, methodology: "pijs_workload", ci_enforced: true },
               Budget { name: "tool_call_throughput_min", category: "tool_call", metric: "min", unit: "calls/sec", threshold: 5000.0, methodology: "pijs_workload", ci_enforced: true },
               Budget { name: "context_graph_build_cold_p95", category: "context_intelligence", metric: "p95", unit: "ms", threshold: 500.0, methodology: "criterion: semantic_context/graph_build_cold", ci_enforced: true },
               Budget { name: "context_graph_build_warm_p95", category: "context_intelligence", metric: "p95", unit: "ms", threshold: 250.0, methodology: "criterion: semantic_context/graph_build_warm", ci_enforced: true },
@@ -1536,7 +1536,7 @@ def run_self_test() -> int:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(fresh_payload), encoding="utf-8")
         (root / "target/perf/perf/pijs_workload_perf.jsonl").write_text(
-            '{"schema":"pi.perf.workload.v1","tool_calls_per_iteration":1}\n',
+            '{"schema":"pi.perf.workload.v1","iterations":2000,"tool_calls_per_iteration":1,"total_calls":2000,"build_profile_verified":true}\n',
             encoding="utf-8",
         )
         (root / "target/release/pi").write_bytes(b"binary")

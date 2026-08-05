@@ -15,6 +15,15 @@ BENCH_ALLOCATORS_CSV="${BENCH_ALLOCATORS_CSV:-system,jemalloc}"
 BENCH_ALLOCATOR_FALLBACK="${BENCH_ALLOCATOR_FALLBACK:-system}"
 BENCH_CARGO_RUNNER="${BENCH_CARGO_RUNNER:-auto}"
 BENCH_SYSTEM_FEATURES="${BENCH_SYSTEM_FEATURES:-image-resize,clipboard,wasm-host,sqlite-sessions}"
+BENCH_RUN_ID="${BENCH_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+BENCH_CORRELATION_ID="${BENCH_CORRELATION_ID:-$BENCH_RUN_ID}"
+
+if [[ -z "$BENCH_RUN_ID" || "$BENCH_RUN_ID" != "$BENCH_CORRELATION_ID" ]]; then
+  echo "BENCH_RUN_ID and BENCH_CORRELATION_ID must be the same non-empty identifier" >&2
+  exit 1
+fi
+export PI_BENCH_RUN_ID="$BENCH_RUN_ID"
+export PI_BENCH_CORRELATION_ID="$BENCH_CORRELATION_ID"
 
 if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
   BENCH_PROFILE_DIR="$TARGET_DIR/$CARGO_BUILD_TARGET/$BENCH_CARGO_PROFILE"
@@ -22,7 +31,7 @@ else
   BENCH_PROFILE_DIR="$TARGET_DIR/$BENCH_CARGO_PROFILE"
 fi
 BIN="$BENCH_PROFILE_DIR/examples/pijs_workload"
-ITERATIONS="${ITERATIONS:-200}"
+ITERATIONS="${ITERATIONS:-2000}"
 TOOL_CALLS_CSV="${TOOL_CALLS_CSV:-1,10}"
 HYPERFINE_WARMUP="${HYPERFINE_WARMUP:-3}"
 HYPERFINE_RUNS="${HYPERFINE_RUNS:-10}"
@@ -101,6 +110,20 @@ build_system_allocator_binary() {
     args+=(--features "$BENCH_SYSTEM_FEATURES")
   fi
 
+  run_cargo_with_rustflags "$rustflags" "${args[@]}" >>"$build_log" 2>&1
+}
+
+build_jemalloc_binary() {
+  local rustflags="$1"
+  local build_log="$2"
+  local features="jemalloc"
+  if [[ -n "$BENCH_SYSTEM_FEATURES" ]]; then
+    features="$BENCH_SYSTEM_FEATURES,jemalloc"
+  fi
+  local args=(
+    build --profile "$BENCH_CARGO_PROFILE" --no-default-features
+    --features "$features" --example pijs_workload
+  )
   run_cargo_with_rustflags "$rustflags" "${args[@]}" >>"$build_log" 2>&1
 }
 
@@ -197,7 +220,7 @@ build_binary_for_allocator() {
   fi
 
   if [[ "$normalized" == "jemalloc" ]]; then
-    if run_cargo_with_rustflags "$rustflags" build --profile "$BENCH_CARGO_PROFILE" --features jemalloc --example pijs_workload >>"$build_log" 2>&1; then
+    if build_jemalloc_binary "$rustflags" "$build_log"; then
       if target_supports_jemalloc; then
         EFFECTIVE_ALLOCATOR="jemalloc"
       else
@@ -222,7 +245,7 @@ build_binary_for_allocator() {
     ALLOCATOR_FALLBACK_REASON="auto_jemalloc_unsupported_target"
     return 0
   fi
-  if run_cargo_with_rustflags "$rustflags" build --profile "$BENCH_CARGO_PROFILE" --features jemalloc --example pijs_workload >>"$build_log" 2>&1; then
+  if build_jemalloc_binary "$rustflags" "$build_log"; then
     EFFECTIVE_ALLOCATOR="jemalloc"
     return 0
   fi
@@ -628,7 +651,11 @@ for ALLOCATOR_REQUEST in "${ALLOCATOR_SET[@]}"; do
       PI_BENCH_BUILD_PROFILE="$BENCH_CARGO_PROFILE" PI_BENCH_ALLOCATOR="$ALLOCATOR_REQUEST" "$PGO_BIN" --iterations "$ITERATIONS" --tool-calls "$TOOL_CALLS" >>"$JSONL_OUT"
     else
       HYPERFINE_OUT="$OUT_DIR/hyperfine_pijs_workload_${ITERATIONS}x${TOOL_CALLS}_${BENCH_CARGO_PROFILE}_${ALLOCATOR_REQUEST}_effective-${EFFECTIVE_ALLOCATOR}.json"
-      ACTIVE_BIN="$BASELINE_BIN"
+      # Keep release-gate evidence bound to Cargo's canonical
+      # target/<profile>/examples path so the producer can independently
+      # verify the executable profile. Copied PGO comparison variants remain
+      # diagnostic-only and therefore fail the gate's path verification.
+      ACTIVE_BIN="$BIN"
       if [[ "$PGO_EFFECTIVE_MODE" == "pgo" || "$PGO_EFFECTIVE_MODE" == "baseline_fallback" ]]; then
         ACTIVE_BIN="$PGO_BIN"
       fi
