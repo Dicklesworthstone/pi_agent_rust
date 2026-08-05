@@ -727,8 +727,7 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
                 )
             })
             .to_owned();
-        let default_scenario_id =
-            format!("{partition}/{measurement_contract_version}/{scenario}");
+        let default_scenario_id = format!("{partition}/{measurement_contract_version}/{scenario}");
         let scenario_id_for_hash = map
             .get("scenario_metadata")
             .and_then(Value::as_object)
@@ -789,7 +788,10 @@ fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> 
             );
         }
         if !map.contains_key("eligible_for_regression_gate") {
-            map.insert("eligible_for_regression_gate".to_string(), Value::Bool(true));
+            map.insert(
+                "eligible_for_regression_gate".to_string(),
+                Value::Bool(true),
+            );
         }
         map.insert(
             "correlation_id".to_string(),
@@ -1094,8 +1096,8 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
         matches!(partition, PARTITION_MATCHED_STATE | PARTITION_REALISTIC),
         "unexpected partition: {partition}"
     );
-    let is_matrix = obj.get("scenario").and_then(Value::as_str)
-        == Some(MATRIX_SCENARIO_SESSION_WORKLOAD);
+    let is_matrix =
+        obj.get("scenario").and_then(Value::as_str) == Some(MATRIX_SCENARIO_SESSION_WORKLOAD);
     let (
         expected_evidence_class,
         expected_confidence,
