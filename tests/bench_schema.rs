@@ -16,9 +16,8 @@
 
 use pi::perf_build::{
     BUILD_FINGERPRINT_CONTRACT, BenchmarkBuildVerification, BenchmarkProvenance,
-    CANONICAL_PIJS_PERF_FEATURES,
-    benchmark_provenance_config_hash, matches_canonical_perf_build_fingerprint,
-    profile_from_target_path, sha256_file,
+    CANONICAL_PIJS_PERF_FEATURES, benchmark_provenance_config_hash,
+    matches_canonical_perf_build_fingerprint, profile_from_target_path, sha256_file,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -119,6 +118,19 @@ const PERF_BUDGET_DEFINITION_FIELDS: &[&str] = &[
     "methodology",
 ];
 const PERF_BUDGET_COMPARISON_VALUES: &[&str] = &["maximum", "minimum"];
+const PERF_CLAIM_READINESS_BLOCKER_CODES: &[&str] = &[
+    "budget_data_missing",
+    "budget_failed",
+    "ci_budget_data_missing",
+    "ci_budget_failed",
+    "correlation_id_missing",
+    "data_contract_failure",
+    "run_id_missing",
+    "source_commit_unbound",
+    "strict_mode_disabled",
+];
+const PERF_BUDGET_V0_2_0_INVENTORY_SHA256: &str =
+    "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad";
 
 /// Known JSONL schemas with version and description.
 const SCHEMAS: &[(&str, &str)] = &[
@@ -397,9 +409,19 @@ fn pijs_schema_candidate_paths_in_target_dir(target_dir: &Path) -> Vec<PathBuf> 
     .collect()
 }
 
+fn bench_target_dirs_for(
+    root: &Path,
+    canonical_project_root: &Path,
+    raw_target_dir: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    if root == canonical_project_root {
+        vec![resolve_bench_target_dir(root, raw_target_dir)]
+    } else {
+        vec![root.join("target")]
+    }
+}
+
 fn pijs_schema_candidate_paths(root: &Path) -> Vec<PathBuf> {
-    let resolved = resolve_bench_target_dir(root, std::env::var_os("CARGO_TARGET_DIR").as_deref());
-    let default = root.join("target");
     let mut paths = Vec::new();
     let mut evidence_dirs = std::env::var_os("PERF_EVIDENCE_DIR")
         .map(PathBuf::from)
@@ -429,12 +451,11 @@ fn pijs_schema_candidate_paths(root: &Path) -> Vec<PathBuf> {
             paths.push(dir.join(relative));
         }
     }
-    let target_dirs = if root == project_root() {
-        vec![resolved, default]
-    } else {
-        vec![default, resolved]
-    };
-    for target_dir in dedup_bench_paths(target_dirs) {
+    for target_dir in bench_target_dirs_for(
+        root,
+        &project_root(),
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    ) {
         paths.extend(pijs_schema_candidate_paths_in_target_dir(&target_dir));
     }
     dedup_bench_paths(paths)
@@ -523,6 +544,23 @@ fn pijs_schema_candidates_prioritize_canonical_perf_artifact() {
     assert_eq!(
         paths.get(3),
         Some(&target_dir.join("perf/pijs_workload.jsonl"))
+    );
+}
+
+#[test]
+fn pijs_schema_target_selection_is_explicit_and_hermetic() {
+    let project = Path::new("/workspace/pi_agent_rust");
+    let explicit = std::ffi::OsStr::new("/data/tmp/pi-schema-target");
+    assert_eq!(
+        bench_target_dirs_for(project, project, Some(explicit)),
+        vec![PathBuf::from("/data/tmp/pi-schema-target")]
+    );
+
+    let fixture = Path::new("/tmp/pi-schema-fixture");
+    assert_eq!(
+        bench_target_dirs_for(fixture, project, Some(explicit)),
+        vec![fixture.join("target")],
+        "fixture schema selection must not inherit the real project's artifacts"
     );
 }
 
@@ -994,8 +1032,23 @@ fn canonical_budget_summary_contract() -> Value {
             "maximum": "actual <= threshold",
             "minimum": "actual >= threshold",
         },
+        "claim_readiness": {
+            "scope": "all_declared_budgets",
+            "blocked_lineage_evaluation": "canonical_all_no_data_sentinel_without_artifact_discovery",
+            "authorization_requires": [
+                "strict_mode",
+                "bound_source_commit",
+                "matching_nonempty_run_and_correlation_ids",
+                "all_declared_budgets_have_data",
+                "all_declared_budgets_pass",
+                "zero_data_contract_failures",
+            ],
+            "blocking_reason_codes": PERF_CLAIM_READINESS_BLOCKER_CODES,
+            "blocking_reason_order": "lexicographic_ascending",
+        },
         "inventory_digest": {
             "algorithm": "sha256",
+            "canonical_v0_2_0_sha256": PERF_BUDGET_V0_2_0_INVENTORY_SHA256,
             "container": "compact_json_array",
             "budget_order": "producer_declaration_order",
             "field_order": PERF_BUDGET_DEFINITION_FIELDS,
@@ -4003,7 +4056,7 @@ fn pijs_gate_workload_fixture(root: &Path, tool_calls_per_iteration: u64) -> Val
         binary_sha256: &binary_sha256,
         debug_assertions: false,
     });
-    json!({
+    let mut record = json!({
         "schema": PIJS_GATE_SCHEMA,
         "timestamp": "2026-08-05T16:00:00Z",
         "run_id": "pijs-schema-test-run",
@@ -4027,6 +4080,12 @@ fn pijs_gate_workload_fixture(root: &Path, tool_calls_per_iteration: u64) -> Val
         "debug_assertions": false,
         "binary_sha256": binary_sha256,
         "config_hash": config_hash,
+    })
+    .as_object()
+    .expect("PiJS provenance fixture object")
+    .clone();
+    record.extend(
+        json!({
         "iterations": PIJS_GATE_ITERATIONS,
         "tool_calls_per_iteration": tool_calls_per_iteration,
         "total_calls": total_calls,
@@ -4048,7 +4107,12 @@ fn pijs_gate_workload_fixture(root: &Path, tool_calls_per_iteration: u64) -> Val
         "allocator_request_source": "env",
         "allocator_effective": "system",
         "allocator_fallback_reason": null,
-    })
+        })
+        .as_object()
+        .expect("PiJS measurement fixture object")
+        .clone(),
+    );
+    Value::Object(record)
 }
 
 fn phase1_matrix_validation_golden_fixture() -> Value {
@@ -4574,6 +4638,22 @@ fn budget_summary_contract_defines_comparison_and_digest_semantics() {
     assert_eq!(
         contract["inventory_digest"]["threshold_representation"].as_str(),
         Some("exactly_six_decimal_places")
+    );
+    assert_eq!(
+        contract["inventory_digest"]["canonical_v0_2_0_sha256"].as_str(),
+        Some(PERF_BUDGET_V0_2_0_INVENTORY_SHA256)
+    );
+    assert_eq!(
+        contract["claim_readiness"]["scope"].as_str(),
+        Some("all_declared_budgets")
+    );
+    assert_eq!(
+        contract["claim_readiness"]["blocked_lineage_evaluation"].as_str(),
+        Some("canonical_all_no_data_sentinel_without_artifact_discovery")
+    );
+    assert_eq!(
+        contract["claim_readiness"]["blocking_reason_codes"],
+        json!(PERF_CLAIM_READINESS_BLOCKER_CODES)
     );
 }
 
@@ -7651,7 +7731,7 @@ fn generate_schema_doc() {
 
     md.push_str("### `pi.perf.budget_summary.v2`\n\n");
     md.push_str(
-        "Each `budgets` entry requires `name`, `category`, `metric`, `unit`, `threshold`, `comparison`, `ci_enforced`, and `methodology`. `comparison` is the exact enum `maximum` (`actual <= threshold`) or `minimum` (`actual >= threshold`); consumers must never infer direction from a budget name. Inventory SHA-256 uses compact JSON in producer declaration order and the listed field order, with every threshold rendered using exactly six decimal places.\n\n",
+        "Each `budgets` entry requires `name`, `category`, `metric`, `unit`, `threshold`, `comparison`, `ci_enforced`, and `methodology`. `comparison` is the exact enum `maximum` (`actual <= threshold`) or `minimum` (`actual >= threshold`); consumers must never infer direction from a budget name. Blanket performance claims are authorized only when strict, source-bound, same-run evidence gives every declared budget data and PASS status with zero data-contract failures; aggregate `budget_data_missing` and `budget_failed` blockers prevent non-CI results from escaping that rule. Incomplete lineage produces a canonical all-`NO_DATA` blocked sentinel without inspecting ambient artifacts, target paths, or mtimes. Inventory SHA-256 uses compact JSON in producer declaration order and the listed field order, with every threshold rendered using exactly six decimal places. The canonical v0.2.0 digest is `96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad`.\n\n",
     );
 
     let protocol_contract = canonical_protocol_contract();
@@ -7778,7 +7858,9 @@ fn generate_schema_doc() {
         "1. **Stable key ordering**: JSON keys are sorted alphabetically within each record\n",
     );
     md.push_str("2. **No floating point in keys**: Use string or integer identifiers\n");
-    md.push_str("3. **Timestamps**: ISO 8601 with seconds precision (`2026-02-06T01:00:00Z`)\n");
+    md.push_str(
+        "3. **Timestamps**: canonical RFC 3339 UTC; release-facing v2 summaries and PiJS records use millisecond precision (`2026-02-06T01:00:00.000Z`)\n",
+    );
     md.push_str("4. **Config hash**: SHA-256 of concatenated env fields for dedup\n");
     md.push_str("5. **One record per line**: Standard JSONL (newline-delimited JSON)\n");
 

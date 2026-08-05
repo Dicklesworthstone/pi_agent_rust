@@ -151,7 +151,7 @@ const BUDGETS: &[Budget] = &[
         category: "tool_call",
         metric: "minimum calls/sec",
         unit: "calls/sec",
-        threshold: 5000.0, // Must exceed 5k calls/sec
+        threshold: 5000.0, // Must meet or exceed 5k calls/sec
         comparison: BudgetComparison::Minimum,
         methodology: "pijs_workload: aggregate throughput across exactly 2000 iterations x 10 tool calls, executable-path-verified perf profile",
         ci_enforced: true,
@@ -368,20 +368,26 @@ fn resolve_target_dir(root: &Path, raw_target_dir: Option<&std::ffi::OsStr>) -> 
     )
 }
 
-fn target_dir(root: &Path) -> PathBuf {
-    resolve_target_dir(root, std::env::var_os("CARGO_TARGET_DIR").as_deref())
+fn target_dir_candidates_for(
+    root: &Path,
+    canonical_project_root: &Path,
+    raw_target_dir: Option<&std::ffi::OsStr>,
+) -> Vec<PathBuf> {
+    if root == canonical_project_root {
+        vec![resolve_target_dir(root, raw_target_dir)]
+    } else {
+        // Callers evaluating a fixture root must remain hermetic and must not
+        // inherit artifacts from the real project's Cargo target directory.
+        vec![root.join("target")]
+    }
 }
 
 fn target_dir_candidates(root: &Path) -> Vec<PathBuf> {
-    let resolved_target = target_dir(root);
-    let default_target = root.join("target");
-    let project_root = project_root();
-    let paths = if root == project_root.as_path() {
-        vec![resolved_target, default_target]
-    } else {
-        vec![default_target, resolved_target]
-    };
-    dedup_paths(paths)
+    target_dir_candidates_for(
+        root,
+        &project_root(),
+        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
+    )
 }
 
 fn resolve_env_path(root: &Path, path: PathBuf) -> Option<PathBuf> {
@@ -445,9 +451,59 @@ fn evidence_then_target_paths(
     dedup_paths(paths)
 }
 
+fn portable_relative_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
 fn display_source_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .map_or_else(|_| path.display().to_string(), |p| p.display().to_string())
+    for (index, evidence_dir) in perf_evidence_dirs(root).iter().enumerate() {
+        if let Ok(relative) = path.strip_prefix(evidence_dir) {
+            return format!("evidence[{index}]://{}", portable_relative_path(relative));
+        }
+    }
+    for (index, target_dir) in target_dir_candidates(root).iter().enumerate() {
+        if let Ok(relative) = path.strip_prefix(target_dir) {
+            return format!(
+                "cargo-target[{index}]://{}",
+                portable_relative_path(relative)
+            );
+        }
+    }
+    if let Ok(relative) = path.strip_prefix(root) {
+        return format!("repo://{}", portable_relative_path(relative));
+    }
+    format!(
+        "external://{}",
+        path.file_name()
+            .map_or_else(|| "artifact".into(), |name| name.to_string_lossy())
+    )
+}
+
+fn canonicalize_diagnostic_text(root: &Path, text: &str) -> String {
+    let mut replacements = Vec::new();
+    for (index, evidence_dir) in perf_evidence_dirs(root).iter().enumerate() {
+        replacements.push((
+            format!("{}/", evidence_dir.to_string_lossy().trim_end_matches('/')),
+            format!("evidence[{index}]://"),
+        ));
+    }
+    for (index, target_dir) in target_dir_candidates(root).iter().enumerate() {
+        replacements.push((
+            format!("{}/", target_dir.to_string_lossy().trim_end_matches('/')),
+            format!("cargo-target[{index}]://"),
+        ));
+    }
+    replacements.push((
+        format!("{}/", root.to_string_lossy().trim_end_matches('/')),
+        "repo://".to_string(),
+    ));
+    replacements.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+
+    replacements
+        .into_iter()
+        .fold(text.to_string(), |canonical, (prefix, replacement)| {
+            canonical.replace(&prefix, &replacement)
+        })
 }
 
 fn read_json_file(path: &Path) -> Option<Value> {
@@ -538,17 +594,49 @@ fn perf_run_id() -> Option<String> {
     })
 }
 
+fn tracked_index_flags_are_default(output: &[u8]) -> bool {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .all(|record| record.starts_with(b"H "))
+}
+
+fn git_command_succeeds(root: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
 fn clean_source_commit(root: &Path) -> Option<String> {
+    let index_flags = Command::new("git")
+        .args(["ls-files", "-v", "-z", "--"])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !index_flags.status.success() || !tracked_index_flags_are_default(&index_flags.stdout) {
+        return None;
+    }
+
     let status = Command::new("git")
-        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .current_dir(root)
         .output()
         .ok()?;
     if !status.status.success() || !status.stdout.is_empty() {
         return None;
     }
+    if !git_command_succeeds(root, &["diff", "--quiet", "--no-ext-diff", "HEAD", "--"])
+        || !git_command_succeeds(
+            root,
+            &["diff", "--cached", "--quiet", "--no-ext-diff", "HEAD", "--"],
+        )
+    {
+        return None;
+    }
     let revision = Command::new("git")
-        .args(["rev-parse", "HEAD"])
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
         .current_dir(root)
         .output()
         .ok()?;
@@ -571,6 +659,8 @@ fn claim_readiness_blockers(
     ci_with_data: usize,
     ci_fail: usize,
     ci_no_data: usize,
+    fail: usize,
+    no_data: usize,
     data_contract_failures: usize,
 ) -> Vec<&'static str> {
     let mut blockers = BTreeSet::new();
@@ -591,6 +681,12 @@ fn claim_readiness_blockers(
     }
     if ci_fail != 0 {
         blockers.insert("ci_budget_failed");
+    }
+    if fail != 0 {
+        blockers.insert("budget_failed");
+    }
+    if no_data != 0 {
+        blockers.insert("budget_data_missing");
     }
     if data_contract_failures != 0 {
         blockers.insert("data_contract_failure");
@@ -624,13 +720,61 @@ struct BudgetSummaryLineage<'a> {
     strict_mode: bool,
 }
 
+fn benchmark_lineage_is_authoritative(lineage: &BudgetSummaryLineage<'_>) -> bool {
+    lineage.strict_mode
+        && lineage.source_commit.is_some()
+        && lineage.run_id.is_some()
+        && lineage.run_id == lineage.correlation_id
+}
+
+fn blocked_sentinel_result(budget: &Budget) -> BudgetResult {
+    BudgetResult {
+        budget_name: budget.name.to_string(),
+        category: budget.category.to_string(),
+        threshold: budget.threshold,
+        comparison: budget.comparison,
+        unit: budget.unit.to_string(),
+        actual: None,
+        status: "NO_DATA".to_string(),
+        source: "not evaluated: authoritative benchmark lineage is incomplete".to_string(),
+        ci_enforced: budget.ci_enforced,
+        failure_reason: None,
+    }
+}
+
+fn evaluate_budget_report(
+    root: &Path,
+    lineage: &BudgetSummaryLineage<'_>,
+) -> (Vec<BudgetResult>, Vec<DataContractFailure>) {
+    if !benchmark_lineage_is_authoritative(lineage) {
+        return (
+            BUDGETS.iter().map(blocked_sentinel_result).collect(),
+            Vec::new(),
+        );
+    }
+
+    (
+        BUDGETS
+            .iter()
+            .map(|budget| check_budget_with_strict_at_root(budget, true, root))
+            .collect(),
+        collect_data_contract_failures(root),
+    )
+}
+
 fn budget_summary_value(
     lineage: &BudgetSummaryLineage<'_>,
     results: &[BudgetResult],
     data_contract_failures: &[DataContractFailure],
 ) -> Value {
-    let pass_count = results.iter().filter(|result| result.status == "PASS").count();
-    let fail_count = results.iter().filter(|result| result.status == "FAIL").count();
+    let pass_count = results
+        .iter()
+        .filter(|result| result.status == "PASS")
+        .count();
+    let fail_count = results
+        .iter()
+        .filter(|result| result.status == "FAIL")
+        .count();
     let no_data_count = results
         .iter()
         .filter(|result| result.status == "NO_DATA")
@@ -661,6 +805,8 @@ fn budget_summary_value(
         ci_with_data_count,
         ci_fail_count,
         ci_no_data_count,
+        fail_count,
+        no_data_count,
         data_contract_failures.len(),
     );
     let claims_authorized = readiness_blockers.is_empty();
@@ -712,15 +858,19 @@ fn artifact_age_hours(path: &Path) -> Option<f64> {
     Some(elapsed.as_secs_f64() / 3600.0)
 }
 
-fn format_path_list(paths: &[PathBuf]) -> String {
+fn format_path_list(root: &Path, paths: &[PathBuf]) -> String {
     paths
         .iter()
-        .map(|p| p.display().to_string())
+        .map(|path| display_source_path(root, path))
         .collect::<Vec<_>>()
         .join(", ")
 }
 
-fn evaluate_artifact_contract(paths: &[PathBuf], max_age_hours: f64) -> Option<String> {
+fn evaluate_artifact_contract(
+    root: &Path,
+    paths: &[PathBuf],
+    max_age_hours: f64,
+) -> Option<String> {
     if paths.is_empty() {
         return Some("no artifact paths configured".to_string());
     }
@@ -729,7 +879,7 @@ fn evaluate_artifact_contract(paths: &[PathBuf], max_age_hours: f64) -> Option<S
     if existing.is_empty() {
         return Some(format!(
             "missing artifacts; expected one of [{}]",
-            format_path_list(paths)
+            format_path_list(root, paths)
         ));
     }
 
@@ -740,11 +890,14 @@ fn evaluate_artifact_contract(paths: &[PathBuf], max_age_hours: f64) -> Option<S
             Some(age_hours) if age_hours <= max_age_hours => {
                 fresh_found = true;
             }
-            Some(age_hours) => {
-                stale_details.push(format!("{} ({age_hours:.2}h old)", path.display()));
+            Some(_) => {
+                stale_details.push(format!("{} (stale)", display_source_path(root, path)));
             }
             None => {
-                stale_details.push(format!("{} (mtime unavailable)", path.display()));
+                stale_details.push(format!(
+                    "{} (mtime unavailable)",
+                    display_source_path(root, path)
+                ));
             }
         }
     }
@@ -857,6 +1010,7 @@ fn collect_estimate_json_files(base: &Path) -> Vec<PathBuf> {
     for entry in entries.flatten() {
         files.push(entry.path().join("new/estimates.json"));
     }
+    files.sort();
     if files.is_empty() {
         files.push(base.to_path_buf());
     }
@@ -1182,7 +1336,7 @@ fn evaluate_phase1_weighted_attribution_contract(
 ) -> Vec<DataContractFailure> {
     let mut failures = Vec::new();
     let candidates = phase1_matrix_validation_candidates(root);
-    if let Some(detail) = evaluate_artifact_contract(&candidates, max_age_hours) {
+    if let Some(detail) = evaluate_artifact_contract(root, &candidates, max_age_hours) {
         failures.push(DataContractFailure {
             contract_id: "missing_or_stale_phase1_matrix_validation_evidence".to_string(),
             budget_name: None,
@@ -1419,7 +1573,7 @@ fn evaluate_required_e2e_ratio_contract(
 ) -> Vec<DataContractFailure> {
     let mut failures = Vec::new();
     let candidates = extension_stratification_candidates(root);
-    if let Some(detail) = evaluate_artifact_contract(&candidates, max_age_hours) {
+    if let Some(detail) = evaluate_artifact_contract(root, &candidates, max_age_hours) {
         failures.push(DataContractFailure {
             contract_id: "missing_or_stale_e2e_matrix_evidence".to_string(),
             budget_name: None,
@@ -1512,7 +1666,7 @@ fn load_context_intelligence_budget_payload(
     max_age_hours: f64,
 ) -> Result<(PathBuf, Value), DataContractFailure> {
     let candidates = context_intelligence_budget_candidate_paths(root);
-    if let Some(detail) = evaluate_artifact_contract(&candidates, max_age_hours) {
+    if let Some(detail) = evaluate_artifact_contract(root, &candidates, max_age_hours) {
         return Err(context_intelligence_failure(
             "missing_or_stale_context_intelligence_budget_evidence",
             None,
@@ -1691,7 +1845,7 @@ fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
         if candidates.is_empty() {
             continue;
         }
-        if let Some(detail) = evaluate_artifact_contract(&candidates, max_age_hours) {
+        if let Some(detail) = evaluate_artifact_contract(root, &candidates, max_age_hours) {
             failures.push(DataContractFailure {
                 contract_id: "missing_or_stale_budget_artifact".to_string(),
                 budget_name: Some(budget.name.to_string()),
@@ -1712,56 +1866,65 @@ fn collect_data_contract_failures(root: &Path) -> Vec<DataContractFailure> {
         max_age_hours,
     ));
     failures.extend(evaluate_pijs_workload_gate_contract(root, max_age_hours));
+    for failure in &mut failures {
+        failure.detail = canonicalize_diagnostic_text(root, &failure.detail);
+    }
     failures
 }
 
 fn check_budget(budget: &Budget) -> BudgetResult {
-    let root = project_root();
-    let strict = perf_strict_mode();
+    check_budget_with_strict(budget, perf_strict_mode())
+}
 
+fn check_budget_with_strict(budget: &Budget, strict: bool) -> BudgetResult {
+    let root = project_root();
+    check_budget_with_strict_at_root(budget, strict, &root)
+}
+
+fn check_budget_with_strict_at_root(budget: &Budget, strict: bool, root: &Path) -> BudgetResult {
     // Try to find actual measurement for this budget
     let (actual, source) = match budget.name {
-        "tool_call_latency_mean" => read_pijs_workload_mean_latency(&root),
-        "tool_call_throughput_min" => read_pijs_workload_throughput(&root),
-        "ext_cold_load_simple_p95" => read_criterion_load_time(&root, "hello"),
-        "ext_cold_load_complex_p95" => read_criterion_load_time(&root, "pirate"),
-        "ext_load_60_total" => read_total_load_time(&root),
-        "sustained_load_rss_growth" => read_stress_rss_growth(&root),
-        "startup_version_p95" => read_criterion_startup(&root, "version"),
-        "startup_full_agent_p95" => read_criterion_startup(&root, "help"),
-        "event_dispatch_p99" => read_scenario_runner_per_call(&root, "event_dispatch"),
+        "tool_call_latency_mean" => read_pijs_workload_mean_latency(root),
+        "tool_call_throughput_min" => read_pijs_workload_throughput(root),
+        "ext_cold_load_simple_p95" => read_criterion_load_time(root, "hello"),
+        "ext_cold_load_complex_p95" => read_criterion_load_time(root, "pirate"),
+        "ext_load_60_total" => read_total_load_time(root),
+        "sustained_load_rss_growth" => read_stress_rss_growth(root),
+        "startup_version_p95" => read_criterion_startup(root, "version"),
+        "startup_full_agent_p95" => read_criterion_startup(root, "help"),
+        "event_dispatch_p99" => read_scenario_runner_per_call(root, "event_dispatch"),
         "context_graph_build_cold_p95" => read_context_intelligence_budget_metric(
-            &root,
+            root,
             "context_graph_build_cold_p95",
             Some("graph_build_cold"),
         ),
         "context_graph_build_warm_p95" => read_context_intelligence_budget_metric(
-            &root,
+            root,
             "context_graph_build_warm_p95",
             Some("graph_build_warm"),
         ),
         "context_incremental_update_p95" => read_context_intelligence_budget_metric(
-            &root,
+            root,
             "context_incremental_update_p95",
             Some("incremental_update"),
         ),
         "context_planning_p95" => {
-            read_context_intelligence_budget_metric(&root, "context_planning_p95", Some("planning"))
+            read_context_intelligence_budget_metric(root, "context_planning_p95", Some("planning"))
         }
         "context_bundle_serialization_p95" => read_context_intelligence_budget_metric(
-            &root,
+            root,
             "context_bundle_serialization_p95",
             Some("bundle_serialization"),
         ),
         "context_bundle_estimated_bytes_max" => read_context_intelligence_budget_metric(
-            &root,
+            root,
             "context_bundle_estimated_bytes_max",
             None,
         ),
-        "policy_eval_p99" => read_criterion_policy_eval(&root),
+        "policy_eval_p99" => read_criterion_policy_eval(root),
         "idle_memory_rss" => read_idle_memory_rss(),
-        "binary_size_release" => read_binary_size(&root),
-        "protocol_parse_p99" => read_criterion_protocol_parse(&root),
+        "binary_size_release" => read_binary_size(root),
+        "protocol_parse_p99" => read_criterion_protocol_parse(root),
         _ => (None, "no data source configured".to_string()),
     };
 
@@ -2122,10 +2285,7 @@ fn validate_pijs_timestamp(
     }
     let max_age_ms = max_age_hours * 60.0 * 60.0 * 1_000.0;
     if age.num_milliseconds() as f64 > max_age_ms {
-        return Err(format!(
-            "timestamp is stale ({:.2}h old; maximum {max_age_hours:.2}h)",
-            age.num_milliseconds() as f64 / 3_600_000.0
-        ));
+        return Err(format!("timestamp is stale (maximum {max_age_hours:.2}h)"));
     }
     Ok(timestamp)
 }
@@ -2262,7 +2422,7 @@ fn evaluate_pijs_workload_gate_contract(
             "missing_or_stale_budget_artifact",
             format!(
                 "missing artifacts; expected one of [{}]",
-                format_path_list(&pijs_workload_candidate_paths(root))
+                format_path_list(root, &pijs_workload_candidate_paths(root))
             ),
             "Generate the canonical PiJS workload artifact in the current perf run.".to_string(),
         ),
@@ -2374,8 +2534,8 @@ fn validate_selected_pijs_freshness(
 ) -> Result<(), String> {
     match artifact_age_hours(path) {
         Some(age_hours) if age_hours <= max_age_hours => Ok(()),
-        Some(age_hours) => Err(format!(
-            "selected artifact {source} is stale ({age_hours:.2}h old; maximum {max_age_hours:.2}h)"
+        Some(_) => Err(format!(
+            "selected artifact {source} is stale (maximum {max_age_hours:.2}h)"
         )),
         None => Err(format!(
             "selected artifact {source} has unavailable or invalid modification time"
@@ -2635,21 +2795,9 @@ fn read_criterion_policy_eval(root: &Path) -> (Option<f64>, String) {
 }
 
 fn read_idle_memory_rss() -> (Option<f64>, String) {
-    // Measure the current process RSS as a proxy for idle memory.
-    // This runs during test, so it's an approximation.
-    let pid = sysinfo::Pid::from_u32(std::process::id());
-    let mut system = sysinfo::System::new();
-    system.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::Some(&[pid]),
-        true,
-        sysinfo::ProcessRefreshKind::nothing().with_memory(),
-    );
-    system.process(pid).map_or_else(
-        || (None, "could not read process RSS".to_string()),
-        |p| {
-            let rss_mb = p.memory() as f64 / 1024.0 / 1024.0;
-            (Some(rss_mb), "sysinfo: current process RSS".to_string())
-        },
+    (
+        None,
+        "no canonical idle Pi RSS artifact; test-harness process RSS is inadmissible".to_string(),
     )
 }
 
@@ -2712,6 +2860,24 @@ fn target_dir_resolution_honors_cargo_target_dir_shape() {
             ))
         ),
         PathBuf::from("/data/tmp/pi_agent_rust_cargo/sunnybeacon/target")
+    );
+}
+
+#[test]
+fn explicit_target_dir_is_authoritative_and_fixture_roots_are_hermetic() {
+    let project = Path::new("/workspace/pi_agent_rust");
+    let explicit = std::ffi::OsStr::new("/data/tmp/pi-release-target");
+    assert_eq!(
+        target_dir_candidates_for(project, project, Some(explicit)),
+        vec![PathBuf::from("/data/tmp/pi-release-target")],
+        "an explicit Cargo target must not fall through to ignored repo-local artifacts"
+    );
+
+    let fixture = Path::new("/tmp/pi-budget-fixture");
+    assert_eq!(
+        target_dir_candidates_for(fixture, project, Some(explicit)),
+        vec![fixture.join("target")],
+        "fixture evaluations must not inherit the real project's target directory"
     );
 }
 
@@ -2853,9 +3019,11 @@ fn budget_inventory_has_stable_cross_language_serialization() {
     assert!(canonical.contains(
         "\"name\":\"tool_call_throughput_min\",\"category\":\"tool_call\",\"metric\":\"minimum calls/sec\",\"unit\":\"calls/sec\",\"threshold\":5000.000000,\"comparison\":\"minimum\""
     ));
-    let digest = budget_inventory_sha256();
-    assert_eq!(digest.len(), 64);
-    eprintln!("canonical budget inventory SHA-256: {digest}");
+    assert_eq!(
+        budget_inventory_sha256(),
+        "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad",
+        "canonical v0.2.0 budget inventory drifted"
+    );
 }
 
 #[test]
@@ -3157,15 +3325,12 @@ fn valid_pijs_gate_record(root: &Path, tool_calls_per_iteration: u64) -> Value {
         "allocator_effective": "system",
         "allocator_fallback_reason": null
     });
-    record
-        .as_object_mut()
-        .expect("PiJS fixture record")
-        .extend(
-            provenance
-                .as_object()
-                .expect("PiJS fixture provenance")
-                .clone(),
-        );
+    record.as_object_mut().expect("PiJS fixture record").extend(
+        provenance
+            .as_object()
+            .expect("PiJS fixture provenance")
+            .clone(),
+    );
     record
 }
 
@@ -3255,7 +3420,10 @@ fn pijs_workload_reader_prefers_profile_labeled_artifact_path() {
 
     let (latency, source) = read_pijs_workload_mean_latency(tmp.path());
     assert_eq!(latency, Some(49.5));
-    assert_eq!(source, "target/perf/perf/pijs_workload_perf.jsonl");
+    assert_eq!(
+        source,
+        "cargo-target[0]://perf/perf/pijs_workload_perf.jsonl"
+    );
 }
 
 #[test]
@@ -3611,7 +3779,7 @@ fn pijs_gate_reader_fails_closed_on_invalid_canonical_artifact() {
     assert_eq!(latency, None);
     assert_eq!(
         source,
-        "no admissible pijs_workload pair in target/perf/perf/pijs_workload_perf.jsonl: confidence must equal \"high\" (observed=Some(\"medium\"))"
+        "no admissible pijs_workload pair in cargo-target[0]://perf/perf/pijs_workload_perf.jsonl: confidence must equal \"high\" (observed=Some(\"medium\"))"
     );
 }
 
@@ -3664,7 +3832,9 @@ fn pijs_gate_freshness_is_bound_to_selected_canonical_artifact() {
     let (actual, source) = read_pijs_workload_mean_latency(tmp.path());
     assert_eq!(actual, None);
     assert!(
-        source.contains("selected artifact target/perf/perf/pijs_workload_perf.jsonl is stale"),
+        source.contains(
+            "selected artifact cargo-target[0]://perf/perf/pijs_workload_perf.jsonl is stale"
+        ),
         "{source}"
     );
     let failures = evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
@@ -3673,7 +3843,7 @@ fn pijs_gate_freshness_is_bound_to_selected_canonical_artifact() {
         failure.contract_id == "missing_or_stale_budget_artifact"
             && failure
                 .detail
-                .contains("target/perf/perf/pijs_workload_perf.jsonl is stale")
+                .contains("cargo-target[0]://perf/perf/pijs_workload_perf.jsonl is stale")
     }));
 }
 
@@ -3713,6 +3883,118 @@ fn budget_report_generation_is_explicitly_opt_in() {
 }
 
 #[test]
+fn blocked_sentinel_is_independent_of_artifact_roots_and_contents() {
+    let first = tempfile::tempdir().expect("first fixture root");
+    let second = tempfile::tempdir().expect("second fixture root");
+    let first_artifact = first
+        .path()
+        .join("target/criterion/startup/version/warm/new/estimates.json");
+    std::fs::create_dir_all(first_artifact.parent().expect("first artifact parent"))
+        .expect("create first artifact parent");
+    std::fs::write(&first_artifact, r#"{"mean":{"point_estimate":1.0}}"#)
+        .expect("write first ambient artifact");
+    let second_artifact = second.path().join("target/perf/pijs_workload.jsonl");
+    std::fs::create_dir_all(second_artifact.parent().expect("second artifact parent"))
+        .expect("create second artifact parent");
+    std::fs::write(&second_artifact, "not-json\n").expect("write second ambient artifact");
+    assert_eq!(
+        display_source_path(first.path(), &first_artifact),
+        "cargo-target[0]://criterion/startup/version/warm/new/estimates.json"
+    );
+    assert_eq!(
+        display_source_path(second.path(), &second_artifact),
+        "cargo-target[0]://perf/pijs_workload.jsonl"
+    );
+
+    let lineage = BudgetSummaryLineage {
+        generated_at: "2026-08-05T17:00:00.000Z",
+        source_commit: None,
+        run_id: None,
+        correlation_id: None,
+        strict_mode: false,
+    };
+    let (first_results, first_failures) = evaluate_budget_report(first.path(), &lineage);
+    let (second_results, second_failures) = evaluate_budget_report(second.path(), &lineage);
+    let first_summary = budget_summary_value(&lineage, &first_results, &first_failures);
+    let second_summary = budget_summary_value(&lineage, &second_results, &second_failures);
+
+    assert_eq!(first_summary, second_summary);
+    assert!(first_failures.is_empty());
+    assert_eq!(first_summary["pass"].as_u64(), Some(0));
+    assert_eq!(first_summary["fail"].as_u64(), Some(0));
+    assert_eq!(
+        first_summary["no_data"].as_u64(),
+        Some(BUDGETS.len() as u64)
+    );
+    assert!(first_results.iter().all(|result| {
+        result.actual.is_none()
+            && result.status == "NO_DATA"
+            && result.source == "not evaluated: authoritative benchmark lineage is incomplete"
+    }));
+}
+
+#[test]
+fn clean_source_commit_rejects_hidden_index_flags_and_untracked_files() {
+    fn git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let repo = tempfile::tempdir().expect("temporary git repository");
+    git(repo.path(), &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(repo.path().join("tracked.txt"), "tracked\n").expect("write tracked file");
+    git(repo.path(), &["add", "tracked.txt"]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=Pi Test",
+            "-c",
+            "user.email=pi-test@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "initial",
+        ],
+    );
+    assert!(clean_source_commit(repo.path()).is_some());
+
+    git(
+        repo.path(),
+        &["update-index", "--skip-worktree", "tracked.txt"],
+    );
+    assert_eq!(clean_source_commit(repo.path()), None);
+    git(
+        repo.path(),
+        &["update-index", "--no-skip-worktree", "tracked.txt"],
+    );
+    git(
+        repo.path(),
+        &["update-index", "--assume-unchanged", "tracked.txt"],
+    );
+    assert_eq!(clean_source_commit(repo.path()), None);
+    git(
+        repo.path(),
+        &["update-index", "--no-assume-unchanged", "tracked.txt"],
+    );
+    assert!(clean_source_commit(repo.path()).is_some());
+
+    let nested = repo.path().join("untracked/nested.txt");
+    std::fs::create_dir_all(nested.parent().expect("nested parent"))
+        .expect("create untracked directory");
+    std::fs::write(nested, "untracked\n").expect("write untracked file");
+    assert_eq!(clean_source_commit(repo.path()), None);
+}
+
+#[test]
 fn claim_readiness_requires_complete_strict_same_run_evidence() {
     assert!(
         claim_readiness_blockers(
@@ -3725,13 +4007,29 @@ fn claim_readiness_requires_complete_strict_same_run_evidence() {
             0,
             0,
             0,
+            0,
+            0,
         )
         .is_empty()
     );
 
     assert_eq!(
-        claim_readiness_blockers(false, None, None, Some("different-run"), 4, 3, 1, 1, 2),
+        claim_readiness_blockers(
+            false,
+            None,
+            None,
+            Some("different-run"),
+            4,
+            3,
+            1,
+            1,
+            2,
+            3,
+            2,
+        ),
         vec![
+            "budget_data_missing",
+            "budget_failed",
             "ci_budget_data_missing",
             "ci_budget_failed",
             "correlation_id_missing",
@@ -3741,6 +4039,148 @@ fn claim_readiness_requires_complete_strict_same_run_evidence() {
             "strict_mode_disabled",
         ]
     );
+
+    assert_eq!(
+        claim_readiness_blockers(
+            true,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            Some("release-run"),
+            Some("release-run"),
+            4,
+            4,
+            0,
+            0,
+            1,
+            0,
+            0,
+        ),
+        vec!["budget_failed"],
+        "a non-CI budget failure must block blanket performance claims",
+    );
+    assert_eq!(
+        claim_readiness_blockers(
+            true,
+            Some("0123456789abcdef0123456789abcdef01234567"),
+            Some("release-run"),
+            Some("release-run"),
+            4,
+            4,
+            0,
+            0,
+            0,
+            1,
+            0,
+        ),
+        vec!["budget_data_missing"],
+        "missing data for a non-CI budget must block blanket performance claims",
+    );
+}
+
+#[test]
+fn checked_in_budget_summary_matches_fresh_canonical_evaluation_exactly() {
+    let root = project_root();
+    let summary_path = root.join("tests/perf/reports/budget_summary.json");
+    let summary_text = std::fs::read_to_string(&summary_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", summary_path.display()));
+    assert!(
+        summary_text.ends_with('\n') && !summary_text.ends_with("\n\n"),
+        "checked-in budget summary must end with exactly one newline"
+    );
+    let checked_in: Value =
+        serde_json::from_str(&summary_text).expect("checked-in budget summary must be valid JSON");
+    assert_eq!(
+        checked_in.get("schema").and_then(Value::as_str),
+        Some("pi.perf.budget_summary.v2")
+    );
+
+    let generated_at = checked_in
+        .get("generated_at")
+        .and_then(Value::as_str)
+        .expect("budget summary generated_at");
+    let parsed_generated_at = chrono::DateTime::parse_from_rfc3339(generated_at)
+        .expect("budget summary generated_at must be RFC3339")
+        .with_timezone(&chrono::Utc);
+    assert_eq!(
+        parsed_generated_at.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        generated_at,
+        "budget summary generated_at must use canonical millisecond UTC form"
+    );
+
+    let optional_string = |field: &str| match checked_in.get(field) {
+        Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        _ => panic!("budget summary {field} must be null or a non-empty string"),
+    };
+    let source_commit = optional_string("source_commit");
+    if let Some(source_commit) = source_commit {
+        assert!(
+            source_commit.len() == 40
+                && source_commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && !source_commit.bytes().all(|byte| byte == b'0'),
+            "budget summary source_commit must be a full lowercase nonzero Git SHA"
+        );
+    }
+    let run_id = optional_string("run_id");
+    let correlation_id = optional_string("correlation_id");
+    assert_eq!(
+        run_id, correlation_id,
+        "budget summary run and correlation identity must be identical"
+    );
+    let strict_mode = checked_in
+        .get("strict_mode")
+        .and_then(Value::as_bool)
+        .expect("budget summary strict_mode");
+
+    let lineage = BudgetSummaryLineage {
+        generated_at,
+        source_commit,
+        run_id,
+        correlation_id,
+        strict_mode,
+    };
+    let (fresh_results, fresh_failures) = evaluate_budget_report(&root, &lineage);
+    let expected = budget_summary_value(&lineage, &fresh_results, &fresh_failures);
+    assert_eq!(
+        checked_in, expected,
+        "checked-in budget summary must exactly match fresh definitions, results, failures, counts, lineage, and readiness"
+    );
+
+    let events_path = root.join("tests/perf/reports/budget_events.jsonl");
+    let events_text = std::fs::read_to_string(&events_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", events_path.display()));
+    let checked_events = events_text
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str::<Value>(line).unwrap_or_else(|err| {
+                panic!(
+                    "{} line {} is not valid JSON: {err}",
+                    events_path.display(),
+                    index + 1
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        Value::Array(checked_events),
+        expected["budget_results"],
+        "checked-in budget events must exactly match the canonical summary results"
+    );
+
+    if !benchmark_lineage_is_authoritative(&lineage) {
+        let markdown_path = root.join("tests/perf/reports/PERF_BUDGETS.md");
+        let markdown = std::fs::read_to_string(&markdown_path)
+            .unwrap_or_else(|err| panic!("read {}: {err}", markdown_path.display()));
+        assert!(
+            markdown.contains(
+                "## Failing Data Contracts\n\n- Not evaluated: authoritative benchmark lineage is incomplete."
+            ),
+            "blocked sentinel Markdown must not imply that data contracts were evaluated cleanly"
+        );
+    }
 }
 
 #[test]
@@ -3759,8 +4199,14 @@ fn generate_budget_report() {
     let source_commit = clean_source_commit(&root);
     let run_id = perf_run_id();
     let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-    let results: Vec<BudgetResult> = BUDGETS.iter().map(check_budget).collect();
-    let data_contract_failures = collect_data_contract_failures(&root);
+    let lineage = BudgetSummaryLineage {
+        generated_at: &generated_at,
+        source_commit: source_commit.as_deref(),
+        run_id: run_id.as_deref(),
+        correlation_id: run_id.as_deref(),
+        strict_mode,
+    };
+    let (results, data_contract_failures) = evaluate_budget_report(&root, &lineage);
     let reports_dir = root.join("tests/perf/reports");
     let _ = std::fs::create_dir_all(&reports_dir);
 
@@ -3804,6 +4250,8 @@ fn generate_budget_report() {
         ci_with_data_count,
         ci_fail_count,
         ci_no_data_count,
+        fail_count,
+        no_data_count,
         data_contract_failures_count,
     );
     let claims_authorized = readiness_blockers.is_empty();
@@ -3812,50 +4260,15 @@ fn generate_budget_report() {
     } else {
         "blocked"
     };
-    let summary = json!({
-        "schema": "pi.perf.budget_summary.v2",
-        "generated_at": generated_at,
-        "source_commit": source_commit,
-        "run_id": run_id_json,
-        "correlation_id": correlation_id,
-        "strict_mode": strict_mode,
-        "total_budgets": BUDGETS.len(),
-        "ci_enforced": ci_enforced_count,
-        "ci_with_data": ci_with_data_count,
-        "ci_fail": ci_fail_count,
-        "ci_no_data": ci_no_data_count,
-        "pass": pass_count,
-        "fail": fail_count,
-        "no_data": no_data_count,
-        "data_contract_failures_count": data_contract_failures_count,
-        "failing_data_contracts": data_contract_failures.iter().map(|failure| json!({
-            "contract_id": failure.contract_id,
-            "budget_name": failure.budget_name,
-            "detail": failure.detail,
-            "remediation": failure.remediation,
-        })).collect::<Vec<_>>(),
-        "budgets": BUDGETS.iter().map(|b| json!({
-            "name": b.name,
-            "category": b.category,
-            "metric": b.metric,
-            "unit": b.unit,
-            "threshold": b.threshold,
-            "comparison": b.comparison,
-            "ci_enforced": b.ci_enforced,
-            "methodology": b.methodology,
-        })).collect::<Vec<_>>(),
-        "budget_results": results,
-        "claim_readiness": {
-            "status": claim_readiness_status,
-            "performance_claims_authorized": claims_authorized,
-            "blocking_reason_codes": readiness_blockers,
-        },
-    });
+    let summary = budget_summary_value(&lineage, &results, &data_contract_failures);
 
     let summary_path = reports_dir.join("budget_summary.json");
     std::fs::write(
         &summary_path,
-        serde_json::to_string_pretty(&summary).unwrap_or_default(),
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&summary).unwrap_or_default()
+        ),
     )
     .expect("write budget_summary.json");
 
@@ -3959,7 +4372,9 @@ fn generate_budget_report() {
     }
 
     md.push_str("## Failing Data Contracts\n\n");
-    if data_contract_failures.is_empty() {
+    if !benchmark_lineage_is_authoritative(&lineage) {
+        md.push_str("- Not evaluated: authoritative benchmark lineage is incomplete.\n\n");
+    } else if data_contract_failures.is_empty() {
         md.push_str("- None\n\n");
     } else {
         for failure in &data_contract_failures {
@@ -4036,13 +4451,25 @@ fn classify_budget_status_promotes_ci_no_data_to_fail_under_strict() {
 }
 
 #[test]
+fn idle_memory_budget_rejects_test_harness_rss_as_release_evidence() {
+    let (actual, source) = read_idle_memory_rss();
+    assert_eq!(actual, None);
+    assert!(source.contains("test-harness process RSS is inadmissible"));
+    let budget = BUDGETS
+        .iter()
+        .find(|budget| budget.name == "idle_memory_rss")
+        .expect("idle-memory budget");
+    assert_eq!(classify_budget_status(budget, actual, true), "FAIL");
+}
+
+#[test]
 fn artifact_contract_flags_stale_evidence() {
     let tmp = tempfile::tempdir().expect("create tempdir");
     let artifact_path = tmp.path().join("artifact.json");
     std::fs::write(&artifact_path, "{}\n").expect("write artifact");
     std::thread::sleep(std::time::Duration::from_millis(25));
 
-    let violation = evaluate_artifact_contract(&[artifact_path], 0.000001)
+    let violation = evaluate_artifact_contract(tmp.path(), &[artifact_path], 0.000001)
         .expect("stale artifact violation expected");
     assert!(
         violation.contains("stale/invalid"),
@@ -4241,7 +4668,7 @@ fn context_intelligence_budget_reader_prefers_machine_artifact() {
     assert_eq!(actual, Some(42.0));
     assert_eq!(
         source,
-        "target/perf/context_intelligence_planner_budget.json"
+        "cargo-target[0]://perf/context_intelligence_planner_budget.json"
     );
 }
 

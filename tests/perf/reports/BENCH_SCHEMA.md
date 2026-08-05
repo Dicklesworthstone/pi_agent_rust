@@ -11,7 +11,7 @@
 | `pi.ext.legacy_bench.v1` | Legacy pi-mono (Node.js) extension benchmark event |
 | `pi.perf.workload.v1` | PiJS workload harness output (tool call throughput) |
 | `pi.perf.budget.v1` | Performance budget check result |
-| `pi.perf.budget_summary.v1` | Aggregate budget summary with pass/fail counts |
+| `pi.perf.budget_summary.v2` | Strict provenance-bound budget summary with per-budget results and claim readiness |
 | `pi.ext.conformance_report.v2` | Per-extension conformance report event |
 | `pi.ext.conformance_summary.v2` | Aggregate conformance summary with per-tier breakdowns |
 | `pi.perf.extension_benchmark_stratification.v1` | Layered extension benchmark artifact linking cold-load, per-call, and full E2E evidence with claim-integrity guards |
@@ -61,13 +61,17 @@ Same structure as `pi.ext.rust_bench.v1` with:
 
 | Field | Type | Description |
 |---|---|---|
-| `scenario` | number | Workload scenario name |
-| `iterations` | number | Number of outer iterations |
-| `tool_calls_per_iteration` | number | Tool calls per iteration |
-| `total_calls` | number | Total tool calls executed |
+| `scenario` | string | Workload scenario name |
+| `iterations` | integer | Number of outer iterations |
+| `tool_calls_per_iteration` | integer | Tool calls per iteration |
+| `total_calls` | integer | Total tool calls executed |
 | `elapsed_ms` | number | Total elapsed milliseconds |
 | `per_call_us` | number | Per-call latency in microseconds |
 | `calls_per_sec` | number | Throughput (calls per second) |
+
+### `pi.perf.budget_summary.v2`
+
+Each `budgets` entry requires `name`, `category`, `metric`, `unit`, `threshold`, `comparison`, `ci_enforced`, and `methodology`. `comparison` is the exact enum `maximum` (`actual <= threshold`) or `minimum` (`actual >= threshold`); consumers must never infer direction from a budget name. Blanket performance claims are authorized only when strict, source-bound, same-run evidence gives every declared budget data and PASS status with zero data-contract failures; aggregate `budget_data_missing` and `budget_failed` blockers prevent non-CI results from escaping that rule. Incomplete lineage produces a canonical all-`NO_DATA` blocked sentinel without inspecting ambient artifacts, target paths, or mtimes. Inventory SHA-256 uses compact JSON in producer declaration order and the listed field order, with every threshold rendered using exactly six decimal places. The canonical v0.2.0 digest is `96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad`.
 
 ### `pi.bench.protocol.v1`
 
@@ -80,7 +84,7 @@ Same structure as `pi.ext.rust_bench.v1` with:
 | `matched_state_scenarios` | object[] | `cold_start`, `warm_start`, `tool_call`, `event_dispatch` with replay inputs |
 | `required_metadata_fields` | string[] | `runtime`, `build_profile`, `host`, `scenario_id`, `correlation_id` |
 | `evidence_labels` | object | `evidence_class` (`measured/inferred`) + `confidence` (`high/medium/low`) |
-| `regression_gate_admission` | object | Generic additive metadata policy only: measured, high-confidence wall-clock evidence at a `production_*` boundary with positive sample counts and explicit disk-cache policy; load scenarios require host page-cache policy and uncontrolled host page cache is ineligible |
+| `regression_gate_admission` | object | Generic additive metadata policy only: measured, high-confidence wall-clock evidence at an enumerated production boundary with a positive sample count, exact cache-policy tokens, a clean source commit, and a verified canonical perf executable/config fingerprint |
 | `pijs_regression_gate_admission` | object | PiJS-specific release gate layered on the generic policy: exactly 2000 path-verified perf-profile QuickJS iterations through the production extension manager, with 1-call mean-latency and 10-call throughput lanes |
 | `partition_weighting` | object | Machine-readable partition weights (`realistic` + `matched-state`) with explicit sum-to-one contract |
 | `partition_interpretation` | object | Primary/secondary partition roles and release guardrail forbidding single-partition conclusions |
@@ -115,6 +119,6 @@ Same structure as `pi.ext.rust_bench.v1` with:
 
 1. **Stable key ordering**: JSON keys are sorted alphabetically within each record
 2. **No floating point in keys**: Use string or integer identifiers
-3. **Timestamps**: ISO 8601 with seconds precision (`2026-02-06T01:00:00Z`)
+3. **Timestamps**: canonical RFC 3339 UTC; release-facing v2 summaries and PiJS records use millisecond precision (`2026-02-06T01:00:00.000Z`)
 4. **Config hash**: SHA-256 of concatenated env fields for dedup
 5. **One record per line**: Standard JSONL (newline-delimited JSON)

@@ -1,8 +1,220 @@
 {
+  "budget_results": [
+    {
+      "actual": null,
+      "budget_name": "startup_version_p95",
+      "category": "startup",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 100.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "startup_full_agent_p95",
+      "category": "startup",
+      "ci_enforced": false,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 200.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "ext_cold_load_simple_p95",
+      "category": "extension",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 5.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "ext_cold_load_complex_p95",
+      "category": "extension",
+      "ci_enforced": false,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 50.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "ext_load_60_total",
+      "category": "extension",
+      "ci_enforced": false,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 10000.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "tool_call_latency_mean",
+      "category": "tool_call",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 200.0,
+      "unit": "us"
+    },
+    {
+      "actual": null,
+      "budget_name": "tool_call_throughput_min",
+      "category": "tool_call",
+      "ci_enforced": true,
+      "comparison": "minimum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 5000.0,
+      "unit": "calls/sec"
+    },
+    {
+      "actual": null,
+      "budget_name": "event_dispatch_p99",
+      "category": "event_dispatch",
+      "ci_enforced": false,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 5000.0,
+      "unit": "us"
+    },
+    {
+      "actual": null,
+      "budget_name": "context_graph_build_cold_p95",
+      "category": "context_intelligence",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 500.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "context_graph_build_warm_p95",
+      "category": "context_intelligence",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 250.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "context_incremental_update_p95",
+      "category": "context_intelligence",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 250.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "context_planning_p95",
+      "category": "context_intelligence",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 50.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "context_bundle_serialization_p95",
+      "category": "context_intelligence",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 25.0,
+      "unit": "ms"
+    },
+    {
+      "actual": null,
+      "budget_name": "context_bundle_estimated_bytes_max",
+      "category": "context_intelligence",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 262144.0,
+      "unit": "bytes"
+    },
+    {
+      "actual": null,
+      "budget_name": "policy_eval_p99",
+      "category": "policy",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 500.0,
+      "unit": "ns"
+    },
+    {
+      "actual": null,
+      "budget_name": "idle_memory_rss",
+      "category": "memory",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 50.0,
+      "unit": "MB"
+    },
+    {
+      "actual": null,
+      "budget_name": "sustained_load_rss_growth",
+      "category": "memory",
+      "ci_enforced": false,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 5.0,
+      "unit": "percent"
+    },
+    {
+      "actual": null,
+      "budget_name": "binary_size_release",
+      "category": "binary",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 22.0,
+      "unit": "MB"
+    },
+    {
+      "actual": null,
+      "budget_name": "protocol_parse_p99",
+      "category": "protocol",
+      "ci_enforced": true,
+      "comparison": "maximum",
+      "source": "not evaluated: authoritative benchmark lineage is incomplete",
+      "status": "NO_DATA",
+      "threshold": 50.0,
+      "unit": "us"
+    }
+  ],
   "budgets": [
     {
       "category": "startup",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "hyperfine: `pi --version` (10 runs, 3 warmup)",
       "metric": "p95 latency",
       "name": "startup_version_p95",
@@ -12,6 +224,7 @@
     {
       "category": "startup",
       "ci_enforced": false,
+      "comparison": "maximum",
       "methodology": "hyperfine: `pi --print '.'` with full init (10 runs, 3 warmup)",
       "metric": "p95 latency",
       "name": "startup_full_agent_p95",
@@ -21,6 +234,7 @@
     {
       "category": "extension",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: load_init_cold for simple single-file extensions (10 samples)",
       "metric": "p95 cold load time",
       "name": "ext_cold_load_simple_p95",
@@ -30,6 +244,7 @@
     {
       "category": "extension",
       "ci_enforced": false,
+      "comparison": "maximum",
       "methodology": "criterion: load_init_cold for multi-registration extensions (10 samples)",
       "metric": "p95 cold load time",
       "name": "ext_cold_load_complex_p95",
@@ -39,6 +254,7 @@
     {
       "category": "extension",
       "ci_enforced": false,
+      "comparison": "maximum",
       "methodology": "conformance runner: sequential load of all 60 official extensions",
       "metric": "total load time (60 official extensions)",
       "name": "ext_load_60_total",
@@ -48,6 +264,7 @@
     {
       "category": "tool_call",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "pijs_workload: arithmetic mean across exactly 2000 iterations x 1 tool call, executable-path-verified perf profile",
       "metric": "mean per-call latency",
       "name": "tool_call_latency_mean",
@@ -57,6 +274,7 @@
     {
       "category": "tool_call",
       "ci_enforced": true,
+      "comparison": "minimum",
       "methodology": "pijs_workload: aggregate throughput across exactly 2000 iterations x 10 tool calls, executable-path-verified perf profile",
       "metric": "minimum calls/sec",
       "name": "tool_call_throughput_min",
@@ -66,6 +284,7 @@
     {
       "category": "event_dispatch",
       "ci_enforced": false,
+      "comparison": "maximum",
       "methodology": "criterion: event_hook dispatch for before_agent_start (100 samples)",
       "metric": "p99 dispatch latency",
       "name": "event_dispatch_p99",
@@ -75,6 +294,7 @@
     {
       "category": "context_intelligence",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: semantic_context/graph_build_cold on large filesystem fixture",
       "metric": "p95 cold graph build latency",
       "name": "context_graph_build_cold_p95",
@@ -84,6 +304,7 @@
     {
       "category": "context_intelligence",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: semantic_context/graph_build_warm on large filesystem fixture",
       "metric": "p95 warm graph build latency",
       "name": "context_graph_build_warm_p95",
@@ -93,6 +314,7 @@
     {
       "category": "context_intelligence",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: semantic_context/incremental_update rebuild after one changed file",
       "metric": "p95 single-change rebuild latency",
       "name": "context_incremental_update_p95",
@@ -102,6 +324,7 @@
     {
       "category": "context_intelligence",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: semantic_context/planning on large graph fixture",
       "metric": "p95 planner latency",
       "name": "context_planning_p95",
@@ -111,6 +334,7 @@
     {
       "category": "context_intelligence",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: semantic_context/bundle_serialization on large bundle fixture",
       "metric": "p95 bundle serialization latency",
       "name": "context_bundle_serialization_p95",
@@ -120,6 +344,7 @@
     {
       "category": "context_intelligence",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "semantic_context budget artifact: estimated selected bundle bytes",
       "metric": "bundle estimated size",
       "name": "context_bundle_estimated_bytes_max",
@@ -129,6 +354,7 @@
     {
       "category": "policy",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: ext_policy/evaluate with various modes and capabilities",
       "metric": "p99 evaluation time",
       "name": "policy_eval_p99",
@@ -138,6 +364,7 @@
     {
       "category": "memory",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "sysinfo: measure RSS after startup, before any user input",
       "metric": "RSS at idle",
       "name": "idle_memory_rss",
@@ -147,6 +374,7 @@
     {
       "category": "memory",
       "ci_enforced": false,
+      "comparison": "maximum",
       "methodology": "stress test: 15 extensions, 50 events/sec for 30 seconds",
       "metric": "RSS growth under 30s sustained load",
       "name": "sustained_load_rss_growth",
@@ -156,6 +384,7 @@
     {
       "category": "binary",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "ls -la target/release/pi (stripped)",
       "metric": "release binary size",
       "name": "binary_size_release",
@@ -165,6 +394,7 @@
     {
       "category": "protocol",
       "ci_enforced": true,
+      "comparison": "maximum",
       "methodology": "criterion: ext_protocol/parse_and_validate for host_call and log messages",
       "metric": "p99 parse+validate time",
       "name": "protocol_parse_p99",
@@ -174,113 +404,30 @@
   ],
   "ci_enforced": 14,
   "ci_fail": 0,
-  "ci_no_data": 13,
-  "ci_with_data": 1,
+  "ci_no_data": 14,
+  "ci_with_data": 0,
+  "claim_readiness": {
+    "blocking_reason_codes": [
+      "budget_data_missing",
+      "ci_budget_data_missing",
+      "correlation_id_missing",
+      "run_id_missing",
+      "source_commit_unbound",
+      "strict_mode_disabled"
+    ],
+    "performance_claims_authorized": false,
+    "status": "blocked"
+  },
   "correlation_id": null,
-  "data_contract_failures_count": 16,
+  "data_contract_failures_count": 0,
   "fail": 0,
-  "failing_data_contracts": [
-    {
-      "budget_name": "startup_version_p95",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/startup/version/warm/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "ext_cold_load_simple_p95",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "tool_call_latency_mean",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "tool_call_throughput_min",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "context_graph_build_cold_p95",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "context_graph_build_warm_p95",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "context_incremental_update_p95",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "context_planning_p95",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/planning/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/planning/large_workspace/new/estimates.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "context_bundle_serialization_p95",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "context_bundle_estimated_bytes_max",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "policy_eval_p99",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_policy/evaluate, /data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "binary_size_release",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/release/pi, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pi, /data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": "protocol_parse_p99",
-      "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_protocol/parse_and_validate, /data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]",
-      "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
-    },
-    {
-      "budget_name": null,
-      "contract_id": "missing_or_stale_e2e_matrix_evidence",
-      "detail": "all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (1926.91h old)",
-      "remediation": "Generate fresh extension_benchmark_stratification.json in the current perf run."
-    },
-    {
-      "budget_name": null,
-      "contract_id": "missing_or_stale_phase1_matrix_validation_evidence",
-      "detail": "all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json (1767.15h old)",
-      "remediation": "Generate fresh phase1_matrix_validation.json in the current perf run."
-    },
-    {
-      "budget_name": null,
-      "contract_id": "missing_or_stale_context_intelligence_budget_evidence",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]",
-      "remediation": "Generate fresh context_intelligence_planner_budget.json in the current perf run."
-    }
-  ],
-  "generated_at": "2026-08-04T23:06:38.345112221+00:00",
-  "no_data": 15,
-  "pass": 4,
+  "failing_data_contracts": [],
+  "generated_at": "2026-08-05T18:08:56.356Z",
+  "no_data": 19,
+  "pass": 0,
   "run_id": null,
-  "schema": "pi.perf.budget_summary.v1",
+  "schema": "pi.perf.budget_summary.v2",
+  "source_commit": null,
+  "strict_mode": false,
   "total_budgets": 19
 }
