@@ -90,6 +90,10 @@ const fn lzss_literal_encoded_len(length: usize) -> usize {
 /// Return the size of the deterministic LZSS representation used for large
 /// JavaScript literals. This is evaluated by rustc; the raw literal is not
 /// needed by the release binary.
+#[expect(
+    clippy::large_stack_arrays,
+    reason = "the hash table exists only during compile-time evaluation of embedded literals"
+)]
 pub const fn lzss_compressed_len(input: &[u8]) -> usize {
     let mut positions = [usize::MAX; LZSS_HASH_SLOTS];
     let mut position = 0;
@@ -110,6 +114,10 @@ pub const fn lzss_compressed_len(input: &[u8]) -> usize {
 }
 
 /// Encode a text literal into the deterministic LZSS representation.
+#[expect(
+    clippy::large_stack_arrays,
+    reason = "the hash table exists only during compile-time evaluation of embedded literals"
+)]
 pub const fn lzss_compress<const OUTPUT_LEN: usize>(input: &[u8]) -> [u8; OUTPUT_LEN] {
     let mut positions = [usize::MAX; LZSS_HASH_SLOTS];
     let mut output = [0; OUTPUT_LEN];
@@ -165,9 +173,10 @@ pub const fn lzss_compress<const OUTPUT_LEN: usize>(input: &[u8]) -> [u8; OUTPUT
             literal_position += 1;
         }
     }
-    if output_position != OUTPUT_LEN {
-        panic!("LZSS encoded length mismatch");
-    }
+    assert!(
+        output_position == OUTPUT_LEN,
+        "LZSS encoded length mismatch"
+    );
     output
 }
 
@@ -306,6 +315,8 @@ mod tests {
     const LZSS_FIXTURE_LEN: usize = super::lzss_compressed_len(LZSS_FIXTURE.as_bytes());
     const LZSS_FIXTURE_ENCODED: [u8; LZSS_FIXTURE_LEN] =
         super::lzss_compress::<LZSS_FIXTURE_LEN>(LZSS_FIXTURE.as_bytes());
+    const EMPTY_LEN: usize = super::lzss_compressed_len(b"");
+    const EMPTY: [u8; EMPTY_LEN] = super::lzss_compress::<EMPTY_LEN>(b"");
 
     #[test]
     fn compile_time_lzss_round_trips_and_compresses_repetition() {
@@ -314,8 +325,6 @@ mod tests {
         assert_eq!(decoded, LZSS_FIXTURE);
         assert!(LZSS_FIXTURE_ENCODED.len() < LZSS_FIXTURE.len());
 
-        const EMPTY_LEN: usize = super::lzss_compressed_len(b"");
-        const EMPTY: [u8; EMPTY_LEN] = super::lzss_compress::<EMPTY_LEN>(b"");
         assert_eq!(super::lzss_decompress(&EMPTY, 0).as_deref(), Ok(""));
     }
 

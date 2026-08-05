@@ -203,6 +203,9 @@ if [ "$is_head" -eq 1 ]; then
 fi
 
 url="${args[${#args[@]}-1]}"
+if [[ "$url" == *.sigstore.json ]]; then
+  exit 22
+fi
 if [ -n "$output" ] && [ -n "${STUB_ARTIFACT_SOURCE:-}" ]; then
   cp "${STUB_ARTIFACT_SOURCE}" "$output"
   exit 0
@@ -448,7 +451,21 @@ assert_file_contains() {
 
 run_test() {
   local name="$1"
-  if "$name"; then
+  local status
+
+  # A function invoked directly as an `if` condition inherits Bash's disabled
+  # errexit state, so an early failed assertion could previously be hidden by
+  # a later successful assertion. Run each case in its own strict subshell and
+  # inspect the captured status only after the case has finished.
+  set +e
+  (
+    set -e
+    "$name"
+  )
+  status=$?
+  set -e
+
+  if [ "$status" -eq 0 ]; then
     PASS_COUNT=$((PASS_COUNT + 1))
     echo "[PASS] ${name}"
   else
@@ -472,9 +489,11 @@ test_help_lists_installer_flags() {
 
 test_release_workflows_do_not_use_no_verify() {
   local matches
-  matches="$(grep -RIn -- '--no-verify' "${ROOT}/.github/workflows" 2>/dev/null || true)"
+  matches="$(grep -RIn -- '--no-verify' \
+    "${ROOT}/.github/workflows" \
+    "${ROOT}/docs/releasing.md" 2>/dev/null || true)"
   if [ -n "$matches" ]; then
-    echo "release/workflow install commands must not use --no-verify" >&2
+    echo "release workflows and instructions must not use --no-verify" >&2
     echo "$matches" >&2
     return 1
   fi

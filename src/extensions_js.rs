@@ -18697,6 +18697,10 @@ fn random_bytes(len: usize) -> std::result::Result<Vec<u8>, getrandom::Error> {
 ///
 /// This code creates the `pi` global object with Promise-returning methods.
 /// Each method wraps a native Rust function (`__pi_*_native`) that returns a call_id.
+#[expect(
+    clippy::too_many_lines,
+    reason = "this function owns one indivisible embedded JavaScript bridge source"
+)]
 fn pi_bridge_js() -> &'static str {
     static PI_BRIDGE_JS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PI_BRIDGE_JS.get_or_init(|| {

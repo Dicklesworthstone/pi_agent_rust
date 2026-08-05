@@ -3003,7 +3003,6 @@ jobs:
             cargo publish \
               --manifest-path "$manifest_abs" \
               --locked \
-              --no-verify \
               --registry crates-io \
               --config "$registry_credential_config" \
               --config "$named_credential_config"

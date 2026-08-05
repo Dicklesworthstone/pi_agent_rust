@@ -30,7 +30,7 @@ Stable crates.io publication is owned only by `.github/workflows/release.yml`.
 That workflow first creates or safely completes a verified GitHub draft, builds
 and inspects the exact `.crate` without a secret, then passes the crate and a
 source-bound checksum receipt to a fresh review-gated runner. The fresh runner
-executes `cargo publish --locked --no-verify --registry crates-io`; its custom
+executes `cargo publish --locked --registry crates-io`; its custom
 Cargo credential provider releases the token only when Cargo identifies the
 canonical crates.io registry and presents the exact verified crate
 name/version/SHA-256. The workflow then requires crates.io to report the exact,
@@ -1909,7 +1909,7 @@ proof is not proof of an empty bypass list.
    (set -C; git show \
      "$expected_source_commit:.github/workflows/release.yml" > "$frozen_workflow")
    test "$(sha256sum "$frozen_workflow" | awk '{print $1}')" = \
-     20b9d3f8d431ca1ed99e977509f4e4a135146917d1b3ec12997c4a1979ec9aef
+     b90f193d5eff25ea2809d1f78fd51a0e5b9d941f3240579ac97bb6d54a36fb59
    FROZEN_WORKFLOW="$frozen_workflow" PROVIDER_PATH="$provider" python3 - <<'PY'
    import os
    from pathlib import Path
@@ -2105,7 +2105,7 @@ proof is not proof of an empty bypass list.
        PI_EXPECTED_CRATE_VERSION="$RELEASE_VERSION" \
        PI_EXPECTED_CRATE_SHA256="$expected_crate_sha256" \
        PI_CREDENTIAL_RECEIPT="$actual_receipt" \
-       cargo publish --manifest-path "$manifest_abs" --locked --no-verify \
+       cargo publish --manifest-path "$manifest_abs" --locked \
          --registry crates-io \
          --config "$registry_credential_config" \
          --config "$named_credential_config"
