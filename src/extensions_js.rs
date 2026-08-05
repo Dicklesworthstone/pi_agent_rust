@@ -9920,7 +9920,7 @@ export class SSEClientTransport {
 import "node:fs";
 
 function __pi_glob_vfs() {
-  return globalThis.__pi_vfs_state || null;
+  return globalThis.__pi_vfs_api || null;
 }
 
 function __pi_is_abs(path) {
@@ -9985,7 +9985,8 @@ function __pi_make_relative(base, full) {
 
 function __pi_collect(patterns, opts) {
   const vfs = __pi_glob_vfs();
-  if (!vfs) return [];
+  if (!vfs || typeof vfs.listVisiblePaths !== "function") return [];
+  const visible = vfs.listVisiblePaths();
   const cwd = opts && typeof opts.cwd === "string" ? opts.cwd : undefined;
   const absolute = !!(opts && opts.absolute);
   const nodir = !!(opts && opts.nodir);
@@ -10003,17 +10004,15 @@ function __pi_collect(patterns, opts) {
   for (const rawPattern of patterns) {
     const normalized = __pi_normalize(rawPattern, cwd);
     const regex = __pi_glob_regex(normalized);
-    for (const file of vfs.files.keys()) {
+    for (const file of visible.files) {
       if (regex.test(file)) results.add(file);
     }
     if (!nodir) {
-      for (const dir of vfs.dirs.values()) {
+      for (const dir of visible.dirs) {
         if (regex.test(dir)) results.add(dir);
       }
-      if (vfs.symlinks && typeof vfs.symlinks.keys === "function") {
-        for (const link of vfs.symlinks.keys()) {
-          if (regex.test(link)) results.add(link);
-        }
+      for (const link of visible.symlinks) {
+        if (regex.test(link)) results.add(link);
       }
     }
   }
@@ -11239,10 +11238,6 @@ export const constants = {
   O_APPEND: 1024,
 };
 const __pi_vfs = (() => {
-  if (globalThis.__pi_vfs_state) {
-    return globalThis.__pi_vfs_state;
-  }
-
   const state = {
     files: new Map(),
     dirs: new Set(["/"]),
@@ -11526,10 +11521,11 @@ const __pi_vfs = (() => {
     return normalizePath(`${dirname(linkPath)}/${raw}`);
   }
 
-  function resolvePath(path, followSymlinks = true) {
+  function resolvePathDetails(path, followSymlinks = true) {
     let normalized = mapExtensionTempPath(path, normalizePath(path));
+    const authorizationPaths = [normalized];
     if (!followSymlinks) {
-      return normalized;
+      return { resolved: normalized, authorizationPaths };
     }
 
     const seen = new Set();
@@ -11539,34 +11535,39 @@ const __pi_vfs = (() => {
       }
       seen.add(normalized);
       normalized = resolveSymlinkPath(normalized, state.symlinks.get(normalized));
+      authorizationPaths.push(normalized);
     }
-    return normalized;
+    return { resolved: normalized, authorizationPaths };
+  }
+
+  function resolvePath(path, followSymlinks = true) {
+    return resolvePathDetails(path, followSymlinks).resolved;
+  }
+
+  function authorizeResolution(details, checkAccess) {
+    for (const candidate of details.authorizationPaths) {
+      checkAccess(candidate);
+    }
+  }
+
+  function authorizeReadResolution(details) {
+    authorizeResolution(details, checkReadAccess);
+  }
+
+  function authorizeWriteResolution(details) {
+    authorizeResolution(details, checkWriteAccess);
   }
 
   function resolvePathForRead(path, followSymlinks = true) {
-    const unresolved = resolvePath(path, false);
-    checkReadAccess(unresolved);
-    if (!followSymlinks) {
-      return unresolved;
-    }
-    const resolved = resolvePath(path, true);
-    if (resolved !== unresolved) {
-      checkReadAccess(resolved);
-    }
-    return resolved;
+    const details = resolvePathDetails(path, followSymlinks);
+    authorizeReadResolution(details);
+    return details.resolved;
   }
 
   function resolvePathForWrite(path, followSymlinks = true) {
-    const unresolved = resolvePath(path, false);
-    checkWriteAccess(unresolved);
-    if (!followSymlinks) {
-      return unresolved;
-    }
-    const resolved = resolvePath(path, true);
-    if (resolved !== unresolved) {
-      checkWriteAccess(resolved);
-    }
-    return resolved;
+    const details = resolvePathDetails(path, followSymlinks);
+    authorizeWriteResolution(details);
+    return details.resolved;
   }
 
   function parseOpenFlags(rawFlags) {
@@ -11622,6 +11623,14 @@ const __pi_vfs = (() => {
       throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
     }
     return entry;
+  }
+
+  function authorizeFdRead(entry) {
+    authorizeReadResolution({ authorizationPaths: entry.authorizationPaths });
+  }
+
+  function authorizeFdWrite(entry) {
+    authorizeWriteResolution({ authorizationPaths: entry.authorizationPaths });
   }
 
   function toWritableView(buffer) {
@@ -11767,6 +11776,26 @@ const __pi_vfs = (() => {
     };
   }
 
+  function listVisiblePaths() {
+    const visible = (paths) => {
+      const out = [];
+      for (const path of paths) {
+        try {
+          resolvePathForRead(path, false);
+          out.push(path);
+        } catch (_) {
+          // Paths outside the active extension's read scope stay private.
+        }
+      }
+      return out;
+    };
+    return {
+      files: visible(state.files.keys()),
+      dirs: visible(state.dirs.values()),
+      symlinks: visible(state.symlinks.keys()),
+    };
+  }
+
   state.normalizePath = normalizePath;
   state.dirname = dirname;
   state.ensureDir = ensureDir;
@@ -11775,9 +11804,12 @@ const __pi_vfs = (() => {
   state.listChildren = listChildren;
   state.makeDirent = makeDirent;
   state.makeStat = makeStat;
+  state.resolvePathDetails = resolvePathDetails;
   state.resolvePath = resolvePath;
   state.resolvePathForRead = resolvePathForRead;
   state.resolvePathForWrite = resolvePathForWrite;
+  state.authorizeReadResolution = authorizeReadResolution;
+  state.authorizeWriteResolution = authorizeWriteResolution;
   state.mapExtensionTempPath = mapExtensionTempPath;
   state.unmapExtensionTempPath = unmapExtensionTempPath;
   state.isCurrentExtensionTempPath = isCurrentExtensionTempPath;
@@ -11786,8 +11818,15 @@ const __pi_vfs = (() => {
   state.checkWorkspaceWriteAccess = checkWorkspaceWriteAccess;
   state.parseOpenFlags = parseOpenFlags;
   state.getFdEntry = getFdEntry;
+  state.authorizeFdRead = authorizeFdRead;
+  state.authorizeFdWrite = authorizeFdWrite;
   state.toWritableView = toWritableView;
-  globalThis.__pi_vfs_state = state;
+  Object.defineProperty(globalThis, "__pi_vfs_api", {
+    value: Object.freeze({ normalizePath, listVisiblePaths }),
+    writable: false,
+    configurable: false,
+    enumerable: false,
+  });
   return state;
 })();
 
@@ -12060,15 +12099,15 @@ export function symlinkSync(target, path, _type) {
 export function openSync(path, flags = "r", _mode) {
   const opts = __pi_vfs.parseOpenFlags(flags);
   const needsWriteAccess = opts.writable || opts.create || opts.append || opts.truncate;
-  let resolved;
+  const resolution = __pi_vfs.resolvePathDetails(path, true);
 
   if (opts.readable) {
-    resolved = __pi_vfs.resolvePathForRead(path, true);
+    __pi_vfs.authorizeReadResolution(resolution);
   }
   if (needsWriteAccess) {
-    resolved = __pi_vfs.resolvePathForWrite(path, true);
+    __pi_vfs.authorizeWriteResolution(resolution);
   }
-  resolved = resolved || __pi_vfs.resolvePath(path, true);
+  const resolved = resolution.resolved;
 
   if (__pi_vfs.dirs.has(resolved)) {
     throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
@@ -12093,6 +12132,7 @@ export function openSync(path, flags = "r", _mode) {
   const current = __pi_vfs.files.get(resolved) || new Uint8Array();
   __pi_vfs.fds.set(fd, {
     path: resolved,
+    authorizationPaths: resolution.authorizationPaths.slice(),
     readable: opts.readable,
     writable: opts.writable,
     append: opts.append,
@@ -12110,7 +12150,7 @@ export function readSync(fd, buffer, offset = 0, length, position = null) {
   if (!entry.readable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
-  __pi_vfs.checkReadAccess(entry.path);
+  __pi_vfs.authorizeFdRead(entry);
   const out = __pi_vfs.toWritableView(buffer);
   const start = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const maxLen =
@@ -12137,6 +12177,7 @@ export function writeSync(fd, buffer, offset, length, position) {
   if (!entry.writable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
+  __pi_vfs.authorizeFdWrite(entry);
 
   let chunk;
   let explicitPosition = false;
@@ -12193,6 +12234,7 @@ export function writeSync(fd, buffer, offset, length, position) {
 }
 export function fstatSync(fd) {
   const entry = __pi_vfs.getFdEntry(fd);
+  __pi_vfs.authorizeFdRead(entry);
   return __pi_vfs.makeStat(entry.path, true);
 }
 export function ftruncateSync(fd, len = 0) {
@@ -12200,6 +12242,7 @@ export function ftruncateSync(fd, len = 0) {
   if (!entry.writable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
+  __pi_vfs.authorizeFdWrite(entry);
   const targetLen =
     Number.isInteger(len) && len >= 0 ? len : 0;
   const current = __pi_vfs.files.get(entry.path) || new Uint8Array();
@@ -27316,7 +27359,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn pijs_registered_tmp_roots_bypass_only_generic_tmp_scoping() {
+    fn pijs_registered_tmp_roots_reach_host_while_generic_tmp_stays_scoped() {
         futures::executor::block_on(async {
             let temp_dir = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
             let workspace = temp_dir.path().join("workspace");
@@ -27324,10 +27367,12 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             std::fs::create_dir_all(&workspace).expect("mkdir workspace");
             std::fs::create_dir_all(&ext_root).expect("mkdir extension");
             let registered_path = ext_root.join("asset.txt");
-            let generic_path = PathBuf::from(format!(
-                "/tmp/pijs-unregistered-{}/asset.txt",
+            std::fs::write(&registered_path, "registered-asset").expect("write asset");
+            let generic_dir = PathBuf::from(format!(
+                "/tmp/pijs-unregistered-{}",
                 uuid::Uuid::new_v4().simple()
             ));
+            let generic_path = generic_dir.join("asset.txt");
 
             let config = PiJsRuntimeConfig {
                 cwd: workspace.display().to_string(),
@@ -27344,49 +27389,60 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             let script = format!(
                 r#"
-                globalThis.tmpRootMapping = {{}};
-                __pi_with_extension_async("ext.a", async () => {{
-                    globalThis.tmpRootMapping.registeredA =
-                        __pi_vfs_state.resolvePath({registered_path:?}, true);
-                    globalThis.tmpRootMapping.genericA =
-                        __pi_vfs_state.resolvePath({generic_path:?}, true);
-                }}).then(() => __pi_with_extension_async("ext.b", async () => {{
-                    globalThis.tmpRootMapping.registeredB =
-                        __pi_vfs_state.resolvePath({registered_path:?}, true);
-                    globalThis.tmpRootMapping.genericB =
-                        __pi_vfs_state.resolvePath({generic_path:?}, true);
-                }})).finally(() => {{
-                    globalThis.tmpRootMapping.done = true;
+                globalThis.tmpRootScope = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.a", async () => {{
+                        globalThis.tmpRootScope.registeredA =
+                            fs.readFileSync({registered_path:?}, 'utf8');
+                        fs.mkdirSync({generic_dir:?}, {{ recursive: true }});
+                        fs.writeFileSync({generic_path:?}, 'generic-a');
+                        globalThis.tmpRootScope.genericA =
+                            fs.readFileSync({generic_path:?}, 'utf8');
+                    }}).then(() => __pi_with_extension_async("ext.b", async () => {{
+                        try {{
+                            fs.readFileSync({registered_path:?}, 'utf8');
+                            globalThis.tmpRootScope.registeredB = true;
+                        }} catch (err) {{
+                            globalThis.tmpRootScope.registeredB = false;
+                            globalThis.tmpRootScope.registeredBError =
+                                String((err && err.message) || err || '');
+                        }}
+                        globalThis.tmpRootScope.genericVisibleBeforeB =
+                            fs.existsSync({generic_path:?});
+                        fs.mkdirSync({generic_dir:?}, {{ recursive: true }});
+                        fs.writeFileSync({generic_path:?}, 'generic-b');
+                        globalThis.tmpRootScope.genericB =
+                            fs.readFileSync({generic_path:?}, 'utf8');
+                    }})).then(() => __pi_with_extension_async("ext.a", async () => {{
+                        globalThis.tmpRootScope.genericAAfter =
+                            fs.readFileSync({generic_path:?}, 'utf8');
+                    }}));
+                }}).finally(() => {{
+                    globalThis.tmpRootScope.done = true;
                 }});
                 "#
             );
             runtime
                 .eval(&script)
                 .await
-                .expect("eval registered and generic /tmp mapping");
+                .expect("eval registered and generic /tmp access");
 
-            let result = get_global_json(&runtime, "tmpRootMapping").await;
+            let result = get_global_json(&runtime, "tmpRootScope").await;
             assert_eq!(result["done"], serde_json::json!(true));
-            assert_eq!(
-                result["registeredA"],
-                serde_json::json!(registered_path.display().to_string())
-            );
-            assert_eq!(result["registeredB"], result["registeredA"]);
-            assert_ne!(
-                result["genericA"],
-                serde_json::json!(generic_path.display().to_string())
-            );
-            assert_ne!(result["genericB"], result["genericA"]);
+            assert_eq!(result["registeredA"], serde_json::json!("registered-asset"));
+            assert_eq!(result["registeredB"], serde_json::json!(false));
             assert!(
-                result["genericA"]
+                result["registeredBError"]
                     .as_str()
-                    .is_some_and(|path| path.starts_with("/__pi_extension_tmp/ext.a/"))
+                    .is_some_and(|error| error.contains("host read denied"))
             );
-            assert!(
-                result["genericB"]
-                    .as_str()
-                    .is_some_and(|path| path.starts_with("/__pi_extension_tmp/ext.b/"))
-            );
+            assert_eq!(result["genericVisibleBeforeB"], serde_json::json!(false));
+            assert_eq!(result["genericA"], serde_json::json!("generic-a"));
+            assert_eq!(result["genericB"], serde_json::json!("generic-b"));
+            assert_eq!(result["genericAAfter"], serde_json::json!("generic-a"));
+            assert!(!generic_path.exists(), "generic /tmp write escaped the VFS");
         });
     }
 
@@ -27402,6 +27458,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
             let cached_secret = ext_a.join("cached-secret.txt");
             let cross_root_link = ext_b.join("workspace-link.txt");
+            let multi_hop_a = ext_a.join("multi-hop-a.txt");
+            let multi_hop_b = ext_b.join("multi-hop-b.txt");
             let workspace_target = workspace.join("link-target.txt");
             std::fs::write(&workspace_target, "workspace-value").expect("write workspace target");
 
@@ -27416,8 +27474,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             )
             .await
             .expect("create runtime");
-            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
-            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+            runtime.add_extension_root_with_id(ext_a.clone(), Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b.clone(), Some("ext.b"));
 
             let script = format!(
                 r#"
@@ -27439,11 +27497,27 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                                 String((err && err.message) || err || '');
                         }}
 
+                        const legacyState = globalThis.__pi_vfs_state;
+                        const safeApi = globalThis.__pi_vfs_api;
+                        globalThis.vfsScope.rawStatePresent =
+                            legacyState !== undefined && legacyState !== null;
+                        globalThis.vfsScope.safeApiExposesRawMaps = !!(
+                            safeApi && (safeApi.files || safeApi.dirs || safeApi.symlinks)
+                        );
+                        const visiblePaths =
+                            safeApi && typeof safeApi.listVisiblePaths === 'function'
+                                ? safeApi.listVisiblePaths()
+                                : {{ files: [] }};
+                        globalThis.vfsScope.safeApiVisibleSecret =
+                            visiblePaths.files.includes({cached_secret:?});
+
                         fs.mkdirSync({ext_b:?}, {{ recursive: true }});
                         fs.symlinkSync({workspace_target:?}, {cross_root_link:?});
+                        fs.symlinkSync({workspace_target:?}, {multi_hop_b:?});
                         globalThis.vfsScope.ownerLinkRead =
                             fs.readFileSync({cross_root_link:?}, 'utf8');
                     }})).then(() => __pi_with_extension_async("ext.a", async () => {{
+                        fs.symlinkSync({multi_hop_b:?}, {multi_hop_a:?});
                         try {{
                             fs.readFileSync({cross_root_link:?}, 'utf8');
                             globalThis.vfsScope.crossLinkRead = true;
@@ -27458,6 +27532,22 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         }} catch (err) {{
                             globalThis.vfsScope.crossLinkWrite = false;
                             globalThis.vfsScope.crossLinkWriteError =
+                                String((err && err.message) || err || '');
+                        }}
+                        try {{
+                            fs.readFileSync({multi_hop_a:?}, 'utf8');
+                            globalThis.vfsScope.multiHopRead = true;
+                        }} catch (err) {{
+                            globalThis.vfsScope.multiHopRead = false;
+                            globalThis.vfsScope.multiHopReadError =
+                                String((err && err.message) || err || '');
+                        }}
+                        try {{
+                            fs.writeFileSync({multi_hop_a:?}, 'multi-hop-tamper');
+                            globalThis.vfsScope.multiHopWrite = true;
+                        }} catch (err) {{
+                            globalThis.vfsScope.multiHopWrite = false;
+                            globalThis.vfsScope.multiHopWriteError =
                                 String((err && err.message) || err || '');
                         }}
                         globalThis.vfsScope.workspaceValue =
@@ -27482,6 +27572,9 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     .as_str()
                     .is_some_and(|error| error.contains("host read denied"))
             );
+            assert_eq!(result["rawStatePresent"], serde_json::json!(false));
+            assert_eq!(result["safeApiExposesRawMaps"], serde_json::json!(false));
+            assert_eq!(result["safeApiVisibleSecret"], serde_json::json!(false));
             assert_eq!(
                 result["ownerLinkRead"],
                 serde_json::json!("workspace-value")
@@ -27498,10 +27591,112 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     .as_str()
                     .is_some_and(|error| error.contains("host write denied"))
             );
+            assert_eq!(result["multiHopRead"], serde_json::json!(false));
+            assert!(
+                result["multiHopReadError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("host read denied"))
+            );
+            assert_eq!(result["multiHopWrite"], serde_json::json!(false));
+            assert!(
+                result["multiHopWriteError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("host write denied"))
+            );
             assert_eq!(
                 result["workspaceValue"],
                 serde_json::json!("workspace-value")
             );
+        });
+    }
+
+    #[test]
+    fn pijs_vfs_file_descriptors_recheck_extension_scope_on_handoff() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let fd_path = ext_a.join("fd-secret.txt");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a.clone(), Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b.clone(), Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.fdScope = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    let fd;
+                    return __pi_with_extension_async("ext.a", async () => {{
+                        fs.mkdirSync({ext_a:?}, {{ recursive: true }});
+                        fs.writeFileSync({fd_path:?}, 'fd-secret');
+                        fd = fs.openSync({fd_path:?}, 'r+');
+                    }}).then(() => __pi_with_extension_async("ext.b", async () => {{
+                        for (const [name, operation] of [
+                            ['read', () => fs.readSync(fd, Buffer.alloc(9), 0, 9, 0)],
+                            ['write', () => fs.writeSync(fd, 'tampered', 0)],
+                            ['truncate', () => fs.ftruncateSync(fd, 1)],
+                            ['stat', () => fs.fstatSync(fd)],
+                        ]) {{
+                            try {{
+                                operation();
+                                globalThis.fdScope[name] = true;
+                            }} catch (err) {{
+                                globalThis.fdScope[name] = false;
+                                globalThis.fdScope[name + 'Error'] =
+                                    String((err && err.message) || err || '');
+                            }}
+                        }}
+                    }})).then(() => __pi_with_extension_async("ext.a", async () => {{
+                        globalThis.fdScope.ownerValue =
+                            fs.readFileSync({fd_path:?}, 'utf8');
+                        globalThis.fdScope.ownerSize = fs.fstatSync(fd).size;
+                        fs.closeSync(fd);
+                    }}));
+                }}).finally(() => {{
+                    globalThis.fdScope.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval cross-extension VFS fd handoff");
+
+            let result = get_global_json(&runtime, "fdScope").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            for (operation, expected_denial) in [
+                ("read", "host read denied"),
+                ("write", "host write denied"),
+                ("truncate", "host write denied"),
+                ("stat", "host read denied"),
+            ] {
+                assert_eq!(result[operation], serde_json::json!(false));
+                assert!(
+                    result[format!("{operation}Error")]
+                        .as_str()
+                        .is_some_and(|error| error.contains(expected_denial)),
+                    "expected {expected_denial} for {operation}: {result}"
+                );
+            }
+            assert_eq!(result["ownerValue"], serde_json::json!("fd-secret"));
+            assert_eq!(result["ownerSize"], serde_json::json!(9));
         });
     }
 
