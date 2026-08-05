@@ -7,12 +7,14 @@
 #![allow(clippy::missing_const_for_fn, clippy::too_many_lines)]
 
 use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error as StdError;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -27,6 +29,101 @@ const DEFAULT_STALE_AFTER_DAYS: i64 = 90;
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 6 * 60 * 60;
 const DEFAULT_CONTEXT_CACHE_TTL_SECONDS: u64 = 15 * 60;
 const CONTEXT_PRIVACY_POLICY_VERSION: &str = "pi.context_privacy.v1";
+
+struct DuplicateRejectingJsonValue(Value);
+
+impl<'de> Deserialize<'de> for DuplicateRejectingJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(DuplicateRejectingJsonVisitor)
+    }
+}
+
+struct DuplicateRejectingJsonVisitor;
+
+impl<'de> Visitor<'de> for DuplicateRejectingJsonVisitor {
+    type Value = DuplicateRejectingJsonValue;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(DuplicateRejectingJsonValue)
+            .ok_or_else(|| E::custom("JSON number must be finite"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::String(
+            value.to_string(),
+        )))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(DuplicateRejectingJsonValue(Value::Null))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<DuplicateRejectingJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(DuplicateRejectingJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut object = serde_json::Map::new();
+        while let Some(key) = entries.next_key::<String>()? {
+            let value = entries.next_value::<DuplicateRejectingJsonValue>()?;
+            if object.insert(key, value.0).is_some() {
+                return Err(<A::Error as serde::de::Error>::custom(
+                    "duplicate JSON object key",
+                ));
+            }
+        }
+        Ok(DuplicateRejectingJsonValue(Value::Object(object)))
+    }
+}
+
+fn parse_evidence_json(content: &str) -> serde_json::Result<Value> {
+    let mut deserializer = serde_json::Deserializer::from_str(content);
+    let value = DuplicateRejectingJsonValue::deserialize(&mut deserializer)?.0;
+    deserializer.end()?;
+    Ok(value)
+}
 
 #[derive(Debug, Clone)]
 pub struct SemanticWorkspaceGraphBuilder {
@@ -253,21 +350,33 @@ impl SemanticWorkspaceGraphBuilder {
             cache_status,
         });
 
-        let content = String::from_utf8_lossy(&bytes);
         match input.surface {
             SourceSurface::RustCodeModules | SourceSurface::IntegrationAndContractTests => {
+                let content = String::from_utf8_lossy(&bytes);
                 Self::ingest_rust_file(input, &content, &content_sha256, size_bytes, state);
             }
             SourceSurface::ReadmeAndDocs => {
+                let content = String::from_utf8_lossy(&bytes);
                 Self::ingest_markdown_file(input, &content, &content_sha256, size_bytes, state);
             }
-            SourceSurface::EvidenceArtifacts => {
-                self.ingest_evidence_file(input, &content, &content_sha256, size_bytes, state);
-            }
+            SourceSurface::EvidenceArtifacts => match std::str::from_utf8(&bytes) {
+                Ok(content) => {
+                    self.ingest_evidence_file(input, content, &content_sha256, size_bytes, state);
+                }
+                Err(_) => Self::ingest_invalid_utf8_evidence_file(
+                    input,
+                    &bytes,
+                    &content_sha256,
+                    size_bytes,
+                    state,
+                ),
+            },
             SourceSurface::BeadsIssueGraph => {
+                let content = String::from_utf8_lossy(&bytes);
                 self.ingest_beads_jsonl(input, &content, &content_sha256, size_bytes, state);
             }
             SourceSurface::RuntimeArtifacts => {
+                let content = String::from_utf8_lossy(&bytes);
                 Self::ingest_runtime_artifact(input, &content, &content_sha256, size_bytes, state);
             }
             SourceSurface::Unknown => {}
@@ -468,12 +577,13 @@ impl SemanticWorkspaceGraphBuilder {
         let file_node_id = file_node.id.clone();
         state.push_node(file_node);
 
-        match serde_json::from_str::<Value>(content) {
+        match parse_evidence_json(content) {
             Ok(value) => {
                 let redaction = assess_redaction(&input.source_path, content, Some(&value));
                 let mut evidence_node = evidence_artifact_node(
                     &input.source_path,
                     &value,
+                    content.as_bytes(),
                     content_sha256,
                     &self.options,
                     &self.root,
@@ -521,6 +631,57 @@ impl SemanticWorkspaceGraphBuilder {
                 ));
             }
         }
+    }
+
+    fn ingest_invalid_utf8_evidence_file(
+        input: &DiscoveredInput,
+        bytes: &[u8],
+        content_sha256: &str,
+        size_bytes: u64,
+        state: &mut GraphBuildState,
+    ) {
+        let line_count = if bytes.is_empty() {
+            0
+        } else {
+            bytes.split(|byte| *byte == b'\n').count()
+        };
+        let mut file_node = file_region_node(
+            &input.source_path,
+            content_sha256,
+            size_bytes,
+            1,
+            line_count,
+            input.surface.as_str(),
+        );
+        file_node.redaction_status = file_node
+            .redaction_status
+            .max(RedactionStatus::SensitiveOmitted);
+        let file_node_id = file_node.id.clone();
+        state.push_node(file_node);
+
+        let mut node = missing_or_unreadable_evidence_node(
+            &input.source_path,
+            EvidenceFreshnessStatus::Malformed,
+            "invalid_utf8",
+        );
+        node.content_sha256 = Some(content_sha256.to_string());
+        node.redaction_status = node.redaction_status.max(RedactionStatus::SensitiveOmitted);
+        state.push_edge(edge(
+            SemanticEdgeType::Tracks,
+            &file_node_id,
+            &node.id,
+            "invalid_utf8_evidence",
+        ));
+        state.register_evidence_node(&input.source_path, &node.id);
+        state.push_node(node);
+        state.push_trace(GraphBuildTraceEvent::new(
+            input.surface.as_str(),
+            input.source_path.clone(),
+            GraphInputStatus::Malformed,
+            "invalid_utf8",
+            1,
+            1,
+        ));
     }
 
     fn ingest_beads_jsonl(
@@ -1887,36 +2048,646 @@ fn classify_in_progress_bead(
     }
 }
 
+const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
+const PERF_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
+const DROPIN_CERTIFICATION_VERDICT_PATH: &str = "docs/evidence/dropin-certification-verdict.json";
+const DROPIN_CERTIFICATION_VERDICT_SCHEMA: &str = "pi.dropin.certification_verdict.v1";
+const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
+    "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad";
+const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
+    "schema",
+    "generated_at",
+    "source_commit",
+    "run_id",
+    "correlation_id",
+    "strict_mode",
+    "total_budgets",
+    "ci_enforced",
+    "ci_with_data",
+    "ci_fail",
+    "ci_no_data",
+    "pass",
+    "fail",
+    "no_data",
+    "data_contract_failures_count",
+    "failing_data_contracts",
+    "budgets",
+    "budget_results",
+    "claim_readiness",
+];
+const PERF_BUDGET_FIELDS: &[&str] = &[
+    "name",
+    "category",
+    "metric",
+    "unit",
+    "threshold",
+    "comparison",
+    "methodology",
+    "ci_enforced",
+];
+const PERF_RESULT_REQUIRED_FIELDS: &[&str] = &[
+    "budget_name",
+    "category",
+    "threshold",
+    "comparison",
+    "unit",
+    "actual",
+    "status",
+    "source",
+    "ci_enforced",
+];
+const PERF_FAILURE_REQUIRED_FIELDS: &[&str] = &["contract_id", "detail", "remediation"];
+const PERF_CLAIM_READINESS_FIELDS: &[&str] = &[
+    "status",
+    "performance_claims_authorized",
+    "blocking_reason_codes",
+];
+
+#[derive(Debug)]
+struct ValidatedPerformanceBudgetClaim {
+    source_commit: Option<String>,
+    claim_ready: bool,
+}
+
+#[derive(Debug)]
+struct PerformanceBudgetDefinition {
+    category: String,
+    unit: String,
+    threshold: f64,
+    comparison: String,
+    ci_enforced: bool,
+}
+
+fn performance_exact_object<'a>(
+    value: &'a Value,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{label} must be an object"))?;
+    let missing = required
+        .iter()
+        .filter(|field| !object.contains_key(**field))
+        .copied()
+        .collect::<Vec<_>>();
+    let unexpected = object
+        .keys()
+        .filter(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() && unexpected.is_empty() {
+        Ok(object)
+    } else {
+        Err(format!(
+            "{label} fields are not exact (missing={missing:?}, unexpected={unexpected:?})"
+        ))
+    }
+}
+
+fn performance_nonempty_string<'a>(value: &'a Value, label: &str) -> Result<&'a str, String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("{label} must be a string"))?;
+    if raw.is_empty() || raw.trim() != raw {
+        Err(format!(
+            "{label} must be non-empty and free of surrounding whitespace"
+        ))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn performance_uint(value: &Value, label: &str) -> Result<u64, String> {
+    value
+        .as_u64()
+        .filter(|number| *number <= i64::MAX.unsigned_abs())
+        .ok_or_else(|| format!("{label} must be a non-negative signed 64-bit integer"))
+}
+
+fn performance_finite_number(value: &Value, label: &str, positive: bool) -> Result<f64, String> {
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("{label} must be a finite number"))?;
+    if positive && number <= 0.0 {
+        Err(format!("{label} must be a positive finite number"))
+    } else {
+        Ok(number)
+    }
+}
+
+fn performance_nullable_lineage(value: &Value, label: &str) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = performance_nonempty_string(value, label)?;
+    let mut chars = raw.chars();
+    let valid_start = chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric());
+    let valid_rest =
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '/' | '-'));
+    if valid_start && valid_rest && raw.len() <= 256 {
+        Ok(Some(raw.to_string()))
+    } else {
+        Err(format!("{label} must be a canonical lineage identifier"))
+    }
+}
+
+fn performance_source_commit(value: &Value) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = performance_nonempty_string(value, "source_commit")?;
+    if matches!(raw.len(), 40 | 64)
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(Some(raw.to_string()))
+    } else {
+        Err("source_commit must be null or a canonical full lowercase Git object ID".to_string())
+    }
+}
+
+fn performance_generated_at(value: &Value) -> Result<DateTime<Utc>, String> {
+    let raw = performance_nonempty_string(value, "generated_at")?;
+    let bytes = raw.as_bytes();
+    let millisecond_utc_shape = bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit()
+        });
+    if !millisecond_utc_shape {
+        return Err(
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
+        );
+    }
+    let parsed = DateTime::parse_from_rfc3339(raw)
+        .map_err(|error| format!("generated_at is not valid RFC3339: {error}"))?;
+    if parsed.offset().local_minus_utc() != 0
+        || parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) != raw
+    {
+        return Err(
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
+        );
+    }
+    Ok(parsed.with_timezone(&Utc))
+}
+
+fn performance_budget_inventory_sha256(budgets: &[Value]) -> Result<String, String> {
+    let mut canonical = String::from("[");
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = budget
+            .as_object()
+            .ok_or_else(|| format!("{label} must be an object"))?;
+        if index != 0 {
+            canonical.push(',');
+        }
+        let name = serde_json::to_string(performance_nonempty_string(
+            &object["name"],
+            &format!("{label}.name"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.name: {error}"))?;
+        let category = serde_json::to_string(performance_nonempty_string(
+            &object["category"],
+            &format!("{label}.category"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.category: {error}"))?;
+        let metric = serde_json::to_string(performance_nonempty_string(
+            &object["metric"],
+            &format!("{label}.metric"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.metric: {error}"))?;
+        let unit = serde_json::to_string(performance_nonempty_string(
+            &object["unit"],
+            &format!("{label}.unit"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.unit: {error}"))?;
+        let threshold =
+            performance_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
+        let rounded_threshold = (threshold * 1_000_000.0).round() / 1_000_000.0;
+        if threshold.total_cmp(&rounded_threshold).is_ne() {
+            return Err(format!(
+                "{label}.threshold exceeds canonical six-decimal precision"
+            ));
+        }
+        let comparison = serde_json::to_string(performance_nonempty_string(
+            &object["comparison"],
+            &format!("{label}.comparison"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.comparison: {error}"))?;
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        let methodology = serde_json::to_string(performance_nonempty_string(
+            &object["methodology"],
+            &format!("{label}.methodology"),
+        )?)
+        .map_err(|error| format!("failed to serialize {label}.methodology: {error}"))?;
+        write!(
+            canonical,
+            "{{\"name\":{name},\"category\":{category},\"metric\":{metric},\"unit\":{unit},\"threshold\":{threshold:.6},\"comparison\":{comparison},\"ci_enforced\":{ci_enforced},\"methodology\":{methodology}}}"
+        )
+        .map_err(|error| format!("failed to serialize canonical budget inventory: {error}"))?;
+    }
+    canonical.push(']');
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+fn validate_performance_budget_contract(
+    value: &Value,
+) -> Result<ValidatedPerformanceBudgetClaim, String> {
+    let top = performance_exact_object(value, PERF_TOP_LEVEL_FIELDS, &[], "performance summary")?;
+    if top.get("schema").and_then(Value::as_str) != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
+        return Err(format!(
+            "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {:?}",
+            top.get("schema")
+        ));
+    }
+    performance_generated_at(&top["generated_at"])?;
+    let source_commit = performance_source_commit(&top["source_commit"])?;
+    let run_id = performance_nullable_lineage(&top["run_id"], "run_id")?;
+    let correlation_id = performance_nullable_lineage(&top["correlation_id"], "correlation_id")?;
+    if run_id != correlation_id {
+        return Err("run_id and correlation_id must both be null or match".to_string());
+    }
+    let strict_mode = top["strict_mode"]
+        .as_bool()
+        .ok_or_else(|| "strict_mode must be a boolean".to_string())?;
+
+    let count_names = [
+        "total_budgets",
+        "ci_enforced",
+        "ci_with_data",
+        "ci_fail",
+        "ci_no_data",
+        "pass",
+        "fail",
+        "no_data",
+        "data_contract_failures_count",
+    ];
+    let mut counts = BTreeMap::new();
+    for name in count_names {
+        counts.insert(name, performance_uint(&top[name], name)?);
+    }
+
+    let budgets = top["budgets"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budgets must be a non-empty array".to_string())?;
+    let results = top["budget_results"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budget_results must be a non-empty array".to_string())?;
+    let failures = top["failing_data_contracts"]
+        .as_array()
+        .ok_or_else(|| "failing_data_contracts must be an array".to_string())?;
+
+    let mut definitions = BTreeMap::new();
+    let mut definition_order = Vec::with_capacity(budgets.len());
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = performance_exact_object(budget, PERF_BUDGET_FIELDS, &[], &label)?;
+        let name = performance_nonempty_string(&object["name"], &format!("{label}.name"))?;
+        for field in ["category", "metric", "unit", "methodology"] {
+            performance_nonempty_string(&object[field], &format!("{label}.{field}"))?;
+        }
+        let comparison = match performance_nonempty_string(
+            &object["comparison"],
+            &format!("{label}.comparison"),
+        )? {
+            comparison @ ("maximum" | "minimum") => comparison,
+            comparison => {
+                return Err(format!(
+                    "{label}.comparison has unsupported value {comparison:?}"
+                ));
+            }
+        };
+        let definition = PerformanceBudgetDefinition {
+            category: performance_nonempty_string(
+                &object["category"],
+                &format!("{label}.category"),
+            )?
+            .to_string(),
+            unit: performance_nonempty_string(&object["unit"], &format!("{label}.unit"))?
+                .to_string(),
+            threshold: performance_finite_number(
+                &object["threshold"],
+                &format!("{label}.threshold"),
+                true,
+            )?,
+            comparison: comparison.to_string(),
+            ci_enforced: object["ci_enforced"]
+                .as_bool()
+                .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?,
+        };
+        if definitions.insert(name.to_string(), definition).is_some() {
+            return Err(format!("duplicate budget name: {name}"));
+        }
+        definition_order.push(name.to_string());
+    }
+    let inventory_sha256 = performance_budget_inventory_sha256(budgets)?;
+    if inventory_sha256 != PERF_CANONICAL_BUDGET_INVENTORY_SHA256 {
+        return Err(format!(
+            "budget inventory does not match the canonical producer contract (observed_sha256={inventory_sha256}, expected_sha256={PERF_CANONICAL_BUDGET_INVENTORY_SHA256})"
+        ));
+    }
+
+    let mut result_names = BTreeSet::new();
+    let mut result_order = Vec::with_capacity(results.len());
+    let mut pass_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut no_data_count = 0usize;
+    let mut ci_with_data = 0usize;
+    let mut ci_fail = 0usize;
+    let mut ci_no_data = 0usize;
+    for (index, result) in results.iter().enumerate() {
+        let label = format!("budget_results[{index}]");
+        let object = performance_exact_object(
+            result,
+            PERF_RESULT_REQUIRED_FIELDS,
+            &["failure_reason"],
+            &label,
+        )?;
+        let name =
+            performance_nonempty_string(&object["budget_name"], &format!("{label}.budget_name"))?;
+        if !result_names.insert(name.to_string()) {
+            return Err(format!("duplicate budget result: {name}"));
+        }
+        result_order.push(name.to_string());
+        let definition = definitions
+            .get(name)
+            .ok_or_else(|| format!("budget result has no matching definition: {name}"))?;
+        let category =
+            performance_nonempty_string(&object["category"], &format!("{label}.category"))?;
+        let unit = performance_nonempty_string(&object["unit"], &format!("{label}.unit"))?;
+        let comparison =
+            performance_nonempty_string(&object["comparison"], &format!("{label}.comparison"))?;
+        let threshold =
+            performance_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        if category != definition.category
+            || unit != definition.unit
+            || comparison != definition.comparison
+            || threshold.total_cmp(&definition.threshold).is_ne()
+            || ci_enforced != definition.ci_enforced
+        {
+            return Err(format!(
+                "budget result {name} does not match its category/unit/threshold/CI definition"
+            ));
+        }
+        performance_nonempty_string(&object["source"], &format!("{label}.source"))?;
+
+        let status = object["status"]
+            .as_str()
+            .ok_or_else(|| format!("{label}.status must be a string"))?;
+        if !matches!(status, "PASS" | "FAIL" | "NO_DATA") {
+            return Err(format!(
+                "budget result {name} has unsupported status: {status}"
+            ));
+        }
+        let failure_reason = object.get("failure_reason");
+        if let Some(reason) = failure_reason {
+            performance_nonempty_string(reason, &format!("{label}.failure_reason"))?;
+        }
+        if object["actual"].is_null() {
+            if strict_mode && definition.ci_enforced {
+                if status != "FAIL"
+                    || failure_reason.and_then(Value::as_str) != Some("missing_measurement_data")
+                {
+                    return Err(format!(
+                        "strict CI budget {name} without data must be FAIL with failure_reason=missing_measurement_data"
+                    ));
+                }
+            } else if status != "NO_DATA" || failure_reason.is_some() {
+                return Err(format!(
+                    "budget {name} without data must be NO_DATA without a failure reason"
+                ));
+            }
+        } else {
+            let actual =
+                performance_finite_number(&object["actual"], &format!("{label}.actual"), false)?;
+            if actual < 0.0 {
+                return Err(format!("{label}.actual must be non-negative"));
+            }
+            let passes = if definition.comparison == "minimum" {
+                actual >= threshold
+            } else {
+                actual <= threshold
+            };
+            let expected_status = if passes { "PASS" } else { "FAIL" };
+            if status != expected_status || failure_reason.is_some() {
+                return Err(format!(
+                    "budget result {name} is inconsistent with actual={actual}, threshold={threshold}, and expected status={expected_status}"
+                ));
+            }
+        }
+
+        match status {
+            "PASS" => pass_count += 1,
+            "FAIL" => fail_count += 1,
+            "NO_DATA" => no_data_count += 1,
+            _ => unreachable!("performance status validated above"),
+        }
+        if definition.ci_enforced {
+            ci_with_data += usize::from(!object["actual"].is_null());
+            ci_fail += usize::from(status == "FAIL");
+            ci_no_data += usize::from(status == "NO_DATA");
+        }
+    }
+    let definition_names = definitions.keys().cloned().collect::<BTreeSet<_>>();
+    if result_names != definition_names || result_order != definition_order {
+        return Err(
+            "budget_results must match canonical budget declaration order and membership"
+                .to_string(),
+        );
+    }
+
+    let mut failure_fingerprints = BTreeSet::new();
+    for (index, failure) in failures.iter().enumerate() {
+        let label = format!("failing_data_contracts[{index}]");
+        let object = performance_exact_object(
+            failure,
+            PERF_FAILURE_REQUIRED_FIELDS,
+            &["budget_name"],
+            &label,
+        )?;
+        let contract_id =
+            performance_nonempty_string(&object["contract_id"], &format!("{label}.contract_id"))?;
+        let detail = performance_nonempty_string(&object["detail"], &format!("{label}.detail"))?;
+        let remediation =
+            performance_nonempty_string(&object["remediation"], &format!("{label}.remediation"))?;
+        let budget_name = match object.get("budget_name") {
+            None | Some(Value::Null) => None,
+            Some(value) => {
+                let name = performance_nonempty_string(value, &format!("{label}.budget_name"))?;
+                if !definitions.contains_key(name) {
+                    return Err(format!(
+                        "data-contract failure references unknown budget: {name}"
+                    ));
+                }
+                Some(name.to_string())
+            }
+        };
+        if !failure_fingerprints.insert((
+            contract_id.to_string(),
+            detail.to_string(),
+            remediation.to_string(),
+            budget_name,
+        )) {
+            return Err(format!("duplicate data-contract failure at index {index}"));
+        }
+    }
+
+    let ci_enforced_count = definitions
+        .values()
+        .filter(|definition| definition.ci_enforced)
+        .count();
+    let derived_counts = [
+        ("total_budgets", budgets.len()),
+        ("ci_enforced", ci_enforced_count),
+        ("ci_with_data", ci_with_data),
+        ("ci_fail", ci_fail),
+        ("ci_no_data", ci_no_data),
+        ("pass", pass_count),
+        ("fail", fail_count),
+        ("no_data", no_data_count),
+        ("data_contract_failures_count", failures.len()),
+    ];
+    for (name, expected) in derived_counts {
+        let expected = u64::try_from(expected)
+            .map_err(|_| format!("derived {name} exceeds the supported count range"))?;
+        if counts[name] != expected {
+            return Err(format!(
+                "{name}={} is inconsistent with derived value {expected}",
+                counts[name]
+            ));
+        }
+    }
+    if counts["pass"]
+        .checked_add(counts["fail"])
+        .and_then(|count| count.checked_add(counts["no_data"]))
+        != Some(counts["total_budgets"])
+    {
+        return Err("pass + fail + no_data must equal total_budgets".to_string());
+    }
+
+    let claim = performance_exact_object(
+        &top["claim_readiness"],
+        PERF_CLAIM_READINESS_FIELDS,
+        &[],
+        "claim_readiness",
+    )?;
+    let reasons = claim["blocking_reason_codes"]
+        .as_array()
+        .ok_or_else(|| "claim_readiness.blocking_reason_codes must be an array".to_string())?;
+    let reported_reasons = reasons
+        .iter()
+        .enumerate()
+        .map(|(index, reason)| {
+            performance_nonempty_string(
+                reason,
+                &format!("claim_readiness.blocking_reason_codes[{index}]"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !reported_reasons.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(
+            "claim_readiness.blocking_reason_codes must be sorted and duplicate-free".to_string(),
+        );
+    }
+
+    let mut expected_reasons = BTreeSet::new();
+    if counts["no_data"] != 0 {
+        expected_reasons.insert("budget_data_missing");
+    }
+    if counts["fail"] != 0 {
+        expected_reasons.insert("budget_failed");
+    }
+    if counts["ci_with_data"] != counts["ci_enforced"] || counts["ci_no_data"] != 0 {
+        expected_reasons.insert("ci_budget_data_missing");
+    }
+    if counts["ci_fail"] != 0 {
+        expected_reasons.insert("ci_budget_failed");
+    }
+    if correlation_id.is_none() {
+        expected_reasons.insert("correlation_id_missing");
+    }
+    if counts["data_contract_failures_count"] != 0 {
+        expected_reasons.insert("data_contract_failure");
+    }
+    if run_id.is_none() {
+        expected_reasons.insert("run_id_missing");
+    }
+    if source_commit.is_none() {
+        expected_reasons.insert("source_commit_unbound");
+    }
+    if !strict_mode {
+        expected_reasons.insert("strict_mode_disabled");
+    }
+    let expected_reasons = expected_reasons.into_iter().collect::<Vec<_>>();
+    if reported_reasons != expected_reasons {
+        return Err(format!(
+            "claim_readiness blockers disagree with derived blockers (reported={reported_reasons:?}, expected={expected_reasons:?})"
+        ));
+    }
+    let claim_ready = expected_reasons.is_empty();
+    let expected_status = if claim_ready {
+        "claim_ready"
+    } else {
+        "blocked"
+    };
+    if claim["status"].as_str() != Some(expected_status)
+        || claim["performance_claims_authorized"].as_bool() != Some(claim_ready)
+    {
+        return Err(
+            "claim_readiness status or authorization contradicts derived blockers".to_string(),
+        );
+    }
+
+    Ok(ValidatedPerformanceBudgetClaim {
+        source_commit,
+        claim_ready,
+    })
+}
+
 fn classify_performance_budget_claim(
     value: &Value,
     options: &SemanticWorkspaceGraphBuildOptions,
     repository_root: Option<&Path>,
+    artifact_source_path: Option<&str>,
+    captured_artifact_bytes: Option<&[u8]>,
+    canonical_path: bool,
 ) -> Option<(EvidenceFreshnessStatus, bool, String)> {
-    let schema = value.get("schema").and_then(Value::as_str)?;
-    if schema == "pi.perf.budget_summary.v1" {
+    let schema = value.get("schema").and_then(Value::as_str);
+    if schema == Some("pi.perf.budget_summary.v1") {
         return Some((
             EvidenceFreshnessStatus::Malformed,
             false,
             "performance_budget_schema_not_current".to_string(),
         ));
     }
-    if schema != "pi.perf.budget_summary.v2" {
-        return None;
+    if schema != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
+        return canonical_path.then(|| {
+            (
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "performance_budget_schema_not_current".to_string(),
+            )
+        });
     }
 
-    let canonical_generated_at =
-        value
-            .get("generated_at")
-            .and_then(Value::as_str)
-            .and_then(|raw| {
-                DateTime::parse_from_rfc3339(raw)
-                    .ok()
-                    .filter(|parsed| {
-                        parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == raw
-                    })
-                    .map(|parsed| parsed.with_timezone(&Utc))
-            });
-    let Some(generated_at) = canonical_generated_at else {
+    let Some(Ok(generated_at)) = value.get("generated_at").map(performance_generated_at) else {
         return Some((
             EvidenceFreshnessStatus::Malformed,
             false,
@@ -1934,206 +2705,44 @@ fn classify_performance_budget_claim(
         ));
     }
 
-    let Some(strict_mode) = value.get("strict_mode").and_then(Value::as_bool) else {
+    let Ok(validated) = validate_performance_budget_contract(value) else {
         return Some((
             EvidenceFreshnessStatus::Malformed,
             false,
             "performance_budget_claim_readiness_malformed".to_string(),
         ));
     };
-    let source_commit = match value.get("source_commit") {
-        Some(Value::Null) => None,
-        Some(Value::String(commit))
-            if commit.len() == 40
-                && commit
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-                && !commit.bytes().all(|byte| byte == b'0') =>
-        {
-            Some(commit.as_str())
-        }
-        _ => {
-            return Some((
-                EvidenceFreshnessStatus::Malformed,
-                false,
-                "performance_budget_claim_readiness_malformed".to_string(),
-            ));
-        }
-    };
-    let optional_lineage = |field: &str| match value.get(field) {
-        Some(Value::Null) => Some(None),
-        Some(Value::String(lineage))
-            if !lineage.is_empty()
-                && lineage.trim() == lineage
-                && !lineage.chars().any(char::is_control) =>
-        {
-            Some(Some(lineage.as_str()))
-        }
-        _ => None,
-    };
-    let (Some(run_id), Some(correlation_id)) = (
-        optional_lineage("run_id"),
-        optional_lineage("correlation_id"),
-    ) else {
+    if !validated.claim_ready {
         return Some((
-            EvidenceFreshnessStatus::Malformed,
-            false,
-            "performance_budget_claim_readiness_malformed".to_string(),
-        ));
-    };
-    let counts = (
-        value.get("total_budgets").and_then(Value::as_u64),
-        value.get("pass").and_then(Value::as_u64),
-        value.get("fail").and_then(Value::as_u64),
-        value.get("no_data").and_then(Value::as_u64),
-        value.get("ci_enforced").and_then(Value::as_u64),
-        value.get("ci_with_data").and_then(Value::as_u64),
-        value.get("ci_fail").and_then(Value::as_u64),
-        value.get("ci_no_data").and_then(Value::as_u64),
-        value
-            .get("data_contract_failures_count")
-            .and_then(Value::as_u64),
-    );
-    let (
-        Some(total_budgets),
-        Some(pass),
-        Some(fail),
-        Some(no_data),
-        Some(ci_enforced),
-        Some(ci_with_data),
-        Some(ci_fail),
-        Some(ci_no_data),
-        Some(contract_failures),
-    ) = counts
-    else {
-        return Some((
-            EvidenceFreshnessStatus::Malformed,
-            false,
-            "performance_budget_claim_readiness_malformed".to_string(),
-        ));
-    };
-    if total_budgets == 0
-        || ci_enforced == 0
-        || pass
-            .checked_add(fail)
-            .and_then(|count| count.checked_add(no_data))
-            != Some(total_budgets)
-        || ci_enforced > total_budgets
-        || ci_with_data
-            .checked_add(ci_no_data)
-            .is_none_or(|count| count != ci_enforced)
-        || ci_fail > ci_enforced
-        || ci_fail > fail
-    {
-        return Some((
-            EvidenceFreshnessStatus::Malformed,
-            false,
-            "performance_budget_claim_readiness_malformed".to_string(),
-        ));
-    }
-
-    let mut expected_blockers = BTreeSet::new();
-    if !strict_mode {
-        expected_blockers.insert("strict_mode_disabled");
-    }
-    if source_commit.is_none() {
-        expected_blockers.insert("source_commit_unbound");
-    }
-    if run_id.is_none() {
-        expected_blockers.insert("run_id_missing");
-    }
-    if correlation_id.is_none() || run_id != correlation_id {
-        expected_blockers.insert("correlation_id_missing");
-    }
-    if ci_with_data != ci_enforced || ci_no_data != 0 {
-        expected_blockers.insert("ci_budget_data_missing");
-    }
-    if ci_fail != 0 {
-        expected_blockers.insert("ci_budget_failed");
-    }
-    if no_data != 0 {
-        expected_blockers.insert("budget_data_missing");
-    }
-    if fail != 0 {
-        expected_blockers.insert("budget_failed");
-    }
-    if contract_failures != 0 {
-        expected_blockers.insert("data_contract_failure");
-    }
-
-    let Some(claim) = value.get("claim_readiness").and_then(Value::as_object) else {
-        return Some((
-            EvidenceFreshnessStatus::Malformed,
-            false,
-            "performance_budget_claim_readiness_malformed".to_string(),
-        ));
-    };
-    let status = claim.get("status").and_then(Value::as_str);
-    let authorized = claim
-        .get("performance_claims_authorized")
-        .and_then(Value::as_bool);
-    let Some(blockers) = claim.get("blocking_reason_codes").and_then(Value::as_array) else {
-        return Some((
-            EvidenceFreshnessStatus::Malformed,
-            false,
-            "performance_budget_claim_readiness_malformed".to_string(),
-        ));
-    };
-    let blockers = blockers
-        .iter()
-        .map(Value::as_str)
-        .collect::<Option<Vec<_>>>();
-    let Some(blockers) = blockers else {
-        return Some((
-            EvidenceFreshnessStatus::Malformed,
-            false,
-            "performance_budget_claim_readiness_malformed".to_string(),
-        ));
-    };
-    let expected = expected_blockers.into_iter().collect::<Vec<_>>();
-    let claims_ready = expected.is_empty();
-    if blockers != expected
-        || status
-            != Some(if claims_ready {
-                "claim_ready"
-            } else {
-                "blocked"
-            })
-        || authorized != Some(claims_ready)
-    {
-        return Some((
-            EvidenceFreshnessStatus::Malformed,
-            false,
-            "performance_budget_claim_readiness_malformed".to_string(),
-        ));
-    }
-    if claims_ready {
-        let Some(source_commit) = source_commit else {
-            return Some((
-                EvidenceFreshnessStatus::Malformed,
-                false,
-                "performance_budget_claim_readiness_malformed".to_string(),
-            ));
-        };
-        match performance_source_binding_failure(repository_root, source_commit) {
-            None => None,
-            Some(PerformanceSourceBindingFailure::Unavailable) => Some((
-                EvidenceFreshnessStatus::Uncertified,
-                false,
-                "performance_budget_source_binding_unavailable".to_string(),
-            )),
-            Some(PerformanceSourceBindingFailure::Invalid(reason)) => Some((
-                EvidenceFreshnessStatus::Malformed,
-                false,
-                reason.to_string(),
-            )),
-        }
-    } else {
-        Some((
             EvidenceFreshnessStatus::Uncertified,
             false,
             "performance_claims_not_authorized".to_string(),
-        ))
+        ));
+    }
+    let Some(source_commit) = validated.source_commit.as_deref() else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    match performance_source_binding_failure(
+        repository_root,
+        artifact_source_path,
+        source_commit,
+        captured_artifact_bytes,
+    ) {
+        None => None,
+        Some(PerformanceSourceBindingFailure::Unavailable) => Some((
+            EvidenceFreshnessStatus::Uncertified,
+            false,
+            "performance_budget_source_binding_unavailable".to_string(),
+        )),
+        Some(PerformanceSourceBindingFailure::Invalid(reason)) => Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            reason.to_string(),
+        )),
     }
 }
 
@@ -2143,25 +2752,751 @@ enum PerformanceSourceBindingFailure {
     Invalid(&'static str),
 }
 
+#[derive(Debug)]
+struct RepositoryGitContext {
+    worktree: PathBuf,
+    git_dir: PathBuf,
+    git_executable: PathBuf,
+}
+
+#[cfg(unix)]
+fn trusted_git_executable() -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let mut candidates = vec![
+        PathBuf::from("/usr/bin/git"),
+        PathBuf::from("/usr/local/bin/git"),
+    ];
+    if let Some(path) = std::env::var_os("PATH") {
+        candidates.extend(
+            std::env::split_paths(&path)
+                .filter(|directory| directory.is_absolute())
+                .map(|directory| directory.join("git")),
+        );
+    }
+
+    let mut seen = BTreeSet::new();
+    for candidate in candidates {
+        let Ok(canonical) = fs::canonicalize(candidate) else {
+            continue;
+        };
+        if !seen.insert(canonical.clone()) {
+            continue;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&canonical) else {
+            continue;
+        };
+        if !metadata.is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != 0
+            || metadata.permissions().mode() & 0o111 == 0
+            || metadata.permissions().mode() & 0o022 != 0
+        {
+            continue;
+        }
+        let trusted_ancestors = canonical.ancestors().skip(1).all(|ancestor| {
+            fs::symlink_metadata(ancestor).is_ok_and(|ancestor_metadata| {
+                ancestor_metadata.is_dir()
+                    && !ancestor_metadata.file_type().is_symlink()
+                    && ancestor_metadata.uid() == 0
+                    && ancestor_metadata.permissions().mode() & 0o022 == 0
+            })
+        });
+        if trusted_ancestors {
+            return Some(canonical);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn trusted_git_executable() -> Option<PathBuf> {
+    [
+        r"C:\Program Files\Git\cmd\git.exe",
+        r"C:\Program Files\Git\bin\git.exe",
+    ]
+    .into_iter()
+    .find_map(|candidate| {
+        let canonical = fs::canonicalize(candidate).ok()?;
+        let metadata = fs::symlink_metadata(&canonical).ok()?;
+        (metadata.is_file() && !metadata.file_type().is_symlink()).then_some(canonical)
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn trusted_git_executable() -> Option<PathBuf> {
+    None
+}
+
+fn repository_git_context(repository_root: &Path) -> Option<RepositoryGitContext> {
+    let worktree = fs::canonicalize(repository_root).ok()?;
+    let git_executable = trusted_git_executable()?;
+    let git_marker = worktree.join(".git");
+    let marker_metadata = fs::symlink_metadata(&git_marker).ok()?;
+    if marker_metadata.file_type().is_symlink() {
+        return None;
+    }
+    let git_dir = if marker_metadata.is_dir() {
+        fs::canonicalize(&git_marker).ok()?
+    } else if marker_metadata.is_file() {
+        let marker = fs::read_to_string(&git_marker).ok()?;
+        let target = marker
+            .trim_end_matches(['\r', '\n'])
+            .strip_prefix("gitdir: ")?;
+        if target.is_empty() || target.contains('\0') || target.lines().count() != 1 {
+            return None;
+        }
+        let target = Path::new(target);
+        let candidate = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            worktree.join(target)
+        };
+        let candidate_metadata = fs::symlink_metadata(&candidate).ok()?;
+        if candidate_metadata.file_type().is_symlink() || !candidate_metadata.is_dir() {
+            return None;
+        }
+        fs::canonicalize(candidate).ok()?
+    } else {
+        return None;
+    };
+    let git_dir_metadata = fs::symlink_metadata(&git_dir).ok()?;
+    let head_metadata = fs::symlink_metadata(git_dir.join("HEAD")).ok()?;
+    (git_dir_metadata.is_dir()
+        && !git_dir_metadata.file_type().is_symlink()
+        && head_metadata.is_file()
+        && !head_metadata.file_type().is_symlink())
+    .then_some(RepositoryGitContext {
+        worktree,
+        git_dir,
+        git_executable,
+    })
+}
+
+fn repository_git_command(context: &RepositoryGitContext) -> Command {
+    let mut command = Command::new(&context.git_executable);
+    command
+        .arg("--git-dir")
+        .arg(&context.git_dir)
+        .arg("--work-tree")
+        .arg(&context.worktree)
+        .args(["-c", "core.bare=false", "-c", "core.fsmonitor=false"])
+        .arg("-c")
+        .arg(format!("core.worktree={}", context.worktree.display()));
+    for (variable, _) in std::env::vars_os() {
+        if variable
+            .to_string_lossy()
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+        {
+            command.env_remove(variable);
+        }
+    }
+    command.env("GIT_LITERAL_PATHSPECS", "1");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command
+}
+
+fn git_output(context: &RepositoryGitContext, args: &[&str]) -> Option<Vec<u8>> {
+    let output = repository_git_command(context).args(args).output().ok()?;
+    output.status.success().then_some(output.stdout)
+}
+
+fn git_stdout(context: &RepositoryGitContext, args: &[&str]) -> Option<String> {
+    String::from_utf8(git_output(context, args)?)
+        .ok()
+        .map(|stdout| stdout.trim().to_string())
+}
+
+type GitRecordFields<'a> = (&'a [u8], &'a [u8], &'a [u8], &'a [u8]);
+
+fn parse_canonical_git_record(record: &[u8]) -> Option<GitRecordFields<'_>> {
+    let tab = record.iter().position(|byte| *byte == b'\t')?;
+    let path = &record[tab + 1..];
+    if path.is_empty() {
+        return None;
+    }
+    let mut fields = record[..tab].split(|byte| *byte == b' ');
+    let first = fields.next().filter(|field| !field.is_empty())?;
+    let second = fields.next().filter(|field| !field.is_empty())?;
+    let third = fields.next().filter(|field| !field.is_empty())?;
+    fields
+        .next()
+        .is_none()
+        .then_some((first, second, third, path))
+}
+
+fn canonical_nul_records(output: &[u8]) -> Option<Vec<&[u8]>> {
+    if output.is_empty() {
+        return Some(Vec::new());
+    }
+    let body = output.strip_suffix(&[0])?;
+    if body.is_empty() {
+        return None;
+    }
+    let records = body.split(|byte| *byte == 0).collect::<Vec<_>>();
+    records
+        .iter()
+        .all(|record| !record.is_empty())
+        .then_some(records)
+}
+
+#[cfg(unix)]
+fn git_path_from_bytes(path: &[u8]) -> PathBuf {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    PathBuf::from(OsStr::from_bytes(path))
+}
+
+#[cfg(not(unix))]
+fn git_path_from_bytes(path: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(path).ok().map(PathBuf::from)
+}
+
+#[cfg(unix)]
+fn symlink_target_bytes(path: &Path) -> Option<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    fs::read_link(path)
+        .ok()
+        .map(|target| target.as_os_str().as_bytes().to_vec())
+}
+
+#[cfg(not(unix))]
+fn symlink_target_bytes(path: &Path) -> Option<Vec<u8>> {
+    fs::read_link(path)
+        .ok()?
+        .to_str()
+        .map(|target| target.as_bytes().to_vec())
+}
+
+fn git_blob_oid(object_format: &str, bytes: &[u8]) -> Option<String> {
+    let header = format!("blob {}\0", bytes.len());
+    match object_format {
+        "sha1" => {
+            let mut hasher = Sha1::new();
+            hasher.update(header.as_bytes());
+            hasher.update(bytes);
+            Some(format!("{:x}", hasher.finalize()))
+        }
+        "sha256" => {
+            let mut hasher = Sha256::new();
+            hasher.update(header.as_bytes());
+            hasher.update(bytes);
+            Some(format!("{:x}", hasher.finalize()))
+        }
+        _ => None,
+    }
+}
+
+fn tracked_worktree_blob(root: &Path, relative: &Path, expected_mode: &[u8]) -> Option<Vec<u8>> {
+    if relative.is_absolute()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return None;
+    }
+    let components = relative.components().collect::<Vec<_>>();
+    let mut path = root.to_path_buf();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            return None;
+        };
+        path.push(name);
+        let metadata = fs::symlink_metadata(&path).ok()?;
+        if index + 1 != components.len() {
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return None;
+            }
+            continue;
+        }
+        return match expected_mode {
+            b"120000" if metadata.file_type().is_symlink() => symlink_target_bytes(&path),
+            b"100644" | b"100755" if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+
+                    let executable = metadata.permissions().mode() & 0o111 != 0;
+                    if executable != (expected_mode == b"100755") {
+                        return None;
+                    }
+                }
+                fs::read(&path).ok()
+            }
+            _ => None,
+        };
+    }
+    None
+}
+
+fn performance_tracked_head_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(object_format) = git_stdout(context, &["rev-parse", "--show-object-format"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if !matches!(object_format.as_str(), "sha1" | "sha256") {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    }
+    let Some(index_output) = git_output(context, &["ls-files", "--stage", "-z"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(index_records) = canonical_nul_records(&index_output) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let mut index_entries = BTreeMap::new();
+    for record in index_records {
+        let Some((mode, oid, stage, path)) = parse_canonical_git_record(record) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        if stage != b"0"
+            || index_entries
+                .insert(path.to_vec(), (mode.to_vec(), oid.to_vec()))
+                .is_some()
+        {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        }
+    }
+
+    let Some(tree_output) = git_output(
+        context,
+        &["ls-tree", "-r", "-z", "--full-tree", expected_head],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(tree_records) = canonical_nul_records(&tree_output) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    for record in tree_records {
+        let Some((mode, object_type, oid, path)) = parse_canonical_git_record(record) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        let Some((index_mode, index_oid)) = index_entries.remove(path) else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        };
+        if object_type != b"blob" || index_mode != mode || index_oid != oid {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        }
+        #[cfg(unix)]
+        let relative = git_path_from_bytes(path);
+        #[cfg(not(unix))]
+        let Some(relative) = git_path_from_bytes(path) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        let Some(bytes) = tracked_worktree_blob(&context.worktree, &relative, mode) else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        };
+        if git_blob_oid(&object_format, &bytes).as_deref() != std::str::from_utf8(oid).ok() {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_repository_tracked_state_not_head",
+            ));
+        }
+    }
+    (!index_entries.is_empty()).then_some(PerformanceSourceBindingFailure::Invalid(
+        "performance_budget_repository_tracked_state_not_head",
+    ))
+}
+
+fn performance_repository_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(top_level) = git_stdout(context, &["rev-parse", "--show-toplevel"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if fs::canonicalize(top_level).ok().as_deref() != Some(context.worktree.as_path()) {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    }
+    let Some(index_entries) = git_output(context, &["ls-files", "-v", "-z"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(index_entries) = canonical_nul_records(&index_entries) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if index_entries.iter().any(|entry| {
+        entry.len() < 3 || entry[1] != b' ' || entry[2..].is_empty() || entry[0] != b'H'
+    }) {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_index_flags_not_default",
+        ));
+    }
+    let Some(status) = git_output(
+        context,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if !status.is_empty() {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_not_clean",
+        ));
+    }
+    performance_tracked_head_state_failure(context, expected_head)
+}
+
+fn performance_repository_end_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(current_head) = git_stdout(context, &["rev-parse", "--verify", "HEAD^{commit}"])
+    else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if current_head != expected_head {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_head_changed",
+        ));
+    }
+    performance_repository_state_failure(context, expected_head)
+}
+
+fn performance_artifact_end_state_failure(
+    context: &RepositoryGitContext,
+    expected_head: &str,
+    artifact_path: &Path,
+    captured_artifact_bytes: &[u8],
+) -> Option<PerformanceSourceBindingFailure> {
+    if let Some(failure) = performance_repository_end_state_failure(context, expected_head) {
+        return Some(failure);
+    }
+    match fs::read(artifact_path) {
+        Ok(bytes) if bytes == captured_artifact_bytes => None,
+        Ok(_) => Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_changed_during_validation",
+        )),
+        Err(_) => Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_unreadable",
+        )),
+    }
+}
+
+fn performance_artifact_relative_path(source_path: &str) -> Option<&Path> {
+    let path = Path::new(source_path);
+    (!source_path.is_empty()
+        && !source_path.contains('\\')
+        && !source_path.contains('\0')
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_))))
+    .then_some(path)
+}
+
+fn toml_line_without_comment(line: &str) -> Option<&str> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, byte) in line.bytes().enumerate() {
+        match quote {
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if byte == b'\\' => escaped = true,
+            Some(delimiter) if byte == delimiter => quote = None,
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if byte == b'#' => return Some(&line[..index]),
+            Some(_) | None => {}
+        }
+    }
+    quote.is_none().then_some(line)
+}
+
+fn toml_string_array_is_complete(raw: &str) -> Option<bool> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    let mut opened = false;
+    for byte in raw.bytes() {
+        match quote {
+            Some(b'"') if escaped => escaped = false,
+            Some(b'"') if byte == b'\\' => escaped = true,
+            Some(delimiter) if byte == delimiter => quote = None,
+            None if matches!(byte, b'"' | b'\'') => quote = Some(byte),
+            None if byte == b'[' => {
+                opened = true;
+                depth = depth.checked_add(1)?;
+            }
+            None if byte == b']' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(opened);
+                }
+            }
+            Some(_) | None => {}
+        }
+    }
+    (quote.is_none() && opened).then_some(false)
+}
+
+fn parse_toml_string_array(raw: &str) -> Option<Vec<String>> {
+    let bytes = raw.as_bytes();
+    let mut index = 0usize;
+    while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+        index += 1;
+    }
+    if bytes.get(index) != Some(&b'[') {
+        return None;
+    }
+    index += 1;
+    let mut values = Vec::new();
+    loop {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if bytes.get(index) == Some(&b']') {
+            index += 1;
+            return bytes[index..]
+                .iter()
+                .all(u8::is_ascii_whitespace)
+                .then_some(values);
+        }
+        let delimiter = *bytes.get(index)?;
+        if !matches!(delimiter, b'"' | b'\'') {
+            return None;
+        }
+        let start = index;
+        index += 1;
+        let content_start = index;
+        let mut escaped = false;
+        loop {
+            let byte = *bytes.get(index)?;
+            if delimiter == b'"' && escaped {
+                escaped = false;
+            } else if delimiter == b'"' && byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                break;
+            }
+            index += 1;
+        }
+        let value = if delimiter == b'"' {
+            serde_json::from_str::<String>(&raw[start..=index]).ok()?
+        } else {
+            raw[content_start..index].to_string()
+        };
+        values.push(value);
+        index += 1;
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        match bytes.get(index) {
+            Some(b',') => index += 1,
+            Some(b']') => {}
+            _ => return None,
+        }
+    }
+}
+
+fn source_package_include_patterns(cargo_toml: &str) -> Option<Vec<String>> {
+    let mut in_package = false;
+    let mut include_value = None::<String>;
+    for raw_line in cargo_toml.lines() {
+        let line = toml_line_without_comment(raw_line)?;
+        let trimmed = line.trim();
+        if let Some(value) = include_value.as_mut() {
+            value.push('\n');
+            value.push_str(trimmed);
+            if toml_string_array_is_complete(value)? {
+                return parse_toml_string_array(value);
+            }
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_package = trimmed == "[package]";
+            continue;
+        }
+        if !in_package || trimmed.is_empty() {
+            continue;
+        }
+        let Some((key, value)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if key.trim() != "include" {
+            continue;
+        }
+        let value = value.trim();
+        if toml_string_array_is_complete(value)? {
+            return parse_toml_string_array(value);
+        }
+        include_value = Some(value.to_string());
+    }
+    // Cargo's default package policy is broad when `package.include` is
+    // absent. Treat docs/evidence as packaged rather than authorizing a
+    // post-measurement follow-up whose distribution status was never narrowed.
+    Some(vec!["/docs/evidence/**".to_string()])
+}
+
+fn performance_path_is_packaged(path: &str, package_patterns: &[String]) -> Option<bool> {
+    for raw_pattern in package_patterns {
+        if raw_pattern.is_empty() {
+            return None;
+        }
+        let normalized = raw_pattern.strip_prefix('/').unwrap_or(raw_pattern);
+        let pattern = glob::Pattern::new(normalized).ok()?;
+        if pattern.matches(path)
+            || normalized.strip_suffix("/**").is_some_and(|prefix| {
+                path.starts_with(&format!("{}/", prefix.trim_end_matches('/')))
+            })
+        {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
 fn performance_source_binding_failure(
     repository_root: Option<&Path>,
+    artifact_source_path: Option<&str>,
     source_commit: &str,
+    captured_artifact_bytes: Option<&[u8]>,
 ) -> Option<PerformanceSourceBindingFailure> {
     let Some(repository_root) = repository_root else {
         return Some(PerformanceSourceBindingFailure::Unavailable);
     };
-    let Some(head) = git_stdout(repository_root, &["rev-parse", "--verify", "HEAD^{commit}"])
-    else {
+    let Some(artifact_source_path) = artifact_source_path else {
         return Some(PerformanceSourceBindingFailure::Unavailable);
     };
-    let Some(resolved_source) = git_stdout(
-        repository_root,
+    let Some(captured_artifact_bytes) = captured_artifact_bytes else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(relative_artifact) = performance_artifact_relative_path(artifact_source_path) else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_path_invalid",
+        ));
+    };
+    let Some(git_context) = repository_git_context(repository_root) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let canonical_root = &git_context.worktree;
+    let Some(head) = git_stdout(&git_context, &["rev-parse", "--verify", "HEAD^{commit}"]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let mut artifact_path = canonical_root.clone();
+    for component in relative_artifact.components() {
+        let Component::Normal(name) = component else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_artifact_path_invalid",
+            ));
+        };
+        artifact_path.push(name);
+        let Ok(metadata) = fs::symlink_metadata(&artifact_path) else {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_artifact_unreadable",
+            ));
+        };
+        if metadata.file_type().is_symlink() {
+            return Some(PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_artifact_symlink",
+            ));
+        }
+    }
+    if !artifact_path.is_file()
+        || fs::canonicalize(&artifact_path)
+            .ok()
+            .is_none_or(|canonical| !canonical.starts_with(canonical_root))
+    {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_path_invalid",
+        ));
+    }
+
+    let Some(tree_entry) = git_output(
+        &git_context,
         &[
-            "rev-parse",
-            "--verify",
-            &format!("{source_commit}^{{commit}}"),
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            &head,
+            "--",
+            artifact_source_path,
         ],
     ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(entries) = canonical_nul_records(&tree_entry) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(entry) = entries
+        .as_slice()
+        .first()
+        .copied()
+        .filter(|_| entries.len() == 1)
+    else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_not_tracked_at_head",
+        ));
+    };
+    let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if &entry[tab + 1..] != artifact_source_path.as_bytes() {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_not_tracked_at_head",
+        ));
+    }
+    let Some((mode, object_type, oid, _)) = parse_canonical_git_record(entry) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if !matches!(mode, b"100644" | b"100755") || object_type != b"blob" {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_not_regular_at_head",
+        ));
+    }
+    let Ok(blob_oid) = std::str::from_utf8(oid) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(head_bytes) = git_output(&git_context, &["cat-file", "blob", blob_oid]) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let repository_state_failure = performance_repository_state_failure(&git_context, &head);
+    if matches!(
+        repository_state_failure,
+        Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_repository_tracked_state_not_head"
+        ))
+    ) {
+        return repository_state_failure;
+    }
+    if captured_artifact_bytes != head_bytes {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_changed_since_ingestion",
+        ));
+    }
+    if let Some(failure) = repository_state_failure {
+        return Some(failure);
+    }
+    let Ok(worktree_bytes) = fs::read(&artifact_path) else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_unreadable",
+        ));
+    };
+    if worktree_bytes != head_bytes {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_artifact_bytes_do_not_match_head",
+        ));
+    }
+
+    let source_expression = format!("{source_commit}^{{commit}}");
+    let Some(resolved_source) =
+        git_stdout(&git_context, &["rev-parse", "--verify", &source_expression])
+    else {
         return Some(PerformanceSourceBindingFailure::Invalid(
             "performance_budget_source_commit_unresolvable",
         ));
@@ -2171,79 +3506,153 @@ fn performance_source_binding_failure(
             "performance_budget_source_commit_not_exact",
         ));
     }
-
-    let ancestor = Command::new("git")
-        .arg("-C")
-        .arg(repository_root)
+    let Ok(ancestor) = repository_git_command(&git_context)
         .args(["merge-base", "--is-ancestor", source_commit, &head])
-        .status()
-        .is_ok_and(|status| status.success());
-    if !ancestor {
-        return Some(PerformanceSourceBindingFailure::Invalid(
-            "performance_budget_source_commit_not_ancestor",
-        ));
+        .output()
+    else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if !ancestor.status.success() {
+        return Some(if ancestor.status.code() == Some(1) {
+            PerformanceSourceBindingFailure::Invalid(
+                "performance_budget_source_commit_not_ancestor",
+            )
+        } else {
+            PerformanceSourceBindingFailure::Unavailable
+        });
     }
     if source_commit == head {
-        return None;
+        return performance_artifact_end_state_failure(
+            &git_context,
+            &head,
+            &artifact_path,
+            captured_artifact_bytes,
+        );
     }
 
-    let Some(changed_paths) = git_stdout(
-        repository_root,
-        &["diff", "--name-only", "--no-renames", source_commit, &head],
+    let Some(changed_paths) = git_output(
+        &git_context,
+        &[
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            source_commit,
+            &head,
+        ],
     ) else {
         return Some(PerformanceSourceBindingFailure::Unavailable);
     };
-    if changed_paths.is_empty() {
+    let Some(paths) = canonical_nul_records(&changed_paths) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if paths.is_empty() {
         return Some(PerformanceSourceBindingFailure::Invalid(
             "performance_budget_source_commit_not_release_bound",
         ));
     }
-    let evidence_only = changed_paths.lines().all(|path| {
-        [
-            "tests/perf/reports/",
-            "tests/e2e_results/",
-            "tests/ext_conformance/reports/",
-            "tests/certification/",
-            "docs/evidence/",
-        ]
+    let Some(paths) = paths
         .iter()
-        .any(|prefix| path.starts_with(prefix))
+        .map(|path| std::str::from_utf8(path).ok())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let package_patterns = if paths.iter().any(|path| path.starts_with("docs/evidence/")) {
+        let cargo_expression = format!("{source_commit}:Cargo.toml");
+        let Some(cargo_toml) = git_output(&git_context, &["show", &cargo_expression])
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+        else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        let Some(patterns) = source_package_include_patterns(&cargo_toml) else {
+            return Some(PerformanceSourceBindingFailure::Unavailable);
+        };
+        patterns
+    } else {
+        Vec::new()
+    };
+    let evidence_only = paths.iter().all(|path| {
+        let packaged_docs_evidence = path.starts_with("docs/evidence/")
+            && performance_path_is_packaged(path, &package_patterns) != Some(false);
+        performance_artifact_relative_path(path).is_some()
+            && !packaged_docs_evidence
+            && [
+                "tests/perf/reports/",
+                "tests/e2e_results/",
+                "tests/ext_conformance/reports/",
+                "tests/certification/",
+                "docs/evidence/",
+            ]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))
     });
     if !evidence_only {
         return Some(PerformanceSourceBindingFailure::Invalid(
             "performance_budget_source_commit_not_release_bound",
         ));
     }
-    None
-}
-
-fn git_stdout(repository_root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repository_root)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|stdout| stdout.trim().to_string())
+    performance_artifact_end_state_failure(
+        &git_context,
+        &head,
+        &artifact_path,
+        captured_artifact_bytes,
+    )
 }
 
 pub fn classify_evidence_freshness(
     value: &Value,
     options: &SemanticWorkspaceGraphBuildOptions,
 ) -> (EvidenceFreshnessStatus, bool, String) {
-    classify_evidence_freshness_in_repository(value, options, None)
+    classify_evidence_freshness_in_repository(value, options, None, None, None)
 }
 
 fn classify_evidence_freshness_in_repository(
     value: &Value,
     options: &SemanticWorkspaceGraphBuildOptions,
     repository_root: Option<&Path>,
+    artifact_source_path: Option<&str>,
+    captured_artifact_bytes: Option<&[u8]>,
 ) -> (EvidenceFreshnessStatus, bool, String) {
+    let canonical_performance_budget = artifact_source_path == Some(PERF_BUDGET_SUMMARY_PATH);
+    if canonical_performance_budget
+        && let Some(classification) = classify_performance_budget_claim(
+            value,
+            options,
+            repository_root,
+            artifact_source_path,
+            captured_artifact_bytes,
+            true,
+        )
+    {
+        return classification;
+    }
+
+    if artifact_source_path == Some(DROPIN_CERTIFICATION_VERDICT_PATH) {
+        if value.get("schema").and_then(Value::as_str) != Some(DROPIN_CERTIFICATION_VERDICT_SCHEMA)
+        {
+            return (
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "dropin_verdict_schema_invalid".to_string(),
+            );
+        }
+        let Some(overall_verdict) = value.get("overall_verdict").and_then(Value::as_str) else {
+            return (
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "overall_verdict_missing_or_invalid".to_string(),
+            );
+        };
+        if overall_verdict != "CERTIFIED" {
+            return (
+                EvidenceFreshnessStatus::Uncertified,
+                false,
+                "overall_verdict_not_certified".to_string(),
+            );
+        }
+    }
+
     if value
         .get("claim_surface")
         .and_then(Value::as_str)
@@ -2256,7 +3665,15 @@ fn classify_evidence_freshness_in_repository(
         );
     }
 
-    if let Some(classification) = classify_performance_budget_claim(value, options, repository_root)
+    if !canonical_performance_budget
+        && let Some(classification) = classify_performance_budget_claim(
+            value,
+            options,
+            repository_root,
+            artifact_source_path,
+            captured_artifact_bytes,
+            false,
+        )
     {
         return classification;
     }
@@ -2297,8 +3714,17 @@ fn classify_evidence_freshness_in_repository(
         );
     };
 
+    let generated_at_utc = generated_at.with_timezone(&Utc);
+    if generated_at_utc > reference_time_utc + Duration::minutes(5) {
+        return (
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "generated_at_in_future".to_string(),
+        );
+    }
+
     if reference_time_utc
-        .signed_duration_since(generated_at.with_timezone(&Utc))
+        .signed_duration_since(generated_at_utc)
         .num_days()
         > options.stale_after_days
     {
@@ -2463,6 +3889,7 @@ fn doc_citation_node(
 fn evidence_artifact_node(
     source_path: &str,
     value: &Value,
+    captured_artifact_bytes: &[u8],
     content_sha256: &str,
     options: &SemanticWorkspaceGraphBuildOptions,
     repository_root: &Path,
@@ -2473,7 +3900,13 @@ fn evidence_artifact_node(
         .unwrap_or("schema_missing");
     let stable_key = format!("{source_path}:{artifact_schema}");
     let (freshness_status, release_claim_allowed, reason) =
-        classify_evidence_freshness_in_repository(value, options, Some(repository_root));
+        classify_evidence_freshness_in_repository(
+            value,
+            options,
+            Some(repository_root),
+            Some(source_path),
+            Some(captured_artifact_bytes),
+        );
     let mut metadata = BTreeMap::new();
     let privacy = classify_node_privacy(source_path, Some(value));
     metadata.insert("artifact_schema".to_string(), json!(artifact_schema));
@@ -3560,4 +4993,53 @@ fn redact_error_message(message: &str) -> String {
         .replace("authorization", "[redacted-keyword]")
         .replace("token", "[redacted-keyword]")
         .replace("secret", "[redacted-keyword]")
+}
+
+#[cfg(test)]
+mod git_record_parser_tests {
+    use super::{canonical_nul_records, parse_canonical_git_record};
+
+    #[test]
+    fn accepts_only_canonical_git_record_headers() {
+        assert_eq!(
+            parse_canonical_git_record(b"100644 blob abcdef\tsrc/lib.rs"),
+            Some((
+                b"100644".as_slice(),
+                b"blob".as_slice(),
+                b"abcdef".as_slice(),
+                b"src/lib.rs".as_slice(),
+            ))
+        );
+
+        for malformed in [
+            b" 100644 blob abcdef\tsrc/lib.rs".as_slice(),
+            b"100644  blob abcdef\tsrc/lib.rs".as_slice(),
+            b"100644 blob  abcdef\tsrc/lib.rs".as_slice(),
+            b"100644 blob abcdef \tsrc/lib.rs".as_slice(),
+            b"100644 blob abcdef src/lib.rs".as_slice(),
+            b"100644 blob abcdef\t".as_slice(),
+            b"100644 blob\tsrc/lib.rs".as_slice(),
+            b"100644 blob abcdef extra\tsrc/lib.rs".as_slice(),
+        ] {
+            assert_eq!(parse_canonical_git_record(malformed), None);
+        }
+    }
+
+    #[test]
+    fn accepts_only_canonically_terminated_nul_records() {
+        assert_eq!(canonical_nul_records(b""), Some(Vec::new()));
+        assert_eq!(
+            canonical_nul_records(b"first\0second\0"),
+            Some(vec![b"first".as_slice(), b"second".as_slice()])
+        );
+
+        for malformed in [
+            b"first".as_slice(),
+            b"\0".as_slice(),
+            b"first\0\0".as_slice(),
+            b"first\0\0second\0".as_slice(),
+        ] {
+            assert_eq!(canonical_nul_records(malformed), None);
+        }
+    }
 }

@@ -17874,6 +17874,19 @@ impl JsRuntimeShardSet {
             .collect()
     }
 
+    fn provider_stream_id_was_issued(&self, stream_id: &str) -> bool {
+        let Some(sequence) = stream_id
+            .strip_prefix("provider-stream-")
+            .and_then(|suffix| suffix.parse::<u64>().ok())
+        else {
+            return false;
+        };
+
+        sequence > 0
+            && sequence <= self.next_provider_stream_id
+            && stream_id == format!("provider-stream-{sequence}")
+    }
+
     fn shard_index_for_extension(&self, extension_id: &str) -> Result<usize> {
         let shard_index = self
             .extension_owner
@@ -18650,15 +18663,18 @@ impl JsExtensionRuntimeHandle {
                                 }
                             };
                             let result = async {
-                                let route = shard_set
+                                let Some(route) = shard_set
                                     .provider_stream_routes
                                     .get(&stream_id)
                                     .cloned()
-                                    .ok_or_else(|| {
-                                        Error::extension(format!(
-                                            "Unknown extension provider stream: {stream_id}"
-                                        ))
-                                    })?;
+                                else {
+                                    if shard_set.provider_stream_id_was_issued(&stream_id) {
+                                        return Ok(None);
+                                    }
+                                    return Err(Error::extension(format!(
+                                        "Unknown extension provider stream: {stream_id}"
+                                    )));
+                                };
                                 let result = next_extension_provider_stream_simple_sharded(
                                     &mut shard_set,
                                     &host,
@@ -40125,6 +40141,21 @@ mod tests {
         assert!(!manager.provider_has_stream_simple("  "));
     }
 
+    #[test]
+    fn issued_provider_stream_ids_require_canonical_in_range_sequence() {
+        let shards = JsRuntimeShardSet {
+            next_provider_stream_id: 3,
+            ..JsRuntimeShardSet::default()
+        };
+
+        assert!(shards.provider_stream_id_was_issued("provider-stream-1"));
+        assert!(shards.provider_stream_id_was_issued("provider-stream-3"));
+        assert!(!shards.provider_stream_id_was_issued("provider-stream-0"));
+        assert!(!shards.provider_stream_id_was_issued("provider-stream-01"));
+        assert!(!shards.provider_stream_id_was_issued("provider-stream-4"));
+        assert!(!shards.provider_stream_id_was_issued("unrelated-stream-1"));
+    }
+
     // --- streamSimple JS runtime integration tests ---
 
     #[test]
@@ -40354,6 +40385,17 @@ mod tests {
                 .await
                 .expect("next after cancel");
             assert!(after_cancel.is_none(), "expected None after cancellation");
+
+            let unknown = js_runtime
+                .provider_stream_simple_next("provider-stream-999".to_string(), 30_000)
+                .await
+                .expect_err("never-issued stream id should remain an error");
+            assert!(
+                unknown
+                    .to_string()
+                    .contains("Unknown extension provider stream: provider-stream-999"),
+                "unexpected unknown-stream error: {unknown}"
+            );
         });
     }
 

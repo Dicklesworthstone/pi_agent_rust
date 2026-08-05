@@ -1,4 +1,5 @@
 //! `PiJS` workload harness for deterministic perf baselines.
+#![recursion_limit = "256"]
 #![forbid(unsafe_code)]
 
 use clap::{Parser, ValueEnum};
@@ -110,29 +111,70 @@ impl WorkloadRuntimeEngine {
 }
 
 #[derive(Clone, Copy)]
+enum RegressionGateRequirement {
+    BuildFingerprint = 1 << 0,
+    BinaryProfile = 1 << 1,
+    CanonicalFeatures = 1 << 2,
+    CanonicalAllocator = 1 << 3,
+    RunIdentity = 1 << 4,
+    SourceIdentity = 1 << 5,
+    OptimizedBinary = 1 << 6,
+}
+
+impl RegressionGateRequirement {
+    const ALL: [Self; 7] = [
+        Self::BuildFingerprint,
+        Self::BinaryProfile,
+        Self::CanonicalFeatures,
+        Self::CanonicalAllocator,
+        Self::RunIdentity,
+        Self::SourceIdentity,
+        Self::OptimizedBinary,
+    ];
+
+    const fn bit(self) -> u8 {
+        self as u8
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RegressionGateVerifications(u8);
+
+impl RegressionGateVerifications {
+    const ALL: Self = Self((1 << RegressionGateRequirement::ALL.len()) - 1);
+
+    fn from_results(results: [(RegressionGateRequirement, bool); 7]) -> Self {
+        let mut verified = 0;
+        for (requirement, passed) in results {
+            if passed {
+                verified |= requirement.bit();
+            }
+        }
+        Self(verified)
+    }
+
+    #[cfg(test)]
+    const fn without(self, requirement: RegressionGateRequirement) -> Self {
+        Self(self.0 & !requirement.bit())
+    }
+
+    const fn is_complete(self) -> bool {
+        self.0 == Self::ALL.0
+    }
+}
+
+#[derive(Clone, Copy)]
 struct RegressionGateInputs<'a> {
     runtime_engine: WorkloadRuntimeEngine,
     build_profile: &'a str,
-    build_fingerprint_verified: bool,
-    binary_profile_verified: bool,
-    canonical_features: bool,
-    canonical_allocator: bool,
-    run_identity_verified: bool,
-    source_identity_verified: bool,
-    debug_assertions: bool,
+    verifications: RegressionGateVerifications,
     iterations: usize,
     tool_calls: usize,
 }
 
 fn is_regression_gate_eligible(inputs: RegressionGateInputs<'_>) -> bool {
-    !inputs.debug_assertions
+    inputs.verifications.is_complete()
         && inputs.build_profile == "perf"
-        && inputs.build_fingerprint_verified
-        && inputs.binary_profile_verified
-        && inputs.canonical_features
-        && inputs.canonical_allocator
-        && inputs.run_identity_verified
-        && inputs.source_identity_verified
         && inputs.runtime_engine == WorkloadRuntimeEngine::Quickjs
         && inputs.iterations == REGRESSION_GATE_ITERATIONS
         && REGRESSION_GATE_TOOL_CALLS.contains(&inputs.tool_calls)
@@ -292,13 +334,36 @@ fn run() -> Result<()> {
     let eligible_for_regression_gate = is_regression_gate_eligible(RegressionGateInputs {
         runtime_engine: args.runtime_engine,
         build_profile: &build_profile,
-        build_fingerprint_verified,
-        binary_profile_verified,
-        canonical_features,
-        canonical_allocator,
-        run_identity_verified,
-        source_identity_verified,
-        debug_assertions: cfg!(debug_assertions),
+        verifications: RegressionGateVerifications::from_results([
+            (
+                RegressionGateRequirement::BuildFingerprint,
+                build_fingerprint_verified,
+            ),
+            (
+                RegressionGateRequirement::BinaryProfile,
+                binary_profile_verified,
+            ),
+            (
+                RegressionGateRequirement::CanonicalFeatures,
+                canonical_features,
+            ),
+            (
+                RegressionGateRequirement::CanonicalAllocator,
+                canonical_allocator,
+            ),
+            (
+                RegressionGateRequirement::RunIdentity,
+                run_identity_verified,
+            ),
+            (
+                RegressionGateRequirement::SourceIdentity,
+                source_identity_verified,
+            ),
+            (
+                RegressionGateRequirement::OptimizedBinary,
+                !cfg!(debug_assertions),
+            ),
+        ]),
         iterations: args.iterations.get(),
         tool_calls: args.tool_calls.get(),
     });
@@ -591,7 +656,8 @@ mod tests {
 
     use crate::{
         Args, NativeBenchRuntime, REGRESSION_GATE_ITERATIONS, RegressionGateInputs,
-        WorkloadRuntimeEngine, checked_total_calls, is_full_git_sha, is_regression_gate_eligible,
+        RegressionGateRequirement, RegressionGateVerifications, WorkloadRuntimeEngine,
+        checked_total_calls, is_full_git_sha, is_regression_gate_eligible,
         run_identity_is_canonical, run_tool_roundtrip_native, run_tool_roundtrip_native_runtime,
         setup_native_runtime_bench_handle,
     };
@@ -630,13 +696,7 @@ mod tests {
         let canonical = RegressionGateInputs {
             runtime_engine: WorkloadRuntimeEngine::Quickjs,
             build_profile: "perf",
-            build_fingerprint_verified: true,
-            binary_profile_verified: true,
-            canonical_features: true,
-            canonical_allocator: true,
-            run_identity_verified: true,
-            source_identity_verified: true,
-            debug_assertions: false,
+            verifications: RegressionGateVerifications::ALL,
             iterations: REGRESSION_GATE_ITERATIONS,
             tool_calls: 1,
         };
@@ -656,34 +716,6 @@ mod tests {
                 ..canonical
             },
             RegressionGateInputs {
-                build_fingerprint_verified: false,
-                ..canonical
-            },
-            RegressionGateInputs {
-                binary_profile_verified: false,
-                ..canonical
-            },
-            RegressionGateInputs {
-                canonical_features: false,
-                ..canonical
-            },
-            RegressionGateInputs {
-                canonical_allocator: false,
-                ..canonical
-            },
-            RegressionGateInputs {
-                run_identity_verified: false,
-                ..canonical
-            },
-            RegressionGateInputs {
-                source_identity_verified: false,
-                ..canonical
-            },
-            RegressionGateInputs {
-                debug_assertions: true,
-                ..canonical
-            },
-            RegressionGateInputs {
                 iterations: REGRESSION_GATE_ITERATIONS - 1,
                 ..canonical
             },
@@ -693,6 +725,12 @@ mod tests {
             },
         ] {
             assert!(!is_regression_gate_eligible(invalid));
+        }
+        for missing in RegressionGateRequirement::ALL {
+            assert!(!is_regression_gate_eligible(RegressionGateInputs {
+                verifications: RegressionGateVerifications::ALL.without(missing),
+                ..canonical
+            }));
         }
     }
 

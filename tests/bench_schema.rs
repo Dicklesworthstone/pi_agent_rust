@@ -4033,8 +4033,8 @@ fn regression_gate_protocol_fixture(root: &Path) -> Value {
 
 fn pijs_gate_workload_fixture(root: &Path, tool_calls_per_iteration: u64) -> Value {
     let total_calls = PIJS_GATE_ITERATIONS * tool_calls_per_iteration;
-    let elapsed_us_f64 = total_calls as f64 * 49.5;
-    let elapsed_us = elapsed_us_f64 as u64;
+    let elapsed_us = total_calls * 99 / 2;
+    let elapsed_us_f64 = elapsed_us as f64;
     let (binary_path, binary_sha256) = generic_test_binary_provenance(root);
     let source_commit = "0123456789abcdef0123456789abcdef01234567";
     let config_hash = benchmark_provenance_config_hash(&BenchmarkProvenance {

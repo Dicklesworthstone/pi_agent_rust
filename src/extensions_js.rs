@@ -11718,7 +11718,11 @@ const __pi_vfs = (() => {
       return { bytes: toBytes(content, "base64"), error: "" };
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
-      if (message.includes("host read denied")) {
+      // A standalone realm may use an unrestricted virtual overlay, but host
+      // reads remain confined. Treat a denied host probe as an absent overlay
+      // entry so create/write operations can proceed entirely in the VFS.
+      // Identified extensions still fail closed on the same denial.
+      if (message.includes("host read denied") && currentExtensionId()) {
         throw error;
       }
       return { bytes: undefined, error: message };
@@ -11736,7 +11740,11 @@ const __pi_vfs = (() => {
       return JSON.parse(globalThis.__pi_host_stat_sync(resolved, !!followSymlinks));
     } catch (error) {
       const message = String((error && error.message) ? error.message : error);
-      if (message.includes("host stat denied")) throw error;
+      // Standalone harness realms have no extension identity. Their virtual
+      // reads and writes intentionally bypass extension policy, so a denied
+      // host metadata probe means only that no host overlay is visible. An
+      // identified extension must retain the fail-closed policy error.
+      if (message.includes("host stat denied") && currentExtensionId()) throw error;
       return undefined;
     }
   }
@@ -24366,8 +24374,8 @@ mod tests {
         for (name, expected_len, expected_sha256) in [
             (
                 "node:fs",
-                56_220,
-                "73c438ae85dc7ee63ee32830928ddb51c2d1a742727b0525633cc9de23cb8451",
+                56_871,
+                "2d07554c39973bfda483a57f7b870916af4950581ab890741fe5203c77bddb78",
             ),
             (
                 "@mariozechner/pi-ai",
@@ -25731,17 +25739,16 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .expect("create runtime");
 
             let cache_key = "pijs://virtual".to_string();
+            let extension_root = PathBuf::from("/tmp/ext-root");
             {
                 let mut state = runtime.module_state.borrow_mut();
-                let extension_root = PathBuf::from("/tmp/ext-root");
-                runtime.add_allowed_read_root(&extension_root);
                 state.extension_roots.push(extension_root.clone());
                 state
                     .extension_root_tiers
                     .insert(extension_root.clone(), ProxyStubSourceTier::Community);
                 state
                     .extension_root_scopes
-                    .insert(extension_root, "@scope".to_string());
+                    .insert(extension_root.clone(), "@scope".to_string());
                 state.foreign_extension_root_boundaries_by_id.insert(
                     "ext.foreign".to_string(),
                     vec![PathBuf::from("/tmp/ext-foreign")],
@@ -25769,6 +25776,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                     disk_hits: 6,
                 };
             }
+            runtime.add_allowed_read_root(&extension_root);
 
             runtime
                 .hostcall_queue
@@ -30827,12 +30835,13 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         baseUrl: "https://not-used.example.com",
                         models: [{ id: "err-model", name: "Error Model" }],
                         streamSimple: async function*(model, context, options) {
+                            globalThis.providerStreamErrorSignal = options.signal;
                             try {
                                 yield "partial";
                                 throw new Error("stream explosion");
                             } finally {
                                 globalThis.providerStreamErrorState.cleanupRan = true;
-                                globalThis.providerStreamErrorState.signalAborted =
+                                globalThis.providerStreamErrorState.signalAbortedDuringCleanup =
                                     options.signal.aborted === true;
                             }
                         }
@@ -30863,6 +30872,8 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                         }
                         globalThis.providerStreamErrorState.afterError =
                             __pi_runtime_registry_snapshot(__pi_test_secret).providerStreams;
+                        globalThis.providerStreamErrorState.signalAbortedAfterError =
+                            globalThis.providerStreamErrorSignal.aborted === true;
                         globalThis.providerStreamErrorState.done = true;
                     })();
                     "#,
@@ -30879,7 +30890,11 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert_eq!(state["error"], serde_json::json!("stream explosion"));
             assert_eq!(state["afterError"], serde_json::json!(0));
             assert_eq!(state["cleanupRan"], serde_json::json!(true));
-            assert_eq!(state["signalAborted"], serde_json::json!(true));
+            assert_eq!(
+                state["signalAbortedDuringCleanup"],
+                serde_json::json!(false)
+            );
+            assert_eq!(state["signalAbortedAfterError"], serde_json::json!(true));
             assert_eq!(state["done"], serde_json::json!(true));
         });
     }
@@ -32586,7 +32601,11 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             drain_until_idle(&runtime, &clock).await;
 
             let result = get_global_json(&runtime, "fsStreamCopy").await;
-            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(
+                result["done"],
+                serde_json::json!(true),
+                "stream copy failed: {result}"
+            );
             assert_eq!(result["value"], serde_json::json!("stream-data-123"));
         });
     }
@@ -32660,7 +32679,11 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             drain_until_idle(&runtime, &clock).await;
 
             let result = get_global_json(&runtime, "fsStreamWriteError").await;
-            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(
+                result["done"],
+                serde_json::json!(true),
+                "write-stream error regression failed: {result}"
+            );
             assert!(
                 result["originalError"]
                     .as_str()

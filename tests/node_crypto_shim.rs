@@ -108,7 +108,7 @@ fn eval_crypto(js_expr: &str) -> String {
         .unwrap_or_else(|| "NO_RESPONSE".to_string())
 }
 
-/// Evaluate the production `node:crypto` module in a bare QuickJS context.
+/// Evaluate the production `node:crypto` module in a bare `QuickJS` context.
 ///
 /// The full extension runtime intentionally installs non-configurable native
 /// crypto bridges, so tests must not mutate those production capabilities to

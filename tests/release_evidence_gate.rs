@@ -11,6 +11,8 @@
 #![allow(clippy::too_many_lines)]
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use serde::Deserialize;
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
@@ -21,10 +23,117 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+struct UniqueJsonValue(Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite number is not valid JSON"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_string())))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value.to_string())))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON object key: {key}"
+                )));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(Value::Object(values)))
+    }
+}
+
+fn parse_release_json(contents: &[u8]) -> Result<Value, String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let value = UniqueJsonValue::deserialize(&mut deserializer)
+        .map_err(|error| error.to_string())?
+        .0;
+    deserializer.end().map_err(|error| error.to_string())?;
+    Ok(value)
+}
+
 fn load_json(relative: &str) -> Option<Value> {
     let path = repo_root().join(relative);
-    let text = std::fs::read_to_string(&path).ok()?;
-    serde_json::from_str(&text).ok()
+    let contents = std::fs::read(&path).ok()?;
+    parse_release_json(&contents).ok()
 }
 
 fn require_json(relative: &str) -> Value {
@@ -370,7 +479,7 @@ fn require_phase1_matrix_validation() -> (String, Value) {
     );
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {display_path}: {err}"));
-    let json = serde_json::from_str(&text)
+    let json = parse_release_json(text.as_bytes())
         .unwrap_or_else(|err| panic!("{display_path} is not valid JSON: {err}"));
     (display_path, json)
 }
@@ -451,7 +560,7 @@ fn require_parameter_sweeps() -> (String, Value) {
     );
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {display_path}: {err}"));
-    let json = serde_json::from_str(&text)
+    let json = parse_release_json(text.as_bytes())
         .unwrap_or_else(|err| panic!("{display_path} is not valid JSON: {err}"));
     (display_path, json)
 }
@@ -470,7 +579,7 @@ fn require_opportunity_matrix() -> (String, Value) {
     );
     let text = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("failed to read {display_path}: {err}"));
-    let json = serde_json::from_str(&text)
+    let json = parse_release_json(text.as_bytes())
         .unwrap_or_else(|err| panic!("{display_path} is not valid JSON: {err}"));
     (display_path, json)
 }
@@ -2216,21 +2325,59 @@ fn validate_performance_budget_summary(
         ));
     }
 
-    if claim_ready {
-        if now.signed_duration_since(generated_at) > maximum_age {
-            return Err("performance summary is too stale to authorize claims".to_string());
-        }
+    if claim_ready && now.signed_duration_since(generated_at) > maximum_age {
+        return Err("performance summary is too stale to authorize claims".to_string());
     }
 
     Ok(PerformanceClaimValidation { claim_ready })
 }
 
-fn perf_git_output(args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root())
+const PERFORMANCE_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
+
+#[derive(Debug)]
+struct PerformanceGitContext {
+    worktree: PathBuf,
+    git_dir: PathBuf,
+}
+
+fn scrub_git_environment(command: &mut std::process::Command) {
+    for (variable, _) in std::env::vars_os() {
+        if variable.to_string_lossy().starts_with("GIT_") {
+            command.env_remove(variable);
+        }
+    }
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+}
+
+fn sanitized_perf_git_command(context: &PerformanceGitContext) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .current_dir(&context.worktree)
+        .arg("--git-dir")
+        .arg(&context.git_dir)
+        .arg("--work-tree")
+        .arg(&context.worktree)
+        .args([
+            "--no-optional-locks",
+            "--literal-pathspecs",
+            "-c",
+            "core.bare=false",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.ignoreStat=false",
+            "-c",
+        ])
+        .arg(format!("core.worktree={}", context.worktree.display()));
+    scrub_git_environment(&mut command);
+    command
+}
+
+fn perf_git_output_at(context: &PerformanceGitContext, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = sanitized_perf_git_command(context)
         .args(args)
-        .env("GIT_LITERAL_PATHSPECS", "1")
         .output()
         .map_err(|err| format!("failed to execute git {}: {err}", args.join(" ")))?;
     if output.status.success() {
@@ -2244,6 +2391,227 @@ fn perf_git_output(args: &[&str]) -> Result<Vec<u8>, String> {
     }
 }
 
+fn perf_git_stdout_at(context: &PerformanceGitContext, args: &[&str]) -> Result<String, String> {
+    String::from_utf8(perf_git_output_at(context, args)?)
+        .map(|stdout| stdout.trim().to_string())
+        .map_err(|err| format!("git {} output was not UTF-8: {err}", args.join(" ")))
+}
+
+fn performance_git_context(root: &Path) -> Result<PerformanceGitContext, String> {
+    let worktree = std::fs::canonicalize(root)
+        .map_err(|err| format!("performance repository root is unavailable: {err}"))?;
+    let marker = worktree.join(".git");
+    let marker_metadata = std::fs::symlink_metadata(&marker)
+        .map_err(|err| format!("performance repository .git marker is unavailable: {err}"))?;
+    if marker_metadata.file_type().is_symlink() {
+        return Err("performance repository .git marker must not be a symlink".to_string());
+    }
+    let git_dir = if marker_metadata.is_dir() {
+        std::fs::canonicalize(&marker)
+            .map_err(|err| format!("performance repository git directory is invalid: {err}"))?
+    } else if marker_metadata.is_file() {
+        let marker_text = std::fs::read_to_string(&marker)
+            .map_err(|err| format!("performance repository gitfile is unreadable: {err}"))?;
+        let marker_line = marker_text.trim_end_matches(['\r', '\n']);
+        let target = marker_line
+            .strip_prefix("gitdir: ")
+            .filter(|target| {
+                !target.is_empty() && !target.contains('\0') && target.lines().count() == 1
+            })
+            .ok_or_else(|| "performance repository gitfile is malformed".to_string())?;
+        let target = Path::new(target);
+        let candidate = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            worktree.join(target)
+        };
+        let target_metadata = std::fs::symlink_metadata(&candidate).map_err(|err| {
+            format!("performance repository gitfile target is unavailable: {err}")
+        })?;
+        if target_metadata.file_type().is_symlink() || !target_metadata.is_dir() {
+            return Err(
+                "performance repository gitfile target must be a non-symlink directory".to_string(),
+            );
+        }
+        std::fs::canonicalize(candidate)
+            .map_err(|err| format!("performance repository gitfile target is invalid: {err}"))?
+    } else {
+        return Err(
+            "performance repository .git marker must be a directory or gitfile".to_string(),
+        );
+    };
+
+    let context = PerformanceGitContext { worktree, git_dir };
+    let top_level = perf_git_stdout_at(&context, &["rev-parse", "--show-toplevel"])?;
+    let canonical_top_level = std::fs::canonicalize(&top_level)
+        .map_err(|err| format!("performance repository top level is invalid: {err}"))?;
+    if canonical_top_level != context.worktree {
+        return Err("performance repository worktree identity mismatch".to_string());
+    }
+    let reported_git_dir = perf_git_stdout_at(&context, &["rev-parse", "--absolute-git-dir"])?;
+    let canonical_reported_git_dir = std::fs::canonicalize(&reported_git_dir).map_err(|err| {
+        format!("performance repository reported git directory is invalid: {err}")
+    })?;
+    if canonical_reported_git_dir != context.git_dir {
+        return Err("performance repository git directory identity mismatch".to_string());
+    }
+    if perf_git_stdout_at(&context, &["rev-parse", "--is-inside-work-tree"])? != "true" {
+        return Err("performance repository is not a worktree".to_string());
+    }
+    Ok(context)
+}
+
+fn validate_performance_checkout_clean(context: &PerformanceGitContext) -> Result<(), String> {
+    let status = perf_git_output_at(
+        context,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+    )?;
+    if !status.is_empty() {
+        let entries: Vec<_> = status
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .take(3)
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect();
+        return Err(format!(
+            "performance summary repository is not clean: {entries:?}"
+        ));
+    }
+
+    let index = perf_git_output_at(context, &["ls-files", "-v", "-z"])?;
+    let flagged: Vec<_> = index
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty() && !entry.starts_with(b"H "))
+        .take(3)
+        .map(|entry| String::from_utf8_lossy(entry.get(2..).unwrap_or_default()).into_owned())
+        .collect();
+    if !flagged.is_empty() {
+        return Err(format!(
+            "performance summary repository uses non-default assume-unchanged/skip-worktree index flags: {flagged:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn contained_regular_artifact_path(
+    context: &PerformanceGitContext,
+    artifact_path: &str,
+) -> Result<PathBuf, String> {
+    let relative = Path::new(artifact_path);
+    if artifact_path.is_empty()
+        || relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "performance summary path must be a normalized repository-relative path: {artifact_path:?}"
+        ));
+    }
+
+    let mut candidate = context.worktree.clone();
+    for component in relative.components() {
+        let std::path::Component::Normal(segment) = component else {
+            unreachable!("non-normal components rejected above");
+        };
+        candidate.push(segment);
+        let metadata = std::fs::symlink_metadata(&candidate).map_err(|err| {
+            format!(
+                "performance summary path component {} is unavailable: {err}",
+                candidate.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() {
+            return Err("performance summary path must not contain symlink components".to_string());
+        }
+    }
+
+    let canonical_artifact = std::fs::canonicalize(&candidate)
+        .map_err(|err| format!("performance summary path could not be resolved: {err}"))?;
+    if !canonical_artifact.starts_with(&context.worktree) {
+        return Err("performance summary path escapes the repository root".to_string());
+    }
+    let metadata = std::fs::metadata(&canonical_artifact)
+        .map_err(|err| format!("performance summary metadata is unavailable: {err}"))?;
+    if !metadata.is_file() {
+        return Err("performance summary must be a regular file".to_string());
+    }
+    Ok(canonical_artifact)
+}
+
+fn validate_performance_artifact_at_head(
+    context: &PerformanceGitContext,
+    artifact_path: &str,
+    head: &str,
+) -> Result<(), String> {
+    let full_path = contained_regular_artifact_path(context, artifact_path)?;
+    let tree_entry = perf_git_output_at(
+        context,
+        &["ls-tree", "--full-tree", "-z", head, "--", artifact_path],
+    )?;
+    let entries: Vec<_> = tree_entry
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    let [entry] = entries.as_slice() else {
+        return Err("performance summary is not tracked exactly once at HEAD".to_string());
+    };
+    let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+        return Err("performance summary HEAD tree entry is malformed".to_string());
+    };
+    let (metadata, tracked_path_with_tab) = entry.split_at(tab);
+    let tracked_path = &tracked_path_with_tab[1..];
+    let metadata_fields: Vec<_> = metadata
+        .split(|byte| *byte == b' ')
+        .filter(|field| !field.is_empty())
+        .collect();
+    if metadata_fields.len() != 3
+        || !matches!(metadata_fields[0], b"100644" | b"100755")
+        || metadata_fields[1] != b"blob"
+        || tracked_path != artifact_path.as_bytes()
+    {
+        return Err(
+            "performance summary HEAD entry must be the exact tracked regular-file blob"
+                .to_string(),
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let live_mode = std::fs::symlink_metadata(&full_path)
+            .map_err(|err| format!("performance summary current mode is unavailable: {err}"))?
+            .permissions()
+            .mode();
+        let live_git_mode = if live_mode & 0o111 == 0 {
+            b"100644".as_slice()
+        } else {
+            b"100755".as_slice()
+        };
+        if live_git_mode != metadata_fields[0] {
+            return Err("performance summary current mode does not exactly match HEAD".to_string());
+        }
+    }
+
+    let blob_oid = std::str::from_utf8(metadata_fields[2])
+        .map_err(|err| format!("performance summary blob ID is not UTF-8: {err}"))?;
+    let head_bytes = perf_git_output_at(context, &["cat-file", "blob", blob_oid])?;
+    let live_bytes = std::fs::read(&full_path)
+        .map_err(|err| format!("performance summary current bytes are unreadable: {err}"))?;
+    if live_bytes != head_bytes {
+        return Err("performance summary current bytes do not exactly match HEAD".to_string());
+    }
+    Ok(())
+}
+
 fn performance_followup_path_allowed(path: &str, packaged: bool) -> bool {
     path.starts_with("tests/perf/reports/")
         || path.starts_with("tests/e2e_results/")
@@ -2252,9 +2620,13 @@ fn performance_followup_path_allowed(path: &str, packaged: bool) -> bool {
         || (path.starts_with("docs/evidence/") && !packaged)
 }
 
-fn performance_path_is_packaged(source_commit: &str, path: &str) -> Result<bool, String> {
+fn performance_path_is_packaged(
+    context: &PerformanceGitContext,
+    source_commit: &str,
+    path: &str,
+) -> Result<bool, String> {
     let cargo_expression = format!("{source_commit}:Cargo.toml");
-    let cargo_toml = String::from_utf8(perf_git_output(&["show", &cargo_expression])?)
+    let cargo_toml = String::from_utf8(perf_git_output_at(context, &["show", &cargo_expression])?)
         .map_err(|err| format!("source Cargo.toml is not UTF-8: {err}"))?;
     let document: toml::Value = toml::from_str(&cargo_toml).map_err(|err| {
         format!("unable to parse source Cargo.toml package include policy: {err}")
@@ -2285,29 +2657,28 @@ fn performance_path_is_packaged(source_commit: &str, path: &str) -> Result<bool,
     Ok(false)
 }
 
-fn validate_performance_source_binding(source_commit: &str) -> Result<(), String> {
-    let head = String::from_utf8(perf_git_output(&[
-        "rev-parse",
-        "--verify",
-        "HEAD^{commit}",
-    ])?)
-    .map_err(|err| format!("HEAD object ID is not UTF-8: {err}"))?;
-    let head = head.trim();
+fn validate_performance_source_binding_at_with_finalizer<F>(
+    root: &Path,
+    artifact_path: &str,
+    source_commit: &str,
+    before_final_check: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    let context = performance_git_context(root)?;
+    let head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    validate_performance_checkout_clean(&context)?;
+    validate_performance_artifact_at_head(&context, artifact_path, &head)?;
+
     let source_expression = format!("{source_commit}^{{commit}}");
-    let resolved = String::from_utf8(perf_git_output(&[
-        "rev-parse",
-        "--verify",
-        &source_expression,
-    ])?)
-    .map_err(|err| format!("source object ID is not UTF-8: {err}"))?;
-    if resolved.trim() != source_commit {
+    let resolved = perf_git_stdout_at(&context, &["rev-parse", "--verify", &source_expression])?;
+    if resolved != source_commit {
         return Err("source_commit does not resolve to the exact recorded commit".to_string());
     }
 
-    let ancestor = std::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root())
-        .args(["merge-base", "--is-ancestor", source_commit, head])
+    let ancestor = sanitized_perf_git_command(&context)
+        .args(["merge-base", "--is-ancestor", source_commit, &head])
         .output()
         .map_err(|err| format!("failed to verify performance source ancestry: {err}"))?;
     if !ancestor.status.success() {
@@ -2320,40 +2691,86 @@ fn validate_performance_source_binding(source_commit: &str) -> Result<(), String
             )
         });
     }
-    if source_commit == head {
-        return Ok(());
-    }
-
-    let changed = perf_git_output(&[
-        "diff",
-        "--name-only",
-        "-z",
-        "--no-renames",
-        source_commit,
-        head,
-    ])?;
-    let paths: Vec<_> = changed
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| {
-            std::str::from_utf8(path).map_err(|err| format!("changed path is not UTF-8: {err}"))
-        })
-        .collect::<Result<_, _>>()?;
-    if paths.is_empty() {
-        return Err(
-            "source_commit differs from HEAD but the source-to-release diff is empty".to_string(),
-        );
-    }
-    for path in paths {
-        let packaged = path.starts_with("docs/evidence/")
-            && performance_path_is_packaged(source_commit, path)?;
-        if !performance_followup_path_allowed(path, packaged) {
-            return Err(format!(
-                "non-evidence or packaged path changed after source_commit: {path}"
-            ));
+    if source_commit != head {
+        let changed = perf_git_output_at(
+            &context,
+            &[
+                "diff",
+                "--name-only",
+                "-z",
+                "--no-renames",
+                source_commit,
+                &head,
+            ],
+        )?;
+        let paths: Vec<_> = changed
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| {
+                std::str::from_utf8(path).map_err(|err| format!("changed path is not UTF-8: {err}"))
+            })
+            .collect::<Result<_, _>>()?;
+        if paths.is_empty() {
+            return Err(
+                "source_commit differs from HEAD but the source-to-release diff is empty"
+                    .to_string(),
+            );
+        }
+        for path in paths {
+            let packaged = path.starts_with("docs/evidence/")
+                && performance_path_is_packaged(&context, source_commit, path)?;
+            if !performance_followup_path_allowed(path, packaged) {
+                return Err(format!(
+                    "non-evidence or packaged path changed after source_commit: {path}"
+                ));
+            }
         }
     }
+
+    before_final_check()?;
+    let final_head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if final_head != head {
+        return Err(
+            "performance repository HEAD changed during source binding validation".to_string(),
+        );
+    }
+    validate_performance_checkout_clean(&context)?;
+    validate_performance_artifact_at_head(&context, artifact_path, &head)?;
+    let final_head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if final_head != head {
+        return Err(
+            "performance repository HEAD changed during source binding validation".to_string(),
+        );
+    }
+    validate_performance_checkout_clean(&context)?;
+    let final_head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    if final_head != head {
+        return Err(
+            "performance repository HEAD changed during source binding validation".to_string(),
+        );
+    }
     Ok(())
+}
+
+fn validate_performance_source_binding_at(
+    root: &Path,
+    artifact_path: &str,
+    source_commit: &str,
+) -> Result<(), String> {
+    validate_performance_source_binding_at_with_finalizer(
+        root,
+        artifact_path,
+        source_commit,
+        || Ok(()),
+    )
+}
+
+fn validate_performance_source_binding(source_commit: &str) -> Result<(), String> {
+    validate_performance_source_binding_at(
+        &repo_root(),
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        source_commit,
+    )
 }
 
 fn performance_fixture_timestamp(now: DateTime<Utc>) -> String {
@@ -2370,11 +2787,10 @@ fn exact_libtest_output_proves_one(
         .map(str::trim)
         .filter(|line| line.ends_with(": test"))
         .collect();
-    let listed_benchmarks: Vec<_> = listing
+    let has_listed_benchmarks = listing
         .lines()
         .map(str::trim)
-        .filter(|line| line.ends_with(": benchmark") || line.ends_with(": bench"))
-        .collect();
+        .any(|line| line.ends_with(": benchmark") || line.ends_with(": bench"));
     let list_summaries: Vec<_> = listing
         .lines()
         .map(str::trim)
@@ -2400,7 +2816,7 @@ fn exact_libtest_output_proves_one(
         .collect();
     let expected_listing = format!("{test_name}: test");
     if listed != [expected_listing.as_str()]
-        || !listed_benchmarks.is_empty()
+        || has_listed_benchmarks
         || !(list_summaries.is_empty() || list_summaries == ["1 test, 0 benchmarks"])
     {
         return Err("exact filter did not list exactly one test".to_string());
@@ -2539,17 +2955,1226 @@ fn claim_ready_performance_summary_fixture(now: DateTime<Utc>) -> Value {
     summary
 }
 
+fn fixture_git_output(root: &Path, args: &[&str]) -> String {
+    let mut command = if std::fs::symlink_metadata(root.join(".git")).is_ok() {
+        let context = performance_git_context(root).expect("resolve fixture Git context");
+        sanitized_perf_git_command(&context)
+    } else {
+        let mut command = std::process::Command::new("git");
+        command.arg("-C").arg(root);
+        scrub_git_environment(&mut command);
+        command
+    };
+    let output = command
+        .args(args)
+        .output()
+        .unwrap_or_else(|err| panic!("fixture git {} failed to run: {err}", args.join(" ")));
+    assert!(
+        output.status.success(),
+        "fixture git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    String::from_utf8(output.stdout)
+        .unwrap_or_else(|err| panic!("fixture git {} output was not UTF-8: {err}", args.join(" ")))
+}
+
+fn fixture_git_context_and_head(root: &Path) -> (PerformanceGitContext, String) {
+    let context = performance_git_context(root).expect("resolve fixture Git context");
+    let head = perf_git_stdout_at(&context, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .expect("resolve fixture HEAD");
+    (context, head)
+}
+
+fn commit_performance_binding_fixture(root: &Path, message: &str) -> String {
+    fixture_git_output(root, &["add", "--all"]);
+    fixture_git_output(
+        root,
+        &[
+            "-c",
+            "user.name=Pi release-gate fixture",
+            "-c",
+            "user.email=pi-release-gate@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            message,
+        ],
+    );
+    fixture_git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])
+        .trim()
+        .to_string()
+}
+
+fn retained_performance_binding_fixture(packaged_evidence: bool) -> (PathBuf, String) {
+    let base = std::env::var_os("TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("pi-release-evidence-gate-fixtures");
+    std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    let root = base.join(format!("fixture-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).expect("create fixture source directory");
+    std::fs::create_dir_all(root.join("tests/perf/reports"))
+        .expect("create fixture performance report directory");
+    let include = if packaged_evidence {
+        r#"include = ["/Cargo.toml", "/docs/evidence/shipped.json"]"#
+    } else {
+        r#"include = ["/Cargo.toml"]"#
+    };
+    std::fs::write(
+        root.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"release-gate-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\n{include}\n"
+        ),
+    )
+    .expect("write fixture Cargo.toml");
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n").expect("write fixture source");
+    std::fs::write(
+        root.join(PERFORMANCE_BUDGET_SUMMARY_PATH),
+        b"{\"fixture\":true}\n",
+    )
+    .expect("write fixture performance summary");
+    if packaged_evidence {
+        std::fs::create_dir_all(root.join("docs/evidence"))
+            .expect("create packaged evidence directory");
+        std::fs::write(
+            root.join("docs/evidence/shipped.json"),
+            b"{\"version\":1}\n",
+        )
+        .expect("write packaged evidence fixture");
+    }
+    fixture_git_output(&root, &["init", "--quiet", "--initial-branch=main"]);
+    let source_commit = commit_performance_binding_fixture(&root, "initial source snapshot");
+    (root, source_commit)
+}
+
+fn retained_e2e_evidence_fixture() -> (PathBuf, PathBuf) {
+    let base = std::env::var_os("TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("pi-release-evidence-gate-fixtures");
+    std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    let root = base.join(format!("e2e-fixture-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(root.join("src")).expect("create E2E fixture source directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"release-gate-e2e-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\ninclude = [\"/Cargo.toml\"]\n",
+    )
+    .expect("write E2E fixture Cargo.toml");
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")
+        .expect("write E2E fixture source");
+    fixture_git_output(&root, &["init", "--quiet", "--initial-branch=main"]);
+    let source_commit = commit_performance_binding_fixture(&root, "initial E2E source snapshot");
+
+    let evidence_dir = root.join("tests/e2e_results/20260805T010203Z");
+    let suite_dir = evidence_dir.join("smoke");
+    std::fs::create_dir_all(&suite_dir).expect("create E2E fixture evidence directory");
+    let correlation_id = "release-gate-e2e-fixture";
+    let artifact_dir = "tests/e2e_results/20260805T010203Z";
+    let suite_result = json!({
+        "suite": "smoke",
+        "exit_code": 0,
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0,
+        "total": 1
+    });
+    let documents = [
+        (
+            evidence_dir.join("evidence_contract.json"),
+            json!({
+                "schema": "pi.evidence.contract.v1",
+                "profile": "ci",
+                "strict_conformance": false,
+                "status": "pass",
+                "errors": [],
+                "checks": [{
+                    "id": "fixture",
+                    "path": "tests/e2e_results/20260805T010203Z/summary.json",
+                    "diagnostics": "",
+                    "ok": true
+                }],
+                "correlation_id": correlation_id,
+                "artifact_dir": artifact_dir
+            }),
+        ),
+        (
+            evidence_dir.join("environment.json"),
+            json!({
+                "schema": "pi.e2e.environment.v1",
+                "profile": "ci",
+                "rerun_from": null,
+                "correlation_id": correlation_id,
+                "artifact_dir": artifact_dir,
+                "unit_targets": ["release_evidence_gate"],
+                "e2e_suites": ["smoke"],
+                "git_sha": source_commit
+            }),
+        ),
+        (
+            evidence_dir.join("summary.json"),
+            json!({
+                "schema": "pi.e2e.summary.v1",
+                "profile": "ci",
+                "rerun_from": null,
+                "correlation_id": correlation_id,
+                "artifact_dir": artifact_dir,
+                "total_units": 1,
+                "passed_units": 1,
+                "failed_units": 0,
+                "unit_targets": [{
+                    "target": "release_evidence_gate",
+                    "exit_code": 0,
+                    "passed": 1,
+                    "failed": 0,
+                    "ignored": 0,
+                    "total": 1
+                }],
+                "total_suites": 1,
+                "passed_suites": 1,
+                "failed_suites": 0,
+                "failed_names": [],
+                "suites": [suite_result]
+            }),
+        ),
+        (suite_dir.join("result.json"), suite_result),
+    ];
+    for (path, document) in documents {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&document).expect("serialize E2E fixture document"),
+        )
+        .expect("write E2E fixture document");
+    }
+    commit_performance_binding_fixture(&root, "record E2E evidence follow-up");
+    (root, evidence_dir)
+}
+
+fn retained_dropin_evidence_fixture() -> (PathBuf, PathBuf, PathBuf) {
+    let base = std::env::var_os("TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("pi-release-evidence-gate-fixtures");
+    std::fs::create_dir_all(&base).expect("create retained release-gate fixture base");
+    let root = base.join(format!("dropin-binding-fixture-{}", uuid::Uuid::new_v4()));
+    let contract_path = root.join("docs/contracts/dropin-certification-contract.json");
+    let verdict_path = root.join("docs/evidence/dropin-certification-verdict.json");
+    std::fs::create_dir_all(root.join("src")).expect("create drop-in fixture source directory");
+    std::fs::create_dir_all(contract_path.parent().expect("drop-in contract parent"))
+        .expect("create drop-in contract directory");
+    std::fs::create_dir_all(verdict_path.parent().expect("drop-in verdict parent"))
+        .expect("create drop-in verdict directory");
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = \"release-gate-dropin-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\ninclude = [\"/Cargo.toml\"]\n",
+    )
+    .expect("write drop-in fixture Cargo.toml");
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")
+        .expect("write drop-in fixture source");
+    std::fs::write(
+        &contract_path,
+        serde_json::to_vec_pretty(&json!({
+            "release_process_enforcement": {
+                "verdict_artifact_contract": {
+                    "required_fields": [
+                        "git_commit",
+                        "generated_at_utc",
+                        "overall_verdict",
+                        "hard_gate_results",
+                        "blocking_reasons",
+                        "evidence_index"
+                    ],
+                    "schema": "pi.dropin.certification_verdict.v1",
+                    "path": "docs/evidence/dropin-certification-verdict.json"
+                }
+            }
+        }))
+        .expect("serialize drop-in binding contract"),
+    )
+    .expect("write drop-in binding contract");
+    fixture_git_output(&root, &["init", "--quiet", "--initial-branch=main"]);
+    let source_commit = commit_performance_binding_fixture(&root, "initial drop-in source");
+    std::fs::write(
+        &verdict_path,
+        serde_json::to_vec_pretty(&json!({
+            "schema": "pi.dropin.certification_verdict.v1",
+            "git_commit": source_commit,
+            "generated_at_utc": Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            "overall_verdict": "NOT_CERTIFIED",
+            "hard_gate_results": [],
+            "blocking_reasons": ["fixture"],
+            "evidence_index": []
+        }))
+        .expect("serialize drop-in binding verdict"),
+    )
+    .expect("write drop-in binding verdict");
+    commit_performance_binding_fixture(&root, "record drop-in verdict evidence");
+    (root, contract_path, verdict_path)
+}
+
+fn release_gate_embedded_python(marker: &str) -> String {
+    let script = require_text("scripts/release_gate.sh");
+    let section = script
+        .get(
+            script
+                .find(marker)
+                .unwrap_or_else(|| panic!("release gate marker not found: {marker}"))..,
+        )
+        .expect("marker index must be a character boundary");
+    let heredoc_marker = "<<'PY'\n";
+    let program_start = section.find(heredoc_marker).map_or_else(
+        || panic!("Python heredoc not found after release gate marker: {marker}"),
+        |index| index + heredoc_marker.len(),
+    );
+    let program_end = section[program_start..].find("\nPY\n").map_or_else(
+        || panic!("Python heredoc terminator not found after marker: {marker}"),
+        |index| program_start + index,
+    );
+    section[program_start..program_end].to_string()
+}
+
+fn release_gate_python_command(marker: &str, args: &[&str]) -> (std::process::Command, String) {
+    let mut command = std::process::Command::new("python3");
+    command
+        .arg("-")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    (command, release_gate_embedded_python(marker))
+}
+
+fn run_release_gate_python(
+    mut command: std::process::Command,
+    program: &str,
+) -> std::process::Output {
+    let mut child = command.spawn().expect("spawn embedded release-gate Python");
+    let mut stdin = child.stdin.take().expect("embedded Python stdin");
+    std::io::Write::write_all(&mut stdin, program.as_bytes())
+        .expect("write embedded release-gate Python");
+    drop(stdin);
+    child
+        .wait_with_output()
+        .expect("wait for embedded release-gate Python")
+}
+
+fn git_executable_on_path() -> PathBuf {
+    let path = std::env::var_os("PATH").expect("PATH must be set for release-gate tests");
+    std::env::split_paths(&path)
+        .map(|directory| directory.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("git executable must be discoverable on PATH")
+}
+
+#[test]
+fn release_evidence_json_rejects_duplicate_keys_recursively() {
+    for (label, document, duplicate_key) in [
+        (
+            "top-level",
+            br#"{"schema":"first","schema":"forged"}"#.as_slice(),
+            "schema",
+        ),
+        (
+            "nested object",
+            br#"{"claim":{"status":"pass","status":"forged"}}"#.as_slice(),
+            "status",
+        ),
+        (
+            "object inside array",
+            br#"{"rows":[{"id":"first","id":"forged"}]}"#.as_slice(),
+            "id",
+        ),
+    ] {
+        let error = parse_release_json(document)
+            .expect_err("duplicate release-evidence object key must fail closed");
+        assert!(
+            error.contains(&format!("duplicate JSON object key: {duplicate_key}")),
+            "{label}: {error}"
+        );
+    }
+}
+
+#[test]
+fn release_gate_embedded_python_rejects_nested_duplicate_json_keys() {
+    let (root, _) = retained_performance_binding_fixture(false);
+    std::fs::write(
+        root.join(PERFORMANCE_BUDGET_SUMMARY_PATH),
+        br#"{"claim_readiness":{"status":"blocked","status":"forged"}}
+"#,
+    )
+    .expect("write duplicate-key performance summary fixture");
+    commit_performance_binding_fixture(&root, "record duplicate-key evidence fixture");
+
+    let root_arg = root.to_str().expect("UTF-8 fixture root");
+    let summary = root.join(PERFORMANCE_BUDGET_SUMMARY_PATH);
+    let summary_arg = summary.to_str().expect("UTF-8 fixture summary path");
+    let (command, program) = release_gate_python_command(
+        "if [[ -f \"$PERFORMANCE_SUMMARY\" ]]; then",
+        &[root_arg, summary_arg, "0", "168"],
+    );
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "the performance validator reports contract failure through stdout: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("duplicate JSON object key: status"),
+        "{stdout}"
+    );
+
+    let release_gate = require_text("scripts/release_gate.sh");
+    for (line_number, line) in release_gate.lines().enumerate() {
+        if line.contains("json.loads(") {
+            let inline_hook = line.contains("object_pairs_hook=reject_duplicate_keys");
+            let multiline_hook = release_gate
+                .lines()
+                .skip(line_number + 1)
+                .take(3)
+                .any(|candidate| candidate.contains("object_pairs_hook=reject_duplicate_keys"));
+            assert!(
+                inline_hook || multiline_hook,
+                "release-gate JSON ingestion at line {} lacks duplicate-key rejection",
+                line_number + 1
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_embedded_e2e_validator_binds_the_exact_parsed_bytes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, evidence_dir) = retained_e2e_evidence_fixture();
+    let root_arg = root.to_str().expect("UTF-8 E2E fixture root");
+    let evidence_arg = evidence_dir
+        .to_str()
+        .expect("UTF-8 E2E fixture evidence path");
+    let marker = "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then";
+    let (command, program) = release_gate_python_command(marker, &[root_arg, evidence_arg]);
+    let positive = run_release_gate_python(command, &program);
+    assert!(
+        positive.status.success(),
+        "{}",
+        String::from_utf8_lossy(&positive.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&positive.stdout).starts_with("pass|"),
+        "{}",
+        String::from_utf8_lossy(&positive.stdout)
+    );
+
+    let summary_path = evidence_dir.join("summary.json");
+    let original_bytes = std::fs::read(&summary_path).expect("read original E2E summary");
+    let original_path = root
+        .parent()
+        .expect("fixture parent")
+        .join(format!("e2e-original-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&original_path, &original_bytes).expect("retain original E2E summary bytes");
+    let mut substituted_bytes = original_bytes;
+    substituted_bytes.extend_from_slice(b" \n");
+    std::fs::write(&summary_path, substituted_bytes).expect("substitute parse-time E2E bytes");
+
+    let wrapper_dir = root
+        .parent()
+        .expect("fixture parent")
+        .join(format!("e2e-git-wrapper-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&wrapper_dir).expect("create E2E Git wrapper directory");
+    let wrapper = wrapper_dir.join("git");
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nif [ ! -f \"$PI_E2E_RESTORE_MARKER\" ]; then\n  cp \"$PI_E2E_ORIGINAL\" \"$PI_E2E_TARGET\" || exit 97\n  : > \"$PI_E2E_RESTORE_MARKER\" || exit 98\nfi\nexec \"$PI_E2E_REAL_GIT\" \"$@\"\n",
+    )
+    .expect("write E2E Git wrapper");
+    let mut permissions = std::fs::metadata(&wrapper)
+        .expect("E2E Git wrapper metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, permissions).expect("make E2E Git wrapper executable");
+    let marker_path = wrapper_dir.join("restored");
+    let real_git = git_executable_on_path();
+    let original_path_env = std::env::var_os("PATH").expect("PATH must be available");
+    let mut wrapped_path_entries = vec![wrapper_dir];
+    wrapped_path_entries.extend(std::env::split_paths(&original_path_env));
+    let wrapped_path = std::env::join_paths(wrapped_path_entries).expect("construct wrapped PATH");
+    let (mut command, program) = release_gate_python_command(marker, &[root_arg, evidence_arg]);
+    command
+        .env("PATH", wrapped_path)
+        .env("PI_E2E_REAL_GIT", &real_git)
+        .env("PI_E2E_ORIGINAL", &original_path)
+        .env("PI_E2E_TARGET", &summary_path)
+        .env("PI_E2E_RESTORE_MARKER", marker_path);
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("bytes parsed by the validator differ from release HEAD"),
+        "{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_embedded_e2e_validator_rejects_live_executable_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, evidence_dir) = retained_e2e_evidence_fixture();
+    let summary = evidence_dir.join("summary.json");
+    let mut permissions = std::fs::metadata(&summary)
+        .expect("E2E summary metadata")
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    std::fs::set_permissions(&summary, permissions).expect("make live E2E summary executable");
+    let root_arg = root.to_str().expect("UTF-8 E2E fixture root");
+    let evidence_arg = evidence_dir
+        .to_str()
+        .expect("UTF-8 E2E fixture evidence path");
+    let (command, program) = release_gate_python_command(
+        "if [[ -f \"$EVIDENCE_CONTRACT\" ]]; then",
+        &[root_arg, evidence_arg],
+    );
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(stdout.contains("must not be executable"), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_embedded_dropin_validator_binds_parsed_bytes_and_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let marker = "DROPIN_VERDICT=\"$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json\"";
+    for (relative, label) in [
+        (
+            "docs/contracts/dropin-certification-contract.json",
+            "drop-in contract",
+        ),
+        (
+            "docs/evidence/dropin-certification-verdict.json",
+            "drop-in verdict",
+        ),
+    ] {
+        let (root, contract_path, verdict_path) = retained_dropin_evidence_fixture();
+        let root_arg = root.to_str().expect("UTF-8 drop-in binding fixture root");
+        let contract_arg = contract_path.to_str().expect("UTF-8 drop-in contract path");
+        let verdict_arg = verdict_path.to_str().expect("UTF-8 drop-in verdict path");
+        let args = [root_arg, contract_arg, verdict_arg, "0", "168"];
+
+        let (command, program) = release_gate_python_command(marker, &args);
+        let positive = run_release_gate_python(command, &program);
+        assert!(
+            positive.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&positive.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&positive.stdout).starts_with("warn|"),
+            "{label}: {}",
+            String::from_utf8_lossy(&positive.stdout)
+        );
+
+        let target = root.join(relative);
+        let original_bytes = std::fs::read(&target).expect("read original drop-in input");
+        let original_path = root
+            .parent()
+            .expect("drop-in fixture parent")
+            .join(format!("dropin-original-{}.json", uuid::Uuid::new_v4()));
+        std::fs::write(&original_path, &original_bytes).expect("retain original drop-in bytes");
+        let mut substituted_bytes = original_bytes;
+        substituted_bytes.extend_from_slice(b" \n");
+        std::fs::write(&target, substituted_bytes).expect("substitute parse-time drop-in bytes");
+
+        let wrapper_dir = root
+            .parent()
+            .expect("drop-in fixture parent")
+            .join(format!("dropin-git-wrapper-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&wrapper_dir).expect("create drop-in Git wrapper directory");
+        let wrapper = wrapper_dir.join("git");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nif [ ! -f \"$PI_DROPIN_RESTORE_MARKER\" ]; then\n  cp \"$PI_DROPIN_ORIGINAL\" \"$PI_DROPIN_TARGET\" || exit 97\n  : > \"$PI_DROPIN_RESTORE_MARKER\" || exit 98\nfi\nexec \"$PI_DROPIN_REAL_GIT\" \"$@\"\n",
+        )
+        .expect("write drop-in Git wrapper");
+        let mut wrapper_permissions = std::fs::metadata(&wrapper)
+            .expect("drop-in Git wrapper metadata")
+            .permissions();
+        wrapper_permissions.set_mode(0o755);
+        std::fs::set_permissions(&wrapper, wrapper_permissions)
+            .expect("make drop-in Git wrapper executable");
+        let restore_marker = wrapper_dir.join("restored");
+        let real_git = git_executable_on_path();
+        let current_path = std::env::var_os("PATH").expect("PATH for drop-in binding test");
+        let mut wrapped_path = vec![wrapper_dir.clone()];
+        wrapped_path.extend(std::env::split_paths(&current_path));
+        let wrapped_path = std::env::join_paths(wrapped_path).expect("construct wrapped PATH");
+        let (mut command, program) = release_gate_python_command(marker, &args);
+        command
+            .env("PATH", wrapped_path)
+            .env("PI_DROPIN_REAL_GIT", real_git)
+            .env("PI_DROPIN_ORIGINAL", &original_path)
+            .env("PI_DROPIN_TARGET", &target)
+            .env("PI_DROPIN_RESTORE_MARKER", restore_marker);
+        let output = run_release_gate_python(command, &program);
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("fail|"), "{label}: {stdout}");
+        assert!(
+            stdout.contains(&format!(
+                "{label} bytes parsed by the validator differ from release HEAD"
+            )),
+            "{label}: {stdout}"
+        );
+
+        let mut permissions = std::fs::metadata(&target)
+            .expect("drop-in decision-input metadata")
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o111);
+        std::fs::set_permissions(&target, permissions)
+            .expect("make drop-in decision input executable");
+        let (command, program) = release_gate_python_command(marker, &args);
+        let output = run_release_gate_python(command, &program);
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.starts_with("fail|"), "{label}: {stdout}");
+        assert!(
+            stdout.contains(&format!("{label} must not be executable")),
+            "{label}: {stdout}"
+        );
+    }
+}
+
+#[test]
+fn release_gate_embedded_dropin_validator_rejects_future_and_stale_evidence() {
+    let base = std::env::var_os("TMPDIR")
+        .map_or_else(std::env::temp_dir, PathBuf::from)
+        .join("pi-release-evidence-gate-fixtures");
+    let root = base.join(format!("dropin-fixture-{}", uuid::Uuid::new_v4()));
+    let contract_path = root.join("docs/contracts/dropin-certification-contract.json");
+    let verdict_path = root.join("docs/evidence/dropin-certification-verdict.json");
+    std::fs::create_dir_all(contract_path.parent().expect("contract parent"))
+        .expect("create drop-in contract directory");
+    std::fs::create_dir_all(verdict_path.parent().expect("verdict parent"))
+        .expect("create drop-in verdict directory");
+    std::fs::write(
+        &contract_path,
+        serde_json::to_vec_pretty(&json!({
+            "release_process_enforcement": {
+                "verdict_artifact_contract": {
+                    "required_fields": [
+                        "git_commit",
+                        "generated_at_utc",
+                        "overall_verdict",
+                        "hard_gate_results",
+                        "blocking_reasons",
+                        "evidence_index"
+                    ],
+                    "schema": "pi.dropin.certification_verdict.v1",
+                    "path": "docs/evidence/dropin-certification-verdict.json"
+                }
+            }
+        }))
+        .expect("serialize drop-in contract fixture"),
+    )
+    .expect("write drop-in contract fixture");
+    let mut verdict = json!({
+        "schema": "pi.dropin.certification_verdict.v1",
+        "git_commit": "a".repeat(40),
+        "generated_at_utc": (Utc::now() + Duration::minutes(6)).to_rfc3339_opts(SecondsFormat::Secs, true),
+        "overall_verdict": "NOT_CERTIFIED",
+        "hard_gate_results": [],
+        "blocking_reasons": ["fixture"],
+        "evidence_index": []
+    });
+    std::fs::write(
+        &verdict_path,
+        serde_json::to_vec_pretty(&verdict).expect("serialize future drop-in verdict fixture"),
+    )
+    .expect("write future drop-in verdict fixture");
+    let root_arg = root.to_str().expect("UTF-8 drop-in fixture root");
+    let contract_arg = contract_path.to_str().expect("UTF-8 contract fixture path");
+    let verdict_arg = verdict_path.to_str().expect("UTF-8 verdict fixture path");
+    let (command, program) = release_gate_python_command(
+        "DROPIN_VERDICT=\"$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json\"",
+        &[root_arg, contract_arg, verdict_arg, "0", "168"],
+    );
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("more than five minutes in the future"),
+        "{stdout}"
+    );
+
+    verdict["generated_at_utc"] = Value::String(
+        (Utc::now() - Duration::hours(169)).to_rfc3339_opts(SecondsFormat::Secs, true),
+    );
+    std::fs::write(
+        &verdict_path,
+        serde_json::to_vec_pretty(&verdict).expect("serialize stale drop-in verdict fixture"),
+    )
+    .expect("write stale drop-in verdict fixture");
+    let (command, program) = release_gate_python_command(
+        "DROPIN_VERDICT=\"$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json\"",
+        &[root_arg, contract_arg, verdict_arg, "0", "168"],
+    );
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("older than the configured 168h evidence limit"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn performance_source_binding_accepts_clean_head_and_non_product_followup() {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    validate_performance_source_binding_at(&root, PERFORMANCE_BUDGET_SUMMARY_PATH, &source_commit)
+        .expect("clean source HEAD must bind");
+
+    std::fs::write(
+        root.join("tests/perf/reports/followup.json"),
+        b"{\"evidence\":true}\n",
+    )
+    .expect("write evidence-only follow-up");
+    commit_performance_binding_fixture(&root, "add non-product evidence follow-up");
+    validate_performance_source_binding_at(&root, PERFORMANCE_BUDGET_SUMMARY_PATH, &source_commit)
+        .expect("non-product evidence follow-up must remain admissible");
+}
+
+#[test]
+fn performance_source_binding_rejects_dirty_staged_and_untracked_changes() {
+    let (dirty_root, dirty_source) = retained_performance_binding_fixture(false);
+    std::fs::write(dirty_root.join("src/lib.rs"), "pub fn dirty() {}\n")
+        .expect("write dirty source");
+    let dirty_error = validate_performance_source_binding_at(
+        &dirty_root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &dirty_source,
+    )
+    .expect_err("dirty source must invalidate binding");
+    assert!(
+        dirty_error.contains("repository is not clean"),
+        "{dirty_error}"
+    );
+
+    let (staged_root, staged_source) = retained_performance_binding_fixture(false);
+    std::fs::write(staged_root.join("src/lib.rs"), "pub fn staged() {}\n")
+        .expect("write staged source");
+    fixture_git_output(&staged_root, &["add", "--", "src/lib.rs"]);
+    let staged_error = validate_performance_source_binding_at(
+        &staged_root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &staged_source,
+    )
+    .expect_err("staged source must invalidate binding");
+    assert!(
+        staged_error.contains("repository is not clean"),
+        "{staged_error}"
+    );
+
+    let (untracked_root, untracked_source) = retained_performance_binding_fixture(false);
+    std::fs::write(
+        untracked_root.join("untracked-release-input"),
+        b"not measured\n",
+    )
+    .expect("write untracked source");
+    let untracked_error = validate_performance_source_binding_at(
+        &untracked_root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &untracked_source,
+    )
+    .expect_err("untracked source must invalidate binding");
+    assert!(
+        untracked_error.contains("repository is not clean"),
+        "{untracked_error}"
+    );
+}
+
+#[test]
+fn release_gate_hardening_rejects_ignored_untracked_performance_summary() {
+    let (root, _) = retained_performance_binding_fixture(false);
+    std::fs::write(
+        root.join(".gitignore"),
+        format!("/{PERFORMANCE_BUDGET_SUMMARY_PATH}\n"),
+    )
+    .expect("write fixture ignore policy");
+    fixture_git_output(&root, &["add", "--", ".gitignore"]);
+    fixture_git_output(
+        &root,
+        &[
+            "update-index",
+            "--force-remove",
+            "--",
+            PERFORMANCE_BUDGET_SUMMARY_PATH,
+        ],
+    );
+    fixture_git_output(
+        &root,
+        &[
+            "-c",
+            "user.name=Pi release-gate fixture",
+            "-c",
+            "user.email=pi-release-gate@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "ignore untracked performance summary",
+        ],
+    );
+    assert!(
+        root.join(PERFORMANCE_BUDGET_SUMMARY_PATH).is_file(),
+        "the adversarial ignored artifact must remain readable in the worktree"
+    );
+    assert!(
+        fixture_git_output(
+            &root,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+                "--no-renames",
+            ],
+        )
+        .is_empty(),
+        "the ignored artifact must evade ordinary clean-status checks"
+    );
+
+    let root_arg = root.to_str().expect("UTF-8 fixture root");
+    let summary = root.join(PERFORMANCE_BUDGET_SUMMARY_PATH);
+    let summary_arg = summary.to_str().expect("UTF-8 fixture summary path");
+    let (command, program) = release_gate_python_command(
+        "if [[ -f \"$PERFORMANCE_SUMMARY\" ]]; then",
+        &[root_arg, summary_arg, "0", "168"],
+    );
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        output.status.success(),
+        "the performance validator reports contract failure through stdout: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.starts_with("fail|"), "{stdout}");
+    assert!(
+        stdout.contains("not tracked exactly once at release HEAD"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn performance_source_binding_rejects_non_default_index_flags() {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    fixture_git_output(&root, &["update-index", "--skip-worktree", "src/lib.rs"]);
+    let error = validate_performance_source_binding_at(
+        &root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &source_commit,
+    )
+    .expect_err("skip-worktree must invalidate binding");
+    assert!(error.contains("non-default"), "{error}");
+}
+
+#[test]
+fn performance_source_binding_rejects_artifact_byte_substitution() {
+    let (root, _) = retained_performance_binding_fixture(false);
+    std::fs::write(
+        root.join(PERFORMANCE_BUDGET_SUMMARY_PATH),
+        b"{\"fixture\":false}\n",
+    )
+    .expect("substitute live performance summary bytes");
+    let (context, head) = fixture_git_context_and_head(&root);
+    let error =
+        validate_performance_artifact_at_head(&context, PERFORMANCE_BUDGET_SUMMARY_PATH, &head)
+            .expect_err("live artifact substitution must fail HEAD-byte binding");
+    assert!(error.contains("do not exactly match HEAD"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_hardening_rejects_artifact_mode_substitution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, _) = retained_performance_binding_fixture(false);
+    let summary = root.join(PERFORMANCE_BUDGET_SUMMARY_PATH);
+    let mut permissions = std::fs::metadata(&summary)
+        .expect("fixture performance summary metadata")
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    std::fs::set_permissions(&summary, permissions)
+        .expect("make live performance summary executable");
+    let (context, head) = fixture_git_context_and_head(&root);
+    let error =
+        validate_performance_artifact_at_head(&context, PERFORMANCE_BUDGET_SUMMARY_PATH, &head)
+            .expect_err("live artifact mode substitution must fail HEAD binding");
+    assert!(
+        error.contains("mode does not exactly match HEAD"),
+        "{error}"
+    );
+}
+
+#[test]
+fn release_gate_hardening_snapshot_rejects_raw_bytes_hidden_by_clean_filter() {
+    let (root, _) = retained_performance_binding_fixture(false);
+    fixture_git_output(
+        &root,
+        &[
+            "config",
+            "filter.release-normalize.clean",
+            "sed s/dirty/fixture/",
+        ],
+    );
+    fixture_git_output(&root, &["config", "filter.release-normalize.smudge", "cat"]);
+    fixture_git_output(
+        &root,
+        &["config", "filter.release-normalize.required", "true"],
+    );
+    std::fs::write(
+        root.join(".gitattributes"),
+        "src/lib.rs filter=release-normalize\n",
+    )
+    .expect("write clean-filter fixture attributes");
+    commit_performance_binding_fixture(&root, "add adversarial clean filter");
+    std::fs::write(root.join("src/lib.rs"), "pub fn dirty() {}\n")
+        .expect("write raw bytes normalized by clean filter");
+    let filtered_diff = fixture_git_output(&root, &["diff", "--quiet", "--", "src/lib.rs"]);
+    assert!(
+        filtered_diff.is_empty(),
+        "Git's clean filter must hide the raw-byte substitution from Git's content diff"
+    );
+
+    let root_arg = root.to_str().expect("UTF-8 fixture root");
+    let (command, program) =
+        release_gate_python_command("capture_repository_snapshot() {", &[root_arg]);
+    let output = run_release_gate_python(command, &program);
+    assert!(!output.status.success(), "raw-byte substitution must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("raw worktree bytes differ from release HEAD at 'src/lib.rs'"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_hardening_snapshot_rejects_executable_mode_substitution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, _) = retained_performance_binding_fixture(false);
+    let source = root.join("src/lib.rs");
+    let mut permissions = std::fs::metadata(&source)
+        .expect("fixture source metadata")
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    std::fs::set_permissions(&source, permissions).expect("make fixture source executable");
+
+    let root_arg = root.to_str().expect("UTF-8 fixture root");
+    let (command, program) =
+        release_gate_python_command("capture_repository_snapshot() {", &[root_arg]);
+    let output = run_release_gate_python(command, &program);
+    assert!(!output.status.success(), "mode substitution must fail");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("raw worktree mode differs from release HEAD at 'src/lib.rs'"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn release_gate_hardening_snapshot_rehash_rejects_mutation_after_initial_hash() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (root, _) = retained_performance_binding_fixture(false);
+    let wrapper_dir = root
+        .parent()
+        .expect("fixture parent")
+        .join(format!("snapshot-git-wrapper-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&wrapper_dir).expect("create snapshot Git wrapper directory");
+    let wrapper = wrapper_dir.join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+set -eu
+case " $* " in
+  *" rev-parse --verify HEAD^{commit} "*)
+    count=0
+    if [ -f "$PI_RELEASE_GATE_TEST_COUNTER" ]; then
+      count=$(sed -n '1p' "$PI_RELEASE_GATE_TEST_COUNTER")
+    fi
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$PI_RELEASE_GATE_TEST_COUNTER"
+    if [ "$count" -eq 2 ]; then
+      printf 'pub fn mutated_after_initial_hash() {}\n' > "$PI_RELEASE_GATE_TEST_MUTATION_TARGET"
+    fi
+    ;;
+esac
+exec "$PI_RELEASE_GATE_TEST_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write snapshot Git wrapper");
+    let mut wrapper_permissions = std::fs::metadata(&wrapper)
+        .expect("snapshot Git wrapper metadata")
+        .permissions();
+    wrapper_permissions.set_mode(0o755);
+    std::fs::set_permissions(&wrapper, wrapper_permissions)
+        .expect("make snapshot Git wrapper executable");
+
+    let counter = wrapper_dir.join("head-counter");
+    let mutation_target = root.join("src/lib.rs");
+    let real_git = git_executable_on_path();
+    let current_path = std::env::var_os("PATH").expect("PATH for snapshot test");
+    let mut wrapped_path = vec![wrapper_dir];
+    wrapped_path.extend(std::env::split_paths(&current_path));
+    let wrapped_path = std::env::join_paths(wrapped_path).expect("construct wrapped PATH");
+
+    let root_arg = root.to_str().expect("UTF-8 fixture root");
+    let (mut command, program) =
+        release_gate_python_command("capture_repository_snapshot() {", &[root_arg]);
+    command
+        .env("PATH", wrapped_path)
+        .env("PI_RELEASE_GATE_TEST_COUNTER", &counter)
+        .env("PI_RELEASE_GATE_TEST_MUTATION_TARGET", &mutation_target)
+        .env("PI_RELEASE_GATE_TEST_REAL_GIT", &real_git);
+    let output = run_release_gate_python(command, &program);
+    assert!(
+        !output.status.success(),
+        "mutation after the first raw hash must fail"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&counter)
+            .expect("read Git wrapper counter")
+            .trim(),
+        "2",
+        "the fixture must mutate only after the initial raw-worktree hash"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("raw worktree bytes differ from release HEAD at 'src/lib.rs'")
+            || stderr.contains("raw tracked worktree bytes or modes changed"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_symlinked_artifact_components() {
+    use std::os::unix::fs::symlink;
+
+    let (root, _) = retained_performance_binding_fixture(false);
+    symlink("reports", root.join("tests/perf/linked-reports"))
+        .expect("create retained artifact-directory symlink");
+    commit_performance_binding_fixture(&root, "add symlinked artifact alias");
+    let (context, head) = fixture_git_context_and_head(&root);
+    let error = validate_performance_artifact_at_head(
+        &context,
+        "tests/perf/linked-reports/budget_summary.json",
+        &head,
+    )
+    .expect_err("artifact path with a symlink component must fail closed");
+    assert!(error.contains("symlink components"), "{error}");
+}
+
+#[test]
+fn performance_source_binding_rejects_packaged_evidence_followup() {
+    let (root, source_commit) = retained_performance_binding_fixture(true);
+    std::fs::write(
+        root.join("docs/evidence/shipped.json"),
+        b"{\"version\":2}\n",
+    )
+    .expect("change packaged evidence");
+    commit_performance_binding_fixture(&root, "change packaged evidence after measurement");
+    let error = validate_performance_source_binding_at(
+        &root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &source_commit,
+    )
+    .expect_err("packaged evidence follow-up must invalidate source binding");
+    assert!(error.contains("packaged path changed"), "{error}");
+}
+
+#[test]
+fn performance_source_binding_scrubs_hostile_git_environment() {
+    const CHILD_FLAG: &str = "PI_RELEASE_GATE_HOSTILE_GIT_CHILD";
+    const ROOT_ENV: &str = "PI_RELEASE_GATE_HOSTILE_GIT_ROOT";
+    const SOURCE_ENV: &str = "PI_RELEASE_GATE_HOSTILE_GIT_SOURCE";
+
+    if std::env::var_os(CHILD_FLAG).is_some() {
+        let root = PathBuf::from(std::env::var_os(ROOT_ENV).expect("child fixture root"));
+        let source_commit = std::env::var(SOURCE_ENV).expect("child fixture source commit");
+        let error = validate_performance_source_binding_at(
+            &root,
+            PERFORMANCE_BUDGET_SUMMARY_PATH,
+            &source_commit,
+        )
+        .expect_err("sanitized Git must inspect the dirty default worktree and index");
+        assert!(error.contains("repository is not clean"), "{error}");
+        return;
+    }
+
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    std::fs::write(
+        root.join("src/lib.rs"),
+        "pub fn staged_but_hidden_by_alternate_index() {}\n",
+    )
+    .expect("write source staged only in the default index");
+    fixture_git_output(&root, &["add", "--", "src/lib.rs"]);
+    std::fs::write(root.join("src/lib.rs"), "pub fn fixture() {}\n")
+        .expect("restore HEAD bytes in the worktree while retaining the staged default-index edit");
+    let alternate_index = root.join(".git/pi-clean-alternate-index");
+    let context = performance_git_context(&root).expect("resolve hostile fixture Git context");
+    let output = sanitized_perf_git_command(&context)
+        .env("GIT_INDEX_FILE", &alternate_index)
+        .args(["read-tree", "HEAD"])
+        .output()
+        .expect("create clean alternate index");
+    assert!(
+        output.status.success(),
+        "failed to create alternate index: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = std::process::Command::new(std::env::current_exe().expect("current test binary"))
+        .arg("performance_source_binding_scrubs_hostile_git_environment")
+        .arg("--exact")
+        .arg("--nocapture")
+        .env(CHILD_FLAG, "1")
+        .env(ROOT_ENV, &root)
+        .env(SOURCE_ENV, &source_commit)
+        .env("GIT_INDEX_FILE", &alternate_index)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.bare")
+        .env("GIT_CONFIG_VALUE_0", "true")
+        .env("GIT_NAMESPACE", "hostile-release-gate-namespace")
+        .output()
+        .expect("run hostile-Git child test");
+    assert!(
+        output.status.success(),
+        "hostile-Git child failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn performance_source_binding_ignores_repo_local_worktree_redirect() {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    let decoy = root
+        .parent()
+        .expect("fixture parent")
+        .join(format!("decoy-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(decoy.join("src")).expect("create decoy source directory");
+    std::fs::create_dir_all(decoy.join("tests/perf/reports"))
+        .expect("create decoy performance report directory");
+    for path in ["Cargo.toml", "src/lib.rs", PERFORMANCE_BUDGET_SUMMARY_PATH] {
+        std::fs::copy(root.join(path), decoy.join(path))
+            .unwrap_or_else(|err| panic!("copy {path} into decoy worktree: {err}"));
+    }
+    fixture_git_output(
+        &root,
+        &[
+            "config",
+            "--local",
+            "core.worktree",
+            decoy.to_str().expect("UTF-8 decoy path"),
+        ],
+    );
+    std::fs::write(root.join("src/lib.rs"), "pub fn dirty_real_worktree() {}\n")
+        .expect("dirty the canonical worktree");
+
+    let mut raw_git = std::process::Command::new("git");
+    raw_git.arg("-C").arg(&root);
+    scrub_git_environment(&mut raw_git);
+    let raw_status = raw_git
+        .args([
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ])
+        .output()
+        .expect("run Git with the hostile repository-local worktree setting");
+    assert!(
+        raw_status.status.success(),
+        "raw redirected Git status failed"
+    );
+    assert!(
+        raw_status.stdout.is_empty(),
+        "the decoy must demonstrate that core.worktree hides the real dirty file"
+    );
+
+    let error = validate_performance_source_binding_at(
+        &root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &source_commit,
+    )
+    .expect_err("the canonical dirty worktree must not be hidden by repository-local config");
+    assert!(error.contains("repository is not clean"), "{error}");
+}
+
+#[test]
+fn performance_source_binding_rejects_head_advance_during_validation() {
+    let (root, source_commit) = retained_performance_binding_fixture(false);
+    let error = validate_performance_source_binding_at_with_finalizer(
+        &root,
+        PERFORMANCE_BUDGET_SUMMARY_PATH,
+        &source_commit,
+        || {
+            std::fs::write(
+                root.join("tests/perf/reports/late-followup.json"),
+                b"{\"late\":true}\n",
+            )
+            .map_err(|err| format!("write late evidence follow-up: {err}"))?;
+            commit_performance_binding_fixture(&root, "advance HEAD during validation");
+            Ok(())
+        },
+    )
+    .expect_err("a clean evidence-only HEAD advance must invalidate the captured snapshot");
+    assert!(error.contains("HEAD changed during"), "{error}");
+}
+
 #[test]
 fn performance_budgets_report_has_exact_v2_contract() {
     let summary = require_json("tests/perf/reports/budget_summary.json");
-    let source_binding_valid =
-        if let Some(source_commit) = summary.get("source_commit").and_then(Value::as_str) {
+    let source_binding_valid = summary
+        .get("source_commit")
+        .and_then(Value::as_str)
+        .is_some_and(|source_commit| {
             validate_performance_source_binding(source_commit)
                 .unwrap_or_else(|err| panic!("invalid asserted performance source binding: {err}"));
             true
-        } else {
-            false
-        };
+        });
     let validated = validate_performance_budget_summary(
         &summary,
         Utc::now(),
@@ -2858,6 +4483,12 @@ fn release_gate_exposes_performance_claim_policy_in_report() {
         "checked_in_budget_summary_matches_fresh_canonical_evaluation_exactly",
         "\"require_performance_claim_ready\"",
         "release must make no quantitative or global performance claims",
+        "performance summary is not tracked exactly once at release HEAD",
+        "performance summary path must not contain symlink components",
+        "performance summary raw worktree bytes do not exactly match release HEAD",
+        "capture_raw_worktree_digest",
+        "final_worktree_digest != initial_worktree_digest",
+        "raw worktree mode differs from release HEAD",
     ] {
         assert!(
             script.contains(required),

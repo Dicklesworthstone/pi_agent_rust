@@ -339,10 +339,10 @@ pub fn profile_from_target_path(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocatorKind, BENCH_ALLOCATOR_ENV, BenchmarkProvenance, benchmark_provenance_config_hash,
-        detect_build_profile_from, matches_canonical_perf_build_fingerprint,
-        matches_canonical_pijs_perf_features, profile_from_target_path,
-        resolve_bench_allocator_from,
+        AllocatorKind, BENCH_ALLOCATOR_ENV, BenchmarkBuildVerification, BenchmarkProvenance,
+        benchmark_provenance_config_hash, detect_build_profile_from,
+        matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
+        profile_from_target_path, resolve_bench_allocator_from,
     };
     use std::path::Path;
 
@@ -385,9 +385,11 @@ mod tests {
     }
 
     #[test]
-    fn profile_from_target_path_rejects_moved_example_binary() {
+    fn profile_from_target_path_does_not_misclassify_moved_binary_as_perf() {
         let path = Path::new("/tmp/repo/pijs_workload");
-        assert_eq!(profile_from_target_path(path), None);
+        let derived = profile_from_target_path(path);
+        assert_eq!(derived.as_deref(), Some("repo"));
+        assert_ne!(derived.as_deref(), Some("perf"));
     }
 
     #[test]

@@ -3,6 +3,7 @@
 //! Aggregates evidence from conformance, performance, security, and traceability
 //! into a single user-focused release-readiness summary.
 
+use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -33,6 +34,172 @@ const PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/paramete
 const OPPORTUNITY_MATRIX_SCHEMA: &str = "pi.perf.opportunity_matrix.v1";
 const OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/opportunity_matrix.json";
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
+const PERF_BUDGET_SUMMARY_PATH: &str = "tests/perf/reports/budget_summary.json";
+const PERF_CANONICAL_BUDGET_COUNT: usize = 19;
+const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
+    "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad";
+const PERF_MAX_EVIDENCE_AGE_HOURS: i64 = 168;
+const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
+    "schema",
+    "generated_at",
+    "source_commit",
+    "run_id",
+    "correlation_id",
+    "strict_mode",
+    "total_budgets",
+    "ci_enforced",
+    "ci_with_data",
+    "ci_fail",
+    "ci_no_data",
+    "pass",
+    "fail",
+    "no_data",
+    "data_contract_failures_count",
+    "failing_data_contracts",
+    "budgets",
+    "budget_results",
+    "claim_readiness",
+];
+const PERF_BUDGET_FIELDS: &[&str] = &[
+    "name",
+    "category",
+    "metric",
+    "unit",
+    "threshold",
+    "comparison",
+    "methodology",
+    "ci_enforced",
+];
+const PERF_RESULT_REQUIRED_FIELDS: &[&str] = &[
+    "budget_name",
+    "category",
+    "threshold",
+    "comparison",
+    "unit",
+    "actual",
+    "status",
+    "source",
+    "ci_enforced",
+];
+const PERF_RESULT_OPTIONAL_FIELDS: &[&str] = &["failure_reason"];
+const PERF_FAILURE_REQUIRED_FIELDS: &[&str] = &["contract_id", "detail", "remediation"];
+const PERF_FAILURE_OPTIONAL_FIELDS: &[&str] = &["budget_name"];
+const PERF_CLAIM_READINESS_FIELDS: &[&str] = &[
+    "status",
+    "performance_claims_authorized",
+    "blocking_reason_codes",
+];
+
+struct UniqueJsonValue(serde_json::Value);
+
+impl<'de> Deserialize<'de> for UniqueJsonValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UniqueJsonValueVisitor)
+    }
+}
+
+struct UniqueJsonValueVisitor;
+
+impl<'de> Visitor<'de> for UniqueJsonValueVisitor {
+    type Value = UniqueJsonValue;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value without duplicate object keys")
+    }
+
+    fn visit_bool<E>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Bool(value)))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Number(value.into())))
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+    where
+        E: serde::de::Error,
+    {
+        serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .map(UniqueJsonValue)
+            .ok_or_else(|| E::custom("non-finite number is not valid JSON"))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(
+            value.to_string(),
+        )))
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(
+            value.to_string(),
+        )))
+    }
+
+    fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::String(value)))
+    }
+
+    fn visit_none<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(UniqueJsonValue(serde_json::Value::Null))
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        UniqueJsonValue::deserialize(deserializer)
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::new();
+        while let Some(value) = sequence.next_element::<UniqueJsonValue>()? {
+            values.push(value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Array(values)))
+    }
+
+    fn visit_map<A>(self, mut object: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut values = serde_json::Map::new();
+        while let Some(key) = object.next_key::<String>()? {
+            if values.contains_key(&key) {
+                return Err(serde::de::Error::custom(format!(
+                    "duplicate JSON object key: {key}"
+                )));
+            }
+            let value = object.next_value::<UniqueJsonValue>()?;
+            values.insert(key, value.0);
+        }
+        Ok(UniqueJsonValue(serde_json::Value::Object(values)))
+    }
+}
+
+fn parse_release_json(contents: &[u8]) -> Result<serde_json::Value, String> {
+    let mut deserializer = serde_json::Deserializer::from_slice(contents);
+    let value = UniqueJsonValue::deserialize(&mut deserializer)
+        .map_err(|error| error.to_string())?
+        .0;
+    deserializer.end().map_err(|error| error.to_string())?;
+    Ok(value)
+}
 
 // ── Data models ─────────────────────────────────────────────────────────────
 
@@ -491,7 +658,7 @@ fn parse_canonical_must_pass_ids(
     inclusion_contents: &[u8],
     expected_must_pass: u64,
 ) -> Result<BTreeSet<String>, String> {
-    let inclusion: V = serde_json::from_slice(inclusion_contents)
+    let inclusion: V = parse_release_json(inclusion_contents)
         .map_err(|err| format!("failed to parse {MUST_PASS_INCLUSION_PATH}: {err}"))?;
     if get_str(&inclusion, "/schema") != "pi.ext.inclusion_list.v1" {
         return Err(format!(
@@ -554,7 +721,7 @@ fn parse_canonical_must_pass_ids(
 fn parse_canonical_manifest_tiers(
     manifest_contents: &[u8],
 ) -> Result<BTreeMap<String, u64>, String> {
-    let manifest: V = serde_json::from_slice(manifest_contents)
+    let manifest: V = parse_release_json(manifest_contents)
         .map_err(|err| format!("failed to parse {MUST_PASS_MANIFEST_PATH}: {err}"))?;
     if get_str(&manifest, "/schema") != "pi.ext.validated-manifest.v1" {
         return Err(format!(
@@ -706,7 +873,7 @@ fn observed_must_pass_event_ids(
         if line.is_empty() {
             continue;
         }
-        let event: V = serde_json::from_str(line).map_err(|err| {
+        let event: V = parse_release_json(line.as_bytes()).map_err(|err| {
             format!(
                 "invalid JSONL row {} in {MUST_PASS_EVENTS_PATH}: {err}",
                 line_index + 1
@@ -1434,7 +1601,7 @@ fn capture_must_pass_source_snapshot(root: &Path) -> Result<MustPassSourceSnapsh
 }
 
 fn validate_snapshot_artifact_paths(snapshot: &MustPassSourceSnapshot) -> Result<(), String> {
-    let manifest: V = serde_json::from_slice(&snapshot.manifest_contents)
+    let manifest: V = parse_release_json(&snapshot.manifest_contents)
         .map_err(|err| format!("failed to parse {MUST_PASS_MANIFEST_PATH}: {err}"))?;
     let extensions = manifest
         .get("extensions")
@@ -1721,7 +1888,7 @@ fn validate_certified_must_pass(root: &Path, verdict: &V) -> (Signal, String) {
         Ok(evidence) => evidence,
         Err(err) => return (Signal::Fail, err),
     };
-    let committed_verdict: V = match serde_json::from_slice(&evidence_before.verdict_contents) {
+    let committed_verdict: V = match parse_release_json(&evidence_before.verdict_contents) {
         Ok(value) => value,
         Err(err) => {
             return (
@@ -1998,7 +2165,7 @@ fn evaluate_committed_conformance_summary(root: &Path) -> (Signal, String, Optio
         Ok(artifact) => artifact,
         Err(err) => return (Signal::Fail, err, None),
     };
-    let summary: V = match serde_json::from_slice(&artifact_before.contents) {
+    let summary: V = match parse_release_json(&artifact_before.contents) {
         Ok(summary) => summary,
         Err(err) => {
             return (
@@ -2586,20 +2753,23 @@ fn check_parameter_sweeps_cert_gate(root: &Path) -> CertEvidence {
         .unwrap_or(path.as_path())
         .to_string_lossy()
         .replace('\\', "/");
-    let (status, detail, sha) = load_json(&path).map_or_else(
-        || {
-            (
-                Signal::Fail,
-                format!("parameter_sweeps artifact is not valid JSON: {artifact_path}"),
-                None,
-            )
-        },
-        |v| {
+    let (status, detail, sha) = match load_json(&path) {
+        Ok(Some(v)) => {
             let (sig, det) = validate_parameter_sweeps_artifact(&v);
             let sha = sha256_file(&path);
             (sig, det, sha)
-        },
-    );
+        }
+        Ok(None) => (
+            Signal::Fail,
+            format!("parameter_sweeps artifact disappeared while reading: {artifact_path}"),
+            None,
+        ),
+        Err(error) => (
+            Signal::Fail,
+            format!("parameter_sweeps artifact is invalid: {artifact_path}: {error}"),
+            None,
+        ),
+    };
 
     CertEvidence {
         gate,
@@ -2875,20 +3045,23 @@ fn check_opportunity_matrix_cert_gate(root: &Path) -> CertEvidence {
         .unwrap_or(path.as_path())
         .to_string_lossy()
         .replace('\\', "/");
-    let (status, detail, sha) = load_json(&path).map_or_else(
-        || {
-            (
-                Signal::Fail,
-                format!("opportunity_matrix artifact is not valid JSON: {artifact_path}"),
-                None,
-            )
-        },
-        |v| {
+    let (status, detail, sha) = match load_json(&path) {
+        Ok(Some(v)) => {
             let (sig, det) = validate_opportunity_matrix_artifact(&v);
             let sha = sha256_file(&path);
             (sig, det, sha)
-        },
-    );
+        }
+        Ok(None) => (
+            Signal::Fail,
+            format!("opportunity_matrix artifact disappeared while reading: {artifact_path}"),
+            None,
+        ),
+        Err(error) => (
+            Signal::Fail,
+            format!("opportunity_matrix artifact is invalid: {artifact_path}: {error}"),
+            None,
+        ),
+    };
 
     CertEvidence {
         gate,
@@ -2906,9 +3079,20 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn load_json(path: &Path) -> Option<V> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+fn load_json(path: &Path) -> Result<Option<V>, String> {
+    let content = match std::fs::read(path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "failed to read release evidence {}: {error}",
+                path.display()
+            ));
+        }
+    };
+    parse_release_json(&content)
+        .map(Some)
+        .map_err(|error| format!("invalid release evidence JSON {}: {error}", path.display()))
 }
 
 fn no_data(name: &str, detail: &str) -> DimensionScore {
@@ -2916,6 +3100,14 @@ fn no_data(name: &str, detail: &str) -> DimensionScore {
         name: name.to_string(),
         signal: Signal::NoData,
         detail: detail.to_string(),
+    }
+}
+
+fn invalid_data(name: &str, detail: String) -> DimensionScore {
+    DimensionScore {
+        name: name.to_string(),
+        signal: Signal::Fail,
+        detail,
     }
 }
 
@@ -2929,25 +3121,1168 @@ fn collect_conformance(root: &Path) -> DimensionScore {
     }
 }
 
-fn validate_performance_advisory_source_binding(
-    root: &Path,
-    source_commit: &str,
-) -> Result<(), String> {
-    let head = current_git_commit(root)?;
-    resolve_exact_commit(root, source_commit, "performance source_commit")?;
-    ensure_commit_ancestor(root, source_commit, &head, "performance source_commit")?;
-    if source_commit == head {
-        return Ok(());
-    }
+#[derive(Debug)]
+struct AuthorizedPerformanceClaim {
+    source_commit: String,
+    total_budgets: u64,
+    pass: u64,
+    ci_enforced: u64,
+}
 
-    let changed_paths = changed_paths_between(root, source_commit, &head)?;
-    if changed_paths.is_empty() {
+#[derive(Debug)]
+struct PerformanceBudgetDefinition {
+    category: String,
+    unit: String,
+    threshold: f64,
+    comparison: String,
+    ci_enforced: bool,
+}
+
+fn performance_exact_object<'a>(
+    value: &'a V,
+    required: &[&str],
+    optional: &[&str],
+    label: &str,
+) -> Result<&'a serde_json::Map<String, V>, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("{label} must be an object"))?;
+    let missing = required
+        .iter()
+        .filter(|field| !object.contains_key(**field))
+        .copied()
+        .collect::<Vec<_>>();
+    let unexpected = object
+        .keys()
+        .filter(|field| !required.contains(&field.as_str()) && !optional.contains(&field.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    if missing.is_empty() && unexpected.is_empty() {
+        Ok(object)
+    } else {
+        Err(format!(
+            "{label} fields are not exact (missing={missing:?}, unexpected={unexpected:?})"
+        ))
+    }
+}
+
+fn performance_nonempty_string<'a>(value: &'a V, label: &str) -> Result<&'a str, String> {
+    let raw = value
+        .as_str()
+        .ok_or_else(|| format!("{label} must be a string"))?;
+    if raw.is_empty() || raw.trim() != raw {
+        Err(format!(
+            "{label} must be non-empty and free of surrounding whitespace"
+        ))
+    } else {
+        Ok(raw)
+    }
+}
+
+fn performance_uint(value: &V, label: &str) -> Result<u64, String> {
+    value
+        .as_u64()
+        .filter(|number| *number <= i64::MAX.unsigned_abs())
+        .ok_or_else(|| format!("{label} must be a non-negative signed 64-bit integer"))
+}
+
+fn performance_finite_number(value: &V, label: &str, positive: bool) -> Result<f64, String> {
+    let number = value
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| format!("{label} must be a finite number"))?;
+    if positive && number <= 0.0 {
+        Err(format!("{label} must be a positive finite number"))
+    } else {
+        Ok(number)
+    }
+}
+
+fn performance_nullable_lineage(value: &V, label: &str) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = performance_nonempty_string(value, label)?;
+    let mut chars = raw.chars();
+    let valid_start = chars.next().is_some_and(|ch| ch.is_ascii_alphanumeric());
+    let valid_rest =
+        chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | ':' | '/' | '-'));
+    if valid_start && valid_rest && raw.len() <= 256 {
+        Ok(Some(raw.to_string()))
+    } else {
+        Err(format!("{label} must be a canonical lineage identifier"))
+    }
+}
+
+fn performance_source_commit(value: &V) -> Result<Option<String>, String> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let raw = performance_nonempty_string(value, "source_commit")?;
+    if matches!(raw.len(), 40 | 64)
+        && raw
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        && raw.bytes().any(|byte| byte != b'0')
+    {
+        Ok(Some(raw.to_string()))
+    } else {
+        Err("source_commit must be null or a canonical full lowercase Git object ID".to_string())
+    }
+}
+
+fn performance_generated_at(value: &V) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let raw = performance_nonempty_string(value, "generated_at")?;
+    let bytes = raw.as_bytes();
+    let canonical_shape = bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit()
+        });
+    if !canonical_shape {
         return Err(
-            "performance source_commit differs from HEAD without a source diff".to_string(),
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
         );
     }
-    let package_patterns = source_package_include_patterns(root, source_commit)?;
-    for path in changed_paths {
+    let parsed = chrono::DateTime::parse_from_rfc3339(raw)
+        .map_err(|error| format!("generated_at is not valid RFC3339: {error}"))?;
+    if parsed.offset().local_minus_utc() != 0
+        || parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) != raw
+    {
+        return Err(
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
+        );
+    }
+    Ok(parsed.with_timezone(&chrono::Utc))
+}
+
+fn performance_budget_inventory_sha256(budgets: &[V]) -> Result<String, String> {
+    let mut canonical = String::from("[");
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = budget
+            .as_object()
+            .ok_or_else(|| format!("{label} must be an object"))?;
+        if index != 0 {
+            canonical.push(',');
+        }
+        let encoded = |field: &str| -> Result<String, String> {
+            serde_json::to_string(performance_nonempty_string(
+                &object[field],
+                &format!("{label}.{field}"),
+            )?)
+            .map_err(|error| format!("failed to serialize {label}.{field}: {error}"))
+        };
+        let name = encoded("name")?;
+        let category = encoded("category")?;
+        let metric = encoded("metric")?;
+        let unit = encoded("unit")?;
+        let comparison = encoded("comparison")?;
+        let methodology = encoded("methodology")?;
+        let threshold =
+            performance_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
+        let rounded = (threshold * 1_000_000.0).round() / 1_000_000.0;
+        if threshold.total_cmp(&rounded).is_ne() {
+            return Err(format!(
+                "{label}.threshold exceeds canonical six-decimal precision"
+            ));
+        }
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        write!(
+            canonical,
+            "{{\"name\":{name},\"category\":{category},\"metric\":{metric},\"unit\":{unit},\"threshold\":{threshold:.6},\"comparison\":{comparison},\"ci_enforced\":{ci_enforced},\"methodology\":{methodology}}}"
+        )
+        .map_err(|error| format!("failed to serialize canonical budget inventory: {error}"))?;
+    }
+    canonical.push(']');
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_performance_budget_contract(v: &V) -> Result<AuthorizedPerformanceClaim, String> {
+    let top = performance_exact_object(v, PERF_TOP_LEVEL_FIELDS, &[], "performance summary")?;
+    if top.get("schema").and_then(V::as_str) != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
+        return Err(format!(
+            "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {:?}",
+            top.get("schema")
+        ));
+    }
+    let generated_at = performance_generated_at(&top["generated_at"])?;
+    let now = chrono::Utc::now();
+    if generated_at > now + chrono::TimeDelta::minutes(5) {
+        return Err("generated_at is more than five minutes in the future".to_string());
+    }
+    let source_commit = performance_source_commit(&top["source_commit"])?;
+    let run_id = performance_nullable_lineage(&top["run_id"], "run_id")?;
+    let correlation_id = performance_nullable_lineage(&top["correlation_id"], "correlation_id")?;
+    if run_id != correlation_id {
+        return Err("run_id and correlation_id must both be null or match".to_string());
+    }
+    let strict_mode = top["strict_mode"]
+        .as_bool()
+        .ok_or_else(|| "strict_mode must be a boolean".to_string())?;
+    let count_names = [
+        "total_budgets",
+        "ci_enforced",
+        "ci_with_data",
+        "ci_fail",
+        "ci_no_data",
+        "pass",
+        "fail",
+        "no_data",
+        "data_contract_failures_count",
+    ];
+    let mut counts = BTreeMap::new();
+    for name in count_names {
+        counts.insert(name, performance_uint(&top[name], name)?);
+    }
+
+    let budgets = top["budgets"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budgets must be a non-empty array".to_string())?;
+    if budgets.len() != PERF_CANONICAL_BUDGET_COUNT {
+        return Err(format!(
+            "budgets must contain the canonical {PERF_CANONICAL_BUDGET_COUNT} declarations"
+        ));
+    }
+    let results = top["budget_results"]
+        .as_array()
+        .filter(|entries| !entries.is_empty())
+        .ok_or_else(|| "budget_results must be a non-empty array".to_string())?;
+    let failures = top["failing_data_contracts"]
+        .as_array()
+        .ok_or_else(|| "failing_data_contracts must be an array".to_string())?;
+
+    let mut definitions = BTreeMap::new();
+    let mut definition_order = Vec::with_capacity(budgets.len());
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = performance_exact_object(budget, PERF_BUDGET_FIELDS, &[], &label)?;
+        let name = performance_nonempty_string(&object["name"], &format!("{label}.name"))?;
+        for field in ["category", "metric", "unit", "methodology"] {
+            performance_nonempty_string(&object[field], &format!("{label}.{field}"))?;
+        }
+        let comparison = match performance_nonempty_string(
+            &object["comparison"],
+            &format!("{label}.comparison"),
+        )? {
+            comparison @ ("maximum" | "minimum") => comparison,
+            comparison => {
+                return Err(format!(
+                    "{label}.comparison has unsupported value {comparison:?}"
+                ));
+            }
+        };
+        let definition = PerformanceBudgetDefinition {
+            category: performance_nonempty_string(
+                &object["category"],
+                &format!("{label}.category"),
+            )?
+            .to_string(),
+            unit: performance_nonempty_string(&object["unit"], &format!("{label}.unit"))?
+                .to_string(),
+            threshold: performance_finite_number(
+                &object["threshold"],
+                &format!("{label}.threshold"),
+                true,
+            )?,
+            comparison: comparison.to_string(),
+            ci_enforced: object["ci_enforced"]
+                .as_bool()
+                .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?,
+        };
+        if definitions.insert(name.to_string(), definition).is_some() {
+            return Err(format!("duplicate budget name: {name}"));
+        }
+        definition_order.push(name.to_string());
+    }
+    let inventory_sha256 = performance_budget_inventory_sha256(budgets)?;
+    if inventory_sha256 != PERF_CANONICAL_BUDGET_INVENTORY_SHA256 {
+        return Err(format!(
+            "budget inventory does not match the canonical producer contract (observed_sha256={inventory_sha256}, expected_sha256={PERF_CANONICAL_BUDGET_INVENTORY_SHA256})"
+        ));
+    }
+
+    let mut result_names = BTreeSet::new();
+    let mut result_order = Vec::with_capacity(results.len());
+    let mut pass_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut no_data_count = 0usize;
+    let mut ci_with_data = 0usize;
+    let mut ci_fail = 0usize;
+    let mut ci_no_data = 0usize;
+    for (index, result) in results.iter().enumerate() {
+        let label = format!("budget_results[{index}]");
+        let object = performance_exact_object(
+            result,
+            PERF_RESULT_REQUIRED_FIELDS,
+            PERF_RESULT_OPTIONAL_FIELDS,
+            &label,
+        )?;
+        let name =
+            performance_nonempty_string(&object["budget_name"], &format!("{label}.budget_name"))?;
+        if !result_names.insert(name.to_string()) {
+            return Err(format!("duplicate budget result: {name}"));
+        }
+        result_order.push(name.to_string());
+        let definition = definitions
+            .get(name)
+            .ok_or_else(|| format!("budget result has no matching definition: {name}"))?;
+        let category =
+            performance_nonempty_string(&object["category"], &format!("{label}.category"))?;
+        let unit = performance_nonempty_string(&object["unit"], &format!("{label}.unit"))?;
+        let comparison =
+            performance_nonempty_string(&object["comparison"], &format!("{label}.comparison"))?;
+        let threshold =
+            performance_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        if category != definition.category
+            || unit != definition.unit
+            || comparison != definition.comparison
+            || threshold.total_cmp(&definition.threshold).is_ne()
+            || ci_enforced != definition.ci_enforced
+        {
+            return Err(format!(
+                "budget result {name} does not match its category/unit/threshold/CI definition"
+            ));
+        }
+        performance_nonempty_string(&object["source"], &format!("{label}.source"))?;
+        let status = object["status"]
+            .as_str()
+            .ok_or_else(|| format!("{label}.status must be a string"))?;
+        if !matches!(status, "PASS" | "FAIL" | "NO_DATA") {
+            return Err(format!(
+                "budget result {name} has unsupported status: {status}"
+            ));
+        }
+        let failure_reason = object.get("failure_reason");
+        if let Some(reason) = failure_reason {
+            performance_nonempty_string(reason, &format!("{label}.failure_reason"))?;
+        }
+        if object["actual"].is_null() {
+            if strict_mode && definition.ci_enforced {
+                if status != "FAIL"
+                    || failure_reason.and_then(V::as_str) != Some("missing_measurement_data")
+                {
+                    return Err(format!(
+                        "strict CI budget {name} without data must be FAIL with failure_reason=missing_measurement_data"
+                    ));
+                }
+            } else if status != "NO_DATA" || failure_reason.is_some() {
+                return Err(format!(
+                    "budget {name} without data must be NO_DATA without a failure reason"
+                ));
+            }
+        } else {
+            let actual =
+                performance_finite_number(&object["actual"], &format!("{label}.actual"), false)?;
+            if actual < 0.0 {
+                return Err(format!("{label}.actual must be non-negative"));
+            }
+            let passes = if definition.comparison == "minimum" {
+                actual >= threshold
+            } else {
+                actual <= threshold
+            };
+            let expected_status = if passes { "PASS" } else { "FAIL" };
+            if status != expected_status || failure_reason.is_some() {
+                return Err(format!(
+                    "budget result {name} is inconsistent with actual={actual}, threshold={threshold}, and expected status={expected_status}"
+                ));
+            }
+        }
+        match status {
+            "PASS" => pass_count += 1,
+            "FAIL" => fail_count += 1,
+            "NO_DATA" => no_data_count += 1,
+            _ => unreachable!("performance status validated above"),
+        }
+        if definition.ci_enforced {
+            ci_with_data += usize::from(!object["actual"].is_null());
+            ci_fail += usize::from(status == "FAIL");
+            ci_no_data += usize::from(status == "NO_DATA");
+        }
+    }
+    let definition_names = definitions.keys().cloned().collect::<BTreeSet<_>>();
+    if result_names != definition_names || result_order != definition_order {
+        return Err(
+            "budget_results must match canonical budget declaration order and membership"
+                .to_string(),
+        );
+    }
+
+    let mut failure_fingerprints = BTreeSet::new();
+    for (index, failure) in failures.iter().enumerate() {
+        let label = format!("failing_data_contracts[{index}]");
+        let object = performance_exact_object(
+            failure,
+            PERF_FAILURE_REQUIRED_FIELDS,
+            PERF_FAILURE_OPTIONAL_FIELDS,
+            &label,
+        )?;
+        let contract_id =
+            performance_nonempty_string(&object["contract_id"], &format!("{label}.contract_id"))?;
+        let detail = performance_nonempty_string(&object["detail"], &format!("{label}.detail"))?;
+        let remediation =
+            performance_nonempty_string(&object["remediation"], &format!("{label}.remediation"))?;
+        let budget_name = match object.get("budget_name") {
+            None | Some(V::Null) => None,
+            Some(value) => {
+                let name = performance_nonempty_string(value, &format!("{label}.budget_name"))?;
+                if !definitions.contains_key(name) {
+                    return Err(format!(
+                        "data-contract failure references unknown budget: {name}"
+                    ));
+                }
+                Some(name.to_string())
+            }
+        };
+        if !failure_fingerprints.insert((
+            contract_id.to_string(),
+            detail.to_string(),
+            remediation.to_string(),
+            budget_name,
+        )) {
+            return Err(format!("duplicate data-contract failure at index {index}"));
+        }
+    }
+
+    let derived_counts = [
+        ("total_budgets", budgets.len()),
+        (
+            "ci_enforced",
+            definitions
+                .values()
+                .filter(|definition| definition.ci_enforced)
+                .count(),
+        ),
+        ("ci_with_data", ci_with_data),
+        ("ci_fail", ci_fail),
+        ("ci_no_data", ci_no_data),
+        ("pass", pass_count),
+        ("fail", fail_count),
+        ("no_data", no_data_count),
+        ("data_contract_failures_count", failures.len()),
+    ];
+    for (name, expected) in derived_counts {
+        let expected = u64::try_from(expected)
+            .map_err(|_| format!("derived {name} exceeds the supported count range"))?;
+        if counts[name] != expected {
+            return Err(format!(
+                "{name}={} is inconsistent with derived value {expected}",
+                counts[name]
+            ));
+        }
+    }
+    if counts["pass"]
+        .checked_add(counts["fail"])
+        .and_then(|count| count.checked_add(counts["no_data"]))
+        != Some(counts["total_budgets"])
+    {
+        return Err("pass + fail + no_data must equal total_budgets".to_string());
+    }
+
+    let claim = performance_exact_object(
+        &top["claim_readiness"],
+        PERF_CLAIM_READINESS_FIELDS,
+        &[],
+        "claim_readiness",
+    )?;
+    let reasons = claim["blocking_reason_codes"]
+        .as_array()
+        .ok_or_else(|| "claim_readiness.blocking_reason_codes must be an array".to_string())?;
+    let reported_reasons = reasons
+        .iter()
+        .enumerate()
+        .map(|(index, reason)| {
+            performance_nonempty_string(
+                reason,
+                &format!("claim_readiness.blocking_reason_codes[{index}]"),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !reported_reasons.windows(2).all(|pair| pair[0] < pair[1]) {
+        return Err(
+            "claim_readiness.blocking_reason_codes must be sorted and duplicate-free".to_string(),
+        );
+    }
+    let mut expected_reasons = BTreeSet::new();
+    if counts["no_data"] != 0 {
+        expected_reasons.insert("budget_data_missing");
+    }
+    if counts["fail"] != 0 {
+        expected_reasons.insert("budget_failed");
+    }
+    if counts["ci_with_data"] != counts["ci_enforced"] || counts["ci_no_data"] != 0 {
+        expected_reasons.insert("ci_budget_data_missing");
+    }
+    if counts["ci_fail"] != 0 {
+        expected_reasons.insert("ci_budget_failed");
+    }
+    if correlation_id.is_none() {
+        expected_reasons.insert("correlation_id_missing");
+    }
+    if counts["data_contract_failures_count"] != 0 {
+        expected_reasons.insert("data_contract_failure");
+    }
+    if run_id.is_none() {
+        expected_reasons.insert("run_id_missing");
+    }
+    if source_commit.is_none() {
+        expected_reasons.insert("source_commit_unbound");
+    }
+    if !strict_mode {
+        expected_reasons.insert("strict_mode_disabled");
+    }
+    let expected_reasons = expected_reasons.into_iter().collect::<Vec<_>>();
+    if reported_reasons != expected_reasons {
+        return Err(format!(
+            "claim_readiness blockers disagree with derived blockers (reported={reported_reasons:?}, expected={expected_reasons:?})"
+        ));
+    }
+    let claim_ready = expected_reasons.is_empty();
+    let expected_status = if claim_ready {
+        "claim_ready"
+    } else {
+        "blocked"
+    };
+    if claim["status"].as_str() != Some(expected_status)
+        || claim["performance_claims_authorized"].as_bool() != Some(claim_ready)
+    {
+        return Err(
+            "claim_readiness status or authorization contradicts derived blockers".to_string(),
+        );
+    }
+    if !claim_ready {
+        return Err(format!(
+            "budget summary does not authorize release-facing performance claims: blocking_reason_codes={expected_reasons:?}"
+        ));
+    }
+    if now.signed_duration_since(generated_at)
+        > chrono::TimeDelta::hours(PERF_MAX_EVIDENCE_AGE_HOURS)
+    {
+        return Err(format!(
+            "performance summary is stale; maximum age is {PERF_MAX_EVIDENCE_AGE_HOURS}h"
+        ));
+    }
+    Ok(AuthorizedPerformanceClaim {
+        source_commit: source_commit
+            .ok_or_else(|| "claim-ready source_commit unexpectedly missing".to_string())?,
+        total_budgets: counts["total_budgets"],
+        pass: counts["pass"],
+        ci_enforced: counts["ci_enforced"],
+    })
+}
+
+fn sanitize_performance_git_environment(
+    command: &mut std::process::Command,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) {
+    for (key, value) in injected_git_env {
+        command.env(key, value);
+    }
+    let mut git_variables = std::env::vars_os()
+        .map(|(key, _)| key)
+        .filter(|key| is_git_environment_key(key))
+        .collect::<BTreeSet<_>>();
+    git_variables.extend(
+        injected_git_env
+            .iter()
+            .map(|(key, _)| key.clone())
+            .filter(|key| is_git_environment_key(key)),
+    );
+    for variable in git_variables {
+        command.env_remove(variable);
+    }
+    command.env("GIT_LITERAL_PATHSPECS", "1");
+    command.env("GIT_NO_REPLACE_OBJECTS", "1");
+    command.env(
+        "GIT_CONFIG_GLOBAL",
+        if cfg!(windows) { "NUL" } else { "/dev/null" },
+    );
+    command.env("GIT_CONFIG_NOSYSTEM", "1");
+    command.env("GIT_OPTIONAL_LOCKS", "0");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+}
+
+fn is_git_environment_key(key: &std::ffi::OsStr) -> bool {
+    key.to_string_lossy()
+        .as_bytes()
+        .get(..4)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PerformancePathIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(not(unix))]
+type PerformancePathIdentity = ();
+
+fn performance_path_identity(path: &Path, label: &str) -> Result<PerformancePathIdentity, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("failed to inspect {label}: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(PerformancePathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Err(format!(
+            "cannot bind {label} to a stable native file identity on this platform; performance release proof fails closed"
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PerformanceGitContext {
+    canonical_root: PathBuf,
+    git_dir: PathBuf,
+    head: String,
+    root_identity: PerformancePathIdentity,
+    git_dir_identity: PerformancePathIdentity,
+    head_file_identity: PerformancePathIdentity,
+    summary_identity: PerformancePathIdentity,
+}
+
+fn performance_repository_paths(root: &Path) -> Result<(PathBuf, PathBuf), String> {
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| format!("failed to canonicalize performance repository root: {error}"))?;
+    let root_metadata = std::fs::symlink_metadata(&canonical_root)
+        .map_err(|error| format!("failed to inspect performance repository root: {error}"))?;
+    if !root_metadata.file_type().is_dir() {
+        return Err("performance repository root must be a directory".to_string());
+    }
+    let dot_git = canonical_root.join(".git");
+    let metadata = std::fs::symlink_metadata(&dot_git)
+        .map_err(|error| format!("failed to inspect performance repository .git: {error}"))?;
+    if metadata.file_type().is_symlink() {
+        return Err("performance repository .git must not be a symlink".to_string());
+    }
+    let git_dir = if metadata.file_type().is_dir() {
+        std::fs::canonicalize(&dot_git)
+            .map_err(|error| format!("failed to canonicalize performance git directory: {error}"))?
+    } else if metadata.file_type().is_file() {
+        let contents = std::fs::read_to_string(&dot_git)
+            .map_err(|error| format!("failed to read performance repository gitfile: {error}"))?;
+        let raw_target = contents
+            .strip_prefix("gitdir: ")
+            .ok_or_else(|| "performance repository gitfile is malformed".to_string())?;
+        let target = raw_target.strip_suffix('\n').unwrap_or(raw_target);
+        if target.is_empty() || target.contains('\n') || target.contains('\0') {
+            return Err("performance repository gitfile is malformed".to_string());
+        }
+        let target = Path::new(target);
+        let unresolved = if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            canonical_root.join(target)
+        };
+        let target_metadata = std::fs::symlink_metadata(&unresolved)
+            .map_err(|error| format!("failed to inspect performance gitfile target: {error}"))?;
+        if target_metadata.file_type().is_symlink() || !target_metadata.file_type().is_dir() {
+            return Err(
+                "performance repository gitfile target must be a nonsymlink directory".to_string(),
+            );
+        }
+        std::fs::canonicalize(unresolved).map_err(|error| {
+            format!("failed to canonicalize performance gitfile target: {error}")
+        })?
+    } else {
+        return Err(
+            "performance repository .git must be a directory or regular gitfile".to_string(),
+        );
+    };
+    let head_metadata = std::fs::symlink_metadata(git_dir.join("HEAD"))
+        .map_err(|error| format!("failed to inspect performance repository HEAD: {error}"))?;
+    if !head_metadata.file_type().is_file() {
+        return Err("performance repository HEAD must be a regular file".to_string());
+    }
+    Ok((canonical_root, git_dir))
+}
+
+fn performance_git_command(
+    root: &Path,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<std::process::Command, String> {
+    let (canonical_root, git_dir) = performance_repository_paths(root)?;
+    Ok(performance_git_command_for_paths(
+        &canonical_root,
+        &git_dir,
+        injected_git_env,
+    ))
+}
+
+fn performance_git_command_for_paths(
+    canonical_root: &Path,
+    git_dir: &Path,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    command
+        .arg("--git-dir")
+        .arg(git_dir)
+        .arg("--work-tree")
+        .arg(canonical_root)
+        .arg("-c")
+        .arg(format!("core.worktree={}", canonical_root.display()))
+        .args(["-c", "core.bare=false", "-c", "core.fsmonitor=false"]);
+    command
+        .args(["-c", "core.untrackedCache=false", "-c"])
+        .arg(format!(
+            "core.excludesFile={}",
+            if cfg!(windows) { "NUL" } else { "/dev/null" }
+        ));
+    sanitize_performance_git_environment(&mut command, injected_git_env);
+    command
+}
+
+fn performance_git_output(
+    root: &Path,
+    args: &[&str],
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<std::process::Output, String> {
+    performance_git_command(root, injected_git_env)?
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))
+}
+
+fn performance_git_success_bytes(
+    root: &Path,
+    args: &[&str],
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<u8>, String> {
+    let output = performance_git_output(root, args, injected_git_env)?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn performance_git_output_in_context(
+    context: &PerformanceGitContext,
+    args: &[&str],
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<std::process::Output, String> {
+    performance_git_command_for_paths(&context.canonical_root, &context.git_dir, injected_git_env)
+        .args(args)
+        .output()
+        .map_err(|error| format!("failed to run git {}: {error}", args.join(" ")))
+}
+
+fn performance_git_success_bytes_in_context(
+    context: &PerformanceGitContext,
+    args: &[&str],
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<u8>, String> {
+    let output = performance_git_output_in_context(context, args, injected_git_env)?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn performance_git_success_string_in_context(
+    context: &PerformanceGitContext,
+    args: &[&str],
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<String, String> {
+    let bytes = performance_git_success_bytes_in_context(context, args, injected_git_env)?;
+    String::from_utf8(bytes)
+        .map(|value| value.trim().to_string())
+        .map_err(|error| format!("git {} returned non-UTF-8 output: {error}", args.join(" ")))
+}
+
+fn validate_performance_repository_identity(
+    context: &PerformanceGitContext,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<(), String> {
+    let reported_root = performance_git_success_string_in_context(
+        context,
+        &["rev-parse", "--show-toplevel"],
+        injected_git_env,
+    )?;
+    let reported_git_dir = performance_git_success_string_in_context(
+        context,
+        &["rev-parse", "--absolute-git-dir"],
+        injected_git_env,
+    )?;
+    let reported_root = std::fs::canonicalize(&reported_root).map_err(|error| {
+        format!("failed to canonicalize Git-reported performance worktree: {error}")
+    })?;
+    let reported_git_dir = std::fs::canonicalize(&reported_git_dir).map_err(|error| {
+        format!("failed to canonicalize Git-reported performance git directory: {error}")
+    })?;
+    if reported_root != context.canonical_root || reported_git_dir != context.git_dir {
+        return Err(format!(
+            "performance repository identity mismatch (worktree={}, git_dir={})",
+            reported_root.display(),
+            reported_git_dir.display()
+        ));
+    }
+    Ok(())
+}
+
+fn capture_performance_git_context(
+    root: &Path,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<PerformanceGitContext, String> {
+    let (canonical_root, git_dir) = performance_repository_paths(root)?;
+    ensure_regular_path_without_symlink_components(&canonical_root, PERF_BUDGET_SUMMARY_PATH)
+        .map_err(|error| {
+            format!("performance summary must be a regular nonsymlink file: {error}")
+        })?;
+    let mut context = PerformanceGitContext {
+        root_identity: performance_path_identity(&canonical_root, "performance repository root")?,
+        git_dir_identity: performance_path_identity(
+            &git_dir,
+            "performance repository git directory",
+        )?,
+        head_file_identity: performance_path_identity(
+            &git_dir.join("HEAD"),
+            "performance repository HEAD",
+        )?,
+        summary_identity: performance_path_identity(
+            &canonical_root.join(PERF_BUDGET_SUMMARY_PATH),
+            "performance summary",
+        )?,
+        canonical_root,
+        git_dir,
+        head: String::new(),
+    };
+    validate_performance_repository_identity(&context, injected_git_env)?;
+    let head = performance_git_success_string_in_context(
+        &context,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        injected_git_env,
+    )?;
+    if !matches!(head.len(), 40 | 64)
+        || !head
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err("release HEAD is not a canonical full lowercase object ID".to_string());
+    }
+    context.head = head;
+    Ok(context)
+}
+
+fn validate_performance_context_paths(
+    root: &Path,
+    context: &PerformanceGitContext,
+) -> Result<(), String> {
+    let rederived = performance_repository_paths(root)?;
+    if rederived.0 != context.canonical_root || rederived.1 != context.git_dir {
+        return Err("performance repository identity changed during validation".to_string());
+    }
+    ensure_regular_path_without_symlink_components(
+        &context.canonical_root,
+        PERF_BUDGET_SUMMARY_PATH,
+    )
+    .map_err(|error| format!("performance summary must be a regular nonsymlink file: {error}"))?;
+    let identities = [
+        (
+            performance_path_identity(&context.canonical_root, "performance repository root")?,
+            context.root_identity,
+        ),
+        (
+            performance_path_identity(&context.git_dir, "performance repository git directory")?,
+            context.git_dir_identity,
+        ),
+        (
+            performance_path_identity(
+                &context.git_dir.join("HEAD"),
+                "performance repository HEAD",
+            )?,
+            context.head_file_identity,
+        ),
+        (
+            performance_path_identity(
+                &context.canonical_root.join(PERF_BUDGET_SUMMARY_PATH),
+                "performance summary",
+            )?,
+            context.summary_identity,
+        ),
+    ];
+    if identities
+        .iter()
+        .any(|(observed, expected)| observed != expected)
+    {
+        return Err("performance repository path identity changed during validation".to_string());
+    }
+    Ok(())
+}
+
+fn validate_performance_repository_clean(
+    context: &PerformanceGitContext,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<(), String> {
+    let status = performance_git_success_bytes_in_context(
+        context,
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+        injected_git_env,
+    )?;
+    if !status.is_empty() {
+        let entries = status
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .take(3)
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect::<Vec<_>>();
+        return Err(format!(
+            "budget summary repository is not clean: {entries:?}"
+        ));
+    }
+    let index = performance_git_success_bytes_in_context(
+        context,
+        &["ls-files", "-v", "-z"],
+        injected_git_env,
+    )?;
+    let flagged = index
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .filter(|entry| {
+            entry
+                .first()
+                .is_some_and(|tag| tag.is_ascii_lowercase() || *tag == b'S')
+        })
+        .take(3)
+        .map(|entry| String::from_utf8_lossy(entry).into_owned())
+        .collect::<Vec<_>>();
+    if flagged.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "budget summary repository uses non-default assume-unchanged/skip-worktree index flags: {flagged:?}"
+        ))
+    }
+}
+
+fn performance_head_artifact_bytes(
+    context: &PerformanceGitContext,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<u8>, String> {
+    ensure_regular_path_without_symlink_components(
+        &context.canonical_root,
+        PERF_BUDGET_SUMMARY_PATH,
+    )
+    .map_err(|error| format!("performance summary must be a regular nonsymlink file: {error}"))?;
+    let tree = performance_git_success_bytes_in_context(
+        context,
+        &[
+            "ls-tree",
+            "-z",
+            "--full-tree",
+            &context.head,
+            "--",
+            PERF_BUDGET_SUMMARY_PATH,
+        ],
+        injected_git_env,
+    )?;
+    let entries = tree
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+        .collect::<Vec<_>>();
+    let entry = entries
+        .first()
+        .copied()
+        .filter(|_| entries.len() == 1)
+        .ok_or_else(|| "performance summary is not tracked at HEAD".to_string())?;
+    let tab = entry
+        .iter()
+        .position(|byte| *byte == b'\t')
+        .ok_or_else(|| "performance summary HEAD tree entry is malformed".to_string())?;
+    if &entry[tab + 1..] != PERF_BUDGET_SUMMARY_PATH.as_bytes() {
+        return Err("performance summary is not tracked at its canonical HEAD path".to_string());
+    }
+    let fields = entry[..tab]
+        .split(|byte| *byte == b' ')
+        .filter(|field| !field.is_empty())
+        .collect::<Vec<_>>();
+    if fields.len() != 3 || !matches!(fields[0], b"100644" | b"100755") || fields[1] != b"blob" {
+        return Err("performance summary HEAD entry must be a regular-file blob".to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let live_metadata =
+            std::fs::symlink_metadata(context.canonical_root.join(PERF_BUDGET_SUMMARY_PATH))
+                .map_err(|error| {
+                    format!("failed to inspect live performance summary mode: {error}")
+                })?;
+        let live_executable = live_metadata.permissions().mode() & 0o111 != 0;
+        let head_executable = fields[0] == b"100755";
+        if live_executable != head_executable {
+            return Err(
+                "performance summary current executable mode does not exactly match HEAD"
+                    .to_string(),
+            );
+        }
+    }
+    let expression = format!("{}:{PERF_BUDGET_SUMMARY_PATH}", context.head);
+    let head_bytes = performance_git_success_bytes_in_context(
+        context,
+        &["show", &expression],
+        injected_git_env,
+    )?;
+    let live_bytes = std::fs::read(context.canonical_root.join(PERF_BUDGET_SUMMARY_PATH))
+        .map_err(|error| format!("failed to read live performance summary bytes: {error}"))?;
+    if live_bytes != head_bytes {
+        return Err("performance summary current bytes do not exactly match HEAD".to_string());
+    }
+    Ok(head_bytes)
+}
+
+fn performance_source_package_patterns(
+    context: &PerformanceGitContext,
+    source_commit: &str,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<Vec<String>, String> {
+    let expression = format!("{source_commit}:Cargo.toml");
+    let bytes = performance_git_success_bytes_in_context(
+        context,
+        &["show", &expression],
+        injected_git_env,
+    )?;
+    let source = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("source Cargo.toml is not UTF-8: {error}"))?;
+    let document = toml::from_str::<toml::Value>(source)
+        .map_err(|error| format!("failed to parse source Cargo.toml: {error}"))?;
+    document
+        .get("package")
+        .and_then(|package| package.get("include"))
+        .and_then(toml::Value::as_array)
+        .ok_or_else(|| "source Cargo.toml package.include must be an array".to_string())?
+        .iter()
+        .map(|entry| {
+            entry
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    "source Cargo.toml package.include entries must be non-empty strings"
+                        .to_string()
+                })
+        })
+        .collect()
+}
+
+fn validate_performance_source_ancestry(
+    context: &PerformanceGitContext,
+    source_commit: &str,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<(), String> {
+    let source_expression = format!("{source_commit}^{{commit}}");
+    let resolved = performance_git_success_string_in_context(
+        context,
+        &["rev-parse", "--verify", &source_expression],
+        injected_git_env,
+    )
+    .map_err(|error| format!("performance source_commit could not be resolved: {error}"))?;
+    if resolved != source_commit {
+        return Err("performance source_commit does not resolve exactly".to_string());
+    }
+    let ancestry = performance_git_output_in_context(
+        context,
+        &["merge-base", "--is-ancestor", source_commit, &context.head],
+        injected_git_env,
+    )?;
+    match ancestry.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => Err("performance source_commit is not an ancestor of release HEAD".to_string()),
+        status => Err(format!(
+            "unable to verify performance source ancestry (status {status:?})"
+        )),
+    }
+}
+
+fn validate_performance_followup_paths(
+    context: &PerformanceGitContext,
+    source_commit: &str,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<(), String> {
+    if source_commit == context.head.as_str() {
+        return Ok(());
+    }
+    let range = format!("{source_commit}..{}", context.head);
+    let history = performance_git_success_bytes_in_context(
+        context,
+        &[
+            "log",
+            "--format=",
+            "--name-only",
+            "-z",
+            "--no-renames",
+            &range,
+            "--",
+        ],
+        injected_git_env,
+    )?;
+    let paths = history
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::str::from_utf8(path)
+                .map(str::to_string)
+                .map_err(|error| format!("performance follow-up path is not UTF-8: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if paths.is_empty() {
+        return Err(
+            "performance source_commit differs from HEAD without an evidence follow-up".to_string(),
+        );
+    }
+    let package_patterns =
+        performance_source_package_patterns(context, source_commit, injected_git_env)?;
+    for path in paths {
+        let relative = Path::new(&path);
+        if relative.is_absolute()
+            || path.contains('\\')
+            || relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(format!(
+                "non-canonical performance follow-up path: {path:?}"
+            ));
+        }
         let evidence_only = path.starts_with("tests/perf/reports/")
             || path.starts_with("tests/e2e_results/")
             || path.starts_with("tests/ext_conformance/reports/")
@@ -2968,170 +4303,175 @@ fn validate_performance_advisory_source_binding(
     Ok(())
 }
 
-fn collect_performance_timestamp_errors(v: &V, errors: &mut Vec<String>) {
-    let Some(raw) = v.get("generated_at").and_then(V::as_str) else {
-        errors
-            .push("generated_at must use canonical millisecond-precision UTC RFC3339".to_string());
-        return;
-    };
-    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) else {
-        errors
-            .push("generated_at must use canonical millisecond-precision UTC RFC3339".to_string());
-        return;
-    };
-    if parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) != raw {
-        errors
-            .push("generated_at must use canonical millisecond-precision UTC RFC3339".to_string());
-    } else if parsed.with_timezone(&chrono::Utc)
-        > chrono::Utc::now() + chrono::TimeDelta::minutes(5)
-    {
-        errors.push("generated_at is more than five minutes in the future".to_string());
+fn validate_performance_source_end_state(
+    root: &Path,
+    context: &PerformanceGitContext,
+    head_bytes: &[u8],
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    before_final_head_validation: Option<&dyn Fn()>,
+) -> Result<(), String> {
+    validate_performance_context_paths(root, context)?;
+    validate_performance_repository_identity(context, injected_git_env)?;
+    let observed_head = performance_git_success_string_in_context(
+        context,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        injected_git_env,
+    )?;
+    if observed_head != context.head {
+        return Err("release HEAD changed during performance source validation".to_string());
     }
+    validate_performance_repository_clean(context, injected_git_env)?;
+    if performance_head_artifact_bytes(context, injected_git_env)? != head_bytes {
+        return Err("performance summary changed during source validation".to_string());
+    }
+    if let Some(hook) = before_final_head_validation {
+        hook();
+    }
+    validate_performance_context_paths(root, context)?;
+    validate_performance_repository_identity(context, injected_git_env)?;
+    let final_head = performance_git_success_string_in_context(
+        context,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        injected_git_env,
+    )?;
+    if final_head != context.head {
+        return Err("release HEAD changed during performance source validation".to_string());
+    }
+    validate_performance_repository_clean(context, injected_git_env)?;
+    if performance_head_artifact_bytes(context, injected_git_env)? != head_bytes {
+        return Err("performance summary changed during source validation".to_string());
+    }
+    validate_performance_context_paths(root, context)?;
+    validate_performance_repository_identity(context, injected_git_env)?;
+    let final_head = performance_git_success_string_in_context(
+        context,
+        &["rev-parse", "--verify", "HEAD^{commit}"],
+        injected_git_env,
+    )?;
+    if final_head != context.head {
+        return Err("release HEAD changed during performance source validation".to_string());
+    }
+    Ok(())
 }
 
-fn collect_performance_claim_readiness_errors(v: &V, errors: &mut Vec<String>) {
-    let Some(claim) = v.get("claim_readiness").and_then(V::as_object) else {
-        errors.push("claim_readiness must be an object".to_string());
-        return;
-    };
-    if claim.get("status").and_then(V::as_str) != Some("claim_ready") {
-        errors.push("claim_readiness.status must be claim_ready".to_string());
+fn validate_performance_advisory_source_binding(
+    root: &Path,
+    payload: &V,
+    source_commit: &str,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    after_head_capture: Option<&dyn Fn()>,
+    before_final_head_validation: Option<&dyn Fn()>,
+) -> Result<(), String> {
+    let context = capture_performance_git_context(root, injected_git_env)?;
+    if let Some(hook) = after_head_capture {
+        hook();
     }
-    if claim
-        .get("performance_claims_authorized")
-        .and_then(V::as_bool)
-        != Some(true)
-    {
-        errors.push("claim_readiness.performance_claims_authorized must be true".to_string());
+    validate_performance_context_paths(root, &context)?;
+    let head_bytes = performance_head_artifact_bytes(&context, injected_git_env)?;
+    validate_performance_repository_clean(&context, injected_git_env)?;
+    let committed_payload: V = parse_release_json(&head_bytes)
+        .map_err(|error| format!("committed performance summary is invalid JSON: {error}"))?;
+    if committed_payload != *payload {
+        return Err(
+            "validated performance payload does not match the committed HEAD artifact".to_string(),
+        );
     }
-    match claim.get("blocking_reason_codes").and_then(V::as_array) {
-        Some(blockers) if blockers.is_empty() => {}
-        Some(blockers) => errors.push(format!(
-            "claim_readiness.blocking_reason_codes must be empty, found {blockers:?}"
-        )),
-        None => {
-            errors.push("claim_readiness.blocking_reason_codes must be an empty array".to_string());
-        }
+
+    validate_performance_source_ancestry(&context, source_commit, injected_git_env)?;
+    validate_performance_followup_paths(&context, source_commit, injected_git_env)?;
+    validate_performance_source_end_state(
+        root,
+        &context,
+        &head_bytes,
+        injected_git_env,
+        before_final_head_validation,
+    )
+}
+
+fn validate_performance_budget_summary_with_git_env(
+    root: &Path,
+    v: &V,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> (Signal, String) {
+    validate_performance_budget_summary_with_options(root, v, injected_git_env, None)
+}
+
+fn validate_performance_budget_summary_with_options(
+    root: &Path,
+    v: &V,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    after_head_capture: Option<&dyn Fn()>,
+) -> (Signal, String) {
+    validate_performance_budget_summary_with_hooks(
+        root,
+        v,
+        injected_git_env,
+        after_head_capture,
+        None,
+    )
+}
+
+fn validate_performance_budget_summary_with_hooks(
+    root: &Path,
+    v: &V,
+    injected_git_env: &[(std::ffi::OsString, std::ffi::OsString)],
+    after_head_capture: Option<&dyn Fn()>,
+    before_final_head_validation: Option<&dyn Fn()>,
+) -> (Signal, String) {
+    let result = validate_performance_budget_contract(v).and_then(|claim| {
+        validate_performance_advisory_source_binding(
+            root,
+            v,
+            &claim.source_commit,
+            injected_git_env,
+            after_head_capture,
+            before_final_head_validation,
+        )?;
+        Ok(claim)
+    });
+    match result {
+        Ok(claim) => (
+            Signal::Pass,
+            format!(
+                "advisory v2 claim-readiness subset passed: {}/{} pass; {}/{} CI budgets have data; final release evidence gate proof is still required",
+                claim.pass, claim.total_budgets, claim.ci_enforced, claim.ci_enforced
+            ),
+        ),
+        Err(error) => (
+            Signal::Fail,
+            format!("performance claim evidence is not authorized: {error}"),
+        ),
     }
 }
 
 fn validate_performance_budget_summary(root: &Path, v: &V) -> (Signal, String) {
-    let mut errors = Vec::new();
-
-    let schema = v.get("schema").and_then(V::as_str);
-    if schema != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
-        errors.push(format!(
-            "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {}",
-            schema.unwrap_or("missing")
-        ));
-    }
-
-    if v.get("strict_mode").and_then(V::as_bool) != Some(true) {
-        errors.push("strict_mode must be true".to_string());
-    }
-
-    collect_performance_timestamp_errors(v, &mut errors);
-    collect_performance_claim_readiness_errors(v, &mut errors);
-
-    for pointer in ["/ci_fail", "/ci_no_data", "/data_contract_failures_count"] {
-        match v.pointer(pointer).and_then(V::as_u64) {
-            Some(0) => {}
-            Some(value) => errors.push(format!("{pointer} must be 0, found {value}")),
-            None => errors.push(format!("{pointer} must be the integer 0")),
-        }
-    }
-
-    let total_budgets = v.get("total_budgets").and_then(V::as_u64);
-    let pass = v.get("pass").and_then(V::as_u64);
-    let fail = v.get("fail").and_then(V::as_u64);
-    let no_data = v.get("no_data").and_then(V::as_u64);
-    if total_budgets.is_none_or(|count| count == 0)
-        || pass != total_budgets
-        || fail != Some(0)
-        || no_data != Some(0)
-    {
-        errors.push(format!(
-            "all declared budgets must have data and pass: pass={pass:?}, fail={fail:?}, no_data={no_data:?}, total_budgets={total_budgets:?}"
-        ));
-    }
-
-    let ci_enforced = v.get("ci_enforced").and_then(V::as_u64);
-    let ci_with_data = v.get("ci_with_data").and_then(V::as_u64);
-    if ci_enforced.is_none_or(|count| count == 0)
-        || ci_with_data != ci_enforced
-        || ci_enforced
-            .zip(total_budgets)
-            .is_some_and(|(ci_count, total)| ci_count > total)
-    {
-        errors.push(format!(
-            "CI data coverage must be complete and non-zero: ci_with_data={ci_with_data:?}, ci_enforced={ci_enforced:?}"
-        ));
-    }
-
-    let source_commit = v.get("source_commit").and_then(V::as_str);
-    if source_commit.is_none_or(|commit| {
-        commit.len() != 40
-            || commit
-                .bytes()
-                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
-            || commit.bytes().all(|byte| byte == b'0')
-    }) {
-        errors.push("source_commit must be a full non-zero lowercase Git SHA".to_string());
-    } else if let Some(source_commit) = source_commit
-        && let Err(error) = validate_performance_advisory_source_binding(root, source_commit)
-    {
-        errors.push(error);
-    }
-
-    let run_id = v.get("run_id").and_then(V::as_str);
-    let correlation_id = v.get("correlation_id").and_then(V::as_str);
-    if run_id.is_none_or(|run| run.is_empty() || run.trim() != run) || correlation_id != run_id {
-        errors.push("run_id and correlation_id must be identical non-empty strings".to_string());
-    }
-
-    if errors.is_empty() {
-        let total = total_budgets.unwrap_or_default();
-        let pass = pass.unwrap_or_default();
-        let ci_enforced = ci_enforced.unwrap_or_default();
-        (
-            Signal::Pass,
-            format!(
-                "advisory v2 claim-readiness subset passed: {pass}/{total} pass; {ci_enforced}/{ci_enforced} CI budgets have data; final release evidence gate proof is still required"
-            ),
-        )
-    } else {
-        (
-            Signal::Fail,
-            format!(
-                "performance claim evidence is not authorized: {}",
-                errors.join("; ")
-            ),
-        )
-    }
+    validate_performance_budget_summary_with_git_env(root, v, &[])
 }
 
 fn collect_performance(root: &Path) -> DimensionScore {
     let name = "Performance Budgets";
-    let path = root.join("tests/perf/reports/budget_summary.json");
-    load_json(&path).map_or_else(
-        || no_data(name, "budget_summary.json not found"),
-        |v| {
+    let path = root.join(PERF_BUDGET_SUMMARY_PATH);
+    match load_json(&path) {
+        Ok(None) => no_data(name, "budget_summary.json not found"),
+        Err(error) => invalid_data(name, error),
+        Ok(Some(v)) => {
             let (signal, detail) = validate_performance_budget_summary(root, &v);
             DimensionScore {
                 name: name.to_string(),
                 signal,
                 detail,
             }
-        },
-    )
+        }
+    }
 }
 
 fn collect_security(root: &Path) -> DimensionScore {
     let name = "Security & Licensing";
     let path = root.join("tests/ext_conformance/artifacts/RISK_REVIEW.json");
-    load_json(&path).map_or_else(
-        || no_data(name, "RISK_REVIEW.json not found"),
-        |v| {
+    match load_json(&path) {
+        Ok(None) => no_data(name, "RISK_REVIEW.json not found"),
+        Err(error) => invalid_data(name, error),
+        Ok(Some(v)) => {
             let total = get_u64(&v, "/summary/total_artifacts");
             let critical = get_u64(&v, "/summary/security_critical");
             let warnings = get_u64(&v, "/summary/security_warnings");
@@ -3154,16 +4494,17 @@ fn collect_security(root: &Path) -> DimensionScore {
                     "{total} artifacts: {license_clear} license-clear, {license_unknown} unknown; {critical} critical, {warnings} warnings; risk={overall_risk}"
                 ),
             }
-        },
-    )
+        }
+    }
 }
 
 fn collect_provenance(root: &Path) -> DimensionScore {
     let name = "Provenance Integrity";
     let path = root.join("tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json");
-    load_json(&path).map_or_else(
-        || no_data(name, "PROVENANCE_VERIFICATION.json not found"),
-        |v| {
+    match load_json(&path) {
+        Ok(None) => no_data(name, "PROVENANCE_VERIFICATION.json not found"),
+        Err(error) => invalid_data(name, error),
+        Ok(Some(v)) => {
             let total = get_u64(&v, "/summary/total_artifacts");
             let verified = get_u64(&v, "/summary/verified_ok");
             let failed = get_u64(&v, "/summary/failed");
@@ -3185,16 +4526,17 @@ fn collect_provenance(root: &Path) -> DimensionScore {
                     pass_rate * 100.0
                 ),
             }
-        },
-    )
+        }
+    }
 }
 
 fn collect_traceability(root: &Path) -> DimensionScore {
     let name = "Traceability";
     let path = root.join("docs/traceability_matrix.json");
-    load_json(&path).map_or_else(
-        || no_data(name, "traceability_matrix.json not found"),
-        |v| {
+    match load_json(&path) {
+        Ok(None) => no_data(name, "traceability_matrix.json not found"),
+        Err(error) => invalid_data(name, error),
+        Ok(Some(v)) => {
             let requirements = v
                 .get("requirements")
                 .and_then(V::as_array)
@@ -3214,16 +4556,17 @@ fn collect_traceability(root: &Path) -> DimensionScore {
                     "{requirements} requirements traced; min coverage threshold: {min_coverage:.0}%"
                 ),
             }
-        },
-    )
+        }
+    }
 }
 
 fn collect_baseline_delta(root: &Path) -> DimensionScore {
     let name = "Baseline Conformance";
     let path = root.join("tests/ext_conformance/reports/conformance_baseline.json");
-    load_json(&path).map_or_else(
-        || no_data(name, "conformance_baseline.json not found"),
-        |v| {
+    match load_json(&path) {
+        Ok(None) => no_data(name, "conformance_baseline.json not found"),
+        Err(error) => invalid_data(name, error),
+        Ok(Some(v)) => {
             let pass_rate = get_f64(&v, "/extension_conformance/pass_rate_pct");
             let passed = get_u64(&v, "/extension_conformance/passed");
             let total = get_u64(&v, "/extension_conformance/manifest_count");
@@ -3245,8 +4588,8 @@ fn collect_baseline_delta(root: &Path) -> DimensionScore {
                     "ext: {passed}/{total} ({pass_rate:.1}%); scenarios: {scenario_rate:.1}%; ref={git_ref}"
                 ),
             }
-        },
-    )
+        }
+    }
 }
 
 fn collect_known_issues(root: &Path) -> Vec<String> {
@@ -3254,45 +4597,71 @@ fn collect_known_issues(root: &Path) -> Vec<String> {
 
     // Conformance failures
     let baseline_path = root.join("tests/ext_conformance/reports/conformance_baseline.json");
-    if let Some(v) = load_json(&baseline_path)
-        && let Some(arr) = v
-            .pointer("/scenario_conformance/failures")
-            .and_then(V::as_array)
-    {
-        for f in arr {
-            let id = get_str(f, "/id");
-            let cause = get_str(f, "/cause");
-            issues.push(format!("Scenario {id}: {cause}"));
+    match load_json(&baseline_path) {
+        Err(error) => issues.push(format!("Baseline conformance evidence: {error}")),
+        Ok(None) => {}
+        Ok(Some(v)) => {
+            if let Some(arr) = v
+                .pointer("/scenario_conformance/failures")
+                .and_then(V::as_array)
+            {
+                for f in arr {
+                    let id = get_str(f, "/id");
+                    let cause = get_str(f, "/cause");
+                    issues.push(format!("Scenario {id}: {cause}"));
+                }
+            }
         }
     }
 
     // Performance evidence that cannot authorize release-facing claims.
     let perf_path = root.join("tests/perf/reports/budget_summary.json");
-    if let Some(v) = load_json(&perf_path) {
-        let (signal, detail) = validate_performance_budget_summary(root, &v);
-        if signal != Signal::Pass {
-            issues.push(format!("Performance budgets: {detail}"));
+    match load_json(&perf_path) {
+        Err(error) => issues.push(format!("Performance budgets: {error}")),
+        Ok(None) => {}
+        Ok(Some(v)) => {
+            let (signal, detail) = validate_performance_budget_summary(root, &v);
+            if signal != Signal::Pass {
+                issues.push(format!("Performance budgets: {detail}"));
+            }
         }
     }
 
     // Security warnings
     let risk_path = root.join("tests/ext_conformance/artifacts/RISK_REVIEW.json");
-    if let Some(v) = load_json(&risk_path) {
-        let warnings = get_u64(&v, "/summary/security_warnings");
-        if warnings > 0 {
-            issues.push(format!(
-                "{warnings} extension artifacts have security warnings"
-            ));
-        }
-        let unknown = get_u64(&v, "/summary/license_unknown");
-        if unknown > 0 {
-            issues.push(format!(
-                "{unknown} extension artifacts have unknown licenses"
-            ));
+    match load_json(&risk_path) {
+        Err(error) => issues.push(format!("Security and licensing evidence: {error}")),
+        Ok(None) => {}
+        Ok(Some(v)) => {
+            let warnings = get_u64(&v, "/summary/security_warnings");
+            if warnings > 0 {
+                issues.push(format!(
+                    "{warnings} extension artifacts have security warnings"
+                ));
+            }
+            let unknown = get_u64(&v, "/summary/license_unknown");
+            if unknown > 0 {
+                issues.push(format!(
+                    "{unknown} extension artifacts have unknown licenses"
+                ));
+            }
         }
     }
 
     issues
+}
+
+fn aggregate_readiness_signals(signals: impl IntoIterator<Item = Signal>) -> Signal {
+    let signals = signals.into_iter().collect::<Vec<_>>();
+    if signals.contains(&Signal::Fail) {
+        Signal::Fail
+    } else if signals.contains(&Signal::Warn) {
+        Signal::Warn
+    } else if signals.is_empty() || signals.contains(&Signal::NoData) {
+        Signal::NoData
+    } else {
+        Signal::Pass
+    }
 }
 
 fn generate_report() -> ReleaseReadinessReport {
@@ -3307,16 +4676,7 @@ fn generate_report() -> ReleaseReadinessReport {
         collect_traceability(&root),
     ];
 
-    // Overall verdict: Fail if any dimension fails, Warn if any warns, else Pass
-    let overall = if dimensions.iter().any(|d| d.signal == Signal::Fail) {
-        Signal::Fail
-    } else if dimensions.iter().any(|d| d.signal == Signal::Warn) {
-        Signal::Warn
-    } else if dimensions.iter().all(|d| d.signal == Signal::NoData) {
-        Signal::NoData
-    } else {
-        Signal::Pass
-    };
+    let overall = aggregate_readiness_signals(dimensions.iter().map(|dimension| dimension.signal));
 
     let known_issues = collect_known_issues(&root);
 
@@ -3441,39 +4801,86 @@ fn performance_dimension_has_data() {
 }
 
 fn claim_ready_performance_budget_fixture(source_commit: &str) -> V {
-    serde_json::json!({
-        "schema": PERF_BUDGET_SUMMARY_SCHEMA,
-        "generated_at": chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "source_commit": source_commit,
-        "run_id": "perf-run-123",
-        "correlation_id": "perf-run-123",
-        "strict_mode": true,
-        "total_budgets": 2,
-        "pass": 2,
-        "fail": 0,
-        "no_data": 0,
-        "ci_enforced": 2,
-        "ci_with_data": 2,
-        "ci_fail": 0,
-        "ci_no_data": 0,
-        "data_contract_failures_count": 0,
-        "claim_readiness": {
-            "status": "claim_ready",
-            "performance_claims_authorized": true,
-            "blocking_reason_codes": []
-        }
-    })
+    let mut summary: V = serde_json::from_str(include_str!("perf/reports/budget_summary.json"))
+        .expect("parse canonical performance budget fixture");
+    let budgets = summary["budgets"]
+        .as_array()
+        .expect("canonical budgets array");
+    let total = u64::try_from(budgets.len()).expect("fixture budget count fits u64");
+    let ci_enforced = u64::try_from(
+        budgets
+            .iter()
+            .filter(|budget| budget["ci_enforced"].as_bool() == Some(true))
+            .count(),
+    )
+    .expect("fixture CI budget count fits u64");
+    for result in summary["budget_results"]
+        .as_array_mut()
+        .expect("canonical budget results array")
+    {
+        result["actual"] = result["threshold"].clone();
+        result["status"] = serde_json::json!("PASS");
+        result["source"] = serde_json::json!("release-readiness claim fixture");
+        result
+            .as_object_mut()
+            .expect("budget result object")
+            .remove("failure_reason");
+    }
+    summary["generated_at"] =
+        serde_json::json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true));
+    summary["source_commit"] = serde_json::json!(source_commit);
+    summary["run_id"] = serde_json::json!("perf-run-123");
+    summary["correlation_id"] = serde_json::json!("perf-run-123");
+    summary["strict_mode"] = serde_json::json!(true);
+    summary["total_budgets"] = serde_json::json!(total);
+    summary["pass"] = serde_json::json!(total);
+    summary["fail"] = serde_json::json!(0);
+    summary["no_data"] = serde_json::json!(0);
+    summary["ci_enforced"] = serde_json::json!(ci_enforced);
+    summary["ci_with_data"] = serde_json::json!(ci_enforced);
+    summary["ci_fail"] = serde_json::json!(0);
+    summary["ci_no_data"] = serde_json::json!(0);
+    summary["data_contract_failures_count"] = serde_json::json!(0);
+    summary["failing_data_contracts"] = serde_json::json!([]);
+    summary["claim_readiness"] = serde_json::json!({
+        "status": "claim_ready",
+        "performance_claims_authorized": true,
+        "blocking_reason_codes": []
+    });
+    summary
 }
 
-fn performance_source_repository_fixture() -> tempfile::TempDir {
-    let root = tempdir().expect("create performance source-binding fixture");
-    run_evidence_binding_fixture_git(root.path(), &["init", "--quiet", "--initial-branch=main"]);
-    std::fs::write(root.path().join("source.txt"), "fixture source\n")
-        .expect("write performance source-binding fixture");
-    run_evidence_binding_fixture_git(root.path(), &["add", "source.txt"]);
-    run_evidence_binding_fixture_git(
-        root.path(),
+fn run_performance_fixture_git(root: &Path, args: &[&str]) -> String {
+    let output = performance_git_output(root, args, &[]).expect("run performance fixture Git");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("performance fixture Git output is UTF-8")
+        .trim()
+        .to_string()
+}
+
+fn init_performance_fixture_repository(root: &Path) {
+    let mut command = std::process::Command::new("git");
+    command.arg("-C").arg(root);
+    sanitize_performance_git_environment(&mut command, &[]);
+    let output = command
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .output()
+        .expect("initialize performance fixture repository");
+    assert!(
+        output.status.success(),
+        "git init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn commit_performance_fixture(root: &Path, message: &str) {
+    run_performance_fixture_git(
+        root,
         &[
             "-c",
             "user.name=Pi Performance Fixture",
@@ -3482,58 +4889,299 @@ fn performance_source_repository_fixture() -> tempfile::TempDir {
             "commit",
             "-q",
             "-m",
-            "fixture source",
+            message,
         ],
     );
-    root
+}
+
+fn write_performance_fixture_summary(root: &Path, summary: &V) {
+    let path = root.join(PERF_BUDGET_SUMMARY_PATH);
+    std::fs::create_dir_all(path.parent().expect("performance summary fixture parent"))
+        .expect("create performance summary fixture directory");
+    let mut bytes = serde_json::to_vec_pretty(summary).expect("serialize performance fixture");
+    bytes.push(b'\n');
+    std::fs::write(path, bytes).expect("write performance summary fixture");
+}
+
+fn configure_performance_fixture_canonical_clean_filter(root: &Path) {
+    let summary_path = root.join(PERF_BUDGET_SUMMARY_PATH);
+    let summary_path = summary_path
+        .to_str()
+        .expect("performance fixture summary path is UTF-8");
+    let canonical_blob = run_performance_fixture_git(
+        root,
+        &["hash-object", "-w", "--no-filters", "--", summary_path],
+    );
+    assert!(
+        matches!(canonical_blob.len(), 40 | 64)
+            && canonical_blob.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "fixture canonical summary blob is not a Git object ID: {canonical_blob:?}"
+    );
+    let clean_filter = format!("git cat-file blob {canonical_blob}");
+    run_performance_fixture_git(
+        root,
+        &["config", "filter.canonical-summary.clean", &clean_filter],
+    );
+    run_performance_fixture_git(
+        root,
+        &["config", "filter.canonical-summary.required", "true"],
+    );
+}
+
+fn performance_fixture_head_summary_bytes(root: &Path) -> Vec<u8> {
+    let expression = format!("HEAD:{PERF_BUDGET_SUMMARY_PATH}");
+    performance_git_success_bytes(root, &["show", &expression], &[])
+        .expect("read committed performance fixture summary bytes")
+}
+
+fn materialize_performance_fixture_summary_from_head(root: &Path) {
+    let committed = performance_fixture_head_summary_bytes(root);
+    let path = root.join(PERF_BUDGET_SUMMARY_PATH);
+    std::fs::write(&path, &committed)
+        .expect("materialize committed performance fixture summary bytes");
+    let materialized =
+        std::fs::read(path).expect("read materialized performance fixture summary bytes");
+    assert_eq!(
+        materialized, committed,
+        "performance fixture worktree bytes must exactly match HEAD"
+    );
+}
+
+struct PerformanceSourceRepositoryFixture {
+    root: tempfile::TempDir,
+    source_commit: String,
+    summary: V,
+}
+
+fn performance_source_repository_fixture() -> PerformanceSourceRepositoryFixture {
+    let root = tempdir().expect("create performance source-binding fixture");
+    init_performance_fixture_repository(root.path());
+    std::fs::write(
+        root.path().join("Cargo.toml"),
+        "[package]\nname = \"performance-source-fixture\"\nversion = \"0.0.0\"\nedition = \"2024\"\ninclude = [\"/Cargo.toml\", \"/src/**\", \"/docs/evidence/**\"]\n",
+    )
+    .expect("write performance fixture Cargo.toml");
+    std::fs::write(
+        root.path().join(".gitattributes"),
+        format!("{PERF_BUDGET_SUMMARY_PATH} filter=canonical-summary\n"),
+    )
+    .expect("write performance fixture attributes");
+    std::fs::write(root.path().join("source.txt"), "fixture source\n")
+        .expect("write performance source-binding fixture");
+    run_performance_fixture_git(
+        root.path(),
+        &["add", "Cargo.toml", ".gitattributes", "source.txt"],
+    );
+    commit_performance_fixture(root.path(), "fixture source");
+    let source_commit = run_performance_fixture_git(root.path(), &["rev-parse", "HEAD"]);
+    let summary = claim_ready_performance_budget_fixture(&source_commit);
+    write_performance_fixture_summary(root.path(), &summary);
+    configure_performance_fixture_canonical_clean_filter(root.path());
+    run_performance_fixture_git(root.path(), &["add", PERF_BUDGET_SUMMARY_PATH]);
+    commit_performance_fixture(root.path(), "fixture performance evidence");
+    materialize_performance_fixture_summary_from_head(root.path());
+    PerformanceSourceRepositoryFixture {
+        root,
+        source_commit,
+        summary,
+    }
 }
 
 #[test]
+fn release_evidence_json_rejects_duplicate_keys_recursively() {
+    for (label, document, duplicate_key) in [
+        (
+            "top-level",
+            br#"{"schema":"first","schema":"forged"}"#.as_slice(),
+            "schema",
+        ),
+        (
+            "nested object",
+            br#"{"claim":{"status":"pass","status":"forged"}}"#.as_slice(),
+            "status",
+        ),
+        (
+            "object inside array",
+            br#"{"rows":[{"id":"first","id":"forged"}]}"#.as_slice(),
+            "id",
+        ),
+    ] {
+        let error = parse_release_json(document)
+            .expect_err("duplicate release-evidence object key must fail closed");
+        assert!(
+            error.contains(&format!("duplicate JSON object key: {duplicate_key}")),
+            "{label}: {error}"
+        );
+    }
+
+    let valid = parse_release_json(br#"{"rows":[{"id":"first"}],"ready":true}"#)
+        .expect("unique-key release evidence should parse");
+    assert_eq!(valid["ready"], serde_json::json!(true));
+}
+
+#[test]
+fn release_readiness_collectors_fail_closed_on_duplicate_json() {
+    let root = tempdir().expect("create duplicate-evidence fixture");
+    let path = root.path().join(PERF_BUDGET_SUMMARY_PATH);
+    std::fs::create_dir_all(path.parent().expect("performance evidence parent"))
+        .expect("create performance evidence directory");
+    std::fs::write(
+        &path,
+        br#"{"schema":"pi.perf.budget_summary.v2","schema":"forged"}"#,
+    )
+    .expect("write duplicate-key performance evidence");
+
+    let dimension = collect_performance(root.path());
+    assert_eq!(dimension.signal, Signal::Fail, "{}", dimension.detail);
+    assert!(
+        dimension
+            .detail
+            .contains("duplicate JSON object key: schema"),
+        "{}",
+        dimension.detail
+    );
+    assert_eq!(
+        aggregate_readiness_signals([Signal::Pass, dimension.signal]),
+        Signal::Fail
+    );
+    assert_eq!(
+        aggregate_readiness_signals([Signal::Pass, Signal::NoData]),
+        Signal::NoData
+    );
+}
+
+#[test]
+fn performance_git_environment_scrubbing_is_ascii_case_insensitive() {
+    let injected = vec![
+        (
+            std::ffi::OsString::from("git_index_file"),
+            std::ffi::OsString::from("hostile-index"),
+        ),
+        (
+            std::ffi::OsString::from("Git_Config_Count"),
+            std::ffi::OsString::from("1"),
+        ),
+        (
+            std::ffi::OsString::from("PI_RELEASE_TEST_SENTINEL"),
+            std::ffi::OsString::from("retained"),
+        ),
+    ];
+    let mut command = std::process::Command::new("git");
+    sanitize_performance_git_environment(&mut command, &injected);
+
+    for hostile in ["git_index_file", "Git_Config_Count"] {
+        let entries = command
+            .get_envs()
+            .filter(|(key, _)| key.to_string_lossy().eq_ignore_ascii_case(hostile))
+            .collect::<Vec<_>>();
+        assert!(!entries.is_empty(), "missing scrub record for {hostile}");
+        assert!(
+            entries.iter().all(|(_, value)| value.is_none()),
+            "{hostile} survived Git environment scrubbing: {entries:?}"
+        );
+    }
+    assert!(command.get_envs().any(|(key, value)| {
+        key == "PI_RELEASE_TEST_SENTINEL"
+            && value.is_some_and(|value| value == std::ffi::OsStr::new("retained"))
+    }));
+}
+
+#[cfg(unix)]
+#[test]
 fn performance_budget_v2_claim_ready_contract_passes() {
-    let root = performance_source_repository_fixture();
-    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
-    let summary = claim_ready_performance_budget_fixture(&source_commit);
-    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    let fixture = performance_source_repository_fixture();
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
     assert_eq!(signal, Signal::Pass, "{detail}");
+    assert!(detail.contains("advisory"), "{detail}");
+    assert!(detail.contains("final release evidence gate"), "{detail}");
+}
+
+#[cfg(not(unix))]
+#[test]
+fn performance_source_binding_fails_closed_without_stable_native_identity() {
+    let fixture = performance_source_repository_fixture();
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("stable native file identity"), "{detail}");
+}
+
+#[test]
+fn performance_fixture_clean_filter_uses_repository_object() {
+    let fixture = performance_source_repository_fixture();
+    let clean_filter = run_performance_fixture_git(
+        fixture.root.path(),
+        &["config", "--get", "filter.canonical-summary.clean"],
+    );
+    let components = clean_filter.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(
+        components.get(..3),
+        Some(["git", "cat-file", "blob"].as_slice()),
+        "clean filter must use Git object storage: {clean_filter:?}"
+    );
+    assert_eq!(
+        components.len(),
+        4,
+        "clean filter must not contain a host path: {clean_filter:?}"
+    );
+    let object_id = components[3];
+    assert!(
+        matches!(object_id.len(), 40 | 64)
+            && object_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "clean filter object ID is malformed: {object_id:?}"
+    );
+    assert_eq!(
+        run_performance_fixture_git(fixture.root.path(), &["cat-file", "-t", object_id]),
+        "blob"
+    );
+    let object_bytes =
+        performance_git_success_bytes(fixture.root.path(), &["cat-file", "blob", object_id], &[])
+            .expect("read clean-filter fixture object bytes");
+    let head_bytes = performance_fixture_head_summary_bytes(fixture.root.path());
+    let live_bytes = std::fs::read(fixture.root.path().join(PERF_BUDGET_SUMMARY_PATH))
+        .expect("read live performance fixture summary bytes");
+    assert_eq!(object_bytes, head_bytes);
+    assert_eq!(live_bytes, head_bytes);
+    assert_eq!(
+        parse_release_json(&head_bytes).expect("parse committed performance fixture summary"),
+        fixture.summary
+    );
 }
 
 #[test]
 fn performance_budget_v2_blocked_claim_fails_closed() {
-    let root = performance_source_repository_fixture();
-    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
-    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    let fixture = performance_source_repository_fixture();
+    let mut summary = fixture.summary.clone();
     summary["claim_readiness"] = serde_json::json!({
         "status": "blocked",
         "performance_claims_authorized": false,
         "blocking_reason_codes": ["ci_budget_data_missing"]
     });
-    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &summary);
     assert_eq!(signal, Signal::Fail, "{detail}");
-    assert!(detail.contains("claim_readiness.status"), "{detail}");
-    assert!(detail.contains("ci_budget_data_missing"), "{detail}");
+    assert!(detail.contains("derived blockers"), "{detail}");
 }
 
 #[test]
 fn performance_budget_legacy_v1_cannot_authorize_claims() {
-    let root = performance_source_repository_fixture();
-    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
-    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    let fixture = performance_source_repository_fixture();
+    let mut summary = fixture.summary.clone();
     summary["schema"] = serde_json::json!("pi.perf.budget_summary.v1");
-    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &summary);
     assert_eq!(signal, Signal::Fail, "{detail}");
     assert!(detail.contains(PERF_BUDGET_SUMMARY_SCHEMA), "{detail}");
 }
 
 #[test]
 fn performance_budget_future_timestamp_fails_closed() {
-    let root = performance_source_repository_fixture();
-    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
-    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    let fixture = performance_source_repository_fixture();
+    let mut summary = fixture.summary.clone();
     summary["generated_at"] = serde_json::json!(
         (chrono::Utc::now() + chrono::TimeDelta::minutes(6))
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
     );
-    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &summary);
     assert_eq!(signal, Signal::Fail, "{detail}");
     assert!(
         detail.contains("more than five minutes in the future"),
@@ -3541,13 +5189,21 @@ fn performance_budget_future_timestamp_fails_closed() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn performance_budget_forged_source_commit_fails_closed() {
-    let root = performance_source_repository_fixture();
-    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
-    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    let fixture = performance_source_repository_fixture();
+    let mut summary = fixture.summary.clone();
     summary["source_commit"] = serde_json::json!("fedcba9876543210fedcba9876543210fedcba98");
-    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    write_performance_fixture_summary(fixture.root.path(), &summary);
+    configure_performance_fixture_canonical_clean_filter(fixture.root.path());
+    run_performance_fixture_git(
+        fixture.root.path(),
+        &["add", "--renormalize", "--", PERF_BUDGET_SUMMARY_PATH],
+    );
+    commit_performance_fixture(fixture.root.path(), "forged source evidence");
+    materialize_performance_fixture_summary_from_head(fixture.root.path());
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &summary);
     assert_eq!(signal, Signal::Fail, "{detail}");
     assert!(
         detail.contains("source_commit") || detail.contains("source object"),
@@ -3557,28 +5213,436 @@ fn performance_budget_forged_source_commit_fails_closed() {
 
 #[test]
 fn performance_budget_global_no_data_fails_even_when_ci_subset_is_green() {
-    let root = performance_source_repository_fixture();
-    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
-    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    let fixture = performance_source_repository_fixture();
+    let mut summary = fixture.summary.clone();
     summary["total_budgets"] = serde_json::json!(3);
     summary["pass"] = serde_json::json!(2);
     summary["no_data"] = serde_json::json!(1);
-    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &summary);
     assert_eq!(signal, Signal::Fail, "{detail}");
-    assert!(detail.contains("all declared budgets"), "{detail}");
+    assert!(
+        detail.contains("inconsistent with derived value"),
+        "{detail}"
+    );
 }
 
 #[test]
 fn performance_budget_rejects_ci_count_larger_than_total_budget_count() {
-    let root = performance_source_repository_fixture();
-    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
-    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    let fixture = performance_source_repository_fixture();
+    let mut summary = fixture.summary.clone();
     summary["ci_enforced"] = serde_json::json!(99);
     summary["ci_with_data"] = serde_json::json!(99);
 
-    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &summary);
     assert_eq!(signal, Signal::Fail, "{detail}");
-    assert!(detail.contains("CI data coverage"), "{detail}");
+    assert!(
+        detail.contains("ci_enforced") || detail.contains("ci_with_data"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn performance_budget_rejects_incomplete_and_forged_result_rows() {
+    let fixture = performance_source_repository_fixture();
+    let mut incomplete = fixture.summary.clone();
+    incomplete["budget_results"]
+        .as_array_mut()
+        .expect("budget results array")
+        .pop();
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &incomplete);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("order and membership"), "{detail}");
+
+    let mut forged = fixture.summary.clone();
+    forged["budget_results"][0]["status"] = serde_json::json!("FAIL");
+    let (signal, detail) = validate_performance_budget_summary(fixture.root.path(), &forged);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("inconsistent with actual"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_unstaged_staged_and_untracked_dirt() {
+    let unstaged = performance_source_repository_fixture();
+    std::fs::write(unstaged.root.path().join("source.txt"), "unstaged change\n")
+        .expect("write unstaged performance fixture change");
+    let (signal, detail) =
+        validate_performance_budget_summary(unstaged.root.path(), &unstaged.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("repository is not clean"), "{detail}");
+
+    let staged = performance_source_repository_fixture();
+    std::fs::write(staged.root.path().join("source.txt"), "staged change\n")
+        .expect("write staged performance fixture change");
+    run_performance_fixture_git(staged.root.path(), &["add", "source.txt"]);
+    let (signal, detail) = validate_performance_budget_summary(staged.root.path(), &staged.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("repository is not clean"), "{detail}");
+
+    let untracked = performance_source_repository_fixture();
+    std::fs::write(untracked.root.path().join("untracked.txt"), "untracked\n")
+        .expect("write untracked performance fixture file");
+    let (signal, detail) =
+        validate_performance_budget_summary(untracked.root.path(), &untracked.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("repository is not clean"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_uses_default_index_despite_hostile_git_environment() {
+    let fixture = performance_source_repository_fixture();
+    let alternate_index = fixture.root.path().join(".git/hostile-index");
+    let output = performance_git_command(fixture.root.path(), &[])
+        .expect("construct performance fixture Git command")
+        .env("GIT_INDEX_FILE", &alternate_index)
+        .args(["read-tree", "HEAD"])
+        .output()
+        .expect("create hostile alternate index");
+    assert!(
+        output.status.success(),
+        "create hostile index: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::fs::write(fixture.root.path().join("source.txt"), "staged only\n")
+        .expect("write default-index fixture change");
+    run_performance_fixture_git(fixture.root.path(), &["add", "source.txt"]);
+    std::fs::write(fixture.root.path().join("source.txt"), "fixture source\n")
+        .expect("restore worktree bytes while leaving default index dirty");
+
+    let injected = vec![
+        (
+            std::ffi::OsString::from("GIT_INDEX_FILE"),
+            alternate_index.into_os_string(),
+        ),
+        (
+            std::ffi::OsString::from("GIT_CONFIG_COUNT"),
+            std::ffi::OsString::from("1"),
+        ),
+        (
+            std::ffi::OsString::from("GIT_CONFIG_KEY_0"),
+            std::ffi::OsString::from("core.worktree"),
+        ),
+        (
+            std::ffi::OsString::from("GIT_CONFIG_VALUE_0"),
+            std::ffi::OsString::from("/definitely/not/the/performance/worktree"),
+        ),
+        (
+            std::ffi::OsString::from("GIT_CONFIG_PARAMETERS"),
+            std::ffi::OsString::from("'core.worktree=/also/not/the/worktree'"),
+        ),
+        (
+            std::ffi::OsString::from("GIT_FUTURE_ATTACK_SURFACE"),
+            std::ffi::OsString::from("hostile"),
+        ),
+    ];
+    let (signal, detail) = validate_performance_budget_summary_with_git_env(
+        fixture.root.path(),
+        &fixture.summary,
+        &injected,
+    );
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("repository is not clean"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_ignores_repo_local_core_worktree_redirect() {
+    let fixture = performance_source_repository_fixture();
+    let redirected = fixture.root.path().join(".git/redirected-worktree");
+    for relative in [
+        "Cargo.toml",
+        ".gitattributes",
+        "source.txt",
+        PERF_BUDGET_SUMMARY_PATH,
+    ] {
+        let destination = redirected.join(relative);
+        std::fs::create_dir_all(destination.parent().expect("redirected fixture parent"))
+            .expect("create redirected worktree fixture directory");
+        std::fs::copy(fixture.root.path().join(relative), destination)
+            .expect("copy redirected worktree fixture file");
+    }
+    run_performance_fixture_git(
+        fixture.root.path(),
+        &[
+            "config",
+            "core.worktree",
+            redirected.to_str().expect("redirected path is UTF-8"),
+        ],
+    );
+    std::fs::write(
+        fixture.root.path().join("actual-root-untracked.txt"),
+        "hidden dirt\n",
+    )
+    .expect("write dirt in the canonical worktree");
+
+    let mut redirected_status = std::process::Command::new("git");
+    redirected_status.arg("-C").arg(fixture.root.path());
+    sanitize_performance_git_environment(&mut redirected_status, &[]);
+    let redirected_status = redirected_status
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .expect("inspect local-config redirected status");
+    assert!(
+        redirected_status.status.success() && redirected_status.stdout.is_empty(),
+        "fixture must demonstrate that repo-local core.worktree hides canonical-root dirt: {}",
+        String::from_utf8_lossy(&redirected_status.stderr)
+    );
+
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("repository is not clean"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_head_advance_during_validation() {
+    let fixture = performance_source_repository_fixture();
+    let advance_head = || {
+        let path = fixture
+            .root
+            .path()
+            .join("tests/perf/reports/concurrent-proof.json");
+        std::fs::write(&path, "{}\n").expect("write concurrent evidence follow-up");
+        run_performance_fixture_git(
+            fixture.root.path(),
+            &["add", "tests/perf/reports/concurrent-proof.json"],
+        );
+        commit_performance_fixture(fixture.root.path(), "concurrent evidence follow-up");
+    };
+    let (signal, detail) = validate_performance_budget_summary_with_options(
+        fixture.root.path(),
+        &fixture.summary,
+        &[],
+        Some(&advance_head),
+    );
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("HEAD changed"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_head_advance_at_final_validation() {
+    let fixture = performance_source_repository_fixture();
+    let advance_head = || {
+        let path = fixture
+            .root
+            .path()
+            .join("tests/perf/reports/late-concurrent-proof.json");
+        std::fs::write(&path, "{}\n").expect("write late concurrent evidence follow-up");
+        run_performance_fixture_git(
+            fixture.root.path(),
+            &["add", "tests/perf/reports/late-concurrent-proof.json"],
+        );
+        commit_performance_fixture(fixture.root.path(), "late concurrent evidence follow-up");
+    };
+    let (signal, detail) = validate_performance_budget_summary_with_hooks(
+        fixture.root.path(),
+        &fixture.summary,
+        &[],
+        None,
+        Some(&advance_head),
+    );
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("HEAD changed"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_raw_mutation_at_final_validation() {
+    let fixture = performance_source_repository_fixture();
+    let mutate_summary = || {
+        let path = fixture.root.path().join(PERF_BUDGET_SUMMARY_PATH);
+        let original = std::fs::read_to_string(&path).expect("read late-mutation fixture");
+        std::fs::write(&path, format!("{original} \n"))
+            .expect("write late filter-hidden performance mutation");
+        run_performance_fixture_git(
+            fixture.root.path(),
+            &["add", "--", PERF_BUDGET_SUMMARY_PATH],
+        );
+        run_performance_fixture_git(fixture.root.path(), &["diff", "--cached", "--quiet"]);
+    };
+    let (signal, detail) = validate_performance_budget_summary_with_hooks(
+        fixture.root.path(),
+        &fixture.summary,
+        &[],
+        None,
+        Some(&mutate_summary),
+    );
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(
+        detail.contains("bytes do not exactly match HEAD")
+            || detail.contains("changed during source validation"),
+        "{detail}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_git_directory_swap_during_validation() {
+    let fixture = performance_source_repository_fixture();
+    let replacement = tempdir().expect("create replacement Git repository fixture");
+    init_performance_fixture_repository(replacement.path());
+    std::fs::write(
+        replacement.path().join("replacement.txt"),
+        "replacement repository\n",
+    )
+    .expect("write replacement repository fixture");
+    run_performance_fixture_git(replacement.path(), &["add", "replacement.txt"]);
+    commit_performance_fixture(replacement.path(), "replacement repository");
+
+    let swap_git_directory = || {
+        std::fs::rename(
+            fixture.root.path().join(".git"),
+            fixture.root.path().join(".git-retained"),
+        )
+        .expect("retain original performance Git directory");
+        std::fs::rename(
+            replacement.path().join(".git"),
+            fixture.root.path().join(".git"),
+        )
+        .expect("install replacement performance Git directory");
+    };
+    let (signal, detail) = validate_performance_budget_summary_with_options(
+        fixture.root.path(),
+        &fixture.summary,
+        &[],
+        Some(&swap_git_directory),
+    );
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("path identity changed"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_non_default_index_flags() {
+    let fixture = performance_source_repository_fixture();
+    run_performance_fixture_git(
+        fixture.root.path(),
+        &["update-index", "--skip-worktree", "source.txt"],
+    );
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("index flags"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_filter_hidden_byte_substitution() {
+    let fixture = performance_source_repository_fixture();
+    let path = fixture.root.path().join(PERF_BUDGET_SUMMARY_PATH);
+    let original = std::fs::read_to_string(&path).expect("read performance summary fixture");
+    std::fs::write(&path, format!("{original} \n"))
+        .expect("write filter-normalized substitute bytes");
+    run_performance_fixture_git(fixture.root.path(), &["add", PERF_BUDGET_SUMMARY_PATH]);
+    run_performance_fixture_git(fixture.root.path(), &["diff", "--cached", "--quiet"]);
+    let status = performance_git_success_bytes(
+        fixture.root.path(),
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+        &[],
+    )
+    .expect("inspect filter-normalized fixture status");
+    assert!(
+        status.is_empty(),
+        "fixture must hide the byte substitution from ordinary Git status: {}",
+        String::from_utf8_lossy(&status)
+    );
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(
+        detail.contains("bytes do not exactly match HEAD"),
+        "{detail}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_filter_hidden_mode_substitution() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = performance_source_repository_fixture();
+    run_performance_fixture_git(fixture.root.path(), &["config", "core.filemode", "false"]);
+    let path = fixture.root.path().join(PERF_BUDGET_SUMMARY_PATH);
+    let mut permissions = std::fs::symlink_metadata(&path)
+        .expect("inspect performance fixture mode")
+        .permissions();
+    permissions.set_mode(permissions.mode() | 0o111);
+    std::fs::set_permissions(&path, permissions).expect("change live performance fixture mode");
+    let status = performance_git_success_bytes(
+        fixture.root.path(),
+        &[
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ],
+        &[],
+    )
+    .expect("inspect filemode-hidden fixture status");
+    assert!(
+        status.is_empty(),
+        "fixture must hide the mode substitution from ordinary Git status: {}",
+        String::from_utf8_lossy(&status)
+    );
+
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("executable mode"), "{detail}");
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_symlink_substitution() {
+    let fixture = performance_source_repository_fixture();
+    let path = fixture.root.path().join(PERF_BUDGET_SUMMARY_PATH);
+    let backup = path.with_file_name("budget_summary.backup");
+    std::fs::rename(&path, &backup).expect("retain performance summary fixture backup");
+    std::os::unix::fs::symlink("budget_summary.backup", &path)
+        .expect("create performance summary symlink substitute");
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(
+        detail.contains("nonsymlink") || detail.contains("symlink"),
+        "{detail}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_source_binding_rejects_product_followup_commit() {
+    let fixture = performance_source_repository_fixture();
+    std::fs::create_dir_all(fixture.root.path().join("src"))
+        .expect("create product follow-up fixture directory");
+    std::fs::write(
+        fixture.root.path().join("src/product.rs"),
+        "pub fn product() {}\n",
+    )
+    .expect("write product follow-up fixture");
+    run_performance_fixture_git(fixture.root.path(), &["add", "src/product.rs"]);
+    commit_performance_fixture(fixture.root.path(), "product follow-up");
+    assert_ne!(
+        fixture.source_commit,
+        run_performance_fixture_git(fixture.root.path(), &["rev-parse", "HEAD"])
+    );
+    let (signal, detail) =
+        validate_performance_budget_summary(fixture.root.path(), &fixture.summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("non-evidence path"), "{detail}");
 }
 
 #[test]
@@ -3610,11 +5674,14 @@ fn overall_verdict_reflects_dimensions() {
     let report = generate_report();
     let has_fail = report.dimensions.iter().any(|d| d.signal == Signal::Fail);
     let has_warn = report.dimensions.iter().any(|d| d.signal == Signal::Warn);
+    let has_no_data = report.dimensions.iter().any(|d| d.signal == Signal::NoData);
 
     if has_fail {
         assert_eq!(report.overall_verdict, Signal::Fail);
     } else if has_warn {
         assert_eq!(report.overall_verdict, Signal::Warn);
+    } else if has_no_data {
+        assert_eq!(report.overall_verdict, Signal::NoData);
     } else {
         assert_eq!(report.overall_verdict, Signal::Pass);
     }
@@ -3776,7 +5843,7 @@ fn check_cert_gate(
 ) -> CertEvidence {
     let (status, detail, sha) = match capture_committed_artifact(root, artifact_rel) {
         Err(err) => (Signal::Fail, err, None),
-        Ok(artifact) => match serde_json::from_slice::<V>(&artifact.contents) {
+        Ok(artifact) => match parse_release_json(&artifact.contents) {
             Err(err) => (
                 Signal::Fail,
                 format!("Committed artifact is not valid JSON ({artifact_rel}): {err}"),

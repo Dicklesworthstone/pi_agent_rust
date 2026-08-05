@@ -296,7 +296,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-root = Path(sys.argv[1])
+raw_root = Path(sys.argv[1])
 
 
 def fail(detail):
@@ -304,11 +304,43 @@ def fail(detail):
     raise SystemExit(1)
 
 
+if raw_root.is_symlink() or not raw_root.is_dir():
+    fail("repository root must be a real directory, not a symlink")
+try:
+    root = raw_root.resolve(strict=True)
+    git_marker = root / ".git"
+    if git_marker.is_symlink():
+        fail("repository .git marker must not be a symlink")
+    if git_marker.is_dir():
+        git_dir = git_marker.resolve(strict=True)
+    elif git_marker.is_file():
+        marker = git_marker.read_text(encoding="utf-8").rstrip("\r\n")
+        if "\n" in marker or "\r" in marker or not marker.startswith("gitdir: "):
+            fail("repository .git file is malformed")
+        target = Path(marker.removeprefix("gitdir: "))
+        git_dir = (target if target.is_absolute() else root / target).resolve(strict=True)
+    else:
+        fail("repository .git marker is missing")
+except (OSError, RuntimeError, UnicodeError) as exc:
+    fail(f"repository Git context could not be resolved safely: {exc}")
+if not git_dir.is_dir():
+    fail("repository Git directory is not a directory")
+
+
 def git(*args):
-    env = os.environ.copy()
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["GIT_LITERAL_PATHSPECS"] = "1"
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
     result = subprocess.run(
-        ["git", "-C", str(root), *args],
+        [
+            "git",
+            "--git-dir", str(git_dir),
+            "--work-tree", str(root),
+            "-c", "core.bare=false",
+            "-c", "core.fsmonitor=false",
+            "-c", f"core.worktree={root}",
+            *args,
+        ],
         capture_output=True,
         env=env,
         check=False,
@@ -329,8 +361,12 @@ def split_record(record, label):
     return metadata, path
 
 
-if root.is_symlink() or not root.is_dir():
-    fail("repository root must be a real directory, not a symlink")
+top_level_text = git("rev-parse", "--show-toplevel").decode("utf-8", "strict")
+if not top_level_text.endswith("\n") or "\n" in top_level_text.removesuffix("\n"):
+    fail("Git top-level output is not one canonical line")
+top_level = Path(top_level_text.removesuffix("\n")).resolve(strict=True)
+if top_level != root:
+    fail("Git worktree does not match the canonical release repository root")
 
 head = git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip()
 if len(head) not in (40, 64) or head.lower() != head or any(ch not in "0123456789abcdef" for ch in head):
@@ -388,61 +424,91 @@ if untracked_bytes:
     fail("untracked non-ignored paths are present: " + ", ".join(paths[:10]))
 
 root_bytes = os.fsencode(root)
-for path, (mode, expected_oid) in tree.items():
-    full_path = os.path.join(root_bytes, path)
-    parent = os.path.dirname(full_path)
-    while parent != root_bytes:
+
+
+def framed_field(value):
+    return str(len(value)).encode("ascii") + b":" + value
+
+
+def capture_raw_worktree_digest():
+    digest = hashlib.sha256()
+    for path, (mode, expected_oid) in tree.items():
+        full_path = os.path.join(root_bytes, path)
+        parent = os.path.dirname(full_path)
+        while parent != root_bytes:
+            try:
+                parent_stat = os.lstat(parent)
+            except OSError as exc:
+                fail(f"cannot inspect parent of {os.fsdecode(path)!r}: {exc}")
+            if stat.S_ISLNK(parent_stat.st_mode):
+                fail(f"tracked path traverses a symlinked parent: {os.fsdecode(path)!r}")
+            next_parent = os.path.dirname(parent)
+            if next_parent == parent or not parent.startswith(root_bytes + os.sep.encode()):
+                fail(f"tracked path escapes repository root: {os.fsdecode(path)!r}")
+            parent = next_parent
+
         try:
-            parent_stat = os.lstat(parent)
+            file_stat = os.lstat(full_path)
         except OSError as exc:
-            fail(f"cannot inspect parent of {os.fsdecode(path)!r}: {exc}")
-        if stat.S_ISLNK(parent_stat.st_mode):
-            fail(f"tracked path traverses a symlinked parent: {os.fsdecode(path)!r}")
-        next_parent = os.path.dirname(parent)
-        if next_parent == parent or not parent.startswith(root_bytes + os.sep.encode()):
-            fail(f"tracked path escapes repository root: {os.fsdecode(path)!r}")
-        parent = next_parent
+            fail(f"cannot inspect tracked path {os.fsdecode(path)!r}: {exc}")
+        if mode in (b"100644", b"100755"):
+            if not stat.S_ISREG(file_stat.st_mode):
+                fail(f"tracked regular file has wrong worktree type: {os.fsdecode(path)!r}")
+            actual_mode = b"100755" if file_stat.st_mode & 0o111 else b"100644"
+            if actual_mode != mode:
+                fail(
+                    f"raw worktree mode differs from release HEAD at {os.fsdecode(path)!r}: "
+                    f"expected={mode.decode('ascii')} actual={actual_mode.decode('ascii')}"
+                )
+            try:
+                with open(full_path, "rb") as handle:
+                    contents = handle.read()
+            except OSError as exc:
+                fail(f"cannot read tracked path {os.fsdecode(path)!r}: {exc}")
+        else:
+            if not stat.S_ISLNK(file_stat.st_mode):
+                fail(f"tracked symlink has wrong worktree type: {os.fsdecode(path)!r}")
+            actual_mode = b"120000"
+            try:
+                contents = os.readlink(full_path)
+            except OSError as exc:
+                fail(f"cannot read tracked symlink {os.fsdecode(path)!r}: {exc}")
 
-    try:
-        file_stat = os.lstat(full_path)
-    except OSError as exc:
-        fail(f"cannot inspect tracked path {os.fsdecode(path)!r}: {exc}")
-    if mode in (b"100644", b"100755"):
-        if not stat.S_ISREG(file_stat.st_mode):
-            fail(f"tracked regular file has wrong worktree type: {os.fsdecode(path)!r}")
-        try:
-            with open(full_path, "rb") as handle:
-                contents = handle.read()
-        except OSError as exc:
-            fail(f"cannot read tracked path {os.fsdecode(path)!r}: {exc}")
-    else:
-        if not stat.S_ISLNK(file_stat.st_mode):
-            fail(f"tracked symlink has wrong worktree type: {os.fsdecode(path)!r}")
-        try:
-            contents = os.readlink(full_path)
-        except OSError as exc:
-            fail(f"cannot read tracked symlink {os.fsdecode(path)!r}: {exc}")
+        framed_blob = b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents
+        if len(expected_oid) == 40:
+            actual_oid = hashlib.sha1(framed_blob).hexdigest().encode("ascii")
+        elif len(expected_oid) == 64:
+            actual_oid = hashlib.sha256(framed_blob).hexdigest().encode("ascii")
+        else:
+            fail(f"unsupported Git object ID length for {os.fsdecode(path)!r}")
+        if actual_oid != expected_oid:
+            fail(f"raw worktree bytes differ from release HEAD at {os.fsdecode(path)!r}")
 
-    framed = b"blob " + str(len(contents)).encode("ascii") + b"\0" + contents
-    if len(expected_oid) == 40:
-        actual_oid = hashlib.sha1(framed).hexdigest().encode("ascii")
-    elif len(expected_oid) == 64:
-        actual_oid = hashlib.sha256(framed).hexdigest().encode("ascii")
-    else:
-        fail(f"unsupported Git object ID length for {os.fsdecode(path)!r}")
-    if actual_oid != expected_oid:
-        fail(f"raw worktree bytes differ from release HEAD at {os.fsdecode(path)!r}")
+        digest.update(framed_field(path))
+        digest.update(framed_field(actual_mode))
+        digest.update(framed_field(contents))
+    return digest.hexdigest()
 
-if git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip() != head:
-    fail("HEAD changed while repository state was captured")
-if git("ls-files", "--stage", "-z") != index_bytes:
-    fail("index changed while repository state was captured")
-if git("ls-files", "-v", "-z") != flag_bytes:
-    fail("index flags changed while repository state was captured")
-if git("ls-files", "--others", "--exclude-standard", "-z") != untracked_bytes:
-    fail("untracked path set changed while repository state was captured")
 
-print(f"{head}|{tree_digest}")
+def verify_git_metadata_unchanged():
+    if git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip() != head:
+        fail("HEAD changed while repository state was captured")
+    if git("ls-files", "--stage", "-z") != index_bytes:
+        fail("index changed while repository state was captured")
+    if git("ls-files", "-v", "-z") != flag_bytes:
+        fail("index flags changed while repository state was captured")
+    if git("ls-files", "--others", "--exclude-standard", "-z") != untracked_bytes:
+        fail("untracked path set changed while repository state was captured")
+
+
+initial_worktree_digest = capture_raw_worktree_digest()
+verify_git_metadata_unchanged()
+final_worktree_digest = capture_raw_worktree_digest()
+if final_worktree_digest != initial_worktree_digest:
+    fail("raw tracked worktree bytes or modes changed while repository state was captured")
+verify_git_metadata_unchanged()
+
+print(f"{head}|{tree_digest}|{final_worktree_digest}")
 PY
 }
 
@@ -481,6 +547,7 @@ import fnmatch
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tomllib
@@ -493,18 +560,36 @@ def finish(status, detail):
     print(f"{status}|{detail}")
     raise SystemExit(0)
 
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
 def load_object(path, label):
-    if path.is_symlink():
-        finish("fail", f"{label} must be a regular file, not a symlink: {path}")
-    if not path.is_file():
-        finish("fail", f"{label} is missing: {path}")
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        metadata = path.lstat()
+    except FileNotFoundError:
+        finish("fail", f"{label} is missing: {path}")
+    except OSError as exc:
+        finish("fail", f"unable to inspect {label}: {exc}")
+    if not stat.S_ISREG(metadata.st_mode):
+        finish("fail", f"{label} must be a regular file, not a symlink or special file: {path}")
+    if os.name != "nt" and metadata.st_mode & 0o111:
+        finish("fail", f"{label} must not be executable: {path}")
+    try:
+        raw_bytes = path.read_bytes()
+        payload = json.loads(
+            raw_bytes.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+        )
     except Exception as exc:  # noqa: BLE001
         finish("fail", f"{label} is not valid JSON: {exc}")
     if not isinstance(payload, dict):
         finish("fail", f"{label} root must be an object")
-    return payload
+    return payload, raw_bytes
 
 def uint(value, label):
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63 - 1:
@@ -560,10 +645,14 @@ except ValueError:
 contract_path = evidence_resolved / "evidence_contract.json"
 environment_path = evidence_resolved / "environment.json"
 summary_path = evidence_resolved / "summary.json"
-decision_paths = [contract_path, environment_path, summary_path]
-contract = load_object(contract_path, "evidence contract")
-environment = load_object(environment_path, "E2E environment")
-summary = load_object(summary_path, "E2E summary")
+contract, contract_bytes = load_object(contract_path, "evidence contract")
+environment, environment_bytes = load_object(environment_path, "E2E environment")
+summary, summary_bytes = load_object(summary_path, "E2E summary")
+decision_inputs = [
+    (contract_path, contract_bytes),
+    (environment_path, environment_bytes),
+    (summary_path, summary_bytes),
+]
 
 if contract.get("schema") != "pi.evidence.contract.v1":
     finish("fail", f"unsupported evidence contract schema: {contract.get('schema')!r}")
@@ -682,8 +771,8 @@ for index, embedded_result in enumerate(summary_suites):
         finish("fail", f"summary.suites[{index}] has an unsafe suite name")
     observed_suite_names.append(suite_name)
     result_path = evidence_resolved / suite_name / "result.json"
-    decision_paths.append(result_path)
-    actual_result = load_object(result_path, f"E2E result for {suite_name}")
+    actual_result, result_bytes = load_object(result_path, f"E2E result for {suite_name}")
+    decision_inputs.append((result_path, result_bytes))
     for field in ("suite", "exit_code", "passed", "failed", "ignored", "total"):
         if actual_result.get(field) != embedded_result.get(field):
             finish("fail", f"summary and result.json disagree for {suite_name}.{field}")
@@ -783,7 +872,7 @@ untracked_paths = [path for path in untracked.stdout.split(b"\0") if path]
 if untracked_paths:
     finish("fail", "release worktree contains untracked non-ignored paths")
 
-for decision_path in decision_paths:
+for decision_path, captured_bytes in decision_inputs:
     relative = decision_path.relative_to(root_resolved).as_posix()
     tree_entry = run_git("ls-tree", "-z", "HEAD", "--", relative, text=False)
     if tree_entry.returncode != 0:
@@ -830,6 +919,10 @@ for decision_path in decision_paths:
         worktree_bytes = decision_path.read_bytes()
     except OSError as exc:
         finish("fail", f"unable to read E2E decision input {relative}: {exc}")
+    if committed.stdout != captured_bytes:
+        finish("fail", f"E2E decision input bytes parsed by the validator differ from release HEAD: {relative}")
+    if worktree_bytes != captured_bytes:
+        finish("fail", f"E2E decision input changed while it was being validated: {relative}")
     if committed.stdout != worktree_bytes:
         finish("fail", f"E2E decision input bytes differ from release HEAD: {relative}")
     diff = run_git("diff", "--quiet", "HEAD", "--", relative)
@@ -837,6 +930,41 @@ for decision_path in decision_paths:
         finish("fail", f"E2E decision input index/worktree differs from release HEAD: {relative}")
     if diff.returncode != 0:
         finish("fail", f"unable to inspect E2E decision input state: {relative}")
+
+final_head_check = run_git("rev-parse", "--verify", "HEAD^{commit}")
+if final_head_check.returncode != 0 or final_head_check.stdout.strip() != current_head:
+    finish("fail", "release HEAD changed while E2E decision inputs were being validated")
+final_tracked_diff = run_git("diff", "--quiet", "HEAD", "--")
+if final_tracked_diff.returncode == 1:
+    finish("fail", "release worktree/index changed while E2E decision inputs were being validated")
+if final_tracked_diff.returncode != 0:
+    finish("fail", "unable to re-inspect release worktree/index state")
+final_untracked = run_git("ls-files", "--others", "--exclude-standard", "-z", text=False)
+if final_untracked.returncode != 0:
+    finish("fail", "unable to re-inspect untracked release paths")
+if any(final_untracked.stdout.split(b"\0")):
+    finish("fail", "release worktree gained untracked non-ignored paths during validation")
+final_index_flags = run_git("ls-files", "-v", "-z", text=False)
+if final_index_flags.returncode != 0:
+    finish("fail", "unable to re-inspect repository index flags")
+if any(record and not record.startswith(b"H ") for record in final_index_flags.stdout.split(b"\0")):
+    finish("fail", "repository index flags changed while E2E decision inputs were being validated")
+for decision_path, captured_bytes in decision_inputs:
+    relative = decision_path.relative_to(root_resolved).as_posix()
+    try:
+        metadata = decision_path.lstat()
+        final_bytes = decision_path.read_bytes()
+    except OSError as exc:
+        finish("fail", f"unable to re-inspect E2E decision input {relative}: {exc}")
+    if not stat.S_ISREG(metadata.st_mode):
+        finish("fail", f"E2E decision input became a symlink or special file: {relative}")
+    if os.name != "nt" and metadata.st_mode & 0o111:
+        finish("fail", f"E2E decision input became executable during validation: {relative}")
+    if final_bytes != captured_bytes:
+        finish("fail", f"E2E decision input changed while it was being validated: {relative}")
+final_head_check = run_git("rev-parse", "--verify", "HEAD^{commit}")
+if final_head_check.returncode != 0 or final_head_check.stdout.strip() != current_head:
+    finish("fail", "release HEAD changed during the final E2E evidence recheck")
 
 finish(
     "pass",
@@ -883,6 +1011,14 @@ root = Path(sys.argv[1])
 summary_path = Path(sys.argv[2])
 minimum_rate = int(sys.argv[3])
 maximum_age = timedelta(hours=int(sys.argv[4]))
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
 
 
 def git(*args):
@@ -967,7 +1103,7 @@ else:
 if worktree_oid != head_oid:
     raise ValueError("raw conformance summary bytes differ from release HEAD")
 
-data = json.loads(raw_summary)
+data = json.loads(raw_summary, object_pairs_hook=reject_duplicate_keys)
 if not isinstance(data, dict):
     raise ValueError("summary root must be an object")
 if data.get("schema") != "pi.ext.conformance_summary.v2":
@@ -1144,16 +1280,18 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import tomllib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-project_root = Path(sys.argv[1])
-summary_path = Path(sys.argv[2])
+raw_project_root = Path(sys.argv[1])
+supplied_summary_path = Path(sys.argv[2])
 claim_ready_required = sys.argv[3] == "1"
 maximum_age = timedelta(hours=int(sys.argv[4]))
+PERFORMANCE_SUMMARY_RELATIVE_PATH = "tests/perf/reports/budget_summary.json"
 
 TOP_LEVEL_FIELDS = {
     "schema",
@@ -1224,6 +1362,36 @@ def finish(status, detail):
 
 def fail(detail):
     raise ContractError(detail)
+
+
+def resolve_repository_context():
+    if raw_project_root.is_symlink() or not raw_project_root.is_dir():
+        fail("performance repository root must be a real directory, not a symlink")
+    try:
+        resolved_root = raw_project_root.resolve(strict=True)
+        git_marker = resolved_root / ".git"
+        marker_metadata = git_marker.lstat()
+        if stat.S_ISLNK(marker_metadata.st_mode):
+            fail("performance repository .git marker must not be a symlink")
+        if stat.S_ISDIR(marker_metadata.st_mode):
+            resolved_git_dir = git_marker.resolve(strict=True)
+        elif stat.S_ISREG(marker_metadata.st_mode):
+            marker = git_marker.read_text(encoding="utf-8").rstrip("\r\n")
+            if "\n" in marker or "\r" in marker or not marker.startswith("gitdir: "):
+                fail("performance repository .git file is malformed")
+            target = Path(marker.removeprefix("gitdir: "))
+            candidate = target if target.is_absolute() else resolved_root / target
+            target_metadata = candidate.lstat()
+            if stat.S_ISLNK(target_metadata.st_mode) or not stat.S_ISDIR(target_metadata.st_mode):
+                fail("performance repository gitfile target must be a non-symlink directory")
+            resolved_git_dir = candidate.resolve(strict=True)
+        else:
+            fail("performance repository .git marker is not a directory or gitfile")
+    except (OSError, RuntimeError, UnicodeError) as exc:
+        fail(f"performance repository Git context could not be resolved safely: {exc}")
+    if not resolved_git_dir.is_dir():
+        fail("performance repository Git directory is not a directory")
+    return resolved_root, resolved_git_dir
 
 
 def reject_duplicate_keys(pairs):
@@ -1302,19 +1470,103 @@ def canonical_budget_inventory_json(budgets):
     return "[" + ",".join(records) + "]"
 
 
-def run_git(*args):
-    env = os.environ.copy()
+def run_git_result(*args):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
     env["GIT_LITERAL_PATHSPECS"] = "1"
-    result = subprocess.run(
-        ["git", "-C", str(project_root), *args],
+    env["GIT_NO_REPLACE_OBJECTS"] = "1"
+    return subprocess.run(
+        [
+            "git",
+            "--git-dir", str(git_dir),
+            "--work-tree", str(project_root),
+            "-c", "core.bare=false",
+            "-c", "core.fsmonitor=false",
+            "-c", f"core.worktree={project_root}",
+            *args,
+        ],
         capture_output=True,
         env=env,
         check=False,
     )
+
+
+def run_git(*args):
+    result = run_git_result(*args)
     if result.returncode != 0:
         diagnostic = result.stderr.decode("utf-8", "replace").strip()
         fail(f"git {' '.join(args)} failed: {diagnostic}")
     return result.stdout
+
+
+def canonical_head():
+    head = run_git("rev-parse", "--verify", "HEAD^{commit}").decode(
+        "ascii", "strict"
+    ).strip()
+    if OBJECT_ID_RE.fullmatch(head) is None:
+        fail(f"release HEAD is not a canonical full lowercase Git object ID: {head!r}")
+    return head
+
+
+def validate_performance_artifact_at_head(expected_head=None):
+    head = canonical_head()
+    if expected_head is not None and head != expected_head:
+        fail("release HEAD changed during performance summary validation")
+
+    expected_path = project_root / PERFORMANCE_SUMMARY_RELATIVE_PATH
+    if supplied_summary_path != expected_path:
+        fail("performance summary path is not the canonical repository-relative artifact path")
+    candidate = project_root
+    for component in Path(PERFORMANCE_SUMMARY_RELATIVE_PATH).parts:
+        candidate /= component
+        try:
+            metadata = candidate.lstat()
+        except OSError as exc:
+            fail(f"performance summary path component is unavailable: {candidate}: {exc}")
+        if stat.S_ISLNK(metadata.st_mode):
+            fail("performance summary path must not contain symlink components")
+    if not stat.S_ISREG(candidate.lstat().st_mode):
+        fail("performance summary must be a regular file")
+
+    tree_bytes = run_git(
+        "ls-tree",
+        "--full-tree",
+        "-z",
+        head,
+        "--",
+        PERFORMANCE_SUMMARY_RELATIVE_PATH,
+    )
+    entries = [entry for entry in tree_bytes.split(b"\0") if entry]
+    if len(entries) != 1:
+        fail("performance summary is not tracked exactly once at release HEAD")
+    try:
+        metadata, tracked_path = entries[0].split(b"\t", 1)
+    except ValueError:
+        fail("performance summary release HEAD entry is malformed")
+    fields = metadata.split(b" ")
+    if (
+        len(fields) != 3
+        or fields[0] not in (b"100644", b"100755")
+        or fields[1] != b"blob"
+        or tracked_path != PERFORMANCE_SUMMARY_RELATIVE_PATH.encode("utf-8")
+    ):
+        fail("performance summary release HEAD entry must be the exact regular-file blob")
+
+    live_metadata = candidate.lstat()
+    live_mode = b"100755" if live_metadata.st_mode & 0o111 else b"100644"
+    if live_mode != fields[0]:
+        fail("performance summary worktree mode does not exactly match release HEAD")
+    head_bytes = run_git("cat-file", "blob", fields[2].decode("ascii", "strict"))
+    live_bytes = candidate.read_bytes()
+    if live_bytes != head_bytes:
+        fail("performance summary raw worktree bytes do not exactly match release HEAD")
+    return head, head_bytes
+
+
+def finish_validated(status, detail):
+    final_head, final_bytes = validate_performance_artifact_at_head(artifact_head)
+    if final_head != artifact_head or final_bytes != artifact_bytes:
+        fail("performance summary binding changed during validation")
+    finish(status, detail)
 
 
 def package_includes(path, patterns):
@@ -1329,18 +1581,15 @@ def package_includes(path, patterns):
     return False
 
 
-def verify_claim_source_binding(source_commit):
-    head = run_git("rev-parse", "--verify", "HEAD^{commit}").decode("ascii", "strict").strip()
+def verify_claim_source_binding(source_commit, head):
+    if canonical_head() != head:
+        fail("release HEAD changed during performance source binding validation")
     resolved = run_git("rev-parse", "--verify", f"{source_commit}^{{commit}}").decode(
         "ascii", "strict"
     ).strip()
     if resolved != source_commit:
         fail("source_commit does not resolve to the exact recorded commit")
-    ancestor = subprocess.run(
-        ["git", "-C", str(project_root), "merge-base", "--is-ancestor", source_commit, head],
-        capture_output=True,
-        check=False,
-    )
+    ancestor = run_git_result("merge-base", "--is-ancestor", source_commit, head)
     if ancestor.returncode == 1:
         fail("performance source commit is not an ancestor of release HEAD")
     if ancestor.returncode != 0:
@@ -1378,9 +1627,9 @@ def verify_claim_source_binding(source_commit):
 
 
 try:
-    if summary_path.is_symlink() or not summary_path.is_file():
-        fail("performance summary must be a regular file, not a symlink")
-    raw = summary_path.read_text(encoding="utf-8")
+    project_root, git_dir = resolve_repository_context()
+    artifact_head, artifact_bytes = validate_performance_artifact_at_head()
+    raw = artifact_bytes.decode("utf-8", "strict")
     data = json.loads(raw, object_pairs_hook=reject_duplicate_keys)
     exact_fields(data, TOP_LEVEL_FIELDS, "performance summary")
     if data["schema"] != "pi.perf.budget_summary.v2":
@@ -1404,7 +1653,7 @@ try:
     ):
         fail("source_commit must be null or a canonical full lowercase Git object ID")
     if source_commit is not None:
-        verify_claim_source_binding(source_commit)
+        verify_claim_source_binding(source_commit, artifact_head)
     run_id = nullable_lineage(data["run_id"], "run_id")
     correlation_id = nullable_lineage(data["correlation_id"], "correlation_id")
     if run_id != correlation_id:
@@ -1624,7 +1873,7 @@ try:
     if claim_ready:
         if now - generated_at > maximum_age:
             fail(f"performance summary is stale ({now - generated_at} old; maximum {maximum_age})")
-        finish(
+        finish_validated(
             "pass",
             f"performance claims authorized: all {counts['total_budgets']} declared budgets "
             f"have data and pass; strict v2 evidence source={source_commit} run={run_id} "
@@ -1636,8 +1885,10 @@ try:
         f"(blocking_reason_codes={','.join(expected_reasons)})"
     )
     if claim_ready_required:
-        finish("fail", f"{detail}; RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=1")
-    finish("warn", f"{detail}; release must make no quantitative or global performance claims")
+        finish_validated("fail", f"{detail}; RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=1")
+    finish_validated(
+        "warn", f"{detail}; release must make no quantitative or global performance claims"
+    )
 except (ContractError, OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
     finish("fail", f"invalid performance budget summary: {exc}")
 PY
@@ -1759,8 +2010,20 @@ import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
+
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
+
 try:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    data = json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=reject_duplicate_keys,
+    )
 except Exception as exc:  # noqa: BLE001
     print(f"parse_error:{exc}")
     raise SystemExit(0)
@@ -1828,15 +2091,16 @@ fi
 
 # Gate 14: Drop-in certification verdict (required for strict claim mode)
 DROPIN_VERDICT="$PROJECT_ROOT/docs/evidence/dropin-certification-verdict.json"
-if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" 2>&1 <<'PY'
+if DROPIN_CHECK=$(python3 - "$PROJECT_ROOT" "$DROPIN_CONTRACT" "$DROPIN_VERDICT" "$REQUIRE_DROPIN_CERTIFIED" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'
 import fnmatch
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tomllib
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 project_root = Path(sys.argv[1])
@@ -1846,16 +2110,24 @@ verdict_path = Path(sys.argv[3])
 # RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED. Reading an unrelated env var here
 # can silently disable strict drop-in enforcement.
 strict_required = sys.argv[4] == "1"
+max_evidence_age = timedelta(hours=int(sys.argv[5]))
 certification_claimed = False
+DROPIN_CONTRACT_RELATIVE = "docs/contracts/dropin-certification-contract.json"
+DROPIN_VERDICT_RELATIVE = "docs/evidence/dropin-certification-verdict.json"
+decision_inputs = []
+current_head = None
 
 def finish(status, detail):
     print(f"{status}|{detail}")
     raise SystemExit(0)
 
-def provenance_failure(detail):
-    if strict_required or certification_claimed:
-        finish("fail", detail)
-    finish("warn", f"{detail} (strict drop-in mode disabled)")
+def reject_duplicate_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        value[key] = item
+    return value
 
 def run_git(*args, text=True):
     env = os.environ.copy()
@@ -1867,6 +2139,134 @@ def run_git(*args, text=True):
         env=env,
         check=False,
     )
+
+def canonical_input_metadata(path, relative, label):
+    expected_path = project_root / relative
+    if path != expected_path:
+        finish("fail", f"{label} path is not the canonical repository path: {relative}")
+    current = project_root
+    try:
+        root_metadata = current.lstat()
+        if stat.S_ISLNK(root_metadata.st_mode) or not stat.S_ISDIR(root_metadata.st_mode):
+            finish("fail", "drop-in repository root must be a real directory, not a symlink")
+        parts = Path(relative).parts
+        for index, component in enumerate(parts):
+            current /= component
+            metadata = current.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                finish("fail", f"{label} path must not contain symlink components: {relative}")
+            if index + 1 < len(parts) and not stat.S_ISDIR(metadata.st_mode):
+                finish("fail", f"{label} parent component is not a directory: {current}")
+    except FileNotFoundError:
+        finish("fail", f"{label} is missing: {relative}")
+    except OSError as exc:
+        finish("fail", f"unable to inspect {label}: {exc}")
+    if not stat.S_ISREG(metadata.st_mode):
+        finish("fail", f"{label} must be a regular non-symlink file: {relative}")
+    if os.name != "nt" and metadata.st_mode & 0o111:
+        finish("fail", f"{label} must not be executable: {relative}")
+    return metadata
+
+def load_json_input(path, relative, label):
+    canonical_input_metadata(path, relative, label)
+    try:
+        raw_bytes = path.read_bytes()
+        payload = json.loads(
+            raw_bytes.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except Exception as exc:  # noqa: BLE001
+        finish("fail", f"{label} parse error: {exc}")
+    if not isinstance(payload, dict):
+        finish("fail", f"{label} root must be an object")
+    return payload, raw_bytes
+
+def canonical_current_head():
+    head_check = run_git("rev-parse", "--verify", "HEAD^{commit}")
+    if head_check.returncode != 0:
+        finish("fail", "unable to resolve the current release HEAD")
+    head = head_check.stdout.strip()
+    if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", head) is None:
+        finish("fail", f"current release HEAD is not a canonical full object ID: {head!r}")
+    return head
+
+def verify_decision_inputs(expected_head):
+    if canonical_current_head() != expected_head:
+        finish("fail", "release HEAD changed while drop-in decision inputs were being validated")
+    for path, relative, label, captured_bytes in decision_inputs:
+        canonical_input_metadata(path, relative, label)
+
+        tree_entry = run_git("ls-tree", "-z", expected_head, "--", relative, text=False)
+        if tree_entry.returncode != 0:
+            finish("fail", f"unable to inspect committed {label}: {relative}")
+        records = [record for record in tree_entry.stdout.split(b"\0") if record]
+        if len(records) != 1:
+            finish("fail", f"{label} must have exactly one entry in release HEAD: {relative}")
+        try:
+            metadata, recorded_path = records[0].split(b"\t", 1)
+            mode, object_type, object_id = metadata.split(b" ", 2)
+        except ValueError:
+            finish("fail", f"{label} has a malformed release HEAD entry: {relative}")
+        if mode != b"100644" or object_type != b"blob" or os.fsdecode(recorded_path) != relative:
+            finish("fail", f"{label} must be a canonical non-executable JSON blob in release HEAD: {relative}")
+
+        index_entry = run_git("ls-files", "--stage", "-z", "--", relative, text=False)
+        if index_entry.returncode != 0:
+            finish("fail", f"unable to inspect {label} index entry: {relative}")
+        index_records = [record for record in index_entry.stdout.split(b"\0") if record]
+        if len(index_records) != 1:
+            finish("fail", f"{label} must have exactly one canonical index entry: {relative}")
+        try:
+            index_metadata, index_path = index_records[0].split(b"\t", 1)
+            index_mode, index_object_id, index_stage = index_metadata.split(b" ", 2)
+        except ValueError:
+            finish("fail", f"{label} has a malformed index entry: {relative}")
+        if (
+            index_mode != mode
+            or index_object_id != object_id
+            or index_stage != b"0"
+            or os.fsdecode(index_path) != relative
+        ):
+            finish("fail", f"{label} index entry differs from release HEAD: {relative}")
+
+        flags = run_git("ls-files", "-v", "-z", "--", relative, text=False)
+        if flags.returncode != 0:
+            finish("fail", f"unable to inspect {label} index flags: {relative}")
+        flag_records = [record for record in flags.stdout.split(b"\0") if record]
+        if flag_records != [b"H " + os.fsencode(relative)]:
+            finish("fail", f"{label} has non-canonical index flags: {relative}")
+
+        committed = run_git("cat-file", "blob", os.fsdecode(object_id), text=False)
+        if committed.returncode != 0:
+            finish("fail", f"unable to read committed {label}: {relative}")
+        try:
+            current_bytes = path.read_bytes()
+        except OSError as exc:
+            finish("fail", f"unable to read current {label}: {exc}")
+        if committed.stdout != captured_bytes:
+            finish("fail", f"{label} bytes parsed by the validator differ from release HEAD: {relative}")
+        if current_bytes != captured_bytes:
+            finish("fail", f"{label} changed while it was being validated: {relative}")
+
+        diff = run_git("diff", "--quiet", "HEAD", "--", relative)
+        if diff.returncode == 1:
+            finish("fail", f"{label} index/worktree differs from release HEAD: {relative}")
+        if diff.returncode != 0:
+            finish("fail", f"unable to inspect current {label} state: {relative}")
+
+    if canonical_current_head() != expected_head:
+        finish("fail", "release HEAD changed during the final drop-in decision-input recheck")
+
+def finish_verified(status, detail):
+    if current_head is None or len(decision_inputs) != 2:
+        finish("fail", "drop-in decision-input verification was not initialized")
+    verify_decision_inputs(current_head)
+    finish(status, detail)
+
+def provenance_failure(detail):
+    if strict_required or certification_claimed:
+        finish("fail", detail)
+    finish_verified("warn", f"{detail} (strict drop-in mode disabled)")
 
 def package_includes(path, patterns):
     for raw_pattern in patterns:
@@ -1892,16 +2292,14 @@ def canonical_repo_path(relative):
         return None
     return pure
 
-if contract_path.is_symlink() or not contract_path.is_file():
-    finish("fail", "contract must be a regular non-symlink file")
-
-try:
-    contract = json.loads(contract_path.read_text(encoding="utf-8"))
-except Exception as exc:  # noqa: BLE001
-    finish("fail", f"contract parse error: {exc}")
-
-if not isinstance(contract, dict):
-    finish("fail", "contract root must be an object")
+contract, contract_bytes = load_json_input(
+    contract_path,
+    DROPIN_CONTRACT_RELATIVE,
+    "drop-in contract",
+)
+decision_inputs.append(
+    (contract_path, DROPIN_CONTRACT_RELATIVE, "drop-in contract", contract_bytes)
+)
 
 enforcement = contract.get("release_process_enforcement")
 if not isinstance(enforcement, dict):
@@ -1936,26 +2334,37 @@ required_verdict_fields = {
 if set(required_fields) != required_verdict_fields:
     finish("fail", "contract verdict required_fields do not match the supported v1 schema")
 
-if verdict_path.is_symlink() or not verdict_path.is_file():
-    if strict_required:
-        finish(
-            "fail",
-            "docs/evidence/dropin-certification-verdict.json must be a regular non-symlink file in strict drop-in mode",
-        )
-    else:
-        finish(
-            "warn",
-            "docs/evidence/dropin-certification-verdict.json is absent or not a regular non-symlink file "
-            "(strict drop-in mode disabled)",
-        )
-
 try:
-    verdict = json.loads(verdict_path.read_text(encoding="utf-8"))
-except Exception as exc:  # noqa: BLE001
-    finish("fail", f"verdict parse error: {exc}")
+    verdict_path.lstat()
+except FileNotFoundError:
+    if strict_required:
+        finish("fail", f"{DROPIN_VERDICT_RELATIVE} is missing in strict drop-in mode")
+    current_head = canonical_current_head()
+    verify_decision_inputs(current_head)
+    try:
+        verdict_path.lstat()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        finish("fail", f"unable to re-inspect missing drop-in verdict: {exc}")
+    else:
+        finish("fail", "drop-in verdict appeared while its absence was being validated")
+    verify_decision_inputs(current_head)
+    finish(
+        "warn",
+        f"{DROPIN_VERDICT_RELATIVE} is absent (strict drop-in mode disabled)",
+    )
+except OSError as exc:
+    finish("fail", f"unable to inspect drop-in verdict: {exc}")
 
-if not isinstance(verdict, dict):
-    finish("fail", "verdict root must be an object")
+verdict, verdict_bytes = load_json_input(
+    verdict_path,
+    DROPIN_VERDICT_RELATIVE,
+    "drop-in verdict",
+)
+decision_inputs.append(
+    (verdict_path, DROPIN_VERDICT_RELATIVE, "drop-in verdict", verdict_bytes)
+)
 
 missing_fields = [field for field in required_fields if field not in verdict]
 if missing_fields:
@@ -1972,20 +2381,38 @@ certification_claimed = overall == "CERTIFIED"
 if strict_required and overall != "CERTIFIED":
     finish("fail", f"overall_verdict={overall} (expected CERTIFIED in strict mode)")
 
+generated_at = verdict.get("generated_at_utc")
+if (
+    not isinstance(generated_at, str)
+    or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z", generated_at)
+    is None
+):
+    finish("fail", "generated_at_utc must be a canonical RFC3339 UTC timestamp ending in Z")
+try:
+    generated_at_time = datetime.fromisoformat(generated_at.removesuffix("Z") + "+00:00")
+except ValueError:
+    finish("fail", "generated_at_utc must be a valid RFC3339 UTC timestamp")
+now = datetime.now(timezone.utc)
+if generated_at_time > now + timedelta(minutes=5):
+    finish("fail", "generated_at_utc is more than five minutes in the future")
+if now - generated_at_time > max_evidence_age:
+    finish(
+        "fail",
+        f"generated_at_utc is older than the configured {int(max_evidence_age.total_seconds() // 3600)}h evidence limit",
+    )
+
 verdict_commit = verdict.get("git_commit")
 if not isinstance(verdict_commit, str) or re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", verdict_commit) is None:
     finish("fail", "git_commit must be a full lowercase Git object ID")
+
+current_head = canonical_current_head()
+verify_decision_inputs(current_head)
 
 commit_check = run_git("rev-parse", "--verify", f"{verdict_commit}^{{commit}}")
 if commit_check.returncode != 0:
     finish("fail", f"git_commit={verdict_commit} is not a commit in this repository")
 if commit_check.stdout.strip() != verdict_commit:
     finish("fail", f"git_commit={verdict_commit} did not resolve exactly")
-
-head_check = run_git("rev-parse", "--verify", "HEAD^{commit}")
-if head_check.returncode != 0:
-    finish("fail", "unable to resolve the current release HEAD")
-current_head = head_check.stdout.strip()
 
 if verdict_commit != current_head:
     ancestor_check = run_git("merge-base", "--is-ancestor", verdict_commit, current_head)
@@ -2044,14 +2471,6 @@ hard_gate_results = verdict.get("hard_gate_results")
 if strict_required or certification_claimed:
     if not isinstance(hard_gate_results, list) or not hard_gate_results:
         finish("fail", "hard_gate_results missing/empty in strict mode")
-
-    generated_at = verdict.get("generated_at_utc")
-    if not isinstance(generated_at, str) or not generated_at.endswith("Z"):
-        finish("fail", "generated_at_utc must be an RFC3339 UTC timestamp ending in Z")
-    try:
-        datetime.fromisoformat(generated_at.removesuffix("Z") + "+00:00")
-    except ValueError:
-        finish("fail", "generated_at_utc must be a valid RFC3339 UTC timestamp")
 
     gate_id_pattern = re.compile(r"G(0[1-9]|1[0-2])-[a-z0-9]+(?:-[a-z0-9]+)*")
     expected_gate_specs = []
@@ -2268,9 +2687,9 @@ if strict_required or certification_claimed:
         finish("fail", "evidence paths contain untracked files: " + ", ".join(untracked_paths))
 
 if strict_required or certification_claimed:
-    finish("pass", "strict drop-in certification verdict is CERTIFIED with complete hard-gate evidence")
+    finish_verified("pass", "strict drop-in certification verdict is CERTIFIED with complete hard-gate evidence")
 else:
-    finish("warn", f"release-source drop-in verdict is not certified (overall_verdict={overall}; strict drop-in mode disabled)")
+    finish_verified("warn", f"release-source drop-in verdict is not certified (overall_verdict={overall}; strict drop-in mode disabled)")
 PY
 ); then
     :

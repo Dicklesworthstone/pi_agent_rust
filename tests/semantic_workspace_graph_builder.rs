@@ -98,6 +98,83 @@ fn bind_fixture_performance_summary_to_source(root: &Path) -> TestResult {
     Ok(())
 }
 
+#[cfg(unix)]
+fn shell_single_quote(path: &Path) -> TestResult<String> {
+    let path = path
+        .to_str()
+        .ok_or("fixture path must be valid UTF-8 for a POSIX shell command")?;
+    Ok(format!("'{}'", path.replace('\'', "'\\''")))
+}
+
+#[cfg(unix)]
+fn bind_fixture_performance_summary_with_hiding_filter(root: &Path) -> TestResult {
+    run_fixture_git(root, &["init", "-b", "main"])?;
+    run_fixture_git(
+        root,
+        &["config", "user.email", "pi-context-e2e@example.invalid"],
+    )?;
+    run_fixture_git(root, &["config", "user.name", "Pi Context E2E"])?;
+
+    let summary_path = root.join("tests/perf/reports/budget_summary.json");
+    let canonical_summary = root.join(".git/canonical-performance-summary.json");
+    fs::copy(&summary_path, &canonical_summary)?;
+    let filter_command = format!("cat {}", shell_single_quote(&canonical_summary)?);
+    run_fixture_git(
+        root,
+        &["config", "filter.canonical-summary.clean", &filter_command],
+    )?;
+    run_fixture_git(
+        root,
+        &["config", "filter.canonical-summary.required", "true"],
+    )?;
+    run_fixture_git(root, &["add", "."])?;
+    run_fixture_git(root, &["commit", "-m", "fixture baseline"])?;
+
+    let source_commit = fixture_git_output(root, &["rev-parse", "HEAD"])?;
+    let mut summary: serde_json::Value = serde_json::from_slice(&fs::read(&summary_path)?)?;
+    summary["source_commit"] = json!(source_commit);
+    let summary_bytes = serde_json::to_vec_pretty(&summary)?;
+    fs::write(&summary_path, &summary_bytes)?;
+    fs::write(&canonical_summary, &summary_bytes)?;
+    run_fixture_git(root, &["add", "tests/perf/reports/budget_summary.json"])?;
+    run_fixture_git(root, &["commit", "-m", "bind performance evidence"])?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bind_fixture_performance_summary_with_source_hiding_filter(root: &Path) -> TestResult {
+    run_fixture_git(root, &["init", "-b", "main"])?;
+    run_fixture_git(
+        root,
+        &["config", "user.email", "pi-context-e2e@example.invalid"],
+    )?;
+    run_fixture_git(root, &["config", "user.name", "Pi Context E2E"])?;
+
+    let source_path = root.join("src/lib.rs");
+    let canonical_source = root.join(".git/canonical-source.rs");
+    fs::copy(&source_path, &canonical_source)?;
+    let filter_command = format!("cat {}", shell_single_quote(&canonical_source)?);
+    run_fixture_git(
+        root,
+        &["config", "filter.canonical-source.clean", &filter_command],
+    )?;
+    run_fixture_git(
+        root,
+        &["config", "filter.canonical-source.required", "true"],
+    )?;
+    run_fixture_git(root, &["add", "."])?;
+    run_fixture_git(root, &["commit", "-m", "fixture baseline"])?;
+
+    let source_commit = fixture_git_output(root, &["rev-parse", "HEAD"])?;
+    let summary_path = root.join("tests/perf/reports/budget_summary.json");
+    let mut summary: serde_json::Value = serde_json::from_slice(&fs::read(&summary_path)?)?;
+    summary["source_commit"] = json!(source_commit);
+    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+    run_fixture_git(root, &["add", "tests/perf/reports/budget_summary.json"])?;
+    run_fixture_git(root, &["commit", "-m", "bind performance evidence"])?;
+    Ok(())
+}
+
 fn fixture_workspace() -> TestResult<TempDir> {
     let temp = std::env::var_os("TMPDIR")
         .map(PathBuf::from)
@@ -106,9 +183,25 @@ fn fixture_workspace() -> TestResult<TempDir> {
                 .ok()
                 .and_then(|()| tempfile::Builder::new().tempdir_in(&tmpdir).ok())
         })
-        .map_or_else(|| tempfile::Builder::new().tempdir_in("/tmp"), Ok)?;
+        .map_or_else(
+            || tempfile::Builder::new().tempdir_in(std::env::temp_dir()),
+            Ok,
+        )?;
     let root = temp.path();
 
+    write_fixture(
+        root,
+        "Cargo.toml",
+        r#"[package]
+name = "semantic-workspace-fixture"
+version = "0.0.0"
+edition = "2024"
+include = [
+    "/docs/evidence/tool-output-context-cache.jsonl",
+    "/src/**",
+]
+"#,
+    )?;
     write_fixture(
         root,
         "src/lib.rs",
@@ -209,7 +302,7 @@ Parity ledger claims cite docs/evidence/dropin-parity-gap-ledger.json.
         root,
         "docs/evidence/dropin-certification-verdict.json",
         r#"{
-  "schema": "pi.dropin_certification.verdict.v1",
+  "schema": "pi.dropin.certification_verdict.v1",
   "generated_at": "2026-01-01T00:00:00Z",
   "overall_verdict": "CERTIFIED",
   "claim_surface": "release_facing"
@@ -218,29 +311,7 @@ Parity ledger claims cite docs/evidence/dropin-parity-gap-ledger.json.
     write_fixture(
         root,
         "tests/perf/reports/budget_summary.json",
-        r#"{
-  "schema": "pi.perf.budget_summary.v2",
-  "generated_at": "2026-05-13T00:00:00.000Z",
-  "source_commit": "0123456789abcdef0123456789abcdef01234567",
-  "run_id": "fixture-run",
-  "correlation_id": "fixture-run",
-  "strict_mode": true,
-  "total_budgets": 2,
-  "pass": 2,
-  "fail": 0,
-  "no_data": 0,
-  "ci_enforced": 2,
-  "ci_with_data": 2,
-  "ci_fail": 0,
-  "ci_no_data": 0,
-  "data_contract_failures_count": 0,
-  "claim_readiness": {
-    "status": "claim_ready",
-    "performance_claims_authorized": true,
-    "blocking_reason_codes": []
-  },
-  "claim_surface": "release_facing"
-}"#,
+        &serde_json::to_string_pretty(&semantic_perf_budget_fixture())?,
     )?;
     write_fixture(
         root,
@@ -595,6 +666,36 @@ fn node_with_source<'a>(
         .ok_or_else(|| format!("missing {node_type:?} node for {source_path}").into())
 }
 
+fn assert_performance_fixture_reason(
+    root: &Path,
+    source_path: &str,
+    expected_reason: &str,
+) -> TestResult {
+    let graph = build_fixture_graph(root)?;
+    let perf_budget = node_with_source(&graph, SemanticNodeType::EvidenceArtifact, source_path)?;
+    assert_eq!(
+        perf_budget.freshness_status,
+        Some(EvidenceFreshnessStatus::Malformed)
+    );
+    assert_eq!(
+        perf_budget.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        perf_budget.metadata.get("freshness_reason"),
+        Some(&json!(expected_reason))
+    );
+    Ok(())
+}
+
+fn ignore_fixture_path(root: &Path, relative_path: &str) -> TestResult {
+    let mut exclude = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join(".git/info/exclude"))?;
+    writeln!(exclude, "/{relative_path}")?;
+    Ok(())
+}
+
 fn bead_status(
     graph: &SemanticWorkspaceGraph,
     bead_id: &str,
@@ -729,6 +830,33 @@ fn graph_cache_validation_enforces_scope_ttl_and_path_policy() -> TestResult {
 }
 
 fn semantic_perf_budget_fixture() -> serde_json::Value {
+    let checked_in: serde_json::Value =
+        serde_json::from_str(include_str!("perf/reports/budget_summary.json"))
+            .expect("checked-in performance summary must be valid JSON");
+    let budgets = checked_in["budgets"]
+        .as_array()
+        .cloned()
+        .expect("checked-in performance summary must contain canonical budgets");
+    let budget_results = budgets
+        .iter()
+        .map(|budget| {
+            json!({
+                "budget_name": budget["name"],
+                "category": budget["category"],
+                "threshold": budget["threshold"],
+                "comparison": budget["comparison"],
+                "unit": budget["unit"],
+                "actual": budget["threshold"],
+                "status": "PASS",
+                "source": "semantic graph contract fixture",
+                "ci_enforced": budget["ci_enforced"]
+            })
+        })
+        .collect::<Vec<_>>();
+    let ci_enforced = budgets
+        .iter()
+        .filter(|budget| budget["ci_enforced"].as_bool() == Some(true))
+        .count();
     json!({
         "schema": "pi.perf.budget_summary.v2",
         "generated_at": "2026-05-13T00:00:00.000Z",
@@ -736,22 +864,209 @@ fn semantic_perf_budget_fixture() -> serde_json::Value {
         "run_id": "fixture-run",
         "correlation_id": "fixture-run",
         "strict_mode": true,
-        "total_budgets": 2,
-        "pass": 2,
+        "total_budgets": budgets.len(),
+        "pass": budgets.len(),
         "fail": 0,
         "no_data": 0,
-        "ci_enforced": 2,
-        "ci_with_data": 2,
+        "ci_enforced": ci_enforced,
+        "ci_with_data": ci_enforced,
         "ci_fail": 0,
         "ci_no_data": 0,
         "data_contract_failures_count": 0,
+        "failing_data_contracts": [],
+        "budgets": budgets,
+        "budget_results": budget_results,
         "claim_readiness": {
             "status": "claim_ready",
             "performance_claims_authorized": true,
             "blocking_reason_codes": []
-        },
-        "claim_surface": "release_facing"
+        }
     })
+}
+
+#[test]
+fn evidence_ingestion_rejects_duplicate_object_keys_recursively() -> TestResult {
+    let temp = fixture_workspace()?;
+    let cases = [
+        (
+            "docs/evidence/duplicate-top-level.json",
+            r#"{"schema":"fixture.duplicate.v1","attacker_secret_top_7f2a":1,"attacker_secret_top_7f2a":2}"#,
+            "attacker_secret_top_7f2a",
+        ),
+        (
+            "docs/evidence/duplicate-nested.json",
+            r#"{"schema":"fixture.duplicate.v1","claim":{"attacker_secret_nested_9c4b":"blocked","attacker_secret_nested_9c4b":"claim_ready"}}"#,
+            "attacker_secret_nested_9c4b",
+        ),
+    ];
+    for (path, content, _) in cases {
+        write_fixture(temp.path(), path, content)?;
+    }
+
+    let graph = build_fixture_graph(temp.path())?;
+    for (path, _, duplicate_key) in cases {
+        let node = node_with_source(&graph, SemanticNodeType::EvidenceArtifact, path)?;
+        assert_eq!(
+            node.freshness_status,
+            Some(EvidenceFreshnessStatus::Malformed)
+        );
+        assert_eq!(
+            node.metadata.get("freshness_reason"),
+            Some(&json!("json_parse_failed"))
+        );
+        let parse_error = node
+            .metadata
+            .get("parse_error")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("duplicate-key evidence must retain a parse error")?;
+        assert!(
+            parse_error.contains("duplicate JSON object key")
+                && !parse_error.contains(duplicate_key),
+            "unexpected duplicate-key parse error: {parse_error}"
+        );
+        assert!(
+            !serde_json::to_string(&graph)?.contains(duplicate_key),
+            "attacker-controlled duplicate key leaked into the graph"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn evidence_ingestion_rejects_invalid_utf8_without_lossy_replacement() -> TestResult {
+    let temp = fixture_workspace()?;
+    let path = "docs/evidence/invalid-utf8.json";
+    let full_path = temp.path().join(path);
+    fs::write(
+        &full_path,
+        b"{\"schema\":\"fixture.invalid_utf8.v1\",\"value\":\"\xff\"}",
+    )?;
+    let expected_sha256 = format!("{:x}", Sha256::digest(fs::read(&full_path)?));
+
+    let graph = build_fixture_graph(temp.path())?;
+    let node = node_with_source(&graph, SemanticNodeType::EvidenceArtifact, path)?;
+    assert_eq!(
+        node.freshness_status,
+        Some(EvidenceFreshnessStatus::Malformed)
+    );
+    assert_eq!(
+        node.metadata.get("freshness_reason"),
+        Some(&json!("invalid_utf8"))
+    );
+    assert_eq!(
+        node.content_sha256.as_deref(),
+        Some(expected_sha256.as_str())
+    );
+    assert_eq!(node.redaction_status, RedactionStatus::SensitiveOmitted);
+    Ok(())
+}
+
+#[test]
+fn canonical_critical_evidence_validators_ignore_payload_schema_dispatch() -> TestResult {
+    for schema in [None, Some("fixture.attacker_budget.v99")] {
+        let temp = fixture_workspace()?;
+        let path = temp.path().join("tests/perf/reports/budget_summary.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        match schema {
+            Some(schema) => value["schema"] = json!(schema),
+            None => {
+                value
+                    .as_object_mut()
+                    .ok_or("performance fixture must be an object")?
+                    .remove("schema");
+            }
+        }
+        fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+
+        assert_performance_fixture_reason(
+            temp.path(),
+            "tests/perf/reports/budget_summary.json",
+            "performance_budget_schema_not_current",
+        )?;
+    }
+
+    for mutation in ["missing_verdict", "unknown_schema"] {
+        let temp = fixture_workspace()?;
+        let path = temp
+            .path()
+            .join("docs/evidence/dropin-certification-verdict.json");
+        let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+        let expected_reason = if mutation == "missing_verdict" {
+            value
+                .as_object_mut()
+                .ok_or("drop-in fixture must be an object")?
+                .remove("overall_verdict");
+            "overall_verdict_missing_or_invalid"
+        } else {
+            value["schema"] = json!("fixture.attacker_dropin_verdict.v99");
+            "dropin_verdict_schema_invalid"
+        };
+        fs::write(&path, serde_json::to_vec_pretty(&value)?)?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let node = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(
+            node.freshness_status,
+            Some(EvidenceFreshnessStatus::Malformed)
+        );
+        assert_eq!(
+            node.metadata.get("release_claim_allowed"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            node.metadata.get("freshness_reason"),
+            Some(&json!(expected_reason))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn evidence_freshness_rejects_timestamps_beyond_clock_skew() -> TestResult {
+    let options = SemanticWorkspaceGraphBuildOptions {
+        reference_time_utc: Some(reference_time()?),
+        ..SemanticWorkspaceGraphBuildOptions::default()
+    };
+    let generic = json!({
+        "schema": "fixture.future.v1",
+        "generated_at": "2026-05-13T00:05:01Z",
+        "claim_surface": "release_facing"
+    });
+    assert_eq!(
+        classify_evidence_freshness(&generic, &options),
+        (
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "generated_at_in_future".to_string()
+        )
+    );
+
+    let temp = fixture_workspace()?;
+    let path = temp
+        .path()
+        .join("docs/evidence/dropin-certification-verdict.json");
+    let mut verdict: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    verdict["generated_at"] = json!("2026-05-13T00:05:01Z");
+    fs::write(&path, serde_json::to_vec_pretty(&verdict)?)?;
+    let graph = build_fixture_graph(temp.path())?;
+    let node = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        node.metadata.get("freshness_reason"),
+        Some(&json!("generated_at_in_future"))
+    );
+    assert_eq!(
+        node.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    Ok(())
 }
 
 #[test]
@@ -768,7 +1083,12 @@ fn performance_budget_freshness_requires_current_global_claim_readiness() -> Tes
     assert!(!legacy_classification.1);
 
     let mut blocked = semantic_perf_budget_fixture();
-    blocked["pass"] = json!(1);
+    let total_budgets = blocked["total_budgets"]
+        .as_u64()
+        .ok_or("fixture total_budgets must be an integer")?;
+    blocked["budget_results"][1]["actual"] = serde_json::Value::Null;
+    blocked["budget_results"][1]["status"] = json!("NO_DATA");
+    blocked["pass"] = json!(total_budgets - 1);
     blocked["no_data"] = json!(1);
     blocked["claim_readiness"] = json!({
         "status": "blocked",
@@ -823,6 +1143,64 @@ fn performance_budget_freshness_requires_current_global_claim_readiness() -> Tes
 }
 
 #[test]
+fn performance_budget_freshness_rejects_missing_or_forged_detail_rows() -> TestResult {
+    let options = SemanticWorkspaceGraphBuildOptions {
+        reference_time_utc: Some(reference_time()?),
+        ..SemanticWorkspaceGraphBuildOptions::default()
+    };
+
+    for field in ["budgets", "budget_results", "failing_data_contracts"] {
+        let mut missing = semantic_perf_budget_fixture();
+        missing
+            .as_object_mut()
+            .ok_or("performance fixture must be an object")?
+            .remove(field);
+        let classification = classify_evidence_freshness(&missing, &options);
+        assert_eq!(classification.0, EvidenceFreshnessStatus::Malformed);
+        assert!(!classification.1);
+    }
+
+    let mut forged_status = semantic_perf_budget_fixture();
+    forged_status["budget_results"][0]["status"] = json!("FAIL");
+
+    let mut forged_count = semantic_perf_budget_fixture();
+    let pass = forged_count["pass"]
+        .as_u64()
+        .ok_or("fixture pass count must be an integer")?;
+    forged_count["pass"] = json!(pass - 1);
+    forged_count["fail"] = json!(1);
+
+    let mut reordered_results = semantic_perf_budget_fixture();
+    reordered_results["budget_results"]
+        .as_array_mut()
+        .ok_or("fixture budget_results must be an array")?
+        .swap(0, 1);
+
+    let mut forged_inventory = semantic_perf_budget_fixture();
+    forged_inventory["budgets"][0]["methodology"] = json!("forged methodology");
+
+    let mut forged_contract_failures = semantic_perf_budget_fixture();
+    forged_contract_failures["failing_data_contracts"] = json!([{
+        "contract_id": "forged-contract",
+        "detail": "forged detail",
+        "remediation": "forged remediation"
+    }]);
+
+    for forged in [
+        forged_status,
+        forged_count,
+        reordered_results,
+        forged_inventory,
+        forged_contract_failures,
+    ] {
+        let classification = classify_evidence_freshness(&forged, &options);
+        assert_eq!(classification.0, EvidenceFreshnessStatus::Malformed);
+        assert!(!classification.1);
+    }
+    Ok(())
+}
+
+#[test]
 fn performance_budget_freshness_rejects_unresolvable_source_commit() -> TestResult {
     let temp = fixture_workspace()?;
     initialize_fixture_git_workspace(temp.path())?;
@@ -845,6 +1223,528 @@ fn performance_budget_freshness_rejects_unresolvable_source_commit() -> TestResu
         perf_budget.metadata.get("freshness_reason"),
         Some(&json!("performance_budget_source_commit_unresolvable"))
     );
+    Ok(())
+}
+
+#[test]
+fn performance_budget_freshness_accepts_clean_head_bound_artifact() -> TestResult {
+    let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+    let graph = build_fixture_graph(temp.path())?;
+    let perf_budget = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "tests/perf/reports/budget_summary.json",
+    )?;
+
+    assert_eq!(
+        perf_budget.freshness_status,
+        Some(EvidenceFreshnessStatus::Current)
+    );
+    assert_eq!(
+        perf_budget.metadata.get("release_claim_allowed"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        perf_budget.metadata.get("freshness_reason"),
+        Some(&json!("generated_at_within_policy"))
+    );
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_rejects_dirty_staged_and_untracked_sources() -> TestResult {
+    let dirty = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(dirty.path())?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(dirty.path().join("src/lib.rs"))?
+        .write_all(b"\n// unstaged source change\n")?;
+    assert_performance_fixture_reason(
+        dirty.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_repository_not_clean",
+    )?;
+
+    let staged = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(staged.path())?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(staged.path().join("src/lib.rs"))?
+        .write_all(b"\n// staged source change\n")?;
+    run_fixture_git(staged.path(), &["add", "src/lib.rs"])?;
+    assert_performance_fixture_reason(
+        staged.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_repository_not_clean",
+    )?;
+
+    let untracked = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(untracked.path())?;
+    write_fixture(
+        untracked.path(),
+        "src/untracked_release_source.rs",
+        "pub fn untracked_release_source() {}\n",
+    )?;
+    assert_performance_fixture_reason(
+        untracked.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_repository_not_clean",
+    )?;
+
+    #[cfg(unix)]
+    {
+        let filtered = fixture_workspace()?;
+        write_fixture(
+            filtered.path(),
+            ".gitattributes",
+            "src/lib.rs filter=canonical-source\n",
+        )?;
+        bind_fixture_performance_summary_with_source_hiding_filter(filtered.path())?;
+        fs::OpenOptions::new()
+            .append(true)
+            .open(filtered.path().join("src/lib.rs"))?
+            .write_all(b"\n// source dirt hidden by a clean filter\n")?;
+        run_fixture_git(filtered.path(), &["add", "src/lib.rs"])?;
+        run_fixture_git(filtered.path(), &["diff", "--cached", "--quiet"])?;
+        assert!(
+            fixture_git_output(
+                filtered.path(),
+                &[
+                    "status",
+                    "--porcelain=v1",
+                    "--untracked-files=all",
+                    "--no-renames",
+                ],
+            )?
+            .is_empty(),
+            "fixture must hide raw source drift from ordinary Git status"
+        );
+        assert_performance_fixture_reason(
+            filtered.path(),
+            "tests/perf/reports/budget_summary.json",
+            "performance_budget_repository_tracked_state_not_head",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_rejects_hidden_index_flags() -> TestResult {
+    let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+
+    for (enable, disable) in [
+        ("--assume-unchanged", "--no-assume-unchanged"),
+        ("--skip-worktree", "--no-skip-worktree"),
+    ] {
+        run_fixture_git(temp.path(), &["update-index", enable, "src/lib.rs"])?;
+        let graph_result = build_fixture_graph(temp.path());
+        let restore_result = run_fixture_git(temp.path(), &["update-index", disable, "src/lib.rs"]);
+        restore_result?;
+        let graph = graph_result?;
+        let perf_budget = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "tests/perf/reports/budget_summary.json",
+        )?;
+        assert_eq!(
+            perf_budget.metadata.get("freshness_reason"),
+            Some(&json!(
+                "performance_budget_repository_index_flags_not_default"
+            ))
+        );
+        assert_eq!(
+            perf_budget.metadata.get("release_claim_allowed"),
+            Some(&json!(false))
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_rejects_untracked_or_substituted_artifact() -> TestResult {
+    let untracked = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(untracked.path())?;
+    let tracked_summary = fs::read_to_string(
+        untracked
+            .path()
+            .join("tests/perf/reports/budget_summary.json"),
+    )?;
+    let untracked_path = "tests/perf/reports/untracked_summary.json";
+    write_fixture(untracked.path(), untracked_path, &tracked_summary)?;
+    ignore_fixture_path(untracked.path(), untracked_path)?;
+    assert_performance_fixture_reason(
+        untracked.path(),
+        untracked_path,
+        "performance_budget_artifact_not_tracked_at_head",
+    )?;
+
+    #[cfg(unix)]
+    {
+        let substituted = fixture_workspace()?;
+        let substituted_path = substituted
+            .path()
+            .join("tests/perf/reports/budget_summary.json");
+        write_fixture(
+            substituted.path(),
+            ".gitattributes",
+            "tests/perf/reports/budget_summary.json filter=canonical-summary\n",
+        )?;
+        bind_fixture_performance_summary_with_hiding_filter(substituted.path())?;
+        let original = fs::read_to_string(&substituted_path)?;
+        fs::write(&substituted_path, format!("{original} \n"))?;
+        run_fixture_git(
+            substituted.path(),
+            &["add", "tests/perf/reports/budget_summary.json"],
+        )?;
+        run_fixture_git(substituted.path(), &["diff", "--cached", "--quiet"])?;
+        let hidden_status = fixture_git_output(
+            substituted.path(),
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--no-renames",
+            ],
+        )?;
+        assert!(
+            hidden_status.is_empty(),
+            "fixture must hide the raw artifact substitution from Git status: {hidden_status:?}"
+        );
+        assert_performance_fixture_reason(
+            substituted.path(),
+            "tests/perf/reports/budget_summary.json",
+            "performance_budget_repository_tracked_state_not_head",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_budget_source_binding_rejects_symlink_artifact() -> TestResult {
+    use std::os::unix::fs::symlink;
+
+    let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+    let symlink_path = "tests/perf/reports/symlink_summary.json";
+    symlink("budget_summary.json", temp.path().join(symlink_path))?;
+    ignore_fixture_path(temp.path(), symlink_path)?;
+    assert_performance_fixture_reason(
+        temp.path(),
+        symlink_path,
+        "performance_budget_artifact_symlink",
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn performance_budget_source_binding_verifies_tracked_symlinks_and_file_modes() -> TestResult {
+    use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+    let symlink_fixture = fixture_workspace()?;
+    symlink("lib.rs", symlink_fixture.path().join("src/tracked-link.rs"))?;
+    bind_fixture_performance_summary_to_source(symlink_fixture.path())?;
+    let graph = build_fixture_graph(symlink_fixture.path())?;
+    let node = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "tests/perf/reports/budget_summary.json",
+    )?;
+    assert_eq!(
+        node.freshness_status,
+        Some(EvidenceFreshnessStatus::Current)
+    );
+
+    let executable_fixture = fixture_workspace()?;
+    let executable_path = executable_fixture.path().join("src/lib.rs");
+    fs::set_permissions(&executable_path, fs::Permissions::from_mode(0o755))?;
+    bind_fixture_performance_summary_to_source(executable_fixture.path())?;
+    let graph = build_fixture_graph(executable_fixture.path())?;
+    let node = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "tests/perf/reports/budget_summary.json",
+    )?;
+    assert_eq!(
+        node.freshness_status,
+        Some(EvidenceFreshnessStatus::Current)
+    );
+
+    let hidden_mode_fixture = fixture_workspace()?;
+    let hidden_mode_path = hidden_mode_fixture.path().join("src/lib.rs");
+    fs::set_permissions(&hidden_mode_path, fs::Permissions::from_mode(0o644))?;
+    bind_fixture_performance_summary_to_source(hidden_mode_fixture.path())?;
+    run_fixture_git(
+        hidden_mode_fixture.path(),
+        &["config", "core.filemode", "false"],
+    )?;
+    fs::set_permissions(&hidden_mode_path, fs::Permissions::from_mode(0o755))?;
+    assert!(
+        fixture_git_output(
+            hidden_mode_fixture.path(),
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--no-renames",
+            ],
+        )?
+        .is_empty(),
+        "fixture must hide chmod drift from ordinary Git status"
+    );
+    assert_performance_fixture_reason(
+        hidden_mode_fixture.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_repository_tracked_state_not_head",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_binds_the_ingested_artifact_bytes() -> TestResult {
+    let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+
+    let artifact_path = temp.path().join("tests/perf/reports/budget_summary.json");
+    let mut stale_captured_bytes = fs::read(&artifact_path)?;
+    stale_captured_bytes.extend_from_slice(b" \n");
+    fs::write(&artifact_path, stale_captured_bytes)?;
+    assert_performance_fixture_reason(
+        temp.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_artifact_changed_since_ingestion",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_rejects_committed_source_followup() -> TestResult {
+    let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+    fs::OpenOptions::new()
+        .append(true)
+        .open(temp.path().join("src/lib.rs"))?
+        .write_all(b"\n// committed post-measurement source change\n")?;
+    run_fixture_git(temp.path(), &["add", "src/lib.rs"])?;
+    run_fixture_git(temp.path(), &["commit", "-m", "source followup"])?;
+    assert_performance_fixture_reason(
+        temp.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_source_commit_not_release_bound",
+    )?;
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_rejects_packaged_evidence_followup() -> TestResult {
+    let packaged = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(packaged.path())?;
+    let packaged_path = "docs/evidence/tool-output-context-cache.jsonl";
+    write_fixture(
+        packaged.path(),
+        packaged_path,
+        "{\"schema\":\"fixture.packaged_evidence.v1\"}\n",
+    )?;
+    run_fixture_git(packaged.path(), &["add", packaged_path])?;
+    run_fixture_git(
+        packaged.path(),
+        &["commit", "-m", "packaged evidence followup"],
+    )?;
+    assert_performance_fixture_reason(
+        packaged.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_source_commit_not_release_bound",
+    )?;
+
+    let nonpackaged = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(nonpackaged.path())?;
+    let nonpackaged_path = "docs/evidence/nonpackaged-release-receipt.json";
+    write_fixture(
+        nonpackaged.path(),
+        nonpackaged_path,
+        r#"{
+  "schema": "fixture.nonpackaged_evidence.v1",
+  "generated_at": "2026-05-13T00:00:00Z"
+}"#,
+    )?;
+    run_fixture_git(nonpackaged.path(), &["add", nonpackaged_path])?;
+    run_fixture_git(
+        nonpackaged.path(),
+        &["commit", "-m", "nonpackaged evidence followup"],
+    )?;
+    let graph = build_fixture_graph(nonpackaged.path())?;
+    let perf_budget = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "tests/perf/reports/budget_summary.json",
+    )?;
+    assert_eq!(
+        perf_budget.freshness_status,
+        Some(EvidenceFreshnessStatus::Current)
+    );
+    assert_eq!(
+        perf_budget.metadata.get("release_claim_allowed"),
+        Some(&json!(true))
+    );
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_rejects_unproved_default_package_policy() -> TestResult {
+    let temp = fixture_workspace()?;
+    write_fixture(
+        temp.path(),
+        "Cargo.toml",
+        r#"[package]
+name = "semantic-workspace-fixture"
+version = "0.0.0"
+edition = "2024"
+"#,
+    )?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+
+    let evidence_path = "docs/evidence/unproved-package-policy.json";
+    write_fixture(
+        temp.path(),
+        evidence_path,
+        "{\"schema\":\"fixture.unproved_package_policy.v1\"}\n",
+    )?;
+    run_fixture_git(temp.path(), &["add", evidence_path])?;
+    run_fixture_git(
+        temp.path(),
+        &["commit", "-m", "evidence followup without include policy"],
+    )?;
+    assert_performance_fixture_reason(
+        temp.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_source_commit_not_release_bound",
+    )?;
+    Ok(())
+}
+
+const HOSTILE_GIT_CHILD_ROOT: &str = "PI_SEMANTIC_HOSTILE_GIT_CHILD_ROOT";
+
+#[test]
+fn performance_budget_source_binding_hostile_git_environment_child() -> TestResult {
+    let Some(root) = std::env::var_os(HOSTILE_GIT_CHILD_ROOT) else {
+        return Ok(());
+    };
+    let graph = build_fixture_graph(Path::new(&root))?;
+    let perf_budget = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "tests/perf/reports/budget_summary.json",
+    )?;
+    assert_eq!(
+        perf_budget.freshness_status,
+        Some(EvidenceFreshnessStatus::Current)
+    );
+    assert_eq!(
+        perf_budget.metadata.get("release_claim_allowed"),
+        Some(&json!(true))
+    );
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_ignores_hostile_git_environment() -> TestResult {
+    let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+    let hostile_index = temp.path().join(".git/hostile-index");
+    fs::write(&hostile_index, b"malformed alternate index")?;
+
+    let mut child = Command::new(std::env::current_exe()?);
+    child
+        .arg("performance_budget_source_binding_hostile_git_environment_child")
+        .args(["--exact", "--nocapture"])
+        .env(HOSTILE_GIT_CHILD_ROOT, temp.path())
+        .env("GIT_INDEX_FILE", &hostile_index)
+        .env("GIT_DIR", temp.path().join(".git/hostile-dir"))
+        .env("GIT_WORK_TREE", temp.path().join("hostile-worktree"))
+        .env(
+            "GIT_COMMON_DIR",
+            temp.path().join(".git/hostile-common-dir"),
+        )
+        .env(
+            "GIT_OBJECT_DIRECTORY",
+            temp.path().join(".git/hostile-objects"),
+        )
+        .env(
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            temp.path().join(".git/hostile-alternate-objects"),
+        )
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.worktree")
+        .env(
+            "GIT_CONFIG_VALUE_0",
+            temp.path().join("hostile-config-worktree"),
+        );
+    #[cfg(unix)]
+    let fake_git_marker = {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let fake_git_dir = temp.path().join(".git/hostile-bin");
+        let fake_git = fake_git_dir.join("git");
+        let marker = temp.path().join(".git/fake-git-invoked");
+        fs::create_dir_all(&fake_git_dir)?;
+        fs::write(
+            &fake_git,
+            format!(
+                "#!/bin/sh\nprintf invoked > {}\nexit 97\n",
+                shell_single_quote(&marker)?
+            ),
+        )?;
+        fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755))?;
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let hostile_path = std::env::join_paths(
+            std::iter::once(fake_git_dir).chain(std::env::split_paths(&original_path)),
+        )?;
+        child.env("PATH", hostile_path);
+        marker
+    };
+    let output = child.output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "hostile Git environment child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    #[cfg(unix)]
+    assert!(
+        !fake_git_marker.exists(),
+        "source binding executed the attacker-controlled Git binary from PATH"
+    );
+    Ok(())
+}
+
+#[test]
+fn performance_budget_source_binding_ignores_local_core_worktree_redirect() -> TestResult {
+    let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
+    let mirror_parent = tempfile::Builder::new()
+        .tempdir_in(std::env::var_os("TMPDIR").map_or_else(std::env::temp_dir, PathBuf::from))?;
+    let mirror = mirror_parent.path().join("clean-mirror");
+    let mirror_text = mirror.to_string_lossy().into_owned();
+    run_fixture_git(
+        temp.path(),
+        &["worktree", "add", "--detach", &mirror_text, "HEAD"],
+    )?;
+    run_fixture_git(temp.path(), &["config", "core.worktree", &mirror_text])?;
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(temp.path().join("src/lib.rs"))?
+        .write_all(b"\n// dirt hidden by hostile local core.worktree\n")?;
+    assert_performance_fixture_reason(
+        temp.path(),
+        "tests/perf/reports/budget_summary.json",
+        "performance_budget_repository_not_clean",
+    )?;
     Ok(())
 }
 
@@ -1216,6 +2116,10 @@ fn planner_emits_budgeted_golden_bundles_for_core_task_shapes() -> TestResult {
             },
             {
                 "path": "docs/evidence/missing.json",
+                "reason": "suppressed_stale_or_unsafe_evidence"
+            },
+            {
+                "path": "tests/perf/reports/budget_summary.json",
                 "reason": "suppressed_stale_or_unsafe_evidence"
             }
         ])

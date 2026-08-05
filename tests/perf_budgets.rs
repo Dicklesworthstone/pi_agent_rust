@@ -497,7 +497,7 @@ fn canonicalize_diagnostic_text(root: &Path, text: &str) -> String {
         format!("{}/", root.to_string_lossy().trim_end_matches('/')),
         "repo://".to_string(),
     ));
-    replacements.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+    replacements.sort_by_key(|(prefix, _)| std::cmp::Reverse(prefix.len()));
 
     replacements
         .into_iter()
@@ -635,8 +635,13 @@ fn clean_source_commit(root: &Path) -> Option<String> {
     {
         return None;
     }
+    let mut head_commit = String::from("HEAD^");
+    head_commit.push('{');
+    head_commit.push_str("commit");
+    head_commit.push('}');
     let revision = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .args(["rev-parse", "--verify"])
+        .arg(head_commit)
         .current_dir(root)
         .output()
         .ok()?;
@@ -2006,7 +2011,7 @@ fn require_pijs_perf_binary_path(record: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result<(), String> {
+fn validate_pijs_gate_classification(record: &Value) -> Result<(), String> {
     for (field, expected) in [
         ("schema", "pi.perf.workload.v1"),
         ("tool", "pijs_workload"),
@@ -2056,6 +2061,10 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
     if record.get("debug_assertions").and_then(Value::as_bool) != Some(false) {
         return Err("debug_assertions must equal false".to_string());
     }
+    Ok(())
+}
+
+fn validate_pijs_gate_build(record: &Value) -> Result<Vec<&str>, String> {
     require_pijs_perf_binary_path(record)?;
 
     if !matches_canonical_perf_build_fingerprint(
@@ -2100,6 +2109,10 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
             "allocator_fallback_reason must be null for the canonical system lane".to_string(),
         );
     }
+    Ok(compiled_features)
+}
+
+fn validate_pijs_gate_lineage(record: &Value, compiled_features: &[&str]) -> Result<(), String> {
     if record.get("source_dirty").and_then(Value::as_bool) != Some(false) {
         return Err("source_dirty must equal false".to_string());
     }
@@ -2146,7 +2159,7 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
         compiled_profile_family: "release",
         compiled_opt_level: "3",
         compiled_debug: "true",
-        compiled_features: &compiled_features,
+        compiled_features,
         binary_path,
         binary_sha256,
         debug_assertions: false,
@@ -2160,7 +2173,13 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
             "config_hash does not match asserted provenance (claimed={claimed_config_hash}, expected={expected_config_hash})"
         ));
     }
+    Ok(())
+}
 
+fn validate_pijs_gate_workload_shape(
+    record: &Value,
+    expected_tool_calls: u64,
+) -> Result<(), String> {
     let iterations = record
         .get("iterations")
         .and_then(Value::as_u64)
@@ -2196,6 +2215,13 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
     Ok(())
 }
 
+fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result<(), String> {
+    validate_pijs_gate_classification(record)?;
+    let compiled_features = validate_pijs_gate_build(record)?;
+    validate_pijs_gate_lineage(record, &compiled_features)?;
+    validate_pijs_gate_workload_shape(record, expected_tool_calls)
+}
+
 fn require_positive_pijs_float(record: &Value, field: &str) -> Result<f64, String> {
     record
         .get(field)
@@ -2221,7 +2247,12 @@ fn derive_and_validate_pijs_metrics(record: &Value) -> Result<(f64, f64), String
         .filter(|value| *value > 0)
         .ok_or_else(|| "elapsed_us must be a positive integer".to_string())?;
     let elapsed_us_f64 = require_positive_pijs_float(record, "elapsed_us_f64")?;
-    if elapsed_us_f64.floor() != elapsed_us as f64 {
+    let elapsed_us_lower_bound = elapsed_us as f64;
+    let elapsed_us_upper_bound = elapsed_us
+        .checked_add(1)
+        .map(|value| value as f64)
+        .ok_or_else(|| "elapsed_us is too large to validate its floating-point pair".to_string())?;
+    if elapsed_us_f64 < elapsed_us_lower_bound || elapsed_us_f64 >= elapsed_us_upper_bound {
         return Err(format!(
             "elapsed_us must equal floor(elapsed_us_f64) (elapsed_us={elapsed_us}, elapsed_us_f64={elapsed_us_f64})"
         ));
@@ -3245,8 +3276,8 @@ fn pijs_workload_profile_field_is_present_when_data_exists() {
 fn valid_pijs_gate_record(root: &Path, tool_calls_per_iteration: u64) -> Value {
     let iterations = PIJS_REGRESSION_GATE_ITERATIONS;
     let total_calls = iterations * tool_calls_per_iteration;
-    let elapsed_us_f64 = total_calls as f64 * 49.5;
-    let elapsed_us = elapsed_us_f64 as u64;
+    let elapsed_us = total_calls * 99 / 2;
+    let elapsed_us_f64 = elapsed_us as f64;
     let binary_path = root.join("target/perf/examples/pijs_workload");
     std::fs::create_dir_all(binary_path.parent().expect("PiJS binary parent"))
         .expect("create PiJS binary parent");
@@ -4276,7 +4307,7 @@ fn generate_budget_report() {
     let mut md = String::with_capacity(8 * 1024);
 
     md.push_str("# Performance Budgets\n\n");
-    let _ = writeln!(md, "> Generated: {}\n", generated_at);
+    let _ = writeln!(md, "> Generated: {generated_at}\n");
     let _ = writeln!(md, "> Run ID: {run_id_label}\n");
     let _ = writeln!(
         md,
