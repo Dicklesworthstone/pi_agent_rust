@@ -58,6 +58,18 @@ use swc_ecma_parser::{Parser as SwcParser, StringInput, Syntax, TsSyntax};
 use swc_ecma_transforms_base::resolver;
 use swc_ecma_transforms_typescript::strip;
 
+macro_rules! compressed_js_literal {
+    ($source:expr) => {{
+        const RAW_LEN: usize = ($source).len();
+        const COMPRESSED_LEN: usize =
+            crate::embedded_assets::lzss_compressed_len(($source).as_bytes());
+        static COMPRESSED: [u8; COMPRESSED_LEN] =
+            crate::embedded_assets::lzss_compress::<COMPRESSED_LEN>(($source).as_bytes());
+        crate::embedded_assets::lzss_decompress(&COMPRESSED, RAW_LEN)
+            .expect("compile-time compressed JavaScript literal must decode")
+    }};
+}
+
 // ============================================================================
 // Environment variable filtering (bd-1av0.9)
 // ============================================================================
@@ -7714,7 +7726,7 @@ fn default_virtual_modules() -> HashMap<String, String> {
 
     modules.insert(
         "@sinclair/typebox".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export const Type = {
   String: (opts = {}) => ({ type: "string", ...opts }),
   Number: (opts = {}) => ({ type: "number", ...opts }),
@@ -7750,14 +7762,14 @@ export const Type = {
   Unsafe: (schema = {}) => schema,
 };
 export default { Type };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "typebox/compile".to_string(),
-        r##"
+        compressed_js_literal!(r##"
 function pointer(path, key) {
   const segment = String(key).replace(/~/g, "~0").replace(/\//g, "~1");
   return `${path}/${segment}`;
@@ -7956,14 +7968,14 @@ export function Compile(...args) {
 }
 
 export default Compile;
-"##
+"##)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@mariozechner/pi-ai".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function StringEnum(values, opts = {}) {
   const list = Array.isArray(values) ? values.map((v) => String(v)) : [];
   return { type: "string", enum: list, ...opts };
@@ -8556,14 +8568,14 @@ export async function refreshOpenAICodexToken(_refreshToken) {
 }
 
 export default { StringEnum, calculateCost, getEnvApiKey, getOAuthApiKey, createAssistantMessageEventStream, stream, streamSimple, streamSimpleAnthropic, streamSimpleOpenAIResponses, streamSimpleOpenAICompletions, complete, completeSimple, getProviders, getModel, getApiProvider, getApiProviders, registerApiProvider, unregisterApiProviders, getModels, loginOpenAICodex, refreshOpenAICodexToken };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@mariozechner/pi-tui".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function matchesKey(_data, _key) {
   return false;
 }
@@ -8885,14 +8897,14 @@ export class Image {
 }
 
 export default { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi, Text, TruncatedText, Container, Markdown, Spacer, Editor, Box, SelectList, Input, ProcessTerminal, Image, CURSOR_MARKER, isKeyRelease, parseKey, Key, DynamicBorder, SettingsList, fuzzyMatch, getEditorKeybindings, fuzzyFilter, CancellableLoader };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@mariozechner/pi-coding-agent".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export const VERSION = "0.0.0";
 
 export const DEFAULT_MAX_LINES = 2000;
@@ -9461,7 +9473,7 @@ export default {
   AuthStorage,
   createAgentSession,
 };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -9492,7 +9504,7 @@ export default { SandboxManager };
 
     modules.insert(
         "ms".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 function parseMs(text) {
   const s = String(text ?? "").trim();
   if (!s) return undefined;
@@ -9516,14 +9528,14 @@ export default function ms(value) {
 }
 
 export const parse = parseMs;
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "jsonwebtoken".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import { createHmac, timingSafeEqual } from "node:crypto";
 
 const ALG_TO_DIGEST = {
@@ -9731,7 +9743,7 @@ export function decode(token, options) {
 }
 
 export default { sign, verify, decode };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -9739,7 +9751,7 @@ export default { sign, verify, decode };
     // ── shell-quote ──────────────────────────────────────────────────
     modules.insert(
         "shell-quote".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function parse(cmd) {
   if (typeof cmd !== 'string') return [];
   const args = [];
@@ -9770,14 +9782,14 @@ export function quote(args) {
   }).join(' ');
 }
 export default { parse, quote };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     // ── vscode-languageserver-protocol ──────────────────────────────
     {
-        let vls = r"
+        let vls = compressed_js_literal!(r"
 export const DiagnosticSeverity = { Error: 1, Warning: 2, Information: 3, Hint: 4 };
 export const CodeActionKind = { QuickFix: 'quickfix', Refactor: 'refactor', RefactorExtract: 'refactor.extract', RefactorInline: 'refactor.inline', RefactorRewrite: 'refactor.rewrite', Source: 'source', SourceOrganizeImports: 'source.organizeImports', SourceFixAll: 'source.fixAll' };
 export const DocumentDiagnosticReportKind = { Full: 'full', Unchanged: 'unchanged' };
@@ -9814,7 +9826,7 @@ export function createMessageConnection(_reader, _writer) {
 }
 export class StreamMessageReader { constructor(_s) {} }
 export class StreamMessageWriter { constructor(_s) {} }
-"
+")
         .trim()
         .to_string();
 
@@ -9892,7 +9904,7 @@ export class SSEClientTransport {
     // ── glob ────────────────────────────────────────────────────────
     modules.insert(
         "glob".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import "node:fs";
 
 function __pi_glob_vfs() {
@@ -10037,7 +10049,7 @@ export class Glob {
 }
 
 export default { globSync, glob, Glob };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -10045,7 +10057,7 @@ export default { globSync, glob, Glob };
     // ── uuid ────────────────────────────────────────────────────────
     modules.insert(
         "uuid".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 function randomHex(n) {
   let out = "";
   for (let i = 0; i < n; i++) out += Math.floor(Math.random() * 16).toString(16);
@@ -10064,7 +10076,7 @@ export function v5() { return v4(); }
 export function validate(uuid) { return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(uuid ?? "")); }
 export function version(uuid) { return parseInt(String(uuid ?? "").charAt(14), 16) || 0; }
 export default { v1, v3, v4, v5, v7, validate, version };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -10072,7 +10084,7 @@ export default { v1, v3, v4, v5, v7, validate, version };
     // ── diff ────────────────────────────────────────────────────────
     modules.insert(
         "diff".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function createTwoFilesPatch(oldFile, newFile, oldStr, newStr, _oldHeader, _newHeader, _opts) {
   const oldLines = String(oldStr ?? "").split("\n");
   const newLines = String(newStr ?? "").split("\n");
@@ -10091,7 +10103,7 @@ export function diffChars(o, n) { return diffLines(o, n); }
 export function diffWords(o, n) { return diffLines(o, n); }
 export function applyPatch() { return false; }
 export default { createTwoFilesPatch, createPatch, diffLines, diffChars, diffWords, applyPatch };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -10126,7 +10138,7 @@ export default { define, loadConfig };
     // ── bun ────────────────────────────────────────────────────────
     modules.insert(
         "bun".to_string(),
-        r"
+        compressed_js_literal!(r"
 const bun = globalThis.Bun || {};
 export const argv = bun.argv || [];
 export const file = (...args) => bun.file(...args);
@@ -10134,7 +10146,7 @@ export const write = (...args) => bun.write(...args);
 export const spawn = (...args) => bun.spawn(...args);
 export const which = (...args) => bun.which(...args);
 export default bun;
-"
+")
         .trim()
         .to_string(),
     );
@@ -10163,7 +10175,7 @@ export default { config, parse };
 
     modules.insert(
         "node:path".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 function __pi_is_abs(s) {
   return s.startsWith("/") || (s.length >= 3 && s[1] === ":" && s[2] === "/");
 }
@@ -10287,7 +10299,7 @@ const win32Stub = new Proxy({}, { get(_, prop) { throw new Error("path.win32." +
 export const win32 = win32Stub;
 
 export default { join, dirname, resolve, basename, relative, isAbsolute, extname, normalize, parse, format, sep, delimiter, posix, win32 };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -10296,7 +10308,7 @@ export default { join, dirname, resolve, basename, relative, isAbsolute, extname
 
     modules.insert(
         "node:child_process".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 const __pi_child_process_state = (() => {
   if (globalThis.__pi_child_process_state) {
     return globalThis.__pi_child_process_state;
@@ -10921,14 +10933,14 @@ export function fork(_modulePath, _args, _opts) {
 }
 
 export default { spawn, spawnSync, execSync, execFileSync, exec, execFile, fork };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:module".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import * as fs from "node:fs";
 import * as fsPromises from "node:fs/promises";
 import * as path from "node:path";
@@ -11188,14 +11200,14 @@ export function createRequire(_path) {
 }
 
 export default { createRequire };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:fs".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import { Readable, Writable } from "node:stream";
 
 export const constants = {
@@ -12434,14 +12446,14 @@ export const promises = {
   utimes: async (path, _atime, _mtime) => accessSync(path),
 };
 export default { constants, existsSync, readFileSync, appendFileSync, writeFileSync, readdirSync, statSync, lstatSync, mkdtempSync, realpathSync, unlinkSync, rmdirSync, rmSync, copyFileSync, renameSync, mkdirSync, accessSync, chmodSync, chownSync, readlinkSync, symlinkSync, openSync, closeSync, readSync, writeSync, fstatSync, ftruncateSync, futimesSync, watch, watchFile, unwatchFile, createReadStream, createWriteStream, readFile, writeFile, stat, lstat, readdir, mkdir, unlink, readlink, symlink, rmdir, rm, rename, copyFile, appendFile, chmod, chown, realpath, access, promises };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:fs/promises".to_string(),
-        r"
+        compressed_js_literal!(r"
 import fs from 'node:fs';
 
 export async function access(path, mode) { return fs.promises.access(path, mode); }
@@ -12476,24 +12488,28 @@ export async function appendFile(path, data, opts) { return fs.promises.appendFi
 export async function open(path, flags, mode) { return { close: async () => {} }; }
 export async function truncate(path, len) { return; }
 export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, readlink, symlink, rmdir, stat, lstat, realpath, readdir, rm, copyFile, cp, rename, chmod, chown, utimes, appendFile, open, truncate };
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:http".to_string(),
-        crate::http_shim::NODE_HTTP_JS.trim().to_string(),
+        compressed_js_literal!(crate::http_shim::NODE_HTTP_JS)
+            .trim()
+            .to_string(),
     );
 
     modules.insert(
         "node:https".to_string(),
-        crate::http_shim::NODE_HTTPS_JS.trim().to_string(),
+        compressed_js_literal!(crate::http_shim::NODE_HTTPS_JS)
+            .trim()
+            .to_string(),
     );
 
     modules.insert(
         "node:http2".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import EventEmitter from "node:events";
 
 export const constants = {
@@ -12560,14 +12576,14 @@ export class ClientHttp2Session extends EventEmitter {}
 export class ClientHttp2Stream extends EventEmitter {}
 
 export default { connect, constants, ClientHttp2Session, ClientHttp2Stream };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:util".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function inspect(value, opts) {
   const depth = (opts && typeof opts.depth === 'number') ? opts.depth : 2;
   const seen = new Set();
@@ -12696,19 +12712,21 @@ export const TextEncoder = globalThis.TextEncoder;
 export const TextDecoder = globalThis.TextDecoder;
 
 export default { inspect, promisify, stripVTControlCharacters, deprecate, inherits, debuglog, format, callbackify, types, TextEncoder, TextDecoder };
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:crypto".to_string(),
-        crate::crypto_shim::NODE_CRYPTO_JS.trim().to_string(),
+        compressed_js_literal!(crate::crypto_shim::NODE_CRYPTO_JS)
+            .trim()
+            .to_string(),
     );
 
     modules.insert(
         "node:readline".to_string(),
-        r"
+        compressed_js_literal!(r"
 // Readline shim backed by pi.ui('input') when UI is available.
 
 function __pi_readline_prompt(query) {
@@ -12758,7 +12776,7 @@ export const promises = {
 };
 
 export default { createInterface, promises };
-"
+")
         .trim()
         .to_string(),
     );
@@ -12777,7 +12795,7 @@ export default { createInterface };
 
     modules.insert(
         "node:url".to_string(),
-        r"
+        compressed_js_literal!(r"
 export function fileURLToPath(url) {
   const u = String(url ?? '');
   if (u.startsWith('file://')) {
@@ -12929,14 +12947,15 @@ export function resolve(from, to) {
   try { return new _URL(to, from).href; } catch (_) { return to; }
 }
 export default { URL: _URL, URLSearchParams: _URLSearchParams, fileURLToPath, pathToFileURL, format, parse, resolve };
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "node:net".to_string(),
-        r"
+        compressed_js_literal!(
+            r"
 import EventEmitter from 'node:events';
 
 // Stub net module - socket operations are not available in PiJS (no network I/O)
@@ -13144,6 +13163,7 @@ export class Server {
 
 export default { createConnection, createServer, connect, isIP, isIPv4, isIPv6, Socket, Server };
 "
+        )
         .trim()
         .to_string(),
     );
@@ -13151,7 +13171,7 @@ export default { createConnection, createServer, connect, isIP, isIPv4, isIPv6, 
     // ── node:events ──────────────────────────────────────────────────
     modules.insert(
         "node:events".to_string(),
-        r"
+        compressed_js_literal!(r"
 class EventEmitter {
   constructor() {
     this._events = Object.create(null);
@@ -13248,7 +13268,7 @@ EventEmitter.defaultMaxListeners = 10;
 
 export { EventEmitter };
 export default EventEmitter;
-"
+")
         .trim()
         .to_string(),
     );
@@ -13256,13 +13276,15 @@ export default EventEmitter;
     // ── node:buffer ──────────────────────────────────────────────────
     modules.insert(
         "node:buffer".to_string(),
-        crate::buffer_shim::NODE_BUFFER_JS.trim().to_string(),
+        compressed_js_literal!(crate::buffer_shim::NODE_BUFFER_JS)
+            .trim()
+            .to_string(),
     );
 
     // ── node:assert ──────────────────────────────────────────────────
     modules.insert(
         "node:assert".to_string(),
-        r"
+        compressed_js_literal!(r"
 function assert(value, message) {
   if (!value) throw new Error(message || 'Assertion failed');
 }
@@ -13289,7 +13311,7 @@ assert.fail = (msg) => { throw new Error(msg || 'assert.fail()'); };
 
 export default assert;
 export { assert };
-"
+")
         .trim()
         .to_string(),
     );
@@ -13297,7 +13319,7 @@ export { assert };
     // ── node:assert/strict ───────────────────────────────────────────
     modules.insert(
         "node:assert/strict".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import assert from "node:assert";
 
 export default assert;
@@ -13314,7 +13336,7 @@ export const throws = assert.throws;
 export const doesNotThrow = assert.doesNotThrow;
 export const fail = assert.fail;
 export { assert };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -13322,7 +13344,7 @@ export { assert };
     // ── node:test ────────────────────────────────────────────────────
     modules.insert(
         "node:test".to_string(),
-        r"
+        compressed_js_literal!(r"
 function __noop() {}
 
 const __state = {
@@ -13480,7 +13502,7 @@ export async function run() {
 }
 
 export default { test, describe, it, before, after, beforeEach, afterEach, run, mock };
-"
+")
         .trim()
         .to_string(),
     );
@@ -13488,7 +13510,7 @@ export default { test, describe, it, before, after, beforeEach, afterEach, run, 
     // ── node:stream ──────────────────────────────────────────────────
     modules.insert(
         "node:stream".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 import EventEmitter from "node:events";
 
 function __streamToError(err) {
@@ -14133,7 +14155,7 @@ const promises = {
 
 export { Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, finished, promises };
 export default { Stream, Readable, Writable, Duplex, Transform, PassThrough, pipeline, finished, promises };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -14141,7 +14163,7 @@ export default { Stream, Readable, Writable, Duplex, Transform, PassThrough, pip
     // node:stream/promises — promise-based stream utilities
     modules.insert(
         "node:stream/promises".to_string(),
-        r"
+        compressed_js_literal!(r"
 import { Readable, Writable } from 'node:stream';
 
 function __streamToError(err) {
@@ -14264,7 +14286,7 @@ export async function finished(stream) {
   });
 }
 export default { pipeline, finished };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14272,7 +14294,7 @@ export default { pipeline, finished };
     // node:stream/web — bridge to global Web Streams when available
     modules.insert(
         "node:stream/web".to_string(),
-        r"
+        compressed_js_literal!(r"
 const _ReadableStream = globalThis.ReadableStream;
 const _WritableStream = globalThis.WritableStream;
 const _TransformStream = globalThis.TransformStream;
@@ -14304,7 +14326,7 @@ export default {
   ByteLengthQueuingStrategy,
   CountQueuingStrategy,
 };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14327,7 +14349,7 @@ export default { StringDecoder };
     // node:querystring — URL query string encoding/decoding
     modules.insert(
         "node:querystring".to_string(),
-        r"
+        compressed_js_literal!(r"
 export function parse(qs, sep, eq) {
   const s = String(qs ?? '');
   const sepStr = sep || '&';
@@ -14361,7 +14383,7 @@ export const encode = stringify;
 export function escape(str) { return encodeURIComponent(str); }
 export function unescape(str) { return decodeURIComponent(str); }
 export default { parse, stringify, decode, encode, escape, unescape };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14467,7 +14489,7 @@ export default { connect, createServer, TLSSocket, DEFAULT_MIN_VERSION, DEFAULT_
     // node:zlib - demand-driven gzip/gunzip subset; stream/Brotli APIs are unavailable.
     modules.insert(
         "node:zlib".to_string(),
-        r"
+        compressed_js_literal!(r"
 import { Buffer } from 'node:buffer';
 
 const constants = {
@@ -14571,7 +14593,7 @@ export default {
   createBrotliDecompress,
   promises,
 };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14693,7 +14715,7 @@ export default { isMainThread, threadId, workerData, parentPort, Worker };
     // node:process — re-exports globalThis.process
     modules.insert(
         "node:process".to_string(),
-        r"
+        compressed_js_literal!(r"
 const p = globalThis.process || {};
 export const env = p.env || {};
 export const argv = p.argv || [];
@@ -14729,7 +14751,7 @@ export const memoryUsage = p.memoryUsage || (() => ({ rss: 0, heapTotal: 0, heap
 export const cpuUsage = p.cpuUsage || (() => ({ user: 0, system: 0 }));
 export const release = p.release || { name: 'node' };
 export default p;
-"
+")
         .trim()
         .to_string(),
     );
@@ -14822,7 +14844,7 @@ export default { watch };
 
     modules.insert(
         "jsdom".to_string(),
-        r"
+        compressed_js_literal!(r"
 class Element {
     constructor(tag, html) { this.tagName = tag; this._html = html || ''; this.childNodes = []; }
     get innerHTML() { return this._html; }
@@ -14853,7 +14875,7 @@ export class JSDOM {
         this.window = { document: doc, location: { href: (opts && opts.url) || '' } };
     }
 }
-"
+")
         .trim()
         .to_string(),
     );
@@ -14887,7 +14909,7 @@ export function renderMermaidAscii(source) {
 
     modules.insert(
         "@aliou/pi-utils-settings".to_string(),
-        r"
+        compressed_js_literal!(r"
 export class ConfigLoader {
     constructor(name, defaultConfig, options) {
         this._name = name;
@@ -14923,14 +14945,14 @@ export function setNestedValue(obj, path, value) {
     }
     cur[keys[keys.length - 1]] = value;
 }
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@aliou/sh".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export class ParseError extends Error { constructor(msg) { super(msg); this.name = 'ParseError'; } }
 export function tokenize(cmd) {
     const source = String(cmd ?? '');
@@ -15004,7 +15026,7 @@ export function parse(cmd) {
     };
 }
 export function quote(s) { return "'" + (s || '').replace(/'/g, "'\\''") + "'"; }
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -15209,7 +15231,7 @@ export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
     // ── npm package stubs for extension conformance ──
 
     {
-        let openclaw_plugin_sdk = r#"
+        let openclaw_plugin_sdk = compressed_js_literal!(r#"
 export function definePlugin(spec = {}) { return spec; }
 export function createPlugin(spec = {}) { return spec; }
 export function tool(spec = {}) { return { ...spec, type: "tool" }; }
@@ -15298,7 +15320,7 @@ export default {
   registerOpenClaw,
   OpenClawPlugin,
 };
-"#
+"#)
         .trim()
         .to_string();
 
@@ -15322,7 +15344,7 @@ export default {
 
     modules.insert(
         "zod".to_string(),
-        r"
+        compressed_js_literal!(r"
 const __schema = {
   parse(value) { return value; },
   safeParse(value) { return { success: true, data: value }; },
@@ -15366,7 +15388,7 @@ export const z = {
   nullable(inner) { return inner ?? makeSchema(); },
 };
 export default z;
-"
+")
         .trim()
         .to_string(),
     );
@@ -15402,7 +15424,7 @@ export default { parse, stringify };
 
     modules.insert(
         "better-sqlite3".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 class Statement {
     all() { return []; }
     get() { return undefined; }
@@ -15432,14 +15454,14 @@ BetterSqlite3.Database = BetterSqlite3;
 
 export { Statement };
 export default BetterSqlite3;
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "ws".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 function __makeEmitter(target) {
   target._listeners = {};
   target.on = function(event, handler) {
@@ -15538,14 +15560,14 @@ WebSocket.Server = WebSocketServer;
 WebSocket.WebSocketServer = WebSocketServer;
 export const Server = WebSocketServer;
 export default WebSocket;
-"#
+"#)
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "axios".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 function __makeResponse(config, data) {
   return {
     data: data ?? null,
@@ -15603,7 +15625,7 @@ axios.all = (promises) => Promise.all(promises);
 axios.spread = (cb) => (arr) => cb(...arr);
 
 export default axios;
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -15637,7 +15659,7 @@ export default open;
 
     modules.insert(
         "commander".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export class Option {
   constructor(flags, description) {
     this.flags = flags;
@@ -15688,7 +15710,7 @@ export class Command {
 export function createCommand(name) { return new Command(name); }
 export const program = new Command();
 export default { Command, Option, Argument, program, createCommand };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -18537,7 +18559,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                 }
 
                 // Install the JS bridge that creates Promises and wraps the native functions
-                match ctx.eval::<(), _>(PI_BRIDGE_JS) {
+                match ctx.eval::<(), _>(pi_bridge_js()) {
                     Ok(()) => {}
                     Err(rquickjs::Error::Exception) => {
                         let detail = format_quickjs_exception(&ctx, ctx.catch());
@@ -18611,7 +18633,10 @@ fn random_bytes(len: usize) -> std::result::Result<Vec<u8>, getrandom::Error> {
 ///
 /// This code creates the `pi` global object with Promise-returning methods.
 /// Each method wraps a native Rust function (`__pi_*_native`) that returns a call_id.
-const PI_BRIDGE_JS: &str = r"
+fn pi_bridge_js() -> &'static str {
+    static PI_BRIDGE_JS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    PI_BRIDGE_JS.get_or_init(|| {
+        compressed_js_literal!(r"
 // ============================================================================
 // Console global — must come first so all other bridge code can use it.
 // ============================================================================
@@ -23139,7 +23164,9 @@ if (typeof globalThis.fetch !== 'function') {
         return new Response(bytes, { status, headers: respHeaders });
     };
 }
-";
+")
+    })
+}
 
 #[cfg(test)]
 #[allow(clippy::future_not_send)]
@@ -23147,6 +23174,89 @@ mod tests {
     use super::*;
     use crate::scheduler::DeterministicClock;
     use serde_json::json;
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn compressed_javascript_sources_preserve_exact_bytes() {
+        let bridge = pi_bridge_js();
+        assert_eq!(bridge.len(), 181_314);
+        assert_eq!(
+            sha256_hex(bridge.as_bytes()),
+            "860c31b41d20da7c69bf095169929d84e49395a474583b969ea4d6fd47fbd4c4"
+        );
+
+        let modules = default_virtual_modules();
+        for (name, expected_len, expected_sha256) in [
+            (
+                "node:fs",
+                42_870,
+                "6653f69100889fb36423a857dea9826b6976d8152762b5623ff10ffb0caf4271",
+            ),
+            (
+                "@mariozechner/pi-ai",
+                20_617,
+                "16f04ddc37822e9ed9a018b5a0c53e48ed171912afe84bbfb31a6ed86487637a",
+            ),
+            (
+                "node:child_process",
+                18_974,
+                "dc00c274aea0e563e3b6014a01278ad7f8b5859f6f65c1279637a4e65b36a70a",
+            ),
+            (
+                "node:stream",
+                17_837,
+                "86032256b40f9ffac34e111ec9246e317884bfdba49249198e9ef18edda29782",
+            ),
+            (
+                "@mariozechner/pi-coding-agent",
+                14_966,
+                "96be2fcee80995ef133943c300289b842e469adb7b5f0c58ce778b7eae09ad4d",
+            ),
+            (
+                "@mariozechner/pi-tui",
+                8_395,
+                "e51cefc340ec148e6202c7cf8f57b429a34357559c504130e962a5c947f36a84",
+            ),
+            (
+                "typebox/compile",
+                8_189,
+                "a4b25b282d3a8d4dea5b22a12cb790975691a3202390827385680c2d9000652e",
+            ),
+            (
+                "node:module",
+                7_418,
+                "0f16b8ba098a98bf96d6ef19ff1222a7e29a820211ed7703a925157066144fd7",
+            ),
+            (
+                "jsonwebtoken",
+                6_806,
+                "ff82b2f65aace15593451d8dfa3e25e06131d7016bbf02b6bba5a8fa593fd80b",
+            ),
+            (
+                "node:net",
+                5_894,
+                "9fb7d79bf0118d8c57bbc8ac41fa1b99ce6bf6fcea05f71c20e068fe2eae49cd",
+            ),
+            (
+                "node:url",
+                5_637,
+                "c4b419ff37056fa9abdb446d0497e70841ba4df7572e8bbe80ada580cebf650c",
+            ),
+        ] {
+            let source = modules
+                .get(name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(source.len(), expected_len, "length drift for {name}");
+            assert_eq!(
+                sha256_hex(source.as_bytes()),
+                expected_sha256,
+                "content drift for {name}"
+            );
+        }
+    }
 
     #[test]
     fn per_runtime_compat_scan_flag_overrides_global_default() {

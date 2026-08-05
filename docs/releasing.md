@@ -229,39 +229,99 @@ Before opening the fail-fast session, freeze every release-source change in one
 or more commits whose subjects end in `[skip actions]`, and leave the checkout
 completely clean. Run the lane as one fail-fast Bash session (`set -euo
 pipefail`); do not copy a later publication command in isolation. Start by
-binding all operator state to the intended stable version and a fresh directory
-outside the checkout. Replace the two explicit operator-supplied values before
-running this block:
+binding all operator state to the intended stable version, a fresh directory
+outside the checkout, four explicitly selected smoke-test hosts, and the
+audited controller's ARM64 sysroot. Linux AMD64 executes natively. Linux ARM64
+executes explicitly under `qemu-aarch64` on the configured x86_64 controller;
+that is target-runtime emulation, not a hardware-native ARM64 claim. The Apple
+Silicon macOS host must support both native ARM64 execution and Rosetta x86_64
+execution, and the Windows host must report an x86_64 OS runtime. Replace all
+seven explicit operator-supplied values before running this block:
 
 ```bash
 set -euo pipefail
 umask 077
 export RELEASE_VERSION="X.Y.Z"
 export MANUAL_RELEASE_STATE_DIR="/path/outside/checkout/pi_agent_rust-vX.Y.Z-release-state"
+export LINUX_AMD64_SMOKE_HOST="operator-supplied-linux-amd64-host"
+export LINUX_ARM64_SMOKE_HOST="operator-supplied-linux-arm64-qemu-host"
+export LINUX_ARM64_QEMU_SYSROOT="/operator/supplied/aarch64/sysroot"
+export DARWIN_SMOKE_HOST="operator-supplied-apple-silicon-host"
+export WINDOWS_AMD64_SMOKE_HOST="operator-supplied-windows-amd64-host"
 [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 export RELEASE_TAG="v${RELEASE_VERSION}"
 test "$RELEASE_TAG" != "vX.Y.Z"
+test "$LINUX_AMD64_SMOKE_HOST" != "operator-supplied-linux-amd64-host"
+test "$LINUX_ARM64_SMOKE_HOST" != "operator-supplied-linux-arm64-qemu-host"
+test "$LINUX_ARM64_QEMU_SYSROOT" != "/operator/supplied/aarch64/sysroot"
+[[ "$LINUX_ARM64_QEMU_SYSROOT" =~ ^/[A-Za-z0-9._/-]+$ ]]
+case "$LINUX_ARM64_QEMU_SYSROOT" in *'/../'*|*'/..'|*'//'*) exit 1 ;; esac
+test "$DARWIN_SMOKE_HOST" != "operator-supplied-apple-silicon-host"
+test "$WINDOWS_AMD64_SMOKE_HOST" != "operator-supplied-windows-amd64-host"
 test ! -e "$MANUAL_RELEASE_STATE_DIR"
 mkdir -m 700 "$MANUAL_RELEASE_STATE_DIR"
 RELEASE_REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 export RELEASE_REPOSITORY
 test "$RELEASE_REPOSITORY" = "Dicklesworthstone/pi_agent_rust"
 test -z "$(git status --porcelain=v2 --untracked-files=all)"
+
+# Fuzz and conformance have daily 02:00 UTC schedules. A baseline is valid only
+# after both current-day scheduled run IDs exist, and this lane must finish on
+# the same UTC date. Their queued/running/completed states may evolve and are
+# recorded but are not part of the invariant; only addition of a run ID after
+# this point is a stop condition. Never recapture the baseline mid-release.
+WORKFLOW_BASELINE_UTC_DATE="$(date -u +%F)"
+export WORKFLOW_BASELINE_UTC_DATE
+workflow_window_start="${WORKFLOW_BASELINE_UTC_DATE}T02:00:00Z"
+workflow_window_end="$(python3 - "$WORKFLOW_BASELINE_UTC_DATE" <<'PY'
+from datetime import date, datetime, time, timedelta, timezone
+import sys
+
+day = date.fromisoformat(sys.argv[1]) + timedelta(days=1)
+print(datetime.combine(day, time.min, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"))
+PY
+)"
+[[ "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$workflow_window_start" ]]
+for scheduled_workflow in fuzz.yml conformance.yml; do
+  scheduled_proof="$MANUAL_RELEASE_STATE_DIR/scheduled-${scheduled_workflow%.yml}.json"
+  test ! -e "$scheduled_proof"
+  gh api -H 'Accept: application/vnd.github+json' \
+    "/repos/${RELEASE_REPOSITORY}/actions/workflows/${scheduled_workflow}/runs?event=schedule&per_page=100" \
+    > "$scheduled_proof"
+  jq -e \
+    --arg start "$workflow_window_start" \
+    --arg end "$workflow_window_end" '
+    (.workflow_runs | type) == "array" and
+    ([.workflow_runs[] |
+      select(.event == "schedule" and .created_at >= $start and .created_at < $end)] |
+      length) >= 1 and
+    all(.workflow_runs[] |
+      select(.event == "schedule" and .created_at >= $start and .created_at < $end);
+      (.id | type) == "number" and .id > 0 and
+      (.status | type) == "string" and (.status | length) > 0)
+  ' "$scheduled_proof" >/dev/null
+done
 workflow_baseline="$MANUAL_RELEASE_STATE_DIR/github-actions-baseline.json"
 workflow_baseline_proof="$MANUAL_RELEASE_STATE_DIR/github-actions-baseline.txt"
 test ! -e "$workflow_baseline" && test ! -e "$workflow_baseline_proof"
-gh api -H 'Accept: application/vnd.github+json' \
-  "/repos/${RELEASE_REPOSITORY}/actions/runs?per_page=1" > "$workflow_baseline"
+gh api --paginate -H 'Accept: application/vnd.github+json' \
+  "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
+  | jq -s '[.[].workflow_runs[]] as $runs |
+    {total_count: ($runs | length), workflow_runs: $runs}' \
+  > "$workflow_baseline"
 jq -e '
-  (.total_count | type) == "number" and .total_count >= 0 and
-  (.workflow_runs | type) == "array" and (.workflow_runs | length) <= 1 and
-  all(.workflow_runs[]; (.id | type) == "number" and .id > 0)
+  (.total_count | type) == "number" and .total_count > 0 and
+  (.workflow_runs | type) == "array" and
+  .total_count == (.workflow_runs | length) and
+  all(.workflow_runs[];
+    (.id | type) == "number" and .id > 0 and
+    (.status | type) == "string" and (.status | length) > 0) and
+  ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
 ' "$workflow_baseline" >/dev/null
-WORKFLOW_BASELINE_ID="$(jq -r '.workflow_runs[0].id // "none"' \
-  "$workflow_baseline")"
-export WORKFLOW_BASELINE_ID
-(set -C; printf 'latest_workflow_run_id=%s\n' "$WORKFLOW_BASELINE_ID" \
-  > "$workflow_baseline_proof")
+(set -C; jq -r '.workflow_runs[].id' "$workflow_baseline" \
+  | LC_ALL=C sort -n > "$workflow_baseline_proof")
+test -s "$workflow_baseline_proof"
+export WORKFLOW_BASELINE_IDS="$workflow_baseline_proof"
 ```
 
 Before step 1, prove the active immutable tag ruleset again. The rule must
@@ -612,13 +672,16 @@ proof is not proof of an empty bypass list.
      "$raw_manifest")
    ```
 
-   The aggregate manifest proves the source/tag binding, exact 5/5 target set,
-   DSR native-host method, raw byte digests/sizes, build-influence environment
-   receipts, per-run isolated source roots, and executable format/architecture
-   checks. It does **not** contain `rustc -Vv` compiler identity and does not
-   prove that each binary has already executed successfully on its target OS.
-   Do not manufacture either claim in the public manifests; target-platform
-   runtime smoke tests remain required in step 10.
+   The operator-retained aggregate manifest proves the source/tag binding,
+   exact 5/5 target set, DSR's recorded `method = native` lane label, raw byte digests/sizes,
+   build-influence environment receipts, per-run isolated source roots, and
+   executable format/architecture checks. It does **not** contain `rustc -Vv`
+   compiler identity and does not prove that each binary has already executed
+   successfully on its target OS. Do not manufacture either claim in the
+   public manifests. In particular, DSR's `native` method value does not prove
+   hardware-native execution: this audited lane cross-builds Linux ARM64 on its
+   configured x86_64 host. All five target-runtime smoke tests are mandatory in
+   step 7, before either registry publication or public GitHub publication.
 
 6. Package the five retained raw binaries in a separate controller-side stage.
    This stage reads the frozen source blobs and the preserved aggregate
@@ -632,9 +695,14 @@ proof is not proof of an empty bypass list.
    `pi.release.dsr_build_manifest.v1`, not the automated lane's
    `pi.release.build_manifest.v1`: the latter requires compiler identity that
    this preserved build receipt does not record. Each manual manifest instead
-   binds its raw artifact and build-environment receipt to the aggregate DSR
-   manifest, exact source blobs, locked registry dependency provenance, final
-   archive, and archived binary.
+   binds its raw artifact and opaque digest commitments for the build
+   environment and aggregate DSR manifest to exact source blobs, locked
+   registry dependency provenance, final archive, and archived binary. The
+   aggregate manifest, environment receipts, preservation-lane audit, and
+   packaging receipt remain operator-retained evidence under
+   `MANUAL_RELEASE_STATE_DIR`; they are not release assets and the public
+   manifest must not imply that those digest commitments are publicly
+   resolvable.
 
    ```bash
    set -euo pipefail
@@ -1048,7 +1116,7 @@ proof is not proof of an empty bypass list.
            "selected_locked_registry_packages": selected,
            "raw_build": {
                "run_id": run_id,
-               "aggregate_manifest": {
+               "operator_retained_aggregate_manifest": {
                    "name": raw_manifest_path.name,
                    "schema_version": "1.0.0",
                    "sha256": aggregate_sha,
@@ -1060,8 +1128,9 @@ proof is not proof of an empty bypass list.
                },
                "build_environment": {
                    "host": environment["host"],
-                   "method": environment["method"],
-                   "receipt_sha256": sha256_bytes(environment_bytes),
+                   "dsr_method_label": environment["method"],
+                   "hardware_native_build_proven": False,
+                   "operator_retained_receipt_sha256": sha256_bytes(environment_bytes),
                },
                "preservation_lane": {
                    "wrapper_sha256": os.environ["PRESERVED_WRAPPER_SHA256"],
@@ -1168,10 +1237,11 @@ proof is not proof of an empty bypass list.
          .schema == "pi.release.dsr_build_manifest.v1" and
          .tag == $tag and .version == $version and
          .pi_agent_rust == $commit and .raw_build.run_id == $run and
-         .raw_build.aggregate_manifest.sha256 == $aggregate and
-         .raw_build.aggregate_manifest.schema_version == "1.0.0" and
-         .raw_build.build_environment.method == "native" and
-         (.raw_build.build_environment.receipt_sha256 |
+         .raw_build.operator_retained_aggregate_manifest.sha256 == $aggregate and
+         .raw_build.operator_retained_aggregate_manifest.schema_version == "1.0.0" and
+         .raw_build.build_environment.dsr_method_label == "native" and
+         .raw_build.build_environment.hardware_native_build_proven == false and
+         (.raw_build.build_environment.operator_retained_receipt_sha256 |
            test("^[0-9a-f]{64}$")) and
          (has("rustc") | not) and
          (.archive.sha256 | test("^[0-9a-f]{64}$")) and
@@ -1251,27 +1321,40 @@ proof is not proof of an empty bypass list.
      "refs/tags/$RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')"
    test "$remote_tag_commit" = "$source_commit"
    posttag_workflows="$MANUAL_RELEASE_STATE_DIR/github-actions-after-tag.json"
-   test ! -e "$posttag_workflows"
-   gh api -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/actions/runs?per_page=1" \
+   posttag_workflow_ids="$MANUAL_RELEASE_STATE_DIR/github-actions-after-tag.txt"
+   test ! -e "$posttag_workflows" && test ! -e "$posttag_workflow_ids"
+   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+   gh api --paginate -H 'Accept: application/vnd.github+json' \
+     "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
+     | jq -s '[.[].workflow_runs[]] as $runs |
+       {total_count: ($runs | length), workflow_runs: $runs}' \
      > "$posttag_workflows"
    jq -e '
-     (.total_count | type) == "number" and .total_count >= 0 and
-     (.workflow_runs | type) == "array" and (.workflow_runs | length) <= 1 and
-     all(.workflow_runs[]; (.id | type) == "number" and .id > 0)
+     (.total_count | type) == "number" and .total_count > 0 and
+     .total_count == (.workflow_runs | length) and
+     all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
+     ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
    ' "$posttag_workflows" >/dev/null
-   test "$(jq -r '.workflow_runs[0].id // "none"' "$posttag_workflows")" = \
-     "$WORKFLOW_BASELINE_ID"
+   (set -C; jq -r '.workflow_runs[].id' "$posttag_workflows" \
+     | LC_ALL=C sort -n > "$posttag_workflow_ids")
+   cmp "$WORKFLOW_BASELINE_IDS" "$posttag_workflow_ids"
    ```
 
-7. Create the GitHub draft with DSR, without dispatching any workflow, and bind
-   it to exact metadata and exact bytes. The release body is a publication
-   input: it must state the live `NOT_CERTIFIED` verdict and explicitly forbid
-   strict drop-in wording. A historical `CERTIFIED` result must never be copied
-   into this current release body. Canonical DSR is draft transport here, not
-   the build or packaging authority. Give it a fresh state root so it cannot
-   discover a stale alternate build manifest or mutate the exact 12-file public
-   inventory with derived sidecars.
+7. Create one new GitHub draft directly by API, bind it to the returned release
+   database ID, and upload exactly 12 assets to that ID. Do **not** run
+   `dsr release`: its recovery-oriented transport may adopt an existing release
+   and may remove its upload-state file, while this lane requires exclusive
+   creation and preserves every receipt. A failed or partial creation is a stop
+   condition requiring manual investigation; this lane never deletes a release,
+   asset, state directory, or receipt and never resumes by adopting existing
+   state.
+
+   The release body is also a frozen publication input. It must contain the
+   exact `v0.2.0` section extracted from `CHANGELOG.md` at the tagged source,
+   state the live `NOT_CERTIFIED` verdict, explicitly forbid strict drop-in
+   wording, and describe `SHA256SUMS` accurately: it covers the other eleven
+   downloadable assets, not itself. A historical `CERTIFIED` result must never
+   be copied into the current body.
 
    ```bash
    set -euo pipefail
@@ -1283,6 +1366,7 @@ proof is not proof of an empty bypass list.
    [[ "$expected_crate_size" =~ ^[0-9]+$ ]]
    test "$(git rev-parse 'HEAD^{commit}')" = "$expected_source_commit"
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
+   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
 
    verdict_source="$(jq -er '
      select(.schema == "pi.dropin.certification_verdict.v1" and
@@ -1293,45 +1377,101 @@ proof is not proof of an empty bypass list.
    ' docs/evidence/dropin-certification-verdict.json)"
    git merge-base --is-ancestor "$verdict_source" "$expected_source_commit"
 
+   frozen_changelog="$MANUAL_RELEASE_STATE_DIR/CHANGELOG.frozen.md"
+   changelog_section="$MANUAL_RELEASE_STATE_DIR/CHANGELOG-${RELEASE_TAG}.md"
    release_body="$MANUAL_RELEASE_STATE_DIR/RELEASE_BODY.md"
+   test ! -e "$frozen_changelog" && test ! -e "$changelog_section"
    test ! -e "$release_body"
-   (set -C; printf '%s\n' \
-     "# ${RELEASE_TAG}" \
-     "" \
-     "Manual DSR release of pi_agent_rust ${RELEASE_VERSION}." \
-     "" \
-     "### Drop-in certification status" \
-     "" \
-     "**NOT_CERTIFIED** — This release is not certified as a strict drop-in replacement and must not be described as one." \
-     "" \
-     "Evidence: https://github.com/Dicklesworthstone/pi_agent_rust/blob/${RELEASE_TAG}/docs/evidence/dropin-certification-verdict.json" \
-     "" \
-     "All downloadable artifacts are covered by the attached SHA256SUMS file." \
-     > "$release_body")
+   (set -C; git show "${expected_source_commit}:CHANGELOG.md" > "$frozen_changelog")
+   FROZEN_CHANGELOG="$frozen_changelog" \
+     CHANGELOG_SECTION="$changelog_section" \
+     RELEASE_TAG="$RELEASE_TAG" python3 - <<'PY'
+   import os
+   from pathlib import Path
+
+   source = Path(os.environ["FROZEN_CHANGELOG"])
+   output = Path(os.environ["CHANGELOG_SECTION"])
+   lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
+   prefix = f"## [{os.environ['RELEASE_TAG']}]"
+   starts = [index for index, line in enumerate(lines) if line.startswith(prefix)]
+   if len(starts) != 1:
+       raise SystemExit(f"expected exactly one changelog section for {prefix}")
+   start = starts[0]
+   end = next(
+       (index for index in range(start + 1, len(lines)) if lines[index].startswith("## ")),
+       len(lines),
+   )
+   section = "".join(lines[start:end]).rstrip() + "\n"
+   if not section.startswith(prefix) or len(section.splitlines()) < 2:
+       raise SystemExit("release changelog section is empty or malformed")
+   with output.open("x", encoding="utf-8", newline="") as handle:
+       handle.write(section)
+   PY
+   (set -C; {
+     printf '%s\n' \
+       "# ${RELEASE_TAG}" \
+       "" \
+       "Manual DSR release of pi_agent_rust ${RELEASE_VERSION}." \
+       "" \
+       "### Drop-in certification status" \
+       "" \
+       "**NOT_CERTIFIED** — This release is not certified as a strict drop-in replacement and must not be described as one." \
+       "" \
+       "Evidence: https://github.com/Dicklesworthstone/pi_agent_rust/blob/${RELEASE_TAG}/docs/evidence/dropin-certification-verdict.json" \
+       "" \
+       "### Changelog" \
+       ""
+     cat "$changelog_section"
+     printf '%s\n' \
+       "" \
+       "SHA256SUMS covers each of the other eleven downloadable assets; as the checksum index, it does not checksum itself."
+   } > "$release_body")
    grep -Fx '**NOT_CERTIFIED** — This release is not certified as a strict drop-in replacement and must not be described as one.' \
      "$release_body" >/dev/null
+   RELEASE_BODY="$release_body" CHANGELOG_SECTION="$changelog_section" \
+     python3 - <<'PY'
+   import os
+   from pathlib import Path
+
+   body = Path(os.environ["RELEASE_BODY"]).read_bytes()
+   section = Path(os.environ["CHANGELOG_SECTION"]).read_bytes()
+   if body.count(section) != 1:
+       raise SystemExit("release body does not contain the exact changelog section once")
+   PY
    sha256sum "$release_body" > "$MANUAL_RELEASE_STATE_DIR/release-body.sha256"
 
-   export DSR_RELEASE_STATE_DIR="$MANUAL_RELEASE_STATE_DIR/dsr-release-state"
-   test ! -e "$DSR_RELEASE_STATE_DIR" && test ! -L "$DSR_RELEASE_STATE_DIR"
-   mkdir -m 700 "$DSR_RELEASE_STATE_DIR"
-   DSR_STATE_DIR="$DSR_RELEASE_STATE_DIR" \
-     dsr release pi_agent_rust "$RELEASE_VERSION" --draft --no-dispatch \
-       --artifacts "$RELEASE_ARTIFACT_DIR"
-
-   draft_discovered="$MANUAL_RELEASE_STATE_DIR/github-draft-discovered.json"
-   test ! -e "$draft_discovered"
-   gh api -H 'Accept: application/vnd.github+json' \
+   # Prove that the tag has no release. `gh api --include` preserves the exact
+   # HTTP status and JSON body; only an authenticated 404 is acceptable here.
+   precreate_proof="$MANUAL_RELEASE_STATE_DIR/github-release-precreate-404.txt"
+   test ! -e "$precreate_proof"
+   set +e
+   (set -C; gh api --include \
+     -H 'Accept: application/vnd.github+json' \
      "/repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
-     > "$draft_discovered"
-   release_id="$(jq -er \
-     --arg tag "$RELEASE_TAG" \
-     'select((.id | type) == "number" and .id > 0 and
-             .draft == true and .tag_name == $tag) | .id' \
-     "$draft_discovered")"
-   draft_payload="$MANUAL_RELEASE_STATE_DIR/github-draft-bind-payload.json"
-   draft_bound="$MANUAL_RELEASE_STATE_DIR/github-draft-bound.json"
-   test ! -e "$draft_payload" && test ! -e "$draft_bound"
+     > "$precreate_proof")
+   precreate_exit=$?
+   set -e
+   test "$precreate_exit" -ne 0
+   PRECREATE_PROOF="$precreate_proof" python3 - <<'PY'
+   import json
+   import os
+   import re
+   from pathlib import Path
+
+   raw = Path(os.environ["PRECREATE_PROOF"]).read_bytes().replace(b"\r\n", b"\n")
+   parts = raw.split(b"\n\n")
+   status_lines = [line for part in parts[:-1] for line in part.splitlines()
+                   if line.startswith(b"HTTP/")]
+   if not status_lines or re.fullmatch(rb"HTTP/[0-9.]+ 404 .+", status_lines[-1]) is None:
+       raise SystemExit("pre-create release lookup did not return HTTP 404")
+   payload = json.loads(parts[-1])
+   if payload.get("message") != "Not Found" or str(payload.get("status")) != "404":
+       raise SystemExit("pre-create 404 body has an unexpected shape")
+   PY
+
+   draft_payload="$MANUAL_RELEASE_STATE_DIR/github-draft-create-payload.json"
+   draft_created="$MANUAL_RELEASE_STATE_DIR/github-draft-created.json"
+   test ! -e "$draft_payload" && test ! -e "$draft_created"
    jq -n \
      --arg tag "$RELEASE_TAG" \
      --arg commit "$expected_source_commit" \
@@ -1340,21 +1480,67 @@ proof is not proof of an empty bypass list.
      '{tag_name: $tag, target_commitish: $commit, name: $title,
        body: $body, draft: true, prerelease: false}' \
      > "$draft_payload"
-   gh api --method PATCH \
+   gh api --method POST \
      -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" \
-     --input "$draft_payload" > "$draft_bound"
+     "/repos/${RELEASE_REPOSITORY}/releases" \
+     --input "$draft_payload" > "$draft_created"
+   release_id="$(jq -er '
+     select((.id | type) == "number" and .id > 0) | .id
+   ' "$draft_created")"
+   created_target_commitish="$(jq -er '
+     .target_commitish | select(type == "string" and length > 0)
+   ' "$draft_created")"
    jq -e \
      --argjson id "$release_id" \
      --arg tag "$RELEASE_TAG" \
-     --arg commit "$expected_source_commit" \
+     --arg target "$created_target_commitish" \
      --rawfile body "$release_body" \
      '.id == $id and .draft == true and .prerelease == false and
-      .tag_name == $tag and .target_commitish == $commit and
-      .name == $tag and .body == $body' \
-     "$draft_bound" >/dev/null
-   printf 'release_id=%s\nrelease_body_sha256=%s\n' \
-     "$release_id" "$(sha256sum "$release_body" | awk '{print $1}')" \
+      .tag_name == $tag and .target_commitish == $target and
+      .name == $tag and .body == $body and
+      (.assets | type) == "array" and (.assets | length) == 0' \
+     "$draft_created" >/dev/null
+
+   EXPECTED_ASSETS=(
+     pi-linux-amd64.tar.xz
+     pi-linux-arm64.tar.xz
+     pi-darwin-amd64.tar.xz
+     pi-darwin-arm64.tar.xz
+     pi-windows-amd64.zip
+     install.sh
+     SHA256SUMS
+     build-manifest-pi-linux-amd64.json
+     build-manifest-pi-linux-arm64.json
+     build-manifest-pi-darwin-amd64.json
+     build-manifest-pi-darwin-arm64.json
+     build-manifest-pi-windows-amd64.json
+   )
+   upload_receipts="$MANUAL_RELEASE_STATE_DIR/github-upload-responses"
+   test ! -e "$upload_receipts" && test ! -L "$upload_receipts"
+   mkdir -m 700 "$upload_receipts"
+   for asset in "${EXPECTED_ASSETS[@]}"; do
+     [[ "$asset" =~ ^[A-Za-z0-9._-]+$ ]]
+     asset_path="$RELEASE_ARTIFACT_DIR/$asset"
+     upload_response="$upload_receipts/${asset}.json"
+     test -f "$asset_path" && test ! -L "$asset_path" && test -s "$asset_path"
+     test ! -e "$upload_response"
+     (set -C; gh api --hostname uploads.github.com --method POST \
+       -H 'Accept: application/vnd.github+json' \
+       -H 'Content-Type: application/octet-stream' \
+       --input "$asset_path" \
+       "/repos/${RELEASE_REPOSITORY}/releases/${release_id}/assets?name=${asset}" \
+       > "$upload_response")
+     jq -e \
+       --arg name "$asset" \
+       --argjson size "$(wc -c < "$asset_path" | tr -d '[:space:]')" '
+       (.id | type) == "number" and .id > 0 and
+       .name == $name and .size == $size and .state == "uploaded" and
+       .content_type == "application/octet-stream"
+     ' "$upload_response" >/dev/null
+   done
+   printf 'release_id=%s\nrelease_target_commitish=%s\nrelease_body_sha256=%s\n' \
+     "$release_id" "$created_target_commitish" \
+     "$(sha256sum "$release_body" | awk '{print $1}')" \
      >> "$proof_file"
    ```
 
@@ -1404,10 +1590,10 @@ proof is not proof of an empty bypass list.
        --argjson id "$release_id" \
        --argjson draft "$expected_draft" \
        --arg tag "$RELEASE_TAG" \
-       --arg commit "$expected_source_commit" \
+       --arg target "$created_target_commitish" \
        --rawfile body "$release_body" \
        '.id == $id and .draft == $draft and .prerelease == false and
-        .tag_name == $tag and .target_commitish == $commit and
+        .tag_name == $tag and .target_commitish == $target and
         .name == $tag and .body == $body and
         (.assets | type) == "array" and (.assets | length) == 12 and
         ([.assets[].name] | length) == ([.assets[].name] | unique | length)' \
@@ -1433,6 +1619,265 @@ proof is not proof of an empty bypass list.
    verify_exact_release true draft-after-bind
    ```
 
+   Before step 8 can publish the crate, execute the exact five retained raw
+   binaries on their target runtimes. Archive inspection, file-format checks,
+   cross-compilation success, and executing only the controller's Linux binary
+   are not substitutes. Linux AMD64 runs natively. The audited Linux ARM64 leg
+   runs explicitly through `qemu-aarch64` plus the selected ARM64 sysroot on the
+   configured x86_64 host and is labeled `qemu-emulated`; it is not presented
+   as hardware-native. The macOS x86_64 leg runs under Rosetta explicitly,
+   while the macOS ARM64 leg runs natively. Every remote directory and local
+   receipt is unique and retained; these commands intentionally perform no
+   cleanup.
+
+   ```bash
+   set -euo pipefail
+   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+
+   smoke_unix_raw_binary() {
+     local label="$1"
+     local host="$2"
+     local raw_name="$3"
+     local qemu_sysroot="${4:-}"
+     local raw_path="$RAW_RELEASE_DIR/$raw_name"
+     local expected_sha remote_dir receipt receipt_label
+     [[ "$label" =~ ^(linux|darwin)-(amd64|arm64)$ ]]
+     test -n "$host"
+     test -f "$raw_path" && test ! -L "$raw_path" && test -s "$raw_path"
+     expected_sha="$(jq -er --arg name "$raw_name" '
+       first(.artifacts[] | select(.name == $name) | .sha256) |
+       select(test("^[0-9a-f]{64}$"))
+     ' "$raw_manifest")"
+     test "$(sha256sum "$raw_path" | awk '{print $1}')" = "$expected_sha"
+     remote_dir="pi-agent-rust-${RELEASE_TAG}-${DSR_BUILD_RUN_ID}-${label}"
+     [[ "$remote_dir" =~ ^[A-Za-z0-9._-]+$ ]]
+     receipt_label="$label"
+     if test "$label" = linux-arm64; then
+       receipt_label="linux-arm64-qemu-emulated"
+       test "$qemu_sysroot" = "$LINUX_ARM64_QEMU_SYSROOT"
+     else
+       test -z "$qemu_sysroot"
+     fi
+     receipt="$MANUAL_RELEASE_STATE_DIR/smoke-${receipt_label}.txt"
+     test ! -e "$receipt"
+
+     ssh "$host" sh -s -- "$remote_dir" <<'REMOTE'
+   set -eu
+   remote_dir="$1"
+   case "$remote_dir" in
+     *[!A-Za-z0-9._-]*|'') exit 2 ;;
+   esac
+   test ! -e "$HOME/$remote_dir"
+   mkdir -m 700 "$HOME/$remote_dir"
+   REMOTE
+     scp -- "$raw_path" "${host}:${remote_dir}/pi"
+     (set -C; ssh "$host" sh -s -- \
+       "$label" "$remote_dir" "$RELEASE_VERSION" "$expected_sha" \
+       "$qemu_sysroot" \
+       > "$receipt" 2>&1 <<'REMOTE'
+   set -eu
+   label="$1"
+   remote_dir="$2"
+   expected_version="$3"
+   expected_sha="$4"
+   qemu_sysroot="$5"
+   binary="$HOME/$remote_dir/pi"
+   test -f "$binary" && test ! -L "$binary" && test -s "$binary"
+   chmod 700 "$binary"
+   host_arch="$(uname -m)"
+   qemu_version="not-applicable"
+   emulated_uname="not-applicable"
+
+   case "$label" in
+     linux-amd64)
+       test "$(uname -s)" = Linux
+       runtime_arch="$host_arch"
+       test "$runtime_arch" = x86_64
+       execution_mode="native"
+       actual_sha="$(sha256sum "$binary" | awk '{print $1}')"
+       version_output="$("$binary" --version)"
+       "$binary" --help >/dev/null
+       ;;
+     linux-arm64)
+       test "$(uname -s)" = Linux
+       test "$host_arch" = x86_64
+       case "$qemu_sysroot" in
+         /*) ;;
+         *) exit 3 ;;
+       esac
+       case "$qemu_sysroot" in *'/../'*|*'/..'|*'//'*) exit 3 ;; esac
+       test -d "$qemu_sysroot"
+       command -v qemu-aarch64 >/dev/null
+       command -v file >/dev/null
+       file -b "$binary" | grep -Eq 'ARM aarch64|aarch64'
+       qemu_version="$(qemu-aarch64 --version | head -n 1)"
+       test -n "$qemu_version"
+       runtime_arch="aarch64"
+       execution_mode="qemu-emulated"
+       actual_sha="$(sha256sum "$binary" | awk '{print $1}')"
+       version_output="$(qemu-aarch64 -L "$qemu_sysroot" "$binary" --version)"
+       qemu-aarch64 -L "$qemu_sysroot" "$binary" --help >/dev/null
+       if test -f "$qemu_sysroot/bin/uname"; then
+         emulated_uname="$(qemu-aarch64 -L "$qemu_sysroot" \
+           "$qemu_sysroot/bin/uname" -m)"
+         case "$emulated_uname" in aarch64|arm64) ;; *) exit 3 ;; esac
+       else
+         emulated_uname="unavailable-in-selected-sysroot"
+       fi
+       ;;
+     darwin-amd64)
+       test "$(uname -s)" = Darwin
+       runtime_arch="$(arch -x86_64 uname -m)"
+       test "$runtime_arch" = x86_64
+       execution_mode="rosetta-translated"
+       actual_sha="$(shasum -a 256 "$binary" | awk '{print $1}')"
+       version_output="$(arch -x86_64 "$binary" --version)"
+       arch -x86_64 "$binary" --help >/dev/null
+       ;;
+     darwin-arm64)
+       test "$(uname -s)" = Darwin
+       runtime_arch="$(arch -arm64 uname -m)"
+       test "$runtime_arch" = arm64
+       execution_mode="native"
+       actual_sha="$(shasum -a 256 "$binary" | awk '{print $1}')"
+       version_output="$(arch -arm64 "$binary" --version)"
+       arch -arm64 "$binary" --help >/dev/null
+       ;;
+     *) exit 4 ;;
+   esac
+
+   test "$actual_sha" = "$expected_sha"
+   case "$version_output" in
+     "pi $expected_version ("*) ;;
+     *) printf 'unexpected version output: %s\n' "$version_output" >&2; exit 5 ;;
+   esac
+   receipt_label="$label"
+   if test "$execution_mode" = qemu-emulated; then
+     receipt_label="${label}-qemu-emulated"
+   fi
+   printf 'status=success\nlabel=%s\nos=%s\nhost_arch=%s\nruntime_arch=%s\nexecution_mode=%s\nsha256=%s\nversion=%s\nqemu_version=%s\nemulated_uname=%s\n' \
+     "$receipt_label" "$(uname -s)" "$host_arch" "$runtime_arch" \
+     "$execution_mode" "$actual_sha" "$version_output" "$qemu_version" \
+     "$emulated_uname"
+   REMOTE
+     )
+     grep -Fx 'status=success' "$receipt" >/dev/null
+     grep -Fx "label=$receipt_label" "$receipt" >/dev/null
+     grep -Fx "sha256=$expected_sha" "$receipt" >/dev/null
+   }
+
+   smoke_unix_raw_binary \
+     linux-amd64 "$LINUX_AMD64_SMOKE_HOST" pi_linux_amd64
+   smoke_unix_raw_binary \
+     linux-arm64 "$LINUX_ARM64_SMOKE_HOST" pi_linux_arm64 \
+     "$LINUX_ARM64_QEMU_SYSROOT"
+   smoke_unix_raw_binary \
+     darwin-amd64 "$DARWIN_SMOKE_HOST" pi_darwin_amd64
+   smoke_unix_raw_binary \
+     darwin-arm64 "$DARWIN_SMOKE_HOST" pi_darwin_arm64
+
+   windows_raw="$RAW_RELEASE_DIR/pi_windows_amd64.exe"
+   windows_expected_sha="$(jq -er '
+     first(.artifacts[] | select(.name == "pi_windows_amd64.exe") | .sha256) |
+     select(test("^[0-9a-f]{64}$"))
+   ' "$raw_manifest")"
+   test -f "$windows_raw" && test ! -L "$windows_raw" && test -s "$windows_raw"
+   test "$(sha256sum "$windows_raw" | awk '{print $1}')" = "$windows_expected_sha"
+   windows_remote_dir="pi-agent-rust-${RELEASE_TAG}-${DSR_BUILD_RUN_ID}-windows-amd64"
+   [[ "$windows_remote_dir" =~ ^[A-Za-z0-9._-]+$ ]]
+   windows_setup_ps="$MANUAL_RELEASE_STATE_DIR/windows-smoke-setup.ps1"
+   windows_smoke_ps="$MANUAL_RELEASE_STATE_DIR/windows-smoke-run.ps1"
+   windows_setup_receipt="$MANUAL_RELEASE_STATE_DIR/windows-smoke-setup.txt"
+   windows_receipt="$MANUAL_RELEASE_STATE_DIR/smoke-windows-amd64.txt"
+   test ! -e "$windows_setup_ps" && test ! -e "$windows_smoke_ps"
+   test ! -e "$windows_setup_receipt" && test ! -e "$windows_receipt"
+   WINDOWS_REMOTE_DIR="$windows_remote_dir" \
+     WINDOWS_EXPECTED_SHA="$windows_expected_sha" \
+     RELEASE_VERSION="$RELEASE_VERSION" \
+     WINDOWS_SETUP_PS="$windows_setup_ps" \
+     WINDOWS_SMOKE_PS="$windows_smoke_ps" python3 - <<'PY'
+   import os
+   import re
+   from pathlib import Path
+
+   remote_dir = os.environ["WINDOWS_REMOTE_DIR"]
+   expected_sha = os.environ["WINDOWS_EXPECTED_SHA"]
+   version = os.environ["RELEASE_VERSION"]
+   if re.fullmatch(r"[A-Za-z0-9._-]+", remote_dir) is None:
+       raise SystemExit("unsafe Windows smoke directory")
+   if re.fullmatch(r"[0-9a-f]{64}", expected_sha) is None:
+       raise SystemExit("invalid Windows smoke digest")
+   if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version) is None:
+       raise SystemExit("invalid Windows smoke version")
+   setup = f"""$ErrorActionPreference = 'Stop'
+   $RemoteDir = Join-Path $HOME '{remote_dir}'
+   if (Test-Path -LiteralPath $RemoteDir) {{ throw 'remote smoke directory already exists' }}
+   New-Item -ItemType Directory -Path $RemoteDir -ErrorAction Stop | Out-Null
+   Write-Output 'status=ready'
+   """
+   smoke = f"""$ErrorActionPreference = 'Stop'
+   $RemoteDir = Join-Path $HOME '{remote_dir}'
+   $Binary = Join-Path $RemoteDir 'pi.exe'
+   if (-not (Test-Path -LiteralPath $Binary -PathType Leaf)) {{ throw 'binary missing' }}
+   $Item = Get-Item -LiteralPath $Binary -Force
+   if (($Item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or $Item.Length -le 0) {{
+       throw 'binary is empty or a reparse point'
+   }}
+   $Arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+   if ($Arch -ne 'X64') {{ throw "expected Windows X64 runtime, got $Arch" }}
+   $ActualSha = (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLowerInvariant()
+   if ($ActualSha -ne '{expected_sha}') {{ throw 'Windows smoke digest mismatch' }}
+   $VersionOutput = ((& $Binary --version 2>&1) -join "`n").Trim()
+   if ($LASTEXITCODE -ne 0) {{ throw 'pi --version failed' }}
+   if (-not $VersionOutput.StartsWith('pi {version} (')) {{ throw "unexpected version: $VersionOutput" }}
+   & $Binary --help *> $null
+   if ($LASTEXITCODE -ne 0) {{ throw 'pi --help failed' }}
+   Write-Output 'status=success'
+   Write-Output 'label=windows-amd64'
+   Write-Output "os=$([System.Runtime.InteropServices.RuntimeInformation]::OSDescription)"
+   Write-Output "arch=$Arch"
+   Write-Output "sha256=$ActualSha"
+   Write-Output "version=$VersionOutput"
+   """
+   with Path(os.environ["WINDOWS_SETUP_PS"]).open(
+       "x", encoding="utf-8", newline="\n"
+   ) as handle:
+       handle.write(setup)
+   with Path(os.environ["WINDOWS_SMOKE_PS"]).open(
+       "x", encoding="utf-8", newline="\n"
+   ) as handle:
+       handle.write(smoke)
+   PY
+   (set -C; ssh "$WINDOWS_AMD64_SMOKE_HOST" \
+     powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+       -Command - < "$windows_setup_ps" > "$windows_setup_receipt" 2>&1)
+   grep -Fq 'status=ready' "$windows_setup_receipt"
+   scp -- "$windows_raw" \
+     "${WINDOWS_AMD64_SMOKE_HOST}:${windows_remote_dir}/pi.exe"
+   (set -C; ssh "$WINDOWS_AMD64_SMOKE_HOST" \
+     powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+       -Command - < "$windows_smoke_ps" > "$windows_receipt" 2>&1)
+   grep -Fq 'status=success' "$windows_receipt"
+   grep -Fq 'label=windows-amd64' "$windows_receipt"
+   grep -Fq "sha256=$windows_expected_sha" "$windows_receipt"
+
+   SMOKE_RECEIPTS=(
+     "$MANUAL_RELEASE_STATE_DIR/smoke-linux-amd64.txt"
+     "$MANUAL_RELEASE_STATE_DIR/smoke-linux-arm64-qemu-emulated.txt"
+     "$MANUAL_RELEASE_STATE_DIR/smoke-darwin-amd64.txt"
+     "$MANUAL_RELEASE_STATE_DIR/smoke-darwin-arm64.txt"
+     "$MANUAL_RELEASE_STATE_DIR/smoke-windows-amd64.txt"
+   )
+   test "${#SMOKE_RECEIPTS[@]}" = 5
+   for smoke_receipt in "${SMOKE_RECEIPTS[@]}"; do
+     test -f "$smoke_receipt" && test ! -L "$smoke_receipt" \
+       && test -s "$smoke_receipt"
+     test "$(grep -Fc 'status=success' "$smoke_receipt")" = 1
+   done
+   sha256sum "${SMOKE_RECEIPTS[@]}" \
+     > "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+   ```
+
 8. On the clean publisher checkout at the exact tagged commit, materialize and
    preserve the checksum-gated Cargo credential provider from the frozen
    release workflow. Do not substitute `cargo:token`. The v0.2.0 reviewed
@@ -1444,6 +1889,11 @@ proof is not proof of an empty bypass list.
    set -euo pipefail
    test "$(git rev-parse 'HEAD^{commit}')" = "$expected_source_commit"
    test -z "$(git status --porcelain=v2 --untracked-files=all)"
+   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+   smoke_proof="$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+   test -f "$smoke_proof" && test ! -L "$smoke_proof"
+   test "$(wc -l < "$smoke_proof" | tr -d '[:space:]')" = 5
+   sha256sum --check --strict "$smoke_proof"
    frozen_workflow="$MANUAL_RELEASE_STATE_DIR/frozen-release-workflow.yml"
    provider="$MANUAL_RELEASE_STATE_DIR/pi-crates-credential-provider.py"
    provider_proof="$MANUAL_RELEASE_STATE_DIR/credential-provider.sha256"
@@ -1718,13 +2168,34 @@ proof is not proof of an empty bypass list.
    PY
    ```
 
-9. Make GitHub public last. Immediately before the PATCH, re-check the immutable
-   tag rule, tag object/target, exact draft ID/state/title/body/prerelease, all
-   12 names and bytes, and the crates.io checksum. PATCH by the recorded release
-   database ID, then repeat the exact release verifier immediately afterward.
+9. Make GitHub public last. Immediately before the PATCH, re-check the unchanged
+   current-day workflow run-ID set, immutable tag rule, tag object/target, exact
+   draft ID/state/title/body/prerelease, all 12 names and bytes, retained runtime
+   receipts, and the crates.io checksum. PATCH by the recorded release database
+   ID, then repeat the exact release verifier immediately afterward.
 
    ```bash
    set -euo pipefail
+   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+   sha256sum --check --strict \
+     "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+   prepublic_workflows="$MANUAL_RELEASE_STATE_DIR/github-actions-before-publication.json"
+   prepublic_workflow_ids="$MANUAL_RELEASE_STATE_DIR/github-actions-before-publication.txt"
+   test ! -e "$prepublic_workflows" && test ! -e "$prepublic_workflow_ids"
+   gh api --paginate -H 'Accept: application/vnd.github+json' \
+     "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
+     | jq -s '[.[].workflow_runs[]] as $runs |
+       {total_count: ($runs | length), workflow_runs: $runs}' \
+     > "$prepublic_workflows"
+   jq -e '
+     (.total_count | type) == "number" and .total_count > 0 and
+     .total_count == (.workflow_runs | length) and
+     all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
+     ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
+   ' "$prepublic_workflows" >/dev/null
+   (set -C; jq -r '.workflow_runs[].id' "$prepublic_workflows" \
+     | LC_ALL=C sort -n > "$prepublic_workflow_ids")
+   cmp "$WORKFLOW_BASELINE_IDS" "$prepublic_workflow_ids"
    prepublic_ruleset="$MANUAL_RELEASE_STATE_DIR/pre-public-ruleset.json"
    test ! -e "$prepublic_ruleset"
    gh api -H 'Accept: application/vnd.github+json' \
@@ -1755,10 +2226,9 @@ proof is not proof of an empty bypass list.
    test ! -e "$public_payload" && test ! -e "$public_response"
    jq -n \
      --arg tag "$RELEASE_TAG" \
-     --arg commit "$expected_source_commit" \
      --arg title "$RELEASE_TAG" \
      --rawfile body "$release_body" \
-     '{tag_name: $tag, target_commitish: $commit, name: $title,
+     '{tag_name: $tag, name: $title,
        body: $body, draft: false, prerelease: false}' \
      > "$public_payload"
    gh api --method PATCH \
@@ -1768,10 +2238,10 @@ proof is not proof of an empty bypass list.
    jq -e \
      --argjson id "$release_id" \
      --arg tag "$RELEASE_TAG" \
-     --arg commit "$expected_source_commit" \
+     --arg target "$created_target_commitish" \
      --rawfile body "$release_body" \
      '.id == $id and .draft == false and .prerelease == false and
-      .tag_name == $tag and .target_commitish == $commit and
+      .tag_name == $tag and .target_commitish == $target and
       .name == $tag and .body == $body' \
      "$public_response" >/dev/null
    verify_exact_release false immediately-after-publication
@@ -1788,27 +2258,81 @@ proof is not proof of an empty bypass list.
    hash, duplicate/extra asset, metadata drift, mismatched byte, or unexpected
    public state is a stop condition.
 
-10. Smoke-test the binaries and installer on their target platforms, confirm
+10. Verify the now-public installer path from an isolated home, confirm
     crates.io still serves the exact non-yanked version/checksum, and prove the
-    latest GitHub Actions run ID is unchanged from the pre-release baseline.
-    Do not dispatch or rerun a workflow to obtain that evidence. Preserve the
-    platform smoke receipts under `MANUAL_RELEASE_STATE_DIR`; a packaging
-    format/architecture check is not a substitute for executing the binaries.
+    current-day GitHub Actions run-ID set is byte-for-byte identical to the
+    pre-release baseline. This is installer and publication verification, not
+    the first binary smoke: all five exact binaries already executed in step 7
+    and their retained receipt hashes must still pass. Workflow run statuses
+    may evolve, but a new run ID is a stop condition. Do not dispatch or rerun a
+    workflow to obtain evidence and do not recapture the baseline.
 
     ```bash
     set -euo pipefail
+    test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+    sha256sum --check --strict "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+
+    public_download_dir="$MANUAL_RELEASE_STATE_DIR/github-assets-immediately-after-publication"
+    public_installer="$public_download_dir/install.sh"
+    test -f "$public_installer" && test ! -L "$public_installer" \
+      && test -s "$public_installer"
+    cmp "$RELEASE_ARTIFACT_DIR/install.sh" "$public_installer"
+    installer_root="$MANUAL_RELEASE_STATE_DIR/post-public-installer-linux-amd64"
+    installer_receipt="$MANUAL_RELEASE_STATE_DIR/post-public-installer-linux-amd64.txt"
+    test ! -e "$installer_root" && test ! -L "$installer_root"
+    test ! -e "$installer_receipt"
+    mkdir -m 700 \
+      "$installer_root" "$installer_root/home" "$installer_root/state" \
+      "$installer_root/bin"
+    (set -C; \
+      HOME="$installer_root/home" \
+      XDG_STATE_HOME="$installer_root/state" \
+      AGENT_SKILLS_ENABLED=0 \
+      bash "$public_installer" \
+        --yes --version "$RELEASE_TAG" --dest "$installer_root/bin" \
+        --verify --no-gum --no-completions --no-agent-skills \
+        > "$installer_receipt" 2>&1)
+    installer_state="$installer_root/state/pi-agent-rust/install-state.env"
+    test -f "$installer_state" && test ! -L "$installer_state"
+    (
+      set -euo pipefail
+      # This state file was produced by the exact downloaded installer whose
+      # bytes were compared above; source it only inside the isolated subshell.
+      source "$installer_state"
+      test "$PIAR_INSTALL_VERSION" = "$RELEASE_TAG"
+      test "$PIAR_INSTALL_SOURCE" = release
+      case "$PIAR_CHECKSUM_STATUS" in "verified (SHA256SUMS)") ;; *) exit 1 ;; esac
+      test -f "$PIAR_INSTALL_BIN" && test ! -L "$PIAR_INSTALL_BIN"
+      installed_sha="$(sha256sum "$PIAR_INSTALL_BIN" | awk '{print $1}')"
+      linux_release_sha="$(jq -er '
+        first(.artifacts[] | select(.name == "pi_linux_amd64") | .sha256) |
+        select(test("^[0-9a-f]{64}$"))
+      ' "$raw_manifest")"
+      test "$installed_sha" = "$linux_release_sha"
+      installed_version="$("$PIAR_INSTALL_BIN" --version)"
+      case "$installed_version" in "pi $RELEASE_VERSION ("*) ;; *) exit 1 ;; esac
+      printf 'post_public_installer_status=success\nsha256=%s\nversion=%s\n' \
+        "$installed_sha" "$installed_version"
+    ) >> "$installer_receipt"
+    grep -Fx 'post_public_installer_status=success' "$installer_receipt" >/dev/null
+
     postrelease_workflows="$MANUAL_RELEASE_STATE_DIR/github-actions-after-release.json"
-    test ! -e "$postrelease_workflows"
-    gh api -H 'Accept: application/vnd.github+json' \
-      "/repos/${RELEASE_REPOSITORY}/actions/runs?per_page=1" \
+    postrelease_workflow_ids="$MANUAL_RELEASE_STATE_DIR/github-actions-after-release.txt"
+    test ! -e "$postrelease_workflows" && test ! -e "$postrelease_workflow_ids"
+    gh api --paginate -H 'Accept: application/vnd.github+json' \
+      "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
+      | jq -s '[.[].workflow_runs[]] as $runs |
+        {total_count: ($runs | length), workflow_runs: $runs}' \
       > "$postrelease_workflows"
     jq -e '
-      (.total_count | type) == "number" and .total_count >= 0 and
-      (.workflow_runs | type) == "array" and (.workflow_runs | length) <= 1 and
-      all(.workflow_runs[]; (.id | type) == "number" and .id > 0)
+      (.total_count | type) == "number" and .total_count > 0 and
+      .total_count == (.workflow_runs | length) and
+      all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
+      ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
     ' "$postrelease_workflows" >/dev/null
-    test "$(jq -r '.workflow_runs[0].id // "none"' "$postrelease_workflows")" = \
-      "$WORKFLOW_BASELINE_ID"
+    (set -C; jq -r '.workflow_runs[].id' "$postrelease_workflows" \
+      | LC_ALL=C sort -n > "$postrelease_workflow_ids")
+    cmp "$WORKFLOW_BASELINE_IDS" "$postrelease_workflow_ids"
     curl -fsS \
       "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
       | jq -e \
@@ -1818,6 +2342,8 @@ proof is not proof of an empty bypass list.
         .version.num == $version and .version.yanked == false and
         .version.checksum == $checksum
       ' >/dev/null
+    sha256sum "$installer_receipt" "$installer_state" \
+      > "$MANUAL_RELEASE_STATE_DIR/post-public-installer.sha256"
     ```
 
 ## Pre-release flow (rc)

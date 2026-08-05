@@ -5,6 +5,16 @@
 # so we add the prefix to the native-library and pkg-config search paths.
 # These settings are inert on Linux/macOS/Windows.
 
+# Release binaries are held to a strict <22 MiB budget. The pinned nightly
+# toolchain exposes Cargo's profile-scoped rustflags support, which lets the
+# LLVM machine outliner reduce repeated instruction sequences without changing
+# dev/test diagnostics or applying flags to non-release builds.
+[unstable]
+profile-rustflags = true
+
+[profile.release]
+rustflags = ["-Cllvm-args=-enable-machine-outliner=always"]
+
 [target.'cfg(target_os = "freebsd")']
 rustflags = ["-L", "/usr/local/lib"]
 
