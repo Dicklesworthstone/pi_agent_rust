@@ -258,11 +258,25 @@ test "$LINUX_ARM64_QEMU_SYSROOT" != "/operator/supplied/aarch64/sysroot"
 case "$LINUX_ARM64_QEMU_SYSROOT" in *'/../'*|*'/..'|*'//'*) exit 1 ;; esac
 test "$DARWIN_SMOKE_HOST" = mmini
 test "$WINDOWS_AMD64_SMOKE_HOST" = wlap
+test -z "${PI_CRATES_IO_RELEASE_TOKEN:-}"
+if [[ -n "${CARGO_REGISTRY_TOKEN:-}" &&
+      -n "${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]]; then
+  test "$CARGO_REGISTRY_TOKEN" = "$CARGO_REGISTRIES_CRATES_IO_TOKEN"
+fi
+release_crates_io_token="${CARGO_REGISTRY_TOKEN:-${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}}"
+test -n "$release_crates_io_token"
+export -n release_crates_io_token
+unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
 test ! -e "$MANUAL_RELEASE_STATE_DIR"
 mkdir -m 700 "$MANUAL_RELEASE_STATE_DIR"
-mkdir -p /data/tmp/pi_agent_rust_cargo
+release_cargo_parent=/data/tmp/pi_agent_rust_cargo
+if [[ ! -e "$release_cargo_parent" && ! -L "$release_cargo_parent" ]]; then
+  mkdir -m 700 "$release_cargo_parent"
+fi
+test -d "$release_cargo_parent" && test ! -L "$release_cargo_parent"
+test "$(stat -c '%a:%u' "$release_cargo_parent")" = "700:$(id -u)"
 RELEASE_CARGO_WORK_DIR="$(mktemp -d \
-  "/data/tmp/pi_agent_rust_cargo/manual-v${RELEASE_VERSION}-XXXXXXXX")"
+  "$release_cargo_parent/manual-v${RELEASE_VERSION}-XXXXXXXX")"
 export RELEASE_CARGO_WORK_DIR
 export CARGO_TARGET_DIR="$RELEASE_CARGO_WORK_DIR/target"
 export TMPDIR="$RELEASE_CARGO_WORK_DIR/tmp"
@@ -2170,18 +2184,9 @@ proof is not proof of an empty bypass list.
    test ! -e "$actual_receipt"
    test "$(sha256sum "$publisher_crate" | awk '{print $1}')" = "$expected_crate_sha256"
    test -z "${PI_CRATES_IO_RELEASE_TOKEN:-}"
-   if [[ -n "${CARGO_REGISTRY_TOKEN:-}" &&
-         -n "${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]]; then
-     test "$CARGO_REGISTRY_TOKEN" = "$CARGO_REGISTRIES_CRATES_IO_TOKEN"
-   fi
-   PI_CRATES_IO_RELEASE_TOKEN="${CARGO_REGISTRY_TOKEN:-${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}}"
-   if [[ -z "$PI_CRATES_IO_RELEASE_TOKEN" ]]; then
-     test -t 0
-     IFS= read -r -s -p 'crates.io token: ' PI_CRATES_IO_RELEASE_TOKEN
-     printf '\n'
-   fi
-   test -n "$PI_CRATES_IO_RELEASE_TOKEN"
-   unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
+   test -n "$release_crates_io_token"
+   PI_CRATES_IO_RELEASE_TOKEN="$release_crates_io_token"
+   unset release_crates_io_token
    export PI_CRATES_IO_RELEASE_TOKEN
    trap 'unset PI_CRATES_IO_RELEASE_TOKEN' EXIT
    set +e
