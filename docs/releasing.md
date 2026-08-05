@@ -260,6 +260,18 @@ test "$DARWIN_SMOKE_HOST" = mmini
 test "$WINDOWS_AMD64_SMOKE_HOST" = wlap
 test ! -e "$MANUAL_RELEASE_STATE_DIR"
 mkdir -m 700 "$MANUAL_RELEASE_STATE_DIR"
+mkdir -p /data/tmp/pi_agent_rust_cargo
+RELEASE_CARGO_WORK_DIR="$(mktemp -d \
+  "/data/tmp/pi_agent_rust_cargo/manual-v${RELEASE_VERSION}-XXXXXXXX")"
+export RELEASE_CARGO_WORK_DIR
+export CARGO_TARGET_DIR="$RELEASE_CARGO_WORK_DIR/target"
+export TMPDIR="$RELEASE_CARGO_WORK_DIR/tmp"
+[[ "$CARGO_TARGET_DIR" == /* && "$TMPDIR" == /* ]]
+test ! -e "$CARGO_TARGET_DIR" && test ! -e "$TMPDIR"
+mkdir -m 700 "$CARGO_TARGET_DIR" "$TMPDIR"
+(set -C; printf 'cargo_target_dir=%s\ntmpdir=%s\n' \
+  "$CARGO_TARGET_DIR" "$TMPDIR" \
+  > "$MANUAL_RELEASE_STATE_DIR/local-build-paths.txt")
 RELEASE_REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
 export RELEASE_REPOSITORY
 test "$RELEASE_REPOSITORY" = "Dicklesworthstone/pi_agent_rust"
@@ -322,6 +334,33 @@ jq -e '
   | LC_ALL=C sort -n > "$workflow_baseline_proof")
 test -s "$workflow_baseline_proof"
 export WORKFLOW_BASELINE_IDS="$workflow_baseline_proof"
+
+verify_workflow_baseline_unchanged() {
+  local checkpoint="$1"
+  [[ "$checkpoint" =~ ^[a-z0-9-]+$ ]]
+  test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+  local snapshot="$MANUAL_RELEASE_STATE_DIR/github-actions-${checkpoint}.json"
+  local ids="$MANUAL_RELEASE_STATE_DIR/github-actions-${checkpoint}.txt"
+  test ! -e "$snapshot" && test ! -e "$ids"
+  gh api --paginate -H 'Accept: application/vnd.github+json' \
+    "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
+    | jq -s '[.[].workflow_runs[]] as $runs |
+      {total_count: ($runs | length), workflow_runs: $runs}' \
+    > "$snapshot"
+  jq -e '
+    (.total_count | type) == "number" and .total_count > 0 and
+    (.workflow_runs | type) == "array" and
+    .total_count == (.workflow_runs | length) and
+    all(.workflow_runs[];
+      (.id | type) == "number" and .id > 0 and
+      (.status | type) == "string" and (.status | length) > 0) and
+    ([.workflow_runs[].id] | length) ==
+      ([.workflow_runs[].id] | unique | length)
+  ' "$snapshot" >/dev/null
+  (set -C; jq -r '.workflow_runs[].id' "$snapshot" \
+    | LC_ALL=C sort -n > "$ids")
+  cmp "$WORKFLOW_BASELINE_IDS" "$ids"
+}
 ```
 
 Before step 1, prove the active immutable tag ruleset again. The rule must
@@ -455,11 +494,21 @@ proof is not proof of an empty bypass list.
    ./scripts/reconcile_beads_ledger.sh
    git commit -m "Record ${RELEASE_TAG} release evidence [skip actions]"
 
-   RELEASE_GATE_REQUIRE_PREFLIGHT=1 \
-   RELEASE_GATE_REQUIRE_QUALITY=1 \
-   RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED=0 \
-   RELEASE_GATE_CARGO_RUNNER=local \
-     ./scripts/release_gate.sh --no-rch --report
+   release_gate_report="$MANUAL_RELEASE_STATE_DIR/release-gate-report.json"
+   test ! -e "$release_gate_report"
+   (
+     set -C
+     RELEASE_GATE_REQUIRE_PREFLIGHT=1 \
+     RELEASE_GATE_REQUIRE_QUALITY=1 \
+     RELEASE_GATE_REQUIRE_DROPIN_CERTIFIED=0 \
+     RELEASE_GATE_CARGO_RUNNER=local \
+       ./scripts/release_gate.sh --no-rch --report > "$release_gate_report"
+   )
+   jq -e '
+     .schema == "pi.release_gate.v1" and .verdict == "pass" and
+     .counts.fail == 0 and .counts.total == (.checks | length) and
+     all(.checks[]; .status != "fail")
+   ' "$release_gate_report" >/dev/null
    ```
 
    The gate requires a clean repository at entry and revalidates the exact
@@ -471,6 +520,12 @@ proof is not proof of an empty bypass list.
    set -euo pipefail
    git push origin main
    git push origin main:master
+   branch_source_commit="$(git rev-parse 'HEAD^{commit}')"
+   test "$(git ls-remote origin refs/heads/main | awk 'NR == 1 {print $1}')" = \
+     "$branch_source_commit"
+   test "$(git ls-remote origin refs/heads/master | awk 'NR == 1 {print $1}')" = \
+     "$branch_source_commit"
+   verify_workflow_baseline_unchanged after-branch-sync
    ```
 
 4. From that final clean evidence commit, build and inspect the exact Cargo
@@ -1321,6 +1376,7 @@ proof is not proof of an empty bypass list.
    test "$(git rev-parse 'origin/master^{commit}')" = "$source_commit"
    test -z "$(git ls-remote --tags origin \
      "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
+   verify_workflow_baseline_unchanged immediately-before-tag-push
    git push origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
    remote_tag_commit="$(git ls-remote --tags origin \
      "refs/tags/$RELEASE_TAG^{}" | awk 'NR == 1 {print $1}')"
@@ -1485,6 +1541,7 @@ proof is not proof of an empty bypass list.
      '{tag_name: $tag, target_commitish: $commit, name: $title,
        body: $body, draft: true, prerelease: false}' \
      > "$draft_payload"
+   verify_workflow_baseline_unchanged immediately-before-draft-creation
    gh api --method POST \
      -H 'Accept: application/vnd.github+json' \
      "/repos/${RELEASE_REPOSITORY}/releases" \
@@ -2093,11 +2150,38 @@ proof is not proof of an empty bypass list.
    test "$(jq -er '.' <<<"$actual_registry_provider")" = "$provider"
    test "$(jq -er '.' <<<"$actual_named_provider")" = "$provider"
 
+   precrate_ruleset="$MANUAL_RELEASE_STATE_DIR/pre-crates-publication-ruleset.json"
+   test ! -e "$precrate_ruleset"
+   gh api -H 'Accept: application/vnd.github+json' \
+     "/repos/${RELEASE_REPOSITORY}/rulesets/${immutable_ruleset_id}?includes_parents=true" \
+     > "$precrate_ruleset"
+   jq -e '
+     .target == "tag" and .enforcement == "active" and
+     ((.conditions.ref_name.include | index("refs/tags/v*")) != null or
+      (.conditions.ref_name.include | index("~ALL")) != null) and
+     .conditions.ref_name.exclude == [] and
+     ([.rules[].type] | index("update")) != null and
+     ([.rules[].type] | index("deletion")) != null and
+     (.bypass_actors | type) == "array" and .bypass_actors == []
+   ' "$precrate_ruleset" >/dev/null
+   verify_workflow_baseline_unchanged immediately-before-crates-publication
+
    actual_receipt="$MANUAL_RELEASE_STATE_DIR/pi-crates-credential-receipt.json"
    test ! -e "$actual_receipt"
    test "$(sha256sum "$publisher_crate" | awk '{print $1}')" = "$expected_crate_sha256"
-   IFS= read -r -s -p 'crates.io token: ' PI_CRATES_IO_RELEASE_TOKEN
-   printf '\n'
+   test -z "${PI_CRATES_IO_RELEASE_TOKEN:-}"
+   if [[ -n "${CARGO_REGISTRY_TOKEN:-}" &&
+         -n "${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}" ]]; then
+     test "$CARGO_REGISTRY_TOKEN" = "$CARGO_REGISTRIES_CRATES_IO_TOKEN"
+   fi
+   PI_CRATES_IO_RELEASE_TOKEN="${CARGO_REGISTRY_TOKEN:-${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}}"
+   if [[ -z "$PI_CRATES_IO_RELEASE_TOKEN" ]]; then
+     test -t 0
+     IFS= read -r -s -p 'crates.io token: ' PI_CRATES_IO_RELEASE_TOKEN
+     printf '\n'
+   fi
+   test -n "$PI_CRATES_IO_RELEASE_TOKEN"
+   unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
    export PI_CRATES_IO_RELEASE_TOKEN
    trap 'unset PI_CRATES_IO_RELEASE_TOKEN' EXIT
    set +e
