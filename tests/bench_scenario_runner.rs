@@ -198,8 +198,7 @@ fn env_fingerprint() -> Value {
     let build_profile = perf_build::detect_build_profile();
     let executable_identity = current_executable_identity().as_ref().ok();
     let current_exe = executable_identity.map(|(path, _)| path.as_path());
-    let executable_build_profile = current_exe
-        .and_then(perf_build::profile_from_target_path);
+    let executable_build_profile = current_exe.and_then(perf_build::profile_from_target_path);
     let executable_profile_verified = executable_build_profile.as_deref() == Some("perf");
     let build_fingerprint_verified = perf_build::has_canonical_perf_build_fingerprint();
     let build_profile_verified = executable_profile_verified && build_fingerprint_verified;

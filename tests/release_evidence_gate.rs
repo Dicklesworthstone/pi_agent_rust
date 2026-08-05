@@ -1636,6 +1636,7 @@ const PERF_RESULT_REQUIRED_FIELDS: &[&str] = &[
     "budget_name",
     "category",
     "threshold",
+    "comparison",
     "unit",
     "actual",
     "status",
@@ -1927,6 +1928,17 @@ fn validate_performance_budget_summary(
                 &format!("{label}.threshold"),
                 true,
             )?,
+            comparison: match perf_nonempty_string(
+                &object["comparison"],
+                &format!("{label}.comparison"),
+            )? {
+                comparison @ ("maximum" | "minimum") => comparison.to_string(),
+                comparison => {
+                    return Err(format!(
+                        "{label}.comparison has unsupported value {comparison:?}"
+                    ));
+                }
+            },
             ci_enforced: object["ci_enforced"]
                 .as_bool()
                 .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?,
@@ -1936,7 +1948,15 @@ fn validate_performance_budget_summary(
         }
     }
 
+    let inventory_sha256 = perf_budget_inventory_sha256(budgets)?;
+    if inventory_sha256 != PERF_CANONICAL_BUDGET_INVENTORY_SHA256 {
+        return Err(format!(
+            "budget inventory does not match the canonical producer contract (observed_sha256={inventory_sha256}, expected_sha256={PERF_CANONICAL_BUDGET_INVENTORY_SHA256})"
+        ));
+    }
+
     let mut result_names = HashSet::new();
+    let mut result_order = Vec::with_capacity(results.len());
     let mut pass_count = 0usize;
     let mut fail_count = 0usize;
     let mut no_data_count = 0usize;
@@ -1955,11 +1975,14 @@ fn validate_performance_budget_summary(
         if !result_names.insert(name.to_string()) {
             return Err(format!("duplicate budget result: {name}"));
         }
+        result_order.push(name.to_string());
         let definition = definitions
             .get(name)
             .ok_or_else(|| format!("budget result has no matching definition: {name}"))?;
         let category = perf_nonempty_string(&object["category"], &format!("{label}.category"))?;
         let unit = perf_nonempty_string(&object["unit"], &format!("{label}.unit"))?;
+        let comparison =
+            perf_nonempty_string(&object["comparison"], &format!("{label}.comparison"))?;
         let threshold =
             perf_finite_number(&object["threshold"], &format!("{label}.threshold"), true)?;
         let ci_enforced = object["ci_enforced"]
@@ -1967,6 +1990,7 @@ fn validate_performance_budget_summary(
             .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
         if category != definition.category
             || unit != definition.unit
+            || comparison != definition.comparison
             || threshold.total_cmp(&definition.threshold).is_ne()
             || ci_enforced != definition.ci_enforced
         {
@@ -2008,7 +2032,7 @@ fn validate_performance_budget_summary(
             if actual < 0.0 {
                 return Err(format!("{label}.actual must be non-negative"));
             }
-            let passes = if name == "tool_call_throughput_min" {
+            let passes = if definition.comparison == "minimum" {
                 actual >= threshold
             } else {
                 actual <= threshold
@@ -2035,13 +2059,19 @@ fn validate_performance_budget_summary(
     }
 
     let definition_names: HashSet<_> = definitions.keys().cloned().collect();
-    if result_names != definition_names {
+    let definition_order: Vec<_> = budgets
+        .iter()
+        .map(|budget| {
+            perf_nonempty_string(&budget["name"], "canonical budget name").map(str::to_string)
+        })
+        .collect::<Result<_, _>>()?;
+    if result_names != definition_names || result_order != definition_order {
         let missing: Vec<_> = definition_names
             .difference(&result_names)
             .cloned()
             .collect();
         return Err(format!(
-            "budget_results do not cover every budget definition (missing={missing:?})"
+            "budget_results must match canonical budget declaration order and membership (missing={missing:?})"
         ));
     }
 
@@ -2382,7 +2412,42 @@ fn exact_libtest_output_proves_one(
     Ok(())
 }
 
+fn canonical_performance_budgets_fixture() -> Vec<Value> {
+    require_json("tests/perf/reports/budget_summary.json")
+        .get("budgets")
+        .and_then(Value::as_array)
+        .cloned()
+        .expect("checked-in performance summary must provide canonical budgets")
+}
+
 fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
+    let budgets = canonical_performance_budgets_fixture();
+    let total_budgets = budgets.len();
+    let ci_enforced = budgets
+        .iter()
+        .filter(|budget| budget["ci_enforced"].as_bool() == Some(true))
+        .count();
+    let budget_results: Vec<_> = budgets
+        .iter()
+        .map(|budget| {
+            json!({
+                "budget_name": budget["name"],
+                "category": budget["category"],
+                "threshold": budget["threshold"],
+                "comparison": budget["comparison"],
+                "unit": budget["unit"],
+                "actual": null,
+                "status": "NO_DATA",
+                "source": "fixture has no measurement",
+                "ci_enforced": budget["ci_enforced"]
+            })
+        })
+        .collect();
+    let first_budget_name = budgets
+        .first()
+        .and_then(|budget| budget["name"].as_str())
+        .expect("canonical budget inventory must be non-empty")
+        .to_string();
     json!({
         "schema": PERF_BUDGET_SUMMARY_SCHEMA,
         "generated_at": performance_fixture_timestamp(now),
@@ -2390,40 +2455,23 @@ fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
         "run_id": null,
         "correlation_id": null,
         "strict_mode": false,
-        "total_budgets": 1,
-        "ci_enforced": 1,
+        "total_budgets": total_budgets,
+        "ci_enforced": ci_enforced,
         "ci_with_data": 0,
         "ci_fail": 0,
-        "ci_no_data": 1,
+        "ci_no_data": ci_enforced,
         "pass": 0,
         "fail": 0,
-        "no_data": 1,
+        "no_data": total_budgets,
         "data_contract_failures_count": 1,
         "failing_data_contracts": [{
             "contract_id": "missing_or_stale_budget_artifact",
-            "budget_name": "latency",
+            "budget_name": first_budget_name,
             "detail": "measurement missing",
             "remediation": "regenerate the measurement"
         }],
-        "budgets": [{
-            "name": "latency",
-            "category": "test",
-            "metric": "latency",
-            "unit": "ms",
-            "threshold": 10.0,
-            "methodology": "fixture",
-            "ci_enforced": true
-        }],
-        "budget_results": [{
-            "budget_name": "latency",
-            "category": "test",
-            "threshold": 10.0,
-            "unit": "ms",
-            "actual": null,
-            "status": "NO_DATA",
-            "source": "fixture has no measurement",
-            "ci_enforced": true
-        }],
+        "budgets": budgets,
+        "budget_results": budget_results,
         "claim_readiness": {
             "status": "blocked",
             "performance_claims_authorized": false,
@@ -2441,18 +2489,33 @@ fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
 
 fn claim_ready_performance_summary_fixture(now: DateTime<Utc>) -> Value {
     let mut summary = blocked_performance_summary_fixture(now);
+    let total_budgets = summary["budgets"]
+        .as_array()
+        .expect("fixture budgets")
+        .len();
+    let ci_enforced = summary["budgets"]
+        .as_array()
+        .expect("fixture budgets")
+        .iter()
+        .filter(|budget| budget["ci_enforced"].as_bool() == Some(true))
+        .count();
     summary["source_commit"] = Value::String("a".repeat(40));
     summary["run_id"] = json!("perf-run-1");
     summary["correlation_id"] = json!("perf-run-1");
     summary["strict_mode"] = json!(true);
-    summary["ci_with_data"] = json!(1);
+    summary["ci_with_data"] = json!(ci_enforced);
     summary["ci_no_data"] = json!(0);
-    summary["pass"] = json!(1);
+    summary["pass"] = json!(total_budgets);
     summary["no_data"] = json!(0);
     summary["data_contract_failures_count"] = json!(0);
     summary["failing_data_contracts"] = json!([]);
-    summary["budget_results"][0]["actual"] = json!(5.0);
-    summary["budget_results"][0]["status"] = json!("PASS");
+    for result in summary["budget_results"]
+        .as_array_mut()
+        .expect("fixture budget results")
+    {
+        result["actual"] = result["threshold"].clone();
+        result["status"] = json!("PASS");
+    }
     summary["claim_readiness"] = json!({
         "status": "claim_ready",
         "performance_claims_authorized": true,
@@ -2546,6 +2609,92 @@ fn performance_contract_rejects_forged_claim_readiness() {
     assert!(
         validate_performance_budget_summary(&mismatched_lineage, now, Duration::hours(168), true)
             .is_err()
+    );
+}
+
+#[test]
+fn performance_contract_rejects_forged_inventory_and_comparison_semantics() {
+    let now = Utc::now();
+
+    let mut minimal = claim_ready_performance_summary_fixture(now);
+    minimal["budgets"]
+        .as_array_mut()
+        .expect("fixture budgets")
+        .truncate(1);
+    minimal["budget_results"]
+        .as_array_mut()
+        .expect("fixture budget results")
+        .truncate(1);
+    minimal["total_budgets"] = json!(1);
+    minimal["ci_enforced"] = json!(1);
+    minimal["ci_with_data"] = json!(1);
+    minimal["pass"] = json!(1);
+    let error = validate_performance_budget_summary(&minimal, now, Duration::hours(168), true)
+        .expect_err("a self-consistent minimal inventory must not authorize claims");
+    assert!(error.contains("canonical producer contract"), "{error}");
+
+    let mut forged_comparison = claim_ready_performance_summary_fixture(now);
+    forged_comparison["budgets"][0]["comparison"] = json!("minimum");
+    forged_comparison["budget_results"][0]["comparison"] = json!("minimum");
+    let error = validate_performance_budget_summary(
+        &forged_comparison,
+        now,
+        Duration::hours(168),
+        true,
+    )
+    .expect_err("self-consistent forged comparison semantics must not authorize claims");
+    assert!(error.contains("canonical producer contract"), "{error}");
+
+    let mut threshold_drift = claim_ready_performance_summary_fixture(now);
+    let threshold = threshold_drift["budgets"][0]["threshold"]
+        .as_f64()
+        .expect("fixture threshold");
+    threshold_drift["budgets"][0]["threshold"] = json!(threshold + 0.000_000_1);
+    threshold_drift["budget_results"][0]["threshold"] = json!(threshold + 0.000_000_1);
+    threshold_drift["budget_results"][0]["actual"] = json!(threshold);
+    let error = validate_performance_budget_summary(
+        &threshold_drift,
+        now,
+        Duration::hours(168),
+        true,
+    )
+    .expect_err("sub-canonical threshold precision drift must not authorize claims");
+    assert!(error.contains("six-decimal precision"), "{error}");
+}
+
+#[test]
+fn performance_contract_rejects_reordered_duplicated_or_missing_results() {
+    let now = Utc::now();
+
+    let mut reordered = claim_ready_performance_summary_fixture(now);
+    reordered["budget_results"]
+        .as_array_mut()
+        .expect("fixture budget results")
+        .swap(0, 1);
+    assert!(
+        validate_performance_budget_summary(&reordered, now, Duration::hours(168), true).is_err(),
+        "reordered results must not preserve canonical membership binding"
+    );
+
+    let mut duplicated = claim_ready_performance_summary_fixture(now);
+    let first = duplicated["budget_results"][0].clone();
+    let results = duplicated["budget_results"]
+        .as_array_mut()
+        .expect("fixture budget results");
+    *results.last_mut().expect("fixture result") = first;
+    assert!(
+        validate_performance_budget_summary(&duplicated, now, Duration::hours(168), true).is_err(),
+        "duplicated results must not preserve canonical membership binding"
+    );
+
+    let mut missing = claim_ready_performance_summary_fixture(now);
+    missing["budget_results"]
+        .as_array_mut()
+        .expect("fixture budget results")
+        .pop();
+    assert!(
+        validate_performance_budget_summary(&missing, now, Duration::hours(168), true).is_err(),
+        "missing results must not preserve canonical membership binding"
     );
 }
 
