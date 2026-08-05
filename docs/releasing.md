@@ -220,7 +220,9 @@ Until then, `0.x` releases may still change behavior to improve correctness/pari
 
 Use this lane when the release is intentionally built and published from the
 operator hosts. It does not dispatch, rerun, or otherwise invoke a GitHub
-Actions workflow. Keep every pushed release-preparation, source, and evidence
+Actions workflow. The frozen Windows build leg uses DSR host `wsurf`, mapped
+to SSH host `oldsurface`; `wlap` is only the post-build Windows execution-smoke
+host. Keep every pushed release-preparation, source, and evidence
 commit marked with `[skip actions]`; the commit ultimately referenced by the
 tag must contain that marker. Use an annotated tag with the marker as an
 additional auditable signal.
@@ -603,7 +605,13 @@ proof is not proof of an empty bypass list.
    The preserved lane and its audit are release inputs. Their fixed hashes
    below apply only to v0.2.0. If the path is absent, any hash or mode differs,
    or a later version is being cut, stop and perform a new preservation-lane
-   audit; never silently fall back to another DSR invocation.
+   audit; never silently fall back to another DSR invocation. All preserved
+   input checks and the exact-environment Windows MSVC link preflight below
+   must pass before creating the local tag. If that preflight fails, repair
+   and re-audit a new preserved lane, replace every pinned wrapper/audit/
+   manifest hash in this runbook, and restart from a clean source. Do not fix
+   it by injecting ambient build variables: the real DSR child deliberately
+   strips them.
 
    ```bash
    set -euo pipefail
@@ -624,13 +632,6 @@ proof is not proof of an empty bypass list.
    test -z "$(git tag --list "$RELEASE_TAG")"
    test -z "$(git ls-remote --tags origin \
      "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")"
-   git tag -a "$RELEASE_TAG" \
-     -m "$RELEASE_TAG manual DSR release [skip actions]" "$source_commit"
-   test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
-   test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$source_commit"
-   test "$(git tag --list --format='%(contents:subject)' "$RELEASE_TAG")" = \
-     "$RELEASE_TAG manual DSR release [skip actions]"
-
    export PRESERVED_DSR_LANE="/data/tmp/dsr-preserve-pi-v0.2.0-d33f69b8-9756-4181-9de8-8b30671a9976"
    export PRESERVED_DSR_WRAPPER="$PRESERVED_DSR_LANE/preserved-pi-build"
    export PRESERVED_DSR_AUDIT="$PRESERVED_DSR_LANE/PRESERVATION_LANE_AUDIT.md"
@@ -655,7 +656,225 @@ proof is not proof of an empty bypass list.
      "$PRESERVED_DSR_LANE/preservation-manifest.sha256" \
      > "$preserved_inputs")
 
-   export DSR_BUILD_RUN_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   windows_preflight_ps1="$MANUAL_RELEASE_STATE_DIR/windows-dsr-msvc-link-preflight.ps1"
+   windows_preflight_receipt="$MANUAL_RELEASE_STATE_DIR/windows-dsr-msvc-link-preflight.json"
+   windows_preflight_stderr="$MANUAL_RELEASE_STATE_DIR/windows-dsr-msvc-link-preflight.stderr"
+   test ! -e "$windows_preflight_ps1"
+   test ! -e "$windows_preflight_receipt"
+   test ! -e "$windows_preflight_stderr"
+
+   windows_dsr_ssh_host="$(yq -er '
+     .hosts.wsurf |
+     select(.enabled == true and .platform == "windows/amd64" and
+            .connection == "ssh") |
+     .ssh_host
+   ' "$PRESERVED_DSR_LANE/preserve-config/hosts.yaml")"
+   test "$windows_dsr_ssh_host" = oldsurface
+   test "$(yq -er '.cross_compile."windows/amd64".host' \
+     "$PRESERVED_DSR_LANE/preserve-config/repos.d/pi.yaml")" = wsurf
+   test "$(yq -er '.cross_compile."windows/amd64".env.CARGO_BUILD_TARGET' \
+     "$PRESERVED_DSR_LANE/preserve-config/repos.d/pi.yaml")" = \
+     x86_64-pc-windows-msvc
+
+   python3 - "$windows_preflight_ps1" <<'PY'
+   from pathlib import Path
+   import sys
+
+   script = r'''$ErrorActionPreference = 'Stop'
+   $Marker = 'pi-dsr-msvc-link-preflight-ok'
+   $TempRoot = Join-Path $env:LOCALAPPDATA 'Temp'
+   $TempItem = Get-Item -LiteralPath $TempRoot -Force
+   if (-not $TempItem.PSIsContainer -or
+       (($TempItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+       throw 'Windows temporary root is not a plain directory'
+   }
+
+   $Scratch = Join-Path $TempRoot (
+       'pi-dsr-msvc-link-preflight-' + [Guid]::NewGuid().ToString('D')
+   )
+   if (Test-Path -LiteralPath $Scratch) {
+       throw 'Fresh preflight path unexpectedly exists'
+   }
+   New-Item -ItemType Directory -Path $Scratch | Out-Null
+   $ScratchItem = Get-Item -LiteralPath $Scratch -Force
+   if (-not $ScratchItem.PSIsContainer -or
+       (($ScratchItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+       throw 'Preflight scratch path is not a plain directory'
+   }
+
+   $CargoHome = Join-Path $Scratch 'cargo-home'
+   $CargoTarget = Join-Path $Scratch 'cargo-target'
+   New-Item -ItemType Directory -Path $CargoHome, $CargoTarget | Out-Null
+
+   $Utf8 = [Text.UTF8Encoding]::new($false)
+   $Source = Join-Path $Scratch 'main.rs'
+   $Binary = Join-Path $Scratch 'pi-dsr-msvc-link-preflight.exe'
+   $CompileStdoutPath = Join-Path $Scratch 'compile.stdout'
+   $CompileStderrPath = Join-Path $Scratch 'compile.stderr'
+   $RunStdoutPath = Join-Path $Scratch 'run.stdout'
+   $RunStderrPath = Join-Path $Scratch 'run.stderr'
+   $RemoteReceipt = Join-Path $Scratch 'receipt.json'
+
+   [IO.File]::WriteAllText(
+       $Source,
+       'fn main() { println!("pi-dsr-msvc-link-preflight-ok"); }' +
+           [Environment]::NewLine,
+       $Utf8
+   )
+
+   $Build = [Diagnostics.ProcessStartInfo]::new()
+   $Build.UseShellExecute = $false
+   $Build.CreateNoWindow = $true
+   $Build.RedirectStandardOutput = $true
+   $Build.RedirectStandardError = $true
+
+   $Keys = @($Build.EnvironmentVariables.Keys)
+   foreach ($Key in $Keys) {
+       if (($Key -match '^(CARGO_|RUST|XWIN_)') -or
+           ($Key -match '^(CC|CXX|CPP|AR|RANLIB|LD|NM|OBJCOPY|STRIP|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|BINDGEN_EXTRA_CLANG_ARGS|SDKROOT|MACOSX_DEPLOYMENT_TARGET|IPHONEOS_DEPLOYMENT_TARGET|INCLUDE|LIB|LIBPATH)(_|$)') -or
+           ($Key -match '_(CC|CXX|AR|RANLIB|CFLAGS|CXXFLAGS|LDFLAGS)$')) {
+           [void]$Build.EnvironmentVariables.Remove($Key)
+       }
+   }
+
+   $Build.EnvironmentVariables['CARGO_BUILD_TARGET'] =
+       'x86_64-pc-windows-msvc'
+   $Build.EnvironmentVariables['CARGO_TERM_COLOR'] = 'always'
+   $Build.EnvironmentVariables['RUST_BACKTRACE'] = '1'
+   $Build.EnvironmentVariables['RCH_DISABLED'] = '1'
+   $Build.EnvironmentVariables['CARGO_HOME'] = $CargoHome
+   $Build.EnvironmentVariables['CARGO_TARGET_DIR'] = $CargoTarget
+
+   $Build.FileName = $env:ComSpec
+   $Build.WorkingDirectory = $Scratch
+   $Build.Arguments = '/d /s /c ' +
+       'where.exe link.exe > link-resolution.txt 2>&1 & ' +
+       'where.exe cl.exe > cl-resolution.txt 2>&1 & ' +
+       'rustc --target x86_64-pc-windows-msvc --edition 2024 ' +
+       '--crate-name pi_dsr_msvc_link_preflight main.rs ' +
+       '-o pi-dsr-msvc-link-preflight.exe'
+
+   $Process = [Diagnostics.Process]::Start($Build)
+   $StdoutTask = $Process.StandardOutput.ReadToEndAsync()
+   $StderrTask = $Process.StandardError.ReadToEndAsync()
+   $Process.WaitForExit()
+   $CompileStdout = $StdoutTask.Result
+   $CompileStderr = $StderrTask.Result
+   [IO.File]::WriteAllText($CompileStdoutPath, $CompileStdout, $Utf8)
+   [IO.File]::WriteAllText($CompileStderrPath, $CompileStderr, $Utf8)
+
+   if ($Process.ExitCode -ne 0) {
+       throw "MSVC link preflight failed with exit $($Process.ExitCode); retained at $Scratch"
+   }
+
+   $BinaryItem = Get-Item -LiteralPath $Binary -Force
+   if ($BinaryItem.PSIsContainer -or $BinaryItem.Length -le 0 -or
+       (($BinaryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+       throw 'Preflight did not produce a plain, nonempty executable'
+   }
+
+   $Run = [Diagnostics.ProcessStartInfo]::new()
+   $Run.UseShellExecute = $false
+   $Run.CreateNoWindow = $true
+   $Run.RedirectStandardOutput = $true
+   $Run.RedirectStandardError = $true
+   $Run.FileName = $Binary
+   $Run.WorkingDirectory = $Scratch
+
+   $RunProcess = [Diagnostics.Process]::Start($Run)
+   $RunStdoutTask = $RunProcess.StandardOutput.ReadToEndAsync()
+   $RunStderrTask = $RunProcess.StandardError.ReadToEndAsync()
+   $RunProcess.WaitForExit()
+   $RunStdout = $RunStdoutTask.Result
+   $RunStderr = $RunStderrTask.Result
+   [IO.File]::WriteAllText($RunStdoutPath, $RunStdout, $Utf8)
+   [IO.File]::WriteAllText($RunStderrPath, $RunStderr, $Utf8)
+
+   if ($RunProcess.ExitCode -ne 0 -or $RunStdout.Trim() -cne $Marker) {
+       throw "Linked executable smoke failed; retained at $Scratch"
+   }
+
+   $Payload = [ordered]@{
+       schema = 'pi.release.windows_msvc_link_preflight.v1'
+       status = 'success'
+       host = $env:COMPUTERNAME
+       target = 'x86_64-pc-windows-msvc'
+       compile_exit = $Process.ExitCode
+       run_exit = $RunProcess.ExitCode
+       run_stdout = $RunStdout.Trim()
+       sha256 = (Get-FileHash -LiteralPath $Binary -Algorithm SHA256).Hash.ToLowerInvariant()
+       link_resolution = (
+           Get-Content -LiteralPath (Join-Path $Scratch 'link-resolution.txt') -Raw
+       ).Trim()
+       cl_resolution = (
+           Get-Content -LiteralPath (Join-Path $Scratch 'cl-resolution.txt') -Raw
+       ).Trim()
+       retained_path = $Scratch
+   }
+   $Json = $Payload | ConvertTo-Json -Compress
+   [IO.File]::WriteAllText($RemoteReceipt, $Json + [Environment]::NewLine, $Utf8)
+   [Console]::Out.WriteLine($Json)
+   '''
+   path = Path(sys.argv[1])
+   with path.open("x", encoding="utf-8", newline="\n") as stream:
+       stream.write(script)
+   PY
+
+   # Keep EncodedCommand below Windows' command-line limit. The tiny bootstrap
+   # reads the audited script on stdin, parses it as one script block, and runs
+   # it; encoding the full script is long enough to be truncated by OpenSSH.
+   windows_preflight_bootstrap="$(python3 - <<'PY'
+   import base64
+
+   payload = (
+       "$source = [Console]::In.ReadToEnd()\n"
+       "$block = [ScriptBlock]::Create($source)\n"
+       "& $block\n"
+   )
+   print(base64.b64encode(payload.encode("utf-16le")).decode("ascii"))
+   PY
+   )"
+
+   set +e
+   (
+     set -C
+     ssh -o BatchMode=yes -o ConnectTimeout=15 \
+       "$windows_dsr_ssh_host" \
+       powershell.exe -NoLogo -NoProfile -NonInteractive \
+         -EncodedCommand "$windows_preflight_bootstrap" \
+       < "$windows_preflight_ps1" \
+       > "$windows_preflight_receipt" \
+       2> "$windows_preflight_stderr"
+   )
+   windows_preflight_status=$?
+   set -e
+   unset windows_preflight_bootstrap
+   test "$windows_preflight_status" -eq 0
+
+   jq -e '
+     .schema == "pi.release.windows_msvc_link_preflight.v1" and
+     .status == "success" and
+     .target == "x86_64-pc-windows-msvc" and
+     .compile_exit == 0 and .run_exit == 0 and
+     .run_stdout == "pi-dsr-msvc-link-preflight-ok" and
+     (.sha256 | test("^[0-9a-f]{64}$")) and
+     (.retained_path | type == "string" and length > 0)
+   ' "$windows_preflight_receipt" >/dev/null
+
+   printf 'windows_dsr_preflight_script_sha256=%s\nwindows_dsr_preflight_receipt_sha256=%s\n' \
+     "$(sha256sum "$windows_preflight_ps1" | awk '{print $1}')" \
+     "$(sha256sum "$windows_preflight_receipt" | awk '{print $1}')" \
+     >> "$proof_file"
+
+   git tag -a "$RELEASE_TAG" \
+     -m "$RELEASE_TAG manual DSR release [skip actions]" "$source_commit"
+   test "$(git cat-file -t "refs/tags/$RELEASE_TAG")" = tag
+   test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$source_commit"
+   test "$(git tag --list --format='%(contents:subject)' "$RELEASE_TAG")" = \
+     "$RELEASE_TAG manual DSR release [skip actions]"
+
+   DSR_BUILD_RUN_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+   export DSR_BUILD_RUN_ID
    [[ "$DSR_BUILD_RUN_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ]]
    export PRESERVED_DSR_STATE_DIR="/data/tmp/pi-v0.2.0-dsr-state-$DSR_BUILD_RUN_ID"
    export RAW_RELEASE_DIR="/data/tmp/pi-v0.2.0-raw-assets-$DSR_BUILD_RUN_ID"
