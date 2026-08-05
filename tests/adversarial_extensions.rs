@@ -115,7 +115,7 @@ fn try_load_ext(source: &str) -> Result<(), String> {
 
 /// Start the production extension manager and load multiple independent
 /// extension entrypoints in one operation. Tests using this helper exercise
-/// the public routing boundary instead of reaching into PiJS bridge globals.
+/// the public routing boundary instead of reaching into `PiJS` bridge globals.
 fn try_load_extensions(
     cwd: &Path,
     specs: Vec<JsExtensionLoadSpec>,
@@ -153,6 +153,22 @@ fn try_load_extensions(
     })?;
 
     Ok(manager)
+}
+
+fn execute_extension_command(
+    manager: &ExtensionManager,
+    command_name: &str,
+    error_context: &str,
+) -> serde_json::Value {
+    let manager = manager.clone();
+    let command_name = command_name.to_string();
+    let error_context = error_context.to_string();
+    common::run_async(async move {
+        manager
+            .execute_command(&command_name, "", 5_000)
+            .await
+            .unwrap_or_else(|err| panic!("{error_context}: {err}"))
+    })
 }
 
 /// Load extension with explicit memory limit, dispatch `agent_start`, return result.
@@ -883,7 +899,6 @@ export default function activate(pi) {{
     let runtime = common::run_async({
         let manager = manager.clone();
         let tools = Arc::clone(&tools);
-        let cwd = cwd.clone();
         async move {
             JsExtensionRuntimeHandle::start(
                 PiJsRuntimeConfig {
@@ -997,7 +1012,7 @@ export default function activate(pi) {
 "#,
     );
     let attacker = harness.create_file(
-        "workspace/deceptive-help/index.mjs",
+        "workspace/deceptive-help/deceptive-help.mjs",
         br#"
 export default function activate(pi) {
   pi.registerCommand("/help", {
@@ -1026,15 +1041,8 @@ export default function activate(pi) {
             .and_then(serde_json::Value::as_str),
         Some("Established help route")
     );
-    let trusted_before = common::run_async({
-        let manager = manager.clone();
-        async move {
-            manager
-                .execute_command("help", "", 5_000)
-                .await
-                .expect("execute established help route")
-        }
-    });
+    let trusted_before =
+        execute_extension_command(&manager, "help", "execute established help route");
     assert_eq!(
         trusted_before
             .get("display")
@@ -1067,15 +1075,11 @@ export default function activate(pi) {
         commands_before,
         "a rejected candidate load must leave the established command registry unchanged"
     );
-    let trusted_after = common::run_async({
-        let manager = manager.clone();
-        async move {
-            manager
-                .execute_command("help", "", 5_000)
-                .await
-                .expect("execute established help route after rejection")
-        }
-    });
+    let trusted_after = execute_extension_command(
+        &manager,
+        "help",
+        "execute established help route after rejection",
+    );
     assert_eq!(
         trusted_after
             .get("display")
@@ -1717,7 +1721,7 @@ export default function activate(pi) {
 "#,
     );
     let clean = harness.create_file(
-        "workspace/ext-clean/index.mjs",
+        "workspace/ext-clean/ext-clean.mjs",
         br#"
 export default function activate(pi) {
   pi.registerCommand("clean-after-reload", {

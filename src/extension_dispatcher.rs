@@ -408,6 +408,67 @@ pub struct ExtensionDispatcher<C: SchedulerClock = WallClock> {
     resource_governor: ResourceGovernor,
 }
 
+#[derive(serde::Deserialize)]
+struct ExtensionEventJsTaskError {
+    #[serde(default)]
+    code: Option<String>,
+    message: String,
+    #[serde(default)]
+    stack: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ExtensionEventJsTaskState {
+    status: String,
+    #[serde(default)]
+    value: Option<Value>,
+    #[serde(default)]
+    error: Option<ExtensionEventJsTaskError>,
+}
+
+enum ExtensionEventTaskProgress {
+    Pending,
+    Resolved(Value),
+}
+
+fn decode_extension_event_task_state(state_json: Value) -> Result<ExtensionEventTaskProgress> {
+    if state_json.is_null() {
+        return Err(crate::error::Error::extension(
+            "events.emit task state missing".to_string(),
+        ));
+    }
+
+    let state: ExtensionEventJsTaskState = serde_json::from_value(state_json)
+        .map_err(|err| crate::error::Error::extension(err.to_string()))?;
+    match state.status.as_str() {
+        "pending" => Ok(ExtensionEventTaskProgress::Pending),
+        "resolved" => Ok(ExtensionEventTaskProgress::Resolved(
+            state.value.unwrap_or(Value::Null),
+        )),
+        "rejected" => {
+            let err = state.error.unwrap_or_else(|| ExtensionEventJsTaskError {
+                code: None,
+                message: "Unknown JS task error".to_string(),
+                stack: None,
+            });
+            let mut message = err.message;
+            if let Some(code) = err.code {
+                message = format!("{code}: {message}");
+            }
+            if let Some(stack) = err.stack
+                && !stack.is_empty()
+            {
+                message.push('\n');
+                message.push_str(&stack);
+            }
+            Err(crate::error::Error::extension(message))
+        }
+        other => Err(crate::error::Error::extension(format!(
+            "Unexpected JS task status: {other}"
+        ))),
+    }
+}
+
 /// Runtime bridge trait so dispatcher logic is not hardwired to a concrete runtime type.
 pub trait ExtensionDispatcherRuntime<C: SchedulerClock>: 'static {
     fn as_js_runtime(&self) -> &PiJsRuntime<C>;
@@ -3867,24 +3928,6 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         ctx_payload: Value,
         timeout_ms: u64,
     ) -> Result<Value> {
-        #[derive(serde::Deserialize)]
-        struct JsTaskError {
-            #[serde(default)]
-            code: Option<String>,
-            message: String,
-            #[serde(default)]
-            stack: Option<String>,
-        }
-
-        #[derive(serde::Deserialize)]
-        struct JsTaskState {
-            status: String,
-            #[serde(default)]
-            value: Option<Value>,
-            #[serde(default)]
-            error: Option<JsTaskError>,
-        }
-
         let task_id = format!("task-events-{call_id}", call_id = uuid::Uuid::new_v4());
         let bridge_secret = self.js_runtime().bridge_secret().to_string();
 
@@ -3938,45 +3981,13 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 })
                 .await?;
 
-            if state_json.is_null() {
-                return Err(crate::error::Error::extension(
-                    "events.emit task state missing".to_string(),
-                ));
-            }
-
-            let state: JsTaskState = serde_json::from_value(state_json)
-                .map_err(|err| crate::error::Error::extension(err.to_string()))?;
-
-            match state.status.as_str() {
-                "pending" => {
+            match decode_extension_event_task_state(state_json)? {
+                ExtensionEventTaskProgress::Pending => {
                     if !self.js_runtime().has_pending() {
                         extension_wait_sleep(Duration::from_millis(1)).await;
                     }
                 }
-                "resolved" => return Ok(state.value.unwrap_or(Value::Null)),
-                "rejected" => {
-                    let err = state.error.unwrap_or_else(|| JsTaskError {
-                        code: None,
-                        message: "Unknown JS task error".to_string(),
-                        stack: None,
-                    });
-                    let mut message = err.message;
-                    if let Some(code) = err.code {
-                        message = format!("{code}: {message}");
-                    }
-                    if let Some(stack) = err.stack
-                        && !stack.is_empty()
-                    {
-                        message.push('\n');
-                        message.push_str(&stack);
-                    }
-                    return Err(crate::error::Error::extension(message));
-                }
-                other => {
-                    return Err(crate::error::Error::extension(format!(
-                        "Unexpected JS task status: {other}"
-                    )));
-                }
+                ExtensionEventTaskProgress::Resolved(value) => return Ok(value),
             }
 
             extension_wait_sleep(Duration::from_millis(0)).await;

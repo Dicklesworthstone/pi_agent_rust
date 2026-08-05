@@ -5243,7 +5243,7 @@ fn canonical_node_builtin(spec: &str) -> Option<&'static str> {
     }
 }
 
-fn canonical_virtual_module_specifier<'a>(spec: &'a str) -> &'a str {
+fn canonical_virtual_module_specifier(spec: &str) -> &str {
     canonical_node_builtin(spec).unwrap_or(match spec {
         "@earendil-works/pi-coding-agent" => "@mariozechner/pi-coding-agent",
         "@earendil-works/pi-tui" => "@mariozechner/pi-tui",
@@ -5701,7 +5701,7 @@ fn maybe_register_builtin_compat_overlay(
 
 impl JsModuleResolver for PiJsResolver {
     #[allow(clippy::too_many_lines)]
-    fn resolve(&mut self, _ctx: &Ctx<'_>, base: &str, name: &str) -> rquickjs::Result<String> {
+    fn resolve(&mut self, ctx: &Ctx<'_>, base: &str, name: &str) -> rquickjs::Result<String> {
         let spec = name.trim();
         if spec.is_empty() {
             return Err(rquickjs::Error::new_resolving(base, name));
@@ -5749,7 +5749,7 @@ impl JsModuleResolver for PiJsResolver {
             let is_safe = canonical_roots
                 .iter()
                 .any(|canonical_root| canonical.starts_with(canonical_root));
-            let active_extension_id = current_extension_id(_ctx);
+            let active_extension_id = current_extension_id(ctx);
             let owner_allows_path = active_extension_id.as_deref().is_none_or(|extension_id| {
                 path_is_in_owned_extension_root(&canonical, Some(extension_id), &self.state)
             });
@@ -17834,7 +17834,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// package scopes.
     pub(crate) fn register_foreign_extension_root_boundary(
         &self,
-        root: PathBuf,
+        root: &Path,
         owner_extension_id: &str,
     ) {
         let owner_extension_id = owner_extension_id.trim();
@@ -17860,7 +17860,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             return;
         }
 
-        let canonical_root = crate::extensions::safe_canonicalize(&root);
+        let canonical_root = crate::extensions::safe_canonicalize(root);
         let mut state = self.module_state.borrow_mut();
         let roots = state
             .foreign_extension_root_boundaries_by_id
@@ -24343,28 +24343,41 @@ mod tests {
     #[test]
     fn compressed_javascript_sources_preserve_exact_bytes() {
         let bridge = pi_bridge_js();
-        assert_eq!(bridge.len(), 189_182);
+        let modules = default_virtual_modules();
+        eprintln!(
+            "PiJS source receipt: bridge len={} sha256={}",
+            bridge.len(),
+            sha256_hex(bridge.as_bytes())
+        );
+        for name in ["node:fs", "@mariozechner/pi-ai", "node:child_process"] {
+            let source = modules.get(name).expect("receipt module must exist");
+            eprintln!(
+                "PiJS source receipt: {name} len={} sha256={}",
+                source.len(),
+                sha256_hex(source.as_bytes())
+            );
+        }
+        assert_eq!(bridge.len(), 193_144);
         assert_eq!(
             sha256_hex(bridge.as_bytes()),
-            "4b2926a10a16fb963d9bbea5ef7452cda3b6198bd5ce96569d1c611cf372a67a"
+            "c3047ae81da821cf2eee265a6adc4a15a1d951268e40daaad8b2e2fa6540a5e8"
         );
 
-        let modules = default_virtual_modules();
         for (name, expected_len, expected_sha256) in [
             (
                 "node:fs",
-                55_180,
-                "d6c98f09a862833e1b79636eda14bf717e6ceb6c117e5d0de0ed7278da7cc730",
+                56_220,
+                "73c438ae85dc7ee63ee32830928ddb51c2d1a742727b0525633cc9de23cb8451",
             ),
             (
                 "@mariozechner/pi-ai",
-                20_617,
-                "16f04ddc37822e9ed9a018b5a0c53e48ed171912afe84bbfb31a6ed86487637a",
+                21_658,
+                "26fee747831ab26565ca358b5d8e3aae61c0ff63c51e6489d4cae56ca4ea2142",
             ),
             (
                 "node:child_process",
-                18_974,
-                "dc00c274aea0e563e3b6014a01278ad7f8b5859f6f65c1279637a4e65b36a70a",
+                20_034,
+                "4c32a5b1b6fbf1754d7b3f6baf6a6bb67532ad42c20c7a942ea8c73a6f4a3908",
             ),
             (
                 "node:stream",
@@ -25272,6 +25285,223 @@ import { isIPv4 as netIsIpv4 } from "node:net";
         assert_eq!(state.module_cache_counters.invalidations, 1);
     }
 
+    const WARM_RESET_EXTENSION_REGISTRATION: &str = r#"
+        __pi_begin_extension(__pi_test_secret, "ext.reset", { name: "ext.reset" });
+        pi.registerTool({
+            name: "warm_reset_tool",
+            execute: async (_callId, _input) => ({ ok: true }),
+        });
+        pi.registerCommand("warm_reset_cmd", {
+            handler: async (_args, _ctx) => ({ ok: true }),
+        });
+        pi.on("startup", async () => {});
+        __pi_end_extension(__pi_test_secret);
+    "#;
+
+    const WARM_RESET_PROTECTED_STATE: &str = r"
+        globalThis.warmResetSecurity = {};
+        Promise.all([
+            import('node:fs'),
+            import('@mariozechner/pi-ai'),
+            import('node:child_process'),
+        ])
+            .then(([fs, ai]) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                fs.writeFileSync('/tmp/warm-reset-vfs.txt', 'transient');
+                ai.registerApiProvider({
+                    api: 'warm-reset-api',
+                    stream: async function* () {},
+                    streamSimple: async function* () {},
+                });
+
+                const vfsReset = globalThis.__pi_vfs_api.reset;
+                const providerReset = globalThis.__pi_reset_api_provider_registry;
+                const childReset = globalThis.__pi_reset_child_process_registry;
+                const processKill = globalThis.__pi_process_kill_impl;
+                try { globalThis.__pi_vfs_api.reset('wrong-secret'); }
+                catch (_) { globalThis.warmResetSecurity.vfsResetDenied = true; }
+                try { globalThis.__pi_reset_api_provider_registry('wrong-secret'); }
+                catch (_) { globalThis.warmResetSecurity.providerResetDenied = true; }
+                try { globalThis.__pi_reset_child_process_registry('wrong-secret'); }
+                catch (_) { globalThis.warmResetSecurity.childResetDenied = true; }
+                try { globalThis.__pi_reset_api_provider_registry = () => {}; }
+                catch (_) {}
+                try {
+                    Object.defineProperty(
+                        globalThis,
+                        '__pi_reset_api_provider_registry',
+                        { value: () => {} },
+                    );
+                } catch (_) {}
+                try { globalThis.__pi_process_kill_impl = () => true; }
+                catch (_) {}
+                try { globalThis.__pi_reset_child_process_registry = () => true; }
+                catch (_) {}
+
+                globalThis.warmResetSecurity.safeApiKeys =
+                    Object.keys(globalThis.__pi_vfs_api).sort().join(',');
+                globalThis.warmResetSecurity.vfsResetIntact =
+                    globalThis.__pi_vfs_api.reset === vfsReset;
+                globalThis.warmResetSecurity.providerResetIntact =
+                    globalThis.__pi_reset_api_provider_registry === providerReset;
+                globalThis.warmResetSecurity.childResetIntact =
+                    globalThis.__pi_reset_child_process_registry === childReset;
+                globalThis.warmResetSecurity.processKillIntact =
+                    globalThis.__pi_process_kill_impl === processKill;
+                globalThis.warmResetSecurity.providerCountBefore =
+                    ai.getApiProviders().length;
+                globalThis.warmResetSecurity.rawProviderStoreHidden =
+                    typeof globalThis.__pi_api_provider_registry_store === 'undefined';
+                globalThis.warmResetSecurity.rawChildStoreHidden =
+                    typeof globalThis.__pi_child_process_state === 'undefined';
+                globalThis.warmResetSecurity.childCountBefore =
+                    globalThis.__pi_child_process_registry_size();
+                globalThis.warmResetSecurity.vfsExistsBefore =
+                    fs.existsSync('/tmp/warm-reset-vfs.txt');
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmResetSecurity.error =
+                    String((error && error.stack) || error || '');
+            })
+            .finally(() => { globalThis.warmResetSecurity.done = true; });
+    ";
+
+    const WARM_RESET_POST_SCRUB_INSPECTION: &str = r"
+        globalThis.warmResetSecurity.afterDone = false;
+        Promise.all([import('node:fs'), import('@mariozechner/pi-ai')])
+            .then(([fs, ai]) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                globalThis.warmResetSecurity.providerCountAfter =
+                    ai.getApiProviders().length;
+                globalThis.warmResetSecurity.vfsExistsAfter =
+                    fs.existsSync('/tmp/warm-reset-vfs.txt');
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmResetSecurity.postError =
+                    String((error && error.stack) || error || '');
+            })
+            .finally(() => { globalThis.warmResetSecurity.afterDone = true; });
+    ";
+
+    const WARM_FD_BEFORE_RESET: &str = r"
+        globalThis.warmFdReset = {};
+        import('node:fs')
+            .then((fs) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                    fs.writeFileSync('/tmp/stale-raw.txt', 'stale-raw');
+                    fs.writeFileSync('/tmp/stale-handle.txt', 'stale-handle');
+                    globalThis.__staleRawFd = fs.openSync('/tmp/stale-raw.txt', 'r');
+                    globalThis.__staleFileHandle =
+                        await fs.promises.open('/tmp/stale-handle.txt', 'r');
+                    globalThis.warmFdReset.oldRawFd = globalThis.__staleRawFd;
+                    globalThis.warmFdReset.oldHandleFd = globalThis.__staleFileHandle.fd;
+                    globalThis.warmFdReset.beforeDone = true;
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmFdReset.beforeError =
+                    String((error && error.stack) || error || '');
+            });
+    ";
+
+    const WARM_FD_AFTER_RESET: &str = r"
+        import('node:fs')
+            .then((fs) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                    fs.writeFileSync('/tmp/fresh-after-reset.txt', 'fresh-value');
+                    const freshFd = fs.openSync('/tmp/fresh-after-reset.txt', 'r+');
+                    globalThis.warmFdReset.freshFd = freshFd;
+                    try {
+                        fs.readSync(globalThis.__staleRawFd, Buffer.alloc(1), 0, 1, 0);
+                        globalThis.warmFdReset.staleRawDenied = false;
+                    } catch (_) {
+                        globalThis.warmFdReset.staleRawDenied = true;
+                    }
+                    try {
+                        await globalThis.__staleFileHandle.read(Buffer.alloc(1), 0, 1, 0);
+                        globalThis.warmFdReset.staleHandleReadDenied = false;
+                    } catch (_) {
+                        globalThis.warmFdReset.staleHandleReadDenied = true;
+                    }
+                    try {
+                        await globalThis.__staleFileHandle.close();
+                        globalThis.warmFdReset.staleHandleCloseDenied = false;
+                    } catch (_) {
+                        globalThis.warmFdReset.staleHandleCloseDenied = true;
+                    }
+                    const freshBytes = Buffer.alloc(11);
+                    const count = fs.readSync(freshFd, freshBytes, 0, 11, 0);
+                    globalThis.warmFdReset.freshValue =
+                        freshBytes.subarray(0, count).toString('utf8');
+                    fs.closeSync(freshFd);
+                    globalThis.warmFdReset.afterDone = true;
+                },
+            ))
+            .catch((error) => {
+                globalThis.warmFdReset.afterError =
+                    String((error && error.stack) || error || '');
+            });
+    ";
+
+    const POISONED_WARM_RESET_SETUP: &str = r"
+        globalThis.poisonedWarmReset = { done: false };
+        Promise.all([import('node:fs'), import('@mariozechner/pi-ai')])
+            .then(([fs, ai]) => __pi_with_extension_async(
+                __pi_test_secret,
+                'ext.reset',
+                async () => {
+                    fs.writeFileSync('/tmp/poisoned-warm-reset.txt', 'transient');
+                    ai.registerApiProvider({
+                        api: 'poisoned-warm-reset-api',
+                        stream: async function* () {},
+                        streamSimple: async function* () {},
+                    });
+                    Map.prototype.clear = () => {};
+                    Set.prototype.clear = () => {};
+                    globalThis.poisonedWarmReset.done = true;
+                },
+            ))
+            .catch((error) => {
+                globalThis.poisonedWarmReset.error =
+                    String((error && error.stack) || error || '');
+            });
+    ";
+
+    fn assert_warm_reset_protected_state_before_scrub(value: &serde_json::Value) {
+        assert_eq!(value["done"], serde_json::json!(true));
+        assert_eq!(
+            value["error"],
+            serde_json::Value::Null,
+            "protected-state setup failed: {value}"
+        );
+        assert_eq!(
+            value["safeApiKeys"],
+            serde_json::json!("listVisiblePaths,normalizePath")
+        );
+        assert_eq!(value["vfsResetDenied"], serde_json::json!(true));
+        assert_eq!(value["providerResetDenied"], serde_json::json!(true));
+        assert_eq!(value["childResetDenied"], serde_json::json!(true));
+        assert_eq!(value["vfsResetIntact"], serde_json::json!(true));
+        assert_eq!(value["providerResetIntact"], serde_json::json!(true));
+        assert_eq!(value["childResetIntact"], serde_json::json!(true));
+        assert_eq!(value["processKillIntact"], serde_json::json!(true));
+        assert_eq!(value["providerCountBefore"], serde_json::json!(1));
+        assert_eq!(value["rawProviderStoreHidden"], serde_json::json!(true));
+        assert_eq!(value["rawChildStoreHidden"], serde_json::json!(true));
+        assert_eq!(value["childCountBefore"], serde_json::json!(0));
+        assert_eq!(value["vfsExistsBefore"], serde_json::json!(true));
+    }
+
     #[test]
     fn warm_reset_clears_extension_registry_state() {
         futures::executor::block_on(async {
@@ -25279,151 +25509,28 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .await
                 .expect("create runtime");
             runtime.register_foreign_extension_root_boundary(
-                PathBuf::from("/tmp/ext-foreign"),
+                Path::new("/tmp/ext-foreign"),
                 "ext.foreign",
             );
 
             runtime
                 .eval(&privileged_test_script(
                     &runtime,
-                    r#"
-                    __pi_begin_extension(__pi_test_secret, "ext.reset", { name: "ext.reset" });
-                    pi.registerTool({
-                        name: "warm_reset_tool",
-                        execute: async (_callId, _input) => ({ ok: true }),
-                    });
-                    pi.registerCommand("warm_reset_cmd", {
-                        handler: async (_args, _ctx) => ({ ok: true }),
-                    });
-                    pi.on("startup", async () => {});
-                    __pi_end_extension(__pi_test_secret);
-                    "#,
+                    WARM_RESET_EXTENSION_REGISTRATION,
                 ))
                 .await
                 .expect("register extension state");
 
             runtime
-                .eval(
-                    r#"
-                    globalThis.warmResetSecurity = {};
-                    Promise.all([
-                        import('node:fs'),
-                        import('@mariozechner/pi-ai'),
-                        import('node:child_process'),
-                    ])
-                        .then(([fs, ai]) => {
-                            fs.writeFileSync('/tmp/warm-reset-vfs.txt', 'transient');
-                            ai.registerApiProvider({
-                                api: 'warm-reset-api',
-                                stream: async function* () {},
-                                streamSimple: async function* () {},
-                            });
-
-                            const vfsReset = globalThis.__pi_vfs_api.reset;
-                            const providerReset = globalThis.__pi_reset_api_provider_registry;
-                            const childReset = globalThis.__pi_reset_child_process_registry;
-                            const processKill = globalThis.__pi_process_kill_impl;
-                            try { globalThis.__pi_vfs_api.reset('wrong-secret'); }
-                            catch (_) { globalThis.warmResetSecurity.vfsResetDenied = true; }
-                            try { globalThis.__pi_reset_api_provider_registry('wrong-secret'); }
-                            catch (_) { globalThis.warmResetSecurity.providerResetDenied = true; }
-                            try { globalThis.__pi_reset_child_process_registry('wrong-secret'); }
-                            catch (_) { globalThis.warmResetSecurity.childResetDenied = true; }
-                            try { globalThis.__pi_reset_api_provider_registry = () => {}; }
-                            catch (_) {}
-                            try {
-                                Object.defineProperty(
-                                    globalThis,
-                                    '__pi_reset_api_provider_registry',
-                                    { value: () => {} },
-                                );
-                            } catch (_) {}
-                            try { globalThis.__pi_process_kill_impl = () => true; }
-                            catch (_) {}
-                            try { globalThis.__pi_reset_child_process_registry = () => true; }
-                            catch (_) {}
-
-                            globalThis.warmResetSecurity.safeApiKeys =
-                                Object.keys(globalThis.__pi_vfs_api).sort().join(',');
-                            globalThis.warmResetSecurity.vfsResetIntact =
-                                globalThis.__pi_vfs_api.reset === vfsReset;
-                            globalThis.warmResetSecurity.providerResetIntact =
-                                globalThis.__pi_reset_api_provider_registry === providerReset;
-                            globalThis.warmResetSecurity.childResetIntact =
-                                globalThis.__pi_reset_child_process_registry === childReset;
-                            globalThis.warmResetSecurity.processKillIntact =
-                                globalThis.__pi_process_kill_impl === processKill;
-                            globalThis.warmResetSecurity.providerCountBefore =
-                                ai.getApiProviders().length;
-                            globalThis.warmResetSecurity.rawProviderStoreHidden =
-                                typeof globalThis.__pi_api_provider_registry_store === 'undefined';
-                            globalThis.warmResetSecurity.rawChildStoreHidden =
-                                typeof globalThis.__pi_child_process_state === 'undefined';
-                            globalThis.warmResetSecurity.childCountBefore =
-                                globalThis.__pi_child_process_registry_size();
-                            globalThis.warmResetSecurity.vfsExistsBefore =
-                                fs.existsSync('/tmp/warm-reset-vfs.txt');
-                        })
-                        .finally(() => { globalThis.warmResetSecurity.done = true; });
-                    "#,
-                )
+                .eval(&privileged_test_script(
+                    &runtime,
+                    WARM_RESET_PROTECTED_STATE,
+                ))
                 .await
                 .expect("register protected warm-reset state");
 
             let reset_security_before = get_global_json(&runtime, "warmResetSecurity").await;
-            assert_eq!(reset_security_before["done"], serde_json::json!(true));
-            assert_eq!(
-                reset_security_before["safeApiKeys"],
-                serde_json::json!("listVisiblePaths,normalizePath")
-            );
-            assert_eq!(
-                reset_security_before["vfsResetDenied"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["providerResetDenied"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["childResetDenied"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["vfsResetIntact"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["providerResetIntact"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["childResetIntact"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["processKillIntact"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["providerCountBefore"],
-                serde_json::json!(1)
-            );
-            assert_eq!(
-                reset_security_before["rawProviderStoreHidden"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["rawChildStoreHidden"],
-                serde_json::json!(true)
-            );
-            assert_eq!(
-                reset_security_before["childCountBefore"],
-                serde_json::json!(0)
-            );
-            assert_eq!(
-                reset_security_before["vfsExistsBefore"],
-                serde_json::json!(true)
-            );
+            assert_warm_reset_protected_state_before_scrub(&reset_security_before);
 
             let before = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
             assert_eq!(before["extensions"], serde_json::json!(1));
@@ -25453,23 +25560,19 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             assert_eq!(after["pendingHostcalls"], serde_json::json!(0));
 
             runtime
-                .eval(
-                    r#"
-                    globalThis.warmResetSecurity.afterDone = false;
-                    Promise.all([import('node:fs'), import('@mariozechner/pi-ai')])
-                        .then(([fs, ai]) => {
-                            globalThis.warmResetSecurity.providerCountAfter =
-                                ai.getApiProviders().length;
-                            globalThis.warmResetSecurity.vfsExistsAfter =
-                                fs.existsSync('/tmp/warm-reset-vfs.txt');
-                        })
-                        .finally(() => { globalThis.warmResetSecurity.afterDone = true; });
-                    "#,
-                )
+                .eval(&privileged_test_script(
+                    &runtime,
+                    WARM_RESET_POST_SCRUB_INSPECTION,
+                ))
                 .await
                 .expect("inspect protected state after warm reset");
             let reset_security_after = get_global_json(&runtime, "warmResetSecurity").await;
             assert_eq!(reset_security_after["afterDone"], serde_json::json!(true));
+            assert_eq!(
+                reset_security_after["postError"],
+                serde_json::Value::Null,
+                "post-reset inspection failed: {reset_security_after}"
+            );
             assert_eq!(
                 reset_security_after["providerCountAfter"],
                 serde_json::json!(0)
@@ -25496,24 +25599,15 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .expect("create runtime");
 
             runtime
-                .eval(
-                    r#"
-                    globalThis.warmFdReset = {};
-                    import('node:fs').then(async (fs) => {
-                        fs.writeFileSync('/tmp/stale-raw.txt', 'stale-raw');
-                        fs.writeFileSync('/tmp/stale-handle.txt', 'stale-handle');
-                        globalThis.__staleRawFd = fs.openSync('/tmp/stale-raw.txt', 'r');
-                        globalThis.__staleFileHandle =
-                            await fs.promises.open('/tmp/stale-handle.txt', 'r');
-                        globalThis.warmFdReset.oldRawFd = globalThis.__staleRawFd;
-                        globalThis.warmFdReset.oldHandleFd = globalThis.__staleFileHandle.fd;
-                        globalThis.warmFdReset.beforeDone = true;
-                    });
-                    "#,
-                )
+                .eval(&privileged_test_script(&runtime, WARM_FD_BEFORE_RESET))
                 .await
                 .expect("create descriptors before reset");
             let before = get_global_json(&runtime, "warmFdReset").await;
+            assert_eq!(
+                before["beforeError"],
+                serde_json::Value::Null,
+                "pre-reset descriptor setup failed: {before}"
+            );
             assert_eq!(before["beforeDone"], serde_json::json!(true));
 
             let report = runtime
@@ -25526,43 +25620,16 @@ import { isIPv4 as netIsIpv4 } from "node:net";
             );
 
             runtime
-                .eval(
-                    r#"
-                    import('node:fs').then(async (fs) => {
-                        fs.writeFileSync('/tmp/fresh-after-reset.txt', 'fresh-value');
-                        const freshFd = fs.openSync('/tmp/fresh-after-reset.txt', 'r+');
-                        globalThis.warmFdReset.freshFd = freshFd;
-                        try {
-                            fs.readSync(globalThis.__staleRawFd, Buffer.alloc(1), 0, 1, 0);
-                            globalThis.warmFdReset.staleRawDenied = false;
-                        } catch (_) {
-                            globalThis.warmFdReset.staleRawDenied = true;
-                        }
-                        try {
-                            await globalThis.__staleFileHandle.read(Buffer.alloc(1), 0, 1, 0);
-                            globalThis.warmFdReset.staleHandleReadDenied = false;
-                        } catch (_) {
-                            globalThis.warmFdReset.staleHandleReadDenied = true;
-                        }
-                        try {
-                            await globalThis.__staleFileHandle.close();
-                            globalThis.warmFdReset.staleHandleCloseDenied = false;
-                        } catch (_) {
-                            globalThis.warmFdReset.staleHandleCloseDenied = true;
-                        }
-                        const freshBytes = Buffer.alloc(11);
-                        const count = fs.readSync(freshFd, freshBytes, 0, 11, 0);
-                        globalThis.warmFdReset.freshValue =
-                            freshBytes.subarray(0, count).toString('utf8');
-                        fs.closeSync(freshFd);
-                        globalThis.warmFdReset.afterDone = true;
-                    });
-                    "#,
-                )
+                .eval(&privileged_test_script(&runtime, WARM_FD_AFTER_RESET))
                 .await
                 .expect("exercise stale descriptors after reset");
 
             let after = get_global_json(&runtime, "warmFdReset").await;
+            assert_eq!(
+                after["afterError"],
+                serde_json::Value::Null,
+                "post-reset descriptor exercise failed: {after}"
+            );
             assert_eq!(after["afterDone"], serde_json::json!(true), "{after}");
             assert_ne!(after["freshFd"], after["oldRawFd"]);
             assert_ne!(after["freshFd"], after["oldHandleFd"]);
@@ -25581,27 +25648,16 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .expect("create runtime");
 
             runtime
-                .eval(
-                    r#"
-                    globalThis.poisonedWarmReset = { done: false };
-                    Promise.all([import('node:fs'), import('@mariozechner/pi-ai')])
-                        .then(([fs, ai]) => {
-                            fs.writeFileSync('/tmp/poisoned-warm-reset.txt', 'transient');
-                            ai.registerApiProvider({
-                                api: 'poisoned-warm-reset-api',
-                                stream: async function* () {},
-                                streamSimple: async function* () {},
-                            });
-                            Map.prototype.clear = () => {};
-                            Set.prototype.clear = () => {};
-                            globalThis.poisonedWarmReset.done = true;
-                        });
-                    "#,
-                )
+                .eval(&privileged_test_script(&runtime, POISONED_WARM_RESET_SETUP))
                 .await
                 .expect("poison collection intrinsics after creating transient state");
 
             let before = get_global_json(&runtime, "poisonedWarmReset").await;
+            assert_eq!(
+                before["error"],
+                serde_json::Value::Null,
+                "poisoned warm-reset setup failed: {before}"
+            );
             assert_eq!(before["done"], serde_json::json!(true));
 
             let report = runtime
@@ -27549,11 +27605,11 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(&format!(
-                    r#"
+                    r"
                     globalThis.watchdogClearAttempt =
                         __pi_clear_timeout_native({watchdog_timer_id});
                     clearTimeout({watchdog_timer_id});
-                    "#
+                    "
                 ))
                 .await
                 .expect("attempt to cancel hostcall watchdog");
@@ -27613,14 +27669,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.processExitError = null;
                     try {
                         process.exit(17);
                     } catch (error) {
                         globalThis.processExitError = error.code;
                     }
-                    "#,
+                    ",
                 )
                 .await
                 .expect("request process exit");
@@ -28808,6 +28864,150 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
         });
     }
 
+    fn cached_vfs_scope_script(
+        ext_a: &Path,
+        ext_b: &Path,
+        cached_secret: &Path,
+        cross_root_link: &Path,
+        multi_hop_a: &Path,
+        multi_hop_b: &Path,
+        workspace_target: &Path,
+    ) -> String {
+        format!(
+            r#"
+            globalThis.vfsScope = {{}};
+            import('node:module').then(({{ createRequire }}) => {{
+                const require = createRequire('/tmp/example.js');
+                const fs = require('node:fs');
+                return __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                    fs.mkdirSync({ext_a:?}, {{ recursive: true }});
+                    fs.writeFileSync({cached_secret:?}, 'cached-secret');
+                    globalThis.vfsScope.ownerRead = fs.readFileSync({cached_secret:?}, 'utf8');
+                }}).then(() => __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
+                    try {{
+                        fs.readFileSync({cached_secret:?}, 'utf8');
+                        globalThis.vfsScope.cachedCrossRead = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.cachedCrossRead = false;
+                        globalThis.vfsScope.cachedCrossReadError =
+                            String((err && err.message) || err || '');
+                    }}
+
+                    const legacyState = globalThis.__pi_vfs_state;
+                    const safeApi = globalThis.__pi_vfs_api;
+                    globalThis.vfsScope.rawStatePresent =
+                        legacyState !== undefined && legacyState !== null;
+                    globalThis.vfsScope.safeApiExposesRawMaps = !!(
+                        safeApi && (safeApi.files || safeApi.dirs || safeApi.symlinks)
+                    );
+                    globalThis.vfsScope.safeApiKeys =
+                        safeApi ? Object.keys(safeApi).sort().join(',') : '';
+                    const visiblePaths =
+                        safeApi && typeof safeApi.listVisiblePaths === 'function'
+                            ? safeApi.listVisiblePaths()
+                            : {{ files: [] }};
+                    globalThis.vfsScope.safeApiVisibleSecret =
+                        visiblePaths.files.includes({cached_secret:?});
+
+                    fs.mkdirSync({ext_b:?}, {{ recursive: true }});
+                    fs.symlinkSync({workspace_target:?}, {cross_root_link:?});
+                    fs.symlinkSync({workspace_target:?}, {multi_hop_b:?});
+                    globalThis.vfsScope.ownerLinkRead =
+                        fs.readFileSync({cross_root_link:?}, 'utf8');
+                }})).then(() => __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
+                    fs.symlinkSync({multi_hop_b:?}, {multi_hop_a:?});
+                    try {{
+                        fs.readFileSync({cross_root_link:?}, 'utf8');
+                        globalThis.vfsScope.crossLinkRead = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.crossLinkRead = false;
+                        globalThis.vfsScope.crossLinkReadError =
+                            String((err && err.message) || err || '');
+                    }}
+                    try {{
+                        fs.writeFileSync({cross_root_link:?}, 'tampered');
+                        globalThis.vfsScope.crossLinkWrite = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.crossLinkWrite = false;
+                        globalThis.vfsScope.crossLinkWriteError =
+                            String((err && err.message) || err || '');
+                    }}
+                    try {{
+                        fs.readFileSync({multi_hop_a:?}, 'utf8');
+                        globalThis.vfsScope.multiHopRead = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.multiHopRead = false;
+                        globalThis.vfsScope.multiHopReadError =
+                            String((err && err.message) || err || '');
+                    }}
+                    try {{
+                        fs.writeFileSync({multi_hop_a:?}, 'multi-hop-tamper');
+                        globalThis.vfsScope.multiHopWrite = true;
+                    }} catch (err) {{
+                        globalThis.vfsScope.multiHopWrite = false;
+                        globalThis.vfsScope.multiHopWriteError =
+                            String((err && err.message) || err || '');
+                    }}
+                    globalThis.vfsScope.workspaceValue =
+                        fs.readFileSync({workspace_target:?}, 'utf8');
+                }}));
+            }}).finally(() => {{
+                globalThis.vfsScope.done = true;
+            }});
+            "#
+        )
+    }
+
+    fn assert_cached_vfs_scope_result(result: &serde_json::Value) {
+        assert_eq!(result["done"], serde_json::json!(true));
+        assert_eq!(result["ownerRead"], serde_json::json!("cached-secret"));
+        assert_eq!(result["cachedCrossRead"], serde_json::json!(false));
+        assert!(
+            result["cachedCrossReadError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host read denied"))
+        );
+        assert_eq!(result["rawStatePresent"], serde_json::json!(false));
+        assert_eq!(result["safeApiExposesRawMaps"], serde_json::json!(false));
+        assert_eq!(
+            result["safeApiKeys"],
+            serde_json::json!("listVisiblePaths,normalizePath")
+        );
+        assert_eq!(result["safeApiVisibleSecret"], serde_json::json!(false));
+        assert_eq!(
+            result["ownerLinkRead"],
+            serde_json::json!("workspace-value")
+        );
+        assert_eq!(result["crossLinkRead"], serde_json::json!(false));
+        assert!(
+            result["crossLinkReadError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host read denied"))
+        );
+        assert_eq!(result["crossLinkWrite"], serde_json::json!(false));
+        assert!(
+            result["crossLinkWriteError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host write denied"))
+        );
+        assert_eq!(result["multiHopRead"], serde_json::json!(false));
+        assert!(
+            result["multiHopReadError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host read denied"))
+        );
+        assert_eq!(result["multiHopWrite"], serde_json::json!(false));
+        assert!(
+            result["multiHopWriteError"]
+                .as_str()
+                .is_some_and(|error| error.contains("host write denied"))
+        );
+        assert_eq!(
+            result["workspaceValue"],
+            serde_json::json!("workspace-value")
+        );
+    }
+
     #[test]
     fn pijs_cached_vfs_and_symlink_access_stays_extension_scoped() {
         futures::executor::block_on(async {
@@ -28839,88 +29039,14 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             runtime.add_extension_root_with_id(ext_a.clone(), Some("ext.a"));
             runtime.add_extension_root_with_id(ext_b.clone(), Some("ext.b"));
 
-            let script = format!(
-                r#"
-                globalThis.vfsScope = {{}};
-                import('node:module').then(({{ createRequire }}) => {{
-                    const require = createRequire('/tmp/example.js');
-                    const fs = require('node:fs');
-                    return __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
-                        fs.mkdirSync({ext_a:?}, {{ recursive: true }});
-                        fs.writeFileSync({cached_secret:?}, 'cached-secret');
-                        globalThis.vfsScope.ownerRead = fs.readFileSync({cached_secret:?}, 'utf8');
-                    }}).then(() => __pi_with_extension_async(__pi_test_secret, "ext.b", async () => {{
-                        try {{
-                            fs.readFileSync({cached_secret:?}, 'utf8');
-                            globalThis.vfsScope.cachedCrossRead = true;
-                        }} catch (err) {{
-                            globalThis.vfsScope.cachedCrossRead = false;
-                            globalThis.vfsScope.cachedCrossReadError =
-                                String((err && err.message) || err || '');
-                        }}
-
-                        const legacyState = globalThis.__pi_vfs_state;
-                        const safeApi = globalThis.__pi_vfs_api;
-                        globalThis.vfsScope.rawStatePresent =
-                            legacyState !== undefined && legacyState !== null;
-                        globalThis.vfsScope.safeApiExposesRawMaps = !!(
-                            safeApi && (safeApi.files || safeApi.dirs || safeApi.symlinks)
-                        );
-                        globalThis.vfsScope.safeApiKeys =
-                            safeApi ? Object.keys(safeApi).sort().join(',') : '';
-                        const visiblePaths =
-                            safeApi && typeof safeApi.listVisiblePaths === 'function'
-                                ? safeApi.listVisiblePaths()
-                                : {{ files: [] }};
-                        globalThis.vfsScope.safeApiVisibleSecret =
-                            visiblePaths.files.includes({cached_secret:?});
-
-                        fs.mkdirSync({ext_b:?}, {{ recursive: true }});
-                        fs.symlinkSync({workspace_target:?}, {cross_root_link:?});
-                        fs.symlinkSync({workspace_target:?}, {multi_hop_b:?});
-                        globalThis.vfsScope.ownerLinkRead =
-                            fs.readFileSync({cross_root_link:?}, 'utf8');
-                    }})).then(() => __pi_with_extension_async(__pi_test_secret, "ext.a", async () => {{
-                        fs.symlinkSync({multi_hop_b:?}, {multi_hop_a:?});
-                        try {{
-                            fs.readFileSync({cross_root_link:?}, 'utf8');
-                            globalThis.vfsScope.crossLinkRead = true;
-                        }} catch (err) {{
-                            globalThis.vfsScope.crossLinkRead = false;
-                            globalThis.vfsScope.crossLinkReadError =
-                                String((err && err.message) || err || '');
-                        }}
-                        try {{
-                            fs.writeFileSync({cross_root_link:?}, 'tampered');
-                            globalThis.vfsScope.crossLinkWrite = true;
-                        }} catch (err) {{
-                            globalThis.vfsScope.crossLinkWrite = false;
-                            globalThis.vfsScope.crossLinkWriteError =
-                                String((err && err.message) || err || '');
-                        }}
-                        try {{
-                            fs.readFileSync({multi_hop_a:?}, 'utf8');
-                            globalThis.vfsScope.multiHopRead = true;
-                        }} catch (err) {{
-                            globalThis.vfsScope.multiHopRead = false;
-                            globalThis.vfsScope.multiHopReadError =
-                                String((err && err.message) || err || '');
-                        }}
-                        try {{
-                            fs.writeFileSync({multi_hop_a:?}, 'multi-hop-tamper');
-                            globalThis.vfsScope.multiHopWrite = true;
-                        }} catch (err) {{
-                            globalThis.vfsScope.multiHopWrite = false;
-                            globalThis.vfsScope.multiHopWriteError =
-                                String((err && err.message) || err || '');
-                        }}
-                        globalThis.vfsScope.workspaceValue =
-                            fs.readFileSync({workspace_target:?}, 'utf8');
-                    }}));
-                }}).finally(() => {{
-                    globalThis.vfsScope.done = true;
-                }});
-                "#
+            let script = cached_vfs_scope_script(
+                &ext_a,
+                &ext_b,
+                &cached_secret,
+                &cross_root_link,
+                &multi_hop_a,
+                &multi_hop_b,
+                &workspace_target,
             );
             runtime
                 .eval(&privileged_test_script(&runtime, &script))
@@ -28928,53 +29054,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                 .expect("eval cached VFS and cross-root symlink access");
 
             let result = get_global_json(&runtime, "vfsScope").await;
-            assert_eq!(result["done"], serde_json::json!(true));
-            assert_eq!(result["ownerRead"], serde_json::json!("cached-secret"));
-            assert_eq!(result["cachedCrossRead"], serde_json::json!(false));
-            assert!(
-                result["cachedCrossReadError"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("host read denied"))
-            );
-            assert_eq!(result["rawStatePresent"], serde_json::json!(false));
-            assert_eq!(result["safeApiExposesRawMaps"], serde_json::json!(false));
-            assert_eq!(
-                result["safeApiKeys"],
-                serde_json::json!("listVisiblePaths,normalizePath")
-            );
-            assert_eq!(result["safeApiVisibleSecret"], serde_json::json!(false));
-            assert_eq!(
-                result["ownerLinkRead"],
-                serde_json::json!("workspace-value")
-            );
-            assert_eq!(result["crossLinkRead"], serde_json::json!(false));
-            assert!(
-                result["crossLinkReadError"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("host read denied"))
-            );
-            assert_eq!(result["crossLinkWrite"], serde_json::json!(false));
-            assert!(
-                result["crossLinkWriteError"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("host write denied"))
-            );
-            assert_eq!(result["multiHopRead"], serde_json::json!(false));
-            assert!(
-                result["multiHopReadError"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("host read denied"))
-            );
-            assert_eq!(result["multiHopWrite"], serde_json::json!(false));
-            assert!(
-                result["multiHopWriteError"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("host write denied"))
-            );
-            assert_eq!(
-                result["workspaceValue"],
-                serde_json::json!("workspace-value")
-            );
+            assert_cached_vfs_scope_result(&result);
         });
     }
 
@@ -29588,10 +29668,10 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             )
             .await
             .expect("create owner runtime");
-            runtime.register_foreign_extension_root_boundary(peer_root, "ext.peer");
+            runtime.register_foreign_extension_root_boundary(peer_root.as_path(), "ext.peer");
 
             let script = format!(
-                r#"
+                r"
                 globalThis.promisesAccessWrite = {{}};
                 import('node:fs').then((fs) =>
                     fs.promises.access({peer_file:?}, fs.constants.W_OK)
@@ -29602,7 +29682,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                                 String((error && error.message) || error || '');
                         }})
                 ).finally(() => {{ globalThis.promisesAccessWrite.done = true; }});
-                "#
+                "
             );
             runtime
                 .eval(&script)
@@ -29705,7 +29785,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             .expect("create owner runtime");
 
             let script = format!(
-                r#"
+                r"
                 globalThis.overlayOpen = {{}};
                 import('node:fs').then((fs) => {{
                     fs.appendFileSync({host_file:?}, '-appended');
@@ -29723,7 +29803,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                     globalThis.overlayOpen.error = String((error && error.stack) || error);
                     globalThis.overlayOpen.done = false;
                 }});
-                "#
+                "
             );
             runtime
                 .eval(&script)
@@ -31919,7 +31999,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
 
             runtime
                 .eval(
-                    r#"
+                    r"
                     globalThis.piAiAliasIdentity = {};
                     Promise.all([
                         import('@mariozechner/pi-ai'),
@@ -31952,7 +32032,7 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
                             done: false,
                         };
                     });
-                    "#,
+                    ",
                 )
                 .await
                 .expect("load mixed pi-ai aliases");

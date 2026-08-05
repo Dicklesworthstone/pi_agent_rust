@@ -19,7 +19,7 @@ use pi::extensions_js::PiJsRuntimeConfig;
 use pi::model::{
     AssistantMessageEvent, ContentBlock, Message, StopReason, StreamEvent, UserContent, UserMessage,
 };
-use pi::provider::{Context, StreamOptions};
+use pi::provider::{Context, Provider, StreamOptions};
 use pi::providers::create_provider;
 use pi::tools::ToolRegistry;
 use std::sync::{Arc, Mutex};
@@ -102,6 +102,125 @@ async fn collect_events(
         }
     }
     events
+}
+
+type TestProviderStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<StreamEvent, pi::error::Error>> + Send>>;
+
+struct CollidingProviderFixture {
+    // Struct fields drop in declaration order. Keep every runtime-facing
+    // handle before the tempdir so fixture paths remain valid through teardown.
+    surviving_provider: Arc<dyn Provider>,
+    cancelled_provider: Arc<dyn Provider>,
+    _tools: Arc<ToolRegistry>,
+    manager: ExtensionManager,
+    _tempdir: tempfile::TempDir,
+}
+
+async fn load_colliding_provider_fixture() -> CollidingProviderFixture {
+    let tempdir = tempdir().expect("tempdir");
+    let workspace = tempdir.path().join("workspace");
+    let cancelled_provider_root = tempdir.path().join("stream-a");
+    let surviving_provider_root = tempdir.path().join("stream-b");
+    std::fs::create_dir_all(&workspace).expect("workspace dir");
+    std::fs::create_dir_all(&cancelled_provider_root).expect("extension A dir");
+    std::fs::create_dir_all(&surviving_provider_root).expect("extension B dir");
+
+    let cancelled_extension = cancelled_provider_root.join("index.mjs");
+    let surviving_extension = surviving_provider_root.join("index.mjs");
+    std::fs::write(&cancelled_extension, COLLIDING_STREAM_EXTENSION_A).expect("write extension A");
+    std::fs::write(&surviving_extension, COLLIDING_STREAM_EXTENSION_B).expect("write extension B");
+
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+    let runtime = JsExtensionRuntimeHandle::start(
+        PiJsRuntimeConfig {
+            cwd: workspace.display().to_string(),
+            ..Default::default()
+        },
+        Arc::clone(&tools),
+        manager.clone(),
+    )
+    .await
+    .expect("start isolated runtime coordinator");
+    manager.set_js_runtime(runtime);
+    manager
+        .load_js_extensions(vec![
+            JsExtensionLoadSpec::from_entry_path(&cancelled_extension).expect("extension A spec"),
+            JsExtensionLoadSpec::from_entry_path(&surviving_extension).expect("extension B spec"),
+        ])
+        .await
+        .expect("load both stream providers");
+
+    let entries = manager.extension_model_entries();
+    let cancelled_entry = entries
+        .iter()
+        .find(|entry| entry.model.provider == "collision-provider-a")
+        .expect("provider A entry");
+    let surviving_entry = entries
+        .iter()
+        .find(|entry| entry.model.provider == "collision-provider-b")
+        .expect("provider B entry");
+    let cancelled_provider = create_provider(cancelled_entry, Some(&manager)).expect("provider A");
+    let surviving_provider = create_provider(surviving_entry, Some(&manager)).expect("provider B");
+
+    CollidingProviderFixture {
+        surviving_provider,
+        cancelled_provider,
+        _tools: tools,
+        manager,
+        _tempdir: tempdir,
+    }
+}
+
+async fn collect_text_until(
+    stream: &mut TestProviderStream,
+    expected: &str,
+    attempt_limit: usize,
+    event_context: &str,
+    result_context: &str,
+) -> String {
+    let mut text = String::new();
+    for _ in 0..attempt_limit {
+        let event = stream
+            .next()
+            .await
+            .expect(event_context)
+            .expect(result_context);
+        if let StreamEvent::TextDelta { delta, .. } = event {
+            text.push_str(&delta);
+        }
+        if text == expected {
+            break;
+        }
+    }
+    text
+}
+
+async fn collect_remaining_text_until_done(
+    stream: &mut TestProviderStream,
+    mut text: String,
+    attempt_limit: usize,
+    event_context: &str,
+    result_context: &str,
+) -> (String, bool) {
+    let mut done = false;
+    for _ in 0..attempt_limit {
+        let event = stream
+            .next()
+            .await
+            .expect(event_context)
+            .expect(result_context);
+        match event {
+            StreamEvent::TextDelta { delta, .. } => text.push_str(&delta),
+            StreamEvent::Done { .. } => done = true,
+            _ => {}
+        }
+        if done {
+            break;
+        }
+    }
+    (text, done)
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +456,38 @@ export default function init(pi) {
       yield { type: "text_end", contentIndex: 0, content: "chunk1chunk2", partial };
       yield { type: "done", reason: "stop", message: partial };
     }
+  });
+}
+"#;
+
+const COLLIDING_STREAM_EXTENSION_A: &str = r#"
+export default function init(pi) {
+  pi.registerProvider("collision-provider-a", {
+    baseUrl: "https://a.example.test",
+    apiKey: "EXAMPLE_KEY_A",
+    api: "custom-api",
+    models: [{ id: "collision-model-a", name: "A", contextWindow: 100, maxTokens: 10, input: ["text"] }],
+    streamSimple: async function* () {
+      yield "A-1";
+      await Promise.resolve();
+      yield "A-2";
+    },
+  });
+}
+"#;
+
+const COLLIDING_STREAM_EXTENSION_B: &str = r#"
+export default function init(pi) {
+  pi.registerProvider("collision-provider-b", {
+    baseUrl: "https://b.example.test",
+    apiKey: "EXAMPLE_KEY_B",
+    api: "custom-api",
+    models: [{ id: "collision-model-b", name: "B", contextWindow: 100, maxTokens: 10, input: ["text"] }],
+    streamSimple: async function* () {
+      yield "B-1";
+      await Promise.resolve();
+      yield "B-2";
+    },
   });
 }
 "#;
@@ -900,158 +1051,63 @@ fn stream_simple_done_message_contains_model_info() {
 #[test]
 fn two_extension_streams_with_colliding_inner_ids_stay_routed_to_their_owner() {
     let scenario = async move {
-        let dir = tempdir().expect("tempdir");
-        let workspace = dir.path().join("workspace");
-        let ext_a_dir = dir.path().join("stream-a");
-        let ext_b_dir = dir.path().join("stream-b");
-        std::fs::create_dir_all(&workspace).expect("workspace dir");
-        std::fs::create_dir_all(&ext_a_dir).expect("extension A dir");
-        std::fs::create_dir_all(&ext_b_dir).expect("extension B dir");
-
-        let ext_a = ext_a_dir.join("index.mjs");
-        let ext_b = ext_b_dir.join("index.mjs");
-        std::fs::write(
-            &ext_a,
-            r#"
-export default function init(pi) {
-  pi.registerProvider("collision-provider-a", {
-    baseUrl: "https://a.example.test",
-    apiKey: "EXAMPLE_KEY_A",
-    api: "custom-api",
-    models: [{ id: "collision-model-a", name: "A", contextWindow: 100, maxTokens: 10, input: ["text"] }],
-    streamSimple: async function* () {
-      yield "A-1";
-      await Promise.resolve();
-      yield "A-2";
-    },
-  });
-}
-"#,
-        )
-        .expect("write extension A");
-        std::fs::write(
-            &ext_b,
-            r#"
-export default function init(pi) {
-  pi.registerProvider("collision-provider-b", {
-    baseUrl: "https://b.example.test",
-    apiKey: "EXAMPLE_KEY_B",
-    api: "custom-api",
-    models: [{ id: "collision-model-b", name: "B", contextWindow: 100, maxTokens: 10, input: ["text"] }],
-    streamSimple: async function* () {
-      yield "B-1";
-      await Promise.resolve();
-      yield "B-2";
-    },
-  });
-}
-"#,
-        )
-        .expect("write extension B");
-
-        let manager = ExtensionManager::new();
-        let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
-        let runtime = JsExtensionRuntimeHandle::start(
-            PiJsRuntimeConfig {
-                cwd: workspace.display().to_string(),
-                ..Default::default()
-            },
-            Arc::clone(&tools),
-            manager.clone(),
-        )
-        .await
-        .expect("start isolated runtime coordinator");
-        manager.set_js_runtime(runtime);
-        manager
-            .load_js_extensions(vec![
-                JsExtensionLoadSpec::from_entry_path(&ext_a).expect("extension A spec"),
-                JsExtensionLoadSpec::from_entry_path(&ext_b).expect("extension B spec"),
-            ])
-            .await
-            .expect("load both stream providers");
-
-        let entries = manager.extension_model_entries();
-        let entry_a = entries
-            .iter()
-            .find(|entry| entry.model.provider == "collision-provider-a")
-            .expect("provider A entry");
-        let entry_b = entries
-            .iter()
-            .find(|entry| entry.model.provider == "collision-provider-b")
-            .expect("provider B entry");
-        let provider_a = create_provider(entry_a, Some(&manager)).expect("provider A");
-        let provider_b = create_provider(entry_b, Some(&manager)).expect("provider B");
+        let fixture = load_colliding_provider_fixture().await;
         let context = basic_context();
         let options = basic_options();
 
         // Start both before polling either. Each fresh shard allocates its
         // first JS-local id (`provider-stream-1`); the coordinator must expose
         // distinct opaque routes and keep next/cancel operations owner-bound.
-        let mut stream_a = provider_a
+        let mut cancelled_stream = fixture
+            .cancelled_provider
             .stream(&context, &options)
             .await
             .expect("start provider A stream");
-        let mut stream_b = provider_b
+        let mut surviving_stream = fixture
+            .surviving_provider
             .stream(&context, &options)
             .await
             .expect("start provider B stream");
 
-        let mut text_a = String::new();
-        let mut text_b = String::new();
-        for _ in 0..8 {
-            let event = stream_a
-                .next()
-                .await
-                .expect("provider A event")
-                .expect("provider A event result");
-            if let StreamEvent::TextDelta { delta, .. } = event {
-                text_a.push_str(&delta);
-            }
-            if text_a == "A-1" {
-                break;
-            }
-        }
-        for _ in 0..8 {
-            let event = stream_b
-                .next()
-                .await
-                .expect("provider B event")
-                .expect("provider B event result");
-            if let StreamEvent::TextDelta { delta, .. } = event {
-                text_b.push_str(&delta);
-            }
-            if text_b == "B-1" {
-                break;
-            }
-        }
-        assert_eq!(text_a, "A-1", "provider A received a peer chunk");
-        assert_eq!(text_b, "B-1", "provider B received a peer chunk");
+        let cancelled_text = collect_text_until(
+            &mut cancelled_stream,
+            "A-1",
+            8,
+            "provider A event",
+            "provider A event result",
+        )
+        .await;
+        let surviving_text = collect_text_until(
+            &mut surviving_stream,
+            "B-1",
+            8,
+            "provider B event",
+            "provider B event result",
+        )
+        .await;
+        assert_eq!(cancelled_text, "A-1", "provider A received a peer chunk");
+        assert_eq!(surviving_text, "B-1", "provider B received a peer chunk");
 
         // Dropping A enqueues cancellation for its opaque route. The next B
         // poll follows that cancellation on the same coordinator channel, so
         // a route keyed only by the colliding inner id would cancel B here.
-        drop(stream_a);
+        drop(cancelled_stream);
 
-        let mut done_b = false;
-        for _ in 0..12 {
-            let event = stream_b
-                .next()
-                .await
-                .expect("provider B event after peer cancellation")
-                .expect("provider B event result after peer cancellation");
-            match event {
-                StreamEvent::TextDelta { delta, .. } => text_b.push_str(&delta),
-                StreamEvent::Done { .. } => done_b = true,
-                _ => {}
-            }
-            if done_b {
-                break;
-            }
-        }
+        let (surviving_text, surviving_done) = collect_remaining_text_until_done(
+            &mut surviving_stream,
+            surviving_text,
+            12,
+            "provider B event after peer cancellation",
+            "provider B event result after peer cancellation",
+        )
+        .await;
 
-        assert!(done_b, "provider B must survive cancellation of provider A");
-        assert_eq!(text_b, "B-1B-2", "provider B received peer chunks");
-        assert!(manager.shutdown(Duration::from_secs(3)).await);
+        assert!(
+            surviving_done,
+            "provider B must survive cancellation of provider A"
+        );
+        assert_eq!(surviving_text, "B-1B-2", "provider B received peer chunks");
+        assert!(fixture.manager.shutdown(Duration::from_secs(3)).await);
     };
 
     make_runtime()

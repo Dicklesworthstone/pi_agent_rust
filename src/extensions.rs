@@ -17703,6 +17703,169 @@ struct JsRuntimeShardSet {
     pump_cursor: usize,
 }
 
+#[derive(Default)]
+struct JsRuntimeShardIndexes {
+    extension_owner: HashMap<String, usize>,
+    tool_owner: HashMap<String, usize>,
+    command_owner: HashMap<String, usize>,
+    shortcut_owner: HashMap<String, usize>,
+    provider_owner: HashMap<String, usize>,
+    mcp_server_owner: HashMap<String, usize>,
+    event_owners: HashMap<String, Vec<usize>>,
+}
+
+impl JsRuntimeShardIndexes {
+    fn insert_unique_route(
+        routes: &mut HashMap<String, usize>,
+        name: &str,
+        shard_index: usize,
+        collision_kind: &str,
+    ) -> Result<()> {
+        if let Some(previous) = routes.insert(name.to_string(), shard_index)
+            && previous != shard_index
+        {
+            return Err(Error::extension(format!("{collision_kind}: {name}")));
+        }
+        Ok(())
+    }
+
+    fn index_extension(&mut self, shard_index: usize, shard: &JsRuntimeShard) -> Result<()> {
+        if self
+            .extension_owner
+            .insert(shard.extension_id.clone(), shard_index)
+            .is_some()
+        {
+            return Err(Error::extension(format!(
+                "Duplicate JS extension id: {}",
+                shard.extension_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn index_tools(&mut self, shard_index: usize, shard: &JsRuntimeShard) -> Result<()> {
+        for tool in &shard.snapshot.tools {
+            let Some(name) = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            Self::insert_unique_route(
+                &mut self.tool_owner,
+                name,
+                shard_index,
+                "registerTool: tool name collision",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn index_commands(&mut self, shard_index: usize, shard: &JsRuntimeShard) -> Result<()> {
+        for command in &shard.snapshot.slash_commands {
+            let Some(name) = extract_slash_command_name(command) else {
+                continue;
+            };
+            let name = js_command_route_name(&name);
+            if name.is_empty() {
+                continue;
+            }
+            Self::insert_unique_route(
+                &mut self.command_owner,
+                name,
+                shard_index,
+                "registerCommand: command name collision",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn index_shortcuts(&mut self, shard_index: usize, shard: &JsRuntimeShard) {
+        for shortcut in &shard.snapshot.shortcuts {
+            let Some(key_id) = shortcut
+                .get("key_id")
+                .or_else(|| shortcut.get("shortcut"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|key_id| !key_id.is_empty())
+            else {
+                continue;
+            };
+            // The shared-realm bridge historically overwrote shortcut
+            // registrations, so preserve deterministic last-loaded-wins.
+            self.shortcut_owner
+                .insert(key_id.to_ascii_lowercase(), shard_index);
+        }
+    }
+
+    fn index_providers(&mut self, shard_index: usize, shard: &JsRuntimeShard) -> Result<()> {
+        for provider in &shard.snapshot.providers {
+            let Some(provider_id) = provider
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|provider_id| !provider_id.is_empty())
+            else {
+                continue;
+            };
+            Self::insert_unique_route(
+                &mut self.provider_owner,
+                provider_id,
+                shard_index,
+                "registerProvider: provider id collision",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn index_mcp_servers(&mut self, shard_index: usize, shard: &JsRuntimeShard) -> Result<()> {
+        for server in &shard.snapshot.mcp_servers {
+            let Some(name) = server
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            else {
+                continue;
+            };
+            Self::insert_unique_route(
+                &mut self.mcp_server_owner,
+                name,
+                shard_index,
+                "registerMcpServer: server name collision",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn index_events(&mut self, shard_index: usize, shard: &JsRuntimeShard) {
+        let mut seen_hooks = HashSet::new();
+        for event_name in &shard.snapshot.event_hooks {
+            let event_name = event_name.trim();
+            if event_name.is_empty() || !seen_hooks.insert(event_name) {
+                continue;
+            }
+            self.event_owners
+                .entry(event_name.to_string())
+                .or_default()
+                .push(shard_index);
+        }
+    }
+
+    fn index_shard(&mut self, shard_index: usize, shard: &JsRuntimeShard) -> Result<()> {
+        self.index_extension(shard_index, shard)?;
+        self.index_tools(shard_index, shard)?;
+        self.index_commands(shard_index, shard)?;
+        self.index_shortcuts(shard_index, shard);
+        self.index_providers(shard_index, shard)?;
+        self.index_mcp_servers(shard_index, shard)?;
+        self.index_events(shard_index, shard);
+        Ok(())
+    }
+}
+
 impl JsRuntimeShardSet {
     fn snapshots(&self) -> Vec<JsExtensionSnapshot> {
         self.shards
@@ -17746,131 +17909,18 @@ impl JsRuntimeShardSet {
     }
 
     fn rebuild_indexes(&mut self) -> Result<()> {
-        let mut extension_owner = HashMap::new();
-        let mut tool_owner = HashMap::new();
-        let mut command_owner = HashMap::new();
-        let mut shortcut_owner = HashMap::new();
-        let mut provider_owner = HashMap::new();
-        let mut mcp_server_owner = HashMap::new();
-        let mut event_owners = HashMap::<String, Vec<usize>>::new();
-
+        let mut indexes = JsRuntimeShardIndexes::default();
         for (shard_index, shard) in self.shards.iter().enumerate() {
-            if extension_owner
-                .insert(shard.extension_id.clone(), shard_index)
-                .is_some()
-            {
-                return Err(Error::extension(format!(
-                    "Duplicate JS extension id: {}",
-                    shard.extension_id
-                )));
-            }
-
-            for tool in &shard.snapshot.tools {
-                let Some(name) = tool
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                else {
-                    continue;
-                };
-                if let Some(previous) = tool_owner.insert(name.to_string(), shard_index)
-                    && previous != shard_index
-                {
-                    return Err(Error::extension(format!(
-                        "registerTool: tool name collision: {name}"
-                    )));
-                }
-            }
-
-            for command in &shard.snapshot.slash_commands {
-                let Some(name) = extract_slash_command_name(command) else {
-                    continue;
-                };
-                let name = js_command_route_name(&name);
-                if name.is_empty() {
-                    continue;
-                }
-                if let Some(previous) = command_owner.insert(name.to_string(), shard_index)
-                    && previous != shard_index
-                {
-                    return Err(Error::extension(format!(
-                        "registerCommand: command name collision: {name}"
-                    )));
-                }
-            }
-
-            for shortcut in &shard.snapshot.shortcuts {
-                let Some(key_id) = shortcut
-                    .get("key_id")
-                    .or_else(|| shortcut.get("shortcut"))
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|key_id| !key_id.is_empty())
-                else {
-                    continue;
-                };
-                // The shared-realm bridge historically overwrote shortcut
-                // registrations, so preserve deterministic last-loaded-wins.
-                shortcut_owner.insert(key_id.to_ascii_lowercase(), shard_index);
-            }
-
-            for provider in &shard.snapshot.providers {
-                let Some(provider_id) = provider
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|provider_id| !provider_id.is_empty())
-                else {
-                    continue;
-                };
-                if let Some(previous) = provider_owner.insert(provider_id.to_string(), shard_index)
-                    && previous != shard_index
-                {
-                    return Err(Error::extension(format!(
-                        "registerProvider: provider id collision: {provider_id}"
-                    )));
-                }
-            }
-
-            for server in &shard.snapshot.mcp_servers {
-                let Some(name) = server
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                else {
-                    continue;
-                };
-                if let Some(previous) = mcp_server_owner.insert(name.to_string(), shard_index)
-                    && previous != shard_index
-                {
-                    return Err(Error::extension(format!(
-                        "registerMcpServer: server name collision: {name}"
-                    )));
-                }
-            }
-
-            let mut seen_hooks = HashSet::new();
-            for event_name in &shard.snapshot.event_hooks {
-                let event_name = event_name.trim();
-                if event_name.is_empty() || !seen_hooks.insert(event_name) {
-                    continue;
-                }
-                event_owners
-                    .entry(event_name.to_string())
-                    .or_default()
-                    .push(shard_index);
-            }
+            indexes.index_shard(shard_index, shard)?;
         }
 
-        self.extension_owner = extension_owner;
-        self.tool_owner = tool_owner;
-        self.command_owner = command_owner;
-        self.shortcut_owner = shortcut_owner;
-        self.provider_owner = provider_owner;
-        self.mcp_server_owner = mcp_server_owner;
-        self.event_owners = event_owners;
+        self.extension_owner = indexes.extension_owner;
+        self.tool_owner = indexes.tool_owner;
+        self.command_owner = indexes.command_owner;
+        self.shortcut_owner = indexes.shortcut_owner;
+        self.provider_owner = indexes.provider_owner;
+        self.mcp_server_owner = indexes.mcp_server_owner;
+        self.event_owners = indexes.event_owners;
 
         Ok(())
     }
@@ -18176,14 +18226,7 @@ impl JsExtensionRuntimeHandle {
                                         .map_or(Duration::ZERO, |remaining| {
                                             remaining.min(ExtensionManager::DEFAULT_CLEANUP_BUDGET)
                                         });
-                                    if !cleanup_budget.is_zero() {
-                                        cancel_active_provider_streams_for_replacement(
-                                            &mut shard_set,
-                                            &host,
-                                            cleanup_budget,
-                                        )
-                                        .await;
-                                    } else {
+                                    if cleanup_budget.is_zero() {
                                         let dropped_routes = shard_set.provider_stream_routes.len();
                                         shard_set.provider_stream_routes.clear();
                                         if dropped_routes > 0 {
@@ -18196,6 +18239,13 @@ impl JsExtensionRuntimeHandle {
                                                 "Provider stream cleanup budget expired before cold shard replacement"
                                             );
                                         }
+                                    } else {
+                                        cancel_active_provider_streams_for_replacement(
+                                            &mut shard_set,
+                                            &host,
+                                            cleanup_budget,
+                                        )
+                                        .await;
                                     }
                                     candidate.next_provider_stream_id = next_provider_stream_id;
                                     let snapshots = candidate.snapshots();
@@ -18322,12 +18372,14 @@ impl JsExtensionRuntimeHandle {
                                     execute_extension_tool_sharded(
                                         &mut shard_set,
                                         &host,
-                                        shard_index,
-                                        &tool_name,
-                                        &tool_call_id,
-                                        input,
-                                        ctx_payload.as_ref(),
-                                        timeout_ms,
+                                        JsToolExecution {
+                                            shard_index,
+                                            tool_name: &tool_name,
+                                            tool_call_id: &tool_call_id,
+                                            input,
+                                            ctx_payload: ctx_payload.as_ref(),
+                                            timeout_ms,
+                                        },
                                     )
                                     .await
                                 }
@@ -18445,12 +18497,14 @@ impl JsExtensionRuntimeHandle {
                                     start_extension_provider_stream_simple_sharded(
                                         &mut shard_set,
                                         &host,
-                                        shard_index,
-                                        &provider_id,
-                                        model,
-                                        context,
-                                        options,
-                                        timeout_ms,
+                                        JsProviderStreamStart {
+                                            shard_index,
+                                            provider_id: &provider_id,
+                                            model,
+                                            context,
+                                            options,
+                                            timeout_ms,
+                                        },
                                     )
                                     .await?;
                                 let continuation_timeout_ms = match js_runtime_remaining_timeout_ms(
@@ -18548,12 +18602,11 @@ impl JsExtensionRuntimeHandle {
                                 {
                                     let cleanup_timeout_ms = deadline
                                         .checked_duration_since(Instant::now())
-                                        .map(|remaining| {
+                                        .map_or(1, |remaining| {
                                             u64::try_from(remaining.as_millis())
                                                 .unwrap_or(u64::MAX)
                                                 .max(1)
-                                        })
-                                        .unwrap_or(1);
+                                        });
                                     if let Err(cleanup_err) =
                                         cancel_extension_provider_stream_simple_best_effort(
                                             &mut shard_set,
@@ -18624,12 +18677,11 @@ impl JsExtensionRuntimeHandle {
                                         shard_set.provider_stream_routes.remove(&stream_id);
                                         let cleanup_timeout_ms = deadline
                                             .checked_duration_since(Instant::now())
-                                            .map(|remaining| {
+                                            .map_or(1, |remaining| {
                                                 u64::try_from(remaining.as_millis())
                                                     .unwrap_or(u64::MAX)
                                                     .max(1)
-                                            })
-                                            .unwrap_or(1);
+                                            });
                                         if let Err(cleanup_err) =
                                             cancel_extension_provider_stream_simple_best_effort(
                                                 &mut shard_set,
@@ -18659,12 +18711,11 @@ impl JsExtensionRuntimeHandle {
                                 {
                                     let cleanup_timeout_ms = deadline
                                         .checked_duration_since(Instant::now())
-                                        .map(|remaining| {
+                                        .map_or(1, |remaining| {
                                             u64::try_from(remaining.as_millis())
                                                 .unwrap_or(u64::MAX)
                                                 .max(1)
-                                        })
-                                        .unwrap_or(1);
+                                        });
                                     if let Err(cleanup_err) =
                                         cancel_extension_provider_stream_simple_best_effort(
                                             &mut shard_set,
@@ -21145,23 +21196,14 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-#[allow(clippy::future_not_send)]
-async fn build_js_runtime_shards(
-    warm_pool: &crate::extensions_js::WarmIsolatePool,
-    policy: &ExtensionPolicy,
-    host: &JsRuntimeHost,
-    specs: &[JsExtensionLoadSpec],
-) -> Result<JsRuntimeShardSet> {
-    let explicit_entry_paths = specs
-        .iter()
-        .map(|spec| safe_canonicalize(&spec.entry_path))
-        .collect::<HashSet<_>>();
+type GroupedJsExtensionSpecs<'a> = Vec<(String, Vec<(&'a JsExtensionLoadSpec, Vec<PathBuf>)>)>;
 
-    // One logical extension can have multiple explicit entrypoints. Keep the
-    // first-seen extension order and the original entrypoint order within each
-    // realm so route resolution stays deterministic across reloads.
+fn group_js_extension_specs<'a>(
+    specs: &'a [JsExtensionLoadSpec],
+    explicit_entry_paths: &HashSet<PathBuf>,
+) -> Result<GroupedJsExtensionSpecs<'a>> {
     let mut group_by_id = HashMap::<String, usize>::new();
-    let mut grouped_specs = Vec::<(String, Vec<(&JsExtensionLoadSpec, Vec<PathBuf>)>)>::new();
+    let mut grouped_specs = GroupedJsExtensionSpecs::new();
     for spec in specs {
         if spec.extension_id.trim().is_empty() {
             return Err(Error::extension("JS extension id cannot be empty"));
@@ -21170,21 +21212,26 @@ async fn build_js_runtime_shards(
         // set drives both peer-boundary metadata and the subsequent load, so a
         // concurrent manifest/filesystem change cannot create an unclassified
         // extension root between two discovery passes.
-        let entry_paths = resolve_extension_load_entry_paths(spec, &explicit_entry_paths)?;
-        let group_index = if let Some(index) = group_by_id.get(&spec.extension_id).copied() {
-            index
-        } else {
-            let index = grouped_specs.len();
-            group_by_id.insert(spec.extension_id.clone(), index);
-            grouped_specs.push((spec.extension_id.clone(), Vec::new()));
-            index
+        let entry_paths = resolve_extension_load_entry_paths(spec, explicit_entry_paths)?;
+        let group_index = match group_by_id.entry(spec.extension_id.clone()) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let index = grouped_specs.len();
+                grouped_specs.push((spec.extension_id.clone(), Vec::new()));
+                entry.insert(index);
+                index
+            }
         };
         grouped_specs[group_index].1.push((spec, entry_paths));
     }
+    Ok(grouped_specs)
+}
 
-    let shard_count = grouped_specs.len();
+fn collect_js_extension_roots(
+    grouped_specs: &GroupedJsExtensionSpecs<'_>,
+) -> Result<Vec<(String, Vec<PathBuf>)>> {
     let mut leaf_root_owner = HashMap::<PathBuf, String>::new();
-    for (extension_id, extension_specs) in &grouped_specs {
+    for (extension_id, extension_specs) in grouped_specs {
         for (_, entry_paths) in extension_specs {
             for entry_path in entry_paths {
                 let Some(parent) = entry_path.parent() else {
@@ -21204,8 +21251,8 @@ async fn build_js_runtime_shards(
         }
     }
 
-    let mut extension_roots_by_id = Vec::with_capacity(shard_count);
-    for (extension_id, extension_specs) in &grouped_specs {
+    let mut roots_by_id = Vec::with_capacity(grouped_specs.len());
+    for (extension_id, extension_specs) in grouped_specs {
         let mut roots = Vec::new();
         let mut seen = BTreeSet::new();
         for (_, entry_paths) in extension_specs {
@@ -21215,44 +21262,74 @@ async fn build_js_runtime_shards(
                 }
             }
         }
-        extension_roots_by_id.push((extension_id.clone(), roots));
+        roots_by_id.push((extension_id.clone(), roots));
     }
+    Ok(roots_by_id)
+}
+
+fn js_runtime_shard_config(
+    warm_pool: &crate::extensions_js::WarmIsolatePool,
+    shard_count: usize,
+    shard_index: usize,
+) -> Result<PiJsRuntimeConfig> {
+    let mut config = warm_pool.make_config();
+    config.limits.memory_limit_bytes = config
+        .limits
+        .memory_limit_bytes
+        .map(|total| split_shard_budget(total, shard_count, shard_index, "memory"))
+        .transpose()?;
+    config.limits.module_cache_limit_bytes = config
+        .limits
+        .module_cache_limit_bytes
+        .map(|total| split_shard_budget(total, shard_count, shard_index, "module cache"))
+        .transpose()?;
+    let fast_queue_total = if config.limits.hostcall_fast_queue_capacity == 0 {
+        crate::hostcall_queue::HOSTCALL_FAST_RING_CAPACITY
+    } else {
+        config.limits.hostcall_fast_queue_capacity
+    };
+    config.limits.hostcall_fast_queue_capacity = split_shard_budget(
+        fast_queue_total,
+        shard_count,
+        shard_index,
+        "hostcall fast queue",
+    )?;
+    let overflow_queue_total = if config.limits.hostcall_overflow_queue_capacity == 0 {
+        crate::hostcall_queue::HOSTCALL_OVERFLOW_CAPACITY
+    } else {
+        config.limits.hostcall_overflow_queue_capacity
+    };
+    config.limits.hostcall_overflow_queue_capacity = split_shard_budget(
+        overflow_queue_total,
+        shard_count,
+        shard_index,
+        "hostcall overflow queue",
+    )?;
+    Ok(config)
+}
+
+#[allow(clippy::future_not_send)]
+async fn build_js_runtime_shards(
+    warm_pool: &crate::extensions_js::WarmIsolatePool,
+    policy: &ExtensionPolicy,
+    host: &JsRuntimeHost,
+    specs: &[JsExtensionLoadSpec],
+) -> Result<JsRuntimeShardSet> {
+    let explicit_entry_paths = specs
+        .iter()
+        .map(|spec| safe_canonicalize(&spec.entry_path))
+        .collect::<HashSet<_>>();
+
+    // One logical extension can have multiple explicit entrypoints. Keep the
+    // first-seen extension order and the original entrypoint order within each
+    // realm so route resolution stays deterministic across reloads.
+    let grouped_specs = group_js_extension_specs(specs, &explicit_entry_paths)?;
+    let shard_count = grouped_specs.len();
+    let extension_roots_by_id = collect_js_extension_roots(&grouped_specs)?;
 
     let mut candidate = JsRuntimeShardSet::default();
     for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
-        let mut shard_config = warm_pool.make_config();
-        shard_config.limits.memory_limit_bytes = shard_config
-            .limits
-            .memory_limit_bytes
-            .map(|total| split_shard_budget(total, shard_count, shard_index, "memory"))
-            .transpose()?;
-        shard_config.limits.module_cache_limit_bytes = shard_config
-            .limits
-            .module_cache_limit_bytes
-            .map(|total| split_shard_budget(total, shard_count, shard_index, "module cache"))
-            .transpose()?;
-        let fast_queue_total = if shard_config.limits.hostcall_fast_queue_capacity == 0 {
-            crate::hostcall_queue::HOSTCALL_FAST_RING_CAPACITY
-        } else {
-            shard_config.limits.hostcall_fast_queue_capacity
-        };
-        shard_config.limits.hostcall_fast_queue_capacity = split_shard_budget(
-            fast_queue_total,
-            shard_count,
-            shard_index,
-            "hostcall fast queue",
-        )?;
-        let overflow_queue_total = if shard_config.limits.hostcall_overflow_queue_capacity == 0 {
-            crate::hostcall_queue::HOSTCALL_OVERFLOW_CAPACITY
-        } else {
-            shard_config.limits.hostcall_overflow_queue_capacity
-        };
-        shard_config.limits.hostcall_overflow_queue_capacity = split_shard_budget(
-            overflow_queue_total,
-            shard_count,
-            shard_index,
-            "hostcall overflow queue",
-        )?;
+        let shard_config = js_runtime_shard_config(warm_pool, shard_count, shard_index)?;
 
         let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
             crate::scheduler::WallClock,
@@ -21271,8 +21348,7 @@ async fn build_js_runtime_shards(
                 continue;
             }
             for root in roots {
-                runtime
-                    .register_foreign_extension_root_boundary(root.clone(), foreign_extension_id);
+                runtime.register_foreign_extension_root_boundary(root, foreign_extension_id);
             }
         }
 
@@ -21517,7 +21593,7 @@ async fn refresh_runtime_shard_snapshot(
             return Err(quarantine_runtime_shard(
                 shards,
                 shard_index,
-                format!("registry snapshot failed: {err}"),
+                &format!("registry snapshot failed: {err}"),
             ));
         }
     };
@@ -21527,7 +21603,7 @@ async fn refresh_runtime_shard_snapshot(
             return Err(quarantine_runtime_shard(
                 shards,
                 shard_index,
-                format!("registry ownership validation failed: {err}"),
+                &format!("registry ownership validation failed: {err}"),
             ));
         }
     };
@@ -21553,7 +21629,7 @@ async fn refresh_runtime_shard_snapshot(
                 )
             },
         );
-        return Err(quarantine_runtime_shard(shards, shard_index, reason));
+        return Err(quarantine_runtime_shard(shards, shard_index, &reason));
     }
     Ok(())
 }
@@ -21561,7 +21637,7 @@ async fn refresh_runtime_shard_snapshot(
 fn quarantine_runtime_shard(
     shards: &mut JsRuntimeShardSet,
     shard_index: usize,
-    reason: String,
+    reason: &str,
 ) -> Error {
     let extension_id = shards.shards.get(shard_index).map_or_else(
         || "<missing>".to_string(),
@@ -21659,18 +21735,31 @@ fn json_value_is_truthy(value: &Value) -> bool {
     }
 }
 
+struct JsEventPhaseDispatch<'a> {
+    shard_index: usize,
+    event_name: &'a str,
+    event_payload: Value,
+    ctx_payload: &'a Value,
+    phase: &'a str,
+    batch_id: Option<&'a str>,
+    deadline: Instant,
+}
+
 #[allow(clippy::future_not_send)]
 async fn dispatch_extension_event_phase_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
-    shard_index: usize,
-    event_name: &str,
-    event_payload: Value,
-    ctx_payload: &Value,
-    phase: &str,
-    batch_id: Option<&str>,
-    deadline: Instant,
+    dispatch: JsEventPhaseDispatch<'_>,
 ) -> Result<Option<Value>> {
+    let JsEventPhaseDispatch {
+        shard_index,
+        event_name,
+        event_payload,
+        ctx_payload,
+        phase,
+        batch_id,
+        deadline,
+    } = dispatch;
     shards.ensure_shard_healthy(shard_index)?;
     let task_id = next_runtime_task_id("task-event-phase");
     {
@@ -21818,13 +21907,15 @@ async fn dispatch_extension_event_across_shards_until(
                 let Some(value) = dispatch_extension_event_phase_sharded(
                     shards,
                     host,
-                    shard_index,
-                    event_name,
-                    payload,
-                    ctx_payload,
-                    phase,
-                    batch_id,
-                    deadline,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: payload,
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        deadline,
+                    },
                 )
                 .await?
                 else {
@@ -21883,13 +21974,15 @@ async fn dispatch_extension_event_across_shards_until(
                 let Some(value) = dispatch_extension_event_phase_sharded(
                     shards,
                     host,
-                    shard_index,
-                    event_name,
-                    payload,
-                    ctx_payload,
-                    phase,
-                    batch_id,
-                    deadline,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: payload,
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        deadline,
+                    },
                 )
                 .await?
                 else {
@@ -21929,13 +22022,15 @@ async fn dispatch_extension_event_across_shards_until(
                 let Some(value) = dispatch_extension_event_phase_sharded(
                     shards,
                     host,
-                    shard_index,
-                    event_name,
-                    event_payload.clone(),
-                    ctx_payload,
-                    phase,
-                    batch_id,
-                    deadline,
+                    JsEventPhaseDispatch {
+                        shard_index,
+                        event_name,
+                        event_payload: event_payload.clone(),
+                        ctx_payload,
+                        phase,
+                        batch_id,
+                        deadline,
+                    },
                 )
                 .await?
                 else {
@@ -21969,13 +22064,15 @@ async fn dispatch_extension_event_across_shards_until(
             let Some(value) = dispatch_extension_event_phase_sharded(
                 shards,
                 host,
-                shard_index,
-                event_name,
-                event_payload.clone(),
-                ctx_payload,
-                phase,
-                batch_id,
-                deadline,
+                JsEventPhaseDispatch {
+                    shard_index,
+                    event_name,
+                    event_payload: event_payload.clone(),
+                    ctx_payload,
+                    phase,
+                    batch_id,
+                    deadline,
+                },
             )
             .await?
             else {
@@ -22125,17 +22222,29 @@ async fn dispatch_extension_event_batch_across_shards(
     Ok(results)
 }
 
+struct JsToolExecution<'a> {
+    shard_index: usize,
+    tool_name: &'a str,
+    tool_call_id: &'a str,
+    input: Value,
+    ctx_payload: &'a Value,
+    timeout_ms: u64,
+}
+
 #[allow(clippy::future_not_send)]
 async fn execute_extension_tool_sharded(
     shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
-    shard_index: usize,
-    tool_name: &str,
-    tool_call_id: &str,
-    input: Value,
-    ctx_payload: &Value,
-    timeout_ms: u64,
+    execution: JsToolExecution<'_>,
 ) -> Result<Value> {
+    let JsToolExecution {
+        shard_index,
+        tool_name,
+        tool_call_id,
+        input,
+        ctx_payload,
+        timeout_ms,
+    } = execution;
     shards.ensure_shard_healthy(shard_index)?;
     let started_at = Instant::now();
     tracing::info!(
@@ -22323,17 +22432,29 @@ struct JsProviderStreamNext {
     value: Option<Value>,
 }
 
-#[allow(clippy::future_not_send)]
-async fn start_extension_provider_stream_simple_sharded(
-    shards: &mut JsRuntimeShardSet,
-    host: &JsRuntimeHost,
+struct JsProviderStreamStart<'a> {
     shard_index: usize,
-    provider_id: &str,
+    provider_id: &'a str,
     model: Value,
     context: Value,
     options: Value,
     timeout_ms: u64,
+}
+
+#[allow(clippy::future_not_send)]
+async fn start_extension_provider_stream_simple_sharded(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    start: JsProviderStreamStart<'_>,
 ) -> Result<String> {
+    let JsProviderStreamStart {
+        shard_index,
+        provider_id,
+        model,
+        context,
+        options,
+        timeout_ms,
+    } = start;
     shards.ensure_shard_healthy(shard_index)?;
     let timeout = Duration::from_millis(timeout_ms);
     let deadline = Instant::now().checked_add(timeout);
@@ -22377,12 +22498,11 @@ async fn start_extension_provider_stream_simple_sharded(
     if let Err(refresh_err) = refresh_runtime_shard_snapshot(shards, shard_index).await {
         let cleanup_timeout_ms = deadline
             .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
-            .map(|remaining| {
+            .map_or(1, |remaining| {
                 u64::try_from(remaining.as_millis())
                     .unwrap_or(u64::MAX)
                     .max(1)
-            })
-            .unwrap_or(1);
+            });
         if let Err(cleanup_err) = cancel_extension_provider_stream_simple_best_effort(
             shards,
             host,
@@ -22884,11 +23004,7 @@ async fn pump_js_runtime_shards_once_for_target(
         }
     }
     shards.pump_cursor = (start + 1) % shard_count;
-    if let Some(fault) = first_fault {
-        Err(Error::extension(fault))
-    } else {
-        Ok(has_pending)
-    }
+    first_fault.map_or_else(|| Ok(has_pending), |fault| Err(Error::extension(fault)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -26585,14 +26701,11 @@ async fn dispatch_hostcall_events_ref(
                 }
             }
             let provider = params_without_key(payload, "op");
-            let result = match authoritative_extension_id {
-                Some(extension_id) => {
-                    manager.register_provider_for_extension(extension_id, provider)
-                }
-                None => {
-                    manager.register_provider(provider);
-                    Ok(())
-                }
+            let result = if let Some(extension_id) = authoritative_extension_id {
+                manager.register_provider_for_extension(extension_id, provider)
+            } else {
+                manager.register_provider(provider);
+                Ok(())
             };
             match result {
                 Ok(()) => HostcallOutcome::Success(Value::Null),
@@ -26705,12 +26818,11 @@ async fn dispatch_hostcall_events_ref(
                 };
             }
             let flag = params_without_key(payload, "op");
-            let result = match authoritative_extension_id {
-                Some(extension_id) => manager.register_flag_for_extension(extension_id, flag),
-                None => {
-                    manager.register_flag(flag);
-                    Ok(())
-                }
+            let result = if let Some(extension_id) = authoritative_extension_id {
+                manager.register_flag_for_extension(extension_id, flag)
+            } else {
+                manager.register_flag(flag);
+                Ok(())
             };
             match result {
                 Ok(()) => HostcallOutcome::Success(Value::Null),
@@ -26923,7 +27035,7 @@ async fn await_js_task_in_shards(
             return Err(quarantine_runtime_shard(
                 shards,
                 shard_index,
-                format!(
+                &format!(
                     "task {task_id} timed out after {}ms with unresolved JavaScript state",
                     timeout.as_millis()
                 ),
@@ -30940,6 +31052,11 @@ impl ExtensionManager {
         description: Option<&str>,
     ) -> Result<()> {
         let normalized_name = js_command_route_name(name);
+        let entry = json!({
+            "name": normalized_name,
+            "description": description,
+            "extension_id": extension_id,
+        });
         let mut guard = self
             .inner
             .lock()
@@ -30964,12 +31081,10 @@ impl ExtensionManager {
             extract_slash_command_name(command)
                 .is_none_or(|existing| js_command_route_name(&existing) != normalized_name)
         });
-        target.slash_commands.push(json!({
-            "name": normalized_name,
-            "description": description,
-            "extension_id": extension_id,
-        }));
-        self.refresh_snapshot_with_guard_release(guard);
+        target.slash_commands.push(entry);
+        let snapshot = Self::build_snapshot_from_inner(&guard);
+        drop(guard);
+        self.publish_snapshot(snapshot);
         Ok(())
     }
 
@@ -30995,6 +31110,13 @@ impl ExtensionManager {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let payload_is_object = payload.as_object_mut().is_some_and(|object| {
+            object.insert(
+                "extension_id".to_string(),
+                Value::String(extension_id.to_string()),
+            );
+            true
+        });
         let mut guard = self
             .inner
             .lock()
@@ -31012,21 +31134,19 @@ impl ExtensionManager {
                 "registerProvider: provider id collision: {provider_id}"
             )));
         }
-        let Some(object) = payload.as_object_mut() else {
+        if !payload_is_object {
             return Err(Error::extension(
                 "registerProvider: provider spec must be an object",
             ));
-        };
-        object.insert(
-            "extension_id".to_string(),
-            Value::String(extension_id.to_string()),
-        );
+        }
         guard.providers.retain(|provider| {
             provider.get("id").and_then(Value::as_str) != Some(provider_id.as_str())
                 || provider.get("extension_id").and_then(Value::as_str) != Some(extension_id)
         });
         guard.providers.push(payload);
-        self.refresh_snapshot_with_guard_release(guard);
+        let snapshot = Self::build_snapshot_from_inner(&guard);
+        drop(guard);
+        self.publish_snapshot(snapshot);
         Ok(())
     }
 
@@ -31085,6 +31205,13 @@ impl ExtensionManager {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let spec_is_object = spec.as_object_mut().is_some_and(|object| {
+            object.insert(
+                "extension_id".to_string(),
+                Value::String(extension_id.to_string()),
+            );
+            true
+        });
         let mut guard = self
             .inner
             .lock()
@@ -31102,21 +31229,19 @@ impl ExtensionManager {
                 "registerFlag: flag name collision: {flag_name}"
             )));
         }
-        let Some(object) = spec.as_object_mut() else {
+        if !spec_is_object {
             return Err(Error::extension(
                 "registerFlag: flag spec must be an object",
             ));
-        };
-        object.insert(
-            "extension_id".to_string(),
-            Value::String(extension_id.to_string()),
-        );
+        }
         guard.flags.retain(|flag| {
             flag.get("name").and_then(Value::as_str) != Some(flag_name.as_str())
                 || flag.get("extension_id").and_then(Value::as_str) != Some(extension_id)
         });
         guard.flags.push(spec);
-        self.refresh_snapshot_with_guard_release(guard);
+        let snapshot = Self::build_snapshot_from_inner(&guard);
+        drop(guard);
+        self.publish_snapshot(snapshot);
         Ok(())
     }
 
@@ -32774,6 +32899,217 @@ mod tests {
     use super::*;
     use jsonschema::Validator;
     use tempfile::tempdir;
+
+    const RESETTABLE_EXTENSION_SOURCE: &str = r#"
+        export default function init(pi) {
+          pi.registerTool({
+            name: "reset_probe_tool",
+            description: "reset probe",
+            parameters: { type: "object", properties: {} },
+            execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+          });
+          pi.registerCommand("reset-probe", {
+            description: "reset probe",
+            handler: async () => "ok",
+          });
+        }
+    "#;
+
+    const NEVER_FINISHES_EXTENSION_SOURCE: &str = r#"
+        export default function init(pi) {
+          pi.registerCommand("never-finishes", {
+            handler: async () => {
+              pi.sendMessage({ customType: "handler-start", content: "start" });
+              setTimeout(() => {
+                pi.sendMessage({ customType: "delayed-side-effect", content: "late" });
+              }, 700);
+              await new Promise(() => {});
+            },
+          });
+        }
+    "#;
+
+    const FAST_PEER_EXTENSION_SOURCE: &str = r#"
+        export default function init(pi) {
+          pi.registerCommand("fast-peer", {
+            handler: async () => "fast",
+          });
+        }
+    "#;
+
+    const COLLISION_PROVIDER_EXTENSION_SOURCE: &str = r#"
+        export default function init(pi) {
+          pi.registerProvider("collision-provider", {
+            api: "openai-completions",
+            baseUrl: "https://not-used.example.com",
+            models: [{ id: "collision-model", name: "Collision Model" }],
+            streamSimple: function() {
+              pi.registerCommand("shared-command", { handler: async () => "poison" });
+              return {
+                next: async () => ({ done: false, value: "unused" }),
+                return: async () => {
+                  pi.sendMessage({ customType: "provider-return", content: "return-called" });
+                  return { done: true };
+                },
+                [Symbol.asyncIterator]() { return this; },
+              };
+            },
+          });
+        }
+    "#;
+
+    const COLLISION_COMMAND_EXTENSION_SOURCE: &str = r#"
+        export default function init(pi) {
+          pi.registerCommand("shared-command", { handler: async () => "owner" });
+        }
+    "#;
+
+    fn create_timeout_quarantine_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let slow_dir = root.join("slow-extension");
+        let fast_dir = root.join("fast-extension");
+        std::fs::create_dir_all(&slow_dir).expect("mkdir slow extension");
+        std::fs::create_dir_all(&fast_dir).expect("mkdir fast extension");
+        let slow_entry = slow_dir.join("index.mjs");
+        let fast_entry = fast_dir.join("index.mjs");
+        std::fs::write(&slow_entry, NEVER_FINISHES_EXTENSION_SOURCE).expect("write slow extension");
+        std::fs::write(&fast_entry, FAST_PEER_EXTENSION_SOURCE).expect("write fast extension");
+        (slow_entry, fast_entry)
+    }
+
+    struct PeerIsolationFixture {
+        workspace: PathBuf,
+        entry_a: PathBuf,
+        entry_b: PathBuf,
+        foreign_secret: PathBuf,
+        foreign_write: PathBuf,
+    }
+
+    fn peer_probe_extension_source(
+        foreign_secret_js: &str,
+        foreign_write_js: &str,
+        foreign_module_js: &str,
+    ) -> String {
+        format!(
+            r#"
+            import * as fs from "node:fs";
+            export default function init(pi) {{
+              pi.registerCommand("probe-peer-root", {{
+                description: "attempt peer filesystem access",
+                handler: async () => {{
+                  const result = {{}};
+                  try {{
+                    result.readValue = fs.readFileSync({foreign_secret_js}, "utf8");
+                    result.readOk = true;
+                  }} catch (error) {{
+                    result.readOk = false;
+                    result.readError = String(error && error.message ? error.message : error);
+                  }}
+                  try {{
+                    fs.writeFileSync({foreign_write_js}, "cross-owner-write");
+                    result.writeOk = true;
+                  }} catch (error) {{
+                    result.writeOk = false;
+                    result.writeError = String(error && error.message ? error.message : error);
+                  }}
+                  try {{
+                    const peer = await import({foreign_module_js});
+                    result.importValue = peer.peerSecret;
+                    result.importOk = true;
+                  }} catch (error) {{
+                    result.importOk = false;
+                    result.importError = String(error && error.message ? error.message : error);
+                  }}
+                  return result;
+                }},
+              }});
+            }}
+            "#
+        )
+    }
+
+    fn peer_owner_extension_source(foreign_secret_js: &str) -> String {
+        format!(
+            r#"
+            import * as fs from "node:fs";
+            export default function init(pi) {{
+              pi.registerCommand("read-own-root", {{
+                description: "read own filesystem root",
+                handler: async () => fs.readFileSync({foreign_secret_js}, "utf8"),
+              }});
+            }}
+            "#
+        )
+    }
+
+    fn create_peer_isolation_fixture(root: &Path) -> PeerIsolationFixture {
+        let workspace = root.join("workspace");
+        let extension_a = workspace.join("extensions").join("ext-a");
+        let extension_b = workspace.join("extensions").join("ext-b");
+        std::fs::create_dir_all(&extension_a).expect("mkdir extension a");
+        std::fs::create_dir_all(&extension_b).expect("mkdir extension b");
+
+        let foreign_secret = extension_b.join("secret.txt");
+        let foreign_write = extension_b.join("written-by-a.txt");
+        let foreign_module = extension_b.join("peer-module.mjs");
+        std::fs::write(&foreign_secret, "owned-by-b").expect("write extension b secret");
+        std::fs::write(
+            &foreign_module,
+            "export const peerSecret = 'module-owned-by-b';",
+        )
+        .expect("write extension b module");
+        let foreign_secret_js = serde_json::to_string(&foreign_secret.display().to_string())
+            .expect("serialize secret path");
+        let foreign_write_js = serde_json::to_string(&foreign_write.display().to_string())
+            .expect("serialize write path");
+        let foreign_module_js = serde_json::to_string("../ext-b/peer-module.mjs")
+            .expect("serialize foreign module path");
+
+        let entry_a = extension_a.join("index.mjs");
+        std::fs::write(
+            &entry_a,
+            peer_probe_extension_source(&foreign_secret_js, &foreign_write_js, &foreign_module_js),
+        )
+        .expect("write extension a entry");
+
+        let entry_b = extension_b.join("index.mjs");
+        std::fs::write(&entry_b, peer_owner_extension_source(&foreign_secret_js))
+            .expect("write extension b entry");
+
+        PeerIsolationFixture {
+            workspace,
+            entry_a,
+            entry_b,
+            foreign_secret,
+            foreign_write,
+        }
+    }
+
+    fn create_provider_collision_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let provider_dir = root.join("provider-extension");
+        let command_dir = root.join("command-extension");
+        std::fs::create_dir_all(&provider_dir).expect("mkdir provider extension");
+        std::fs::create_dir_all(&command_dir).expect("mkdir command extension");
+        let provider_entry = provider_dir.join("index.mjs");
+        let command_entry = command_dir.join("index.mjs");
+        std::fs::write(&provider_entry, COLLISION_PROVIDER_EXTENSION_SOURCE)
+            .expect("write collision provider");
+        std::fs::write(&command_entry, COLLISION_COMMAND_EXTENSION_SOURCE)
+            .expect("write command owner");
+        (provider_entry, command_entry)
+    }
+
+    fn assert_only_host_message(
+        actions: &MockHostActions,
+        expected_custom_type: &str,
+        count_message: &str,
+    ) {
+        let messages = actions
+            .messages
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(messages.len(), 1, "{count_message}");
+        assert_eq!(messages[0].custom_type, expected_custom_type);
+    }
 
     #[test]
     fn extension_wait_sleep_uses_current_timer_driver_epoch() {
@@ -34476,24 +34812,8 @@ mod tests {
         runtime.block_on(async move {
             let dir = tempdir().expect("tempdir");
             let entry_path = dir.path().join("resettable.mjs");
-            std::fs::write(
-                &entry_path,
-                r#"
-                export default function init(pi) {
-                  pi.registerTool({
-                    name: "reset_probe_tool",
-                    description: "reset probe",
-                    parameters: { type: "object", properties: {} },
-                    execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
-                  });
-                  pi.registerCommand("reset-probe", {
-                    description: "reset probe",
-                    handler: async () => "ok",
-                  });
-                }
-                "#,
-            )
-            .expect("write extension entry");
+            std::fs::write(&entry_path, RESETTABLE_EXTENSION_SOURCE)
+                .expect("write extension entry");
 
             let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
             let js_runtime = JsExtensionRuntimeHandle::start(
@@ -34696,41 +35016,7 @@ mod tests {
 
         runtime.block_on(async move {
             let dir = tempdir().expect("tempdir");
-            let slow_dir = dir.path().join("slow-extension");
-            let fast_dir = dir.path().join("fast-extension");
-            std::fs::create_dir_all(&slow_dir).expect("mkdir slow extension");
-            std::fs::create_dir_all(&fast_dir).expect("mkdir fast extension");
-
-            let slow_entry = slow_dir.join("index.mjs");
-            std::fs::write(
-                &slow_entry,
-                r#"
-                export default function init(pi) {
-                  pi.registerCommand("never-finishes", {
-                    handler: async () => {
-                      pi.sendMessage({ customType: "handler-start", content: "start" });
-                      setTimeout(() => {
-                        pi.sendMessage({ customType: "delayed-side-effect", content: "late" });
-                      }, 700);
-                      await new Promise(() => {});
-                    },
-                  });
-                }
-                "#,
-            )
-            .expect("write slow extension");
-            let fast_entry = fast_dir.join("index.mjs");
-            std::fs::write(
-                &fast_entry,
-                r#"
-                export default function init(pi) {
-                  pi.registerCommand("fast-peer", {
-                    handler: async () => "fast",
-                  });
-                }
-                "#,
-            )
-            .expect("write fast extension");
+            let (slow_entry, fast_entry) = create_timeout_quarantine_fixture(dir.path());
 
             let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
             let js_runtime = JsExtensionRuntimeHandle::start(
@@ -34762,14 +35048,11 @@ mod tests {
                 )
                 .await;
             assert!(first.is_err(), "never-finishing handler must time out");
-            {
-                let messages = actions
-                    .messages
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                assert_eq!(messages.len(), 1, "the first handler must have started");
-                assert_eq!(messages[0].custom_type, "handler-start");
-            }
+            assert_only_host_message(
+                &actions,
+                "handler-start",
+                "the first handler must have started",
+            );
             sleep(wall_now(), Duration::from_millis(400)).await;
             js_runtime
                 .pump_once()
@@ -34816,16 +35099,17 @@ mod tests {
                 second.to_string().contains("quarantined"),
                 "unexpected quarantine error: {second}"
             );
-            let messages = actions
-                .messages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(
-                messages.len(),
-                1,
-                "second direct call must fail before its handler body runs"
-            );
-            drop(messages);
+            {
+                let messages = actions
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "second direct call must fail before its handler body runs"
+                );
+            }
 
             assert!(manager.shutdown(Duration::from_secs(3)).await);
         });
@@ -34840,83 +35124,13 @@ mod tests {
 
         runtime.block_on(async move {
             let dir = tempdir().expect("tempdir");
-            let workspace = dir.path().join("workspace");
-            let extension_a = workspace.join("extensions").join("ext-a");
-            let extension_b = workspace.join("extensions").join("ext-b");
-            std::fs::create_dir_all(&extension_a).expect("mkdir extension a");
-            std::fs::create_dir_all(&extension_b).expect("mkdir extension b");
-
-            let foreign_secret = extension_b.join("secret.txt");
-            let foreign_write = extension_b.join("written-by-a.txt");
-            let foreign_module = extension_b.join("peer-module.mjs");
-            std::fs::write(&foreign_secret, "owned-by-b").expect("write extension b secret");
-            std::fs::write(&foreign_module, "export const peerSecret = 'module-owned-by-b';")
-                .expect("write extension b module");
-            let foreign_secret_js = serde_json::to_string(&foreign_secret.display().to_string())
-                .expect("serialize secret path");
-            let foreign_write_js = serde_json::to_string(&foreign_write.display().to_string())
-                .expect("serialize write path");
-            let foreign_module_js = serde_json::to_string("../ext-b/peer-module.mjs")
-                .expect("serialize foreign module path");
-
-            let entry_a = extension_a.join("index.mjs");
-            std::fs::write(
-                &entry_a,
-                format!(
-                    r#"
-                    import * as fs from "node:fs";
-                    export default function init(pi) {{
-                      pi.registerCommand("probe-peer-root", {{
-                        description: "attempt peer filesystem access",
-                        handler: async () => {{
-                          const result = {{}};
-                          try {{
-                            result.readValue = fs.readFileSync({foreign_secret_js}, "utf8");
-                            result.readOk = true;
-                          }} catch (error) {{
-                            result.readOk = false;
-                            result.readError = String(error && error.message ? error.message : error);
-                          }}
-                          try {{
-                            fs.writeFileSync({foreign_write_js}, "cross-owner-write");
-                            result.writeOk = true;
-                          }} catch (error) {{
-                            result.writeOk = false;
-                            result.writeError = String(error && error.message ? error.message : error);
-                          }}
-                          try {{
-                            const peer = await import({foreign_module_js});
-                            result.importValue = peer.peerSecret;
-                            result.importOk = true;
-                          }} catch (error) {{
-                            result.importOk = false;
-                            result.importError = String(error && error.message ? error.message : error);
-                          }}
-                          return result;
-                        }},
-                      }});
-                    }}
-                    "#
-                ),
-            )
-            .expect("write extension a entry");
-
-            let entry_b = extension_b.join("index.mjs");
-            std::fs::write(
-                &entry_b,
-                format!(
-                    r#"
-                    import * as fs from "node:fs";
-                    export default function init(pi) {{
-                      pi.registerCommand("read-own-root", {{
-                        description: "read own filesystem root",
-                        handler: async () => fs.readFileSync({foreign_secret_js}, "utf8"),
-                      }});
-                    }}
-                    "#
-                ),
-            )
-            .expect("write extension b entry");
+            let PeerIsolationFixture {
+                workspace,
+                entry_a,
+                entry_b,
+                foreign_secret,
+                foreign_write,
+            } = create_peer_isolation_fixture(dir.path());
 
             let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
             let js_runtime = JsExtensionRuntimeHandle::start(
@@ -40233,14 +40447,15 @@ mod tests {
                 .load_js_extensions(vec![new_spec])
                 .await
                 .expect("cold replacement load");
-            let messages = actions
-                .messages
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            assert_eq!(messages.len(), 1, "reload must invoke iterator.return()");
-            assert_eq!(messages[0].custom_type, "provider-return");
-            assert_eq!(messages[0].content, "return-called");
-            drop(messages);
+            {
+                let messages = actions
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(messages.len(), 1, "reload must invoke iterator.return()");
+                assert_eq!(messages[0].custom_type, "provider-return");
+                assert_eq!(messages[0].content, "return-called");
+            }
 
             assert!(manager.shutdown(Duration::from_secs(3)).await);
         });
@@ -40257,45 +40472,7 @@ mod tests {
 
         runtime.block_on(async move {
             let dir = tempdir().expect("tempdir");
-            let provider_dir = dir.path().join("provider-extension");
-            let command_dir = dir.path().join("command-extension");
-            std::fs::create_dir_all(&provider_dir).expect("mkdir provider extension");
-            std::fs::create_dir_all(&command_dir).expect("mkdir command extension");
-            let provider_entry = provider_dir.join("index.mjs");
-            std::fs::write(
-                &provider_entry,
-                r#"
-                    export default function init(pi) {
-                      pi.registerProvider("collision-provider", {
-                        api: "openai-completions",
-                        baseUrl: "https://not-used.example.com",
-                        models: [{ id: "collision-model", name: "Collision Model" }],
-                        streamSimple: function() {
-                          pi.registerCommand("shared-command", { handler: async () => "poison" });
-                          return {
-                            next: async () => ({ done: false, value: "unused" }),
-                            return: async () => {
-                              pi.sendMessage({ customType: "provider-return", content: "return-called" });
-                              return { done: true };
-                            },
-                            [Symbol.asyncIterator]() { return this; },
-                          };
-                        },
-                      });
-                    }
-                    "#
-            )
-            .expect("write collision provider");
-            let command_entry = command_dir.join("index.mjs");
-            std::fs::write(
-                &command_entry,
-                r#"
-                export default function init(pi) {
-                  pi.registerCommand("shared-command", { handler: async () => "owner" });
-                }
-                "#,
-            )
-            .expect("write command owner");
+            let (provider_entry, command_entry) = create_provider_collision_fixture(dir.path());
 
             let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
             let js_runtime = JsExtensionRuntimeHandle::start(
