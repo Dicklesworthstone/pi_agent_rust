@@ -14,7 +14,7 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 
 ## [Unreleased]
 
-## [v0.2.0] — 2026-08-04 — Release
+## [v0.2.0] — 2026-08-05 — Release
 
 ### Breaking Changes
 
@@ -77,6 +77,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   hardening checks guard the shipping path.
 - **Extension filesystem fallback is more robust** — a denied host `readdir`
   no longer aborts the filesystem shim before later fallback paths are checked.
+- **Extension VFS isolation is enforced end to end** — registered roots under
+  `/tmp` remain host-backed while unrelated scratch paths stay private per
+  extension; cached data, every hop of virtual symlink resolution, and shared
+  file-descriptor operations are re-authorized for the active extension. The
+  raw shared VFS state is no longer exposed to extension code.
+- **Extension reloads use fresh JavaScript realms** — reset-time registry and
+  intrinsic checks are hygiene evidence before dropping a realm, not authority
+  to reuse arbitrary mutable module/global state. Versioned transpile-cache
+  artifacts remain reusable across cold owner-isolated realms.
 - **Context-evidence suppression is deterministic** — duplicate stale/unsafe
   suppression records are collapsed per source and reason while the complete
   excluded-item audit trail is retained.
