@@ -1583,11 +1583,29 @@ def run_self_test() -> int:
         (root / "tests/perf/reports/budget_summary.json").write_text(
             json.dumps(
                 {
-                    "schema": "pi.perf.budget_summary.v1",
+                    "schema": "pi.perf.budget_summary.v2",
                     "generated_at": iso_now(),
+                    "source_commit": "1" * 40,
+                    "run_id": "preflight-self-test",
+                    "correlation_id": "preflight-self-test",
+                    "strict_mode": True,
+                    "total_budgets": 0,
+                    "ci_enforced": 0,
+                    "ci_with_data": 0,
                     "ci_fail": 0,
                     "ci_no_data": 0,
+                    "pass": 0,
+                    "fail": 0,
+                    "no_data": 0,
                     "data_contract_failures_count": 0,
+                    "failing_data_contracts": [],
+                    "budgets": [],
+                    "budget_results": [],
+                    "claim_readiness": {
+                        "status": "claim_ready",
+                        "performance_claims_authorized": True,
+                        "blocking_reason_codes": [],
+                    },
                 }
             ),
             encoding="utf-8",

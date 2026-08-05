@@ -92,7 +92,9 @@ fn compress_embedded_text_assets() -> Result<(), Box<dyn std::error::Error>> {
 fn emit_benchmark_build_fingerprint() -> Result<(), Box<dyn std::error::Error>> {
     fn required_env(name: &str) -> Result<String, std::io::Error> {
         std::env::var(name).map_err(|_| {
-            std::io::Error::other(format!("Cargo did not provide required build variable {name}"))
+            std::io::Error::other(format!(
+                "Cargo did not provide required build variable {name}"
+            ))
         })
     }
 

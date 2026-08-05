@@ -13,13 +13,14 @@
 )]
 
 use pi::perf_build::{
-    BINARY_SIZE_RELEASE_BUDGET_MB, BUILD_FINGERPRINT_CONTRACT, CANONICAL_PIJS_PERF_FEATURES,
-    BenchmarkProvenance, benchmark_provenance_config_hash,
+    BINARY_SIZE_RELEASE_BUDGET_MB, BUILD_FINGERPRINT_CONTRACT, BenchmarkProvenance,
+    CANONICAL_PIJS_PERF_FEATURES, benchmark_provenance_config_hash,
     matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
     profile_from_target_path, sha256_file,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,29 @@ use std::time::SystemTime;
 enum BudgetComparison {
     Maximum,
     Minimum,
+}
+
+impl BudgetComparison {
+    fn passes(self, actual: f64, threshold: f64) -> bool {
+        match self {
+            Self::Maximum => actual <= threshold,
+            Self::Minimum => actual >= threshold,
+        }
+    }
+
+    const fn symbol(self) -> &'static str {
+        match self {
+            Self::Maximum => "<=",
+            Self::Minimum => ">=",
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Maximum => "maximum",
+            Self::Minimum => "minimum",
+        }
+    }
 }
 
 // ─── Budget Definitions ──────────────────────────────────────────────────────
@@ -66,6 +90,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 latency",
         unit: "ms",
         threshold: 100.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "hyperfine: `pi --version` (10 runs, 3 warmup)",
         ci_enforced: true,
     },
@@ -75,6 +100,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 latency",
         unit: "ms",
         threshold: 200.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "hyperfine: `pi --print '.'` with full init (10 runs, 3 warmup)",
         ci_enforced: false, // Requires API key or VCR
     },
@@ -85,6 +111,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 cold load time",
         unit: "ms",
         threshold: 5.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: load_init_cold for simple single-file extensions (10 samples)",
         ci_enforced: true,
     },
@@ -94,6 +121,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 cold load time",
         unit: "ms",
         threshold: 50.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: load_init_cold for multi-registration extensions (10 samples)",
         ci_enforced: false,
     },
@@ -103,6 +131,7 @@ const BUDGETS: &[Budget] = &[
         metric: "total load time (60 official extensions)",
         unit: "ms",
         threshold: 10000.0, // 10 seconds total for all 60
+        comparison: BudgetComparison::Maximum,
         methodology: "conformance runner: sequential load of all 60 official extensions",
         ci_enforced: false,
     },
@@ -113,6 +142,7 @@ const BUDGETS: &[Budget] = &[
         metric: "mean per-call latency",
         unit: "us",
         threshold: 200.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "pijs_workload: arithmetic mean across exactly 2000 iterations x 1 tool call, executable-path-verified perf profile",
         ci_enforced: true,
     },
@@ -122,6 +152,7 @@ const BUDGETS: &[Budget] = &[
         metric: "minimum calls/sec",
         unit: "calls/sec",
         threshold: 5000.0, // Must exceed 5k calls/sec
+        comparison: BudgetComparison::Minimum,
         methodology: "pijs_workload: aggregate throughput across exactly 2000 iterations x 10 tool calls, executable-path-verified perf profile",
         ci_enforced: true,
     },
@@ -132,6 +163,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p99 dispatch latency",
         unit: "us",
         threshold: 5000.0, // 5ms
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: event_hook dispatch for before_agent_start (100 samples)",
         ci_enforced: false,
     },
@@ -142,6 +174,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 cold graph build latency",
         unit: "ms",
         threshold: 500.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: semantic_context/graph_build_cold on large filesystem fixture",
         ci_enforced: true,
     },
@@ -151,6 +184,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 warm graph build latency",
         unit: "ms",
         threshold: 250.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: semantic_context/graph_build_warm on large filesystem fixture",
         ci_enforced: true,
     },
@@ -160,6 +194,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 single-change rebuild latency",
         unit: "ms",
         threshold: 250.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: semantic_context/incremental_update rebuild after one changed file",
         ci_enforced: true,
     },
@@ -169,6 +204,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 planner latency",
         unit: "ms",
         threshold: 50.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: semantic_context/planning on large graph fixture",
         ci_enforced: true,
     },
@@ -178,6 +214,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p95 bundle serialization latency",
         unit: "ms",
         threshold: 25.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: semantic_context/bundle_serialization on large bundle fixture",
         ci_enforced: true,
     },
@@ -187,6 +224,7 @@ const BUDGETS: &[Budget] = &[
         metric: "bundle estimated size",
         unit: "bytes",
         threshold: 262_144.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "semantic_context budget artifact: estimated selected bundle bytes",
         ci_enforced: true,
     },
@@ -197,6 +235,7 @@ const BUDGETS: &[Budget] = &[
         metric: "p99 evaluation time",
         unit: "ns",
         threshold: 500.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: ext_policy/evaluate with various modes and capabilities",
         ci_enforced: true,
     },
@@ -207,6 +246,7 @@ const BUDGETS: &[Budget] = &[
         metric: "RSS at idle",
         unit: "MB",
         threshold: 50.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "sysinfo: measure RSS after startup, before any user input",
         ci_enforced: true,
     },
@@ -216,6 +256,7 @@ const BUDGETS: &[Budget] = &[
         metric: "RSS growth under 30s sustained load",
         unit: "percent",
         threshold: 5.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "stress test: 15 extensions, 50 events/sec for 30 seconds",
         ci_enforced: false,
     },
@@ -226,6 +267,7 @@ const BUDGETS: &[Budget] = &[
         metric: "release binary size",
         unit: "MB",
         threshold: BINARY_SIZE_RELEASE_BUDGET_MB,
+        comparison: BudgetComparison::Maximum,
         methodology: "ls -la target/release/pi (stripped)",
         ci_enforced: true,
     },
@@ -236,10 +278,44 @@ const BUDGETS: &[Budget] = &[
         metric: "p99 parse+validate time",
         unit: "us",
         threshold: 50.0,
+        comparison: BudgetComparison::Maximum,
         methodology: "criterion: ext_protocol/parse_and_validate for host_call and log messages",
         ci_enforced: true,
     },
 ];
+
+/// Canonical cross-language inventory serialization used by release consumers.
+///
+/// Array and field order are fixed. Thresholds use exactly six decimal places,
+/// avoiding parser-dependent `100` versus `100.0` spellings while retaining all
+/// precision used by the v0.2.0 budget inventory.
+fn budget_inventory_canonical_json() -> String {
+    let mut canonical = String::from("[");
+    for (index, budget) in BUDGETS.iter().enumerate() {
+        if index != 0 {
+            canonical.push(',');
+        }
+        let name = serde_json::to_string(budget.name).expect("serialize budget name");
+        let category = serde_json::to_string(budget.category).expect("serialize budget category");
+        let metric = serde_json::to_string(budget.metric).expect("serialize budget metric");
+        let unit = serde_json::to_string(budget.unit).expect("serialize budget unit");
+        let comparison =
+            serde_json::to_string(budget.comparison.as_str()).expect("serialize comparison");
+        let methodology = serde_json::to_string(budget.methodology).expect("serialize methodology");
+        let _ = write!(
+            canonical,
+            "{{\"name\":{name},\"category\":{category},\"metric\":{metric},\"unit\":{unit},\"threshold\":{:.6},\"comparison\":{comparison},\"ci_enforced\":{},\"methodology\":{methodology}}}",
+            budget.threshold, budget.ci_enforced
+        );
+    }
+    canonical.push(']');
+    canonical
+}
+
+fn budget_inventory_sha256() -> String {
+    let digest = Sha256::digest(budget_inventory_canonical_json().as_bytes());
+    format!("{digest:x}")
+}
 
 const DEFAULT_MAX_ARTIFACT_AGE_HOURS: f64 = 24.0;
 const BUN_KILLER_MAX_RUST_VS_BUN_RATIO: f64 = 0.33;
@@ -404,6 +480,7 @@ struct BudgetResult {
     budget_name: String,
     category: String,
     threshold: f64,
+    comparison: BudgetComparison,
     unit: String,
     actual: Option<f64>,
     status: String, // "PASS", "FAIL", "NO_DATA"
@@ -524,13 +601,7 @@ fn claim_readiness_blockers(
 fn classify_budget_status(budget: &Budget, actual: Option<f64>, strict: bool) -> &'static str {
     match actual {
         Some(val) => {
-            if budget.name == "tool_call_throughput_min" {
-                if val >= budget.threshold {
-                    "PASS"
-                } else {
-                    "FAIL"
-                }
-            } else if val <= budget.threshold {
+            if budget.comparison.passes(val, budget.threshold) {
                 "PASS"
             } else {
                 "FAIL"
@@ -1611,6 +1682,7 @@ fn check_budget(budget: &Budget) -> BudgetResult {
         budget_name: budget.name.to_string(),
         category: budget.category.to_string(),
         threshold: budget.threshold,
+        comparison: budget.comparison,
         unit: budget.unit.to_string(),
         actual,
         status: status.to_string(),
@@ -1743,7 +1815,9 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
             .and_then(Value::as_str)
             .unwrap_or_default(),
     ) {
-        return Err("compiled Cargo settings do not match the canonical perf fingerprint".to_string());
+        return Err(
+            "compiled Cargo settings do not match the canonical perf fingerprint".to_string(),
+        );
     }
     let compiled_features = record
         .get("compiled_features")
@@ -1761,8 +1835,13 @@ fn validate_pijs_gate_record(record: &Value, expected_tool_calls: u64) -> Result
             "compiled_features must equal canonical shipping feature set {CANONICAL_PIJS_PERF_FEATURES:?} (observed={compiled_features:?})"
         ));
     }
-    if record.get("allocator_fallback_reason").is_some_and(|value| !value.is_null()) {
-        return Err("allocator_fallback_reason must be null for the canonical system lane".to_string());
+    if record
+        .get("allocator_fallback_reason")
+        .is_some_and(|value| !value.is_null())
+    {
+        return Err(
+            "allocator_fallback_reason must be null for the canonical system lane".to_string(),
+        );
     }
     if record.get("source_dirty").and_then(Value::as_bool) != Some(false) {
         return Err("source_dirty must equal false".to_string());
@@ -1997,8 +2076,10 @@ fn validate_pijs_gate_pair(
     }
     admitted.sort_by_key(|(tool_calls, ..)| *tool_calls);
     if admitted[0].0 != 1 || admitted[1].0 != 10 {
-        return Err("PiJS regression gate requires exactly one 1-call lane and one 10-call lane"
-            .to_string());
+        return Err(
+            "PiJS regression gate requires exactly one 1-call lane and one 10-call lane"
+                .to_string(),
+        );
     }
 
     let latency_record = admitted[0].1;
@@ -2018,18 +2099,13 @@ fn validate_pijs_gate_pair(
         "allocator_effective",
     ] {
         if latency_record.get(field) != throughput_record.get(field) {
-            return Err(format!(
-                "PiJS 1-call and 10-call lanes must share {field}"
-            ));
+            return Err(format!("PiJS 1-call and 10-call lanes must share {field}"));
         }
     }
     if latency_record.get("compiled_features") != throughput_record.get("compiled_features") {
         return Err("PiJS 1-call and 10-call lanes must share compiled_features".to_string());
     }
-    let timestamp_span = admitted[1]
-        .3
-        .signed_duration_since(admitted[0].3)
-        .abs();
+    let timestamp_span = admitted[1].3.signed_duration_since(admitted[0].3).abs();
     if timestamp_span > chrono::TimeDelta::minutes(15) {
         return Err("PiJS lane timestamps must be within 15 minutes of one another".to_string());
     }
@@ -2056,9 +2132,7 @@ fn read_pijs_gate_pair(root: &Path, max_age_hours: f64) -> (Option<ValidatedPijs
             source,
             events,
         } => {
-            if let Err(detail) =
-                validate_selected_pijs_freshness(&path, &source, max_age_hours)
-            {
+            if let Err(detail) = validate_selected_pijs_freshness(&path, &source, max_age_hours) {
                 return (None, detail);
             }
             (events, source)
@@ -2066,7 +2140,10 @@ fn read_pijs_gate_pair(root: &Path, max_age_hours: f64) -> (Option<ValidatedPijs
     };
     match validate_pijs_gate_pair(&events, max_age_hours) {
         Ok(pair) => (Some(pair), source),
-        Err(detail) => (None, format!("no admissible pijs_workload pair in {source}: {detail}")),
+        Err(detail) => (
+            None,
+            format!("no admissible pijs_workload pair in {source}: {detail}"),
+        ),
     }
 }
 
@@ -2630,6 +2707,62 @@ fn budget_names_are_unique() {
 }
 
 #[test]
+fn budget_comparison_directions_are_explicit_and_not_name_derived() {
+    let minimum_budgets = BUDGETS
+        .iter()
+        .filter(|budget| budget.comparison == BudgetComparison::Minimum)
+        .map(|budget| budget.name)
+        .collect::<Vec<_>>();
+    assert_eq!(minimum_budgets, vec!["tool_call_throughput_min"]);
+
+    let maximum = BUDGETS
+        .iter()
+        .find(|budget| budget.name == "tool_call_latency_mean")
+        .expect("maximum budget");
+    assert_eq!(
+        classify_budget_status(maximum, Some(maximum.threshold), true),
+        "PASS"
+    );
+    assert_eq!(
+        classify_budget_status(maximum, Some(maximum.threshold + 1.0), true),
+        "FAIL"
+    );
+
+    let minimum = BUDGETS
+        .iter()
+        .find(|budget| budget.name == "tool_call_throughput_min")
+        .expect("minimum budget");
+    assert_eq!(
+        classify_budget_status(minimum, Some(minimum.threshold), true),
+        "PASS"
+    );
+    assert_eq!(
+        classify_budget_status(minimum, Some(minimum.threshold - 1.0), true),
+        "FAIL"
+    );
+}
+
+#[test]
+fn budget_inventory_has_stable_cross_language_serialization() {
+    let canonical = budget_inventory_canonical_json();
+    let parsed: Value = serde_json::from_str(&canonical).expect("canonical inventory is JSON");
+    assert_eq!(
+        parsed.as_array().map(Vec::len),
+        Some(BUDGETS.len()),
+        "canonical inventory must serialize every budget in declaration order"
+    );
+    assert!(canonical.starts_with(
+        "[{\"name\":\"startup_version_p95\",\"category\":\"startup\",\"metric\":\"p95 latency\",\"unit\":\"ms\",\"threshold\":100.000000,\"comparison\":\"maximum\",\"ci_enforced\":true,\"methodology\":"
+    ));
+    assert!(canonical.contains(
+        "\"name\":\"tool_call_throughput_min\",\"category\":\"tool_call\",\"metric\":\"minimum calls/sec\",\"unit\":\"calls/sec\",\"threshold\":5000.000000,\"comparison\":\"minimum\""
+    ));
+    let digest = budget_inventory_sha256();
+    assert_eq!(digest.len(), 64);
+    eprintln!("canonical budget inventory SHA-256: {digest}");
+}
+
+#[test]
 fn ci_enforced_budgets_have_data_sources() {
     // CI-enforced budgets should have measurement data available
     let ci_budgets: Vec<_> = BUDGETS.iter().filter(|b| b.ci_enforced).collect();
@@ -2944,9 +3077,8 @@ fn retarget_pijs_record(record: &mut Value, binary_path: &Path, contents: &[u8])
     std::fs::write(binary_path, contents).expect("write retargeted PiJS binary");
     let binary_path = std::fs::canonicalize(binary_path).expect("canonicalize PiJS binary");
     record["binary_path"] = json!(binary_path.display().to_string());
-    record["executable_build_profile"] = json!(
-        profile_from_target_path(&binary_path).expect("derive retargeted binary profile")
-    );
+    record["executable_build_profile"] =
+        json!(profile_from_target_path(&binary_path).expect("derive retargeted binary profile"));
     record["binary_sha256"] =
         json!(sha256_file(&binary_path).expect("hash retargeted PiJS binary"));
     refresh_pijs_test_config_hash(record);
@@ -2984,9 +3116,7 @@ fn refresh_pijs_test_config_hash(record: &mut Value) {
         compiled_opt_level: record["compiled_opt_level"]
             .as_str()
             .expect("compiled opt level"),
-        compiled_debug: record["compiled_debug"]
-            .as_str()
-            .expect("compiled debug"),
+        compiled_debug: record["compiled_debug"].as_str().expect("compiled debug"),
         compiled_features: &features,
         binary_path: record["binary_path"].as_str().expect("binary path"),
         binary_sha256: record["binary_sha256"].as_str().expect("binary sha256"),
@@ -3055,7 +3185,12 @@ fn pijs_gate_reader_accepts_custom_cargo_target_dir_layout() {
 #[test]
 fn pijs_gate_reader_rejects_forged_metrics() {
     let cases = [
-        (1_u64, "per_call_us_f64", json!(0.01), "per_call_us_f64 is inconsistent"),
+        (
+            1_u64,
+            "per_call_us_f64",
+            json!(0.01),
+            "per_call_us_f64 is inconsistent",
+        ),
         (
             10_u64,
             "calls_per_sec",
@@ -3115,7 +3250,11 @@ fn pijs_gate_reader_rejects_mixed_run_identity_and_duplicate_lanes() {
     throughput["run_id"] = json!("other-run");
     throughput["correlation_id"] = json!("other-run");
     write_pijs_workload_records(&path, &[latency.clone(), throughput]);
-    assert!(read_pijs_workload_mean_latency(tmp.path()).1.contains("must share run_id"));
+    assert!(
+        read_pijs_workload_mean_latency(tmp.path())
+            .1
+            .contains("must share run_id")
+    );
 
     write_pijs_workload_records(
         &path,
@@ -3155,20 +3294,13 @@ fn pijs_gate_reader_rejects_binary_hash_allocator_and_feature_conflicts() {
             json!("z"),
             "compiled_opt_level must equal \"3\"",
         ),
-        (
-            "source_dirty",
-            json!(true),
-            "source_dirty must equal false",
-        ),
+        ("source_dirty", json!(true), "source_dirty must equal false"),
     ] {
         let tmp = tempfile::tempdir().expect("create tempdir");
         let path = tmp.path().join("target/perf/perf/pijs_workload_perf.jsonl");
         let mut latency = valid_pijs_gate_record(tmp.path(), 1);
         latency[field] = value;
-        write_pijs_workload_records(
-            &path,
-            &[latency, valid_pijs_gate_record(tmp.path(), 10)],
-        );
+        write_pijs_workload_records(&path, &[latency, valid_pijs_gate_record(tmp.path(), 10)]);
         let failures =
             evaluate_pijs_workload_gate_contract(tmp.path(), DEFAULT_MAX_ARTIFACT_AGE_HOURS);
         assert!(
@@ -3361,10 +3493,7 @@ fn pijs_gate_reader_fails_closed_on_invalid_canonical_artifact() {
     let mut invalid = valid_pijs_gate_record(tmp.path(), 1);
     invalid["confidence"] = json!("medium");
     write_pijs_workload_records(&canonical, &[invalid]);
-    write_pijs_workload_records(
-        &fallback,
-        &[valid_pijs_gate_record(tmp.path(), 1)],
-    );
+    write_pijs_workload_records(&fallback, &[valid_pijs_gate_record(tmp.path(), 1)]);
 
     let (latency, source) = read_pijs_workload_mean_latency(tmp.path());
     assert_eq!(latency, None);
@@ -3598,6 +3727,7 @@ fn generate_budget_report() {
             "metric": b.metric,
             "unit": b.unit,
             "threshold": b.threshold,
+            "comparison": b.comparison,
             "ci_enforced": b.ci_enforced,
             "methodology": b.methodology,
         })).collect::<Vec<_>>(),
@@ -3620,11 +3750,7 @@ fn generate_budget_report() {
     let mut md = String::with_capacity(8 * 1024);
 
     md.push_str("# Performance Budgets\n\n");
-    let _ = writeln!(
-        md,
-        "> Generated: {}\n",
-        generated_at
-    );
+    let _ = writeln!(md, "> Generated: {}\n", generated_at);
     let _ = writeln!(md, "> Run ID: {run_id_label}\n");
     let _ = writeln!(
         md,
@@ -3681,16 +3807,17 @@ fn generate_budget_report() {
         }
 
         let _ = writeln!(md, "## {}\n", capitalize(cat));
-        md.push_str("| Budget | Metric | Threshold | Actual | Status | CI |\n");
-        md.push_str("|---|---|---|---|---|---|\n");
+        md.push_str("| Budget | Metric | Comparison | Threshold | Actual | Status | CI |\n");
+        md.push_str("|---|---|---|---|---|---|---|\n");
 
         for budget in &cat_budgets {
             let Some(result) = results.iter().find(|r| r.budget_name.eq(budget.name)) else {
                 let _ = writeln!(
                     md,
-                    "| {} | {} | {} {} | - | NO_DATA | {} |",
+                    "| {} | {} | {} | {} {} | - | NO_DATA | {} |",
                     budget.name,
                     budget.metric,
+                    budget.comparison.symbol(),
                     format_value(budget.threshold, budget.unit),
                     budget.unit,
                     if budget.ci_enforced { "yes" } else { "no" }
@@ -3704,9 +3831,10 @@ fn generate_budget_report() {
 
             let _ = writeln!(
                 md,
-                "| `{}` | {} | {} {} | {} | {} | {} |",
+                "| `{}` | {} | {} | {} {} | {} | {} | {} |",
                 budget.name,
                 budget.metric,
+                budget.comparison.symbol(),
                 budget.threshold,
                 budget.unit,
                 actual_str,

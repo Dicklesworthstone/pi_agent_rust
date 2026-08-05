@@ -15,9 +15,9 @@
 )]
 
 use pi::perf_build::{
-    BUILD_FINGERPRINT_CONTRACT, CANONICAL_PIJS_PERF_FEATURES,
-    BenchmarkProvenance, benchmark_provenance_config_hash,
-    matches_canonical_perf_build_fingerprint, profile_from_target_path, sha256_file,
+    BUILD_FINGERPRINT_CONTRACT, BenchmarkProvenance, CANONICAL_PIJS_PERF_FEATURES,
+    benchmark_provenance_config_hash, matches_canonical_perf_build_fingerprint,
+    profile_from_target_path, sha256_file,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -106,6 +106,19 @@ pub struct BudgetEvent {
 
 // ─── Schema Registry ─────────────────────────────────────────────────────────
 
+const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
+const PERF_BUDGET_DEFINITION_FIELDS: &[&str] = &[
+    "name",
+    "category",
+    "metric",
+    "unit",
+    "threshold",
+    "comparison",
+    "ci_enforced",
+    "methodology",
+];
+const PERF_BUDGET_COMPARISON_VALUES: &[&str] = &["maximum", "minimum"];
+
 /// Known JSONL schemas with version and description.
 const SCHEMAS: &[(&str, &str)] = &[
     (
@@ -126,7 +139,7 @@ const SCHEMAS: &[(&str, &str)] = &[
     ),
     ("pi.perf.budget.v1", "Performance budget check result"),
     (
-        "pi.perf.budget_summary.v2",
+        PERF_BUDGET_SUMMARY_SCHEMA,
         "Strict provenance-bound budget summary with per-budget results and claim readiness",
     ),
     (
@@ -212,8 +225,10 @@ const REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES: &[&str] = &[
     "not_applicable_synthetic",
     HOST_PAGE_CACHE_UNCONTROLLED,
 ];
-const REGRESSION_GATE_ELIGIBLE_BOUNDARIES: &[&str] =
-    &["production_extension_manager", "production_extension_runtime"];
+const REGRESSION_GATE_ELIGIBLE_BOUNDARIES: &[&str] = &[
+    "production_extension_manager",
+    "production_extension_runtime",
+];
 const REGRESSION_GATE_REQUIRED_RECORD_FIELDS: &[&str] = &[
     "evidence_class",
     "confidence",
@@ -382,10 +397,7 @@ fn pijs_schema_candidate_paths_in_target_dir(target_dir: &Path) -> Vec<PathBuf> 
 }
 
 fn pijs_schema_candidate_paths(root: &Path) -> Vec<PathBuf> {
-    let resolved = resolve_bench_target_dir(
-        root,
-        std::env::var_os("CARGO_TARGET_DIR").as_deref(),
-    );
+    let resolved = resolve_bench_target_dir(root, std::env::var_os("CARGO_TARGET_DIR").as_deref());
     let default = root.join("target");
     let mut paths = Vec::new();
     let mut evidence_dirs = std::env::var_os("PERF_EVIDENCE_DIR")
@@ -489,11 +501,8 @@ fn pijs_schema_selection_rejects_empty_or_malformed_canonical_before_fallback() 
     fs::write(&fallback, "{\"schema\":\"fallback\"}\n").expect("write fallback");
 
     fs::write(&canonical, " \n\n").expect("write empty canonical");
-    let err = load_selected_pijs_schema_artifact_from_paths(&[
-        canonical.clone(),
-        fallback.clone(),
-    ])
-    .expect_err("empty selected canonical must not fall back");
+    let err = load_selected_pijs_schema_artifact_from_paths(&[canonical.clone(), fallback.clone()])
+        .expect_err("empty selected canonical must not fall back");
     assert!(err.contains("contains no nonblank JSON records"), "{err}");
 
     fs::write(&canonical, "{not-json\n").expect("write malformed canonical");
@@ -975,6 +984,25 @@ fn canonical_protocol_contract() -> Value {
     })
 }
 
+fn canonical_budget_summary_contract() -> Value {
+    json!({
+        "schema": PERF_BUDGET_SUMMARY_SCHEMA,
+        "budget_definition_required_fields": PERF_BUDGET_DEFINITION_FIELDS,
+        "comparison_values": PERF_BUDGET_COMPARISON_VALUES,
+        "comparison_semantics": {
+            "maximum": "actual <= threshold",
+            "minimum": "actual >= threshold",
+        },
+        "inventory_digest": {
+            "algorithm": "sha256",
+            "container": "compact_json_array",
+            "budget_order": "producer_declaration_order",
+            "field_order": PERF_BUDGET_DEFINITION_FIELDS,
+            "threshold_representation": "exactly_six_decimal_places",
+        },
+    })
+}
+
 fn validate_metric_group(
     metrics: &serde_json::Map<String, Value>,
     field: &str,
@@ -1356,9 +1384,7 @@ fn validate_eligible_build_provenance(record: &Value) -> Result<(), String> {
         format!("regression-gate eligible evidence binary_path must exist: {err}")
     })?;
     if canonical_path != binary_path {
-        return Err(
-            "regression-gate eligible evidence binary_path must be canonical".to_string(),
-        );
+        return Err("regression-gate eligible evidence binary_path must be canonical".to_string());
     }
     let claimed_sha256 = regression_provenance_field(record, "binary_sha256")
         .and_then(Value::as_str)
@@ -1369,8 +1395,7 @@ fn validate_eligible_build_provenance(record: &Value) -> Result<(), String> {
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         })
         .ok_or_else(|| {
-            "regression-gate eligible evidence binary_sha256 must be lowercase SHA-256"
-                .to_string()
+            "regression-gate eligible evidence binary_sha256 must be lowercase SHA-256".to_string()
         })?;
     let observed_sha256 = sha256_file(binary_path)
         .map_err(|err| format!("failed to hash regression-gate binary_path: {err}"))?;
@@ -1393,8 +1418,7 @@ fn validate_eligible_build_provenance(record: &Value) -> Result<(), String> {
             "regression-gate eligible evidence source_commit must be a full lowercase Git SHA"
                 .to_string()
         })?;
-    if regression_provenance_field(record, "source_dirty").and_then(Value::as_bool) != Some(false)
-    {
+    if regression_provenance_field(record, "source_dirty").and_then(Value::as_bool) != Some(false) {
         return Err("regression-gate eligible evidence source_dirty must equal false".to_string());
     }
     let compiled_features = regression_provenance_field(record, "compiled_features")
@@ -1410,9 +1434,7 @@ fn validate_eligible_build_provenance(record: &Value) -> Result<(), String> {
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if compiled_features.is_empty()
-        || compiled_features.windows(2).any(|pair| pair[0] >= pair[1])
-    {
+    if compiled_features.is_empty() || compiled_features.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err(
             "regression-gate eligible evidence compiled_features must be non-empty, sorted, and unique"
                 .to_string(),
@@ -1539,9 +1561,9 @@ fn validate_regression_gate_admission_record(record: &Value) -> Result<(), Strin
         ));
     }
     if let Some(host_page_cache_policy) = record.get("host_page_cache_policy") {
-        let host_page_cache_policy = host_page_cache_policy.as_str().ok_or_else(|| {
-            "regression-gate host_page_cache_policy must be a string".to_string()
-        })?;
+        let host_page_cache_policy = host_page_cache_policy
+            .as_str()
+            .ok_or_else(|| "regression-gate host_page_cache_policy must be a string".to_string())?;
         if !REGRESSION_GATE_ALLOWED_HOST_PAGE_CACHE_POLICIES.contains(&host_page_cache_policy) {
             return Err(format!(
                 "invalid regression-gate host_page_cache_policy token: {host_page_cache_policy}"
@@ -1716,9 +1738,7 @@ fn validate_pijs_regression_gate_admission_record(record: &Value) -> Result<(), 
         .get("allocator_fallback_reason")
         .is_some_and(Value::is_null)
     {
-        return Err(
-            "PiJS regression-gate allocator_fallback_reason must equal null".to_string(),
-        );
+        return Err("PiJS regression-gate allocator_fallback_reason must equal null".to_string());
     }
     let features = record
         .get("compiled_features")
@@ -1749,9 +1769,7 @@ fn validate_pijs_regression_gate_admission_record(record: &Value) -> Result<(), 
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "PiJS regression-gate correlation_id must be non-empty".to_string())?;
     if run_id != correlation_id {
-        return Err(
-            "PiJS regression-gate run_id and correlation_id must be identical".to_string(),
-        );
+        return Err("PiJS regression-gate run_id and correlation_id must be identical".to_string());
     }
     let timestamp = record
         .get("timestamp")
@@ -1773,7 +1791,9 @@ fn validate_pijs_regression_gate_admission_record(record: &Value) -> Result<(), 
                 )
             })?;
         if value.bytes().all(|byte| byte == b'0') {
-            return Err(format!("PiJS regression-gate {field} must not be all zeros"));
+            return Err(format!(
+                "PiJS regression-gate {field} must not be all zeros"
+            ));
         }
     }
     record
@@ -1821,9 +1841,7 @@ fn validate_pijs_regression_gate_admission_record(record: &Value) -> Result<(), 
         .get("elapsed_us")
         .and_then(Value::as_u64)
         .filter(|value| *value > 0)
-        .ok_or_else(|| {
-            "PiJS regression-gate elapsed_us must be a positive integer".to_string()
-        })?;
+        .ok_or_else(|| "PiJS regression-gate elapsed_us must be a positive integer".to_string())?;
     for field in ["elapsed_us_f64", "per_call_us_f64"] {
         record
             .get(field)
@@ -4524,6 +4542,35 @@ fn protocol_contract_labels_evidence_and_confidence() {
 }
 
 #[test]
+fn budget_summary_contract_defines_comparison_and_digest_semantics() {
+    let contract = canonical_budget_summary_contract();
+    assert_eq!(
+        contract["schema"].as_str(),
+        Some(PERF_BUDGET_SUMMARY_SCHEMA)
+    );
+    assert_eq!(
+        contract["budget_definition_required_fields"],
+        json!(PERF_BUDGET_DEFINITION_FIELDS)
+    );
+    assert_eq!(
+        contract["comparison_values"],
+        json!(PERF_BUDGET_COMPARISON_VALUES)
+    );
+    assert_eq!(
+        contract["comparison_semantics"]["maximum"].as_str(),
+        Some("actual <= threshold")
+    );
+    assert_eq!(
+        contract["comparison_semantics"]["minimum"].as_str(),
+        Some("actual >= threshold")
+    );
+    assert_eq!(
+        contract["inventory_digest"]["threshold_representation"].as_str(),
+        Some("exactly_six_decimal_places")
+    );
+}
+
+#[test]
 fn protocol_contract_defines_regression_gate_admission() {
     let contract = canonical_protocol_contract();
     let admission = contract["regression_gate_admission"]
@@ -4885,11 +4932,7 @@ fn regression_gate_admission_recomputes_generic_build_provenance() {
             json!("0".repeat(64)),
             "binary_sha256 does not match binary_path",
         ),
-        (
-            "source_dirty",
-            json!(true),
-            "source_dirty must equal false",
-        ),
+        ("source_dirty", json!(true), "source_dirty must equal false"),
         (
             "config_hash",
             json!("0".repeat(64)),
@@ -5098,11 +5141,7 @@ fn pijs_workload_admission_requires_exact_quickjs_perf_contract() {
             json!(false),
             "build_profile_verified must equal true",
         ),
-        (
-            "binary_path",
-            json!(""),
-            "binary_path must be non-empty",
-        ),
+        ("binary_path", json!(""), "binary_path must be non-empty"),
         (
             "binary_sha256",
             json!("not-a-digest"),
@@ -6429,13 +6468,13 @@ fn evidence_contract_schema_includes_benchmark_protocol_definition() {
         pijs_admission["properties"]["required_record_fields"]["maxItems"].as_u64(),
         Some(PIJS_GATE_REQUIRED_RECORD_FIELDS.len() as u64)
     );
-    let pijs_required_record_fields = pijs_admission["properties"]["required_record_fields"]
-        ["items"]["enum"]
-        .as_array()
-        .expect("PiJS required record field enum")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
+    let pijs_required_record_fields =
+        pijs_admission["properties"]["required_record_fields"]["items"]["enum"]
+            .as_array()
+            .expect("PiJS required record field enum")
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
     assert_eq!(
         pijs_required_record_fields, PIJS_GATE_REQUIRED_RECORD_FIELDS,
         "PiJS admission schema must enumerate every required record field exactly"
@@ -7348,8 +7387,8 @@ fn validate_rust_bench_schema() {
 #[test]
 fn validate_workload_schema() {
     let root = project_root();
-    let Some((source, events)) = load_selected_pijs_schema_artifact(&root)
-        .unwrap_or_else(|err| panic!("{err}"))
+    let Some((source, events)) =
+        load_selected_pijs_schema_artifact(&root).unwrap_or_else(|err| panic!("{err}"))
     else {
         eprintln!("[schema] No pijs_workload.jsonl data — skipping");
         return;
@@ -7601,6 +7640,11 @@ fn generate_schema_doc() {
     }
     md.push('\n');
 
+    md.push_str("### `pi.perf.budget_summary.v2`\n\n");
+    md.push_str(
+        "Each `budgets` entry requires `name`, `category`, `metric`, `unit`, `threshold`, `comparison`, `ci_enforced`, and `methodology`. `comparison` is the exact enum `maximum` (`actual <= threshold`) or `minimum` (`actual >= threshold`); consumers must never infer direction from a budget name. Inventory SHA-256 uses compact JSON in producer declaration order and the listed field order, with every threshold rendered using exactly six decimal places.\n\n",
+    );
+
     let protocol_contract = canonical_protocol_contract();
 
     md.push_str("### `pi.bench.protocol.v1`\n\n");
@@ -7740,6 +7784,7 @@ fn generate_schema_doc() {
             "description": desc,
         })).collect::<Vec<_>>(),
         "protocol_contract": canonical_protocol_contract(),
+        "budget_summary_contract": canonical_budget_summary_contract(),
         "env_fingerprint_fields": ENV_FINGERPRINT_FIELDS.iter().map(|(name, desc)| json!({
             "field": name,
             "description": desc,

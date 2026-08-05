@@ -242,6 +242,42 @@ run_cargo_gate() {
     "${CARGO_RUNNER_ARGS[@]}" "$@"
 }
 
+validate_exact_libtest_output() {
+    local mode="$1"
+    local test_name="$2"
+    python3 -c '
+import re
+import sys
+
+mode, test_name = sys.argv[1:]
+lines = [line.strip() for line in sys.stdin.read().splitlines()]
+if mode == "list":
+    listed = [line for line in lines if line.endswith(": test")]
+    summaries = [
+        line
+        for line in lines
+        if re.fullmatch(r"[0-9]+ tests?, [0-9]+ benchmarks?", line)
+    ]
+    if listed != [f"{test_name}: test"] or summaries != ["1 test, 0 benchmarks"]:
+        raise SystemExit(1)
+elif mode == "run":
+    running = [
+        match.group(1)
+        for line in lines
+        if (match := re.fullmatch(r"running ([0-9]+) tests?", line)) is not None
+    ]
+    results = [line for line in lines if line.startswith("test result:")]
+    result_pattern = re.compile(
+        r"test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; "
+        r"[0-9]+ filtered out; finished in .+"
+    )
+    if running != ["1"] or len(results) != 1 or result_pattern.fullmatch(results[0]) is None:
+        raise SystemExit(1)
+else:
+    raise SystemExit(2)
+' "$mode" "$test_name"
+}
+
 capture_repository_snapshot() {
     python3 - "$PROJECT_ROOT" <<'PY'
 import hashlib
@@ -1094,6 +1130,7 @@ PERFORMANCE_SUMMARY="$PROJECT_ROOT/tests/perf/reports/budget_summary.json"
 if [[ -f "$PERFORMANCE_SUMMARY" ]]; then
     if PERFORMANCE_CHECK=$(python3 - "$PROJECT_ROOT" "$PERFORMANCE_SUMMARY" "$REQUIRE_PERFORMANCE_CLAIM_READY" "$MAX_EVIDENCE_AGE_HOURS" 2>&1 <<'PY'
 import fnmatch
+import hashlib
 import json
 import math
 import os
@@ -1136,6 +1173,7 @@ BUDGET_FIELDS = {
     "metric",
     "unit",
     "threshold",
+    "comparison",
     "methodology",
     "ci_enforced",
 }
@@ -1143,6 +1181,7 @@ RESULT_REQUIRED_FIELDS = {
     "budget_name",
     "category",
     "threshold",
+    "comparison",
     "unit",
     "actual",
     "status",
@@ -1160,8 +1199,9 @@ CLAIM_READINESS_FIELDS = {
 LINEAGE_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}")
 OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 TIMESTAMP_RE = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z"
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
+CANONICAL_BUDGET_INVENTORY_SHA256 = "PENDING_CANONICAL_BUDGET_INVENTORY_SHA256"
 
 
 class ContractError(ValueError):
@@ -1228,6 +1268,29 @@ def nullable_lineage(value, label):
     if not isinstance(value, str) or LINEAGE_RE.fullmatch(value) is None:
         fail(f"{label} must be null or a canonical lineage identifier")
     return value
+
+
+def canonical_budget_inventory_json(budgets):
+    records = []
+    for budget in budgets:
+        threshold = float(budget["threshold"])
+        if threshold != round(threshold, 6):
+            fail(f"budget {budget['name']} threshold exceeds canonical six-decimal precision")
+        records.append(
+            "{" + ",".join(
+                (
+                    '"name":' + json.dumps(budget["name"], ensure_ascii=False),
+                    '"category":' + json.dumps(budget["category"], ensure_ascii=False),
+                    '"metric":' + json.dumps(budget["metric"], ensure_ascii=False),
+                    '"unit":' + json.dumps(budget["unit"], ensure_ascii=False),
+                    f'"threshold":{threshold:.6f}',
+                    '"comparison":' + json.dumps(budget["comparison"], ensure_ascii=False),
+                    '"ci_enforced":' + ("true" if budget["ci_enforced"] else "false"),
+                    '"methodology":' + json.dumps(budget["methodology"], ensure_ascii=False),
+                )
+            ) + "}"
+        )
+    return "[" + ",".join(records) + "]"
 
 
 def run_git(*args):
@@ -1320,6 +1383,8 @@ try:
     generated_at = datetime.fromisoformat(generated_at_raw.removesuffix("Z") + "+00:00")
     if generated_at.utcoffset() != timedelta(0):
         fail("generated_at must use UTC")
+    if generated_at.isoformat(timespec="milliseconds").replace("+00:00", "Z") != generated_at_raw:
+        fail("generated_at must use canonical millisecond-precision UTC RFC3339")
 
     source_commit = data["source_commit"]
     if source_commit is not None and (
@@ -1366,9 +1431,20 @@ try:
         for field in ("category", "metric", "unit", "methodology"):
             nonempty_string(budget[field], f"budgets[{index}].{field}")
         finite_number(budget["threshold"], f"budgets[{index}].threshold", positive=True)
+        if budget["comparison"] not in ("maximum", "minimum"):
+            fail(f"budgets[{index}].comparison must be 'maximum' or 'minimum'")
         if not isinstance(budget["ci_enforced"], bool):
             fail(f"budgets[{index}].ci_enforced must be a boolean")
         budgets_by_name[name] = budget
+
+    inventory_json = canonical_budget_inventory_json(budgets)
+    inventory_sha256 = hashlib.sha256(inventory_json.encode("utf-8")).hexdigest()
+    if inventory_sha256 != CANONICAL_BUDGET_INVENTORY_SHA256:
+        fail(
+            "budget inventory does not match the canonical producer contract "
+            f"(observed_sha256={inventory_sha256}, "
+            f"expected_sha256={CANONICAL_BUDGET_INVENTORY_SHA256})"
+        )
 
     results_by_name = {}
     status_counts = {"PASS": 0, "FAIL": 0, "NO_DATA": 0}
@@ -1388,7 +1464,7 @@ try:
         budget = budgets_by_name.get(name)
         if budget is None:
             fail(f"budget result has no matching definition: {name}")
-        for field in ("category", "unit"):
+        for field in ("category", "unit", "comparison"):
             nonempty_string(result[field], f"budget_results[{index}].{field}")
             if result[field] != budget[field]:
                 fail(f"budget result {name} has mismatched {field}")
@@ -1423,15 +1499,12 @@ try:
             actual_value = finite_number(actual, f"budget_results[{index}].actual")
             if actual_value < 0.0:
                 fail(f"budget_results[{index}].actual must be non-negative")
-            expected_status = (
-                "PASS"
-                if (
-                    actual_value >= threshold
-                    if name == "tool_call_throughput_min"
-                    else actual_value <= threshold
-                )
-                else "FAIL"
+            passes = (
+                actual_value >= threshold
+                if budget["comparison"] == "minimum"
+                else actual_value <= threshold
             )
+            expected_status = "PASS" if passes else "FAIL"
             if status != expected_status:
                 fail(
                     f"budget result {name} status={status} is inconsistent with "
@@ -1446,9 +1519,13 @@ try:
             ci_no_data += int(status == "NO_DATA")
         results_by_name[name] = result
 
-    if set(results_by_name) != set(budgets_by_name):
+    if list(results_by_name) != list(budgets_by_name):
         missing = sorted(set(budgets_by_name) - set(results_by_name))
-        fail(f"budget_results do not cover every budget definition (missing={missing})")
+        unexpected = sorted(set(results_by_name) - set(budgets_by_name))
+        fail(
+            "budget_results must match canonical budget declaration order and membership "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
 
     failure_fingerprints = set()
     for index, failure in enumerate(failures):
@@ -1563,14 +1640,34 @@ PERFORMANCE_DETAIL="${PERFORMANCE_CHECK#*|}"
 case "$PERFORMANCE_STATUS" in
     pass)
         check_pass "performance_claim_readiness" "$PERFORMANCE_DETAIL"
-        if (
-            export PI_PERF_STRICT=1
-            run_cargo_gate test --locked --test perf_budgets \
-                ci_enforced_budgets_fail_on_regression_or_missing_data -- --exact
-        ) >/dev/null 2>&1; then
+        CANONICAL_PERF_TEST="ci_enforced_budgets_fail_on_regression_or_missing_data"
+        CANONICAL_PERF_LIST_OUTPUT=""
+        CANONICAL_PERF_RUN_OUTPUT=""
+        CANONICAL_PERF_LIST_VALID=0
+        CANONICAL_PERF_RUN_VALID=0
+        if CANONICAL_PERF_LIST_OUTPUT=$(
+            CARGO_TERM_COLOR=never run_cargo_gate test --locked --test perf_budgets \
+                "$CANONICAL_PERF_TEST" -- --exact --list --format terse 2>&1
+        ); then
+            if printf '%s\n' "$CANONICAL_PERF_LIST_OUTPUT" \
+                | validate_exact_libtest_output list "$CANONICAL_PERF_TEST"; then
+                CANONICAL_PERF_LIST_VALID=1
+            fi
+        fi
+        if [[ "$CANONICAL_PERF_LIST_VALID" -eq 1 ]] && CANONICAL_PERF_RUN_OUTPUT=$(
+            PI_PERF_STRICT=1 CARGO_TERM_COLOR=never \
+                run_cargo_gate test --locked --test perf_budgets \
+                "$CANONICAL_PERF_TEST" -- --exact --nocapture --test-threads=1 2>&1
+        ); then
+            if printf '%s\n' "$CANONICAL_PERF_RUN_OUTPUT" \
+                | validate_exact_libtest_output run "$CANONICAL_PERF_TEST"; then
+                CANONICAL_PERF_RUN_VALID=1
+            fi
+        fi
+        if [[ "$CANONICAL_PERF_LIST_VALID" -eq 1 && "$CANONICAL_PERF_RUN_VALID" -eq 1 ]]; then
             check_pass "performance_claim_canonical_contract" "Canonical strict perf data readers independently confirm every CI-enforced budget and linked data contract"
         else
-            check_fail "performance_claim_canonical_contract" "Canonical strict perf contract test failed; summary cannot authorize performance claims"
+            check_fail "performance_claim_canonical_contract" "Canonical strict perf contract did not list and execute exactly one non-ignored test successfully; summary cannot authorize performance claims"
         fi
         ;;
     warn)

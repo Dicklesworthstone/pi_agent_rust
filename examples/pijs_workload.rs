@@ -262,7 +262,9 @@ fn run() -> Result<()> {
     let args = Args::parse();
     let build_profile = perf_build::detect_build_profile();
     let current_exe = std::env::current_exe().map_err(|err| {
-        Error::extension(format!("failed to resolve current workload executable: {err}"))
+        Error::extension(format!(
+            "failed to resolve current workload executable: {err}"
+        ))
     })?;
     let current_exe = canonical_executable_path(&current_exe)?;
     let binary_path_profile = perf_build::profile_from_target_path(&current_exe);
@@ -311,8 +313,8 @@ fn run() -> Result<()> {
     let binary_path = current_exe.display().to_string();
     let compiled_features = perf_build::compiled_feature_set();
     let executable_build_profile = binary_path_profile.as_deref().unwrap_or("unknown");
-    let config_hash = perf_build::benchmark_provenance_config_hash(
-        &perf_build::BenchmarkProvenance {
+    let config_hash =
+        perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {
             source_commit,
             source_dirty,
             build_profile: &build_profile,
@@ -328,8 +330,7 @@ fn run() -> Result<()> {
             binary_path: &binary_path,
             binary_sha256: &binary_sha256,
             debug_assertions: cfg!(debug_assertions),
-        },
-    );
+        });
     let timestamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let quickjs_runtime = if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
@@ -588,9 +589,9 @@ mod tests {
 
     use crate::{
         Args, NativeBenchRuntime, REGRESSION_GATE_ITERATIONS, RegressionGateInputs,
-        WorkloadRuntimeEngine, checked_total_calls, is_regression_gate_eligible,
-        is_full_git_sha, run_identity_is_canonical, run_tool_roundtrip_native,
-        run_tool_roundtrip_native_runtime, setup_native_runtime_bench_handle,
+        WorkloadRuntimeEngine, checked_total_calls, is_full_git_sha, is_regression_gate_eligible,
+        run_identity_is_canonical, run_tool_roundtrip_native, run_tool_roundtrip_native_runtime,
+        setup_native_runtime_bench_handle,
     };
 
     #[test]
@@ -708,9 +709,7 @@ mod tests {
     fn release_source_identity_requires_full_git_sha() {
         assert!(is_full_git_sha("0123456789abcdef0123456789abcdef01234567"));
         assert!(!is_full_git_sha("abc123"));
-        assert!(!is_full_git_sha(
-            "0123456789abcdef0123456789abcdef0123456g"
-        ));
+        assert!(!is_full_git_sha("0123456789abcdef0123456789abcdef0123456g"));
     }
 
     #[test]

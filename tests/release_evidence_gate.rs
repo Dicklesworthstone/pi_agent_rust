@@ -12,7 +12,9 @@
 
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -1597,6 +1599,8 @@ fn failure_count_within_release_threshold() {
 }
 
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
+const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
+    "PENDING_CANONICAL_BUDGET_INVENTORY_SHA256";
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
     "generated_at",
@@ -1624,6 +1628,7 @@ const PERF_BUDGET_FIELDS: &[&str] = &[
     "metric",
     "unit",
     "threshold",
+    "comparison",
     "methodology",
     "ci_enforced",
 ];
@@ -1654,6 +1659,7 @@ struct PerformanceBudgetDefinition {
     category: String,
     unit: String,
     threshold: f64,
+    comparison: String,
     ci_enforced: bool,
 }
 
@@ -1751,8 +1757,23 @@ fn perf_source_commit(value: &Value) -> Result<Option<&str>, String> {
 
 fn perf_generated_at(value: &Value) -> Result<DateTime<Utc>, String> {
     let raw = perf_nonempty_string(value, "generated_at")?;
-    if !raw.ends_with('Z') {
-        return Err("generated_at must be canonical UTC RFC3339 ending in Z".to_string());
+    let bytes = raw.as_bytes();
+    let millisecond_utc_shape = bytes.len() == 24
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[10] == b'T'
+        && bytes[13] == b':'
+        && bytes[16] == b':'
+        && bytes[19] == b'.'
+        && bytes[23] == b'Z'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 4 | 7 | 10 | 13 | 16 | 19 | 23) || byte.is_ascii_digit());
+    if !millisecond_utc_shape {
+        return Err(
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
+        );
     }
     let parsed = DateTime::parse_from_rfc3339(raw)
         .map_err(|err| format!("generated_at is not valid RFC3339: {err}"))?;
@@ -1760,14 +1781,80 @@ fn perf_generated_at(value: &Value) -> Result<DateTime<Utc>, String> {
         return Err("generated_at must use UTC".to_string());
     }
     let utc = parsed.with_timezone(&Utc);
-    if utc.to_rfc3339_opts(SecondsFormat::AutoSi, true) != raw {
-        return Err("generated_at is not in canonical UTC RFC3339 form".to_string());
+    if utc.to_rfc3339_opts(SecondsFormat::Millis, true) != raw {
+        return Err(
+            "generated_at must use canonical millisecond-precision UTC RFC3339".to_string(),
+        );
     }
     Ok(utc)
 }
 
 fn perf_usize_as_u64(value: usize, label: &str) -> Result<u64, String> {
     u64::try_from(value).map_err(|_| format!("derived {label} exceeds u64"))
+}
+
+fn perf_budget_inventory_sha256(budgets: &[Value]) -> Result<String, String> {
+    let mut canonical = String::from("[");
+    for (index, budget) in budgets.iter().enumerate() {
+        let label = format!("budgets[{index}]");
+        let object = budget
+            .as_object()
+            .ok_or_else(|| format!("{label} must be an object"))?;
+        if index != 0 {
+            canonical.push(',');
+        }
+        let name = serde_json::to_string(perf_nonempty_string(
+            &object["name"],
+            &format!("{label}.name"),
+        )?)
+        .map_err(|err| format!("failed to serialize {label}.name: {err}"))?;
+        let category = serde_json::to_string(perf_nonempty_string(
+            &object["category"],
+            &format!("{label}.category"),
+        )?)
+        .map_err(|err| format!("failed to serialize {label}.category: {err}"))?;
+        let metric = serde_json::to_string(perf_nonempty_string(
+            &object["metric"],
+            &format!("{label}.metric"),
+        )?)
+        .map_err(|err| format!("failed to serialize {label}.metric: {err}"))?;
+        let unit = serde_json::to_string(perf_nonempty_string(
+            &object["unit"],
+            &format!("{label}.unit"),
+        )?)
+        .map_err(|err| format!("failed to serialize {label}.unit: {err}"))?;
+        let threshold = perf_finite_number(
+            &object["threshold"],
+            &format!("{label}.threshold"),
+            true,
+        )?;
+        let rounded_threshold = (threshold * 1_000_000.0).round() / 1_000_000.0;
+        if threshold.total_cmp(&rounded_threshold).is_ne() {
+            return Err(format!(
+                "{label}.threshold exceeds canonical six-decimal precision"
+            ));
+        }
+        let comparison = serde_json::to_string(perf_nonempty_string(
+            &object["comparison"],
+            &format!("{label}.comparison"),
+        )?)
+        .map_err(|err| format!("failed to serialize {label}.comparison: {err}"))?;
+        let ci_enforced = object["ci_enforced"]
+            .as_bool()
+            .ok_or_else(|| format!("{label}.ci_enforced must be a boolean"))?;
+        let methodology = serde_json::to_string(perf_nonempty_string(
+            &object["methodology"],
+            &format!("{label}.methodology"),
+        )?)
+        .map_err(|err| format!("failed to serialize {label}.methodology: {err}"))?;
+        write!(
+            canonical,
+            "{{\"name\":{name},\"category\":{category},\"metric\":{metric},\"unit\":{unit},\"threshold\":{threshold:.6},\"comparison\":{comparison},\"ci_enforced\":{ci_enforced},\"methodology\":{methodology}}}"
+        )
+        .map_err(|err| format!("failed to serialize canonical budget inventory: {err}"))?;
+    }
+    canonical.push(']');
+    Ok(format!("{:x}", Sha256::digest(canonical.as_bytes())))
 }
 
 fn validate_performance_budget_summary(
@@ -2240,7 +2327,59 @@ fn validate_performance_source_binding(source_commit: &str) -> Result<(), String
 }
 
 fn performance_fixture_timestamp(now: DateTime<Utc>) -> String {
-    now.to_rfc3339_opts(SecondsFormat::Secs, true)
+    now.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+fn exact_libtest_output_proves_one(
+    listing: &str,
+    execution: &str,
+    test_name: &str,
+) -> Result<(), String> {
+    let listed: Vec<_> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(": test"))
+        .collect();
+    let list_summaries: Vec<_> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            let mut parts = line.split_whitespace();
+            matches!(
+                (
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                    parts.next(),
+                ),
+                (Some(_), Some("test," | "tests,"), Some(_), Some("benchmark" | "benchmarks"), None)
+            )
+        })
+        .collect();
+    let expected_listing = format!("{test_name}: test");
+    if listed != [expected_listing.as_str()] || list_summaries != ["1 test, 0 benchmarks"] {
+        return Err("exact filter did not list exactly one test".to_string());
+    }
+
+    let running: Vec<_> = execution
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("running ") && line.ends_with(" test"))
+        .collect();
+    let results: Vec<_> = execution
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("test result:"))
+        .collect();
+    if running != ["running 1 test"]
+        || results.len() != 1
+        || !results[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; ")
+        || !results[0].contains(" filtered out; finished in ")
+    {
+        return Err("exact filter did not execute one non-ignored passing test".to_string());
+    }
+    Ok(())
 }
 
 fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
@@ -2424,6 +2563,40 @@ fn performance_claim_ready_requires_source_binding_and_fresh_timestamp() {
     let future_time = now + Duration::minutes(6);
     let future = claim_ready_performance_summary_fixture(future_time);
     assert!(validate_performance_budget_summary(&future, now, Duration::hours(168), true).is_err());
+
+    let mut noncanonical_fraction = claim_ready_performance_summary_fixture(now);
+    noncanonical_fraction["generated_at"] = json!("2026-08-05T12:34:56.1Z");
+    assert!(
+        validate_performance_budget_summary(
+            &noncanonical_fraction,
+            now,
+            Duration::hours(168),
+            true,
+        )
+        .is_err(),
+        "the Rust contract must reject fractional precision accepted by neither the v2 producer nor shell consumer"
+    );
+}
+
+#[test]
+fn canonical_perf_test_proof_rejects_zero_match_and_ignored_runs() {
+    let name = "ci_enforced_budgets_fail_on_regression_or_missing_data";
+    let one_listing = format!("{name}: test\n\n1 test, 0 benchmarks\n");
+    let one_execution = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.01s\n";
+    assert!(exact_libtest_output_proves_one(&one_listing, one_execution, name).is_ok());
+
+    let zero_listing = "0 tests, 0 benchmarks\n";
+    let zero_execution = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.00s\n";
+    assert!(
+        exact_libtest_output_proves_one(zero_listing, zero_execution, name).is_err(),
+        "a zero-match Cargo test filter must not authorize performance claims"
+    );
+
+    let ignored_execution = "running 1 test\ntest result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 42 filtered out; finished in 0.00s\n";
+    assert!(
+        exact_libtest_output_proves_one(&one_listing, ignored_execution, name).is_err(),
+        "an ignored canonical test must not authorize performance claims"
+    );
 }
 
 #[test]

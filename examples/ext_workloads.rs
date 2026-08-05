@@ -445,7 +445,7 @@ fn run() -> Result<()> {
     let build_profile = perf_build::detect_build_profile();
     let current_exe = std::env::current_exe()
         .ok()
-        .map(|path| fs::canonicalize(&path).unwrap_or(path));
+        .and_then(|path| fs::canonicalize(path).ok());
     let executable_build_profile = current_exe
         .as_deref()
         .and_then(perf_build::profile_from_target_path);
@@ -453,8 +453,10 @@ fn run() -> Result<()> {
     let build_fingerprint_verified = perf_build::has_canonical_perf_build_fingerprint();
     let build_profile_verified = executable_profile_verified && build_fingerprint_verified;
     let binary_path = current_exe
-        .as_ref()
-        .map_or_else(|| "unknown".to_string(), |path| path.display().to_string());
+        .as_deref()
+        .and_then(Path::to_str)
+        .unwrap_or("unknown")
+        .to_string();
     let binary_sha256 = current_exe
         .as_deref()
         .and_then(|path| perf_build::sha256_file(path).ok())
@@ -464,6 +466,7 @@ fn run() -> Result<()> {
     let compiled_features = perf_build::compiled_feature_set();
     let provenance_identity_verified = is_full_git_sha(source_commit)
         && !source_dirty
+        && binary_path != "unknown"
         && is_lower_hex_sha256(&binary_sha256)
         && !compiled_features.is_empty()
         && compiled_features.windows(2).all(|pair| pair[0] < pair[1]);
@@ -2078,8 +2081,8 @@ fn parse_profile_record(record: &Value) -> Option<ParsedProfileRecord> {
         });
     let config_hash_verified = config_hash == expected_config_hash;
     let source_identity_verified = is_full_git_sha(&source_commit) && !source_dirty;
-    let compiled_features_canonical = !compiled_features.is_empty()
-        && compiled_features.windows(2).all(|pair| pair[0] < pair[1]);
+    let compiled_features_canonical =
+        !compiled_features.is_empty() && compiled_features.windows(2).all(|pair| pair[0] < pair[1]);
     let exact_measurement_contract = measurement_method == "wall_clock_observation"
         && measurement_boundary == MEASUREMENT_BOUNDARY
         && measurement_contract_version == MEASUREMENT_CONTRACT_VERSION;
@@ -4531,12 +4534,15 @@ mod tests {
     #[test]
     fn profile_record_eligibility_rejects_forged_contract_and_build_claims() {
         assert!(is_full_git_sha(TEST_SOURCE_COMMIT));
-        assert!(!is_full_git_sha(
-            "0123456789ABCDEF0123456789ABCDEF01234567"
+        assert!(!is_full_git_sha("0123456789ABCDEF0123456789ABCDEF01234567"));
+        assert!(!is_full_git_sha("0000000000000000000000000000000000000000"));
+        assert!(is_lower_hex_sha256(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         ));
-        assert!(!is_full_git_sha(
-            "0000000000000000000000000000000000000000"
+        assert!(!is_lower_hex_sha256(
+            "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
         ));
+        assert!(!is_lower_hex_sha256(&"0".repeat(64)));
 
         let binary_path = "/tmp/repo/target/perf/examples/ext_workloads";
         let binary_sha256 = "b".repeat(64);

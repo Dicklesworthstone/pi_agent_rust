@@ -133,6 +133,51 @@ fn is_lower_hex_sha256(value: &str) -> bool {
         && !value.bytes().all(|byte| byte == b'0')
 }
 
+fn compiled_features_are_canonical(value: Option<&Value>) -> bool {
+    let Some(features) = value.and_then(Value::as_array) else {
+        return false;
+    };
+    let Some(features) = features
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>()
+    else {
+        return false;
+    };
+    !features.is_empty() && features.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+fn provenance_identity_is_verified(env: &Map<String, Value>) -> bool {
+    env.get("source_commit")
+        .and_then(Value::as_str)
+        .is_some_and(is_full_git_sha)
+        && env.get("source_dirty").and_then(Value::as_bool) == Some(false)
+        && compiled_features_are_canonical(env.get("compiled_features"))
+        && env
+            .get("binary_path")
+            .and_then(Value::as_str)
+            .is_some_and(|path| path != "unknown")
+        && env
+            .get("binary_sha256")
+            .and_then(Value::as_str)
+            .is_some_and(is_lower_hex_sha256)
+}
+
+static CURRENT_EXECUTABLE_IDENTITY: OnceLock<std::result::Result<(PathBuf, String), String>> =
+    OnceLock::new();
+
+fn current_executable_identity() -> &'static std::result::Result<(PathBuf, String), String> {
+    CURRENT_EXECUTABLE_IDENTITY.get_or_init(|| {
+        let path = std::env::current_exe()
+            .map_err(|error| format!("resolve benchmark executable: {error}"))?;
+        let path = fs::canonicalize(path)
+            .map_err(|error| format!("canonicalize benchmark executable: {error}"))?;
+        let sha256 = perf_build::sha256_file(&path)
+            .map_err(|error| format!("hash benchmark executable: {error}"))?;
+        Ok((path, sha256))
+    })
+}
+
 fn env_fingerprint() -> Value {
     let mut system = System::new();
     system.refresh_cpu_all();
@@ -151,21 +196,19 @@ fn env_fingerprint() -> Value {
     let source_commit = option_env!("VERGEN_GIT_SHA").unwrap_or("unknown");
     let source_dirty = option_env!("VERGEN_GIT_DIRTY") != Some("false");
     let build_profile = perf_build::detect_build_profile();
-    let current_exe = std::env::current_exe()
-        .ok()
-        .map(|path| fs::canonicalize(&path).unwrap_or(path));
+    let executable_identity = current_executable_identity().as_ref().ok();
+    let current_exe = executable_identity.map(|(path, _)| path.as_path());
     let executable_build_profile = current_exe
-        .as_deref()
         .and_then(perf_build::profile_from_target_path);
     let executable_profile_verified = executable_build_profile.as_deref() == Some("perf");
     let build_fingerprint_verified = perf_build::has_canonical_perf_build_fingerprint();
     let build_profile_verified = executable_profile_verified && build_fingerprint_verified;
     let binary_path = current_exe
-        .as_ref()
-        .map_or_else(|| "unknown".to_string(), |path| path.display().to_string());
-    let binary_sha256 = current_exe
-        .as_deref()
-        .and_then(|path| perf_build::sha256_file(path).ok())
+        .and_then(Path::to_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let binary_sha256 = executable_identity
+        .map(|(_, sha256)| sha256.clone())
         .unwrap_or_else(|| "unknown".to_string());
     let compiled_features = perf_build::compiled_feature_set();
     let config_hash =
@@ -802,28 +845,7 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
         .get("build_profile_verified")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let source_identity_verified = env
-        .get("source_commit")
-        .and_then(Value::as_str)
-        .is_some_and(is_full_git_sha)
-        && env.get("source_dirty").and_then(Value::as_bool) == Some(false);
-    let compiled_features_verified = env
-        .get("compiled_features")
-        .and_then(Value::as_array)
-        .is_some_and(|features| {
-            !features.is_empty()
-                && features.iter().all(Value::is_string)
-                && features.windows(2).all(|pair| {
-                    pair[0].as_str().expect("checked string")
-                        < pair[1].as_str().expect("checked string")
-                })
-        });
-    let provenance_identity_verified = source_identity_verified
-        && compiled_features_verified
-        && env
-            .get("binary_sha256")
-            .and_then(Value::as_str)
-            .is_some_and(is_lower_hex_sha256);
+    let provenance_identity_verified = env.as_object().is_some_and(provenance_identity_is_verified);
     let measured_evidence = classify_regression_evidence(
         build_profile,
         build_profile_verified,
@@ -1337,15 +1359,16 @@ fn regression_eligibility_rejects_an_unverified_perf_label() {
     // no test body in this benchmark binary overlaps the timed workload.
     let _records = shared_scenario_records();
 
-    assert!(is_full_git_sha(
-        "0123456789abcdef0123456789abcdef01234567"
+    assert!(is_full_git_sha("0123456789abcdef0123456789abcdef01234567"));
+    assert!(!is_full_git_sha("0123456789ABCDEF0123456789ABCDEF01234567"));
+    assert!(!is_full_git_sha("0000000000000000000000000000000000000000"));
+    assert!(is_lower_hex_sha256(
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
     ));
-    assert!(!is_full_git_sha(
-        "0123456789ABCDEF0123456789ABCDEF01234567"
+    assert!(!is_lower_hex_sha256(
+        "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"
     ));
-    assert!(!is_full_git_sha(
-        "0000000000000000000000000000000000000000"
-    ));
+    assert!(!is_lower_hex_sha256(&"0".repeat(64)));
 
     assert_eq!(
         classify_regression_evidence("perf", false, true, false, false),
@@ -1360,7 +1383,7 @@ fn regression_eligibility_rejects_an_unverified_perf_label() {
             confidence: CONFIDENCE_MEDIUM,
             eligible: false,
         },
-        "dirty or unidentified source must not become gate-eligible"
+        "incomplete source, feature, or executable identity must not become gate-eligible"
     );
     assert_eq!(
         classify_regression_evidence("perf", true, true, false, false),
@@ -1484,14 +1507,7 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
             .and_then(|value| value.get("build_profile_verified"))
             .and_then(Value::as_bool)
             == Some(true)
-        && env
-            .and_then(|value| value.get("source_commit"))
-            .and_then(Value::as_str)
-            .is_some_and(is_full_git_sha)
-        && env
-            .and_then(|value| value.get("source_dirty"))
-            .and_then(Value::as_bool)
-            == Some(false);
+        && env.is_some_and(provenance_identity_is_verified);
     let (
         expected_evidence_class,
         expected_confidence,
@@ -1658,9 +1674,16 @@ fn assert_env_fingerprint_fields(obj: &Map<String, Value>) {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
         "env.binary_sha256 must be a lowercase SHA-256 digest"
     );
+    let (observed_path, observed_sha256) = current_executable_identity()
+        .as_ref()
+        .expect("resolve and hash benchmark test executable");
     assert_eq!(
-        perf_build::sha256_file(Path::new(binary_path)).expect("hash benchmark test executable"),
-        binary_sha256,
+        Path::new(binary_path),
+        observed_path,
+        "env.binary_path must identify the executable that produced the evidence"
+    );
+    assert_eq!(
+        binary_sha256, observed_sha256,
         "env.binary_sha256 must identify the executable that produced the evidence"
     );
     let executable_profile_matches = env.get("executable_build_profile").and_then(Value::as_str)
@@ -1711,8 +1734,8 @@ fn assert_env_fingerprint_fields(obj: &Map<String, Value>) {
         })
         .collect::<Vec<_>>();
     assert!(
-        compiled_features.windows(2).all(|pair| pair[0] < pair[1]),
-        "env.compiled_features must be sorted and deduplicated"
+        !compiled_features.is_empty() && compiled_features.windows(2).all(|pair| pair[0] < pair[1]),
+        "env.compiled_features must be non-empty, sorted, and deduplicated"
     );
     let expected_config_hash =
         perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {

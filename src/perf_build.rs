@@ -30,14 +30,13 @@ pub const COMPILED_DEBUG: &str = env!("PI_BUILD_DEBUG");
 pub const COMPILED_FEATURES_CSV: &str = env!("PI_BUILD_FEATURES");
 
 /// Exact package feature set for the canonical shipping/system PiJS perf lane.
-pub const CANONICAL_PIJS_PERF_FEATURES: &[&str] =
-    &[
-        "clipboard",
-        "image",
-        "image-resize",
-        "sqlite-sessions",
-        "wasm-host",
-    ];
+pub const CANONICAL_PIJS_PERF_FEATURES: &[&str] = &[
+    "clipboard",
+    "image",
+    "image-resize",
+    "sqlite-sessions",
+    "wasm-host",
+];
 
 /// Versioned name for the authoritative Cargo build fingerprint contract.
 pub const BUILD_FINGERPRINT_CONTRACT: &str = "cargo_build_fingerprint.v1";
@@ -330,10 +329,10 @@ pub fn profile_from_target_path(path: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        AllocatorKind, BENCH_ALLOCATOR_ENV, detect_build_profile_from,
-        BenchmarkProvenance, benchmark_provenance_config_hash,
-        matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
-        profile_from_target_path, resolve_bench_allocator_from,
+        AllocatorKind, BENCH_ALLOCATOR_ENV, BenchmarkProvenance, benchmark_provenance_config_hash,
+        detect_build_profile_from, matches_canonical_perf_build_fingerprint,
+        matches_canonical_pijs_perf_features, profile_from_target_path,
+        resolve_bench_allocator_from,
     };
     use std::path::Path;
 
@@ -420,12 +419,7 @@ mod tests {
         ];
         assert!(matches_canonical_pijs_perf_features(&canonical));
 
-        let missing_implicit_image = [
-            "clipboard",
-            "image-resize",
-            "sqlite-sessions",
-            "wasm-host",
-        ];
+        let missing_implicit_image = ["clipboard", "image-resize", "sqlite-sessions", "wasm-host"];
         assert!(!matches_canonical_pijs_perf_features(
             &missing_implicit_image
         ));
@@ -448,8 +442,7 @@ mod tests {
             compiled_debug: "true",
             compiled_features: &features,
             binary_path: "/tmp/pi-build/perf/examples/pijs_workload",
-            binary_sha256:
-                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            binary_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             debug_assertions: false,
         };
         let first = benchmark_provenance_config_hash(&canonical);
