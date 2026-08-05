@@ -15,7 +15,8 @@
 )]
 
 use pi::perf_build::{
-    BUILD_FINGERPRINT_CONTRACT, BenchmarkProvenance, CANONICAL_PIJS_PERF_FEATURES,
+    BUILD_FINGERPRINT_CONTRACT, BenchmarkBuildVerification, BenchmarkProvenance,
+    CANONICAL_PIJS_PERF_FEATURES,
     benchmark_provenance_config_hash, matches_canonical_perf_build_fingerprint,
     profile_from_target_path, sha256_file,
 };
@@ -1445,9 +1446,11 @@ fn validate_eligible_build_provenance(record: &Value) -> Result<(), String> {
         source_dirty: false,
         build_profile: "perf",
         executable_build_profile: "perf",
-        executable_profile_verified: true,
-        build_fingerprint_verified: true,
-        build_profile_verified: true,
+        verification: BenchmarkBuildVerification {
+            executable_profile: true,
+            build_fingerprint: true,
+            build_profile: true,
+        },
         build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
         compiled_profile_family: "release",
         compiled_opt_level: "3",
@@ -3912,9 +3915,11 @@ fn regression_gate_protocol_fixture(root: &Path) -> Value {
         source_dirty: false,
         build_profile: "perf",
         executable_build_profile: "perf",
-        executable_profile_verified: true,
-        build_fingerprint_verified: true,
-        build_profile_verified: true,
+        verification: BenchmarkBuildVerification {
+            executable_profile: true,
+            build_fingerprint: true,
+            build_profile: true,
+        },
         build_fingerprint_contract: BUILD_FINGERPRINT_CONTRACT,
         compiled_profile_family: "release",
         compiled_opt_level: "3",

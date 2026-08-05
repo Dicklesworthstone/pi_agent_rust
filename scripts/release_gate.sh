@@ -1385,12 +1385,17 @@ try:
         fail("generated_at must use UTC")
     if generated_at.isoformat(timespec="milliseconds").replace("+00:00", "Z") != generated_at_raw:
         fail("generated_at must use canonical millisecond-precision UTC RFC3339")
+    now = datetime.now(timezone.utc)
+    if generated_at > now + timedelta(minutes=5):
+        fail("performance summary timestamp is more than five minutes in the future")
 
     source_commit = data["source_commit"]
     if source_commit is not None and (
         not isinstance(source_commit, str) or OBJECT_ID_RE.fullmatch(source_commit) is None
     ):
         fail("source_commit must be null or a canonical full lowercase Git object ID")
+    if source_commit is not None:
+        verify_claim_source_binding(source_commit)
     run_id = nullable_lineage(data["run_id"], "run_id")
     correlation_id = nullable_lineage(data["correlation_id"], "correlation_id")
     if run_id is not None and correlation_id is not None and run_id != correlation_id:
@@ -1604,12 +1609,8 @@ try:
         fail(f"claim_readiness.performance_claims_authorized must be {claim_ready}")
 
     if claim_ready:
-        now = datetime.now(timezone.utc)
-        if generated_at > now + timedelta(minutes=5):
-            fail("performance summary timestamp is more than five minutes in the future")
         if now - generated_at > maximum_age:
             fail(f"performance summary is stale ({now - generated_at} old; maximum {maximum_age})")
-        verify_claim_source_binding(source_commit)
         finish(
             "pass",
             f"performance claims authorized: strict v2 evidence source={source_commit} "

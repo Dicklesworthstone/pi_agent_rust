@@ -13,8 +13,8 @@
 )]
 
 use pi::perf_build::{
-    BINARY_SIZE_RELEASE_BUDGET_MB, BUILD_FINGERPRINT_CONTRACT, BenchmarkProvenance,
-    CANONICAL_PIJS_PERF_FEATURES, benchmark_provenance_config_hash,
+    BINARY_SIZE_RELEASE_BUDGET_MB, BUILD_FINGERPRINT_CONTRACT, BenchmarkBuildVerification,
+    BenchmarkProvenance, CANONICAL_PIJS_PERF_FEATURES, benchmark_provenance_config_hash,
     matches_canonical_perf_build_fingerprint, matches_canonical_pijs_perf_features,
     profile_from_target_path, sha256_file,
 };

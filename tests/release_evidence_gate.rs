@@ -1873,7 +1873,15 @@ fn validate_performance_budget_summary(
     }
 
     let generated_at = perf_generated_at(&top["generated_at"])?;
+    if generated_at > now + Duration::minutes(5) {
+        return Err(
+            "performance summary timestamp is more than five minutes in the future".to_string(),
+        );
+    }
     let source_commit = perf_source_commit(&top["source_commit"])?;
+    if source_commit.is_some() && !source_binding_valid {
+        return Err("asserted performance source_commit is not bound to release HEAD".to_string());
+    }
     let run_id = perf_nullable_lineage(&top["run_id"], "run_id")?;
     let correlation_id = perf_nullable_lineage(&top["correlation_id"], "correlation_id")?;
     if run_id.is_some() && correlation_id.is_some() && run_id != correlation_id {
@@ -2207,18 +2215,8 @@ fn validate_performance_budget_summary(
     }
 
     if claim_ready {
-        if generated_at > now + Duration::minutes(5) {
-            return Err(
-                "performance summary timestamp is more than five minutes in the future".to_string(),
-            );
-        }
         if now.signed_duration_since(generated_at) > maximum_age {
             return Err("performance summary is too stale to authorize claims".to_string());
-        }
-        if !source_binding_valid {
-            return Err(
-                "claim-ready performance evidence is not bound to the release source".to_string(),
-            );
         }
     }
 
@@ -2527,17 +2525,12 @@ fn claim_ready_performance_summary_fixture(now: DateTime<Utc>) -> Value {
 #[test]
 fn performance_budgets_report_has_exact_v2_contract() {
     let summary = require_json("tests/perf/reports/budget_summary.json");
-    let declared_claim_ready = summary
-        .pointer("/claim_readiness/status")
+    let source_binding_valid = if let Some(source_commit) = summary
+        .get("source_commit")
         .and_then(Value::as_str)
-        == Some("claim_ready");
-    let source_binding_valid = if declared_claim_ready {
-        let source_commit = summary
-            .get("source_commit")
-            .and_then(Value::as_str)
-            .expect("claim-ready summary must declare source_commit");
+    {
         validate_performance_source_binding(source_commit)
-            .unwrap_or_else(|err| panic!("invalid claim-ready source binding: {err}"));
+            .unwrap_or_else(|err| panic!("invalid asserted performance source binding: {err}"));
         true
     } else {
         false
@@ -2569,6 +2562,32 @@ fn performance_contract_accepts_coherent_blocked_no_data() {
     )
     .expect("coherent blocked evidence must remain admissible for a no-claims release");
     assert!(!validated.claim_ready);
+
+    let mut forged_source = blocked_performance_summary_fixture(now);
+    forged_source["source_commit"] = Value::String("a".repeat(40));
+    forged_source["claim_readiness"]["blocking_reason_codes"] = json!([
+        "ci_budget_data_missing",
+        "correlation_id_missing",
+        "data_contract_failure",
+        "run_id_missing",
+        "strict_mode_disabled"
+    ]);
+    assert!(
+        validate_performance_budget_summary(
+            &forged_source,
+            now,
+            Duration::hours(168),
+            false,
+        )
+        .is_err(),
+        "a blocked artifact may omit source binding, but must not assert a fabricated binding"
+    );
+
+    let future = blocked_performance_summary_fixture(now + Duration::minutes(6));
+    assert!(
+        validate_performance_budget_summary(&future, now, Duration::hours(168), false).is_err(),
+        "an impossible future timestamp is malformed even when claims remain blocked"
+    );
 }
 
 #[test]
