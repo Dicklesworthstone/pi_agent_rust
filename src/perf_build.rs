@@ -41,6 +41,14 @@ pub const CANONICAL_PIJS_PERF_FEATURES: &[&str] = &[
 /// Versioned name for the authoritative Cargo build fingerprint contract.
 pub const BUILD_FINGERPRINT_CONTRACT: &str = "cargo_build_fingerprint.v1";
 
+/// Independent build assertions carried by benchmark provenance.
+#[derive(Debug, Clone, Copy)]
+pub struct BenchmarkBuildVerification {
+    pub executable_profile: bool,
+    pub build_fingerprint: bool,
+    pub build_profile: bool,
+}
+
 /// Inputs covered by the benchmark provenance configuration hash.
 #[derive(Debug, Clone, Copy)]
 pub struct BenchmarkProvenance<'a> {
@@ -48,9 +56,7 @@ pub struct BenchmarkProvenance<'a> {
     pub source_dirty: bool,
     pub build_profile: &'a str,
     pub executable_build_profile: &'a str,
-    pub executable_profile_verified: bool,
-    pub build_fingerprint_verified: bool,
-    pub build_profile_verified: bool,
+    pub verification: BenchmarkBuildVerification,
     pub build_fingerprint_contract: &'a str,
     pub compiled_profile_family: &'a str,
     pub compiled_opt_level: &'a str,
@@ -221,9 +227,10 @@ pub fn compiled_feature_set() -> Vec<&'static str> {
 }
 
 /// Returns whether Cargo's authoritative build settings match the custom
-/// `perf` profile fingerprint. The profile's directory name is deliberately
-/// not trusted because Cargo reports release-inheriting custom profiles through
-/// `PROFILE=release`.
+/// `perf` profile fingerprint.
+///
+/// The profile's directory name is deliberately not trusted because Cargo
+/// reports release-inheriting custom profiles through `PROFILE=release`.
 #[must_use]
 pub fn has_canonical_perf_build_fingerprint() -> bool {
     matches_canonical_perf_build_fingerprint(
@@ -252,8 +259,10 @@ pub fn has_canonical_pijs_perf_features() -> bool {
 }
 
 /// Checks an injected sorted feature set against the canonical shipping/system
-/// PiJS lane. `image-resize` also enables the package's implicit `image`
-/// feature, so both are intentionally present.
+/// PiJS lane.
+///
+/// `image-resize` also enables the package's implicit `image` feature, so both
+/// are intentionally present.
 #[must_use]
 pub fn matches_canonical_pijs_perf_features(features: &[&str]) -> bool {
     features == CANONICAL_PIJS_PERF_FEATURES
@@ -264,7 +273,7 @@ pub fn matches_canonical_pijs_perf_features(features: &[&str]) -> bool {
 pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = [0_u8; 8 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
         if read == 0 {
@@ -284,16 +293,16 @@ pub fn benchmark_provenance_config_hash(provenance: &BenchmarkProvenance<'_>) ->
         "binary_path": provenance.binary_path,
         "binary_sha256": provenance.binary_sha256,
         "build_fingerprint_contract": provenance.build_fingerprint_contract,
-        "build_fingerprint_verified": provenance.build_fingerprint_verified,
+        "build_fingerprint_verified": provenance.verification.build_fingerprint,
         "build_profile": provenance.build_profile,
-        "build_profile_verified": provenance.build_profile_verified,
+        "build_profile_verified": provenance.verification.build_profile,
         "compiled_debug": provenance.compiled_debug,
         "compiled_features": provenance.compiled_features,
         "compiled_opt_level": provenance.compiled_opt_level,
         "compiled_profile_family": provenance.compiled_profile_family,
         "debug_assertions": provenance.debug_assertions,
         "executable_build_profile": provenance.executable_build_profile,
-        "executable_profile_verified": provenance.executable_profile_verified,
+        "executable_profile_verified": provenance.verification.executable_profile,
         "source_commit": provenance.source_commit,
         "source_dirty": provenance.source_dirty,
     });
