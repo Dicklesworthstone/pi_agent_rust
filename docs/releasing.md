@@ -519,9 +519,10 @@ proof is not proof of an empty bypass list.
    preserved v0.2.0 lane is intentionally narrower than ordinary DSR: the
    launcher accepts one exact argument vector, rejects `--no-sync` and every
    resume/release/fallback/cleanup override, snapshots the frozen source into
-   fresh per-run paths on the configured build hosts, runs DSR's native-host
-   build mode, and produces raw executables only. Do not invoke the private
-   `dsr` entrypoint directly, do not substitute canonical `dsr build`, and do
+   fresh per-run paths on the configured build hosts, runs DSR's build mode
+   labeled `native`, and produces raw executables only. That DSR label describes
+   the lane rather than proving hardware-native execution. Do not invoke the
+   private `dsr` entrypoint directly, do not substitute canonical `dsr build`, and do
    not treat `--only-native` as proof that every target ran on matching CPU
    hardware: the audited configuration's Linux ARM64 leg is a cross-target
    build on its configured Linux host.
@@ -673,9 +674,9 @@ proof is not proof of an empty bypass list.
    ```
 
    The operator-retained aggregate manifest proves the source/tag binding,
-   exact 5/5 target set, DSR's recorded `method = native` lane label, raw byte digests/sizes,
-   build-influence environment receipts, per-run isolated source roots, and
-   executable format/architecture checks. It does **not** contain `rustc -Vv`
+   exact 5/5 target set, DSR's recorded `method = native` lane label, raw byte
+   digests/sizes, build-influence environment receipts, per-run isolated source
+   roots, and executable format/architecture checks. It does **not** contain `rustc -Vv`
    compiler identity and does not prove that each binary has already executed
    successfully on its target OS. Do not manufacture either claim in the
    public manifests. In particular, DSR's `native` method value does not prove

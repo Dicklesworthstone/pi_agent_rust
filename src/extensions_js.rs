@@ -14391,7 +14391,7 @@ export default { parse, stringify, decode, encode, escape, unescape };
     // node:constants — compatibility map for libraries probing process constants
     modules.insert(
         "node:constants".to_string(),
-        r"
+        compressed_js_literal!(r"
 const _constants = {
   EOL: '\n',
   F_OK: 0,
@@ -14414,7 +14414,7 @@ const constants = new Proxy(_constants, {
 
 export default constants;
 export { constants };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14422,7 +14422,7 @@ export { constants };
     // node:tty — terminal capability probes
     modules.insert(
         "node:tty".to_string(),
-        r"
+        compressed_js_literal!(r"
 import EventEmitter from 'node:events';
 
 export function isatty(_fd) { return false; }
@@ -14450,7 +14450,7 @@ export class WriteStream extends EventEmitter {
 }
 
 export default { isatty, ReadStream, WriteStream };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14458,7 +14458,7 @@ export default { isatty, ReadStream, WriteStream };
     // node:tls — secure socket APIs are intentionally unavailable in PiJS
     modules.insert(
         "node:tls".to_string(),
-        r"
+        compressed_js_literal!(r"
 import EventEmitter from 'node:events';
 
 export const DEFAULT_MIN_VERSION = 'TLSv1.2';
@@ -14481,7 +14481,7 @@ export function createServer(_options, _secureConnectionListener) {
 }
 
 export default { connect, createServer, TLSSocket, DEFAULT_MIN_VERSION, DEFAULT_MAX_VERSION };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14601,7 +14601,7 @@ export default {
     // node:perf_hooks — expose lightweight performance clock surface
     modules.insert(
         "node:perf_hooks".to_string(),
-        r"
+        compressed_js_literal!(r"
 const perf =
   globalThis.performance ||
   {
@@ -14624,7 +14624,7 @@ export class PerformanceObserver {
 }
 
 export default { performance, constants, PerformanceObserver };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14632,7 +14632,7 @@ export default { performance, constants, PerformanceObserver };
     // node:vm — disabled in PiJS for safety
     modules.insert(
         "node:vm".to_string(),
-        r"
+        compressed_js_literal!(r"
 function unsupported(name) {
   throw new Error(`node:vm.${name} is not available in PiJS`);
 }
@@ -14647,7 +14647,7 @@ export class Script {
 }
 
 export default { runInContext, runInNewContext, runInThisContext, createContext, Script };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14655,7 +14655,7 @@ export default { runInContext, runInNewContext, runInThisContext, createContext,
     // node:v8 — lightweight serialization fallback used by some libs
     modules.insert(
         "node:v8".to_string(),
-        r"
+        compressed_js_literal!(r"
 function __toBuffer(str) {
   if (typeof Buffer !== 'undefined' && typeof Buffer.from === 'function') {
     return Buffer.from(str, 'utf8');
@@ -14686,7 +14686,7 @@ export function deserialize(value) {
 }
 
 export default { serialize, deserialize };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14759,7 +14759,7 @@ export default p;
     // node:timers — expose timer helpers backed by the PiJS event loop
     modules.insert(
         "node:timers".to_string(),
-        r"
+        compressed_js_literal!(r"
 export const setTimeout = globalThis.setTimeout;
 export const clearTimeout = globalThis.clearTimeout;
 export const setInterval = globalThis.setInterval;
@@ -14777,7 +14777,7 @@ export default {
   clearImmediate,
   queueMicrotask,
 };
-"
+")
         .trim()
         .to_string(),
     );
@@ -14823,7 +14823,7 @@ export default { spawn };
 
     modules.insert(
         "chokidar".to_string(),
-        r"
+        compressed_js_literal!(r"
 function makeWatcher() {
     const w = {
         on(ev, cb) { return w; },
@@ -14837,7 +14837,7 @@ function makeWatcher() {
 }
 export function watch(paths, options) { return makeWatcher(); }
 export default { watch };
-"
+")
         .trim()
         .to_string(),
     );
@@ -15033,7 +15033,7 @@ export function quote(s) { return "'" + (s || '').replace(/'/g, "'\\''") + "'"; 
 
     modules.insert(
         "@marckrenn/pi-sub-shared".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export const PROVIDERS = ["anthropic", "openai", "google", "aws", "azure"];
 export const MODEL_MULTIPLIERS = {};
 const _meta = (name) => ({
@@ -15053,7 +15053,7 @@ export const PROVIDER_DISPLAY_NAMES = Object.fromEntries(
 export function getDefaultCoreSettings() {
     return { providers: {}, behavior: { autoSwitch: false } };
 }
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -15076,7 +15076,7 @@ export default TurndownService;
 
     modules.insert(
         "@xterm/headless".to_string(),
-        r"
+        compressed_js_literal!(r"
 export class Terminal {
     constructor(opts) { this._opts = opts || {}; this.cols = opts?.cols || 80; this.rows = opts?.rows || 24; this.buffer = { active: { cursorX: 0, cursorY: 0, length: 0, getLine: () => null } }; }
     write(data) {}
@@ -15087,14 +15087,14 @@ export class Terminal {
     onLineFeed(cb) { return { dispose() {} }; }
 }
 export default { Terminal };
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@opentelemetry/api".to_string(),
-        r"
+        compressed_js_literal!(r"
 export const SpanStatusCode = { UNSET: 0, OK: 1, ERROR: 2 };
 const noopSpan = {
     setAttribute() { return this; },
@@ -15122,7 +15122,7 @@ export const context = {
     active() { return {}; },
     with(ctx, fn) { return fn(); },
 };
-"
+")
         .trim()
         .to_string(),
     );
@@ -15191,7 +15191,7 @@ export function resourceFromAttributes(attrs) { return new Resource(attrs); }
 
     modules.insert(
         "@opentelemetry/sdk-trace-base".to_string(),
-        r"
+        compressed_js_literal!(r"
 const noopSpan = { setAttribute() { return this; }, end() {}, isRecording() { return false; }, spanContext() { return {}; } };
 export class BasicTracerProvider {
     constructor(opts) { this._opts = opts || {}; }
@@ -15208,14 +15208,14 @@ export class SimpleSpanProcessor {
     forceFlush() { return Promise.resolve(); }
 }
 export class BatchSpanProcessor extends SimpleSpanProcessor {}
-"
+")
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@opentelemetry/semantic-conventions".to_string(),
-        r"
+        compressed_js_literal!(r"
 export const SemanticResourceAttributes = {
     SERVICE_NAME: 'service.name',
     SERVICE_VERSION: 'service.version',
@@ -15223,7 +15223,7 @@ export const SemanticResourceAttributes = {
 };
 export const SEMRESATTRS_SERVICE_NAME = 'service.name';
 export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
-"
+")
         .trim()
         .to_string(),
     );
@@ -15395,7 +15395,7 @@ export default z;
 
     modules.insert(
         "yaml".to_string(),
-        r##"
+        compressed_js_literal!(r##"
 export function parse(input) {
     const text = String(input ?? "").trim();
     if (!text) return {};
@@ -15417,7 +15417,7 @@ export function stringify(value) {
     return lines.length ? `${lines.join("\n")}\n` : "";
 }
 export default { parse, stringify };
-"##
+"##)
         .trim()
         .to_string(),
     );
@@ -15717,7 +15717,7 @@ export default { Command, Option, Argument, program, createCommand };
 
     modules.insert(
         "chalk".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 function chalk(...args) {
   return args.join("");
 }
@@ -15745,7 +15745,7 @@ export class Chalk {
 
 export default chalk;
 export { chalk };
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -15815,7 +15815,7 @@ export default AdmZip;
 
     modules.insert(
         "linkedom".to_string(),
-        r#"
+        compressed_js_literal!(r#"
 export function parseHTML(html) {
     const doc = {
         documentElement: { outerHTML: html || "" },
@@ -15827,7 +15827,7 @@ export function parseHTML(html) {
     };
     return { document: doc, window: { document: doc } };
 }
-"#
+"#)
         .trim()
         .to_string(),
     );
@@ -15854,7 +15854,7 @@ export default { scip };
 
     modules.insert(
         "p-limit".to_string(),
-        r"
+        compressed_js_literal!(r"
 export default function pLimit(concurrency) {
     const queue = [];
     let active = 0;
@@ -15881,7 +15881,7 @@ export default function pLimit(concurrency) {
     });
     return generator;
 }
-"
+")
         .trim()
         .to_string(),
     );
