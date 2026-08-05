@@ -1,10 +1,10 @@
 //! Extension workload harness for deterministic legacy-vs-rust perf baselines.
 //!
-//! This intentionally avoids `JsExtensionRuntimeHandle::start()` (which spawns an OS
-//! thread) so it can run in constrained CI / sandbox environments.
+//! Workloads run through the production extension manager and runtime handle so
+//! they measure the same owner-isolated routing boundary used by the CLI.
 #![forbid(unsafe_code)]
-// QuickJS runtime types are intentionally single-threaded (Rc-based); this binary
-// uses `block_on` and never requires `Send` futures.
+// The driver uses `block_on`; the runtime handle owns its isolated QuickJS
+// worker, so driver futures do not need to be `Send`.
 #![allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -24,19 +24,23 @@ use pi::extension_scoring::{
     InterferenceMatrixCompletenessReport, evaluate_interference_matrix_completeness,
     format_interference_pair_key, parse_interference_pair_key,
 };
-use pi::extensions::JsExtensionLoadSpec;
-use pi::extensions_js::{HostcallKind, PiJsRuntime, PiJsRuntimeConfig};
-use pi::scheduler::{HostcallOutcome, WallClock};
+use pi::extensions::{
+    ExtensionEventName, ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+};
+use pi::extensions_js::PiJsRuntimeConfig;
+use pi::tools::ToolRegistry;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const BENCH_REPORT_TOOL: &str = "__bench_report";
 const BENCH_SCHEMA: &str = "pi.ext.rust_bench.v1";
+const MEASUREMENT_BOUNDARY: &str = "production_extension_manager";
+const MEASUREMENT_CONTRACT_VERSION: &str = "production_extension_manager.v1";
 const HOTSPOT_MATRIX_SCHEMA: &str = "pi.ext.hostcall_hotspot_matrix.v1";
 const VOI_SCHEDULER_SCHEMA: &str = "pi.ext.voi_scheduler.v1";
 const TRACE_EVENT_SCHEMA: &str = "pi.ext.hostcall_trace.v1";
@@ -579,7 +583,10 @@ fn trace_event_for_record(event_type: &str, record: &Value) -> Value {
             "elapsed_ms": record.get("elapsed_ms").cloned().unwrap_or(Value::Null),
             "per_call_us": record.get("per_call_us").cloned().unwrap_or(Value::Null),
             "calls_per_sec": record.get("calls_per_sec").cloned().unwrap_or(Value::Null),
-            "unexpected_hostcalls": record.get("unexpected_hostcalls").cloned().unwrap_or_else(|| json!({})),
+            "unexpected_hostcalls": record.get("unexpected_hostcalls").cloned().unwrap_or(Value::Null),
+            "unexpected_hostcalls_observable": record.get("unexpected_hostcalls_observable").cloned().unwrap_or(Value::Null),
+            "measurement_boundary": record.get("measurement_boundary").cloned().unwrap_or(Value::Null),
+            "measurement_contract_version": record.get("measurement_contract_version").cloned().unwrap_or(Value::Null),
         }),
     )
 }
@@ -1226,167 +1233,26 @@ fn summarize_ms(durations: &[Duration]) -> SummaryMs {
     }
 }
 
-async fn new_runtime(js_cwd: &str) -> Result<PiJsRuntime> {
+struct BenchRuntime {
+    manager: ExtensionManager,
+    runtime: JsExtensionRuntimeHandle,
+}
+
+async fn new_runtime(js_cwd: &str) -> Result<BenchRuntime> {
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], Path::new(js_cwd), None));
     let config = PiJsRuntimeConfig {
         cwd: js_cwd.to_string(),
+        disk_cache_dir: None,
         ..Default::default()
     };
-    PiJsRuntime::with_clock_and_config(WallClock, config).await
+    let runtime = JsExtensionRuntimeHandle::start(config, tools, manager.clone()).await?;
+    manager.set_js_runtime(runtime.clone());
+    Ok(BenchRuntime { manager, runtime })
 }
 
-fn js_literal(value: &impl Serialize) -> Result<String> {
-    serde_json::to_string(value).map_err(|err| Error::Json(Box::new(err)))
-}
-
-struct BenchPumpOutcome {
-    report: Value,
-    unexpected_hostcalls: BTreeMap<String, u64>,
-    elapsed: Duration,
-}
-
-async fn run_bench_js(
-    runtime: &PiJsRuntime,
-    js: &str,
-    budget: Duration,
-) -> Result<BenchPumpOutcome> {
-    let started_at = Instant::now();
-    runtime.eval(js).await?;
-
-    let mut report: Option<Value> = None;
-    let mut unexpected_hostcalls: BTreeMap<String, u64> = BTreeMap::new();
-
-    while started_at.elapsed() < budget {
-        let mut requests = runtime.drain_hostcall_requests();
-        while let Some(req) = requests.pop_front() {
-            let (kind_key, outcome) = match &req.kind {
-                HostcallKind::Tool { name } => {
-                    if name == BENCH_REPORT_TOOL {
-                        report = Some(req.payload.clone());
-                        (
-                            "tool.__bench_report".to_string(),
-                            HostcallOutcome::Success(json!({})),
-                        )
-                    } else {
-                        (
-                            format!("tool.{name}"),
-                            HostcallOutcome::Error {
-                                code: "UNSUPPORTED_TOOL".to_string(),
-                                message: format!(
-                                    "benchmark harness does not implement tool {name}"
-                                ),
-                            },
-                        )
-                    }
-                }
-                HostcallKind::Ui { op } => (
-                    format!("ui.{op}"),
-                    HostcallOutcome::Success(json!({ "ok": true })),
-                ),
-                HostcallKind::Events { op } => (
-                    format!("events.{op}"),
-                    HostcallOutcome::Success(json!({ "ok": true })),
-                ),
-                HostcallKind::Session { op } => (
-                    format!("session.{op}"),
-                    HostcallOutcome::Success(json!({ "ok": true })),
-                ),
-                HostcallKind::Exec { cmd } => (
-                    format!("exec.{cmd}"),
-                    HostcallOutcome::Error {
-                        code: "EXEC_DISABLED".to_string(),
-                        message: "benchmark harness forbids pi.exec".to_string(),
-                    },
-                ),
-                HostcallKind::Http => (
-                    "http".to_string(),
-                    HostcallOutcome::Error {
-                        code: "HTTP_DISABLED".to_string(),
-                        message: "benchmark harness forbids pi.http".to_string(),
-                    },
-                ),
-                HostcallKind::Log => (
-                    "log".to_string(),
-                    HostcallOutcome::Success(json!({ "logged": true })),
-                ),
-            };
-
-            if kind_key != "tool.__bench_report" {
-                *unexpected_hostcalls.entry(kind_key).or_insert(0) += 1;
-            }
-
-            runtime.complete_hostcall(req.call_id, outcome);
-            // Deliver the completion (one macrotask) and any microtasks it triggers.
-            let _ = runtime.tick().await?;
-        }
-
-        // Drain any promise microtasks (even if no macrotasks ran).
-        let _ = runtime.drain_microtasks().await?;
-
-        if let Some(report) = report.take() {
-            let elapsed = started_at.elapsed();
-            return Ok(BenchPumpOutcome {
-                report,
-                unexpected_hostcalls,
-                elapsed,
-            });
-        }
-
-        if runtime.has_pending() {
-            let _ = runtime.tick().await?;
-        }
-    }
-
-    Err(Error::extension(format!(
-        "benchmark timed out after {}ms",
-        budget.as_millis()
-    )))
-}
-
-fn report_ok_or_err(report: &Value) -> Result<()> {
-    let ok = report.get("ok").and_then(Value::as_bool).unwrap_or(false);
-    if ok {
-        return Ok(());
-    }
-    let err = report
-        .get("error")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown js error");
-    Err(Error::extension(format!("js bench failed: {err}")))
-}
-
-async fn load_extension(runtime: &PiJsRuntime, spec: &JsExtensionLoadSpec) -> Result<()> {
-    let ext_id = js_literal(&spec.extension_id)?;
-    let entry = js_literal(&spec.entry_path.display().to_string().replace('\\', "/"))?;
-    let meta = js_literal(&json!({
-        "name": spec.name,
-        "version": spec.version,
-        "apiVersion": spec.api_version,
-    }))?;
-
-    let js = format!(
-        r"
-(async () => {{
-  try {{
-    await __pi_load_extension({ext_id}, {entry}, {meta});
-    await pi.tool({bench_tool}, {{ ok: true }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-",
-        bench_tool = js_literal(&BENCH_REPORT_TOOL)?,
-    );
-
-    let outcome = run_bench_js(runtime, &js, Duration::from_secs(10)).await?;
-    report_ok_or_err(&outcome.report)?;
-    if !outcome.unexpected_hostcalls.is_empty() {
-        return Err(Error::extension(format!(
-            "unexpected hostcalls during extension load: {:?}",
-            outcome.unexpected_hostcalls
-        )));
-    }
-    Ok(())
+async fn load_extension(runtime: &BenchRuntime, spec: &JsExtensionLoadSpec) -> Result<()> {
+    runtime.manager.load_js_extensions(vec![spec.clone()]).await
 }
 
 fn discover_real_corpus_specs(limit: usize) -> Result<Vec<JsExtensionLoadSpec>> {
@@ -1439,6 +1305,11 @@ async fn scenario_load_init_cold(
         let runtime = new_runtime(js_cwd).await?;
         load_extension(&runtime, spec).await?;
         timings.push(start.elapsed());
+        if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+            return Err(Error::extension(
+                "extension workload runtime did not shut down after cold load",
+            ));
+        }
     }
 
     Ok(json!({
@@ -1448,6 +1319,9 @@ async fn scenario_load_init_cold(
         "extension": spec.extension_id,
         "runs": runs,
         "summary": summarize_ms(&timings),
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
     }))
 }
 
@@ -1459,35 +1333,41 @@ async fn scenario_tool_call(
     let runtime = new_runtime(js_cwd).await?;
     load_extension(&runtime, spec).await?;
 
-    let tool_name = js_literal(&"hello")?;
-    let call_id = js_literal(&"bench-call-1")?;
-    let input = js_literal(&json!({"name": "World"}))?;
-    let ctx = js_literal(&json!({"hasUI": false, "cwd": js_cwd}))?;
-    let iterations_js = js_literal(&iterations)?;
-
-    let js = format!(
-        r"
-(async () => {{
-  try {{
-    const N = {iterations};
-    for (let i = 0; i < N; i++) {{
-      await __pi_execute_tool({tool_name}, {call_id}, {input}, {ctx});
-    }}
-    await pi.tool({bench_tool}, {{ ok: true }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-",
-        iterations = iterations_js,
-        bench_tool = js_literal(&BENCH_REPORT_TOOL)?,
-    );
-
-    let outcome = run_bench_js(&runtime, &js, Duration::from_secs(30)).await?;
-    report_ok_or_err(&outcome.report)?;
-
-    let elapsed = outcome.elapsed;
+    let ctx = Arc::new(json!({"hasUI": false, "cwd": js_cwd}));
+    let budget = Duration::from_secs(30);
+    let started_at = Instant::now();
+    for _ in 0..iterations {
+        if started_at.elapsed() >= budget {
+            let _ = runtime.manager.shutdown(Duration::from_secs(5)).await;
+            return Err(Error::extension(format!(
+                "tool-call benchmark timed out after {}ms",
+                budget.as_millis()
+            )));
+        }
+        let remaining_ms = u64::try_from(
+            budget
+                .saturating_sub(started_at.elapsed())
+                .as_millis()
+                .max(1),
+        )
+        .unwrap_or(u64::MAX);
+        let _ = runtime
+            .runtime
+            .execute_tool(
+                "hello".to_string(),
+                "bench-call-1".to_string(),
+                json!({"name": "World"}),
+                Arc::clone(&ctx),
+                remaining_ms,
+            )
+            .await?;
+    }
+    let elapsed = started_at.elapsed();
+    if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+        return Err(Error::extension(
+            "extension workload runtime did not shut down after tool calls",
+        ));
+    }
     let elapsed_us = elapsed.as_secs_f64() * 1_000_000.0;
     let iters_f = f64::from(iterations.max(1));
     let per_call_us = elapsed_us / iters_f;
@@ -1502,7 +1382,11 @@ async fn scenario_tool_call(
         "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
         "per_call_us": per_call_us,
         "calls_per_sec": calls_per_sec,
-        "unexpected_hostcalls": outcome.unexpected_hostcalls,
+        "unexpected_hostcalls": null,
+        "unexpected_hostcalls_observable": false,
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
     }))
 }
 
@@ -1514,34 +1398,39 @@ async fn scenario_event_hook(
     let runtime = new_runtime(js_cwd).await?;
     load_extension(&runtime, spec).await?;
 
-    let event_name = js_literal(&"before_agent_start")?;
-    let event_payload = js_literal(&json!({"systemPrompt": "You are Pi."}))?;
-    let ctx = js_literal(&json!({"hasUI": false, "cwd": js_cwd}))?;
-    let iterations_js = js_literal(&iterations)?;
-
-    let js = format!(
-        r"
-(async () => {{
-  try {{
-    const N = {iterations};
-    for (let i = 0; i < N; i++) {{
-      await __pi_dispatch_extension_event({event_name}, {event_payload}, {ctx});
-    }}
-    await pi.tool({bench_tool}, {{ ok: true }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-",
-        iterations = iterations_js,
-        bench_tool = js_literal(&BENCH_REPORT_TOOL)?,
-    );
-
-    let outcome = run_bench_js(&runtime, &js, Duration::from_secs(30)).await?;
-    report_ok_or_err(&outcome.report)?;
-
-    let elapsed = outcome.elapsed;
+    let event_payload = json!({"systemPrompt": "You are Pi."});
+    let budget = Duration::from_secs(30);
+    let started_at = Instant::now();
+    for _ in 0..iterations {
+        if started_at.elapsed() >= budget {
+            let _ = runtime.manager.shutdown(Duration::from_secs(5)).await;
+            return Err(Error::extension(format!(
+                "event-hook benchmark timed out after {}ms",
+                budget.as_millis()
+            )));
+        }
+        let remaining_ms = u64::try_from(
+            budget
+                .saturating_sub(started_at.elapsed())
+                .as_millis()
+                .max(1),
+        )
+        .unwrap_or(u64::MAX);
+        let _ = runtime
+            .manager
+            .dispatch_event_with_response(
+                ExtensionEventName::BeforeAgentStart,
+                Some(event_payload.clone()),
+                remaining_ms,
+            )
+            .await?;
+    }
+    let elapsed = started_at.elapsed();
+    if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+        return Err(Error::extension(
+            "extension workload runtime did not shut down after event dispatch",
+        ));
+    }
     let elapsed_us = elapsed.as_secs_f64() * 1_000_000.0;
     let iters_f = f64::from(iterations.max(1));
     let per_call_us = elapsed_us / iters_f;
@@ -1556,7 +1445,11 @@ async fn scenario_event_hook(
         "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
         "per_call_us": per_call_us,
         "calls_per_sec": calls_per_sec,
-        "unexpected_hostcalls": outcome.unexpected_hostcalls,
+        "unexpected_hostcalls": null,
+        "unexpected_hostcalls_observable": false,
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
     }))
 }
 
@@ -1566,49 +1459,50 @@ async fn scenario_long_session_real_corpus(
     iterations: u32,
 ) -> Result<Value> {
     let runtime = new_runtime(js_cwd).await?;
-    let mut loaded_extension_ids = Vec::new();
-    for spec in specs {
-        load_extension(&runtime, spec).await?;
-        loaded_extension_ids.push(spec.extension_id.clone());
-    }
+    runtime.manager.load_js_extensions(specs.to_vec()).await?;
+    let loaded_extension_ids = specs
+        .iter()
+        .map(|spec| spec.extension_id.clone())
+        .collect::<Vec<_>>();
 
-    let event_name = js_literal(&"before_agent_start")?;
-    let event_payload = js_literal(&json!({
+    let event_payload = json!({
         "systemPrompt": "You are Pi.",
         "mode": "long-session",
-    }))?;
-    let ctx = js_literal(&json!({"hasUI": false, "cwd": js_cwd}))?;
-    let iterations_js = js_literal(&iterations)?;
-
-    let js = format!(
-        r#"
-(async () => {{
-  try {{
-    const N = {iterations};
-    for (let i = 0; i < N; i++) {{
-      await __pi_dispatch_extension_event({event_name}, {event_payload}, {ctx});
-    }}
-    await pi.tool({bench_tool}, {{
-      ok: true,
-      loaded_extensions: {loaded_count},
-      workload: "long_session_real_corpus"
-    }});
-  }} catch (e) {{
-    const msg = (e && e.message) ? String(e.message) : String(e);
-    await pi.tool({bench_tool}, {{ ok: false, error: msg }});
-  }}
-}})();
-"#,
-        iterations = iterations_js,
-        bench_tool = js_literal(&BENCH_REPORT_TOOL)?,
-        loaded_count = loaded_extension_ids.len(),
-    );
+    });
 
     let budget_secs = u64::from(iterations).saturating_div(200).clamp(30, 600);
-    let outcome = run_bench_js(&runtime, &js, Duration::from_secs(budget_secs)).await?;
-    report_ok_or_err(&outcome.report)?;
-
-    let elapsed = outcome.elapsed;
+    let budget = Duration::from_secs(budget_secs);
+    let started_at = Instant::now();
+    for _ in 0..iterations {
+        if started_at.elapsed() >= budget {
+            let _ = runtime.manager.shutdown(Duration::from_secs(5)).await;
+            return Err(Error::extension(format!(
+                "long-session benchmark timed out after {}ms",
+                budget.as_millis()
+            )));
+        }
+        let remaining_ms = u64::try_from(
+            budget
+                .saturating_sub(started_at.elapsed())
+                .as_millis()
+                .max(1),
+        )
+        .unwrap_or(u64::MAX);
+        let _ = runtime
+            .manager
+            .dispatch_event_with_response(
+                ExtensionEventName::BeforeAgentStart,
+                Some(event_payload.clone()),
+                remaining_ms,
+            )
+            .await?;
+    }
+    let elapsed = started_at.elapsed();
+    if !runtime.manager.shutdown(Duration::from_secs(5)).await {
+        return Err(Error::extension(
+            "extension workload runtime did not shut down after long session",
+        ));
+    }
     let elapsed_us = elapsed.as_secs_f64() * 1_000_000.0;
     let iters_f = f64::from(iterations.max(1));
     let per_call_us = elapsed_us / iters_f;
@@ -1624,8 +1518,12 @@ async fn scenario_long_session_real_corpus(
         "per_call_us": per_call_us,
         "calls_per_sec": calls_per_sec,
         "extensions_loaded": loaded_extension_ids,
-        "unexpected_hostcalls": outcome.unexpected_hostcalls,
+        "unexpected_hostcalls": null,
+        "unexpected_hostcalls_observable": false,
         "profile_class": "long_session",
+        "measurement_boundary": MEASUREMENT_BOUNDARY,
+        "measurement_contract_version": MEASUREMENT_CONTRACT_VERSION,
+        "disk_cache_policy": "disabled",
     }))
 }
 

@@ -5,44 +5,21 @@ use clap::{Parser, ValueEnum};
 use futures::executor::block_on;
 use pi::error::{Error, Result};
 use pi::extensions::{
-    ExtensionManager, ExtensionRuntimeHandle, NativeRustExtensionLoadSpec,
-    NativeRustExtensionRuntimeHandle,
+    ExtensionManager, ExtensionRuntimeHandle, JsExtensionLoadSpec, JsExtensionRuntimeHandle,
+    NativeRustExtensionLoadSpec, NativeRustExtensionRuntimeHandle,
 };
-use pi::extensions_js::PiJsRuntime;
+use pi::extensions_js::PiJsRuntimeConfig;
 use pi::perf_build;
 use pi::scheduler::HostcallOutcome;
+use pi::tools::ToolRegistry;
 use serde_json::json;
 use std::collections::VecDeque;
 use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const BENCH_BEGIN_FN: &str = "__bench_begin_roundtrip";
-const BENCH_ASSERT_FN: &str = "__bench_assert_roundtrip";
+const QUICKJS_RUNTIME_TOOL_NAME: &str = "hello";
 const NATIVE_RUNTIME_TOOL_NAME: &str = "bench_tool";
-
-const BENCH_TOOL_SETUP: &str = r#"
-__pi_begin_extension("ext.bench", { name: "Bench" });
-pi.registerTool({
-  name: "bench_tool",
-  description: "Benchmark tool",
-  parameters: { type: "object", properties: { value: { type: "number" } } },
-  execute: async (_callId, input) => {
-    return { ok: true, value: input.value };
-  },
-});
-globalThis.__bench_done = false;
-globalThis.__bench_begin_roundtrip = () => {
-  globalThis.__bench_done = false;
-  return pi.tool("bench_tool", { value: 1 }).then(() => { globalThis.__bench_done = true; });
-};
-globalThis.__bench_assert_roundtrip = () => {
-  if (!globalThis.__bench_done) {
-    throw new Error("bench tool call did not resolve");
-  }
-};
-__pi_end_extension();
-"#;
 
 const NATIVE_RUNTIME_DESCRIPTOR: &str = r#"
 {
@@ -104,11 +81,32 @@ impl WorkloadRuntimeEngine {
             Self::NativeRustRuntime => "native_rust_runtime",
         }
     }
+
+    const fn measurement_boundary(self) -> &'static str {
+        match self {
+            Self::Quickjs => "production_extension_manager",
+            Self::NativeRustRuntime => "production_extension_runtime",
+            Self::NativeRustPreview => "in_process_preview",
+        }
+    }
+
+    const fn measurement_contract_version(self) -> &'static str {
+        match self {
+            Self::Quickjs => "production_extension_manager.v1",
+            Self::NativeRustRuntime => "production_extension_runtime.v1",
+            Self::NativeRustPreview => "in_process_preview.v1",
+        }
+    }
 }
 
 #[derive(Debug)]
 struct NativeHostcallRequest {
     call_id: u64,
+}
+
+struct QuickJsBenchRuntime {
+    manager: ExtensionManager,
+    runtime: JsExtensionRuntimeHandle,
 }
 
 #[derive(Debug, Default)]
@@ -190,9 +188,7 @@ fn run() -> Result<()> {
         .map_or_else(|| "unknown".to_string(), |path| path.display().to_string());
 
     let quickjs_runtime = if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
-        let runtime = block_on(PiJsRuntime::new())?;
-        block_on(runtime.eval(BENCH_TOOL_SETUP))?;
-        Some(runtime)
+        Some(setup_quickjs_runtime()?)
     } else {
         None
     };
@@ -266,6 +262,21 @@ fn run() -> Result<()> {
         .checked_div(elapsed_micros)
         .unwrap_or(0);
 
+    if let Some(runtime) = native_runtime_handle {
+        if !block_on(runtime.shutdown(Duration::from_secs(5))) {
+            return Err(Error::extension(
+                "native workload runtime did not shut down",
+            ));
+        }
+    }
+    if let Some(runtime) = quickjs_runtime {
+        if !block_on(runtime.manager.shutdown(Duration::from_secs(5))) {
+            return Err(Error::extension(
+                "quickjs workload runtime did not shut down",
+            ));
+        }
+    }
+
     println!(
         "{}",
         json!({
@@ -283,6 +294,13 @@ fn run() -> Result<()> {
             "calls_per_sec": calls_per_sec,
             "build_profile": build_profile,
             "runtime_engine": args.runtime_engine.as_str(),
+            "measurement_boundary": args.runtime_engine.measurement_boundary(),
+            "measurement_contract_version": args.runtime_engine.measurement_contract_version(),
+            "disk_cache_policy": if args.runtime_engine == WorkloadRuntimeEngine::Quickjs {
+                "disabled"
+            } else {
+                "not_applicable"
+            },
             "allocator_requested": allocator.requested,
             "allocator_request_source": allocator.requested_source,
             "allocator_effective": allocator.effective.as_str(),
@@ -291,11 +309,27 @@ fn run() -> Result<()> {
         })
     );
 
-    if let Some(runtime) = native_runtime_handle {
-        let _ = block_on(runtime.shutdown(Duration::from_secs(5)));
-    }
-
     Ok(())
+}
+
+fn setup_quickjs_runtime() -> Result<QuickJsBenchRuntime> {
+    let cwd = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let entry = cwd.join("tests/ext_conformance/artifacts/hello/hello.ts");
+    let spec = JsExtensionLoadSpec::from_entry_path(&entry)?;
+    let manager = ExtensionManager::new();
+    let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
+    let runtime = block_on(JsExtensionRuntimeHandle::start(
+        PiJsRuntimeConfig {
+            cwd: cwd.display().to_string(),
+            disk_cache_dir: None,
+            ..Default::default()
+        },
+        tools,
+        manager.clone(),
+    ))?;
+    manager.set_js_runtime(runtime.clone());
+    block_on(manager.load_js_extensions(vec![spec]))?;
+    Ok(QuickJsBenchRuntime { manager, runtime })
 }
 
 fn setup_native_runtime_bench_handle() -> Result<ExtensionRuntimeHandle> {
@@ -319,26 +353,30 @@ fn setup_native_runtime_bench_handle() -> Result<ExtensionRuntimeHandle> {
     Ok(ExtensionRuntimeHandle::NativeRust(runtime))
 }
 
-fn run_tool_roundtrip_quickjs(runtime: &PiJsRuntime) -> Result<()> {
+fn run_tool_roundtrip_quickjs(runtime: &QuickJsBenchRuntime) -> Result<()> {
     block_on(async {
-        runtime.call_global_void(BENCH_BEGIN_FN).await?;
-        let mut requests = runtime.drain_hostcall_requests();
-        let request = requests
-            .pop_front()
-            .ok_or_else(|| Error::extension("bench workload: missing hostcall request"))?;
-        if !requests.is_empty() {
-            return Err(Error::extension(
-                "bench workload: unexpected extra hostcall requests",
-            ));
+        let output = runtime
+            .runtime
+            .execute_tool(
+                QUICKJS_RUNTIME_TOOL_NAME.to_string(),
+                "bench-quickjs-call".to_string(),
+                json!({ "name": "Pi" }),
+                Arc::new(json!({})),
+                60_000,
+            )
+            .await?;
+        if output
+            .get("details")
+            .and_then(|details| details.get("greeted"))
+            .and_then(serde_json::Value::as_str)
+            == Some("Pi")
+        {
+            Ok(())
+        } else {
+            Err(Error::extension(format!(
+                "quickjs workload returned an unexpected tool result: {output}"
+            )))
         }
-
-        runtime.complete_hostcall(
-            request.call_id,
-            HostcallOutcome::Success(json!({"ok": true})),
-        );
-        runtime.tick().await?;
-        runtime.call_global_void(BENCH_ASSERT_FN).await?;
-        Ok(())
     })
 }
 

@@ -23,19 +23,6 @@ use pi::scheduler::HostcallOutcome;
 use pi::tools::ToolRegistry;
 use serde_json::{Value, json};
 
-const BENCH_TOOL_SETUP: &str = r#"
-__pi_begin_extension("ext.bench", { name: "Bench" });
-pi.registerTool({
-  name: "bench_tool",
-  description: "Benchmark tool",
-  parameters: { type: "object", properties: { value: { type: "number" } } },
-  execute: async (_callId, input) => {
-    return { ok: true, value: input.value };
-  },
-});
-__pi_end_extension();
-"#;
-
 const BENCH_TOOL_CALL: &str = r#"
 globalThis.__bench_done = false;
 pi.tool("bench_tool", { value: 1 }).then(() => { globalThis.__bench_done = true; });
@@ -650,13 +637,15 @@ fn bench_js_runtime(c: &mut Criterion) {
         });
     });
 
-    let tool_runtime = block_on(PiJsRuntime::new()).unwrap();
-    block_on(async {
-        tool_runtime
-            .eval(BENCH_TOOL_SETUP)
-            .await
-            .expect("register bench tool");
-    });
+    let tool_runtime = block_on(
+        PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            pi::scheduler::WallClock,
+            PiJsRuntimeConfig::default(),
+            None,
+            "ext.bench".to_string(),
+        ),
+    )
+    .unwrap();
     group.bench_function("tool_call_roundtrip", |b| {
         b.iter(|| {
             block_on(async {
@@ -1053,9 +1042,17 @@ fn bench_dispatch_shared_events(c: &mut Criterion) {
 /// We measure this indirectly via the `complete_hostcall` + `tick` path with
 /// varying payload sizes.
 fn bench_js_serde_bridge(c: &mut Criterion) {
-    // Set up a PiJsRuntime with the tool-calling shim installed.
-    let rt = block_on(PiJsRuntime::new()).unwrap();
-    block_on(rt.eval(BENCH_TOOL_SETUP)).expect("register bench tool");
+    // Use an immutable benchmark principal so hostcall attribution follows the
+    // same Rust-owned identity boundary as production extension shards.
+    let rt = block_on(
+        PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            pi::scheduler::WallClock,
+            PiJsRuntimeConfig::default(),
+            None,
+            "ext.bench".to_string(),
+        ),
+    )
+    .unwrap();
 
     let payloads: Vec<(&str, Value)> = vec![
         ("null", Value::Null),
