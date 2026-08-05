@@ -1,6 +1,6 @@
 {
   "schema": "pi.perf3x.bead_coverage.audit.v1",
-  "generated_at": "2026-08-04T07:06:47.655Z",
+  "generated_at": "2026-08-04T22:32:23.519Z",
   "contract_schema": "pi.perf3x.bead_coverage.v1",
   "status": "pass",
   "detail": "Validated 7 PERF-3X bead coverage row(s) with complete unit/e2e/log evidence paths",

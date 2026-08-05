@@ -48,12 +48,10 @@ fn digest_artifact_dir(dir: &Path) -> io::Result<String> {
         hasher.update(b"file\0");
         hasher.update(rel.as_bytes());
         hasher.update(b"\0");
-        // Strip \r so CRLF (Windows autocrlf) hashes the same as LF (Unix)
-        let content: Vec<u8> = fs::read(&path)?
-            .into_iter()
-            .filter(|&b| b != b'\r')
-            .collect();
-        hasher.update(&content);
+        // Keep this independent implementation byte-for-byte identical to the
+        // library protocol: provenance binds exact on-disk content, including
+        // CRLF text and carriage-return bytes inside binary artifacts.
+        hasher.update(fs::read(&path)?);
         hasher.update(b"\0");
     }
 
@@ -1255,10 +1253,18 @@ fn test_scan_all_ts_entry_points() {
         results.push(scan);
     }
 
-    // Write the full JSON manifest.
+    // Keep ordinary test runs read-only. The ignored manifest is a maintenance
+    // artifact, not a source input; writing it by default would contaminate the
+    // fail-closed must-pass provenance snapshot when test binaries share a tree.
     let manifest_path = artifacts_dir.join("entry-point-scan.json");
     let json = serde_json::to_string_pretty(&results).expect("serialize scan results");
-    fs::write(&manifest_path, &json).expect("write entry-point-scan.json");
+    let generate = matches!(
+        std::env::var("PI_GENERATE_EXT_ENTRY_SCAN").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        fs::write(&manifest_path, &json).expect("write entry-point-scan.json");
+    }
 
     // Verify classification distribution is reasonable.
     let entry_count = results
@@ -1292,7 +1298,11 @@ fn test_scan_all_ts_entry_points() {
     eprintln!("Sub-modules:     {sub_count}");
     eprintln!("Non-extensions:  {non_ext_count}");
     eprintln!("Unknown:         {unknown_count}");
-    eprintln!("Manifest:        {}", manifest_path.display());
+    if generate {
+        eprintln!("Manifest:        {}", manifest_path.display());
+    } else {
+        eprintln!("Manifest:        not written (set PI_GENERATE_EXT_ENTRY_SCAN=1)");
+    }
 
     // Sanity: we should have a reasonable number of entry points.
     // The catalog has ~205 extensions, so we expect at least ~100 entry points

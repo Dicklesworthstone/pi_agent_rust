@@ -1,6 +1,6 @@
 # Full-Suite CI Gate Report
 
-> Generated: 2026-08-04T07:06:47Z
+> Generated: 2026-08-04T22:32:23Z
 > Verdict: **FAIL**
 
 ## Summary
@@ -64,7 +64,7 @@
 ### Practical-finish checkpoint (docs-only residual filter) — FAIL **(BLOCKING)**
 
 - **Bead:** bd-3ar8v.6.9
-- **Detail:** Practical-finish checkpoint blocked: 43 technical PERF-3X issue(s) still open (bd-3ar8v.1.2, bd-3ar8v.2.12, bd-3ar8v.2.8, bd-3ar8v.3.11, bd-3ar8v.3.6, ...)
+- **Detail:** Practical-finish checkpoint blocked: 48 technical PERF-3X issue(s) still open (bd-3ar8v.1.2, bd-3ar8v.2.12, bd-3ar8v.2.8, bd-3ar8v.3.11, bd-3ar8v.3.6, ...)
 - **Artifact:** `tests/full_suite_gate/practical_finish_checkpoint.json`
 - **Reproduce:**
   ```bash

@@ -1,8 +1,8 @@
 {
   "schema": "pi.dropin.certification_contract.v1",
   "bead_id": "bd-35t7i",
-  "version": "1.0.1",
-  "effective_date_utc": "2026-08-04T19:03:36Z",
+  "version": "1.0.2",
+  "effective_date_utc": "2026-08-04T23:48:36Z",
   "status": "active_blocking_policy",
   "policy_owner_issue": "bd-35t7i",
   "normative_statement": "Pi Rust MUST NOT be described as a strict drop-in replacement unless every hard gate in this contract is PASS with verifiable evidence.",
@@ -381,10 +381,18 @@
   },
   "immediate_status_snapshot": {
     "overall_verdict_now": "NOT_CERTIFIED",
-    "reason": "The checked-in CERTIFIED verdict names historical source commit 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8, and later history includes non-evidence source changes. Strict drop-in language remains blocked until the contract is rerun from a clean release source commit and only allowlisted evidence-only commits follow it.",
+    "reason": "The current release source is NOT_CERTIFIED. A historical verdict recorded CERTIFIED for source commit 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8, but that fact is retained in Git history and does not describe the current contents of docs/evidence/dropin-certification-verdict.json or certify any later source. Strict drop-in language remains blocked unless the live verdict is CERTIFIED for the clean release source and only allowlisted evidence-only commits follow it.",
     "open_critical_gate_domains": [
       "evidence-freshness-and-provenance"
-    ]
+    ],
+    "historical_certification_record": {
+      "artifact_commit": "2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91",
+      "source_commit": "52e9fbfb24352045985b59df9d7ea63f1f8f2ef8",
+      "overall_verdict_at_that_revision": "CERTIFIED",
+      "artifact_at_that_revision": "docs/evidence/dropin-certification-verdict.json",
+      "retrieval_command": "git show 2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json",
+      "current_claim_authority": false
+    }
   },
   "maintenance_policy": {
     "update_trigger": "Any newly discovered mismatch or gate-topology change.",

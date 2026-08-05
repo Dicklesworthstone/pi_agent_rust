@@ -2091,13 +2091,13 @@ fn normalize_tool_diagnostic_for_snapshot(mut diagnostic: serde_json::Value) -> 
         .and_then(serde_json::Value::as_array_mut)
     {
         for entry in entries {
-            if let Some(entry_object) = entry.as_object_mut() {
-                if entry_object.contains_key("permissions_octal") {
-                    entry_object.insert(
-                        "permissions_octal".to_string(),
-                        serde_json::json!("<PERMISSIONS>"),
-                    );
-                }
+            if let Some(entry_object) = entry.as_object_mut()
+                && entry_object.contains_key("permissions_octal")
+            {
+                entry_object.insert(
+                    "permissions_octal".to_string(),
+                    serde_json::json!("<PERMISSIONS>"),
+                );
             }
         }
     }
@@ -3704,11 +3704,11 @@ mod security_environment {
             let candidate_keys = ["LC_ALL", "LC_CTYPE", "LANG"];
             let mut selected = None;
             for key in candidate_keys {
-                if let Ok(value) = std::env::var(key) {
-                    if !value.trim().is_empty() {
-                        selected = Some((key, value));
-                        break;
-                    }
+                if let Ok(value) = std::env::var(key)
+                    && !value.trim().is_empty()
+                {
+                    selected = Some((key, value));
+                    break;
                 }
             }
 

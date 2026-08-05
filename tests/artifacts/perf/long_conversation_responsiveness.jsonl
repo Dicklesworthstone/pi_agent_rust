@@ -1,1 +1,1 @@
-{"data":{"cold_content_build_us":352,"frame_count":20,"message_count":500,"warm_content_p50_us":346,"warm_frame_p95_us":1040},"event":"frame_times","schema":"pi.test.perf_event.v1","test":"tui_perf_e2e_long_conversation_responsiveness"}
+{"data":{"cold_content_build_us":282,"frame_count":20,"message_count":500,"warm_content_p50_us":282,"warm_frame_p95_us":972},"event":"frame_times","schema":"pi.test.perf_event.v1","test":"tui_perf_e2e_long_conversation_responsiveness"}

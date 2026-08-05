@@ -1,8 +1,8 @@
 # Unified CI Evidence Bundle
 
-> Generated: 2026-08-04T07:06:47Z
-> Git ref: 320475bc
-> CI run: local-20260804T070647Z
+> Generated: 2026-08-04T22:32:23Z
+> Git ref: 45f28beb
+> CI run: local-20260804T223218Z
 > Verdict: **INSUFFICIENT**
 
 ## Summary
@@ -10,12 +10,12 @@
 | Metric | Value |
 |--------|-------|
 | Total sections | 29 |
-| Present | 28 |
+| Present | 27 |
 | Missing | 0 |
-| Invalid | 1 |
+| Invalid | 2 |
 | Total artifacts | 2004 |
 | Total size | 181049.4 KB |
-| Required present | 12/12 |
+| Required present | 12/13 |
 
 ## Conformance (6)
 
@@ -32,14 +32,14 @@
 
 | Section | Status | Files | Size | Path |
 |---------|--------|-------|------|------|
-| Must-pass gate verdict | PASS | 1 | 1236 B | `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` |
+| Must-pass gate verdict | WARN | 1 | 1236 B | `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json` |
 | Must-pass gate event log | PASS | 1 | 61962 B | `tests/ext_conformance/reports/gate/must_pass_events.jsonl` |
 | Per-extension failure dossiers | PASS | 34 | 140366 B | `tests/ext_conformance/reports/dossiers` |
 | Health & regression delta report | PASS | 3 | 80504 B | `tests/ext_conformance/reports/health_delta` |
 | Provider compatibility matrix | PASS | 753 | 375207 B | `tests/ext_conformance/reports/provider_compat` |
 | Sharded extension matrix reports | PASS | 12 | 280518 B | `tests/ext_conformance/reports/sharded` |
 | Extension journey report | PASS | 1 | 778 B | `tests/ext_conformance/reports/journeys/journey_report.json` |
-| Auto-repair summary | PASS | 1 | 45400 B | `tests/ext_conformance/reports/auto_repair_summary.json` |
+| Auto-repair summary | PASS | 1 | 45398 B | `tests/ext_conformance/reports/auto_repair_summary.json` |
 
 ## E2e (1)
 
@@ -88,6 +88,8 @@
 
 ## Missing / Invalid Sections
 
-- **PERF-3X lineage coherence contract** (invalid): PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 06:56:22 UTC)
+- **Must-pass gate verdict** (invalid): must-pass evidence git_commit is not a full commit ID **(REQUIRED)**
+  Path: `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json`
+- **PERF-3X lineage coherence contract** (invalid): section 'must_pass_gate' must be present, found status 'invalid'
   Path: `tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json`
 

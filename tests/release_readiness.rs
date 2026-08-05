@@ -1875,6 +1875,32 @@ fn validate_conformance_summary_metadata(v: &V) -> Result<(), String> {
     Ok(())
 }
 
+fn current_conformance_counts(v: &V) -> Result<(u64, u64, u64, u64, u64), String> {
+    let count = |name: &str| {
+        v.pointer(&format!("/counts/{name}"))
+            .and_then(V::as_u64)
+            .ok_or_else(|| format!("Missing required unsigned count: /counts/{name}"))
+    };
+    match (
+        count("total"),
+        count("tested"),
+        count("pass"),
+        count("fail"),
+        count("na"),
+    ) {
+        (Ok(total), Ok(tested), Ok(passed), Ok(failed), Ok(not_applicable)) => {
+            Ok((total, tested, passed, failed, not_applicable))
+        }
+        counts => {
+            let errors = [counts.0, counts.1, counts.2, counts.3, counts.4]
+                .into_iter()
+                .filter_map(Result::err)
+                .collect::<Vec<_>>();
+            Err(errors.join("; "))
+        }
+    }
+}
+
 fn validate_current_conformance_summary(v: &V) -> (Signal, String) {
     let schema = get_str(v, "/schema");
     if schema != CONFORMANCE_SUMMARY_SCHEMA {
@@ -1884,28 +1910,9 @@ fn validate_current_conformance_summary(v: &V) -> (Signal, String) {
         );
     }
 
-    let count = |name: &str| {
-        v.pointer(&format!("/counts/{name}"))
-            .and_then(V::as_u64)
-            .ok_or_else(|| format!("Missing required unsigned count: /counts/{name}"))
-    };
-    let (total, tested, passed, failed, not_applicable) = match (
-        count("total"),
-        count("tested"),
-        count("pass"),
-        count("fail"),
-        count("na"),
-    ) {
-        (Ok(total), Ok(tested), Ok(passed), Ok(failed), Ok(not_applicable)) => {
-            (total, tested, passed, failed, not_applicable)
-        }
-        counts => {
-            let errors = [counts.0, counts.1, counts.2, counts.3, counts.4]
-                .into_iter()
-                .filter_map(Result::err)
-                .collect::<Vec<_>>();
-            return (Signal::Fail, errors.join("; "));
-        }
+    let (total, tested, passed, failed, not_applicable) = match current_conformance_counts(v) {
+        Ok(counts) => counts,
+        Err(error) => return (Signal::Fail, error),
     };
 
     if total == 0 {
@@ -4303,8 +4310,8 @@ fn write_must_pass_events_fixture(
 
 fn must_pass_fixture_verdict(
     observed_count: u64,
-    inclusion_sha256: String,
-    manifest_sha256: String,
+    inclusion_sha256: &str,
+    manifest_sha256: &str,
 ) -> V {
     serde_json::json!({
         "schema": MUST_PASS_GATE_SCHEMA,
@@ -4379,7 +4386,7 @@ fn write_must_pass_certification_fixture(
         &manifest_sha256,
     );
     let observed_count = u64::try_from(observed_ids.len()).expect("fixture count fits u64");
-    must_pass_fixture_verdict(observed_count, inclusion_sha256, manifest_sha256)
+    must_pass_fixture_verdict(observed_count, &inclusion_sha256, &manifest_sha256)
 }
 
 #[test]

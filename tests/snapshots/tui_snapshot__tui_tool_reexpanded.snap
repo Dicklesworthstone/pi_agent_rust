@@ -1,6 +1,6 @@
 ---
 source: tests/tui_snapshot.rs
-assertion_line: 214
+assertion_line: 216
 expression: view
 ---
   Pi (dummy/dummy-model)
@@ -24,4 +24,4 @@ short output here
   │ >
   │ >
 
-  Tokens: 0 in / 0 out  |  main  |  Persist: balanced  |  /help  |  Ctrl+C: quit
+  Tokens: 0 in / 0 out  |  Persist: balanced  |  /help  |  Ctrl+C: quit

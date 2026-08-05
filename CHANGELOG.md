@@ -60,6 +60,15 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
 - **Concurrency-sensitive tests are deterministic** — RPC crash-recovery
   checkpoints, process-wide current-directory mutation, remote-worker fixtures,
   and extension memory/scanner cases now isolate their shared state.
+- **Extension corpus scans are read-only by default** — ordinary test runs now
+  validate the committed entry-point scan in place and keep auxiliary scan
+  results in memory, so an ignored generated file cannot contaminate the
+  fail-closed must-pass source snapshot. Maintainers can regenerate scan
+  artifacts explicitly with `PI_GENERATE_EXT_ENTRY_SCAN=1`.
+- **Release builds no longer compile duplicate process-inspection stacks** —
+  the direct `sysinfo` dependency now matches the version already used by the
+  runtime. This preserves process-tree behavior while reducing binary-size
+  pressure.
 - **Extension filesystem fallback is more robust** — a denied host `readdir`
   no longer aborts the filesystem shim before later fallback paths are checked.
 - **Context-evidence suppression is deterministic** — duplicate stale/unsafe

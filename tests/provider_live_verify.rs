@@ -201,10 +201,10 @@ async fn collect_stream_events(
                         // Fall back to Done message text if no deltas were received.
                         if text.is_empty() {
                             for block in &message.content {
-                                if let pi::model::ContentBlock::Text(tc) = block {
-                                    if !tc.text.is_empty() {
-                                        text.clone_from(&tc.text);
-                                    }
+                                if let pi::model::ContentBlock::Text(tc) = block
+                                    && !tc.text.is_empty()
+                                {
+                                    text.clone_from(&tc.text);
                                 }
                             }
                         }

@@ -36,7 +36,7 @@
   ],
   "bead": "bd-3uqg.8.11",
   "ci_workflow": {
-    "artifact_upload_steps": 11,
+    "artifact_upload_steps": 12,
     "explicit_retention_30d": 3,
     "test_path_references": 14
   },
@@ -46,7 +46,7 @@
     "qa_runbook": "docs/qa-runbook.md",
     "testing_policy": "docs/testing-policy.md"
   },
-  "generated_at": "2026-08-04T07:06:47.603723253+00:00",
+  "generated_at": "2026-08-04T22:32:18.254593818+00:00",
   "schema": "pi.ci.artifact_retention_report.v1",
   "triage_artifacts": {
     "evidence_contract": "tests/e2e_results/<ts>/evidence_contract.json",

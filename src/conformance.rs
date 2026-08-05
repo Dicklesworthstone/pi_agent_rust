@@ -1292,12 +1292,12 @@ pub mod snapshot {
             hasher.update(b"file\0");
             hasher.update(rel.as_bytes());
             hasher.update(b"\0");
-            // Strip \r so CRLF (Windows autocrlf) hashes the same as LF (Unix)
-            let content: Vec<u8> = std::fs::read(path)?
-                .into_iter()
-                .filter(|&b| b != b'\r')
-                .collect();
-            hasher.update(&content);
+            // Hash the exact bytes on disk. Provenance is an integrity
+            // boundary, so it must distinguish every byte even when a file
+            // contains CRLF text or an embedded carriage return in binary
+            // data. Repository EOL normalization belongs at checkout time,
+            // not inside the digest algorithm.
+            hasher.update(std::fs::read(path)?);
             hasher.update(b"\0");
         }
         Ok(hex_lower(&hasher.finalize()))
@@ -3333,6 +3333,22 @@ mod tests {
         let d2 = snapshot::digest_artifact_dir(tmp.path()).unwrap();
 
         assert_ne!(d1, d2, "different content must produce different digest");
+    }
+
+    #[test]
+    fn snapshot_digest_artifact_dir_binds_carriage_return_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let artifact = tmp.path().join("artifact.bin");
+        std::fs::write(&artifact, b"prefix\r\nsuffix\r\0").unwrap();
+        let with_carriage_returns = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+
+        std::fs::write(&artifact, b"prefix\nsuffix\0").unwrap();
+        let without_carriage_returns = snapshot::digest_artifact_dir(tmp.path()).unwrap();
+
+        assert_ne!(
+            with_carriage_returns, without_carriage_returns,
+            "provenance digest must bind every carriage-return byte"
+        );
     }
 
     #[test]

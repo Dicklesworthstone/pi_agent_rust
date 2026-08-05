@@ -1,6 +1,6 @@
 # Performance Budgets
 
-> Generated: 2026-08-04T07:11:34Z
+> Generated: 2026-08-04T23:06:38Z
 
 > Run ID: not set
 
@@ -13,8 +13,8 @@
 | CI-enforced with data | 1 |
 | CI-enforced FAIL | 0 |
 | CI-enforced NO_DATA | 13 |
-| PASS | 3 |
-| FAIL | 1 |
+| PASS | 4 |
+| FAIL | 0 |
 | No data | 15 |
 
 | Failing data contracts | 16 |
@@ -45,7 +45,7 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 39 | PASS | No |
+| `event_dispatch_p99` | p99 dispatch latency | 5000 us | 36 | PASS | No |
 
 ## Context_intelligence
 
@@ -68,8 +68,8 @@
 
 | Budget | Metric | Threshold | Actual | Status | CI |
 |---|---|---|---|---|---|
-| `idle_memory_rss` | RSS at idle | 50 MB | 6.3 | PASS | Yes |
-| `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 5.6 | FAIL | No |
+| `idle_memory_rss` | RSS at idle | 50 MB | 13.4 | PASS | Yes |
+| `sustained_load_rss_growth` | RSS growth under 30s sustained load | 5 percent | 0.0 | PASS | No |
 
 ## Binary
 
@@ -85,37 +85,37 @@
 
 ## Failing Data Contracts
 
-- `missing_or_stale_budget_artifact` (`startup_version_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/startup/version/warm/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`startup_version_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/startup/version/warm/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`ext_cold_load_simple_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`ext_cold_load_simple_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`tool_call_latency_p99`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]
+- `missing_or_stale_budget_artifact` (`tool_call_latency_p99`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`tool_call_throughput_min`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]
+- `missing_or_stale_budget_artifact` (`tool_call_throughput_min`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`context_graph_build_cold_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`context_graph_build_cold_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`context_graph_build_warm_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`context_graph_build_warm_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`context_incremental_update_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`context_incremental_update_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`context_planning_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/planning/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/planning/large_workspace/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`context_planning_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/planning/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/planning/large_workspace/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`context_bundle_serialization_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json]
+- `missing_or_stale_budget_artifact` (`context_bundle_serialization_p95`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`context_bundle_estimated_bytes_max`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]
+- `missing_or_stale_budget_artifact` (`context_bundle_estimated_bytes_max`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`policy_eval_p99`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/ext_policy/evaluate, /data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]
+- `missing_or_stale_budget_artifact` (`policy_eval_p99`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_policy/evaluate, /data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`binary_size_release`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/release/pi, /data/tmp/pi_agent_rust_cargo/root/target/perf/pi, /data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]
+- `missing_or_stale_budget_artifact` (`binary_size_release`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/release/pi, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pi, /data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_budget_artifact` (`protocol_parse_p99`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/ext_protocol/parse_and_validate, /data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]
+- `missing_or_stale_budget_artifact` (`protocol_parse_p99`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_protocol/parse_and_validate, /data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]
   - Remediation: Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets.
-- `missing_or_stale_e2e_matrix_evidence` (`global`): all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (1910.99h old)
+- `missing_or_stale_e2e_matrix_evidence` (`global`): all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (1926.91h old)
   - Remediation: Generate fresh extension_benchmark_stratification.json in the current perf run.
-- `missing_or_stale_phase1_matrix_validation_evidence` (`global`): all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json (1751.23h old)
+- `missing_or_stale_phase1_matrix_validation_evidence` (`global`): all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json (1767.15h old)
   - Remediation: Generate fresh phase1_matrix_validation.json in the current perf run.
-- `missing_or_stale_context_intelligence_budget_evidence` (`global`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]
+- `missing_or_stale_context_intelligence_budget_evidence` (`global`): missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]
   - Remediation: Generate fresh context_intelligence_planner_budget.json in the current perf run.
 
 ## Measurement Methodology

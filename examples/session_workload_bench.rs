@@ -219,10 +219,10 @@ fn user_message_entry_ids(session: &Session) -> Vec<String> {
         .entries
         .iter()
         .filter_map(|entry| {
-            if let pi::session::SessionEntry::Message(msg_entry) = entry {
-                if matches!(msg_entry.message, SessionMessage::User { .. }) {
-                    return msg_entry.base.id.clone();
-                }
+            if let pi::session::SessionEntry::Message(msg_entry) = entry
+                && matches!(msg_entry.message, SessionMessage::User { .. })
+            {
+                return msg_entry.base.id.clone();
             }
             None
         })

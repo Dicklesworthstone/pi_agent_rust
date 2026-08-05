@@ -178,108 +178,108 @@
   "ci_with_data": 1,
   "correlation_id": null,
   "data_contract_failures_count": 16,
-  "fail": 1,
+  "fail": 0,
   "failing_data_contracts": [
     {
       "budget_name": "startup_version_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/startup/version/warm/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/startup/version/warm/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/startup/version/warm/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "ext_cold_load_simple_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/ext_load_init/load_init_cold/hello/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "tool_call_latency_p99",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "tool_call_throughput_min",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/perf/pijs_workload_perf.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/release/pijs_workload_release.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/debug/pijs_workload_debug.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pijs_workload.jsonl, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/perf/pijs_workload_perf.jsonl, /data/projects/pi_agent_rust/target/perf/release/pijs_workload_release.jsonl, /data/projects/pi_agent_rust/target/perf/debug/pijs_workload_debug.jsonl, /data/projects/pi_agent_rust/target/perf/pijs_workload.jsonl, /data/projects/pi_agent_rust/target/perf/results/pijs_workload.jsonl]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "context_graph_build_cold_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_cold/large_workspace/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "context_graph_build_warm_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/graph_build_warm/large_workspace/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "context_incremental_update_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/incremental_update/large_workspace/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "context_planning_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/planning/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/planning/large_workspace/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/planning/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/planning/large_workspace/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "context_bundle_serialization_p95",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json, /data/projects/pi_agent_rust/target/criterion/semantic_context/bundle_serialization/large_workspace/new/estimates.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "context_bundle_estimated_bytes_max",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "policy_eval_p99",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/ext_policy/evaluate, /data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_policy/evaluate, /data/projects/pi_agent_rust/target/criterion/ext_policy/evaluate]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "binary_size_release",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/release/pi, /data/tmp/pi_agent_rust_cargo/root/target/perf/pi, /data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/release/pi, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/pi, /data/projects/pi_agent_rust/target/release/pi, /data/projects/pi_agent_rust/target/perf/pi]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": "protocol_parse_p99",
       "contract_id": "missing_or_stale_budget_artifact",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/criterion/ext_protocol/parse_and_validate, /data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/criterion/ext_protocol/parse_and_validate, /data/projects/pi_agent_rust/target/criterion/ext_protocol/parse_and_validate]",
       "remediation": "Regenerate benchmark artifacts in the same CI/perf run before evaluating budgets."
     },
     {
       "budget_name": null,
       "contract_id": "missing_or_stale_e2e_matrix_evidence",
-      "detail": "all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (1910.99h old)",
+      "detail": "all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/extension_benchmark_stratification.json (1926.91h old)",
       "remediation": "Generate fresh extension_benchmark_stratification.json in the current perf run."
     },
     {
       "budget_name": null,
       "contract_id": "missing_or_stale_phase1_matrix_validation_evidence",
-      "detail": "all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json (1751.23h old)",
+      "detail": "all candidate artifacts are stale/invalid (>24.00h): /data/projects/pi_agent_rust/tests/perf/reports/phase1_matrix_validation.json (1767.15h old)",
       "remediation": "Generate fresh phase1_matrix_validation.json in the current perf run."
     },
     {
       "budget_name": null,
       "contract_id": "missing_or_stale_context_intelligence_budget_evidence",
-      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/root/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]",
+      "detail": "missing artifacts; expected one of [/data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/results/context_intelligence_planner_budget.json, /data/tmp/pi_agent_rust_cargo/security_dependency_research/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/results/context_intelligence_planner_budget.json, /data/projects/pi_agent_rust/target/perf/context_intelligence/perf_budget.json, /data/projects/pi_agent_rust/tests/perf/reports/context_intelligence_planner_budget.json]",
       "remediation": "Generate fresh context_intelligence_planner_budget.json in the current perf run."
     }
   ],
-  "generated_at": "2026-08-04T07:11:34.770013589+00:00",
+  "generated_at": "2026-08-04T23:06:38.345112221+00:00",
   "no_data": 15,
-  "pass": 3,
+  "pass": 4,
   "run_id": null,
   "schema": "pi.perf.budget_summary.v1",
   "total_budgets": 19

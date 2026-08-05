@@ -1,8 +1,8 @@
 {
   "schema": "pi.ci.evidence_bundle.v1",
-  "generated_at": "2026-08-04T07:06:47.649Z",
-  "git_ref": "320475bc",
-  "ci_run_id": "local-20260804T070647Z",
+  "generated_at": "2026-08-04T22:32:23.505Z",
+  "git_ref": "45f28beb",
+  "ci_run_id": "local-20260804T223218Z",
   "sections": [
     {
       "id": "conformance_summary",
@@ -13,7 +13,7 @@
       "schema": "pi.ext.conformance_summary.v2",
       "summary": {
         "fail": 0,
-        "generated_at": "2026-08-04T06:56:22Z",
+        "generated_at": "2026-08-04T07:06:49Z",
         "pass": 60,
         "pass_rate_pct": 100.0,
         "total": 226
@@ -83,20 +83,10 @@
       "id": "must_pass_gate",
       "label": "Must-pass gate verdict",
       "category": "diagnostics",
-      "status": "present",
+      "status": "invalid",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json",
       "schema": "pi.ext.must_pass_gate.v1",
-      "summary": {
-        "correlation_id": "must-pass-gate-local-20260515T170218075Z",
-        "generated_at": "2026-05-15T17:03:02.000Z",
-        "must_pass_failed": 0,
-        "must_pass_pass_rate_pct": 100.0,
-        "must_pass_passed": 123,
-        "must_pass_skipped": 0,
-        "must_pass_total": 123,
-        "run_id": "local-20260515T170218075Z",
-        "status": "pass"
-      },
+      "diagnostics": "must-pass evidence git_commit is not a full commit ID",
       "file_count": 1,
       "total_bytes": 1236
     },
@@ -179,7 +169,7 @@
       "artifact_path": "tests/ext_conformance/reports/auto_repair_summary.json",
       "schema": "pi.ext.auto_repair_summary.v1",
       "file_count": 1,
-      "total_bytes": 45400
+      "total_bytes": 45398
     },
     {
       "id": "e2e_results",
@@ -357,18 +347,18 @@
       "status": "invalid",
       "artifact_path": "tests/ext_conformance/reports/gate/must_pass_gate_verdict.json | tests/ext_conformance/reports/conformance_summary.json | tests/perf/reports/stress_triage.json",
       "schema": "pi.perf3x.lineage_contract.v1",
-      "diagnostics": "PERF-3X lineage span exceeds 14 days for run_id 'local-20260515T170218075Z' (oldest=2026-05-10 01:22:30 UTC, newest=2026-08-04 06:56:22 UTC)",
+      "diagnostics": "section 'must_pass_gate' must be present, found status 'invalid'",
       "file_count": 0,
       "total_bytes": 0
     }
   ],
   "summary": {
     "total_sections": 29,
-    "present_sections": 28,
+    "present_sections": 27,
     "missing_sections": 0,
-    "invalid_sections": 1,
+    "invalid_sections": 2,
     "total_artifacts": 2004,
-    "total_bytes": 185394633,
+    "total_bytes": 185394631,
     "verdict": "insufficient"
   }
 }

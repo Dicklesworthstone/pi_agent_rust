@@ -1839,7 +1839,7 @@ fn markdown_table_cell(input: &str) -> String {
         .replace('\n', "<br/>")
 }
 
-fn shard_status_rank(status: &str) -> u8 {
+const fn shard_status_rank(status: &str) -> u8 {
     if status.eq_ignore_ascii_case("fail") || status.eq_ignore_ascii_case("failed") {
         0
     } else if status.eq_ignore_ascii_case("pass") || status.eq_ignore_ascii_case("passed") {

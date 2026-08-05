@@ -2702,22 +2702,22 @@ fn e2e_scenario_slash_command_workflow() {
         .artifacts
         .iter()
         .find(|a| a.name == "scenario-transcript.jsonl");
-    if let Some(artifact) = transcript_artifact {
-        if let Ok(actual_content) = std::fs::read_to_string(&artifact.path) {
-            let expected_lines = parse_transcript(&expected_jsonl);
-            let actual_lines = parse_transcript(&actual_content);
-            let diff = TranscriptDiff::compare(&expected_lines, &actual_lines);
+    if let Some(artifact) = transcript_artifact
+        && let Ok(actual_content) = std::fs::read_to_string(&artifact.path)
+    {
+        let expected_lines = parse_transcript(&expected_jsonl);
+        let actual_lines = parse_transcript(&actual_content);
+        let diff = TranscriptDiff::compare(&expected_lines, &actual_lines);
 
-            // Label and success should match; action format may differ slightly
-            assert!(
-                !diff
-                    .diffs
-                    .iter()
-                    .any(|d| d.field == "label" || d.field == "success"),
-                "Unexpected label/success diffs:\n{}",
-                diff.human_summary()
-            );
-        }
+        // Label and success should match; action format may differ slightly
+        assert!(
+            !diff
+                .diffs
+                .iter()
+                .any(|d| d.field == "label" || d.field == "success"),
+            "Unexpected label/success diffs:\n{}",
+            diff.human_summary()
+        );
     }
 }
 
@@ -3089,46 +3089,45 @@ fn e2e_scenario_session_persistence_and_tree() {
         .artifacts
         .iter()
         .find(|a| a.name == "scenario-transcript.jsonl")
+        && let Ok(content) = std::fs::read_to_string(&transcript_artifact.path)
     {
-        if let Ok(content) = std::fs::read_to_string(&transcript_artifact.path) {
-            let lines = parse_transcript(&content);
+        let lines = parse_transcript(&content);
 
-            // Must have header
-            let headers: Vec<_> = lines
-                .iter()
-                .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_HEADER))
-                .collect();
-            assert_eq!(headers.len(), 1, "transcript must have exactly 1 header");
-            assert_eq!(headers[0].value["scenario_name"].as_str(), Some(test_name));
+        // Must have header
+        let headers: Vec<_> = lines
+            .iter()
+            .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_HEADER))
+            .collect();
+        assert_eq!(headers.len(), 1, "transcript must have exactly 1 header");
+        assert_eq!(headers[0].value["scenario_name"].as_str(), Some(test_name));
 
-            // Must have step results
-            let step_count = lines
-                .iter()
-                .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_STEP))
-                .count();
-            assert_eq!(step_count, 2, "transcript must have 2 step results");
+        // Must have step results
+        let step_count = lines
+            .iter()
+            .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_STEP))
+            .count();
+        assert_eq!(step_count, 2, "transcript must have 2 step results");
 
-            // Must have event boundaries
-            let boundary_count = lines
-                .iter()
-                .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_BOUNDARY))
-                .count();
-            assert!(
-                boundary_count >= 6,
-                "transcript must have >= 6 boundaries (3 per step), got {boundary_count}"
-            );
-        }
+        // Must have event boundaries
+        let boundary_count = lines
+            .iter()
+            .filter(|l| l.event_type.as_deref() == Some(EVENT_TYPE_BOUNDARY))
+            .count();
+        assert!(
+            boundary_count >= 6,
+            "transcript must have >= 6 boundaries (3 per step), got {boundary_count}"
+        );
     }
 
     // If the session artifact exists, verify tree structure
-    if let Some(sess) = session_artifact {
-        if let Ok(content) = std::fs::read_to_string(&sess.path) {
-            let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-            if lines.len() >= 2 {
-                let header: Value = serde_json::from_str(lines[0]).expect("parse header");
-                assert_eq!(header["type"].as_str(), Some("session"));
-                assert_eq!(header["version"].as_u64(), Some(u64::from(SESSION_VERSION)));
-            }
+    if let Some(sess) = session_artifact
+        && let Ok(content) = std::fs::read_to_string(&sess.path)
+    {
+        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.len() >= 2 {
+            let header: Value = serde_json::from_str(lines[0]).expect("parse header");
+            assert_eq!(header["type"].as_str(), Some("session"));
+            assert_eq!(header["version"].as_u64(), Some(u64::from(SESSION_VERSION)));
         }
     }
 }

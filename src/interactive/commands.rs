@@ -2116,7 +2116,7 @@ impl PiApp {
                 None
             }
             SlashCommand::Changelog => {
-                let content = include_str!("../../CHANGELOG.md").to_string();
+                let content = crate::embedded_assets::changelog().to_string();
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
                     content,

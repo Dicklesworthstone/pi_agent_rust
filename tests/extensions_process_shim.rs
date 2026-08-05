@@ -4,6 +4,7 @@
 //! stdout/stderr routing, exit signaling, event emitter API, hrtime, and more.
 #![allow(clippy::needless_raw_string_hashes)]
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use pi::extensions_js::{HostcallKind, PiJsRuntime, PiJsRuntimeConfig, is_env_var_allowed};
@@ -12,20 +13,25 @@ use pi::scheduler::DeterministicClock;
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn config_with_env(env: Vec<(&str, &str)>) -> PiJsRuntimeConfig {
+    let mut env: HashMap<String, String> = env
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+    env.insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
     PiJsRuntimeConfig {
         cwd: "/test".to_string(),
-        env: env
-            .into_iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect(),
+        env,
         deny_env: false,
         ..Default::default()
     }
 }
 
 fn default_config() -> PiJsRuntimeConfig {
+    let env: HashMap<String, String> =
+        HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string())]);
     PiJsRuntimeConfig {
         cwd: "/test".to_string(),
+        env,
         ..Default::default()
     }
 }

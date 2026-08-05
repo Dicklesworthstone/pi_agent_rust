@@ -1,6 +1,6 @@
 ---
 source: tests/tui_snapshot.rs
-assertion_line: 214
+assertion_line: 216
 expression: view
 ---
   Pi (dummy/dummy-model)
@@ -17,4 +17,4 @@ expression: view
   │ >
   │ >
 
-  Tokens: 120 in / 45 out ($0.0030)  |  main  |  Persist: balanced  |  /help ...
+  Tokens: 120 in / 45 out ($0.0030)  |  snapshot-fixture  |  Persist: balance...

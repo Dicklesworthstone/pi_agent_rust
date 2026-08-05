@@ -2105,7 +2105,7 @@ fn persist_last_changelog_version_with_roots(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_startup_changelog_with_roots(
+fn prepare_startup_changelog_with_roots<'a>(
     config: &mut Config,
     global_dir: &Path,
     cwd: &Path,
@@ -2113,7 +2113,7 @@ fn prepare_startup_changelog_with_roots(
     has_existing_messages: bool,
     persist_version_updates: bool,
     current_version: &str,
-    changelog_markdown: &str,
+    changelog_markdown: impl FnOnce() -> &'a str,
 ) -> Option<StartupChangelog> {
     if has_existing_messages {
         return None;
@@ -2142,8 +2142,11 @@ fn prepare_startup_changelog_with_roots(
         return None;
     }
 
-    let markdown =
-        collect_startup_changelog_sections(changelog_markdown, current_version, last_seen_version)?;
+    let markdown = collect_startup_changelog_sections(
+        changelog_markdown(),
+        current_version,
+        last_seen_version,
+    )?;
     remember_version(config);
 
     if config.quiet_startup.unwrap_or(false) || config.collapse_changelog.unwrap_or(false) {
@@ -2213,7 +2216,7 @@ mod startup_changelog_tests {
             false,
             true,
             "0.1.9",
-            SAMPLE_CHANGELOG,
+            || SAMPLE_CHANGELOG,
         );
 
         let markdown = match result {
@@ -2234,6 +2237,37 @@ mod startup_changelog_tests {
             serde_json::from_str(&std::fs::read_to_string(&config_path).expect("settings file"))
                 .expect("valid settings json");
         assert_eq!(persisted["lastChangelogVersion"], "0.1.9");
+    }
+
+    #[test]
+    fn prepare_startup_changelog_does_not_read_current_changelog() {
+        let temp = tempdir();
+        let global_dir = temp.path().join("global");
+        let cwd = temp.path().join("cwd");
+        std::fs::create_dir_all(&global_dir).expect("global dir");
+        std::fs::create_dir_all(&cwd).expect("cwd dir");
+
+        let mut config = Config {
+            last_changelog_version: Some("0.1.9".to_string()),
+            ..Config::default()
+        };
+        let read = std::cell::Cell::new(false);
+        let result = prepare_startup_changelog_with_roots(
+            &mut config,
+            &global_dir,
+            &cwd,
+            None,
+            false,
+            false,
+            "0.1.9",
+            || {
+                read.set(true);
+                SAMPLE_CHANGELOG
+            },
+        );
+
+        assert!(result.is_none());
+        assert!(!read.get(), "current changelog should stay compressed");
     }
 }
 
@@ -2570,7 +2604,7 @@ impl PiApp {
             !messages.is_empty(),
             persist_startup_settings,
             VERSION,
-            include_str!("../CHANGELOG.md"),
+            crate::embedded_assets::changelog,
         );
 
         let mut app = Self {

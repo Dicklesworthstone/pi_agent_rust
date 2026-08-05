@@ -31,9 +31,8 @@ include = [
     "/Cargo.toml",
     "/LICENSE",
     "/README.md",
-    # Pulled in by `include_str!("../../CHANGELOG.md")` in
-    # src/interactive/commands.rs and src/interactive.rs — without it the
-    # `cargo publish --dry-run` verify step fails to build the packaged tarball.
+    # Compressed by build.rs and embedded by src/embedded_assets.rs; without it
+    # the `cargo publish --dry-run` verify step cannot build the packaged tarball.
     "/CHANGELOG.md",
     "/build.rs",
     "/src/**",
@@ -251,7 +250,7 @@ ast-grep-language = { version = "0.40", default-features = false, features = [
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
-sysinfo = "0.38.2"
+sysinfo = "0.39.6"
 rquickjs = { version = "0.11", features = ["futures", "loader"] }
 swc_common = "18.0.1"
 swc_ecma_codegen = "23.0.0"
@@ -267,6 +266,8 @@ filetime = "0.2.27"
 image = { version = "0.25", optional = true }
 
 [build-dependencies]
+crc32c = "0.6.8"
+flate2 = "1.1.9"
 vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
 
 [dev-dependencies]
@@ -280,7 +281,11 @@ jsonschema = { version = "0.42.0", default-features = false }
 proptest = "1.10.0"
 wat = "1.255.0"
 toml = "1.0.3"
-loom = "0.7.2"
+# Pinned to the reviewed upstream root-stack configurability change from
+# tokio-rs/loom#412. Loom 0.7.2 hard-codes the model root coroutine to 4 KiB,
+# which overflows before these hostcall models can begin exploring. The exact
+# revision is immutable and remains test-only until upstream publishes it.
+loom = { version = "0.7.2", git = "https://github.com/ongardie-atomix/loom", rev = "2b7c402034cc041b5e325384c67bb43bff93c048" }
 signal-hook = "0.4.4"
 
 [[bench]]

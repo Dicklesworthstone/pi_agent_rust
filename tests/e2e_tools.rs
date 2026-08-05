@@ -1209,27 +1209,26 @@ fn bash_process_tree_cleanup_on_timeout() {
     std::thread::sleep(std::time::Duration::from_millis(500));
 
     // If the PID file was created, verify the child process is gone
-    if pid_file.exists() {
-        if let Ok(pid_str) = std::fs::read_to_string(&pid_file) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                // Check if process still exists via kill -0 (signal check only)
-                let check = std::process::Command::new("kill")
-                    .args(["-0", &pid.to_string()])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                let still_alive = check.is_ok_and(|s| s.success());
-                h.log().info(
-                    "cleanup",
-                    format!("child pid={pid}, still_alive={still_alive}"),
-                );
-                // The child should have been killed
-                assert!(
-                    !still_alive,
-                    "child process {pid} should have been killed after timeout"
-                );
-            }
-        }
+    if pid_file.exists()
+        && let Ok(pid_str) = std::fs::read_to_string(&pid_file)
+        && let Ok(pid) = pid_str.trim().parse::<u32>()
+    {
+        // Check if process still exists via kill -0 (signal check only)
+        let check = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let still_alive = check.is_ok_and(|s| s.success());
+        h.log().info(
+            "cleanup",
+            format!("child pid={pid}, still_alive={still_alive}"),
+        );
+        // The child should have been killed
+        assert!(
+            !still_alive,
+            "child process {pid} should have been killed after timeout"
+        );
     }
 }
 

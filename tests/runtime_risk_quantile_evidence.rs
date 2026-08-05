@@ -299,12 +299,11 @@ fn e2e_quantile_quarantine_escalation_with_replay() {
                 context: None,
             };
             let result = dispatch_host_call_shared(&ctx, call).await;
-            if result.is_error {
-                if let Some(err) = result.error.as_ref() {
-                    if err.message.contains("quarantined") {
-                        saw_terminate = true;
-                    }
-                }
+            if result.is_error
+                && let Some(err) = result.error.as_ref()
+                && err.message.contains("quarantined")
+            {
+                saw_terminate = true;
             }
         }
         assert!(

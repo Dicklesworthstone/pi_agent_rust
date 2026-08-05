@@ -396,16 +396,16 @@ fn check_divergences(
         .collect();
     let mut divergences = Vec::new();
     for check in &candidate.checks {
-        if let Some(&reference_pass) = reference_checks.get(check.name.as_str()) {
-            if reference_pass != check.pass {
-                let mut divergence = String::with_capacity(check.name.len() + label.len() + 32);
-                let _ = write!(
-                    &mut divergence,
-                    "{}: node={}, {}={}",
-                    check.name, reference_pass, label, check.pass
-                );
-                divergences.push(divergence);
-            }
+        if let Some(&reference_pass) = reference_checks.get(check.name.as_str())
+            && reference_pass != check.pass
+        {
+            let mut divergence = String::with_capacity(check.name.len() + label.len() + 32);
+            let _ = write!(
+                &mut divergence,
+                "{}: node={}, {}={}",
+                check.name, reference_pass, label, check.pass
+            );
+            divergences.push(divergence);
         }
     }
     divergences
@@ -1034,10 +1034,10 @@ fn compat_harness_captures_node_bun_divergences() {
         .collect();
     let mut divergences = Vec::new();
     for check in &bun_result.checks {
-        if let Some(&node_pass) = node_checks.get(check.name.as_str()) {
-            if node_pass != check.pass {
-                divergences.push(check.name.clone());
-            }
+        if let Some(&node_pass) = node_checks.get(check.name.as_str())
+            && node_pass != check.pass
+        {
+            divergences.push(check.name.clone());
         }
     }
 

@@ -6,6 +6,34 @@ use pi::hostcall_queue::{
     BravoBiasMode, ContentionSample, ContentionSignature, HostcallQueueMode, HostcallRequestQueue,
 };
 
+// `generator`, which backs Loom's simulated threads, defaults to a 4 KiB
+// coroutine stack. The queue's contention classifier legitimately exceeds
+// that budget in debug/all-feature builds, causing the model to abort before
+// exploring any interleavings. Keep the model and assertions unchanged while
+// giving every simulated thread a deterministic, bounded stack.
+const LOOM_THREAD_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+fn spawn_loom_thread<F, T>(f: F) -> thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new()
+        .stack_size(LOOM_THREAD_STACK_BYTES)
+        .spawn(f)
+        .expect("spawn Loom thread")
+}
+
+// The reviewed upstream Loom revision exposes one default for the root and all
+// spawned model threads. Set it explicitly rather than relying on the
+// generator crate's 4 KiB default; individual Builder-spawned threads below
+// retain the same bound explicitly as defense in depth.
+fn check_loom_model(model: fn()) {
+    let mut builder = loom::model::Builder::new();
+    builder.stack_size = Some(LOOM_THREAD_STACK_BYTES);
+    builder.check(model);
+}
+
 struct PinGate {
     pin_ready: bool,
     release_pin: bool,
@@ -56,9 +84,8 @@ const fn mixed_sample() -> ContentionSample {
     }
 }
 
-#[test]
 fn loom_epoch_pin_blocks_reclamation_until_release() {
-    loom::model(|| {
+    check_loom_model(|| {
         let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
             1,
             2,
@@ -74,7 +101,7 @@ fn loom_epoch_pin_blocks_reclamation_until_release() {
 
         let queue_for_pin = Arc::clone(&queue);
         let pin_gate_for_thread = Arc::clone(&pin_gate);
-        let pin_thread = thread::spawn(move || {
+        let pin_thread = spawn_loom_thread(move || {
             let pin = queue_for_pin.lock().expect("lock queue").pin_epoch();
             mark_pin_ready(&pin_gate_for_thread);
             drop(pin);
@@ -82,7 +109,7 @@ fn loom_epoch_pin_blocks_reclamation_until_release() {
 
         let queue_for_worker = Arc::clone(&queue);
         let pin_gate_for_worker = Arc::clone(&pin_gate);
-        let worker = thread::spawn(move || {
+        let worker = spawn_loom_thread(move || {
             wait_until_pin_ready(&pin_gate_for_worker);
 
             let mut queue = queue_for_worker.lock().expect("lock queue");
@@ -113,9 +140,8 @@ fn loom_epoch_pin_blocks_reclamation_until_release() {
     });
 }
 
-#[test]
 fn loom_concurrent_enqueue_dequeue_keeps_values_unique() {
-    loom::model(|| {
+    check_loom_model(|| {
         let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
             2,
             2,
@@ -123,13 +149,13 @@ fn loom_concurrent_enqueue_dequeue_keeps_values_unique() {
         )));
 
         let queue_a = Arc::clone(&queue);
-        let producer_a = thread::spawn(move || {
+        let producer_a = spawn_loom_thread(move || {
             let mut queue = queue_a.lock().expect("lock queue");
             let _ = queue.push_back(10_u8);
         });
 
         let queue_b = Arc::clone(&queue);
-        let producer_b = thread::spawn(move || {
+        let producer_b = spawn_loom_thread(move || {
             let mut queue = queue_b.lock().expect("lock queue");
             let _ = queue.push_back(11_u8);
         });
@@ -146,9 +172,8 @@ fn loom_concurrent_enqueue_dequeue_keeps_values_unique() {
     });
 }
 
-#[test]
 fn loom_repeated_safe_fallback_switch_is_idempotent() {
-    loom::model(|| {
+    check_loom_model(|| {
         let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
             2,
             2,
@@ -156,13 +181,13 @@ fn loom_repeated_safe_fallback_switch_is_idempotent() {
         )));
 
         let queue_a = Arc::clone(&queue);
-        let switcher_a = thread::spawn(move || {
+        let switcher_a = spawn_loom_thread(move || {
             let mut queue = queue_a.lock().expect("lock queue");
             queue.force_safe_fallback();
         });
 
         let queue_b = Arc::clone(&queue);
-        let switcher_b = thread::spawn(move || {
+        let switcher_b = spawn_loom_thread(move || {
             let mut queue = queue_b.lock().expect("lock queue");
             queue.force_safe_fallback();
         });
@@ -176,9 +201,8 @@ fn loom_repeated_safe_fallback_switch_is_idempotent() {
     });
 }
 
-#[test]
 fn loom_bravo_writer_recovery_is_bounded_under_concurrent_starvation() {
-    loom::model(|| {
+    check_loom_model(|| {
         let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
             4,
             4,
@@ -186,13 +210,13 @@ fn loom_bravo_writer_recovery_is_bounded_under_concurrent_starvation() {
         )));
 
         let queue_a = Arc::clone(&queue);
-        let starvation_a = thread::spawn(move || {
+        let starvation_a = spawn_loom_thread(move || {
             let mut queue = queue_a.lock().expect("lock queue");
             let _ = queue.observe_contention_window(starvation_sample());
         });
 
         let queue_b = Arc::clone(&queue);
-        let starvation_b = thread::spawn(move || {
+        let starvation_b = spawn_loom_thread(move || {
             let mut queue = queue_b.lock().expect("lock queue");
             let _ = queue.observe_contention_window(starvation_sample());
         });
@@ -217,9 +241,8 @@ fn loom_bravo_writer_recovery_is_bounded_under_concurrent_starvation() {
     });
 }
 
-#[test]
 fn loom_bravo_writer_recovery_returns_to_balanced_without_stale_counters() {
-    loom::model(|| {
+    check_loom_model(|| {
         let queue = Arc::new(Mutex::new(HostcallRequestQueue::<u8>::with_mode(
             4,
             4,
@@ -227,7 +250,7 @@ fn loom_bravo_writer_recovery_returns_to_balanced_without_stale_counters() {
         )));
 
         let queue_for_starvation = Arc::clone(&queue);
-        let starvation_thread = thread::spawn(move || {
+        let starvation_thread = spawn_loom_thread(move || {
             let mut queue = queue_for_starvation.lock().expect("lock queue");
             let _ = queue.observe_contention_window(starvation_sample());
         });
@@ -248,4 +271,18 @@ fn loom_bravo_writer_recovery_returns_to_balanced_without_stale_counters() {
             ContentionSignature::MixedContention
         );
     });
+}
+
+#[test]
+fn loom_hostcall_queue_models() {
+    // The generator crate's process-global stack-overflow machinery can
+    // deadlock when several independent Loom models initialize concurrently.
+    // A single harness test runs every unchanged model and assertion in a
+    // deterministic sequence while each model still exhaustively schedules
+    // its own simulated threads.
+    loom_epoch_pin_blocks_reclamation_until_release();
+    loom_concurrent_enqueue_dequeue_keeps_values_unique();
+    loom_repeated_safe_fallback_switch_is_idempotent();
+    loom_bravo_writer_recovery_is_bounded_under_concurrent_starvation();
+    loom_bravo_writer_recovery_returns_to_balanced_without_stale_counters();
 }

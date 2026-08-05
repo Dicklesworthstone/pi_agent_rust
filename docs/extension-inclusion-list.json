@@ -1521,7 +1521,7 @@
       "license": "MIT",
       "score": 60.0,
       "provenance": {
-        "checksum_sha256": "f30bbefe1cafe5c97dc3811b42fd6ea3463c7c9cba72ea6d2a7291e453561389",
+        "checksum_sha256": "0aa1b88e3e7de47059af457a6a6635337a424f8b34a31e47b23001683c860573",
         "source_type": "git",
         "source_repo": "https://github.com/badlogic/pi-mono",
         "source_path": "packages/coding-agent/examples/extensions/doom-component.ts"
@@ -2100,7 +2100,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "101dc9871cb4edb92a70a150a448dbc9a9b725e1a3e71fcdabc8ff7353c04258",
+        "checksum_sha256": "5ecd58b26d58e41415e6c2b45bc408b1c598011c4447a7dbc6248c33b6dbd452",
         "source_type": "npm",
         "npm_package": "ogulcancelik-pi-sketch",
         "npm_version": "0.1.1"
@@ -2180,7 +2180,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "06e660432388303a270b6053566309458d177947e55a8f4701f1c55cac1b0e2f",
+        "checksum_sha256": "cf98e955a19bb579e4117a0878abcce650cc539d563ef8987da1107536ba8b6b",
         "source_type": "npm",
         "npm_package": "pi-annotate",
         "npm_version": "0.3.6"
@@ -2370,7 +2370,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "ab4b0e0267133ac5ff15f8864e5bd192d5097ca52e026cb63517a7d7c14898b8",
+        "checksum_sha256": "648ac76846fab38495eff900e8459f4446bb921bb063308ab76e8075f74040c8",
         "source_type": "npm",
         "npm_package": "pi-messenger",
         "npm_version": "0.8.2"
@@ -2434,7 +2434,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "dd264c074fefe7beb7bb5298d86009666951a9c6c504364b8b176d3a1dbb3be6",
+        "checksum_sha256": "5062226f7706474d7fa67a1835cd0428bf86d4e9087f0a4804608ad151048152",
         "source_type": "npm",
         "npm_package": "pi-multicodex",
         "npm_version": "1.0.2"
@@ -2459,7 +2459,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "aab4f0c8d44a39b306cc9a15256dc8fed516f9032cf5434b4ccc49e6ebcca027",
+        "checksum_sha256": "76957c026ee81629146b914d34dd32892ee2db62125d846af5470b516246cbf1",
         "source_type": "npm",
         "npm_package": "pi-notify",
         "npm_version": "1.0.3"
@@ -2499,7 +2499,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "6dca196820839176a66ccf3a9290b32de4a06b17ea6aa70c0c92d933f21b46cf",
+        "checksum_sha256": "faaee501cfc8824e12fc2003885f8b45975159fa90b6cec8ae4618290746a1fe",
         "source_type": "npm",
         "npm_package": "pi-prompt-template-model",
         "npm_version": "0.2.1"
@@ -2545,7 +2545,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "54824a3e7e92d2565adb6319a6849607db6b6fef54945459ec12659096b86c97",
+        "checksum_sha256": "702b84a720521184955491fd2ca72b6b0e15d86a9b1636f87d03fbddcf6bff69",
         "source_type": "npm",
         "npm_package": "pi-review-loop",
         "npm_version": "0.4.2"
@@ -2566,7 +2566,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "5b0abc4ebe179d072610d02f0294d90bac00b975a84f47d6034ca6e007b3f1c2",
+        "checksum_sha256": "cd5ac0eea7259bba6cf02dc7c0793336aa15ffe25bc7b0cfee8226d2172d22d5",
         "source_type": "npm",
         "npm_package": "pi-screenshots-picker",
         "npm_version": "1.1.10"
@@ -2608,7 +2608,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "f3c251c0f4f3be4ba3b97146b52179530d6675fa4949ba48fdd82c0708134d0f",
+        "checksum_sha256": "55eb623f2c2389218d0a6cd8c536df22fc2f54fb955fc0ce89dd70aca52be46c",
         "source_type": "npm",
         "npm_package": "pi-shadow-git",
         "npm_version": "2.1.0"
@@ -2820,7 +2820,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "a5de8dc38b5ec95d7cc6b0fbcd7b14e323a0fc2a664a18320ca8ef1ab8a2bff1",
+        "checksum_sha256": "62427a5f9452041963b260175572780d760599534dc0749ae66ed5154a71011b",
         "source_type": "npm",
         "npm_package": "pi-web-access",
         "npm_version": "0.7.2"
@@ -2905,7 +2905,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "af722a01c27ce97d24a3d5b561b201318fe4aa3dc2d20caaa6a3bd678d217321",
+        "checksum_sha256": "a198925c198669dcfcc5287ed9f5974d1a58ad43e3619b7a01903328b61602e7",
         "source_type": "npm",
         "npm_package": "tmustier-pi-arcade",
         "npm_version": "0.1.5"
@@ -3032,7 +3032,7 @@
       "source_tier": "npm-registry",
       "license": "MIT",
       "provenance": {
-        "checksum_sha256": "482c04ffc4c4dce864caa270629663cf422882ba1999389984ecca3a41ae026a",
+        "checksum_sha256": "8f6034974269cb16a2afd43af934ed82cc7f8c69a2c37ef7b4048aa39b531994",
         "source_type": "npm",
         "npm_package": "vpellegrino-pi-skills",
         "npm_version": "1.0.5"
@@ -3094,7 +3094,7 @@
       "license": "MIT",
       "score": 27.0,
       "provenance": {
-        "checksum_sha256": "6e0263edbbc673af68cf43d671e7d9d23046932cafd47557022520355a8147a4",
+        "checksum_sha256": "9d891ad9a87696e3ef20ffb7a1dbc1f30d89da0ad9d0f4f1323d7dd40cdf092c",
         "source_type": "npm",
         "npm_package": "zenobius-pi-dcp",
         "npm_version": "0.1.0"
@@ -3700,7 +3700,7 @@
       "license": "MIT",
       "score": 38.0,
       "provenance": {
-        "checksum_sha256": "e320494cd06919d6fd0caf0371805f353d24b7d6bd74dc2e48cb74a241f98098",
+        "checksum_sha256": "62e84c46cbfc81f24c6ae65bd318ab8719c4ca78994949b9a78a32418c401c2c",
         "source_type": "url"
       },
       "capabilities": [
@@ -3750,7 +3750,7 @@
       "license": "MIT",
       "score": 23.0,
       "provenance": {
-        "checksum_sha256": "4659a06686ba04a53360afb7b65d5e83869a73613bb6116dea06f98dc94b3e7a",
+        "checksum_sha256": "730c07065c338ff7cdf0124d39ffd7d5885771e50b83f27a1c6417f5c729010e",
         "source_type": "url"
       },
       "capabilities": [
@@ -4215,7 +4215,7 @@
       "license": "UNKNOWN",
       "score": 38.0,
       "provenance": {
-        "checksum_sha256": "186ff16f9e9facfb2467cda452d3f11307a55f1f8c62cf98e33679b8ebeaa791",
+        "checksum_sha256": "21eee9be6d91393d856e1db08abadf41b691c0f704ff68c4e00f37d5af510b7d",
         "source_type": "url"
       },
       "capabilities": [

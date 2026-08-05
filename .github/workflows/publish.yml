@@ -93,6 +93,8 @@ jobs:
             "refs/heads/master:${validation_master_ref}"
           tag_oid="$(git rev-parse "${tag_ref}")"
           remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
+          tag_type="$(git cat-file -t "${tag_ref}")"
+          remote_tag_type="$(git cat-file -t "${validation_tag_ref}")"
           tag_commit="$(git rev-parse "${tag_ref}^{commit}")"
           remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
           main_commit="$(git rev-parse "${validation_main_ref}^{commit}")"
@@ -104,6 +106,10 @@ jobs:
               exit 1
             fi
           done
+          if [ "$tag_type" != "tag" ] || [ "$remote_tag_type" != "tag" ]; then
+            echo "::error::Release validation requires an annotated tag object"
+            exit 1
+          fi
           if [ "$tag_oid" != "$remote_tag_oid" ] \
             || [ "$head_commit" != "$tag_commit" ] \
             || [ "$remote_commit" != "$tag_commit" ] \
@@ -149,19 +155,34 @@ jobs:
           tag_ref="refs/tags/${RELEASE_TAG}"
           validation_tag_ref="refs/release-validation/publish-validation/tag/${RELEASE_TAG}"
           validation_main_ref="refs/release-validation/publish-validation/main"
+          validation_master_ref="refs/release-validation/publish-validation/master"
           git fetch --no-tags --force origin \
             "${tag_ref}:${validation_tag_ref}" \
-            "refs/heads/main:${validation_main_ref}"
+            "refs/heads/main:${validation_main_ref}" \
+            "refs/heads/master:${validation_master_ref}"
           remote_tag_oid="$(git rev-parse "${validation_tag_ref}")"
           remote_commit="$(git rev-parse "${validation_tag_ref}^{commit}")"
           remote_main="$(git rev-parse "${validation_main_ref}^{commit}")"
+          remote_master="$(git rev-parse "${validation_master_ref}^{commit}")"
           head_commit="$(git rev-parse 'HEAD^{commit}')"
           if [ "$remote_tag_oid" != "$RELEASE_TAG_OID" ] \
             || [ "$head_commit" != "$RELEASE_COMMIT" ] \
             || [ "$remote_commit" != "$RELEASE_COMMIT" ] \
             || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || [ "$remote_main" != "$remote_master" ] \
             || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$remote_main"; then
             echo "::error::Frozen release validation source changed"
+            exit 1
+          fi
+
+      - name: Require canonical checkout before validation code executes
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain=v2 --untracked-files=all)" ] \
+            || ! git diff --quiet HEAD -- \
+            || ! git diff --cached --quiet HEAD -- \
+            || [ -n "$(git ls-files -v | grep -v '^H ' || true)" ]; then
+            echo "::error::Publish-validation checkout/index is not canonical"
             exit 1
           fi
 
@@ -171,22 +192,28 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
 
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master commit verified 2026-08-04
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # upstream commit verified 2026-08-04
         with:
           toolchain: nightly-2026-07-05
 
-      - name: Verify version matches tag
+      - name: Verify exact root package identity matches tag
+        id: package
         env:
           RELEASE_VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -euo pipefail
-          cargo_version="$(cargo metadata --no-deps --locked --format-version 1 \
-            | python3 -c 'import json, pathlib, sys; data=json.load(sys.stdin); root=pathlib.Path("Cargo.toml").resolve(); matches=[p for p in data["packages"] if pathlib.Path(p["manifest_path"]) == root]; assert len(matches) == 1; print(matches[0]["version"])')"
-          if [[ "$cargo_version" != "$RELEASE_VERSION" ]]; then
-            echo "Version mismatch: Cargo.toml=$cargo_version, tag=$RELEASE_VERSION"
+          package_fields="$(cargo metadata --no-deps --locked --format-version 1 \
+            | python3 -c 'import json, pathlib, sys; data=json.load(sys.stdin); root=pathlib.Path("Cargo.toml").resolve(); matches=[p for p in data["packages"] if pathlib.Path(p["manifest_path"]) == root]; assert len(matches) == 1; print(matches[0]["name"], matches[0]["version"])')"
+          read -r cargo_name cargo_version <<< "$package_fields"
+          if [[ "$cargo_name" != "pi_agent_rust" || "$cargo_version" != "$RELEASE_VERSION" ]]; then
+            echo "Package mismatch: root=${cargo_name}@${cargo_version}, expected=pi_agent_rust@${RELEASE_VERSION}"
             exit 1
           fi
-          echo "Version verified: $cargo_version"
+          {
+            echo "name=$cargo_name"
+            echo "version=$cargo_version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Package identity verified: ${cargo_name}@${cargo_version}"
 
       - name: Run release gate
         env:
@@ -215,8 +242,112 @@ jobs:
           path: ${{ runner.temp }}/pi-publish-release-gate-report.json
           if-no-files-found: error
 
-      - name: Dry run publish
-        run: cargo publish --dry-run --locked
+      - name: Require canonical checkout after validation code executes
+        run: |
+          set -euo pipefail
+          if [ -n "$(git status --porcelain=v2 --untracked-files=all)" ] \
+            || ! git diff --quiet HEAD -- \
+            || ! git diff --cached --quiet HEAD -- \
+            || [ -n "$(git ls-files -v | grep -v '^H ' || true)" ]; then
+            echo "::error::Release-gate execution mutated the validation checkout/index"
+            exit 1
+          fi
+
+      - name: Dry run and inspect exact source package
+        env:
+          RELEASE_COMMIT: ${{ needs.plan.outputs.commit }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          cargo publish --dry-run --locked
+          crate_path="target/package/${PACKAGE_NAME}-${PACKAGE_VERSION}.crate"
+          if [ ! -f "$crate_path" ] || [ -L "$crate_path" ] || [ ! -s "$crate_path" ]; then
+            echo "::error::Publish dry run did not produce the expected regular .crate"
+            exit 1
+          fi
+          CRATE_PATH="$crate_path" python3 - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import subprocess
+          import tarfile
+          import tomllib
+          from pathlib import Path, PurePosixPath
+
+          def strict_object(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      raise SystemExit(f"duplicate package metadata key: {key!r}")
+                  result[key] = value
+              return result
+
+          def head_blob(path):
+              entry = subprocess.run(
+                  ["git", "ls-tree", "HEAD", "--", path], capture_output=True, text=True, check=True
+              ).stdout.strip().split()
+              if len(entry) < 4 or entry[0] not in {"100644", "100755"} or entry[1] != "blob":
+                  raise SystemExit(f"packaged path is not a regular tracked HEAD blob: {path}")
+              return subprocess.run(
+                  ["git", "show", f"HEAD:{path}"], capture_output=True, check=True
+              ).stdout
+
+          crate_path = Path(os.environ["CRATE_PATH"])
+          data = crate_path.read_bytes()
+          if len(data) > 50 * 1024 * 1024:
+              raise SystemExit("dry-run crate exceeds the 50 MiB validation cap")
+          prefix = f"{os.environ['PACKAGE_NAME']}-{os.environ['PACKAGE_VERSION']}"
+          saw_vcs = saw_original = saw_normalized = False
+          with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
+              members = archive.getmembers()
+              names = [member.name.rstrip("/") for member in members]
+              if len(names) != len(set(names)):
+                  raise SystemExit("dry-run crate contains duplicate paths")
+              for member, name in zip(members, names, strict=True):
+                  parts = name.split("/")
+                  path = PurePosixPath(name)
+                  if "\\" in name or name.startswith("/") or not parts or parts[0] != prefix \
+                      or any(part in {"", ".", ".."} for part in parts):
+                      raise SystemExit(f"unsafe dry-run crate path: {name!r}")
+                  if member.isdir():
+                      continue
+                  if not member.isreg() or member.issym() or member.islnk():
+                      raise SystemExit(f"non-regular dry-run crate entry: {name!r}")
+                  extracted = archive.extractfile(member)
+                  if extracted is None:
+                      raise SystemExit(f"unreadable dry-run crate entry: {name!r}")
+                  member_bytes = extracted.read()
+                  relative = PurePosixPath(*path.parts[1:]).as_posix()
+                  if relative == ".cargo_vcs_info.json":
+                      vcs = json.loads(member_bytes, object_pairs_hook=strict_object)
+                      if not isinstance(vcs, dict) \
+                          or not set(vcs).issubset({"git", "path_in_vcs"}) \
+                          or not isinstance(vcs.get("git"), dict) \
+                          or set(vcs["git"]) not in ({"sha1"}, {"sha1", "dirty"}) \
+                          or vcs["git"].get("sha1") != os.environ["RELEASE_COMMIT"] \
+                          or vcs["git"].get("dirty", False) is not False:
+                          raise SystemExit("dry-run crate VCS metadata differs from the frozen commit")
+                      if "path_in_vcs" in vcs and vcs["path_in_vcs"] != "":
+                          raise SystemExit("root package has unexpected path_in_vcs metadata")
+                      saw_vcs = True
+                  elif relative == "Cargo.toml.orig":
+                      if member_bytes != head_blob("Cargo.toml"):
+                          raise SystemExit("Cargo.toml.orig differs from frozen HEAD")
+                      saw_original = True
+                  elif relative == "Cargo.toml":
+                      normalized = tomllib.loads(member_bytes.decode("utf-8"))
+                      if normalized.get("package", {}).get("name") != os.environ["PACKAGE_NAME"] \
+                          or normalized.get("package", {}).get("version") != os.environ["PACKAGE_VERSION"]:
+                          raise SystemExit("normalized package identity differs")
+                      saw_normalized = True
+                  elif member_bytes != head_blob(relative):
+                      raise SystemExit(f"packaged bytes differ from frozen HEAD: {relative}")
+          if not (saw_vcs and saw_original and saw_normalized):
+              raise SystemExit("dry-run crate is missing required Cargo/VCS metadata")
+          print(f"Verified dry-run crate sha256={hashlib.sha256(data).hexdigest()} size={len(data)}")
+          PY
 
       - name: Revalidate frozen source after dry run
         env:
@@ -228,15 +359,26 @@ jobs:
           set -euo pipefail
           validation_tag_ref="refs/release-validation/final-publish-validation/tag/${RELEASE_TAG}"
           validation_main_ref="refs/release-validation/final-publish-validation/main"
+          validation_master_ref="refs/release-validation/final-publish-validation/master"
           git fetch --no-tags --force origin \
             "refs/tags/${RELEASE_TAG}:${validation_tag_ref}" \
-            "refs/heads/main:${validation_main_ref}"
-          if [ "$(git rev-parse "${validation_tag_ref}")" != "$RELEASE_TAG_OID" ] \
+            "refs/heads/main:${validation_main_ref}" \
+            "refs/heads/master:${validation_master_ref}"
+          if [ "$(git cat-file -t "${validation_tag_ref}")" != "tag" ] \
+            || [ "$(git rev-parse "${validation_tag_ref}")" != "$RELEASE_TAG_OID" ] \
             || [ "$(git rev-parse "${validation_tag_ref}^{commit}")" != "$RELEASE_COMMIT" ] \
             || [ "$(git rev-parse 'HEAD^{commit}')" != "$RELEASE_COMMIT" ] \
             || [ "$RELEASE_COMMIT" != "$RELEASE_MAIN_COMMIT" ] \
+            || [ "$(git rev-parse "${validation_main_ref}^{commit}")" != "$(git rev-parse "${validation_master_ref}^{commit}")" ] \
             || ! git merge-base --is-ancestor "$RELEASE_MAIN_COMMIT" "$(git rev-parse "${validation_main_ref}^{commit}")"; then
             echo "::error::Frozen release source changed during publish validation"
+            exit 1
+          fi
+          if [ -n "$(git status --porcelain=v2 --untracked-files=all)" ] \
+            || ! git diff --quiet HEAD -- \
+            || ! git diff --cached --quiet HEAD -- \
+            || [ -n "$(git ls-files -v | grep -v '^H ' || true)" ]; then
+            echo "::error::Publish validation mutated the canonical checkout/index"
             exit 1
           fi
 
@@ -246,5 +388,6 @@ jobs:
             echo "## Crates.io package validation"
             echo ""
             echo "Validated pi_agent_rust v${{ needs.plan.outputs.version }} with cargo publish --dry-run."
-            echo "No registry mutation is performed by this workflow; release.yml owns publication."
+            echo "This is a non-authoritative manual diagnostic: no registry mutation is performed."
+            echo "Only release.yml's full frozen-SHA gate and ordered reconciliation may authorize publication."
           } >> "$GITHUB_STEP_SUMMARY"

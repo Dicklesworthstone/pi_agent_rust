@@ -2420,12 +2420,12 @@ fn validate_phase1_matrix_validation_record(record: &Value) -> Result<(), String
                         "weighted_bottleneck_attribution.global_ranking stage {stage} has ci95_lower_pct ({lower}) > ci95_upper_pct ({upper})"
                     ));
                 }
-                if let Some(mean) = mean_share_pct {
-                    if mean < lower || mean > upper {
-                        return Err(format!(
-                            "weighted_bottleneck_attribution.global_ranking stage {stage} mean_share_pct ({mean}) must lie within CI [{lower}, {upper}]"
-                        ));
-                    }
+                if let Some(mean) = mean_share_pct
+                    && (mean < lower || mean > upper)
+                {
+                    return Err(format!(
+                        "weighted_bottleneck_attribution.global_ranking stage {stage} mean_share_pct ({mean}) must lie within CI [{lower}, {upper}]"
+                    ));
                 }
             }
             let sample_size = ranking_obj

@@ -94,6 +94,100 @@ fn ensure_no_symlink_parent(root: &Path, relative: &Path) -> Result<(), String> 
     Ok(())
 }
 
+type GitPathRecords = BTreeMap<String, (String, String)>;
+
+fn parse_git_tree_records(output: &[u8]) -> Result<GitPathRecords, String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let separator = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| "malformed git ls-tree record".to_string())?;
+            let (metadata, path_with_separator) = record.split_at(separator);
+            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 3 || fields[1] != b"blob" {
+                return Err("release-source tree contains a non-blob entry".to_string());
+            }
+            let mode = std::str::from_utf8(fields[0])
+                .map_err(|err| format!("non-UTF-8 Git mode: {err}"))?
+                .to_string();
+            let oid = std::str::from_utf8(fields[2])
+                .map_err(|err| format!("non-UTF-8 Git object ID: {err}"))?
+                .to_string();
+            let path = std::str::from_utf8(&path_with_separator[1..])
+                .map_err(|err| format!("release-source path is not UTF-8: {err}"))?
+                .to_string();
+            Ok((path, (mode, oid)))
+        })
+        .collect()
+}
+
+fn parse_git_index_records(output: &[u8]) -> Result<GitPathRecords, String> {
+    output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty())
+        .map(|record| {
+            let separator = record
+                .iter()
+                .position(|byte| *byte == b'\t')
+                .ok_or_else(|| "malformed git index record".to_string())?;
+            let (metadata, path_with_separator) = record.split_at(separator);
+            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
+            if fields.len() != 3 || fields[2] != b"0" {
+                return Err("release-source index contains a non-stage-zero entry".to_string());
+            }
+            let path = std::str::from_utf8(&path_with_separator[1..])
+                .map_err(|err| format!("release-source index path is not UTF-8: {err}"))?
+                .to_string();
+            let mode = std::str::from_utf8(fields[0])
+                .map_err(|err| format!("non-UTF-8 index mode: {err}"))?
+                .to_string();
+            let oid = std::str::from_utf8(fields[1])
+                .map_err(|err| format!("non-UTF-8 index object ID: {err}"))?
+                .to_string();
+            Ok((path, (mode, oid)))
+        })
+        .collect()
+}
+
+fn verify_release_worktree(
+    root: &Path,
+    index_records: &GitPathRecords,
+    allowed_worktree_changes: &HashSet<&str>,
+) -> Result<(), String> {
+    for (path, (mode, expected_oid)) in index_records {
+        let relative = Path::new(path);
+        ensure_no_symlink_parent(root, relative)?;
+        let full_path = root.join(relative);
+        let metadata = std::fs::symlink_metadata(&full_path).map_err(|err| {
+            format!("failed to inspect release-source worktree path {path}: {err}")
+        })?;
+        let contents = match mode.as_str() {
+            "100644" | "100755" if metadata.file_type().is_file() => std::fs::read(&full_path)
+                .map_err(|err| format!("failed to read release-source path {path}: {err}"))?,
+            "120000" if metadata.file_type().is_symlink() => std::fs::read_link(&full_path)
+                .map_err(|err| format!("failed to read release-source symlink {path}: {err}"))?
+                .as_os_str()
+                .as_encoded_bytes()
+                .to_vec(),
+            _ => {
+                return Err(format!(
+                    "release-source worktree type differs from HEAD for {path}"
+                ));
+            }
+        };
+        let actual_oid = git_blob_oid(&contents, expected_oid.len())?;
+        if actual_oid != *expected_oid && !allowed_worktree_changes.contains(path.as_str()) {
+            return Err(format!(
+                "release-source worktree bytes differ from HEAD for {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Capture the exact source commit and the SHA-256 of the canonical
 /// `git ls-tree -r -z --full-tree HEAD` byte stream. The worktree and index are
 /// independently proven byte-for-byte equal to that tree before evidence is
@@ -147,61 +241,8 @@ fn release_source_provenance(
         return Err("release-source worktree contains untracked non-ignored paths".to_string());
     }
 
-    let tree_records = tree
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-        .map(|record| {
-            let separator = record
-                .iter()
-                .position(|byte| *byte == b'\t')
-                .ok_or_else(|| "malformed git ls-tree record".to_string())?;
-            let (metadata, path_with_separator) = record.split_at(separator);
-            let path = &path_with_separator[1..];
-            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
-            if fields.len() != 3 || fields[1] != b"blob" {
-                return Err("release-source tree contains a non-blob entry".to_string());
-            }
-            let mode = std::str::from_utf8(fields[0])
-                .map_err(|err| format!("non-UTF-8 Git mode: {err}"))?
-                .to_string();
-            let oid = std::str::from_utf8(fields[2])
-                .map_err(|err| format!("non-UTF-8 Git object ID: {err}"))?
-                .to_string();
-            let path = std::str::from_utf8(path)
-                .map_err(|err| format!("release-source path is not UTF-8: {err}"))?
-                .to_string();
-            Ok((path, (mode, oid)))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
-
-    let index_records = index
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|record| !record.is_empty())
-        .map(|record| {
-            let separator = record
-                .iter()
-                .position(|byte| *byte == b'\t')
-                .ok_or_else(|| "malformed git index record".to_string())?;
-            let (metadata, path_with_separator) = record.split_at(separator);
-            let path = &path_with_separator[1..];
-            let fields = metadata.split(|byte| *byte == b' ').collect::<Vec<_>>();
-            if fields.len() != 3 || fields[2] != b"0" {
-                return Err("release-source index contains a non-stage-zero entry".to_string());
-            }
-            let path = std::str::from_utf8(path)
-                .map_err(|err| format!("release-source index path is not UTF-8: {err}"))?
-                .to_string();
-            let mode = std::str::from_utf8(fields[0])
-                .map_err(|err| format!("non-UTF-8 index mode: {err}"))?
-                .to_string();
-            let oid = std::str::from_utf8(fields[1])
-                .map_err(|err| format!("non-UTF-8 index object ID: {err}"))?
-                .to_string();
-            Ok((path, (mode, oid)))
-        })
-        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let tree_records = parse_git_tree_records(&tree.stdout)?;
+    let index_records = parse_git_index_records(&index.stdout)?;
     if tree_records != index_records {
         return Err("release-source index differs from HEAD".to_string());
     }
@@ -218,34 +259,7 @@ fn release_source_provenance(
         );
     }
 
-    for (path, (mode, expected_oid)) in &index_records {
-        let relative = Path::new(path);
-        ensure_no_symlink_parent(root, relative)?;
-        let full_path = root.join(relative);
-        let metadata = std::fs::symlink_metadata(&full_path).map_err(|err| {
-            format!("failed to inspect release-source worktree path {path}: {err}")
-        })?;
-        let contents = match mode.as_str() {
-            "100644" | "100755" if metadata.file_type().is_file() => std::fs::read(&full_path)
-                .map_err(|err| format!("failed to read release-source path {path}: {err}"))?,
-            "120000" if metadata.file_type().is_symlink() => std::fs::read_link(&full_path)
-                .map_err(|err| format!("failed to read release-source symlink {path}: {err}"))?
-                .as_os_str()
-                .as_encoded_bytes()
-                .to_vec(),
-            _ => {
-                return Err(format!(
-                    "release-source worktree type differs from HEAD for {path}"
-                ));
-            }
-        };
-        let actual_oid = git_blob_oid(&contents, expected_oid.len())?;
-        if actual_oid != *expected_oid && !allowed_worktree_changes.contains(path.as_str()) {
-            return Err(format!(
-                "release-source worktree bytes differ from HEAD for {path}"
-            ));
-        }
-    }
+    verify_release_worktree(root, &index_records, allowed_worktree_changes)?;
 
     let head_after = git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     if !head_after.status.success()
@@ -1128,8 +1142,8 @@ fn generate_conformance_report_impl() {
         "generated_at": summary_now.to_rfc3339_opts(SecondsFormat::Secs, true),
         "run_id": summary_run_id,
         "correlation_id": summary_correlation_id,
-        "git_commit": git_commit.clone(),
-        "source_tree_sha256": source_tree_sha256.clone(),
+        "git_commit": git_commit,
+        "source_tree_sha256": source_tree_sha256,
         "counts": {
             "total": total,
             "pass": pass,

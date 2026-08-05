@@ -815,12 +815,12 @@ fn validation_broker_fault_corpus_covers_build_storm_and_stale_recovery() -> Tes
         if decision.reusable_slot != scenario.expected.reusable_slot {
             return Err(scenario_reusable_slot_mismatch(&scenario.scenario_id));
         }
-        if let Some(expected_artifacts) = scenario.expected.coalesced_artifacts {
-            if decision.coalesced_artifacts.len() != expected_artifacts {
-                return Err(scenario_coalesced_artifact_count_mismatch(
-                    &scenario.scenario_id,
-                ));
-            }
+        if let Some(expected_artifacts) = scenario.expected.coalesced_artifacts
+            && decision.coalesced_artifacts.len() != expected_artifacts
+        {
+            return Err(scenario_coalesced_artifact_count_mismatch(
+                &scenario.scenario_id,
+            ));
         }
         for (source_id, expected_state) in &scenario.expected.source_statuses {
             let Some(actual_status) = decision

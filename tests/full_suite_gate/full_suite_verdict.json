@@ -1,6 +1,6 @@
 {
   "schema": "pi.ci.full_suite_gate.v1",
-  "generated_at": "2026-08-04T07:06:47.752Z",
+  "generated_at": "2026-08-04T22:32:23.874Z",
   "verdict": "fail",
   "policy": "Full-suite gate: all blocking gates must pass for release. Non-blocking gates produce warnings but do not block.",
   "gates": [
@@ -137,7 +137,7 @@
       "status": "fail",
       "blocking": true,
       "artifact_path": "tests/full_suite_gate/practical_finish_checkpoint.json",
-      "detail": "Practical-finish checkpoint blocked: 43 technical PERF-3X issue(s) still open (bd-3ar8v.1.2, bd-3ar8v.2.12, bd-3ar8v.2.8, bd-3ar8v.3.11, bd-3ar8v.3.6, ...)",
+      "detail": "Practical-finish checkpoint blocked: 48 technical PERF-3X issue(s) still open (bd-3ar8v.1.2, bd-3ar8v.2.12, bd-3ar8v.2.8, bd-3ar8v.3.11, bd-3ar8v.3.6, ...)",
       "reproduce_command": "cargo test --test ci_full_suite_gate -- practical_finish_report_fails_when_technical_open_issues_remain --nocapture --exact"
     },
     {

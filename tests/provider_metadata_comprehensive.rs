@@ -231,16 +231,16 @@ fn native_adapter_providers_routing_defaults_are_consistent() {
     // max_tokens, etc.) but their base_url is typically empty because they
     // construct URLs from provider-specific config (project/region/deployment).
     for meta in PROVIDER_METADATA {
-        if meta.onboarding == ProviderOnboardingMode::NativeAdapterRequired {
-            if let Some(defaults) = &meta.routing_defaults {
-                // Native providers with routing_defaults should have an
-                // API identifier (non-empty).
-                assert!(
-                    !defaults.api.is_empty(),
-                    "native-adapter provider '{}' has routing_defaults but empty api",
-                    meta.canonical_id
-                );
-            }
+        if meta.onboarding == ProviderOnboardingMode::NativeAdapterRequired
+            && let Some(defaults) = &meta.routing_defaults
+        {
+            // Native providers with routing_defaults should have an
+            // API identifier (non-empty).
+            assert!(
+                !defaults.api.is_empty(),
+                "native-adapter provider '{}' has routing_defaults but empty api",
+                meta.canonical_id
+            );
         }
     }
 }
@@ -251,14 +251,14 @@ fn all_oai_compatible_base_urls_are_nonempty() {
     // base_url because they construct endpoints from provider-specific config.
     // Only OpenAI-compatible presets require a non-empty base_url.
     for meta in PROVIDER_METADATA {
-        if meta.onboarding == ProviderOnboardingMode::OpenAICompatiblePreset {
-            if let Some(defaults) = &meta.routing_defaults {
-                assert!(
-                    !defaults.base_url.is_empty(),
-                    "OAI-compatible provider '{}' has empty base_url",
-                    meta.canonical_id
-                );
-            }
+        if meta.onboarding == ProviderOnboardingMode::OpenAICompatiblePreset
+            && let Some(defaults) = &meta.routing_defaults
+        {
+            assert!(
+                !defaults.base_url.is_empty(),
+                "OAI-compatible provider '{}' has empty base_url",
+                meta.canonical_id
+            );
         }
     }
 }

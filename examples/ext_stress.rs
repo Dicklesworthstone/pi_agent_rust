@@ -602,23 +602,23 @@ async fn run_loop(
             next_event = catch_up + interval;
         }
 
-        if let Some(next_rss_due) = next_rss {
-            if Instant::now() >= next_rss_due {
-                let sample = resource_probe.sample(start.elapsed().as_secs());
-                if sample.rss_bytes > max_rss_bytes {
-                    max_rss_bytes = sample.rss_bytes;
-                }
-                if sample.process_cpu_pct > max_cpu_usage_pct {
-                    max_cpu_usage_pct = sample.process_cpu_pct;
-                }
-                if collect {
-                    resource_samples.push(sample);
-                }
-                if collect {
-                    push_reactor_queue_sample(manager, start.elapsed(), &mut reactor_queue_samples);
-                }
-                next_rss = Some(next_rss_due + Duration::from_secs(rss_interval_secs));
+        if let Some(next_rss_due) = next_rss
+            && Instant::now() >= next_rss_due
+        {
+            let sample = resource_probe.sample(start.elapsed().as_secs());
+            if sample.rss_bytes > max_rss_bytes {
+                max_rss_bytes = sample.rss_bytes;
             }
+            if sample.process_cpu_pct > max_cpu_usage_pct {
+                max_cpu_usage_pct = sample.process_cpu_pct;
+            }
+            if collect {
+                resource_samples.push(sample);
+            }
+            if collect {
+                push_reactor_queue_sample(manager, start.elapsed(), &mut reactor_queue_samples);
+            }
+            next_rss = Some(next_rss_due + Duration::from_secs(rss_interval_secs));
         }
     }
 

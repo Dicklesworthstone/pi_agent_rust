@@ -660,7 +660,7 @@ test_proxy_args_are_applied_to_curl_downloads() {
 
 test_linux_target_uses_supported_linux_artifact_naming() {
   local dir artifact checksum curl_log
-  dir="$(case_dir "linux-target-musl")"
+  dir="$(case_dir "linux-target-gnu")"
   write_existing_pi_stub "$dir"
   write_uname_stub "$dir" "Linux" "x86_64"
   write_curl_artifact_stub "$dir"
@@ -681,8 +681,8 @@ test_linux_target_uses_supported_linux_artifact_naming() {
     --no-agent-skills
 
   assert_exit_code "$dir" 0
-  if ! grep -Eq "pi_linux_amd64|x86_64-unknown-linux-musl" "$curl_log"; then
-    echo "expected linux-amd64 or musl artifact URL candidate" >&2
+  if ! grep -Eq "pi_linux_amd64|x86_64-unknown-linux-gnu" "$curl_log"; then
+    echo "expected linux-amd64 or GNU artifact URL candidate" >&2
     cat "$curl_log" >&2
     return 1
   fi

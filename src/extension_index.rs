@@ -1247,9 +1247,6 @@ fn non_empty(value: &str) -> Option<String> {
 // Seed Index (Bundled)
 // ============================================================================
 
-const SEED_ARTIFACT_PROVENANCE_JSON: &str =
-    include_str!("../docs/extension-artifact-provenance.json");
-
 #[derive(Debug, Deserialize)]
 struct ArtifactProvenance {
     #[serde(rename = "$schema")]
@@ -1290,7 +1287,8 @@ enum ArtifactProvenanceSource {
 }
 
 pub fn seed_index() -> Result<ExtensionIndex> {
-    let provenance: ArtifactProvenance = serde_json::from_str(SEED_ARTIFACT_PROVENANCE_JSON)?;
+    let provenance: ArtifactProvenance =
+        serde_json::from_str(&crate::embedded_assets::extension_artifact_provenance_json())?;
     let generated_at = provenance.generated;
 
     let mut entries = Vec::with_capacity(provenance.items.len());

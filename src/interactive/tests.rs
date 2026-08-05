@@ -147,7 +147,7 @@ fn prepare_startup_changelog_skips_disk_write_when_persistence_disabled() {
         false,
         false,
         "1.0.0",
-        changelog,
+        || changelog,
     );
 
     assert_eq!(
@@ -182,7 +182,7 @@ fn prepare_startup_changelog_writes_when_persistence_enabled() {
         false,
         true,
         "1.0.0",
-        "## 1.0.0\n- Added startup changelog notices\n\n## 0.9.0\n- Previous release\n",
+        || "## 1.0.0\n- Added startup changelog notices\n\n## 0.9.0\n- Previous release\n",
     );
 
     assert!(matches!(startup, Some(StartupChangelog::Full { .. })));

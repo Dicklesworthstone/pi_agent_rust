@@ -183,12 +183,12 @@ fn scenario_matrix_replay_commands_reference_valid_suites() {
             .and_then(|v| v.as_array());
         if let Some(ids) = suite_ids {
             for id in ids {
-                if let Some(s) = id.as_str() {
-                    if !classified.contains(s) {
-                        invalid_refs.push(format!(
-                            "{workflow_id}: suite_id '{s}' not in suite_classification.toml"
-                        ));
-                    }
+                if let Some(s) = id.as_str()
+                    && !classified.contains(s)
+                {
+                    invalid_refs.push(format!(
+                        "{workflow_id}: suite_id '{s}' not in suite_classification.toml"
+                    ));
                 }
             }
         }
@@ -227,32 +227,32 @@ fn gate_reproduce_commands_reference_valid_targets() {
     let mut invalid_refs: Vec<String> = Vec::new();
     let mut checked = 0;
 
-    if let Some(v) = &verdict {
-        if let Some(gates) = v["gates"].as_array() {
-            for gate in gates {
-                let gate_id = gate["id"].as_str().unwrap_or("unknown");
-                if let Some(cmd) = gate.get("reproduce_command").and_then(|v| v.as_str()) {
-                    if cmd.is_empty() {
-                        continue;
-                    }
-                    checked += 1;
+    if let Some(v) = &verdict
+        && let Some(gates) = v["gates"].as_array()
+    {
+        for gate in gates {
+            let gate_id = gate["id"].as_str().unwrap_or("unknown");
+            if let Some(cmd) = gate.get("reproduce_command").and_then(|v| v.as_str()) {
+                if cmd.is_empty() {
+                    continue;
+                }
+                checked += 1;
 
-                    // Extract test target from cargo test command
-                    if let Some(target) = extract_cargo_test_target(cmd) {
-                        if classified.contains(&target) {
-                            eprintln!("  [OK] {gate_id}: target '{target}' is valid");
-                        } else {
-                            invalid_refs.push(format!(
-                                "gate '{gate_id}': reproduce_command references unknown test target '{target}'"
-                            ));
-                            eprintln!("  [INVALID] {gate_id}: target '{target}' not classified");
-                        }
-                    } else if cmd.contains("python3") || cmd.contains("scripts/") {
-                        // Script-based commands are valid by definition
-                        eprintln!("  [OK] {gate_id}: script command");
+                // Extract test target from cargo test command
+                if let Some(target) = extract_cargo_test_target(cmd) {
+                    if classified.contains(&target) {
+                        eprintln!("  [OK] {gate_id}: target '{target}' is valid");
                     } else {
-                        eprintln!("  [WARN] {gate_id}: could not extract test target from: {cmd}");
+                        invalid_refs.push(format!(
+                            "gate '{gate_id}': reproduce_command references unknown test target '{target}'"
+                        ));
+                        eprintln!("  [INVALID] {gate_id}: target '{target}' not classified");
                     }
+                } else if cmd.contains("python3") || cmd.contains("scripts/") {
+                    // Script-based commands are valid by definition
+                    eprintln!("  [OK] {gate_id}: script command");
+                } else {
+                    eprintln!("  [WARN] {gate_id}: could not extract test target from: {cmd}");
                 }
             }
         }
@@ -484,12 +484,39 @@ fn generate_and_validate_replay_bundle() {
     let verdict_path = report_dir.join("full_suite_verdict.json");
     let mut failed_gates: Vec<GateReplayEntry> = Vec::new();
 
-    if let Some(v) = load_json(&verdict_path) {
-        if let Some(gates) = v["gates"].as_array() {
-            for gate in gates {
-                let status = gate["status"].as_str().unwrap_or("pass");
-                if status == "fail" {
-                    let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
+    if let Some(v) = load_json(&verdict_path)
+        && let Some(gates) = v["gates"].as_array()
+    {
+        for gate in gates {
+            let status = gate["status"].as_str().unwrap_or("pass");
+            if status == "fail" {
+                let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
+                let gate_name = gate["name"].as_str().unwrap_or("unknown").to_string();
+                let cmd = gate
+                    .get("reproduce_command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                failed_gates.push(GateReplayEntry {
+                    gate_id,
+                    gate_name,
+                    reproduce_command: cmd,
+                });
+            }
+        }
+    }
+
+    // ── Read preflight verdict for failed blocking gates ──
+    let preflight_path = report_dir.join("preflight_verdict.json");
+    if let Some(pf) = load_json(&preflight_path)
+        && let Some(blocking) = pf["blocking_gates"].as_array()
+    {
+        for gate in blocking {
+            let status = gate["status"].as_str().unwrap_or("pass");
+            if status == "fail" {
+                let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
+                // Avoid duplicates
+                if !failed_gates.iter().any(|g| g.gate_id == gate_id) {
                     let gate_name = gate["name"].as_str().unwrap_or("unknown").to_string();
                     let cmd = gate
                         .get("reproduce_command")
@@ -501,33 +528,6 @@ fn generate_and_validate_replay_bundle() {
                         gate_name,
                         reproduce_command: cmd,
                     });
-                }
-            }
-        }
-    }
-
-    // ── Read preflight verdict for failed blocking gates ──
-    let preflight_path = report_dir.join("preflight_verdict.json");
-    if let Some(pf) = load_json(&preflight_path) {
-        if let Some(blocking) = pf["blocking_gates"].as_array() {
-            for gate in blocking {
-                let status = gate["status"].as_str().unwrap_or("pass");
-                if status == "fail" {
-                    let gate_id = gate["id"].as_str().unwrap_or("unknown").to_string();
-                    // Avoid duplicates
-                    if !failed_gates.iter().any(|g| g.gate_id == gate_id) {
-                        let gate_name = gate["name"].as_str().unwrap_or("unknown").to_string();
-                        let cmd = gate
-                            .get("reproduce_command")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-                        failed_gates.push(GateReplayEntry {
-                            gate_id,
-                            gate_name,
-                            reproduce_command: cmd,
-                        });
-                    }
                 }
             }
         }
@@ -549,16 +549,15 @@ fn generate_and_validate_replay_bundle() {
     // ── Validate all replay commands reference valid targets ──
     let mut all_valid = true;
     for gate in &failed_gates {
-        if !gate.reproduce_command.is_empty() {
-            if let Some(target) = extract_cargo_test_target(&gate.reproduce_command) {
-                if !classified.contains(&target) {
-                    eprintln!(
-                        "  [INVALID] gate '{}' references unknown target '{}'",
-                        gate.gate_id, target
-                    );
-                    all_valid = false;
-                }
-            }
+        if !gate.reproduce_command.is_empty()
+            && let Some(target) = extract_cargo_test_target(&gate.reproduce_command)
+            && !classified.contains(&target)
+        {
+            eprintln!(
+                "  [INVALID] gate '{}' references unknown target '{}'",
+                gate.gate_id, target
+            );
+            all_valid = false;
         }
     }
 

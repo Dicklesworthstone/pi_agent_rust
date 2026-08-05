@@ -293,10 +293,10 @@ fn run_cli(
         buf
     });
 
-    if let Some(input) = stdin {
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(input).expect("write stdin");
-        }
+    if let Some(input) = stdin
+        && let Some(mut child_stdin) = child.stdin.take()
+    {
+        child_stdin.write_all(input).expect("write stdin");
     }
 
     let timeout = Duration::from_secs(DEFAULT_CLI_TIMEOUT_SECS);

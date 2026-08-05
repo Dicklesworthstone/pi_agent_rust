@@ -171,11 +171,11 @@ fn ope_numeric_instability_fails_closed_and_stays_serializable() {
     serde_json::to_string(&report).expect("report must serialize");
 }
 
-fn target_policy_reward(context: f64) -> f64 {
+const fn target_policy_reward(context: f64) -> f64 {
     context.mul_add(0.5, 0.25)
 }
 
-fn behavior_only_reward(context: f64) -> f64 {
+const fn behavior_only_reward(context: f64) -> f64 {
     context.mul_add(0.2, 0.10)
 }
 

@@ -1,6 +1,6 @@
 # QA Certification Dossier
 
-> Generated: 2026-08-04T12:28:52.772Z
+> Generated: 2026-08-04T23:06:43.632Z
 > Bead: bd-1f42.8.10
 > Verdict: **PASS_WITH_RESIDUALS**
 
@@ -30,7 +30,7 @@ The covered workflows have structured E2E evidence. 19/21 workflows covered (90%
 Evidence:
 - `docs/e2e_scenario_matrix.json`
 - `scripts/e2e/run_all.sh`
-- `tests/ci_full_suite_gate.rs (80 tests)`
+- `tests/ci_full_suite_gate.rs (106 tests)`
 - `tests/e2e_replay_bundles.rs (10 tests pass)`
 - `docs/qa-runbook.md`
 - `docs/ci-operator-runbook.md`

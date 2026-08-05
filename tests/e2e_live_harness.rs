@@ -166,14 +166,15 @@ fn scan_for_unredacted_header_pairs(value: &Value, path: &str, leaks: &mut Vec<S
             }
         }
         Value::Array(items) => {
-            if items.len() == 2 {
-                if let (Some(key), Some(raw)) = (items[0].as_str(), items[1].as_str()) {
-                    if is_sensitive_key(key) && !raw.is_empty() && raw != REDACTED_VALUE {
-                        leaks.push(format!(
-                            "{path}[\"{key}\"] contains unredacted sensitive value"
-                        ));
-                    }
-                }
+            if items.len() == 2
+                && let (Some(key), Some(raw)) = (items[0].as_str(), items[1].as_str())
+                && is_sensitive_key(key)
+                && !raw.is_empty()
+                && raw != REDACTED_VALUE
+            {
+                leaks.push(format!(
+                    "{path}[\"{key}\"] contains unredacted sensitive value"
+                ));
             }
             for (index, child) in items.iter().enumerate() {
                 scan_for_unredacted_header_pairs(child, &format!("{path}[{index}]"), leaks);

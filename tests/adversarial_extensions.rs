@@ -36,10 +36,13 @@ fn load_ext(harness: &common::TestHarness, source: &str) -> ExtensionManager {
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
-    let js_config = PiJsRuntimeConfig {
+    let mut js_config = PiJsRuntimeConfig {
         cwd: cwd.display().to_string(),
         ..Default::default()
     };
+    js_config
+        .env
+        .insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
 
     let runtime = common::run_async({
         let manager = manager.clone();
@@ -76,10 +79,13 @@ fn try_load_ext(source: &str) -> Result<(), String> {
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
-    let js_config = PiJsRuntimeConfig {
+    let mut js_config = PiJsRuntimeConfig {
         cwd: cwd.display().to_string(),
         ..Default::default()
     };
+    js_config
+        .env
+        .insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
 
     let runtime = common::run_async({
         let manager = manager.clone();
@@ -115,7 +121,7 @@ fn eval_adversarial_with_memory_limit(source: &str, memory_limit_bytes: usize) -
 
     let manager = ExtensionManager::new();
     let tools = Arc::new(ToolRegistry::new(&[], &cwd, None));
-    let js_config = PiJsRuntimeConfig {
+    let mut js_config = PiJsRuntimeConfig {
         cwd: cwd.display().to_string(),
         limits: PiJsRuntimeLimits {
             memory_limit_bytes: Some(memory_limit_bytes),
@@ -123,6 +129,9 @@ fn eval_adversarial_with_memory_limit(source: &str, memory_limit_bytes: usize) -
         },
         ..Default::default()
     };
+    js_config
+        .env
+        .insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
 
     let runtime = common::run_async({
         let manager = manager.clone();

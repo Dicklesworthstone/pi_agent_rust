@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tempfile::TempDir;
 
 // ─── Paths ──────────────────────────────────────────────────────────────────
 
@@ -480,6 +481,86 @@ fn resolve_extension_path(extension_id: &str, items: &[SampleItem]) -> Option<Pa
     None
 }
 
+/// Copy a focused base-fixture entry into a one-entry root before loading it.
+///
+/// The production loader deliberately discovers sibling `index.*` files so a
+/// multi-entry extension package can be loaded from any declared entrypoint.
+/// `base_fixtures`, however, is a test corpus containing independent positive
+/// and negative extensions as siblings. Focused scenario fixtures must not let
+/// an intentionally-invalid sibling poison the selected case.
+struct FocusedFixtureIsolation {
+    entry_path: PathBuf,
+    // Keep the temporary root alive for as long as the isolated entry path is
+    // in use. The leading underscore documents the lifetime-only purpose and
+    // prevents an all-target Clippy run from treating it as dead state.
+    _root: TempDir,
+}
+
+fn copy_fixture_tree(source: &Path, destination: &Path) -> Result<(), String> {
+    fs::create_dir(destination)
+        .map_err(|error| format!("create isolated fixture directory: {error}"))?;
+    let entries = fs::read_dir(source)
+        .map_err(|error| format!("read focused scenario fixture directory: {error}"))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("read focused scenario fixture entry: {error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("inspect focused scenario fixture entry: {error}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_fixture_tree(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            fs::copy(&source_path, &destination_path)
+                .map_err(|error| format!("copy focused scenario fixture file: {error}"))?;
+        } else {
+            return Err(format!(
+                "focused scenario fixture contains unsupported filesystem entry: {}",
+                source_path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn isolate_focused_base_fixture_entry(
+    extension_path: &Path,
+) -> Result<FocusedFixtureIsolation, String> {
+    let base_fixtures = artifacts_dir().join("base_fixtures");
+    if !extension_path.starts_with(&base_fixtures) {
+        return Err(format!(
+            "focused fixture path is outside base_fixtures: {}",
+            extension_path.display()
+        ));
+    }
+
+    let fixture_dir = extension_path
+        .parent()
+        .ok_or_else(|| "focused scenario fixture has no parent directory".to_string())?;
+    let fixture_id = fixture_dir
+        .file_name()
+        .ok_or_else(|| "focused scenario fixture has no fixture id".to_string())?;
+    let relative_entry = extension_path
+        .strip_prefix(fixture_dir)
+        .map_err(|error| format!("resolve focused scenario fixture entry: {error}"))?;
+    let prefix = format!(
+        "pi-ext-scenario-fixture-{}-",
+        sanitize_path_for_dir(Path::new(fixture_id))
+    );
+    let root = tempfile::Builder::new()
+        .prefix(&prefix)
+        .tempdir()
+        .map_err(|error| format!("create isolated scenario fixture root: {error}"))?;
+    let isolated_fixture_dir = root.path().join(fixture_id);
+    copy_fixture_tree(fixture_dir, &isolated_fixture_dir)?;
+
+    Ok(FocusedFixtureIsolation {
+        entry_path: isolated_fixture_dir.join(relative_entry),
+        _root: root,
+    })
+}
+
 struct LoadedExtension {
     manager: ExtensionManager,
     runtime: JsExtensionRuntimeHandle,
@@ -508,6 +589,7 @@ fn load_extension(extension_path: &Path) -> Result<LoadedExtension, String> {
     env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
     env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
     env.insert("HOME".to_string(), settings.home.clone());
+    env.insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
     if let Some(random_value) = settings.random_value {
         env.insert("PI_DETERMINISTIC_RANDOM".to_string(), random_value);
     } else {
@@ -1966,6 +2048,7 @@ fn load_extension_with_mocks(
     env.insert("PI_DETERMINISTIC_CWD".to_string(), settings.cwd.clone());
     env.insert("PI_DETERMINISTIC_HOME".to_string(), settings.home.clone());
     env.insert("HOME".to_string(), settings.home.clone());
+    env.insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
     if let Some(random_value) = settings.random_value {
         env.insert("PI_DETERMINISTIC_RANDOM".to_string(), random_value);
     } else {
@@ -2584,14 +2667,34 @@ fn run_scenario(
             ..base
         });
     };
+    let fixture_isolation = if item.is_some_and(|item| item.source_tier == "fixture") {
+        match isolate_focused_base_fixture_entry(&ext_path) {
+            Ok(isolation) => Some(isolation),
+            Err(error) => {
+                return finalize_scenario_result(ScenarioResult {
+                    status: "error".to_string(),
+                    error: Some(error),
+                    duration_ms: u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
+                    ..base
+                });
+            }
+        }
+    } else {
+        None
+    };
+    let load_path = fixture_isolation
+        .as_ref()
+        .map_or(ext_path.as_path(), |isolation| {
+            isolation.entry_path.as_path()
+        });
 
     // Decide whether to use mock-based or plain loader
     if needs_mock_loader(scenario) {
-        return run_scenario_with_mocks(ext, scenario, &ext_path, start, base);
+        return run_scenario_with_mocks(ext, scenario, load_path, start, base);
     }
 
     // Load extension (plain path - no mocks needed)
-    let loaded = match load_extension(&ext_path) {
+    let loaded = match load_extension(load_path) {
         Ok(loaded) => loaded,
         Err(err) => {
             return finalize_scenario_result(ScenarioResult {
@@ -3104,6 +3207,34 @@ fn load_scenario_fixture(name: &str) -> (ScenarioExtension, Vec<SampleItem>) {
     };
 
     (extension, vec![item])
+}
+
+#[test]
+fn focused_fixture_isolation_preserves_identity_and_assets() {
+    let original = artifacts_dir().join("base_fixtures/minimal_resources/index.ts");
+    let isolation = isolate_focused_base_fixture_entry(&original).expect("isolate focused fixture");
+
+    let spec = JsExtensionLoadSpec::from_entry_path(&isolation.entry_path)
+        .expect("derive isolated extension spec");
+    assert_eq!(spec.extension_id, "minimal_resources");
+    let isolated_fixture_dir = isolation
+        .entry_path
+        .parent()
+        .expect("isolated fixture directory");
+    assert!(
+        isolated_fixture_dir
+            .join("prompts/test-prompt.md")
+            .is_file()
+    );
+    assert!(isolated_fixture_dir.join("skills/test-skill.md").is_file());
+    assert!(
+        !isolation
+            ._root
+            .path()
+            .join("negative_invalid_tool_schema")
+            .exists(),
+        "focused isolation must not copy sibling fixtures"
+    );
 }
 
 #[test]

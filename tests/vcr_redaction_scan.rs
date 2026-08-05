@@ -59,17 +59,15 @@ fn check_headers_redacted(headers: &serde_json::Value, path: &str) -> Vec<String
     let mut violations = Vec::new();
     if let Some(arr) = headers.as_array() {
         for (i, pair) in arr.iter().enumerate() {
-            if let Some(pair_arr) = pair.as_array() {
-                if pair_arr.len() >= 2 {
-                    if let (Some(key), Some(value)) = (pair_arr[0].as_str(), pair_arr[1].as_str()) {
-                        let key_lower = key.to_ascii_lowercase();
-                        if SENSITIVE_HEADERS.iter().any(|h| key_lower == *h)
-                            && !is_header_value_redacted(value)
-                        {
-                            violations
-                                .push(format!("{path}[{i}]: header '{key}' has unredacted value"));
-                        }
-                    }
+            if let Some(pair_arr) = pair.as_array()
+                && pair_arr.len() >= 2
+                && let (Some(key), Some(value)) = (pair_arr[0].as_str(), pair_arr[1].as_str())
+            {
+                let key_lower = key.to_ascii_lowercase();
+                if SENSITIVE_HEADERS.iter().any(|h| key_lower == *h)
+                    && !is_header_value_redacted(value)
+                {
+                    violations.push(format!("{path}[{i}]: header '{key}' has unredacted value"));
                 }
             }
         }
@@ -113,23 +111,21 @@ fn scan_cassette(cassette: &serde_json::Value, filename: &str) -> Vec<String> {
         }
 
         // Check response body_chunks for unredacted JSON fields
-        if let Some(chunks) = interaction.pointer("/response/body_chunks") {
-            if let Some(arr) = chunks.as_array() {
-                for (ci, chunk) in arr.iter().enumerate() {
-                    if let Some(chunk_str) = chunk.as_str() {
-                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(chunk_str) {
-                            let chunk_leaks = find_unredacted_keys(&parsed);
-                            for leak in chunk_leaks {
-                                // Skip allowlisted response-body fields (synthetic test values).
-                                let is_allowed = RESPONSE_BODY_ALLOWLIST
-                                    .iter()
-                                    .any(|(f, suffix)| *f == filename && leak.ends_with(suffix));
-                                if !is_allowed {
-                                    violations.push(format!(
-                                        "{prefix}.response.body_chunks[{ci}].{leak}"
-                                    ));
-                                }
-                            }
+        if let Some(chunks) = interaction.pointer("/response/body_chunks")
+            && let Some(arr) = chunks.as_array()
+        {
+            for (ci, chunk) in arr.iter().enumerate() {
+                if let Some(chunk_str) = chunk.as_str()
+                    && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(chunk_str)
+                {
+                    let chunk_leaks = find_unredacted_keys(&parsed);
+                    for leak in chunk_leaks {
+                        // Skip allowlisted response-body fields (synthetic test values).
+                        let is_allowed = RESPONSE_BODY_ALLOWLIST
+                            .iter()
+                            .any(|(f, suffix)| *f == filename && leak.ends_with(suffix));
+                        if !is_allowed {
+                            violations.push(format!("{prefix}.response.body_chunks[{ci}].{leak}"));
                         }
                     }
                 }

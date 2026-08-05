@@ -1,15 +1,21 @@
 //! Provenance verification evidence log (bd-bc2z).
 //!
 //! This test verifies that every vendored extension artifact is byte-for-byte
-//! identical to its upstream source by cross-checking:
+//! identical to the integrity snapshot recorded in both repository manifests
+//! by cross-checking:
 //!
 //! 1. On-disk SHA-256 directory digest (computed fresh each run)
 //! 2. `extension-master-catalog.json` checksum
 //! 3. `extension-artifact-provenance.json` checksum
 //!
-//! It generates a structured evidence log at
+//! It does not fetch or compare the mutable upstream repository. The
+//! provenance manifest records that source separately, while these checksums
+//! bind the exact vendored (and, where documented, adapted) corpus bytes.
+//!
+//! It verifies the committed structured evidence log at
 //! `tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json`
-//! for auditability.
+//! for auditability. Maintainers can regenerate that file explicitly with
+//! `PI_GENERATE_PROVENANCE_VERIFICATION=1`.
 
 use pi::conformance::snapshot::{SourceTier, digest_artifact_dir, validate_directory, validate_id};
 use serde::{Deserialize, Serialize};
@@ -282,8 +288,9 @@ fn provenance_verification_evidence_log() {
         });
     }
 
-    // Note any known exceptions
-    // (Currently there are none - all artifacts should be unmodified upstream)
+    // Note any known integrity exceptions. Source provenance and any vendored
+    // adaptations are documented in the manifest; they are not inferred from
+    // this repository-local byte-integrity check.
 
     #[allow(clippy::cast_precision_loss)]
     let pass_rate = if all_ids.is_empty() {
@@ -306,31 +313,12 @@ fn provenance_verification_evidence_log() {
         exceptions,
     };
 
-    // Write evidence log
     let evidence_json = serde_json::to_string_pretty(&evidence).expect("serialize evidence log");
-
     let output_path =
         repo_root.join("tests/ext_conformance/artifacts/PROVENANCE_VERIFICATION.json");
-    fs::write(&output_path, &evidence_json).expect("write evidence log");
 
-    // Print summary for test output
-    eprintln!(
-        "\n=== Provenance Verification Summary ===\n\
-         Total: {}\n\
-         Verified OK: {}\n\
-         Failed: {}\n\
-         Exceptions: {}\n\
-         Pass Rate: {:.1}%\n\
-         Evidence log: {}\n",
-        evidence.summary.total_artifacts,
-        evidence.summary.verified_ok,
-        evidence.summary.failed,
-        evidence.summary.exceptions,
-        evidence.summary.pass_rate * 100.0,
-        output_path.display()
-    );
-
-    // Collect failure details for assertion message
+    // Collect failure details before touching the committed evidence. A failed
+    // verification must never overwrite the last reviewed PASS artifact.
     let failure_details: Vec<String> = evidence
         .artifacts
         .iter()
@@ -343,5 +331,61 @@ fn provenance_verification_evidence_log() {
         "Provenance verification failed for {} artifacts:\n{}",
         fail_count,
         failure_details.join("\n")
+    );
+
+    let generate = matches!(
+        std::env::var("PI_GENERATE_PROVENANCE_VERIFICATION").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        fs::write(&output_path, format!("{evidence_json}\n")).expect("write evidence log");
+    } else {
+        let committed_json = fs::read_to_string(&output_path)
+            .expect("read committed provenance verification evidence");
+        let mut committed: serde_json::Value = serde_json::from_str(&committed_json)
+            .expect("parse committed provenance verification evidence");
+        let mut computed: serde_json::Value = serde_json::from_str(&evidence_json)
+            .expect("parse computed provenance verification evidence");
+
+        // `generated_at` is informational; all integrity-bearing fields must
+        // match exactly, while ordinary test runs remain read-only and stable.
+        let committed_generated_at = committed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        let computed_generated_at = computed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        assert!(
+            committed_generated_at.is_some(),
+            "committed provenance evidence is missing generated_at"
+        );
+        assert!(
+            computed_generated_at.is_some(),
+            "computed provenance evidence is missing generated_at"
+        );
+        assert_eq!(
+            committed, computed,
+            "committed provenance evidence is stale; regenerate explicitly with \
+             PI_GENERATE_PROVENANCE_VERIFICATION=1 cargo test \
+             --test ext_provenance_verification provenance_verification_evidence_log -- --exact"
+        );
+    }
+
+    // Print summary for test output
+    eprintln!(
+        "\n=== Provenance Verification Summary ===\n\
+         Total: {}\n\
+         Verified OK: {}\n\
+         Failed: {}\n\
+         Exceptions: {}\n\
+         Pass Rate: {:.1}%\n\
+         Evidence log: {} ({})\n",
+        evidence.summary.total_artifacts,
+        evidence.summary.verified_ok,
+        evidence.summary.failed,
+        evidence.summary.exceptions,
+        evidence.summary.pass_rate * 100.0,
+        output_path.display(),
+        if generate { "generated" } else { "verified" }
     );
 }

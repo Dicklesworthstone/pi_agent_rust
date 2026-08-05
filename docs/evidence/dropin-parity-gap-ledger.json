@@ -2,7 +2,7 @@
   "schema": "pi.dropin.parity_gap_ledger.v1",
   "bead_id": "bd-13pqz",
   "generated_at_utc": "2026-02-14T19:16:00Z",
-  "last_updated_at_utc": "2026-08-04T19:03:36Z",
+  "last_updated_at_utc": "2026-08-04T23:48:36Z",
   "status": "active",
   "baseline_reference": "docs/dropin-upstream-baseline.json",
   "inventory_references": [
@@ -58,7 +58,7 @@
       "verification_evidence": [
         "tests/extension_flag_passthrough.rs - comprehensive integration tests",
         "tests/cli_edge_cases.rs - 40+ edge case test functions",
-        "G04 certification gate marked as pass in docs/evidence/dropin-certification-verdict.json"
+        "Historical G04 pass evidence for source 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8 is retained in the verdict blob at artifact commit 2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91; the live docs/evidence/dropin-certification-verdict.json remains the only authority for current release claims"
       ],
       "owner_issue_primary": "bd-2cd9b",
       "owner_issue_supporting": [
@@ -171,12 +171,12 @@
         "docs/dropin-112-feature-inventory-matrix.md#section:5-slash-commands"
       ],
       "final_state": "tests/dropin_slash_differential.rs now requires real mirrored Rust Pi/pi-mono RPC success for every credential-free RPC-observable slash scenario. UI-only, process-exit, invalid parser, and model-dependent compaction scenarios are explicit policy exclusions from pass evidence and continue to fail closed if counted.",
-      "release_claim_impact": "No longer blocks strict drop-in replacement claims. G04 and G10 may rely on the real mirrored slash-command differential evidence for the credential-free pass-evidence set.",
+      "release_claim_impact": "This individual gap was closed for the recorded evidence run. G04 and G10 may rely on the real mirrored slash-command differential evidence only when it is rerun and provenance-matched to the release source; this row does not independently authorize strict drop-in wording.",
       "closure_path": [
         "Provisioned the pinned legacy pi-mono runtime on the RCH worker used for the proof so legacy_pi_mono_code/pi-mono/node_modules/tsx/dist/cli.mjs is runnable.",
         "Required pass evidence to come only from slash inputs that map to credential-free shared RPC commands.",
         "Kept UI-only, process-exit, invalid parser, and model-dependent compaction scenarios fail-closed and out of pass evidence with explicit observability policy.",
-        "Regenerated docs/evidence/dropin-differential-evidence-suite.json and docs/evidence/dropin-certification-verdict.json after the runner produced non-synthetic pass evidence."
+        "Regenerated the differential suite and verdict artifacts for the historical 2026-05-18 evidence run after the runner produced non-synthetic pass evidence; later live artifacts may supersede those historical file contents."
       ],
       "verification_evidence": [
         "rch exec -- cargo test --test dropin_slash_differential -- --nocapture passed 12/12 on ts2 at 2026-05-18T19:37:26Z",
@@ -441,7 +441,7 @@
       ],
       "verification_evidence": [
         "docs/contracts/dropin-certification-contract.json: strict replacement requires a provenance-valid CERTIFIED verdict",
-        "docs/evidence/dropin-certification-verdict.json: the artifact reports CERTIFIED with no blockers for recorded source 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8; it does not certify the current release source",
+        "Git blob 2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json historically reported CERTIFIED with no blockers for recorded source 52e9fbfb24352045985b59df9d7ea63f1f8f2ef8; this is a historical fact, not a description of the live verdict file or current release source",
         "docs/integrator-migration-playbook.md and docs/testing-policy.md keep strict drop-in language gated by the certification verdict"
       ],
       "blocked_by": []

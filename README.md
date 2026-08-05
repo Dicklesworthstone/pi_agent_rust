@@ -583,9 +583,9 @@ From:
 - `tests/ext_conformance/reports/journeys/journey_report.json` (generated `2026-05-13T02:59:58.302Z`)
 - `tests/evidence_bundle/index.json` (generated `2026-05-12T19:26:21.441Z`, run `local-20260512T192621Z`)
 - `tests/full_suite_gate/certification_verdict.json` (generated `2026-05-14T19:59:37.227Z`)
-- `docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z`)
+- Historical verdict blob at `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91:docs/evidence/dropin-certification-verdict.json` (generated `2026-05-18T19:37:26Z` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8`; the live file may contain a later verdict)
 
-- Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for the artifact's recorded revision only *(from docs/evidence/dropin-certification-verdict.json; it does not certify `v0.2.0`)*
+- Historical strict drop-in result: **22/22 certification gates PASS, 16/16 blocking gates PASS** - `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the Git-pinned historical verdict blob above; it neither describes the live verdict file nor certifies `v0.2.0`)*
 - Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json)*
 - Historical extension gate: `123/123` then-observed must-pass extensions passed; informational stretch set `100/101` passed with one non-blocking stretch failure *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json)*
 - Extension health delta: `223/223` tested extensions passed (`100.0%`), `0` regressions, `13` fixes vs the 2026-02-07 baseline, with `1` intentionally excluded test fixture disclosed in the report *(from tests/ext_conformance/reports/health_delta/health_delta_report.json)*
@@ -607,10 +607,10 @@ curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/ma
 curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --yes --easy-mode
 
 # Pin a release tag
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | bash -s -- --version v0.2.0
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.2.0/install.sh" | bash -s -- --version v0.2.0
 
 # Install from explicit artifact URL + checksum URL
-curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/main/install.sh?$(date +%s)" | \
+curl -fsSL "https://raw.githubusercontent.com/Dicklesworthstone/pi_agent_rust/v0.2.0/install.sh" | \
   bash -s -- \
     --artifact-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.2.0/pi-linux-amd64.tar.xz" \
     --checksum-url "https://github.com/Dicklesworthstone/pi_agent_rust/releases/download/v0.2.0/SHA256SUMS"
@@ -1972,7 +1972,7 @@ Current checked-in performance evidence state:
 Historical certification/evidence refresh (`2026-05-15` progress SLO closeout; `2026-05-15` extension gate; `2026-05-14` full-suite reports; `2026-05-18` drop-in certification verdict). These results do not certify the current source revision or `v0.2.0`:
 - Unified evidence bundle: `29/29` sections present, `0` missing, `0` invalid *(from tests/evidence_bundle/index.json)*
 - Full-suite gate: `20/20` gates passed, including `14/14` blocking gates *(from tests/full_suite_gate/full_suite_verdict.json)*
-- Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for the artifact's recorded revision only *(from docs/evidence/dropin-certification-verdict.json)*
+- Historical drop-in result: `22/22` certification gates passed, overall verdict `CERTIFIED` for source `52e9fbfb24352045985b59df9d7ea63f1f8f2ef8` only *(from the verdict blob stored at Git revision `2fc4b8c0b77ded267cf5e0f517f4b6fa87f45e91`, not from the live verdict file)*
 - Historical extension gate: `123/123` then-observed must-pass extensions passed; stretch set `100/101` passed with only non-blocking stretch failures *(from tests/ext_conformance/reports/gate/must_pass_gate_verdict.json)*
 - Context-intelligence closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, redaction posture, perf-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/context-intelligence-closeout-gate.json)*
 - Progress SLO closeout gate: `pass`, with child Beads mapped to code, tests, docs/evidence, validation commands, pushed commits, source-boundary checks, stress-budget evidence, README freshness, staged UBS, and Beads ledger reconciliation *(from docs/evidence/swarm-progress-slo-closeout-gate.json)*
@@ -2798,7 +2798,22 @@ Releases are tag-driven and must align with `Cargo.toml` versions.
 - Tag format: `vX.Y.Z` (pre-releases like `vX.Y.Z-rc.N` are allowed but skip crates.io publish).
 - The tag version **must** match `package.version` in `Cargo.toml`.
 - Publish order for dependencies: `asupersync` → `rich_rust` → `charmed-*` (lipgloss, bubbletea, bubbles, glamour) → `pi_agent_rust`.
-- `.github/workflows/publish.yml` handles crates.io publish when `CARGO_REGISTRY_TOKEN` is set.
+- `.github/workflows/release.yml` owns the ordered release boundary: verified
+  GitHub draft, exact stable crate publication/reconciliation on a fresh
+  review-gated runner, then public GitHub release last. Pre-releases skip
+  crates.io. `.github/workflows/publish.yml` is a manual dry-run diagnostic;
+  it has no registry secret and never publishes.
+- The no-Actions DSR lane is specified in [docs/releasing.md](docs/releasing.md).
+  It is fail-closed. For v0.2.0, the audited preserved wrapper is authorized
+  only to produce five raw binaries plus its aggregate build manifest; a
+  separate source-bound deterministic stage creates the exact 12 public assets.
+  Publication uses the checksum-gated Cargo credential provider materialized
+  from the frozen release workflow; a plain `cargo:token` publish is forbidden.
+  Immutable `v*` tag ruleset `20418963` was created and read back on 2026-08-04
+  with update/deletion forbidden and no bypass actors. The manual lane
+  re-verifies that live control before tagging and publication and stops on any
+  drift; the automated lane remains disabled until its separate
+  protected-environment governance is configured.
 
 ### Coverage
 

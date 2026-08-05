@@ -109,11 +109,12 @@ fn read_all_ts_sources(dir: &Path) -> String {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().is_some_and(|e| e == "ts" || e == "js") {
-                if let Ok(text) = fs::read_to_string(&path) {
-                    content.push_str(&text);
-                    content.push('\n');
-                }
+            if path.is_file()
+                && path.extension().is_some_and(|e| e == "ts" || e == "js")
+                && let Ok(text) = fs::read_to_string(&path)
+            {
+                content.push_str(&text);
+                content.push('\n');
             }
             if path.is_dir() {
                 content.push_str(&read_all_ts_sources(&path));
@@ -137,37 +138,36 @@ fn detect_artifact_license(
         "license.md",
     ] {
         let path = dir.join(name);
-        if path.is_file() {
-            if let Ok(content) = fs::read_to_string(&path) {
-                let license = detect_license_from_content(&content);
-                if license != License::Unknown {
-                    return (license, "license_file");
-                }
+        if path.is_file()
+            && let Ok(content) = fs::read_to_string(&path)
+        {
+            let license = detect_license_from_content(&content);
+            if license != License::Unknown {
+                return (license, "license_file");
             }
         }
     }
 
     // Strategy 2: Check package.json license field
     let pkg_path = dir.join("package.json");
-    if pkg_path.is_file() {
-        if let Ok(content) = fs::read_to_string(&pkg_path) {
-            if let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(spdx) = pkg.get("license").and_then(serde_json::Value::as_str) {
-                    let license = detect_license_from_spdx(spdx);
-                    if license != License::Unknown {
-                        return (license, "package_json");
-                    }
-                }
-            }
+    if pkg_path.is_file()
+        && let Ok(content) = fs::read_to_string(&pkg_path)
+        && let Ok(pkg) = serde_json::from_str::<serde_json::Value>(&content)
+        && let Some(spdx) = pkg.get("license").and_then(serde_json::Value::as_str)
+    {
+        let license = detect_license_from_spdx(spdx);
+        if license != License::Unknown {
+            return (license, "package_json");
         }
     }
 
     // Strategy 3: Use provenance manifest license
-    if let Some(prov_license) = provenance_license {
-        if prov_license != "UNKNOWN" && !prov_license.is_empty() {
-            let license = detect_license_from_spdx(prov_license);
-            return (license, "provenance_manifest");
-        }
+    if let Some(prov_license) = provenance_license
+        && prov_license != "UNKNOWN"
+        && !prov_license.is_empty()
+    {
+        let license = detect_license_from_spdx(prov_license);
+        return (license, "provenance_manifest");
     }
 
     (License::Unknown, "none")

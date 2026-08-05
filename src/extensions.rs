@@ -17747,6 +17747,10 @@ fn short_warm_pool_fingerprint(fingerprint: &str) -> &str {
 /// `exit_signal`.
 pub struct JsExtensionRuntimeHandle {
     sender: mpsc::Sender<JsRuntimeCommand>,
+    /// Frozen compatibility policy from the runtime config. This is shared
+    /// with the manager-side static-registration fallback so every
+    /// conformance-only behavior observes the same per-runtime decision.
+    compat_scan_mode: bool,
     /// Receives `()` when the runtime thread exits its event loop.
     /// Wrapped in `Arc<Mutex<Option<_>>>` so only the first `shutdown()`
     /// caller actually awaits the signal.
@@ -17757,6 +17761,7 @@ impl Clone for JsExtensionRuntimeHandle {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            compat_scan_mode: self.compat_scan_mode,
             exit_signal: Arc::clone(&self.exit_signal),
         }
     }
@@ -17814,6 +17819,7 @@ impl JsExtensionRuntimeHandle {
         interceptor: Option<Arc<dyn HostcallInterceptor>>,
         policy: Option<ExtensionPolicy>,
     ) -> Result<Self> {
+        let compat_scan_mode = config.compat_scan_mode();
         let (tx, mut rx) = mpsc::channel(32);
         let (init_tx, mut init_rx) = oneshot::channel();
         let (exit_tx, exit_rx) = oneshot::channel();
@@ -18296,8 +18302,13 @@ impl JsExtensionRuntimeHandle {
 
         Ok(Self {
             sender: tx,
+            compat_scan_mode,
             exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
         })
+    }
+
+    pub(crate) const fn compat_scan_mode(&self) -> bool {
+        self.compat_scan_mode
     }
 
     /// Request the JS runtime thread to shut down gracefully.
@@ -19506,6 +19517,13 @@ mod native_runtime_duplicate_scaffold {
             match self {
                 Self::Js(_) => "quickjs",
                 Self::NativeRust(_) => "native-rust",
+            }
+        }
+
+        pub(super) const fn compat_scan_mode(&self) -> bool {
+            match self {
+                Self::Js(runtime) => runtime.compat_scan_mode(),
+                Self::NativeRust(_) => false,
             }
         }
 
@@ -28482,7 +28500,7 @@ impl ExtensionManager {
             .collect::<Vec<_>>();
         let extension_roots = collect_extension_roots_from_paths(&entry_paths);
 
-        let compat_hints_by_extension = if compat_static_registration_enabled() {
+        let compat_hints_by_extension = if runtime.compat_scan_mode() {
             Some(build_compat_registration_hints(&specs))
         } else {
             None
@@ -30415,18 +30433,6 @@ impl CompatRegistrationHints {
     }
 }
 
-fn parse_truthy_flag(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn compat_static_registration_enabled() -> bool {
-    cfg!(feature = "ext-conformance")
-        || std::env::var("PI_EXT_COMPAT_SCAN").is_ok_and(|value| parse_truthy_flag(&value))
-}
-
 fn register_command_literal_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
@@ -32322,6 +32328,80 @@ mod tests {
             assert!(wrote, "expected out.txt to be created after pumping");
             let contents = std::fs::read_to_string(&out_path).expect("read out.txt");
             assert_eq!(contents, "hi");
+        });
+    }
+
+    #[test]
+    #[cfg(feature = "ext-conformance")]
+    fn explicit_compat_scan_disable_prevents_static_registration_fallback() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let entry_path = dir.path().join("strict.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  if (false) {
+                    pi.registerTool({
+                      name: "static_ghost_tool",
+                      description: "must not be inferred",
+                      parameters: { type: "object", properties: {} },
+                      execute: async () => ({ content: [] }),
+                    });
+                    pi.registerCommand("static-ghost-command", {
+                      description: "must not be inferred",
+                      handler: async () => "ghost",
+                    });
+                  }
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let mut config = PiJsRuntimeConfig {
+                cwd: dir.path().display().to_string(),
+                ..Default::default()
+            };
+            config
+                .env
+                .insert("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string());
+            let js_runtime =
+                JsExtensionRuntimeHandle::start(config, Arc::clone(&tools), manager.clone())
+                    .await
+                    .expect("start strict js runtime");
+            manager.set_js_runtime(js_runtime);
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load strict extension");
+
+            let guard = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let payload = guard
+                .extensions
+                .first()
+                .expect("registered extension payload");
+            assert!(
+                payload.tools.is_empty(),
+                "explicit compatibility disable must not infer tool metadata"
+            );
+            assert!(
+                payload.slash_commands.is_empty(),
+                "explicit compatibility disable must not infer command metadata"
+            );
+            drop(guard);
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
         });
     }
 
@@ -37704,6 +37784,7 @@ mod tests {
 
                 let runtime = JsExtensionRuntimeHandle {
                     sender,
+                    compat_scan_mode: false,
                     exit_signal: Arc::new(Mutex::new(Some(exit_rx))),
                 };
 

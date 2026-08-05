@@ -339,10 +339,6 @@ struct LegacyGeneratedModel {
     compat: Option<CompatConfig>,
 }
 
-const LEGACY_MODELS_GENERATED_TS: &str =
-    include_str!("../legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts");
-const UPSTREAM_PROVIDER_MODEL_IDS_JSON: &str =
-    include_str!("../docs/provider-upstream-model-ids-snapshot.json");
 const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const GOOGLE_GEMINI_CLI_API_URL: &str = "https://cloudcode-pa.googleapis.com";
 const GOOGLE_ANTIGRAVITY_API_URL: &str = "https://daily-cloudcode-pa.sandbox.googleapis.com";
@@ -415,7 +411,7 @@ fn parse_input_types(input: &[String]) -> Vec<InputType> {
 }
 
 fn legacy_generated_models_cache_path() -> Option<PathBuf> {
-    let checksum = crc32c::crc32c(LEGACY_MODELS_GENERATED_TS.as_bytes());
+    let checksum = crate::embedded_assets::legacy_models_generated_ts_crc32c();
     dirs::cache_dir().map(|dir| {
         dir.join("pi")
             .join("models-cache")
@@ -464,23 +460,23 @@ fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
         return cached;
     }
 
-    let Some(models_decl_start) = LEGACY_MODELS_GENERATED_TS.find("export const MODELS =") else {
+    let source = crate::embedded_assets::legacy_models_generated_ts();
+    let Some(models_decl_start) = source.find("export const MODELS =") else {
         tracing::warn!("Legacy model catalog missing MODELS declaration");
         return Vec::new();
     };
-    let Some(object_start_rel) = LEGACY_MODELS_GENERATED_TS[models_decl_start..].find('{') else {
+    let Some(object_start_rel) = source[models_decl_start..].find('{') else {
         tracing::warn!("Legacy model catalog missing object start after MODELS declaration");
         return Vec::new();
     };
     let object_start = models_decl_start + object_start_rel;
-    let Some(end_marker_rel) = LEGACY_MODELS_GENERATED_TS[object_start..].rfind("} as const;")
-    else {
+    let Some(end_marker_rel) = source[object_start..].rfind("} as const;") else {
         tracing::warn!("Legacy model catalog missing end marker");
         return Vec::new();
     };
     let end_marker = object_start + end_marker_rel;
 
-    let mut object_source = LEGACY_MODELS_GENERATED_TS[object_start..=end_marker]
+    let mut object_source = source[object_start..=end_marker]
         .trim_end_matches(" as const;")
         .to_string();
     let satisfies_re = SATISFIES_RE.get_or_init(|| {
@@ -519,7 +515,7 @@ fn legacy_generated_models() -> &'static [LegacyGeneratedModel] {
 
 fn parse_upstream_provider_model_ids() -> HashMap<String, Vec<String>> {
     let parsed: HashMap<String, Vec<String>> =
-        match serde_json::from_str(UPSTREAM_PROVIDER_MODEL_IDS_JSON) {
+        match serde_json::from_str(&crate::embedded_assets::provider_upstream_model_ids_json()) {
             Ok(value) => value,
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to parse upstream provider model snapshot");
@@ -742,8 +738,8 @@ pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] 
 
 pub fn model_catalog_cache_fingerprint() -> u64 {
     *MODEL_CATALOG_CACHE_FINGERPRINT.get_or_init(|| {
-        let legacy = u64::from(crc32c::crc32c(LEGACY_MODELS_GENERATED_TS.as_bytes()));
-        let upstream = u64::from(crc32c::crc32c(UPSTREAM_PROVIDER_MODEL_IDS_JSON.as_bytes()));
+        let legacy = u64::from(crate::embedded_assets::legacy_models_generated_ts_crc32c());
+        let upstream = u64::from(crate::embedded_assets::provider_upstream_model_ids_json_crc32c());
         let user_override = u64::from(user_model_overrides_fingerprint());
         // Mix the override CRC into both halves so any change forces cache
         // invalidation regardless of whether the snapshot or the override
@@ -2695,7 +2691,9 @@ mod tests {
     #[test]
     fn parse_legacy_generated_models_extracts_known_legacy_only_providers() {
         let parsed = parse_legacy_generated_models();
-        if LEGACY_MODELS_GENERATED_TS.contains("export const MODELS = {} as const;") {
+        if crate::embedded_assets::legacy_models_generated_ts()
+            .contains("export const MODELS = {} as const;")
+        {
             assert!(
                 parsed.is_empty(),
                 "published stub catalog should not parse into legacy entries"

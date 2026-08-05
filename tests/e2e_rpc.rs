@@ -3681,10 +3681,10 @@ async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> 
 
         match recv_result {
             Ok(line) => {
-                if let Ok(val) = serde_json::from_str::<Value>(&line) {
-                    if val.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
-                        return val;
-                    }
+                if let Ok(val) = serde_json::from_str::<Value>(&line)
+                    && val.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+                {
+                    return val;
                 }
                 // Not our event — keep waiting.
             }

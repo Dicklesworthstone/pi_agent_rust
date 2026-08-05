@@ -1017,11 +1017,11 @@ detect_platform() {
 
   case "${OS}-${ARCH}" in
     linux-x86_64)
-      TARGET="x86_64-unknown-linux-musl"
+      TARGET="x86_64-unknown-linux-gnu"
       ASSET_PLATFORM="linux-amd64"
       ;;
     linux-aarch64)
-      TARGET="aarch64-unknown-linux-musl"
+      TARGET="aarch64-unknown-linux-gnu"
       ASSET_PLATFORM="linux-arm64"
       ;;
     darwin-x86_64)

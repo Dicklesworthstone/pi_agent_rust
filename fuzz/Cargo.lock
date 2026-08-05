@@ -292,7 +292,7 @@ dependencies = [
  "smallvec",
  "socket2",
  "subtle",
- "sysinfo 0.39.6",
+ "sysinfo",
  "tempfile",
  "thiserror",
  "tracing",
@@ -3305,7 +3305,7 @@ dependencies = [
  "swc_ecma_transforms_base",
  "swc_ecma_transforms_typescript",
  "swc_ecma_visit",
- "sysinfo 0.38.4",
+ "sysinfo",
  "tempfile",
  "thiserror",
  "tracing",
@@ -4570,20 +4570,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "sysinfo"
-version = "0.38.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ab6a2f8bfe508deb3c6406578252e491d299cbbf3bc0529ecc3313aee4a52f"
-dependencies = [
- "libc",
- "memchr",
- "ntapi",
- "objc2-core-foundation",
- "objc2-io-kit",
- "windows",
 ]
 
 [[package]]

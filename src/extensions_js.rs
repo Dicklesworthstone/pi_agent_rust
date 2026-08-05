@@ -130,10 +130,8 @@ fn is_global_compat_scan_mode() -> bool {
 }
 
 fn is_compat_scan_mode(env: &HashMap<String, String>) -> bool {
-    is_global_compat_scan_mode()
-        || env
-            .get("PI_EXT_COMPAT_SCAN")
-            .is_some_and(|value| parse_truthy_flag(value))
+    env.get("PI_EXT_COMPAT_SCAN")
+        .map_or_else(is_global_compat_scan_mode, |value| parse_truthy_flag(value))
 }
 
 /// Compatibility-mode fallback values for environment-gated extension registration.
@@ -4580,6 +4578,14 @@ impl PiJsRuntimeConfig {
     pub const fn auto_repair_enabled(&self) -> bool {
         self.repair_mode.should_apply()
     }
+
+    /// Resolve the compatibility-scan policy for this runtime.
+    ///
+    /// An explicit per-runtime value wins over the process/feature default so
+    /// strict callers cannot receive conformance-only fallbacks accidentally.
+    pub(crate) fn compat_scan_mode(&self) -> bool {
+        is_compat_scan_mode(&self.env)
+    }
 }
 
 impl Default for PiJsRuntimeConfig {
@@ -4857,6 +4863,11 @@ struct PiJsModuleState {
     /// Repair mode propagated from `PiJsRuntimeConfig` so the resolver can
     /// gate fallback patterns without executing any broken code.
     repair_mode: RepairMode,
+    /// Whether conformance-only compatibility fallbacks are enabled for this
+    /// runtime. A per-runtime `PI_EXT_COMPAT_SCAN` value takes precedence over
+    /// the compile-time feature so strict tests and callers remain strict even
+    /// in an all-features build.
+    compat_scan_mode: bool,
     /// Extension root directories used to detect monorepo escape (Pattern 3).
     /// Populated as extensions are loaded via [`PiJsRuntime::add_extension_root`].
     extension_roots: Vec<PathBuf>,
@@ -4918,6 +4929,7 @@ impl PiJsModuleState {
             compiled_sources: HashMap::new(),
             module_cache_counters: ModuleCacheCounters::default(),
             repair_mode: RepairMode::default(),
+            compat_scan_mode: is_global_compat_scan_mode(),
             extension_roots: Vec::new(),
             canonical_extension_roots: Vec::new(),
             extension_root_tiers: HashMap::new(),
@@ -4934,6 +4946,11 @@ impl PiJsModuleState {
 
     const fn with_repair_mode(mut self, mode: RepairMode) -> Self {
         self.repair_mode = mode;
+        self
+    }
+
+    const fn with_compat_scan_mode(mut self, enabled: bool) -> Self {
+        self.compat_scan_mode = enabled;
         self
     }
 
@@ -5595,7 +5612,7 @@ impl JsModuleResolver for PiJsResolver {
 
         // Alias bare Node.js builtins to their node: prefixed virtual modules.
         let canonical = canonical_node_builtin(spec).unwrap_or(spec);
-        let compat_scan_mode = is_global_compat_scan_mode();
+        let compat_scan_mode = self.state.borrow().compat_scan_mode;
 
         let repair_mode = {
             let mut state = self.state.borrow_mut();
@@ -16125,9 +16142,11 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
         let repair_events: Arc<std::sync::Mutex<Vec<ExtensionRepairEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
         let compiled_cache_limit_bytes = config.limits.module_cache_limit_bytes;
+        let compat_scan_mode = is_compat_scan_mode(&config.env);
         let module_state = Rc::new(RefCell::new(
             PiJsModuleState::new()
                 .with_repair_mode(config.repair_mode)
+                .with_compat_scan_mode(compat_scan_mode)
                 .with_repair_events(Arc::clone(&repair_events))
                 .with_disk_cache_dir(config.disk_cache_dir.clone())
                 .with_compiled_cache_limit_bytes(compiled_cache_limit_bytes),
@@ -23128,6 +23147,15 @@ mod tests {
     use super::*;
     use crate::scheduler::DeterministicClock;
     use serde_json::json;
+
+    #[test]
+    fn per_runtime_compat_scan_flag_overrides_global_default() {
+        let disabled = HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "0".to_string())]);
+        assert!(!is_compat_scan_mode(&disabled));
+
+        let enabled = HashMap::from([("PI_EXT_COMPAT_SCAN".to_string(), "1".to_string())]);
+        assert!(is_compat_scan_mode(&enabled));
+    }
 
     #[allow(clippy::future_not_send)]
     async fn get_global_json<C: SchedulerClock + 'static>(
