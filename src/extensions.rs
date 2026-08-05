@@ -21355,7 +21355,7 @@ async fn scrub_and_drop_runtime_shards(
     let mut errors = Vec::new();
     for shard in &shards.shards {
         match shard.runtime.scrub_for_cold_drop().await {
-            Ok(report) if report.scrubbed_cleanly => {
+            Ok(report) if report.inventoried_state_cleared => {
                 warm_pool.record_reset();
             }
             Ok(report) => errors.push(format!(

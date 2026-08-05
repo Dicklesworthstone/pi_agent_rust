@@ -16687,7 +16687,7 @@ struct JsRuntimeResetPayload {
 
 #[derive(Debug, Clone, Default)]
 pub struct PiJsRealmScrubReport {
-    pub scrubbed_cleanly: bool,
+    pub inventoried_state_cleared: bool,
     pub reason_code: Option<String>,
     pub rust_pending_hostcalls: u64,
     pub rust_pending_hostcall_queue: u64,
@@ -17085,15 +17085,12 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
             return Ok(report);
         }
 
-        if !reset_payload.clean
-            || residual_after > 0
-            || !reset_payload.after.intrinsics_intact
-        {
+        if !reset_payload.clean || residual_after > 0 || !reset_payload.after.intrinsics_intact {
             report.reason_code = Some("reset_residual_state".to_string());
             return Ok(report);
         }
 
-        report.scrubbed_cleanly = true;
+        report.inventoried_state_cleared = true;
         Ok(report)
     }
 
@@ -17182,6 +17179,7 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
     /// repair events, and cache counters while **preserving** the compiled
     /// sources cache (both in-memory and disk). This method does not reset the
     /// JavaScript realm and must never authorize realm reuse.
+    #[cfg(test)]
     fn reset_host_bookkeeping_before_drop(&self) {
         let mut state = self.module_state.borrow_mut();
         state.extension_roots.clear();
@@ -25437,8 +25435,8 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .await
                 .expect("warm reset should run");
             assert!(
-                report.scrubbed_cleanly,
-                "expected clean realm scrub, got report: {report:?}"
+                report.inventoried_state_cleared,
+                "expected inventoried state to clear, got report: {report:?}"
             );
             assert!(
                 report.reason_code.is_none(),
@@ -25471,10 +25469,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .await
                 .expect("inspect protected state after warm reset");
             let reset_security_after = get_global_json(&runtime, "warmResetSecurity").await;
-            assert_eq!(
-                reset_security_after["afterDone"],
-                serde_json::json!(true)
-            );
+            assert_eq!(reset_security_after["afterDone"], serde_json::json!(true));
             assert_eq!(
                 reset_security_after["providerCountAfter"],
                 serde_json::json!(0)
@@ -25526,8 +25521,8 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .await
                 .expect("warm reset should run");
             assert!(
-                report.scrubbed_cleanly,
-                "expected clean realm scrub, got report: {report:?}"
+                report.inventoried_state_cleared,
+                "expected inventoried state to clear, got report: {report:?}"
             );
 
             runtime
@@ -25614,13 +25609,10 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .await
                 .expect("warm reset should use captured primordial methods");
             assert!(
-                !report.scrubbed_cleanly,
+                !report.inventoried_state_cleared,
                 "poisoned runtime must fail the realm scrub: {report:?}"
             );
-            assert_eq!(
-                report.reason_code.as_deref(),
-                Some("reset_residual_state")
-            );
+            assert_eq!(report.reason_code.as_deref(), Some("reset_residual_state"));
             assert_eq!(
                 report.residual_entries_after, 0,
                 "captured primordial methods should still clear all transient registries"
@@ -25640,7 +25632,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .scrub_for_cold_drop()
                 .await
                 .expect("warm reset should return report");
-            assert!(!report.scrubbed_cleanly);
+            assert!(!report.inventoried_state_cleared);
             assert_eq!(report.reason_code.as_deref(), Some("pending_rust_work"));
         });
     }
@@ -25666,7 +25658,7 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .scrub_for_cold_drop()
                 .await
                 .expect("warm reset should return report");
-            assert!(!report.scrubbed_cleanly);
+            assert!(!report.inventoried_state_cleared);
             assert_eq!(report.reason_code.as_deref(), Some("pending_js_work"));
 
             let after = call_global_fn_json(&runtime, "__pi_runtime_registry_snapshot").await;
@@ -25853,8 +25845,8 @@ import { isIPv4 as netIsIpv4 } from "node:net";
                 .await
                 .expect("warm reset should run");
             assert!(
-                report.scrubbed_cleanly,
-                "expected clean realm scrub, got report: {report:?}"
+                report.inventoried_state_cleared,
+                "expected inventoried state to clear, got report: {report:?}"
             );
 
             let state = runtime.module_state.borrow();
