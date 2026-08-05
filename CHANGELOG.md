@@ -105,7 +105,10 @@ Repository: <https://github.com/Dicklesworthstone/pi_agent_rust>
   performance-claims-NOT-authorized because its checked-in budget summary is a
   valid blocked/NO_DATA artifact; publication may proceed only without
   quantitative or global performance claims. The producer and validator share
-  the canonical G01–G12 contract.
+  the canonical G01–G12 contract. The v2 claim contract also pins the complete
+  19-budget inventory and requires every declared budget to have data and pass
+  before its global performance-authorization boolean can become true; CI-only
+  counters remain additional diagnostics rather than an authorization loophole.
   Per-target build manifests now identify selected sibling-project crates by
   their locked registry version, source, and checksum instead of attributing
   binaries to unrelated sibling repository HEADs.

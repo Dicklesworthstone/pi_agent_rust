@@ -82,7 +82,8 @@ Security is a first-class design goal here, not a bolt-on:
 The Rust port is designed around large-session, multi-agent, and extension-heavy
 workloads. Release-facing performance numbers are published only when the
 checked-in evidence artifacts are current, have matching run provenance, and
-report no CI no-data or data-contract failures. Historical benchmark snapshots
+show data and a passing result for every declared budget, with no data-contract
+failures. Historical benchmark snapshots
 are retained in planning/evidence artifacts, but they are not treated as current
 README claims until the performance evidence gate is regenerated cleanly.
 
@@ -1940,9 +1941,10 @@ See `docs/testing-policy.md` and `docs/releasing.md` for normative policy detail
 
 Current checked-in performance evidence state:
 - Run output: `tests/perf/reports/` (budget_summary.json, PERF_BUDGETS.md)
-- The current budget summary is a blocker artifact, not claim support: most
-  CI-enforced budgets have no measurement data and the data-contract section
-  reports missing or stale required evidence.
+- The current budget summary is a blocker artifact, not claim support: without
+  strict, source-bound, same-run lineage it records every declared budget as
+  `NO_DATA` and does not run the artifact data-contract evaluation. Its empty
+  failure list therefore means "not evaluated," not "contracts passed."
 - Before spending time on a definitive refresh, run
   `python3 scripts/perf/preflight_budget_inputs.py` to list missing budget
   inputs, expected artifact paths, and RCH-only refresh commands.
@@ -2315,7 +2317,7 @@ That blocked state is not a passing benchmark result.
 - `scripts/perf/orchestrate.sh` generates artifacts tied to a shared `correlation_id` for the same run.
 - `scripts/e2e/run_all.sh` validates required schemas, freshness, and `correlation_id` alignment before considering claims valid.
 - `tests/release_evidence_gate.rs` and `scripts/release_gate.sh` always reject malformed schemas, a non-canonical budget-inventory digest, reordered/duplicate/missing results, mismatched comparison semantics, inconsistent counts/statuses, or forged readiness fields. A coherent `blocked` summary is only a release warning when `RELEASE_GATE_REQUIRE_PERFORMANCE_CLAIM_READY=0`; it still cannot authorize performance copy.
-- A `claim_ready` summary must come from strict mode with complete CI data, no regressions or data-contract failures, one matching `run_id`/`correlation_id`, and fresh source-bound evidence. The gate also proves its exact canonical strict test was listed once, executed once, and was not ignored; that test freshly recomputes and deep-compares the checked-in definitions, results, failures, counts, and readiness instead of accepting an unrelated passing benchmark run.
+- A `claim_ready` summary must come from strict mode with data for every declared budget, no declared budget failures or data-contract failures, complete CI coverage, one matching `run_id`/`correlation_id`, and fresh source-bound evidence. The aggregate `budget_data_missing` and `budget_failed` blockers prevent non-CI informational budgets from being silently excluded from the global authorization boolean. The gate also proves its exact canonical strict test was listed once, executed once, and was not ignored; that test freshly recomputes and deep-compares the checked-in definitions, results, failures, counts, and readiness instead of accepting an unrelated passing benchmark run.
 - `scripts/e2e/run_all.sh` emits an evidence-adjudication matrix and only treats evidence as canonical when freshness and lineage checks both pass.
 - Key release-facing artifacts include:
   - `pi.perf.extension_benchmark_stratification.v1`

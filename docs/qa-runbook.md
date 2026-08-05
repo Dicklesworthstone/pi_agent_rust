@@ -140,6 +140,17 @@ PI_GENERATE_PERF_BUDGET_REPORT=1 cargo test --test perf_budgets generate_budget_
 PI_GENERATE_BENCH_SCHEMA_DOCS=1 cargo test --test bench_schema generate_schema_doc -- --nocapture
 ```
 
+In `pi.perf.budget_summary.v2`, `performance_claims_authorized=true` governs
+blanket quantitative performance copy. It therefore requires strict,
+source-bound, same-run evidence for **all declared budgets**: every budget must
+have data and PASS, including budgets that are not CI-enforced, and there must
+be no data-contract failures. `budget_data_missing` and `budget_failed` are the
+aggregate blocker codes; the CI-specific counts and blockers remain as
+diagnostics. When that authoritative lineage is incomplete, the tracked report
+is a canonical all-`NO_DATA` blocked sentinel and deliberately does not inspect
+ambient Cargo targets, ignored artifacts, or filesystem mtimes. A complete
+strict lineage is required before real artifact evaluation begins.
+
 `tests/perf_budgets.rs` checks `PERF_EVIDENCE_DIR`/`PERF_EVIDENCE_DIRS` before
 `CARGO_TARGET_DIR`, so the report can consume staged evidence that RCH actually
 syncs instead of an unsynced local target directory.

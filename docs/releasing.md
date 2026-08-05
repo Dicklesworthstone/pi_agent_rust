@@ -539,7 +539,10 @@ proof is not proof of an empty bypass list.
    claim. Structural, schema, count, status, or readiness contradictions remain
    hard failures in either mode. A future release that makes such a claim must
    set the flag to `1`; the gate then also requires fresh source-bound lineage
-   and the pinned canonical budget-inventory digest. It proves the exact strict
+   and the pinned canonical budget-inventory digest. Global authorization also
+   requires data for every declared budget and zero declared budget failures;
+   non-CI `NO_DATA` and `FAIL` results derive `budget_data_missing` and
+   `budget_failed` blockers respectively. The gate proves the exact strict
    perf test is listed once, runs once, is not ignored, and freshly recomputes
    and deep-compares the checked-in definitions, results, failures, counts, and
    readiness.
