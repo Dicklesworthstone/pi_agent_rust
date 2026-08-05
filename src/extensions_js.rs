@@ -5095,9 +5095,6 @@ fn path_is_in_allowed_extension_root(
         .any(|root| path.starts_with(root))
 }
 
-// Retained for policy diagnostics that distinguish registered roots from the
-// broader fallback root set used by filesystem hostcalls.
-#[allow(dead_code)]
 fn path_is_in_registered_extension_root(
     path: &Path,
     module_state: &Rc<RefCell<PiJsModuleState>>,
@@ -5107,6 +5104,16 @@ fn path_is_in_registered_extension_root(
         .canonical_extension_roots
         .iter()
         .any(|root| path.starts_with(root))
+}
+
+fn path_is_in_workspace_or_registered_extension_root(
+    path: &Path,
+    workspace_root: &Path,
+    module_state: &Rc<RefCell<PiJsModuleState>>,
+) -> bool {
+    let checked_path = crate::extensions::safe_canonicalize(path);
+    checked_path.starts_with(workspace_root)
+        || path_is_in_registered_extension_root(&checked_path, module_state)
 }
 
 fn path_is_in_leaf_allowed_extension_root(
@@ -11255,6 +11262,16 @@ const __pi_vfs = (() => {
     }
   }
 
+  function checkReadAccess(resolved) {
+    const normalized = normalizePath(resolved);
+    if (isCurrentExtensionTempPath(normalized)) {
+      return;
+    }
+    if (typeof globalThis.__pi_host_check_read_access === "function") {
+      globalThis.__pi_host_check_read_access(normalized);
+    }
+  }
+
   function checkWorkspaceWriteAccess(resolved) {
     const normalized = normalizePath(resolved);
     if (isCurrentExtensionTempPath(normalized)) {
@@ -11309,6 +11326,12 @@ const __pi_vfs = (() => {
       return normalized;
     }
     if (normalized !== "/tmp" && !normalized.startsWith("/tmp/")) {
+      return normalized;
+    }
+    if (
+      typeof globalThis.__pi_host_is_registered_fs_path === "function" &&
+      globalThis.__pi_host_is_registered_fs_path(normalized)
+    ) {
       return normalized;
     }
     return `${root}${normalized.slice("/tmp".length)}`;
@@ -11520,6 +11543,32 @@ const __pi_vfs = (() => {
     return normalized;
   }
 
+  function resolvePathForRead(path, followSymlinks = true) {
+    const unresolved = resolvePath(path, false);
+    checkReadAccess(unresolved);
+    if (!followSymlinks) {
+      return unresolved;
+    }
+    const resolved = resolvePath(path, true);
+    if (resolved !== unresolved) {
+      checkReadAccess(resolved);
+    }
+    return resolved;
+  }
+
+  function resolvePathForWrite(path, followSymlinks = true) {
+    const unresolved = resolvePath(path, false);
+    checkWriteAccess(unresolved);
+    if (!followSymlinks) {
+      return unresolved;
+    }
+    const resolved = resolvePath(path, true);
+    if (resolved !== unresolved) {
+      checkWriteAccess(resolved);
+    }
+    return resolved;
+  }
+
   function parseOpenFlags(rawFlags) {
     if (typeof rawFlags === "number" && Number.isFinite(rawFlags)) {
       const flags = rawFlags | 0;
@@ -11629,7 +11678,7 @@ const __pi_vfs = (() => {
   }
 
   function makeStat(path, followSymlinks = true) {
-    const normalized = followSymlinks ? resolvePath(path, true) : resolvePath(path, false);
+    const normalized = resolvePathForRead(path, followSymlinks);
     const linkTarget = state.symlinks.get(normalized);
     if (linkTarget !== undefined) {
       if (!followSymlinks) {
@@ -11727,9 +11776,12 @@ const __pi_vfs = (() => {
   state.makeDirent = makeDirent;
   state.makeStat = makeStat;
   state.resolvePath = resolvePath;
+  state.resolvePathForRead = resolvePathForRead;
+  state.resolvePathForWrite = resolvePathForWrite;
   state.mapExtensionTempPath = mapExtensionTempPath;
   state.unmapExtensionTempPath = unmapExtensionTempPath;
   state.isCurrentExtensionTempPath = isCurrentExtensionTempPath;
+  state.checkReadAccess = checkReadAccess;
   state.checkWriteAccess = checkWriteAccess;
   state.checkWorkspaceWriteAccess = checkWorkspaceWriteAccess;
   state.parseOpenFlags = parseOpenFlags;
@@ -11749,7 +11801,7 @@ export function existsSync(path) {
 }
 
 export function readFileSync(path, encoding) {
-  const resolved = __pi_vfs.resolvePath(path, true);
+  const resolved = __pi_vfs.resolvePathForRead(path, true);
   let bytes = __pi_vfs.files.get(resolved);
   let hostError;
   if (!bytes && !__pi_vfs.isCurrentExtensionTempPath(resolved) && typeof globalThis.__pi_host_read_file_sync === "function") {
@@ -11776,8 +11828,7 @@ export function readFileSync(path, encoding) {
 }
 
 export function appendFileSync(path, data, opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
-  __pi_vfs.checkWriteAccess(resolved);
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
   const current = __pi_vfs.files.get(resolved) || new Uint8Array();
   const next = __pi_vfs.toBytes(data, opts);
   const merged = new Uint8Array(current.byteLength + next.byteLength);
@@ -11788,14 +11839,13 @@ export function appendFileSync(path, data, opts) {
 }
 
 export function writeFileSync(path, data, opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
-  __pi_vfs.checkWriteAccess(resolved);
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
   __pi_vfs.ensureDir(__pi_vfs.dirname(resolved));
   __pi_vfs.files.set(resolved, __pi_vfs.toBytes(data, opts));
 }
 
 export function readdirSync(path, opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
+  const resolved = __pi_vfs.resolvePathForRead(path, true);
   const withFileTypes = !!(opts && typeof opts === "object" && opts.withFileTypes);
   const children = new Map();
   let foundDir = __pi_vfs.dirs.has(resolved);
@@ -11865,11 +11915,11 @@ export function mkdtempSync(prefix, _opts) {
   return out;
 }
 export function realpathSync(path, _opts) {
-  return __pi_vfs.unmapExtensionTempPath(__pi_vfs.resolvePath(path, true));
+  const resolved = __pi_vfs.resolvePathForRead(path, true);
+  return __pi_vfs.unmapExtensionTempPath(resolved);
 }
 export function unlinkSync(path) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
   if (__pi_vfs.symlinks.delete(normalized)) {
     return;
   }
@@ -11878,8 +11928,7 @@ export function unlinkSync(path) {
   }
 }
 export function rmdirSync(path, _opts) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
   if (normalized === "/") {
     throw new Error("EBUSY: resource busy or locked, rmdir '/'");
   }
@@ -11906,8 +11955,7 @@ export function rmdirSync(path, _opts) {
   }
 }
 export function rmSync(path, opts) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
   if (__pi_vfs.files.has(normalized)) {
     __pi_vfs.files.delete(normalized);
     return;
@@ -11948,10 +11996,8 @@ export function copyFileSync(src, dest, _mode) {
   writeFileSync(dest, readFileSync(src));
 }
 export function renameSync(oldPath, newPath) {
-  const src = __pi_vfs.resolvePath(oldPath, false);
-  const dst = __pi_vfs.resolvePath(newPath, false);
-  __pi_vfs.checkWriteAccess(src);
-  __pi_vfs.checkWriteAccess(dst);
+  const src = __pi_vfs.resolvePathForWrite(oldPath, false);
+  const dst = __pi_vfs.resolvePathForWrite(newPath, false);
   const linkTarget = __pi_vfs.symlinks.get(src);
   if (linkTarget !== undefined) {
     __pi_vfs.ensureDir(__pi_vfs.dirname(dst));
@@ -11969,8 +12015,7 @@ export function renameSync(oldPath, newPath) {
   throw new Error(`ENOENT: no such file or directory, rename '${String(oldPath ?? "")}'`);
 }
 export function mkdirSync(path, _opts) {
-  const resolved = __pi_vfs.resolvePath(path, true);
-  __pi_vfs.checkWriteAccess(resolved);
+  const resolved = __pi_vfs.resolvePathForWrite(path, true);
   __pi_vfs.ensureDir(resolved);
   return __pi_vfs.normalizePath(path);
 }
@@ -11982,7 +12027,7 @@ export function accessSync(path, _mode) {
 export function chmodSync(path, _mode) { accessSync(path); return; }
 export function chownSync(path, _uid, _gid) { accessSync(path); return; }
 export function readlinkSync(path, opts) {
-  const normalized = __pi_vfs.normalizePath(path);
+  const normalized = __pi_vfs.resolvePathForRead(path, false);
   if (!__pi_vfs.symlinks.has(normalized)) {
     if (__pi_vfs.files.has(normalized) || __pi_vfs.dirs.has(normalized)) {
       throw new Error(`EINVAL: invalid argument, readlink '${String(path ?? "")}'`);
@@ -12002,8 +12047,7 @@ export function readlinkSync(path, opts) {
   return target;
 }
 export function symlinkSync(target, path, _type) {
-  const normalized = __pi_vfs.resolvePath(path, false);
-  __pi_vfs.checkWriteAccess(normalized);
+  const normalized = __pi_vfs.resolvePathForWrite(path, false);
   const parent = __pi_vfs.dirname(normalized);
   if (!__pi_vfs.dirs.has(parent)) {
     throw new Error(`ENOENT: no such file or directory, symlink '${String(path ?? "")}'`);
@@ -12014,12 +12058,17 @@ export function symlinkSync(target, path, _type) {
   __pi_vfs.symlinks.set(normalized, String(target ?? ""));
 }
 export function openSync(path, flags = "r", _mode) {
-  const resolved = __pi_vfs.resolvePath(path, true);
   const opts = __pi_vfs.parseOpenFlags(flags);
+  const needsWriteAccess = opts.writable || opts.create || opts.append || opts.truncate;
+  let resolved;
 
-  if (opts.writable || opts.create || opts.append || opts.truncate) {
-    __pi_vfs.checkWriteAccess(resolved);
+  if (opts.readable) {
+    resolved = __pi_vfs.resolvePathForRead(path, true);
   }
+  if (needsWriteAccess) {
+    resolved = __pi_vfs.resolvePathForWrite(path, true);
+  }
+  resolved = resolved || __pi_vfs.resolvePath(path, true);
 
   if (__pi_vfs.dirs.has(resolved)) {
     throw new Error(`EISDIR: illegal operation on a directory, open '${String(path ?? "")}'`);
@@ -12061,6 +12110,7 @@ export function readSync(fd, buffer, offset = 0, length, position = null) {
   if (!entry.readable) {
     throw new Error(`EBADF: bad file descriptor, fd ${String(fd)}`);
   }
+  __pi_vfs.checkReadAccess(entry.path);
   const out = __pi_vfs.toWritableView(buffer);
   const start = Number.isInteger(offset) && offset >= 0 ? offset : 0;
   const maxLen =
@@ -12252,8 +12302,7 @@ export function createWriteStream(path, opts) {
     final(callback) {
       try {
         if (appendMode) {
-          const resolved = __pi_vfs.resolvePath(path, true);
-          __pi_vfs.checkWriteAccess(resolved);
+          const resolved = __pi_vfs.resolvePathForWrite(path, true);
           const current = __pi_vfs.files.get(resolved) || new Uint8Array();
           const totalSize = current.byteLength + bufferedChunks.reduce((sum, bytes) => sum + bytes.byteLength, 0);
           const merged = new Uint8Array(totalSize);
@@ -17873,6 +17922,75 @@ impl<C: SchedulerClock + 'static> PiJsRuntime<C> {
                             Ok(())
                         },
                     ),
+                )?;
+
+                // __pi_host_is_registered_fs_path(path) -> bool
+                // Distinguishes real workspace/extension paths from generic
+                // extension-private /tmp paths before the node:fs VFS remaps them.
+                global.set(
+                    "__pi_host_is_registered_fs_path",
+                    Func::from({
+                        let workspace_root =
+                            crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                        let module_state = Rc::clone(&module_state);
+                        move |_ctx: Ctx<'_>, path: String| -> bool {
+                            path_is_in_workspace_or_registered_extension_root(
+                                Path::new(&path),
+                                &workspace_root,
+                                &module_state,
+                            )
+                        }
+                    }),
+                )?;
+
+                // __pi_host_check_read_access(path) -> void (throws on denied path)
+                // Applies the active extension's root policy before node:fs reads
+                // either host-backed data or runtime-cached VFS data.
+                global.set(
+                    "__pi_host_check_read_access",
+                    Func::from({
+                        let process_cwd = process_cwd.clone();
+                        let allowed_read_roots = Arc::clone(&allowed_read_roots);
+                        let module_state = Rc::clone(&module_state);
+                        move |ctx: Ctx<'_>, path: String| -> rquickjs::Result<()> {
+                            let extension_id = current_extension_id(&ctx);
+
+                            // Standalone runtime harnesses have no active extension. Their
+                            // virtual filesystem behavior is intentionally unrestricted.
+                            if extension_id.is_none() {
+                                return Ok(());
+                            }
+
+                            let workspace_root =
+                                crate::extensions::safe_canonicalize(Path::new(&process_cwd));
+                            let requested = PathBuf::from(&path);
+                            let requested_abs = if requested.is_absolute() {
+                                requested
+                            } else {
+                                workspace_root.join(requested)
+                            };
+                            let checked_path =
+                                crate::extensions::safe_canonicalize(&requested_abs);
+
+                            let in_ext_root = path_is_in_allowed_extension_root(
+                                &checked_path,
+                                extension_id.as_deref(),
+                                &module_state,
+                                &allowed_read_roots,
+                            );
+                            let allowed =
+                                checked_path.starts_with(&workspace_root) || in_ext_root;
+
+                            if allowed {
+                                Ok(())
+                            } else {
+                                Err(rquickjs::Error::new_loading_message(
+                                    &path,
+                                    "host read denied: path outside extension root".to_string(),
+                                ))
+                            }
+                        }
+                    }),
                 )?;
 
                 // __pi_host_check_write_access(path) -> void (throws on denied path)
@@ -27192,6 +27310,197 @@ export const bundled = globalThis.__doomWadFinderProbe.bundled;
             assert!(
                 error.contains("host write denied"),
                 "expected host write denial, got: {error}"
+            );
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pijs_registered_tmp_roots_bypass_only_generic_tmp_scoping() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir_in("/tmp").expect("tempdir in /tmp");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_root = temp_dir.path().join("ext-a");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_root).expect("mkdir extension");
+            let registered_path = ext_root.join("asset.txt");
+            let generic_path = PathBuf::from(format!(
+                "/tmp/pijs-unregistered-{}/asset.txt",
+                uuid::Uuid::new_v4().simple()
+            ));
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_root, Some("ext.a"));
+
+            let script = format!(
+                r#"
+                globalThis.tmpRootMapping = {{}};
+                __pi_with_extension_async("ext.a", async () => {{
+                    globalThis.tmpRootMapping.registeredA =
+                        __pi_vfs_state.resolvePath({registered_path:?}, true);
+                    globalThis.tmpRootMapping.genericA =
+                        __pi_vfs_state.resolvePath({generic_path:?}, true);
+                }}).then(() => __pi_with_extension_async("ext.b", async () => {{
+                    globalThis.tmpRootMapping.registeredB =
+                        __pi_vfs_state.resolvePath({registered_path:?}, true);
+                    globalThis.tmpRootMapping.genericB =
+                        __pi_vfs_state.resolvePath({generic_path:?}, true);
+                }})).finally(() => {{
+                    globalThis.tmpRootMapping.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval registered and generic /tmp mapping");
+
+            let result = get_global_json(&runtime, "tmpRootMapping").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(
+                result["registeredA"],
+                serde_json::json!(registered_path.display().to_string())
+            );
+            assert_eq!(result["registeredB"], result["registeredA"]);
+            assert_ne!(
+                result["genericA"],
+                serde_json::json!(generic_path.display().to_string())
+            );
+            assert_ne!(result["genericB"], result["genericA"]);
+            assert!(
+                result["genericA"]
+                    .as_str()
+                    .is_some_and(|path| path.starts_with("/__pi_extension_tmp/ext.a/"))
+            );
+            assert!(
+                result["genericB"]
+                    .as_str()
+                    .is_some_and(|path| path.starts_with("/__pi_extension_tmp/ext.b/"))
+            );
+        });
+    }
+
+    #[test]
+    fn pijs_cached_vfs_and_symlink_access_stays_extension_scoped() {
+        futures::executor::block_on(async {
+            let temp_dir = tempfile::tempdir().expect("tempdir");
+            let workspace = temp_dir.path().join("workspace");
+            let ext_a = temp_dir.path().join("ext-a");
+            let ext_b = temp_dir.path().join("ext-b");
+            std::fs::create_dir_all(&workspace).expect("mkdir workspace");
+            std::fs::create_dir_all(&ext_a).expect("mkdir ext-a");
+            std::fs::create_dir_all(&ext_b).expect("mkdir ext-b");
+            let cached_secret = ext_a.join("cached-secret.txt");
+            let cross_root_link = ext_b.join("workspace-link.txt");
+            let workspace_target = workspace.join("link-target.txt");
+            std::fs::write(&workspace_target, "workspace-value").expect("write workspace target");
+
+            let config = PiJsRuntimeConfig {
+                cwd: workspace.display().to_string(),
+                ..PiJsRuntimeConfig::default()
+            };
+            let runtime = PiJsRuntime::with_clock_and_config_with_policy(
+                DeterministicClock::new(0),
+                config,
+                None,
+            )
+            .await
+            .expect("create runtime");
+            runtime.add_extension_root_with_id(ext_a, Some("ext.a"));
+            runtime.add_extension_root_with_id(ext_b, Some("ext.b"));
+
+            let script = format!(
+                r#"
+                globalThis.vfsScope = {{}};
+                import('node:module').then(({{ createRequire }}) => {{
+                    const require = createRequire('/tmp/example.js');
+                    const fs = require('node:fs');
+                    return __pi_with_extension_async("ext.a", async () => {{
+                        fs.mkdirSync({ext_a:?}, {{ recursive: true }});
+                        fs.writeFileSync({cached_secret:?}, 'cached-secret');
+                        globalThis.vfsScope.ownerRead = fs.readFileSync({cached_secret:?}, 'utf8');
+                    }}).then(() => __pi_with_extension_async("ext.b", async () => {{
+                        try {{
+                            fs.readFileSync({cached_secret:?}, 'utf8');
+                            globalThis.vfsScope.cachedCrossRead = true;
+                        }} catch (err) {{
+                            globalThis.vfsScope.cachedCrossRead = false;
+                            globalThis.vfsScope.cachedCrossReadError =
+                                String((err && err.message) || err || '');
+                        }}
+
+                        fs.mkdirSync({ext_b:?}, {{ recursive: true }});
+                        fs.symlinkSync({workspace_target:?}, {cross_root_link:?});
+                        globalThis.vfsScope.ownerLinkRead =
+                            fs.readFileSync({cross_root_link:?}, 'utf8');
+                    }})).then(() => __pi_with_extension_async("ext.a", async () => {{
+                        try {{
+                            fs.readFileSync({cross_root_link:?}, 'utf8');
+                            globalThis.vfsScope.crossLinkRead = true;
+                        }} catch (err) {{
+                            globalThis.vfsScope.crossLinkRead = false;
+                            globalThis.vfsScope.crossLinkReadError =
+                                String((err && err.message) || err || '');
+                        }}
+                        try {{
+                            fs.writeFileSync({cross_root_link:?}, 'tampered');
+                            globalThis.vfsScope.crossLinkWrite = true;
+                        }} catch (err) {{
+                            globalThis.vfsScope.crossLinkWrite = false;
+                            globalThis.vfsScope.crossLinkWriteError =
+                                String((err && err.message) || err || '');
+                        }}
+                        globalThis.vfsScope.workspaceValue =
+                            fs.readFileSync({workspace_target:?}, 'utf8');
+                    }}));
+                }}).finally(() => {{
+                    globalThis.vfsScope.done = true;
+                }});
+                "#
+            );
+            runtime
+                .eval(&script)
+                .await
+                .expect("eval cached VFS and cross-root symlink access");
+
+            let result = get_global_json(&runtime, "vfsScope").await;
+            assert_eq!(result["done"], serde_json::json!(true));
+            assert_eq!(result["ownerRead"], serde_json::json!("cached-secret"));
+            assert_eq!(result["cachedCrossRead"], serde_json::json!(false));
+            assert!(
+                result["cachedCrossReadError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("host read denied"))
+            );
+            assert_eq!(
+                result["ownerLinkRead"],
+                serde_json::json!("workspace-value")
+            );
+            assert_eq!(result["crossLinkRead"], serde_json::json!(false));
+            assert!(
+                result["crossLinkReadError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("host read denied"))
+            );
+            assert_eq!(result["crossLinkWrite"], serde_json::json!(false));
+            assert!(
+                result["crossLinkWriteError"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("host write denied"))
+            );
+            assert_eq!(
+                result["workspaceValue"],
+                serde_json::json!("workspace-value")
             );
         });
     }
