@@ -87,18 +87,27 @@ struct RegressionEvidence {
     eligible: bool,
 }
 
-fn classify_regression_evidence(
-    build_profile: &str,
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MeasurementRegion {
+    Controlled,
+    Load,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegressionEligibility<'a> {
+    build_profile: &'a str,
     build_profile_verified: bool,
     provenance_identity_verified: bool,
-    debug_assertions: bool,
-    host_page_cache_uncontrolled: bool,
-) -> RegressionEvidence {
-    let eligible = !host_page_cache_uncontrolled
-        && !debug_assertions
-        && build_profile == "perf"
-        && build_profile_verified
-        && provenance_identity_verified;
+    optimized_binary: bool,
+    measurement_region: MeasurementRegion,
+}
+
+fn classify_regression_evidence(eligibility: RegressionEligibility<'_>) -> RegressionEvidence {
+    let eligible = eligibility.build_profile == "perf"
+        && eligibility.build_profile_verified
+        && eligibility.provenance_identity_verified
+        && eligibility.optimized_binary
+        && eligibility.measurement_region == MeasurementRegion::Controlled;
     RegressionEvidence {
         confidence: if eligible {
             CONFIDENCE_HIGH
@@ -206,9 +215,8 @@ fn env_fingerprint() -> Value {
         .and_then(Path::to_str)
         .unwrap_or("unknown")
         .to_string();
-    let binary_sha256 = executable_identity
-        .map(|(_, sha256)| sha256.clone())
-        .unwrap_or_else(|| "unknown".to_string());
+    let binary_sha256 =
+        executable_identity.map_or_else(|| "unknown".to_string(), |(_, sha256)| sha256.clone());
     let compiled_features = perf_build::compiled_feature_set();
     let config_hash =
         perf_build::benchmark_provenance_config_hash(&perf_build::BenchmarkProvenance {
@@ -847,20 +855,20 @@ fn run_all_scenarios() -> Result<Vec<Value>> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let provenance_identity_verified = env.as_object().is_some_and(provenance_identity_is_verified);
-    let measured_evidence = classify_regression_evidence(
+    let measured_evidence = classify_regression_evidence(RegressionEligibility {
         build_profile,
         build_profile_verified,
         provenance_identity_verified,
-        debug_assertions,
-        false,
-    );
-    let load_evidence = classify_regression_evidence(
+        optimized_binary: !debug_assertions,
+        measurement_region: MeasurementRegion::Controlled,
+    });
+    let load_evidence = classify_regression_evidence(RegressionEligibility {
         build_profile,
         build_profile_verified,
         provenance_identity_verified,
-        debug_assertions,
-        true,
-    );
+        optimized_binary: !debug_assertions,
+        measurement_region: MeasurementRegion::Load,
+    });
 
     let mut records: Vec<Value> = Vec::new();
 
@@ -934,6 +942,8 @@ fn shared_scenario_records() -> &'static [Value] {
     }
 }
 
+// Keeping the protocol projection in one place makes omissions visible during review.
+#[allow(clippy::too_many_lines)]
 fn attach_contract(mut record: Value, env: &Value, run_correlation_id: &str) -> Value {
     if let Value::Object(ref mut map) = record {
         let extension = map
@@ -1325,18 +1335,20 @@ fn run_scenario_suite_and_emit_jsonl() {
 #[test]
 fn concurrent_test_consumers_share_one_benchmark_execution() {
     let correlation_ids = std::thread::scope(|scope| {
-        let handles = (0..4)
-            .map(|_| {
-                scope.spawn(|| {
-                    shared_scenario_records()
-                        .first()
-                        .and_then(|record| record.get("correlation_id"))
-                        .and_then(Value::as_str)
-                        .expect("shared benchmark record correlation_id")
-                        .to_string()
-                })
-            })
-            .collect::<Vec<_>>();
+        let read_correlation_id = || {
+            shared_scenario_records()
+                .first()
+                .and_then(|record| record.get("correlation_id"))
+                .and_then(Value::as_str)
+                .expect("shared benchmark record correlation_id")
+                .to_string()
+        };
+        let handles = [
+            scope.spawn(read_correlation_id),
+            scope.spawn(read_correlation_id),
+            scope.spawn(read_correlation_id),
+            scope.spawn(read_correlation_id),
+        ];
         handles
             .into_iter()
             .map(|handle| handle.join().expect("shared benchmark consumer thread"))
@@ -1372,14 +1384,26 @@ fn regression_eligibility_rejects_an_unverified_perf_label() {
     assert!(!is_lower_hex_sha256(&"0".repeat(64)));
 
     assert_eq!(
-        classify_regression_evidence("perf", false, true, false, false),
+        classify_regression_evidence(RegressionEligibility {
+            build_profile: "perf",
+            build_profile_verified: false,
+            provenance_identity_verified: true,
+            optimized_binary: true,
+            measurement_region: MeasurementRegion::Controlled,
+        }),
         RegressionEvidence {
             confidence: CONFIDENCE_MEDIUM,
             eligible: false,
         }
     );
     assert_eq!(
-        classify_regression_evidence("perf", true, false, false, false),
+        classify_regression_evidence(RegressionEligibility {
+            build_profile: "perf",
+            build_profile_verified: true,
+            provenance_identity_verified: false,
+            optimized_binary: true,
+            measurement_region: MeasurementRegion::Controlled,
+        }),
         RegressionEvidence {
             confidence: CONFIDENCE_MEDIUM,
             eligible: false,
@@ -1387,7 +1411,13 @@ fn regression_eligibility_rejects_an_unverified_perf_label() {
         "incomplete source, feature, or executable identity must not become gate-eligible"
     );
     assert_eq!(
-        classify_regression_evidence("perf", true, true, false, false),
+        classify_regression_evidence(RegressionEligibility {
+            build_profile: "perf",
+            build_profile_verified: true,
+            provenance_identity_verified: true,
+            optimized_binary: true,
+            measurement_region: MeasurementRegion::Controlled,
+        }),
         RegressionEvidence {
             confidence: CONFIDENCE_HIGH,
             eligible: true,
@@ -1476,6 +1506,8 @@ fn assert_record_required_fields(obj: &Map<String, Value>) {
     );
 }
 
+// This assertion intentionally enumerates the complete cross-field protocol contract.
+#[allow(clippy::too_many_lines)]
 fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
     assert_eq!(
         obj.get("protocol_schema").and_then(Value::as_str),
@@ -1598,6 +1630,8 @@ fn assert_protocol_and_partition_contract(obj: &Map<String, Value>) {
     );
 }
 
+// This assertion intentionally recomputes every provenance field from independent inputs.
+#[allow(clippy::too_many_lines)]
 fn assert_env_fingerprint_fields(obj: &Map<String, Value>) {
     let env = obj.get("env").expect("env must be present");
     for field in &[

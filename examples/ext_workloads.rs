@@ -152,18 +152,27 @@ struct RegressionEvidence {
     eligible: bool,
 }
 
-fn classify_regression_evidence(
-    build_profile: &str,
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum MeasurementRegion {
+    Controlled,
+    Load,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RegressionEligibility<'a> {
+    build_profile: &'a str,
     build_profile_verified: bool,
     provenance_identity_verified: bool,
-    debug_assertions: bool,
-    host_page_cache_uncontrolled: bool,
-) -> RegressionEvidence {
-    let eligible = !host_page_cache_uncontrolled
-        && !debug_assertions
-        && build_profile == "perf"
-        && build_profile_verified
-        && provenance_identity_verified;
+    optimized_binary: bool,
+    measurement_region: MeasurementRegion,
+}
+
+fn classify_regression_evidence(eligibility: RegressionEligibility<'_>) -> RegressionEvidence {
+    let eligible = eligibility.build_profile == "perf"
+        && eligibility.build_profile_verified
+        && eligibility.provenance_identity_verified
+        && eligibility.optimized_binary
+        && eligibility.measurement_region == MeasurementRegion::Controlled;
     RegressionEvidence {
         confidence: if eligible {
             CONFIDENCE_HIGH
@@ -397,6 +406,8 @@ impl StageTotals {
 }
 
 #[derive(Debug, Clone)]
+// These booleans mirror independent evidence fields in the parsed JSON protocol.
+#[allow(clippy::struct_excessive_bools)]
 struct ParsedProfileRecord {
     scenario: String,
     extension: String,
@@ -490,20 +501,20 @@ fn run() -> Result<()> {
             binary_sha256: &binary_sha256,
             debug_assertions: cfg!(debug_assertions),
         });
-    let measured_evidence = classify_regression_evidence(
-        &build_profile,
+    let measured_evidence = classify_regression_evidence(RegressionEligibility {
+        build_profile: &build_profile,
         build_profile_verified,
         provenance_identity_verified,
-        cfg!(debug_assertions),
-        false,
-    );
-    let load_evidence = classify_regression_evidence(
-        &build_profile,
+        optimized_binary: !cfg!(debug_assertions),
+        measurement_region: MeasurementRegion::Controlled,
+    });
+    let load_evidence = classify_regression_evidence(RegressionEligibility {
+        build_profile: &build_profile,
         build_profile_verified,
         provenance_identity_verified,
-        cfg!(debug_assertions),
-        true,
-    );
+        optimized_binary: !cfg!(debug_assertions),
+        measurement_region: MeasurementRegion::Load,
+    });
 
     let mut out: Box<dyn Write> = match args.out.as_ref() {
         Some(path) => Box::new(fs::File::create(path)?),
@@ -4220,18 +4231,54 @@ mod tests {
     #[test]
     fn regression_evidence_requires_perf_and_controlled_measurement_region() {
         assert_eq!(
-            classify_regression_evidence("perf", true, true, false, false),
+            classify_regression_evidence(RegressionEligibility {
+                build_profile: "perf",
+                build_profile_verified: true,
+                provenance_identity_verified: true,
+                optimized_binary: true,
+                measurement_region: MeasurementRegion::Controlled,
+            }),
             RegressionEvidence {
                 confidence: CONFIDENCE_HIGH,
                 eligible: true,
             }
         );
         for evidence in [
-            classify_regression_evidence("release", true, true, false, false),
-            classify_regression_evidence("perf", false, true, false, false),
-            classify_regression_evidence("perf", true, false, false, false),
-            classify_regression_evidence("perf", true, true, true, false),
-            classify_regression_evidence("perf", true, true, false, true),
+            classify_regression_evidence(RegressionEligibility {
+                build_profile: "release",
+                build_profile_verified: true,
+                provenance_identity_verified: true,
+                optimized_binary: true,
+                measurement_region: MeasurementRegion::Controlled,
+            }),
+            classify_regression_evidence(RegressionEligibility {
+                build_profile: "perf",
+                build_profile_verified: false,
+                provenance_identity_verified: true,
+                optimized_binary: true,
+                measurement_region: MeasurementRegion::Controlled,
+            }),
+            classify_regression_evidence(RegressionEligibility {
+                build_profile: "perf",
+                build_profile_verified: true,
+                provenance_identity_verified: false,
+                optimized_binary: true,
+                measurement_region: MeasurementRegion::Controlled,
+            }),
+            classify_regression_evidence(RegressionEligibility {
+                build_profile: "perf",
+                build_profile_verified: true,
+                provenance_identity_verified: true,
+                optimized_binary: false,
+                measurement_region: MeasurementRegion::Controlled,
+            }),
+            classify_regression_evidence(RegressionEligibility {
+                build_profile: "perf",
+                build_profile_verified: true,
+                provenance_identity_verified: true,
+                optimized_binary: true,
+                measurement_region: MeasurementRegion::Load,
+            }),
         ] {
             assert_eq!(evidence.confidence, CONFIDENCE_MEDIUM);
             assert!(!evidence.eligible);

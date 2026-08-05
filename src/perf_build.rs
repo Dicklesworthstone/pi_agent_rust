@@ -284,9 +284,10 @@ pub fn sha256_file(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Hashes the complete asserted build/source/binary provenance as compact
-/// canonical JSON. Both evidence producers and consumers use this helper so a
-/// field omission or serialization-order drift fails closed.
+/// Hashes asserted build/source/binary provenance as compact canonical JSON.
+///
+/// Evidence producers and consumers share this helper so field omissions or
+/// serialization-order drift fail closed.
 #[must_use]
 pub fn benchmark_provenance_config_hash(provenance: &BenchmarkProvenance<'_>) -> String {
     let canonical = serde_json::json!({
