@@ -1764,26 +1764,28 @@ fn conformance_report_generation_requires_exact_opt_in() {
 }
 
 #[test]
-fn conformance_report_default_path_does_not_mutate_tracked_outputs() {
+fn conformance_report_default_path_does_not_mutate_release_outputs() {
     let paths = [
         reports_dir().join("CONFORMANCE_REPORT.md"),
         reports_dir().join("conformance_events.jsonl"),
         reports_dir().join("conformance_summary.json"),
         reports_dir().join("conformance_trend.json"),
     ];
-    let before = paths
-        .iter()
-        .map(std::fs::read)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read tracked conformance outputs before read-only path");
+    let snapshot = || {
+        paths
+            .iter()
+            .map(|path| match std::fs::read(path) {
+                Ok(contents) => Ok(Some(contents)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error),
+            })
+            .collect::<Result<Vec<_>, std::io::Error>>()
+    };
+    let before = snapshot().expect("snapshot conformance outputs before read-only path");
 
     assert!(!generate_conformance_report_when_requested(false));
 
-    let after = paths
-        .iter()
-        .map(std::fs::read)
-        .collect::<Result<Vec<_>, _>>()
-        .expect("read tracked conformance outputs after read-only path");
+    let after = snapshot().expect("snapshot conformance outputs after read-only path");
     assert_eq!(
         before, after,
         "ordinary tests must not freshen release evidence"

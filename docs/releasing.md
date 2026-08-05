@@ -447,8 +447,12 @@ proof is not proof of an empty bypass list.
    git add \
      docs/evidence/dropin-certification-verdict.json \
      tests/ext_conformance/reports/CONFORMANCE_REPORT.md \
-     tests/ext_conformance/reports/conformance_summary.json \
-     tests/ext_conformance/reports/conformance_events.jsonl
+     tests/ext_conformance/reports/conformance_summary.json
+   # Ordinary local report outputs are ignored; this source-bound event log is
+   # intentionally retained as release evidence.
+   git add -f tests/ext_conformance/reports/conformance_events.jsonl
+   ubs --staged --only=rust .
+   ./scripts/reconcile_beads_ledger.sh
    git commit -m "Record ${RELEASE_TAG} release evidence [skip actions]"
 
    RELEASE_GATE_REQUIRE_PREFLIGHT=1 \
@@ -2224,7 +2228,7 @@ proof is not proof of an empty bypass list.
    ' "$prepublic_ruleset" >/dev/null
 
    verify_exact_release true immediately-before-publication
-   registry_checksum="$(curl -fsS \
+   registry_checksum="$(curl -fsS -A 'pi-agent-rust-manual-release' \
      "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
      | jq -er --arg version "$RELEASE_VERSION" '
        select(.version.crate == "pi_agent_rust" and
@@ -2257,7 +2261,7 @@ proof is not proof of an empty bypass list.
       .name == $tag and .body == $body' \
      "$public_response" >/dev/null
    verify_exact_release false immediately-after-publication
-   test "$(curl -fsS \
+   test "$(curl -fsS -A 'pi-agent-rust-manual-release' \
      "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
      | jq -er '.version.checksum')" = "$expected_crate_sha256"
    ```
@@ -2345,7 +2349,7 @@ proof is not proof of an empty bypass list.
     (set -C; jq -r '.workflow_runs[].id' "$postrelease_workflows" \
       | LC_ALL=C sort -n > "$postrelease_workflow_ids")
     cmp "$WORKFLOW_BASELINE_IDS" "$postrelease_workflow_ids"
-    curl -fsS \
+    curl -fsS -A 'pi-agent-rust-manual-release' \
       "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
       | jq -e \
         --arg version "$RELEASE_VERSION" \
