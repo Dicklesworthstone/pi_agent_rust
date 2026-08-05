@@ -230,34 +230,34 @@ or more commits whose subjects end in `[skip actions]`, and leave the checkout
 completely clean. Run the lane as one fail-fast Bash session (`set -euo
 pipefail`); do not copy a later publication command in isolation. Start by
 binding all operator state to the intended stable version, a fresh directory
-outside the checkout, four explicitly selected smoke-test hosts, and the
-audited controller's ARM64 sysroot. Linux AMD64 executes natively. Linux ARM64
-executes explicitly under `qemu-aarch64` on the configured x86_64 controller;
-that is target-runtime emulation, not a hardware-native ARM64 claim. The Apple
-Silicon macOS host must support both native ARM64 execution and Rosetta x86_64
-execution, and the Windows host must report an x86_64 OS runtime. Replace all
-seven explicit operator-supplied values before running this block:
+outside the checkout, the fixed audited smoke hosts (`trj`, `mmini`, and
+`wlap`), and the audited controller's ARM64 sysroot. Linux AMD64 executes
+natively on `trj`. Linux ARM64 executes explicitly under `qemu-aarch64` on that
+x86_64 host; that is target-runtime emulation, not a hardware-native ARM64
+claim. `mmini` must support both native ARM64 execution and Rosetta x86_64
+execution, and `wlap` must report an x86_64 Windows runtime. Replace the three
+explicit operator-supplied values before running this block:
 
 ```bash
 set -euo pipefail
 umask 077
 export RELEASE_VERSION="X.Y.Z"
 export MANUAL_RELEASE_STATE_DIR="/path/outside/checkout/pi_agent_rust-vX.Y.Z-release-state"
-export LINUX_AMD64_SMOKE_HOST="operator-supplied-linux-amd64-host"
-export LINUX_ARM64_SMOKE_HOST="operator-supplied-linux-arm64-qemu-host"
+export LINUX_AMD64_SMOKE_HOST="trj"
+export LINUX_ARM64_SMOKE_HOST="trj"
 export LINUX_ARM64_QEMU_SYSROOT="/operator/supplied/aarch64/sysroot"
-export DARWIN_SMOKE_HOST="operator-supplied-apple-silicon-host"
-export WINDOWS_AMD64_SMOKE_HOST="operator-supplied-windows-amd64-host"
+export DARWIN_SMOKE_HOST="mmini"
+export WINDOWS_AMD64_SMOKE_HOST="wlap"
 [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
 export RELEASE_TAG="v${RELEASE_VERSION}"
 test "$RELEASE_TAG" != "vX.Y.Z"
-test "$LINUX_AMD64_SMOKE_HOST" != "operator-supplied-linux-amd64-host"
-test "$LINUX_ARM64_SMOKE_HOST" != "operator-supplied-linux-arm64-qemu-host"
+test "$LINUX_AMD64_SMOKE_HOST" = trj
+test "$LINUX_ARM64_SMOKE_HOST" = trj
 test "$LINUX_ARM64_QEMU_SYSROOT" != "/operator/supplied/aarch64/sysroot"
 [[ "$LINUX_ARM64_QEMU_SYSROOT" =~ ^/[A-Za-z0-9._/-]+$ ]]
 case "$LINUX_ARM64_QEMU_SYSROOT" in *'/../'*|*'/..'|*'//'*) exit 1 ;; esac
-test "$DARWIN_SMOKE_HOST" != "operator-supplied-apple-silicon-host"
-test "$WINDOWS_AMD64_SMOKE_HOST" != "operator-supplied-windows-amd64-host"
+test "$DARWIN_SMOKE_HOST" = mmini
+test "$WINDOWS_AMD64_SMOKE_HOST" = wlap
 test ! -e "$MANUAL_RELEASE_STATE_DIR"
 mkdir -m 700 "$MANUAL_RELEASE_STATE_DIR"
 RELEASE_REPOSITORY="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
@@ -1491,16 +1491,23 @@ proof is not proof of an empty bypass list.
    created_target_commitish="$(jq -er '
      .target_commitish | select(type == "string" and length > 0)
    ' "$draft_created")"
+   expected_upload_template="https://uploads.github.com/repos/${RELEASE_REPOSITORY}/releases/${release_id}/assets{?name,label}"
    jq -e \
      --argjson id "$release_id" \
      --arg tag "$RELEASE_TAG" \
      --arg target "$created_target_commitish" \
+     --arg upload "$expected_upload_template" \
      --rawfile body "$release_body" \
      '.id == $id and .draft == true and .prerelease == false and
       .tag_name == $tag and .target_commitish == $target and
       .name == $tag and .body == $body and
+      .upload_url == $upload and
       (.assets | type) == "array" and (.assets | length) == 0' \
      "$draft_created" >/dev/null
+   release_upload_url="$(jq -er '
+     .upload_url | sub("\\{\\?name,label\\}$"; "") |
+     select(startswith("https://uploads.github.com/"))
+   ' "$draft_created")"
 
    EXPECTED_ASSETS=(
      pi-linux-amd64.tar.xz
@@ -1525,11 +1532,11 @@ proof is not proof of an empty bypass list.
      upload_response="$upload_receipts/${asset}.json"
      test -f "$asset_path" && test ! -L "$asset_path" && test -s "$asset_path"
      test ! -e "$upload_response"
-     (set -C; gh api --hostname uploads.github.com --method POST \
+     (set -C; gh api --method POST \
        -H 'Accept: application/vnd.github+json' \
        -H 'Content-Type: application/octet-stream' \
        --input "$asset_path" \
-       "/repos/${RELEASE_REPOSITORY}/releases/${release_id}/assets?name=${asset}" \
+       "${release_upload_url}?name=${asset}" \
        > "$upload_response")
      jq -e \
        --arg name "$asset" \

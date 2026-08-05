@@ -9504,7 +9504,8 @@ export default { SandboxManager };
 
     modules.insert(
         "ms".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 function parseMs(text) {
   const s = String(text ?? "").trim();
   if (!s) return undefined;
@@ -9528,7 +9529,8 @@ export default function ms(value) {
 }
 
 export const parse = parseMs;
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -9751,7 +9753,8 @@ export default { sign, verify, decode };
     // ── shell-quote ──────────────────────────────────────────────────
     modules.insert(
         "shell-quote".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 export function parse(cmd) {
   if (typeof cmd !== 'string') return [];
   const args = [];
@@ -9782,7 +9785,8 @@ export function quote(args) {
   }).join(' ');
 }
 export default { parse, quote };
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -9904,7 +9908,8 @@ export class SSEClientTransport {
     // ── glob ────────────────────────────────────────────────────────
     modules.insert(
         "glob".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 import "node:fs";
 
 function __pi_glob_vfs() {
@@ -10049,7 +10054,8 @@ export class Glob {
 }
 
 export default { globSync, glob, Glob };
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -10138,7 +10144,8 @@ export default { define, loadConfig };
     // ── bun ────────────────────────────────────────────────────────
     modules.insert(
         "bun".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 const bun = globalThis.Bun || {};
 export const argv = bun.argv || [];
 export const file = (...args) => bun.file(...args);
@@ -10146,7 +10153,8 @@ export const write = (...args) => bun.write(...args);
 export const spawn = (...args) => bun.spawn(...args);
 export const which = (...args) => bun.which(...args);
 export default bun;
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -12509,7 +12517,8 @@ export default { access, mkdir, mkdtemp, readFile, writeFile, unlink, readlink, 
 
     modules.insert(
         "node:http2".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 import EventEmitter from "node:events";
 
 export const constants = {
@@ -12576,7 +12585,8 @@ export class ClientHttp2Session extends EventEmitter {}
 export class ClientHttp2Stream extends EventEmitter {}
 
 export default { connect, constants, ClientHttp2Session, ClientHttp2Stream };
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -12726,7 +12736,8 @@ export default { inspect, promisify, stripVTControlCharacters, deprecate, inheri
 
     modules.insert(
         "node:readline".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 // Readline shim backed by pi.ui('input') when UI is available.
 
 function __pi_readline_prompt(query) {
@@ -12776,7 +12787,8 @@ export const promises = {
 };
 
 export default { createInterface, promises };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -13171,7 +13183,8 @@ export default { createConnection, createServer, connect, isIP, isIPv4, isIPv6, 
     // ── node:events ──────────────────────────────────────────────────
     modules.insert(
         "node:events".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 class EventEmitter {
   constructor() {
     this._events = Object.create(null);
@@ -13268,7 +13281,8 @@ EventEmitter.defaultMaxListeners = 10;
 
 export { EventEmitter };
 export default EventEmitter;
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -13284,7 +13298,8 @@ export default EventEmitter;
     // ── node:assert ──────────────────────────────────────────────────
     modules.insert(
         "node:assert".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 function assert(value, message) {
   if (!value) throw new Error(message || 'Assertion failed');
 }
@@ -13311,7 +13326,8 @@ assert.fail = (msg) => { throw new Error(msg || 'assert.fail()'); };
 
 export default assert;
 export { assert };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -13319,7 +13335,8 @@ export { assert };
     // ── node:assert/strict ───────────────────────────────────────────
     modules.insert(
         "node:assert/strict".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 import assert from "node:assert";
 
 export default assert;
@@ -13336,7 +13353,8 @@ export const throws = assert.throws;
 export const doesNotThrow = assert.doesNotThrow;
 export const fail = assert.fail;
 export { assert };
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -13344,7 +13362,8 @@ export { assert };
     // ── node:test ────────────────────────────────────────────────────
     modules.insert(
         "node:test".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 function __noop() {}
 
 const __state = {
@@ -13502,7 +13521,8 @@ export async function run() {
 }
 
 export default { test, describe, it, before, after, beforeEach, afterEach, run, mock };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14294,7 +14314,8 @@ export default { pipeline, finished };
     // node:stream/web — bridge to global Web Streams when available
     modules.insert(
         "node:stream/web".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 const _ReadableStream = globalThis.ReadableStream;
 const _WritableStream = globalThis.WritableStream;
 const _TransformStream = globalThis.TransformStream;
@@ -14326,7 +14347,8 @@ export default {
   ByteLengthQueuingStrategy,
   CountQueuingStrategy,
 };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14391,7 +14413,8 @@ export default { parse, stringify, decode, encode, escape, unescape };
     // node:constants — compatibility map for libraries probing process constants
     modules.insert(
         "node:constants".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 const _constants = {
   EOL: '\n',
   F_OK: 0,
@@ -14414,7 +14437,8 @@ const constants = new Proxy(_constants, {
 
 export default constants;
 export { constants };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14422,7 +14446,8 @@ export { constants };
     // node:tty — terminal capability probes
     modules.insert(
         "node:tty".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 import EventEmitter from 'node:events';
 
 export function isatty(_fd) { return false; }
@@ -14450,7 +14475,8 @@ export class WriteStream extends EventEmitter {
 }
 
 export default { isatty, ReadStream, WriteStream };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14458,7 +14484,8 @@ export default { isatty, ReadStream, WriteStream };
     // node:tls — secure socket APIs are intentionally unavailable in PiJS
     modules.insert(
         "node:tls".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 import EventEmitter from 'node:events';
 
 export const DEFAULT_MIN_VERSION = 'TLSv1.2';
@@ -14481,7 +14508,8 @@ export function createServer(_options, _secureConnectionListener) {
 }
 
 export default { connect, createServer, TLSSocket, DEFAULT_MIN_VERSION, DEFAULT_MAX_VERSION };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14601,7 +14629,8 @@ export default {
     // node:perf_hooks — expose lightweight performance clock surface
     modules.insert(
         "node:perf_hooks".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 const perf =
   globalThis.performance ||
   {
@@ -14624,7 +14653,8 @@ export class PerformanceObserver {
 }
 
 export default { performance, constants, PerformanceObserver };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14632,7 +14662,8 @@ export default { performance, constants, PerformanceObserver };
     // node:vm — disabled in PiJS for safety
     modules.insert(
         "node:vm".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 function unsupported(name) {
   throw new Error(`node:vm.${name} is not available in PiJS`);
 }
@@ -14647,7 +14678,8 @@ export class Script {
 }
 
 export default { runInContext, runInNewContext, runInThisContext, createContext, Script };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14823,7 +14855,8 @@ export default { spawn };
 
     modules.insert(
         "chokidar".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 function makeWatcher() {
     const w = {
         on(ev, cb) { return w; },
@@ -14837,14 +14870,16 @@ function makeWatcher() {
 }
 export function watch(paths, options) { return makeWatcher(); }
 export default { watch };
-")
+"
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "jsdom".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 class Element {
     constructor(tag, html) { this.tagName = tag; this._html = html || ''; this.childNodes = []; }
     get innerHTML() { return this._html; }
@@ -14875,7 +14910,8 @@ export class JSDOM {
         this.window = { document: doc, location: { href: (opts && opts.url) || '' } };
     }
 }
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -14909,7 +14945,8 @@ export function renderMermaidAscii(source) {
 
     modules.insert(
         "@aliou/pi-utils-settings".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 export class ConfigLoader {
     constructor(name, defaultConfig, options) {
         this._name = name;
@@ -14945,14 +14982,16 @@ export function setNestedValue(obj, path, value) {
     }
     cur[keys[keys.length - 1]] = value;
 }
-")
+"
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@aliou/sh".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 export class ParseError extends Error { constructor(msg) { super(msg); this.name = 'ParseError'; } }
 export function tokenize(cmd) {
     const source = String(cmd ?? '');
@@ -15026,14 +15065,16 @@ export function parse(cmd) {
     };
 }
 export function quote(s) { return "'" + (s || '').replace(/'/g, "'\\''") + "'"; }
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "@marckrenn/pi-sub-shared".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 export const PROVIDERS = ["anthropic", "openai", "google", "aws", "azure"];
 export const MODEL_MULTIPLIERS = {};
 const _meta = (name) => ({
@@ -15053,7 +15094,8 @@ export const PROVIDER_DISPLAY_NAMES = Object.fromEntries(
 export function getDefaultCoreSettings() {
     return { providers: {}, behavior: { autoSwitch: false } };
 }
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -15094,7 +15136,8 @@ export default { Terminal };
 
     modules.insert(
         "@opentelemetry/api".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 export const SpanStatusCode = { UNSET: 0, OK: 1, ERROR: 2 };
 const noopSpan = {
     setAttribute() { return this; },
@@ -15122,7 +15165,8 @@ export const context = {
     active() { return {}; },
     with(ctx, fn) { return fn(); },
 };
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -15215,7 +15259,8 @@ export class BatchSpanProcessor extends SimpleSpanProcessor {}
 
     modules.insert(
         "@opentelemetry/semantic-conventions".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 export const SemanticResourceAttributes = {
     SERVICE_NAME: 'service.name',
     SERVICE_VERSION: 'service.version',
@@ -15223,7 +15268,8 @@ export const SemanticResourceAttributes = {
 };
 export const SEMRESATTRS_SERVICE_NAME = 'service.name';
 export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
-")
+"
+        )
         .trim()
         .to_string(),
     );
@@ -15231,7 +15277,8 @@ export const SEMRESATTRS_SERVICE_VERSION = 'service.version';
     // ── npm package stubs for extension conformance ──
 
     {
-        let openclaw_plugin_sdk = compressed_js_literal!(r#"
+        let openclaw_plugin_sdk = compressed_js_literal!(
+            r#"
 export function definePlugin(spec = {}) { return spec; }
 export function createPlugin(spec = {}) { return spec; }
 export function tool(spec = {}) { return { ...spec, type: "tool" }; }
@@ -15320,7 +15367,8 @@ export default {
   registerOpenClaw,
   OpenClawPlugin,
 };
-"#)
+"#
+        )
         .trim()
         .to_string();
 
@@ -15344,7 +15392,8 @@ export default {
 
     modules.insert(
         "zod".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 const __schema = {
   parse(value) { return value; },
   safeParse(value) { return { success: true, data: value }; },
@@ -15388,14 +15437,16 @@ export const z = {
   nullable(inner) { return inner ?? makeSchema(); },
 };
 export default z;
-")
+"
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "yaml".to_string(),
-        compressed_js_literal!(r##"
+        compressed_js_literal!(
+            r##"
 export function parse(input) {
     const text = String(input ?? "").trim();
     if (!text) return {};
@@ -15417,14 +15468,16 @@ export function stringify(value) {
     return lines.length ? `${lines.join("\n")}\n` : "";
 }
 export default { parse, stringify };
-"##)
+"##
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "better-sqlite3".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 class Statement {
     all() { return []; }
     get() { return undefined; }
@@ -15454,14 +15507,16 @@ BetterSqlite3.Database = BetterSqlite3;
 
 export { Statement };
 export default BetterSqlite3;
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "ws".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 function __makeEmitter(target) {
   target._listeners = {};
   target.on = function(event, handler) {
@@ -15560,14 +15615,16 @@ WebSocket.Server = WebSocketServer;
 WebSocket.WebSocketServer = WebSocketServer;
 export const Server = WebSocketServer;
 export default WebSocket;
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "axios".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 function __makeResponse(config, data) {
   return {
     data: data ?? null,
@@ -15625,7 +15682,8 @@ axios.all = (promises) => Promise.all(promises);
 axios.spread = (cb) => (arr) => cb(...arr);
 
 export default axios;
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -15659,7 +15717,8 @@ export default open;
 
     modules.insert(
         "commander".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 export class Option {
   constructor(flags, description) {
     this.flags = flags;
@@ -15710,14 +15769,16 @@ export class Command {
 export function createCommand(name) { return new Command(name); }
 export const program = new Command();
 export default { Command, Option, Argument, program, createCommand };
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
 
     modules.insert(
         "chalk".to_string(),
-        compressed_js_literal!(r#"
+        compressed_js_literal!(
+            r#"
 function chalk(...args) {
   return args.join("");
 }
@@ -15745,7 +15806,8 @@ export class Chalk {
 
 export default chalk;
 export { chalk };
-"#)
+"#
+        )
         .trim()
         .to_string(),
     );
@@ -15854,7 +15916,8 @@ export default { scip };
 
     modules.insert(
         "p-limit".to_string(),
-        compressed_js_literal!(r"
+        compressed_js_literal!(
+            r"
 export default function pLimit(concurrency) {
     const queue = [];
     let active = 0;
@@ -15881,7 +15944,8 @@ export default function pLimit(concurrency) {
     });
     return generator;
 }
-")
+"
+        )
         .trim()
         .to_string(),
     );
