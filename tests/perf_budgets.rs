@@ -3641,6 +3641,12 @@ fn generate_budget_report() {
         return;
     }
     let root = project_root();
+    // Capture source/run identity before mutating any tracked report. Otherwise
+    // a clean, claim-ready generation would make itself appear dirty.
+    let strict_mode = perf_strict_mode();
+    let source_commit = clean_source_commit(&root);
+    let run_id = perf_run_id();
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let results: Vec<BudgetResult> = BUDGETS.iter().map(check_budget).collect();
     let data_contract_failures = collect_data_contract_failures(&root);
     let reports_dir = root.join("tests/perf/reports");
@@ -3674,9 +3680,6 @@ fn generate_budget_report() {
         .filter(|result| result.status == "NO_DATA")
         .count();
     let data_contract_failures_count = data_contract_failures.len();
-    let strict_mode = perf_strict_mode();
-    let source_commit = clean_source_commit(&root);
-    let run_id = perf_run_id();
     let run_id_json = run_id.as_deref();
     let run_id_label = run_id.as_deref().unwrap_or("not set").to_string();
     let correlation_id = run_id.as_deref();
@@ -3697,8 +3700,6 @@ fn generate_budget_report() {
     } else {
         "blocked"
     };
-    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-
     let summary = json!({
         "schema": "pi.perf.budget_summary.v2",
         "generated_at": generated_at,
