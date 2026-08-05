@@ -1036,8 +1036,7 @@ def artifact_groups(repo_root: Path, target_dir: Path) -> list[ArtifactGroup]:
             budget_names=("tool_call_latency_mean", "tool_call_throughput_min"),
             candidates=pijs_candidates(repo_root, target_dir),
             suggested_commands=(
-                f"{bench_prefix} build --profile perf --no-default-features --example pijs_workload",
-                f"{cargo_env} && BENCH_CARGO_RUNNER=rch ./scripts/bench_extension_workloads.sh",
+                f"{cargo_env} && BENCH_CARGO_RUNNER=rch BENCH_ALLOCATORS_CSV=system BENCH_PGO_MODE=off ITERATIONS=2000 TOOL_CALLS_CSV=1,10 ./scripts/bench_extension_workloads.sh",
             ),
             reason="pijs_workload JSONL required for tool-call latency and throughput budgets",
             expected_outputs=pijs_candidates(repo_root, target_dir),
@@ -1191,7 +1190,13 @@ def report_status(repo_root: Path, now: datetime) -> dict[str, Any]:
         "generated_at": payload.get("generated_at") if payload else None,
     }
     if payload:
-        for key in ("ci_fail", "ci_no_data", "data_contract_failures_count"):
+        for key in (
+            "fail",
+            "no_data",
+            "ci_fail",
+            "ci_no_data",
+            "data_contract_failures_count",
+        ):
             base[key] = payload.get(key)
     return base
 
@@ -1333,7 +1338,13 @@ def build_report(args: argparse.Namespace) -> tuple[int, dict[str, Any]]:
 
     report = report_status(repo_root, now)
     report_blockers: list[str] = []
-    for key in ("ci_fail", "ci_no_data", "data_contract_failures_count"):
+    for key in (
+        "fail",
+        "no_data",
+        "ci_fail",
+        "ci_no_data",
+        "data_contract_failures_count",
+    ):
         value = report.get(key)
         if isinstance(value, int | float) and value != 0:
             report_blockers.append(f"budget_summary.{key}={value}")
@@ -1616,6 +1627,37 @@ def run_self_test() -> int:
     ok_code, ok_payload = build_report(build_args(ok_root))
     assert ok_code == 0, ok_payload
     assert ok_payload["readiness"] == "ready", ok_payload
+
+    aggregate_blocked_root = Path(
+        tempfile.mkdtemp(prefix="pi-perf-preflight-aggregate-blocked-")
+    )
+    write_fixture(aggregate_blocked_root, include_policy=True)
+    aggregate_summary_path = (
+        aggregate_blocked_root / "tests/perf/reports/budget_summary.json"
+    )
+    aggregate_summary = json.loads(aggregate_summary_path.read_text(encoding="utf-8"))
+    aggregate_summary["fail"] = 1
+    aggregate_summary["no_data"] = 1
+    aggregate_summary["claim_readiness"] = {
+        "status": "blocked",
+        "performance_claims_authorized": False,
+        "blocking_reason_codes": ["budget_data_missing", "budget_failed"],
+    }
+    aggregate_summary_path.write_text(
+        json.dumps(aggregate_summary),
+        encoding="utf-8",
+    )
+    aggregate_code, aggregate_payload = build_report(
+        build_args(aggregate_blocked_root)
+    )
+    assert aggregate_code == 1, aggregate_payload
+    assert aggregate_payload["readiness"] == "blocked", aggregate_payload
+    assert "budget_summary.fail=1" in aggregate_payload["report_blockers"], (
+        aggregate_payload
+    )
+    assert "budget_summary.no_data=1" in aggregate_payload["report_blockers"], (
+        aggregate_payload
+    )
 
     blocked_root = Path(tempfile.mkdtemp(prefix="pi-perf-preflight-blocked-"))
     write_fixture(blocked_root, include_policy=False)

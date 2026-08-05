@@ -1600,7 +1600,7 @@ fn failure_count_within_release_threshold() {
 
 const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 const PERF_CANONICAL_BUDGET_INVENTORY_SHA256: &str =
-    "PENDING_CANONICAL_BUDGET_INVENTORY_SHA256";
+    "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad";
 const PERF_TOP_LEVEL_FIELDS: &[&str] = &[
     "schema",
     "generated_at",
@@ -1880,8 +1880,8 @@ fn validate_performance_budget_summary(
     }
     let run_id = perf_nullable_lineage(&top["run_id"], "run_id")?;
     let correlation_id = perf_nullable_lineage(&top["correlation_id"], "correlation_id")?;
-    if run_id.is_some() && correlation_id.is_some() && run_id != correlation_id {
-        return Err("run_id and correlation_id must match when both are present".to_string());
+    if run_id != correlation_id {
+        return Err("run_id and correlation_id must both be null or match".to_string());
     }
     let strict_mode = top["strict_mode"]
         .as_bool()
@@ -2166,6 +2166,12 @@ fn validate_performance_budget_summary(
     }
 
     let mut expected_reasons = Vec::new();
+    if counts["no_data"] != 0 {
+        expected_reasons.push("budget_data_missing");
+    }
+    if counts["fail"] != 0 {
+        expected_reasons.push("budget_failed");
+    }
     if counts["ci_with_data"] != counts["ci_enforced"] || counts["ci_no_data"] != 0 {
         expected_reasons.push("ci_budget_data_missing");
     }
@@ -2364,6 +2370,11 @@ fn exact_libtest_output_proves_one(
         .map(str::trim)
         .filter(|line| line.ends_with(": test"))
         .collect();
+    let listed_benchmarks: Vec<_> = listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.ends_with(": benchmark") || line.ends_with(": bench"))
+        .collect();
     let list_summaries: Vec<_> = listing
         .lines()
         .map(str::trim)
@@ -2388,7 +2399,10 @@ fn exact_libtest_output_proves_one(
         })
         .collect();
     let expected_listing = format!("{test_name}: test");
-    if listed != [expected_listing.as_str()] || list_summaries != ["1 test, 0 benchmarks"] {
+    if listed != [expected_listing.as_str()]
+        || !listed_benchmarks.is_empty()
+        || !(list_summaries.is_empty() || list_summaries == ["1 test, 0 benchmarks"])
+    {
         return Err("exact filter did not list exactly one test".to_string());
     }
 
@@ -2476,6 +2490,7 @@ fn blocked_performance_summary_fixture(now: DateTime<Utc>) -> Value {
             "status": "blocked",
             "performance_claims_authorized": false,
             "blocking_reason_codes": [
+                "budget_data_missing",
                 "ci_budget_data_missing",
                 "correlation_id_missing",
                 "data_contract_failure",
@@ -2566,6 +2581,7 @@ fn performance_contract_accepts_coherent_blocked_no_data() {
     let mut forged_source = blocked_performance_summary_fixture(now);
     forged_source["source_commit"] = Value::String("a".repeat(40));
     forged_source["claim_readiness"]["blocking_reason_codes"] = json!([
+        "budget_data_missing",
         "ci_budget_data_missing",
         "correlation_id_missing",
         "data_contract_failure",
@@ -2583,6 +2599,25 @@ fn performance_contract_accepts_coherent_blocked_no_data() {
         validate_performance_budget_summary(&future, now, Duration::hours(168), false).is_err(),
         "an impossible future timestamp is malformed even when claims remain blocked"
     );
+
+    for (run_id, correlation_id) in [
+        (json!("partial-run"), Value::Null),
+        (Value::Null, json!("partial-correlation")),
+    ] {
+        let mut partial_lineage = blocked_performance_summary_fixture(now);
+        partial_lineage["run_id"] = run_id;
+        partial_lineage["correlation_id"] = correlation_id;
+        assert!(
+            validate_performance_budget_summary(
+                &partial_lineage,
+                now,
+                Duration::hours(168),
+                false,
+            )
+            .is_err(),
+            "one-sided run/correlation lineage must be malformed, not merely blocked"
+        );
+    }
 }
 
 #[test]
@@ -2607,6 +2642,46 @@ fn performance_contract_rejects_count_or_status_inconsistency() {
             .is_err(),
         "negative measurements must never satisfy maximum-style budgets"
     );
+
+    let non_ci_index = claim_ready_performance_summary_fixture(now)["budgets"]
+        .as_array()
+        .expect("fixture budgets")
+        .iter()
+        .position(|budget| budget["ci_enforced"].as_bool() == Some(false))
+        .expect("canonical inventory must include a non-CI budget");
+
+    let mut non_ci_no_data = claim_ready_performance_summary_fixture(now);
+    non_ci_no_data["budget_results"][non_ci_index]["actual"] = Value::Null;
+    non_ci_no_data["budget_results"][non_ci_index]["status"] = json!("NO_DATA");
+    non_ci_no_data["pass"] =
+        json!(non_ci_no_data["pass"].as_u64().expect("fixture pass count") - 1);
+    non_ci_no_data["no_data"] = json!(1);
+    let error =
+        validate_performance_budget_summary(&non_ci_no_data, now, Duration::hours(168), true)
+            .expect_err("global authorization must reject missing non-CI budget data");
+    assert!(error.contains("budget_data_missing"), "{error}");
+
+    let mut non_ci_failure = claim_ready_performance_summary_fixture(now);
+    let threshold = non_ci_failure["budget_results"][non_ci_index]["threshold"]
+        .as_f64()
+        .expect("fixture threshold");
+    let comparison = non_ci_failure["budget_results"][non_ci_index]["comparison"]
+        .as_str()
+        .expect("fixture comparison");
+    let failing_actual = if comparison == "minimum" {
+        threshold / 2.0
+    } else {
+        threshold + 1.0
+    };
+    non_ci_failure["budget_results"][non_ci_index]["actual"] = json!(failing_actual);
+    non_ci_failure["budget_results"][non_ci_index]["status"] = json!("FAIL");
+    non_ci_failure["pass"] =
+        json!(non_ci_failure["pass"].as_u64().expect("fixture pass count") - 1);
+    non_ci_failure["fail"] = json!(1);
+    let error =
+        validate_performance_budget_summary(&non_ci_failure, now, Duration::hours(168), true)
+            .expect_err("global authorization must reject a failed non-CI budget");
+    assert!(error.contains("budget_failed"), "{error}");
 }
 
 #[test]
@@ -2735,10 +2810,21 @@ fn performance_claim_ready_requires_source_binding_and_fresh_timestamp() {
 
 #[test]
 fn canonical_perf_test_proof_rejects_zero_match_and_ignored_runs() {
-    let name = "ci_enforced_budgets_fail_on_regression_or_missing_data";
+    let name = "checked_in_budget_summary_matches_fresh_canonical_evaluation_exactly";
     let one_listing = format!("{name}: test\n\n1 test, 0 benchmarks\n");
+    let one_listing_without_summary = format!("{name}: test\n");
     let one_execution = "running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.01s\n";
     assert!(exact_libtest_output_proves_one(&one_listing, one_execution, name).is_ok());
+    assert!(
+        exact_libtest_output_proves_one(&one_listing_without_summary, one_execution, name).is_ok(),
+        "current terse libtest output legitimately omits an aggregate list summary"
+    );
+
+    let benchmark_listing = format!("{name}: test\nforged: benchmark\n");
+    assert!(
+        exact_libtest_output_proves_one(&benchmark_listing, one_execution, name).is_err(),
+        "an exact-test listing must not contain a benchmark"
+    );
 
     let zero_listing = "0 tests, 0 benchmarks\n";
     let zero_execution = "running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 43 filtered out; finished in 0.00s\n";
@@ -2762,11 +2848,14 @@ fn release_gate_exposes_performance_claim_policy_in_report() {
         "pi.perf.budget_summary.v2",
         "performance_claim_readiness",
         "performance_claim_canonical_contract",
+        "run_id and correlation_id must both be null or match",
+        "budget_data_missing",
+        "budget_failed",
         "CANONICAL_BUDGET_INVENTORY_SHA256",
         "validate_exact_libtest_output",
         "--list --format terse",
         "0 ignored",
-        "ci_enforced_budgets_fail_on_regression_or_missing_data",
+        "checked_in_budget_summary_matches_fresh_canonical_evaluation_exactly",
         "\"require_performance_claim_ready\"",
         "release must make no quantitative or global performance claims",
     ] {

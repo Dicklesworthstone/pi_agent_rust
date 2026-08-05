@@ -6,9 +6,9 @@ Citations have the format `*(from artifact-path, run correlation-id)*` or
 `*(from artifact-path, generated timestamp)*`.
 
 If any cited artifact is missing, stale, missing the cited correlation id, or is
-a budget summary with CI no-data/fail/data-contract failures, the check fails to
-prevent stale or unverifiable evidence from misleading users about current
-project capabilities.
+a performance budget summary without a complete v2 claim-readiness
+authorization, the check fails to prevent stale or unverifiable evidence from
+misleading users about current project capabilities.
 
 Usage:
     python3 scripts/check_readme_evidence_freshness.py
@@ -28,11 +28,15 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import NamedTuple
+
+
+PERF_BUDGET_SUMMARY_SCHEMA = "pi.perf.budget_summary.v2"
 
 
 class CitationCheck(NamedTuple):
@@ -253,7 +257,188 @@ def load_json_object(artifact_path: str, text: str) -> tuple[dict[str, object] |
     return payload, None
 
 
+def performance_source_binding_error(repo_root: Path, source_commit: str) -> str | None:
+    """Require a real source ancestor with only evidence follow-up changes."""
+    def git_output(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo_root), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout if result.returncode == 0 else None
+
+    head = git_output("rev-parse", "--verify", "HEAD^{commit}")
+    resolved = git_output("rev-parse", "--verify", f"{source_commit}^{{commit}}")
+    if head is None or resolved is None:
+        return "budget summary source_commit could not be resolved in this repository"
+    head = head.strip()
+    if resolved.strip() != source_commit:
+        return "budget summary source_commit does not resolve to the exact recorded commit"
+
+    try:
+        ancestor = subprocess.run(
+            ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", source_commit, head],
+            check=False,
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "budget summary source_commit ancestry could not be verified"
+    if ancestor.returncode != 0:
+        return "budget summary source_commit is not an ancestor of release HEAD"
+    if source_commit == head:
+        return None
+
+    changed = git_output("diff", "--name-only", "-z", "--no-renames", source_commit, head)
+    if changed is None:
+        return "budget summary source-to-release changes could not be inspected"
+    changed_paths = tuple(path for path in changed.split("\0") if path)
+    if not changed_paths:
+        return "budget summary source_commit differs from HEAD without a source diff"
+    allowed_prefixes = (
+        "tests/perf/reports/",
+        "tests/e2e_results/",
+        "tests/ext_conformance/reports/",
+        "tests/certification/",
+        "docs/evidence/",
+    )
+    unexpected = tuple(
+        path for path in changed_paths if not path.startswith(allowed_prefixes)
+    )
+    if unexpected:
+        return f"non-evidence paths changed after budget summary source_commit: {unexpected[:3]!r}"
+    return None
+
+
+def performance_budget_claim_errors(
+    payload: dict[str, object],
+    repo_root: Path,
+    now: datetime,
+) -> tuple[str, ...]:
+    """Return fail-closed errors for a release-facing performance summary."""
+    errors: list[str] = []
+    schema = payload.get("schema")
+    if schema != PERF_BUDGET_SUMMARY_SCHEMA:
+        return (
+            f"budget summary schema must be {PERF_BUDGET_SUMMARY_SCHEMA!r}, found {schema!r}",
+        )
+
+    claim_readiness = payload.get("claim_readiness")
+    if not isinstance(claim_readiness, dict):
+        return ("budget summary missing claim_readiness object",)
+
+    status = claim_readiness.get("status")
+    authorized = claim_readiness.get("performance_claims_authorized")
+    blockers = claim_readiness.get("blocking_reason_codes")
+    if status != "claim_ready":
+        errors.append(f"budget summary claim_readiness.status={status!r}")
+    if authorized is not True:
+        errors.append(
+            "budget summary claim_readiness.performance_claims_authorized="
+            f"{authorized!r}"
+        )
+    if not isinstance(blockers, list):
+        errors.append("budget summary claim_readiness.blocking_reason_codes must be an array")
+    elif blockers:
+        errors.append(
+            f"budget summary claim_readiness.blocking_reason_codes={blockers!r}"
+        )
+
+    generated_at_raw = payload.get("generated_at")
+    canonical_timestamp = (
+        isinstance(generated_at_raw, str)
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", generated_at_raw)
+        is not None
+    )
+    generated_at = parse_iso_datetime(generated_at_raw) if canonical_timestamp else None
+    if generated_at is None:
+        errors.append(
+            "budget summary generated_at must use canonical millisecond-precision UTC RFC3339"
+        )
+    elif generated_at > now + timedelta(minutes=5):
+        errors.append("budget summary generated_at is more than five minutes in the future")
+
+    if payload.get("strict_mode") is not True:
+        errors.append(f"budget summary strict_mode={payload.get('strict_mode')!r}")
+    for field in ("ci_fail", "ci_no_data", "data_contract_failures_count"):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            errors.append(f"budget summary has {field}={value!r}")
+
+    total_budgets = payload.get("total_budgets")
+    pass_count = payload.get("pass")
+    fail_count = payload.get("fail")
+    no_data_count = payload.get("no_data")
+    if (
+        isinstance(total_budgets, bool)
+        or not isinstance(total_budgets, int)
+        or total_budgets <= 0
+        or isinstance(pass_count, bool)
+        or not isinstance(pass_count, int)
+        or pass_count != total_budgets
+        or isinstance(fail_count, bool)
+        or not isinstance(fail_count, int)
+        or fail_count != 0
+        or isinstance(no_data_count, bool)
+        or not isinstance(no_data_count, int)
+        or no_data_count != 0
+    ):
+        errors.append(
+            "all declared performance budgets must have data and pass: "
+            f"pass={pass_count!r}, fail={fail_count!r}, "
+            f"no_data={no_data_count!r}, total_budgets={total_budgets!r}"
+        )
+
+    ci_enforced = payload.get("ci_enforced")
+    ci_with_data = payload.get("ci_with_data")
+    if (
+        isinstance(ci_enforced, bool)
+        or not isinstance(ci_enforced, int)
+        or ci_enforced <= 0
+        or isinstance(ci_with_data, bool)
+        or not isinstance(ci_with_data, int)
+        or ci_with_data != ci_enforced
+        or (
+            isinstance(total_budgets, int)
+            and not isinstance(total_budgets, bool)
+            and ci_enforced > total_budgets
+        )
+    ):
+        errors.append(
+            "budget summary CI data coverage is invalid or incomplete: "
+            f"ci_with_data={ci_with_data!r}, ci_enforced={ci_enforced!r}"
+        )
+
+    source_commit = payload.get("source_commit")
+    if (
+        not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or set(source_commit) == {"0"}
+    ):
+        errors.append("budget summary source_commit is not a full clean-source Git SHA")
+    elif (binding_error := performance_source_binding_error(repo_root, source_commit)) is not None:
+        errors.append(binding_error)
+    run_id = payload.get("run_id")
+    correlation_id = payload.get("correlation_id")
+    if (
+        not isinstance(run_id, str)
+        or not run_id.strip()
+        or correlation_id != run_id
+    ):
+        errors.append(
+            "budget summary run_id/correlation_id must be identical non-empty strings"
+        )
+
+    return tuple(errors)
+
+
 def check_artifact_content(
+    repo_root: Path,
     artifact_path: str,
     correlation_id: str,
     full_path: Path,
@@ -295,18 +480,11 @@ def check_artifact_content(
         days_old = (now - generated_at).total_seconds() / 86400
         errors.append(f"artifact generated_at is stale: {days_old:.1f} days old")
 
-    if payload.get("schema") == "pi.perf.budget_summary.v1":
-        ci_no_data = int(payload.get("ci_no_data") or 0)
-        ci_fail = int(payload.get("ci_fail") or 0)
-        data_contract_failures = int(payload.get("data_contract_failures_count") or 0)
-        if ci_no_data != 0:
-            errors.append(f"budget summary has ci_no_data={ci_no_data}")
-        if ci_fail != 0:
-            errors.append(f"budget summary has ci_fail={ci_fail}")
-        if data_contract_failures != 0:
-            errors.append(
-                f"budget summary has data_contract_failures_count={data_contract_failures}"
-            )
+    if (
+        artifact_path == "tests/perf/reports/budget_summary.json"
+        and claim_surface == "release_facing"
+    ):
+        errors.extend(performance_budget_claim_errors(payload, repo_root, now))
 
     return tuple(errors)
 
@@ -406,6 +584,7 @@ def check_readme(repo_root: Path, now: datetime | None = None) -> int:
                 )
 
             content_errors = check_artifact_content(
+                repo_root,
                 artifact_path,
                 correlation_id,
                 full_path,
@@ -477,7 +656,7 @@ def run_self_test() -> int:
         artifact.write_text(
             json.dumps(
                 {
-                    "generated_at": now.isoformat(),
+                    "generated_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                     "correlation_id": "fixture-run",
                     "ok": True,
                 }
@@ -543,12 +722,26 @@ def run_self_test() -> int:
         budget_summary.write_text(
             json.dumps(
                 {
-                    "schema": "pi.perf.budget_summary.v1",
-                    "generated_at": now.isoformat(),
+                    "schema": PERF_BUDGET_SUMMARY_SCHEMA,
+                    "generated_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+                    "source_commit": "0123456789abcdef0123456789abcdef01234567",
+                    "run_id": "budget-run",
                     "correlation_id": "budget-run",
+                    "strict_mode": True,
+                    "total_budgets": 1,
+                    "pass": 0,
+                    "fail": 0,
+                    "no_data": 1,
+                    "ci_enforced": 1,
+                    "ci_with_data": 0,
                     "ci_no_data": 1,
                     "ci_fail": 0,
                     "data_contract_failures_count": 0,
+                    "claim_readiness": {
+                        "status": "blocked",
+                        "performance_claims_authorized": False,
+                        "blocking_reason_codes": ["ci_budget_data_missing"],
+                    },
                 }
             )
             + "\n",
@@ -565,6 +758,49 @@ def run_self_test() -> int:
         if third_result != 1 or "ci_no_data=1" not in third_output.getvalue():
             print(third_output.getvalue())
             print("SELF-TEST FAIL: no-data budget summary citation should fail")
+            return 2
+
+        legacy_payload = {
+            "schema": "pi.perf.budget_summary.v1",
+            "generated_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "run_id": "budget-run",
+            "correlation_id": "budget-run",
+            "strict_mode": True,
+            "total_budgets": 1,
+            "pass": 1,
+            "fail": 0,
+            "no_data": 0,
+            "ci_enforced": 1,
+            "ci_with_data": 1,
+            "ci_no_data": 0,
+            "ci_fail": 0,
+            "data_contract_failures_count": 0,
+            "claim_readiness": {
+                "status": "claim_ready",
+                "performance_claims_authorized": True,
+                "blocking_reason_codes": [],
+            },
+        }
+        legacy_errors = performance_budget_claim_errors(legacy_payload, repo_root, now)
+        if not any(PERF_BUDGET_SUMMARY_SCHEMA in error for error in legacy_errors):
+            print(legacy_errors)
+            print("SELF-TEST FAIL: legacy v1 budget summary must fail closed")
+            return 2
+
+        future_payload = dict(legacy_payload)
+        future_payload["schema"] = PERF_BUDGET_SUMMARY_SCHEMA
+        future_payload["generated_at"] = (
+            now + timedelta(minutes=6)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        future_errors = performance_budget_claim_errors(future_payload, repo_root, now)
+        if not any("more than five minutes in the future" in error for error in future_errors):
+            print(future_errors)
+            print("SELF-TEST FAIL: future-dated v2 budget summary must fail closed")
+            return 2
+        if not any("could not be resolved" in error for error in future_errors):
+            print(future_errors)
+            print("SELF-TEST FAIL: forged v2 source_commit must fail closed")
             return 2
 
         provenance_mismatch = repo_root / "tests/perf/reports/provenance_mismatch.json"

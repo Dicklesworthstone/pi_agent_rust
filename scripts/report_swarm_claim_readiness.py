@@ -27,6 +27,7 @@ from typing import Any
 
 
 REPORT_SCHEMA = "pi.swarm.claim_readiness_report.v1"
+PERF_BUDGET_SUMMARY_SCHEMA = "pi.perf.budget_summary.v2"
 STALE_CLAIM_REPORT_SCHEMA = "pi.swarm.stale_claim_report.v1"
 REDUNDANT_AGENT_WORK_SCHEMA = "pi.swarm.redundant_agent_work.v1"
 HOSTCALL_QUEUE_REPORT_SCHEMA = "pi.swarm.hostcall_queue_readiness.v1"
@@ -34,6 +35,7 @@ OPERATOR_EXPLANATIONS_SCHEMA = "pi.swarm.operator_explanations.v1"
 GOLDEN_REPORT_DIRECTORY = Path("tests/golden_corpus/swarm_claim_readiness")
 COMPLETE_REPORT_GOLDEN = "complete_report_projection.json"
 UPDATE_GOLDEN_ENV = "UPDATE_SWARM_CLAIM_READINESS_GOLDEN"
+_FIXTURE_GIT_TEMPLATE: Path | None = None
 DEFAULT_MAX_AGE_DAYS = 14
 DEFAULT_STALE_CLAIM_AFTER_HOURS = 24
 DEFAULT_STALE_CLAIM_ACTIVITY_FRESH_HOURS = 6
@@ -100,6 +102,8 @@ class EvidenceSpec:
     status_path: str | None = None
     ok_values: tuple[Any, ...] = ()
     zero_paths: tuple[str, ...] = ()
+    required_true_paths: tuple[str, ...] = ()
+    required_empty_list_paths: tuple[str, ...] = ()
     provenance_paths: tuple[str, ...] = DEFAULT_PROVENANCE_PATHS
     provenance_group: str | None = None
 
@@ -324,8 +328,21 @@ EVIDENCE_SPECS = (
         path="tests/perf/reports/budget_summary.json",
         description="CI-enforced performance budget summary.",
         claim_surface="release_facing",
-        required_schema="pi.perf.budget_summary.v1",
-        zero_paths=("ci_fail", "ci_no_data", "data_contract_failures_count"),
+        required_schema=PERF_BUDGET_SUMMARY_SCHEMA,
+        status_path="claim_readiness.status",
+        ok_values=("claim_ready",),
+        zero_paths=(
+            "fail",
+            "no_data",
+            "ci_fail",
+            "ci_no_data",
+            "data_contract_failures_count",
+        ),
+        required_true_paths=(
+            "strict_mode",
+            "claim_readiness.performance_claims_authorized",
+        ),
+        required_empty_list_paths=("claim_readiness.blocking_reason_codes",),
         provenance_group="perf",
     ),
     EvidenceSpec(
@@ -1439,6 +1456,170 @@ def classify_agent_mail_health(payload: dict[str, Any] | None, source: str) -> d
     }
 
 
+def performance_budget_contract_issues(
+    repo_root: Path,
+    spec: EvidenceSpec,
+    payload: dict[str, Any],
+    now: datetime,
+) -> list[EvidenceIssue]:
+    """Validate the v2 facts from which performance claim readiness is derived."""
+    issues: list[EvidenceIssue] = []
+
+    generated_at_raw = payload.get("generated_at")
+    canonical_timestamp = (
+        isinstance(generated_at_raw, str)
+        and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", generated_at_raw)
+        is not None
+    )
+    generated_at = parse_iso_datetime(generated_at_raw) if canonical_timestamp else None
+    if generated_at is None:
+        issues.append(issue_for(
+            spec,
+            "status_not_ready",
+            "generated_at must use canonical millisecond-precision UTC RFC3339",
+        ))
+    elif generated_at > now + timedelta(minutes=5):
+        issues.append(issue_for(
+            spec,
+            "status_not_ready",
+            "generated_at is more than five minutes in the future",
+        ))
+
+    for field in ("ci_fail", "ci_no_data", "data_contract_failures_count"):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value != 0:
+            issues.append(issue_for(
+                spec,
+                "status_not_ready",
+                f"{field}={value!r}, expected integer 0",
+            ))
+
+    total_budgets = payload.get("total_budgets")
+    pass_count = payload.get("pass")
+    fail_count = payload.get("fail")
+    no_data_count = payload.get("no_data")
+    if (
+        isinstance(total_budgets, bool)
+        or not isinstance(total_budgets, int)
+        or total_budgets <= 0
+        or isinstance(pass_count, bool)
+        or not isinstance(pass_count, int)
+        or pass_count != total_budgets
+        or isinstance(fail_count, bool)
+        or not isinstance(fail_count, int)
+        or fail_count != 0
+        or isinstance(no_data_count, bool)
+        or not isinstance(no_data_count, int)
+        or no_data_count != 0
+    ):
+        issues.append(issue_for(
+            spec,
+            "no_data",
+            "all declared budgets must have data and pass: "
+            f"pass={pass_count!r}, fail={fail_count!r}, "
+            f"no_data={no_data_count!r}, total_budgets={total_budgets!r}",
+        ))
+
+    ci_enforced = payload.get("ci_enforced")
+    ci_with_data = payload.get("ci_with_data")
+    if (
+        isinstance(ci_enforced, bool)
+        or not isinstance(ci_enforced, int)
+        or ci_enforced <= 0
+        or isinstance(ci_with_data, bool)
+        or not isinstance(ci_with_data, int)
+        or ci_with_data != ci_enforced
+        or (
+            isinstance(total_budgets, int)
+            and not isinstance(total_budgets, bool)
+            and ci_enforced > total_budgets
+        )
+    ):
+        issues.append(issue_for(
+            spec,
+            "no_data",
+            "CI budget data coverage is invalid or incomplete: "
+            f"ci_with_data={ci_with_data!r}, ci_enforced={ci_enforced!r}",
+        ))
+
+    source_commit = payload.get("source_commit")
+    if (
+        not isinstance(source_commit, str)
+        or re.fullmatch(r"[0-9a-f]{40}", source_commit) is None
+        or set(source_commit) == {"0"}
+    ):
+        issues.append(issue_for(
+            spec,
+            "status_not_ready",
+            "source_commit must be a full non-zero lowercase Git SHA",
+        ))
+    elif (binding_error := performance_source_binding_error(repo_root, source_commit)) is not None:
+        issues.append(issue_for(spec, "status_not_ready", binding_error))
+
+    run_id = payload.get("run_id")
+    correlation_id = payload.get("correlation_id")
+    if not isinstance(run_id, str) or not run_id.strip() or correlation_id != run_id:
+        issues.append(issue_for(
+            spec,
+            "status_not_ready",
+            "run_id and correlation_id must be identical non-empty strings",
+        ))
+
+    return issues
+
+
+def performance_source_binding_error(repo_root: Path, source_commit: str) -> str | None:
+    """Require a real source ancestor with only evidence follow-up changes."""
+    head = git_output(repo_root, ["rev-parse", "--verify", "HEAD^{commit}"])
+    resolved = git_output(
+        repo_root,
+        ["rev-parse", "--verify", f"{source_commit}^{{commit}}"],
+    )
+    if head is None or resolved is None:
+        return "source_commit could not be resolved in the current repository"
+    head = head.strip()
+    if resolved.strip() != source_commit:
+        return "source_commit does not resolve to the exact recorded commit"
+
+    try:
+        ancestor = subprocess.run(
+            ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", source_commit, head],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return "source_commit ancestry could not be verified"
+    if ancestor.returncode != 0:
+        return "source_commit is not an ancestor of the current release HEAD"
+    if source_commit == head:
+        return None
+
+    changed = git_output(
+        repo_root,
+        ["diff", "--name-only", "-z", "--no-renames", source_commit, head],
+    )
+    if changed is None:
+        return "source-to-release path changes could not be inspected"
+    changed_paths = tuple(path for path in changed.split("\0") if path)
+    if not changed_paths:
+        return "source_commit differs from HEAD without an inspectable source diff"
+    allowed_prefixes = (
+        "tests/perf/reports/",
+        "tests/e2e_results/",
+        "tests/ext_conformance/reports/",
+        "tests/certification/",
+        "docs/evidence/",
+    )
+    unexpected = tuple(
+        path for path in changed_paths if not path.startswith(allowed_prefixes)
+    )
+    if unexpected:
+        return f"non-evidence paths changed after source_commit: {unexpected[:3]!r}"
+    return None
+
+
 def collect_git_path_activity(
     repo_root: Path,
     surface_paths: tuple[str, ...],
@@ -1933,6 +2114,29 @@ def check_spec(
                 detail = zero_path_issue_detail(spec, payload, zero_path)
                 if detail is not None:
                     issues.append(issue_for(spec, "no_data", detail))
+
+            for required_true_path in spec.required_true_paths:
+                value = get_path(payload, required_true_path)
+                if value is not True:
+                    issues.append(issue_for(
+                        spec,
+                        "status_not_ready",
+                        f"{required_true_path}={value!r}, expected True",
+                    ))
+
+            for required_empty_list_path in spec.required_empty_list_paths:
+                value = get_path(payload, required_empty_list_path)
+                if not isinstance(value, list) or value:
+                    issues.append(issue_for(
+                        spec,
+                        "status_not_ready",
+                        f"{required_empty_list_path}={value!r}, expected an empty array",
+                    ))
+
+            if spec.id == "perf_budget_summary":
+                issues.extend(
+                    performance_budget_contract_issues(repo_root, spec, payload, now)
+                )
 
     if generated_at is None and spec.generated:
         issues.append(issue_for(spec, "missing_timestamp", "artifact lacks a parseable generated timestamp"))
@@ -2855,6 +3059,22 @@ def fixture_payload(
         assign_path(payload, spec.status_path, ok_value)
     for zero_path in spec.zero_paths:
         assign_path(payload, zero_path, 0)
+    for required_true_path in spec.required_true_paths:
+        assign_path(payload, required_true_path, True)
+    for required_empty_list_path in spec.required_empty_list_paths:
+        assign_path(payload, required_empty_list_path, [])
+    if spec.id == "perf_budget_summary":
+        payload.update({
+            "generated_at": now.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+            "run_id": provenance,
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "total_budgets": 1,
+            "pass": 1,
+            "fail": 0,
+            "no_data": 0,
+            "ci_enforced": 1,
+            "ci_with_data": 1,
+        })
     if spec.id == "dropin_certification_verdict":
         payload["overall_verdict"] = "CERTIFIED"
         payload["generated_at_utc"] = format_datetime(now)
@@ -2961,6 +3181,17 @@ def make_complete_fixture(
         else:
             write_artifact(repo_root, spec.path, payload, mtime=now)
     write_readme_release_snapshot_fixture(repo_root, now, provenance)
+
+    source_commit = git_output(repo_root, ["rev-parse", "HEAD"])
+    if source_commit is None:
+        raise AssertionError("fixture repository has no source commit")
+    source_commit = source_commit.strip()
+    budget_path = repo_root / EVIDENCE_SPECS[0].path
+    budget_payload, budget_error = load_json(budget_path)
+    if budget_error is not None or budget_payload is None:
+        raise AssertionError(f"failed to bind fixture budget summary: {budget_error}")
+    budget_payload["source_commit"] = source_commit
+    write_artifact(repo_root, EVIDENCE_SPECS[0].path, budget_payload)
 
 
 def write_readme_release_snapshot_fixture(repo_root: Path, now: datetime, provenance: str) -> None:
@@ -3295,6 +3526,88 @@ def run_self_test() -> int:
         report = build_report(repo_root, now=now)
         details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
         assert_condition("ci_no_data=2" in details, "no-data budget summary should block")
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload = fixture_payload(EVIDENCE_SPECS[0], now, "fixture-run")
+        assert payload is not None
+        payload["claim_readiness"] = {
+            "status": "blocked",
+            "performance_claims_authorized": False,
+            "blocking_reason_codes": ["ci_budget_data_missing"],
+        }
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "claim_readiness.status='blocked'" in details,
+            "blocked v2 claim_readiness status should block",
+        )
+        assert_condition(
+            "performance_claims_authorized=False" in details,
+            "false v2 performance claim authorization should block",
+        )
+        assert_condition(
+            "blocking_reason_codes=['ci_budget_data_missing']" in details,
+            "non-empty v2 claim-readiness blockers should block",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload = fixture_payload(EVIDENCE_SPECS[0], now, "fixture-run")
+        assert payload is not None
+        payload["schema"] = "pi.perf.budget_summary.v1"
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "expected schema 'pi.perf.budget_summary.v2'" in details,
+            "legacy v1 budget summary must not authorize current claims",
+        )
+
+        repo_root = fixture_root()
+        make_complete_fixture(repo_root, now)
+        payload, payload_error = load_json(repo_root / budget_path)
+        assert payload_error is None and payload is not None
+        payload["generated_at"] = (
+            now + timedelta(minutes=6)
+        ).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "more than five minutes in the future" in details,
+            "future-dated v2 budget summary must fail closed",
+        )
+
+        payload["generated_at"] = now.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+        payload["source_commit"] = "fedcba9876543210fedcba9876543210fedcba98"
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "could not be resolved" in details,
+            "forged v2 source_commit must fail closed",
+        )
+
+        bound_source_commit = git_output(repo_root, ["rev-parse", "HEAD"])
+        assert bound_source_commit is not None
+        payload["source_commit"] = bound_source_commit.strip()
+        payload["total_budgets"] = 2
+        payload["pass"] = 1
+        payload["no_data"] = 1
+        payload["claim_readiness"] = {
+            "status": "blocked",
+            "performance_claims_authorized": False,
+            "blocking_reason_codes": ["budget_data_missing"],
+        }
+        write_artifact(repo_root, budget_path, payload, mtime=now)
+        report = build_report(repo_root, now=now)
+        details = "\n".join(issue["detail"] for issue in report["blocking_issues"])
+        assert_condition(
+            "all declared budgets must have data and pass" in details,
+            "global no-data must block even when the CI subset is green",
+        )
 
         repo_root = fixture_root()
         make_complete_fixture(repo_root, now)
@@ -3908,7 +4221,40 @@ def run_self_test() -> int:
 
 
 def fixture_root() -> Path:
-    return Path(tempfile.mkdtemp(prefix="pi_claim_readiness_"))
+    global _FIXTURE_GIT_TEMPLATE
+    if _FIXTURE_GIT_TEMPLATE is None:
+        template = Path(tempfile.mkdtemp(prefix="pi_claim_readiness_git_"))
+        commands = (
+            ("init", "-b", "main"),
+            ("config", "user.name", "Pi claim-readiness fixture"),
+            ("config", "user.email", "pi-fixture@example.invalid"),
+            ("commit", "--allow-empty", "-m", "fixture source baseline"),
+        )
+        for args in commands:
+            result = subprocess.run(
+                ["git", "-C", str(template), *args],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode != 0:
+                raise AssertionError(
+                    f"fixture template git {' '.join(args)} failed: {result.stderr.strip()}"
+                )
+        _FIXTURE_GIT_TEMPLATE = template
+
+    root = Path(tempfile.mkdtemp(prefix="pi_claim_readiness_"))
+    clone = subprocess.run(
+        ["git", "clone", "--quiet", "--shared", str(_FIXTURE_GIT_TEMPLATE), str(root)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if clone.returncode != 0:
+        raise AssertionError(f"fixture git clone failed: {clone.stderr.strip()}")
+    return root
 
 
 def parse_args() -> argparse.Namespace:

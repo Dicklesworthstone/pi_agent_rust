@@ -253,12 +253,21 @@ mode, test_name = sys.argv[1:]
 lines = [line.strip() for line in sys.stdin.read().splitlines()]
 if mode == "list":
     listed = [line for line in lines if line.endswith(": test")]
+    benchmarks = [
+        line
+        for line in lines
+        if line.endswith(": benchmark") or line.endswith(": bench")
+    ]
     summaries = [
         line
         for line in lines
         if re.fullmatch(r"[0-9]+ tests?, [0-9]+ benchmarks?", line)
     ]
-    if listed != [f"{test_name}: test"] or summaries != ["1 test, 0 benchmarks"]:
+    if (
+        listed != [f"{test_name}: test"]
+        or benchmarks
+        or summaries not in ([], ["1 test, 0 benchmarks"])
+    ):
         raise SystemExit(1)
 elif mode == "run":
     running = [
@@ -1201,7 +1210,7 @@ OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 TIMESTAMP_RE = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
-CANONICAL_BUDGET_INVENTORY_SHA256 = "PENDING_CANONICAL_BUDGET_INVENTORY_SHA256"
+CANONICAL_BUDGET_INVENTORY_SHA256 = "96e3147ef23e1c634d56265581975a2b619ac9a701f4839ef6f3f4b3987226ad"
 
 
 class ContractError(ValueError):
@@ -1398,8 +1407,8 @@ try:
         verify_claim_source_binding(source_commit)
     run_id = nullable_lineage(data["run_id"], "run_id")
     correlation_id = nullable_lineage(data["correlation_id"], "correlation_id")
-    if run_id is not None and correlation_id is not None and run_id != correlation_id:
-        fail("run_id and correlation_id must match when both are present")
+    if run_id != correlation_id:
+        fail("run_id and correlation_id must both be null or match")
     strict_mode = data["strict_mode"]
     if not isinstance(strict_mode, bool):
         fail("strict_mode must be a boolean")
@@ -1580,6 +1589,10 @@ try:
         fail("claim_readiness.blocking_reason_codes must be sorted and duplicate-free")
 
     expected_reasons = []
+    if counts["no_data"] != 0:
+        expected_reasons.append("budget_data_missing")
+    if counts["fail"] != 0:
+        expected_reasons.append("budget_failed")
     if counts["ci_with_data"] != counts["ci_enforced"] or counts["ci_no_data"] != 0:
         expected_reasons.append("ci_budget_data_missing")
     if counts["ci_fail"] != 0:
@@ -1613,8 +1626,9 @@ try:
             fail(f"performance summary is stale ({now - generated_at} old; maximum {maximum_age})")
         finish(
             "pass",
-            f"performance claims authorized: strict v2 evidence source={source_commit} "
-            f"run={run_id} correlation={correlation_id} age<={sys.argv[4]}h",
+            f"performance claims authorized: all {counts['total_budgets']} declared budgets "
+            f"have data and pass; strict v2 evidence source={source_commit} run={run_id} "
+            f"correlation={correlation_id} age<={sys.argv[4]}h",
         )
 
     detail = (
@@ -1641,7 +1655,7 @@ PERFORMANCE_DETAIL="${PERFORMANCE_CHECK#*|}"
 case "$PERFORMANCE_STATUS" in
     pass)
         check_pass "performance_claim_readiness" "$PERFORMANCE_DETAIL"
-        CANONICAL_PERF_TEST="ci_enforced_budgets_fail_on_regression_or_missing_data"
+        CANONICAL_PERF_TEST="checked_in_budget_summary_matches_fresh_canonical_evaluation_exactly"
         CANONICAL_PERF_LIST_OUTPUT=""
         CANONICAL_PERF_RUN_OUTPUT=""
         CANONICAL_PERF_LIST_VALID=0
@@ -1666,7 +1680,7 @@ case "$PERFORMANCE_STATUS" in
             fi
         fi
         if [[ "$CANONICAL_PERF_LIST_VALID" -eq 1 && "$CANONICAL_PERF_RUN_VALID" -eq 1 ]]; then
-            check_pass "performance_claim_canonical_contract" "Canonical strict perf data readers independently confirm every CI-enforced budget and linked data contract"
+            check_pass "performance_claim_canonical_contract" "Canonical strict perf data readers independently confirm every declared budget and linked data contract"
         else
             check_fail "performance_claim_canonical_contract" "Canonical strict perf contract did not list and execute exactly one non-ignored test successfully; summary cannot authorize performance claims"
         fi

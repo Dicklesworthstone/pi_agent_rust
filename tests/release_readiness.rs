@@ -32,6 +32,7 @@ const PARAMETER_SWEEPS_SCHEMA: &str = "pi.perf.parameter_sweeps.v1";
 const PARAMETER_SWEEPS_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/parameter_sweeps.json";
 const OPPORTUNITY_MATRIX_SCHEMA: &str = "pi.perf.opportunity_matrix.v1";
 const OPPORTUNITY_MATRIX_PRIMARY_ARTIFACT_REL: &str = "tests/perf/reports/opportunity_matrix.json";
+const PERF_BUDGET_SUMMARY_SCHEMA: &str = "pi.perf.budget_summary.v2";
 
 // ── Data models ─────────────────────────────────────────────────────────────
 
@@ -2928,33 +2929,198 @@ fn collect_conformance(root: &Path) -> DimensionScore {
     }
 }
 
+fn validate_performance_advisory_source_binding(
+    root: &Path,
+    source_commit: &str,
+) -> Result<(), String> {
+    let head = current_git_commit(root)?;
+    resolve_exact_commit(root, source_commit, "performance source_commit")?;
+    ensure_commit_ancestor(root, source_commit, &head, "performance source_commit")?;
+    if source_commit == head {
+        return Ok(());
+    }
+
+    let changed_paths = changed_paths_between(root, source_commit, &head)?;
+    if changed_paths.is_empty() {
+        return Err(
+            "performance source_commit differs from HEAD without a source diff".to_string(),
+        );
+    }
+    let package_patterns = source_package_include_patterns(root, source_commit)?;
+    for path in changed_paths {
+        let evidence_only = path.starts_with("tests/perf/reports/")
+            || path.starts_with("tests/e2e_results/")
+            || path.starts_with("tests/ext_conformance/reports/")
+            || path.starts_with("tests/certification/")
+            || path.starts_with("docs/evidence/");
+        if !evidence_only {
+            return Err(format!(
+                "non-evidence path changed after performance source capture: {path}"
+            ));
+        }
+        if path.starts_with("docs/evidence/") && product_package_includes(&path, &package_patterns)?
+        {
+            return Err(format!(
+                "packaged or product-consumed evidence changed after performance source capture: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn collect_performance_timestamp_errors(v: &V, errors: &mut Vec<String>) {
+    let Some(raw) = v.get("generated_at").and_then(V::as_str) else {
+        errors
+            .push("generated_at must use canonical millisecond-precision UTC RFC3339".to_string());
+        return;
+    };
+    let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) else {
+        errors
+            .push("generated_at must use canonical millisecond-precision UTC RFC3339".to_string());
+        return;
+    };
+    if parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) != raw {
+        errors
+            .push("generated_at must use canonical millisecond-precision UTC RFC3339".to_string());
+    } else if parsed.with_timezone(&chrono::Utc)
+        > chrono::Utc::now() + chrono::TimeDelta::minutes(5)
+    {
+        errors.push("generated_at is more than five minutes in the future".to_string());
+    }
+}
+
+fn collect_performance_claim_readiness_errors(v: &V, errors: &mut Vec<String>) {
+    let Some(claim) = v.get("claim_readiness").and_then(V::as_object) else {
+        errors.push("claim_readiness must be an object".to_string());
+        return;
+    };
+    if claim.get("status").and_then(V::as_str) != Some("claim_ready") {
+        errors.push("claim_readiness.status must be claim_ready".to_string());
+    }
+    if claim
+        .get("performance_claims_authorized")
+        .and_then(V::as_bool)
+        != Some(true)
+    {
+        errors.push("claim_readiness.performance_claims_authorized must be true".to_string());
+    }
+    match claim.get("blocking_reason_codes").and_then(V::as_array) {
+        Some(blockers) if blockers.is_empty() => {}
+        Some(blockers) => errors.push(format!(
+            "claim_readiness.blocking_reason_codes must be empty, found {blockers:?}"
+        )),
+        None => {
+            errors.push("claim_readiness.blocking_reason_codes must be an empty array".to_string());
+        }
+    }
+}
+
+fn validate_performance_budget_summary(root: &Path, v: &V) -> (Signal, String) {
+    let mut errors = Vec::new();
+
+    let schema = v.get("schema").and_then(V::as_str);
+    if schema != Some(PERF_BUDGET_SUMMARY_SCHEMA) {
+        errors.push(format!(
+            "schema must be {PERF_BUDGET_SUMMARY_SCHEMA}, found {}",
+            schema.unwrap_or("missing")
+        ));
+    }
+
+    if v.get("strict_mode").and_then(V::as_bool) != Some(true) {
+        errors.push("strict_mode must be true".to_string());
+    }
+
+    collect_performance_timestamp_errors(v, &mut errors);
+    collect_performance_claim_readiness_errors(v, &mut errors);
+
+    for pointer in ["/ci_fail", "/ci_no_data", "/data_contract_failures_count"] {
+        match v.pointer(pointer).and_then(V::as_u64) {
+            Some(0) => {}
+            Some(value) => errors.push(format!("{pointer} must be 0, found {value}")),
+            None => errors.push(format!("{pointer} must be the integer 0")),
+        }
+    }
+
+    let total_budgets = v.get("total_budgets").and_then(V::as_u64);
+    let pass = v.get("pass").and_then(V::as_u64);
+    let fail = v.get("fail").and_then(V::as_u64);
+    let no_data = v.get("no_data").and_then(V::as_u64);
+    if total_budgets.is_none_or(|count| count == 0)
+        || pass != total_budgets
+        || fail != Some(0)
+        || no_data != Some(0)
+    {
+        errors.push(format!(
+            "all declared budgets must have data and pass: pass={pass:?}, fail={fail:?}, no_data={no_data:?}, total_budgets={total_budgets:?}"
+        ));
+    }
+
+    let ci_enforced = v.get("ci_enforced").and_then(V::as_u64);
+    let ci_with_data = v.get("ci_with_data").and_then(V::as_u64);
+    if ci_enforced.is_none_or(|count| count == 0)
+        || ci_with_data != ci_enforced
+        || ci_enforced
+            .zip(total_budgets)
+            .is_some_and(|(ci_count, total)| ci_count > total)
+    {
+        errors.push(format!(
+            "CI data coverage must be complete and non-zero: ci_with_data={ci_with_data:?}, ci_enforced={ci_enforced:?}"
+        ));
+    }
+
+    let source_commit = v.get("source_commit").and_then(V::as_str);
+    if source_commit.is_none_or(|commit| {
+        commit.len() != 40
+            || commit
+                .bytes()
+                .any(|byte| !byte.is_ascii_hexdigit() || byte.is_ascii_uppercase())
+            || commit.bytes().all(|byte| byte == b'0')
+    }) {
+        errors.push("source_commit must be a full non-zero lowercase Git SHA".to_string());
+    } else if let Some(source_commit) = source_commit
+        && let Err(error) = validate_performance_advisory_source_binding(root, source_commit)
+    {
+        errors.push(error);
+    }
+
+    let run_id = v.get("run_id").and_then(V::as_str);
+    let correlation_id = v.get("correlation_id").and_then(V::as_str);
+    if run_id.is_none_or(|run| run.is_empty() || run.trim() != run) || correlation_id != run_id {
+        errors.push("run_id and correlation_id must be identical non-empty strings".to_string());
+    }
+
+    if errors.is_empty() {
+        let total = total_budgets.unwrap_or_default();
+        let pass = pass.unwrap_or_default();
+        let ci_enforced = ci_enforced.unwrap_or_default();
+        (
+            Signal::Pass,
+            format!(
+                "advisory v2 claim-readiness subset passed: {pass}/{total} pass; {ci_enforced}/{ci_enforced} CI budgets have data; final release evidence gate proof is still required"
+            ),
+        )
+    } else {
+        (
+            Signal::Fail,
+            format!(
+                "performance claim evidence is not authorized: {}",
+                errors.join("; ")
+            ),
+        )
+    }
+}
+
 fn collect_performance(root: &Path) -> DimensionScore {
     let name = "Performance Budgets";
     let path = root.join("tests/perf/reports/budget_summary.json");
     load_json(&path).map_or_else(
         || no_data(name, "budget_summary.json not found"),
         |v| {
-            let total = get_u64(&v, "/total_budgets");
-            let pass = get_u64(&v, "/pass");
-            let fail = get_u64(&v, "/fail");
-            let ci_enforced = get_u64(&v, "/ci_enforced");
-            let ci_fail = get_u64(&v, "/ci_fail");
-            let no_data_count = get_u64(&v, "/no_data");
-
-            let signal = if ci_fail > 0 {
-                Signal::Fail
-            } else if fail > 0 || no_data_count > total / 2 {
-                Signal::Warn
-            } else {
-                Signal::Pass
-            };
-
+            let (signal, detail) = validate_performance_budget_summary(root, &v);
             DimensionScore {
                 name: name.to_string(),
                 signal,
-                detail: format!(
-                    "{pass}/{total} pass, {fail} fail, {no_data_count} no data; {ci_enforced} CI-enforced ({ci_fail} CI fail)"
-                ),
+                detail,
             }
         },
     )
@@ -3100,14 +3266,12 @@ fn collect_known_issues(root: &Path) -> Vec<String> {
         }
     }
 
-    // Performance no-data budgets
+    // Performance evidence that cannot authorize release-facing claims.
     let perf_path = root.join("tests/perf/reports/budget_summary.json");
     if let Some(v) = load_json(&perf_path) {
-        let nd = get_u64(&v, "/no_data");
-        if nd > 0 {
-            issues.push(format!(
-                "{nd} performance budgets have no measured data yet"
-            ));
+        let (signal, detail) = validate_performance_budget_summary(root, &v);
+        if signal != Signal::Pass {
+            issues.push(format!("Performance budgets: {detail}"));
         }
     }
 
@@ -3274,6 +3438,147 @@ fn conformance_dimension_accepts_lineage_when_present() {
 fn performance_dimension_has_data() {
     let dim = collect_performance(&repo_root());
     assert_ne!(dim.signal, Signal::NoData, "performance: {}", dim.detail);
+}
+
+fn claim_ready_performance_budget_fixture(source_commit: &str) -> V {
+    serde_json::json!({
+        "schema": PERF_BUDGET_SUMMARY_SCHEMA,
+        "generated_at": chrono::Utc::now()
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        "source_commit": source_commit,
+        "run_id": "perf-run-123",
+        "correlation_id": "perf-run-123",
+        "strict_mode": true,
+        "total_budgets": 2,
+        "pass": 2,
+        "fail": 0,
+        "no_data": 0,
+        "ci_enforced": 2,
+        "ci_with_data": 2,
+        "ci_fail": 0,
+        "ci_no_data": 0,
+        "data_contract_failures_count": 0,
+        "claim_readiness": {
+            "status": "claim_ready",
+            "performance_claims_authorized": true,
+            "blocking_reason_codes": []
+        }
+    })
+}
+
+fn performance_source_repository_fixture() -> tempfile::TempDir {
+    let root = tempdir().expect("create performance source-binding fixture");
+    run_evidence_binding_fixture_git(root.path(), &["init", "--quiet", "--initial-branch=main"]);
+    std::fs::write(root.path().join("source.txt"), "fixture source\n")
+        .expect("write performance source-binding fixture");
+    run_evidence_binding_fixture_git(root.path(), &["add", "source.txt"]);
+    run_evidence_binding_fixture_git(
+        root.path(),
+        &[
+            "-c",
+            "user.name=Pi Performance Fixture",
+            "-c",
+            "user.email=pi-performance@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture source",
+        ],
+    );
+    root
+}
+
+#[test]
+fn performance_budget_v2_claim_ready_contract_passes() {
+    let root = performance_source_repository_fixture();
+    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
+    let summary = claim_ready_performance_budget_fixture(&source_commit);
+    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    assert_eq!(signal, Signal::Pass, "{detail}");
+}
+
+#[test]
+fn performance_budget_v2_blocked_claim_fails_closed() {
+    let root = performance_source_repository_fixture();
+    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
+    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    summary["claim_readiness"] = serde_json::json!({
+        "status": "blocked",
+        "performance_claims_authorized": false,
+        "blocking_reason_codes": ["ci_budget_data_missing"]
+    });
+    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("claim_readiness.status"), "{detail}");
+    assert!(detail.contains("ci_budget_data_missing"), "{detail}");
+}
+
+#[test]
+fn performance_budget_legacy_v1_cannot_authorize_claims() {
+    let root = performance_source_repository_fixture();
+    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
+    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    summary["schema"] = serde_json::json!("pi.perf.budget_summary.v1");
+    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains(PERF_BUDGET_SUMMARY_SCHEMA), "{detail}");
+}
+
+#[test]
+fn performance_budget_future_timestamp_fails_closed() {
+    let root = performance_source_repository_fixture();
+    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
+    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    summary["generated_at"] = serde_json::json!(
+        (chrono::Utc::now() + chrono::TimeDelta::minutes(6))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    );
+    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(
+        detail.contains("more than five minutes in the future"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn performance_budget_forged_source_commit_fails_closed() {
+    let root = performance_source_repository_fixture();
+    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
+    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    summary["source_commit"] = serde_json::json!("fedcba9876543210fedcba9876543210fedcba98");
+    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(
+        detail.contains("source_commit") || detail.contains("source object"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn performance_budget_global_no_data_fails_even_when_ci_subset_is_green() {
+    let root = performance_source_repository_fixture();
+    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
+    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    summary["total_budgets"] = serde_json::json!(3);
+    summary["pass"] = serde_json::json!(2);
+    summary["no_data"] = serde_json::json!(1);
+    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("all declared budgets"), "{detail}");
+}
+
+#[test]
+fn performance_budget_rejects_ci_count_larger_than_total_budget_count() {
+    let root = performance_source_repository_fixture();
+    let source_commit = current_git_commit(root.path()).expect("resolve fixture source commit");
+    let mut summary = claim_ready_performance_budget_fixture(&source_commit);
+    summary["ci_enforced"] = serde_json::json!(99);
+    summary["ci_with_data"] = serde_json::json!(99);
+
+    let (signal, detail) = validate_performance_budget_summary(root.path(), &summary);
+    assert_eq!(signal, Signal::Fail, "{detail}");
+    assert!(detail.contains("CI data coverage"), "{detail}");
 }
 
 #[test]
