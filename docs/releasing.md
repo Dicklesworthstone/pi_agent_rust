@@ -2031,6 +2031,10 @@ proof is not proof of an empty bypass list.
 
    ```bash
    set -euo pipefail
+   test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
+   sha256sum --check --strict \
+     "$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256"
+   verify_exact_release true immediately-before-crates-publication
    manifest_abs="$(realpath Cargo.toml)"
    publisher_cargo_home="$MANUAL_RELEASE_STATE_DIR/publisher-cargo-home"
    publisher_cwd="$MANUAL_RELEASE_STATE_DIR/publisher-cwd"
