@@ -3791,7 +3791,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
             .with_ctx(|ctx| {
                 let global = ctx.globals();
                 let snapshot_fn: rquickjs::Function<'_> = global.get("__pi_snapshot_extensions")?;
-                let value: rquickjs::Value<'_> = snapshot_fn.call(())?;
+                let value: rquickjs::Value<'_> =
+                    snapshot_fn.call((self.js_runtime().bridge_secret(),))?;
                 js_to_json(&value)
             })
             .await?;
@@ -3831,17 +3832,13 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
     #[allow(clippy::future_not_send)]
     async fn count_event_handlers(&self, event_name: &str) -> Result<Option<usize>> {
-        let literal = serde_json::to_string(event_name)
-            .map_err(|err| crate::error::Error::extension(err.to_string()))?;
-
         self.js_runtime()
             .with_ctx(|ctx| {
-                let code = format!(
-                    "(function() {{ const handlers = (__pi_hook_index.get({literal}) || []); return handlers.length; }})()"
-                );
-                ctx.eval::<usize, _>(code)
+                let global = ctx.globals();
+                let count_fn: rquickjs::Function<'_> = global.get("__pi_count_event_handlers")?;
+                count_fn
+                    .call::<_, usize>((self.js_runtime().bridge_secret(), event_name))
                     .map(Some)
-                    .or(Ok(None))
             })
             .await
     }
@@ -3889,6 +3886,7 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
         }
 
         let task_id = format!("task-events-{call_id}", call_id = uuid::Uuid::new_v4());
+        let bridge_secret = self.js_runtime().bridge_secret().to_string();
 
         self.js_runtime()
             .with_ctx(|ctx| {
@@ -3899,9 +3897,14 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
 
                 let event_js = json_to_js(&ctx, &event_payload)?;
                 let ctx_js = json_to_js(&ctx, &ctx_payload)?;
-                let promise: rquickjs::Value<'_> =
-                    dispatch_fn.call((event_name.to_string(), event_js, ctx_js))?;
-                let _task: String = task_start.call((task_id.clone(), promise))?;
+                let promise: rquickjs::Value<'_> = dispatch_fn.call((
+                    bridge_secret.as_str(),
+                    event_name.to_string(),
+                    event_js,
+                    ctx_js,
+                ))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.clone(), promise))?;
                 Ok(())
             })
             .await?;
@@ -3929,7 +3932,8 @@ impl<C: SchedulerClock + 'static> ExtensionDispatcher<C> {
                 .with_ctx(|ctx| {
                     let global = ctx.globals();
                     let take_fn: rquickjs::Function<'_> = global.get("__pi_task_take")?;
-                    let value: rquickjs::Value<'_> = take_fn.call((task_id.clone(),))?;
+                    let value: rquickjs::Value<'_> =
+                        take_fn.call((bridge_secret.as_str(), task_id.clone()))?;
                     js_to_json(&value)
                 })
                 .await?;
@@ -4383,6 +4387,15 @@ mod tests {
             runtime,
             ExtensionPolicy::from_profile(PolicyProfile::Permissive),
         )
+    }
+
+    fn privileged_test_script<C: SchedulerClock + 'static>(
+        runtime: &PiJsRuntime<C>,
+        source: &str,
+    ) -> String {
+        let bridge_secret = serde_json::to_string(runtime.bridge_secret())
+            .expect("serialize bridge secret for test script");
+        format!("(() => {{ const __pi_test_secret = {bridge_secret};\n{source}\n}})();")
     }
 
     fn build_dispatcher_with_policy(
@@ -5737,12 +5750,13 @@ mod tests {
             );
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
-                    const ui = __pi_make_extension_ui(true);
+                    const ui = __pi_make_extension_ui(__pi_test_secret, true);
                     ui.setStatus("key", "hello");
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -5799,12 +5813,13 @@ mod tests {
             );
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
-                    const ui = __pi_make_extension_ui(true);
+                    const ui = __pi_make_extension_ui(__pi_test_secret, true);
                     ui.setWidget("widget", ["a", "b"]);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -5905,15 +5920,16 @@ mod tests {
             );
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     globalThis.eventsList = null;
-                    __pi_begin_extension("ext.a", { name: "ext.a" });
+                    __pi_begin_extension(__pi_test_secret, "ext.a", { name: "ext.a" });
                     pi.on("custom_event", (_payload, _ctx) => {});
                     pi.events("list", {}).then((r) => { globalThis.eventsList = r; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -8263,16 +8279,17 @@ mod tests {
 
             // Register an extension with no hooks, then list events
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     globalThis.result = null;
-                    __pi_begin_extension("ext.empty", { name: "ext.empty" });
+                    __pi_begin_extension(__pi_test_secret, "ext.empty", { name: "ext.empty" });
                     pi.events("list", {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -8290,7 +8307,8 @@ mod tests {
             }
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     if (!globalThis.result) throw new Error("events list not resolved");
                     // Result is { events: [...] }
@@ -8302,7 +8320,7 @@ mod tests {
                         throw new Error("Expected empty events list, got: " + JSON.stringify(events));
                     }
                 "#,
-                )
+                ))
                 .await
                 .expect("verify events list empty");
         });
@@ -8523,21 +8541,22 @@ mod tests {
             );
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     globalThis.seen = [];
                     globalThis.emitResult = null;
 
-                    __pi_begin_extension("ext.b", { name: "ext.b" });
+                    __pi_begin_extension(__pi_test_secret, "ext.b", { name: "ext.b" });
                     pi.on("custom_event", (payload, _ctx) => { globalThis.seen.push(payload); });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
-                    __pi_begin_extension("ext.a", { name: "ext.a" });
+                    __pi_begin_extension(__pi_test_secret, "ext.a", { name: "ext.a" });
                     pi.events("emit", { event: "custom_event", data: { hello: "world" } })
                       .then((r) => { globalThis.emitResult = r; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -8552,7 +8571,8 @@ mod tests {
             runtime.tick().await.expect("tick");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     if (!globalThis.emitResult) throw new Error("emit promise not resolved");
                     if (globalThis.emitResult.dispatched !== true) {
@@ -8569,7 +8589,7 @@ mod tests {
                         throw new Error("wrong payload: " + JSON.stringify(payload));
                     }
                 "#,
-                )
+                ))
                 .await
                 .expect("verify emit");
         });
@@ -9857,21 +9877,22 @@ mod tests {
 
             // Use "name" instead of "event" field
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     globalThis.seen = [];
                     globalThis.emitResult = null;
 
-                    __pi_begin_extension("ext.listener", { name: "ext.listener" });
+                    __pi_begin_extension(__pi_test_secret, "ext.listener", { name: "ext.listener" });
                     pi.on("named_event", (payload, _ctx) => { globalThis.seen.push(payload); });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
-                    __pi_begin_extension("ext.emitter", { name: "ext.emitter" });
+                    __pi_begin_extension(__pi_test_secret, "ext.emitter", { name: "ext.emitter" });
                     pi.events("emit", { name: "named_event", data: { via: "name_field" } })
                       .then((r) => { globalThis.emitResult = r; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -9886,7 +9907,8 @@ mod tests {
             runtime.tick().await.expect("tick");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     if (!globalThis.emitResult) throw new Error("emit not resolved");
                     if (globalThis.emitResult.dispatched !== true) {
@@ -9899,7 +9921,7 @@ mod tests {
                         throw new Error("Wrong payload: " + JSON.stringify(globalThis.seen[0]));
                     }
                 "#,
-                )
+                ))
                 .await
                 .expect("verify name field alias");
         });
@@ -10016,24 +10038,25 @@ mod tests {
 
             // Register 2 handlers for same event
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     globalThis.emitResult = null;
 
-                    __pi_begin_extension("ext.h1", { name: "ext.h1" });
+                    __pi_begin_extension(__pi_test_secret, "ext.h1", { name: "ext.h1" });
                     pi.on("counted_event", (_p, _c) => {});
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
-                    __pi_begin_extension("ext.h2", { name: "ext.h2" });
+                    __pi_begin_extension(__pi_test_secret, "ext.h2", { name: "ext.h2" });
                     pi.on("counted_event", (_p, _c) => {});
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
 
-                    __pi_begin_extension("ext.emitter", { name: "ext.emitter" });
+                    __pi_begin_extension(__pi_test_secret, "ext.emitter", { name: "ext.emitter" });
                     pi.events("emit", { event: "counted_event", data: {} })
                       .then((r) => { globalThis.emitResult = r; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -10048,7 +10071,8 @@ mod tests {
             runtime.tick().await.expect("tick");
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     if (!globalThis.emitResult) throw new Error("emit not resolved");
                     if (globalThis.emitResult.dispatched !== true) {
@@ -10061,7 +10085,7 @@ mod tests {
                         throw new Error("Expected at least 2 handlers, got: " + globalThis.emitResult.handler_count);
                     }
                 "#,
-                )
+                ))
                 .await
                 .expect("verify handler count");
         });
@@ -10078,20 +10102,21 @@ mod tests {
 
             // Register multiple event hooks
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     globalThis.result = null;
 
-                    __pi_begin_extension("ext.multi", { name: "ext.multi" });
+                    __pi_begin_extension(__pi_test_secret, "ext.multi", { name: "ext.multi" });
                     pi.on("event_alpha", (_p, _c) => {});
                     pi.on("event_beta", (_p, _c) => {});
                     pi.on("event_gamma", (_p, _c) => {});
                     pi.events("list", {})
                         .then((r) => { globalThis.result = r; })
                         .catch((e) => { globalThis.result = { error: e.message || String(e) }; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 
@@ -10109,7 +10134,8 @@ mod tests {
             }
 
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     if (!globalThis.result) throw new Error("list not resolved");
                     if (globalThis.result.error) throw new Error("list error: " + globalThis.result.error);
@@ -10127,7 +10153,7 @@ mod tests {
                         throw new Error("Missing event_beta in: " + JSON.stringify(events));
                     }
                 "#,
-                )
+                ))
                 .await
                 .expect("verify event names list");
         });
@@ -10144,17 +10170,18 @@ mod tests {
 
             // Emit an event that has no registered handlers
             runtime
-                .eval(
+                .eval(&privileged_test_script(
+                    runtime.as_ref(),
                     r#"
                     globalThis.emitResult = null;
 
-                    __pi_begin_extension("ext.lonely", { name: "ext.lonely" });
+                    __pi_begin_extension(__pi_test_secret, "ext.lonely", { name: "ext.lonely" });
                     pi.events("emit", { event: "unheard_event", data: { msg: "nobody listens" } })
                       .then((r) => { globalThis.emitResult = r; })
                       .catch((e) => { globalThis.emitResult = { error: e.message || String(e) }; });
-                    __pi_end_extension();
+                    __pi_end_extension(__pi_test_secret);
                 "#,
-                )
+                ))
                 .await
                 .expect("eval");
 

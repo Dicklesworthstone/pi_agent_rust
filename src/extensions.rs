@@ -15126,6 +15126,25 @@ fn cx_with_deadline(timeout_ms: u64) -> Cx {
     Cx::for_request_with_budget(budget)
 }
 
+fn js_runtime_request_deadline(timeout_ms: u64) -> Instant {
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .unwrap_or_else(Instant::now)
+}
+
+fn js_runtime_remaining_timeout_ms(deadline: Instant, operation: &str) -> Result<u64> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            Error::extension(format!(
+                "JS extension runtime {operation} expired before actor execution"
+            ))
+        })?;
+    Ok(u64::try_from(remaining.as_millis())
+        .unwrap_or(u64::MAX)
+        .max(1))
+}
+
 /// Event names for the extension lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExtensionEventName {
@@ -17549,12 +17568,15 @@ impl JsRuntimeHost {
 enum JsRuntimeCommand {
     LoadExtensions {
         specs: Vec<JsExtensionLoadSpec>,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Vec<JsExtensionSnapshot>>>,
     },
     GetRegisteredTools {
+        deadline: Instant,
         reply: oneshot::Sender<Result<Vec<ExtensionToolDef>>>,
     },
     PumpOnce {
+        deadline: Instant,
         reply: oneshot::Sender<Result<bool>>,
     },
     DispatchEvent {
@@ -17562,6 +17584,7 @@ enum JsRuntimeCommand {
         event_payload: Value,
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
     },
     /// Dispatch multiple events in a single JS bridge call with shared context.
@@ -17569,6 +17592,7 @@ enum JsRuntimeCommand {
         events: Vec<(String, Value)>,
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Vec<Result<Value>>>>,
     },
     ExecuteTool {
@@ -17577,6 +17601,7 @@ enum JsRuntimeCommand {
         input: Value,
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
     },
     ExecuteCommand {
@@ -17584,12 +17609,14 @@ enum JsRuntimeCommand {
         args: String,
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
     },
     ExecuteShortcut {
         key_id: String,
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
     },
     ProviderStreamSimpleStart {
@@ -17598,47 +17625,255 @@ enum JsRuntimeCommand {
         context: Value,
         options: Value,
         timeout_ms: u64,
+        deadline: Instant,
         reply: oneshot::Sender<Result<String>>,
     },
     ProviderStreamSimpleNext {
         stream_id: String,
         timeout_ms: u64,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Option<Value>>>,
     },
     ProviderStreamSimpleCancel {
         stream_id: String,
         timeout_ms: u64,
+        deadline: Instant,
         reply: Option<oneshot::Sender<Result<()>>>,
     },
     SetFlagValue {
         extension_id: String,
         flag_name: String,
         value: Value,
+        deadline: Instant,
         reply: oneshot::Sender<Result<()>>,
     },
     RegisterMcpServer {
         extension_id: String,
         name: String,
         spec: Value,
+        deadline: Instant,
         reply: oneshot::Sender<Result<Value>>,
     },
     /// Drain accumulated auto-repair events from the runtime.
     DrainRepairEvents {
+        deadline: Instant,
         reply: oneshot::Sender<Vec<ExtensionRepairEvent>>,
     },
-    /// Reset transient runtime state for reuse (warm pool deterministic reset).
+    /// Reset every realm and remove all shards from actor routing.
     ///
-    /// Clears extension roots, dynamic virtual modules, and repair events while
-    /// preserving the transpiled source cache and disk cache configuration.
-    ResetTransientState { reply: oneshot::Sender<Result<()>> },
+    /// The next load is always a cold transactional rebuild; no realm-local
+    /// registry, task, timer, VFS, stream, or module-cache state is retained.
+    ResetTransientState {
+        deadline: Instant,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Request the runtime thread to shut down gracefully.
     Shutdown,
 }
 
-#[derive(Debug, Default)]
-struct WarmRuntimePoolState {
-    active_fingerprint: Option<String>,
-    last_startup_latency_ms: Option<u64>,
+struct JsRuntimeShard {
+    extension_id: String,
+    runtime: PiJsRuntime,
+    snapshot: JsExtensionSnapshot,
+    /// Terminal pump failure retained so unrelated shards can continue while
+    /// future calls targeting this shard still receive the original failure.
+    pump_fault: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct JsProviderStreamRoute {
+    shard_index: usize,
+    inner_stream_id: String,
+}
+
+#[derive(Default)]
+struct JsRuntimeShardSet {
+    /// Stable extension load order. Every execution and event route is an index
+    /// into this vector so reloads cannot inherit realm-local state.
+    shards: Vec<JsRuntimeShard>,
+    extension_owner: HashMap<String, usize>,
+    tool_owner: HashMap<String, usize>,
+    command_owner: HashMap<String, usize>,
+    shortcut_owner: HashMap<String, usize>,
+    provider_owner: HashMap<String, usize>,
+    mcp_server_owner: HashMap<String, usize>,
+    event_owners: HashMap<String, Vec<usize>>,
+    provider_stream_routes: HashMap<String, JsProviderStreamRoute>,
+    next_provider_stream_id: u64,
+    pump_cursor: usize,
+}
+
+impl JsRuntimeShardSet {
+    fn snapshots(&self) -> Vec<JsExtensionSnapshot> {
+        self.shards
+            .iter()
+            .map(|shard| shard.snapshot.clone())
+            .collect()
+    }
+
+    fn shard_index_for_extension(&self, extension_id: &str) -> Result<usize> {
+        let shard_index = self
+            .extension_owner
+            .get(extension_id)
+            .copied()
+            .ok_or_else(|| Error::extension(format!("Unknown JS extension: {extension_id}")))?;
+        self.ensure_shard_healthy(shard_index)?;
+        Ok(shard_index)
+    }
+
+    fn shard_index_for_route(
+        &self,
+        routes: &HashMap<String, usize>,
+        route_kind: &str,
+        route_name: &str,
+    ) -> Result<usize> {
+        let shard_index = routes.get(route_name).copied().ok_or_else(|| {
+            Error::extension(format!("Unknown JS extension {route_kind}: {route_name}"))
+        })?;
+        self.ensure_shard_healthy(shard_index)?;
+        Ok(shard_index)
+    }
+
+    fn ensure_shard_healthy(&self, shard_index: usize) -> Result<()> {
+        let shard = self
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?;
+        if let Some(fault) = shard.pump_fault.as_deref() {
+            return Err(Error::extension(fault.to_string()));
+        }
+        Ok(())
+    }
+
+    fn rebuild_indexes(&mut self) -> Result<()> {
+        let mut extension_owner = HashMap::new();
+        let mut tool_owner = HashMap::new();
+        let mut command_owner = HashMap::new();
+        let mut shortcut_owner = HashMap::new();
+        let mut provider_owner = HashMap::new();
+        let mut mcp_server_owner = HashMap::new();
+        let mut event_owners = HashMap::<String, Vec<usize>>::new();
+
+        for (shard_index, shard) in self.shards.iter().enumerate() {
+            if extension_owner
+                .insert(shard.extension_id.clone(), shard_index)
+                .is_some()
+            {
+                return Err(Error::extension(format!(
+                    "Duplicate JS extension id: {}",
+                    shard.extension_id
+                )));
+            }
+
+            for tool in &shard.snapshot.tools {
+                let Some(name) = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                if let Some(previous) = tool_owner.insert(name.to_string(), shard_index)
+                    && previous != shard_index
+                {
+                    return Err(Error::extension(format!(
+                        "registerTool: tool name collision: {name}"
+                    )));
+                }
+            }
+
+            for command in &shard.snapshot.slash_commands {
+                let Some(name) = extract_slash_command_name(command) else {
+                    continue;
+                };
+                let name = js_command_route_name(&name);
+                if name.is_empty() {
+                    continue;
+                }
+                if let Some(previous) = command_owner.insert(name.to_string(), shard_index)
+                    && previous != shard_index
+                {
+                    return Err(Error::extension(format!(
+                        "registerCommand: command name collision: {name}"
+                    )));
+                }
+            }
+
+            for shortcut in &shard.snapshot.shortcuts {
+                let Some(key_id) = shortcut
+                    .get("key_id")
+                    .or_else(|| shortcut.get("shortcut"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|key_id| !key_id.is_empty())
+                else {
+                    continue;
+                };
+                // The shared-realm bridge historically overwrote shortcut
+                // registrations, so preserve deterministic last-loaded-wins.
+                shortcut_owner.insert(key_id.to_ascii_lowercase(), shard_index);
+            }
+
+            for provider in &shard.snapshot.providers {
+                let Some(provider_id) = provider
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|provider_id| !provider_id.is_empty())
+                else {
+                    continue;
+                };
+                if let Some(previous) = provider_owner.insert(provider_id.to_string(), shard_index)
+                    && previous != shard_index
+                {
+                    return Err(Error::extension(format!(
+                        "registerProvider: provider id collision: {provider_id}"
+                    )));
+                }
+            }
+
+            for server in &shard.snapshot.mcp_servers {
+                let Some(name) = server
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                else {
+                    continue;
+                };
+                if let Some(previous) = mcp_server_owner.insert(name.to_string(), shard_index)
+                    && previous != shard_index
+                {
+                    return Err(Error::extension(format!(
+                        "registerMcpServer: server name collision: {name}"
+                    )));
+                }
+            }
+
+            let mut seen_hooks = HashSet::new();
+            for event_name in &shard.snapshot.event_hooks {
+                let event_name = event_name.trim();
+                if event_name.is_empty() || !seen_hooks.insert(event_name) {
+                    continue;
+                }
+                event_owners
+                    .entry(event_name.to_string())
+                    .or_default()
+                    .push(shard_index);
+            }
+        }
+
+        self.extension_owner = extension_owner;
+        self.tool_owner = tool_owner;
+        self.command_owner = command_owner;
+        self.shortcut_owner = shortcut_owner;
+        self.provider_owner = provider_owner;
+        self.mcp_server_owner = mcp_server_owner;
+        self.event_owners = event_owners;
+
+        Ok(())
+    }
 }
 
 fn duration_ms_u64(duration: Duration) -> u64 {
@@ -17857,255 +18092,172 @@ impl JsExtensionRuntimeHandle {
                 )
                 .await;
                 let cold_init_latency_ms = duration_ms_u64(cold_init_started.elapsed());
-                let mut js_runtime = match init {
-                    Ok(runtime) => {
+                match init {
+                    Ok(runtime_probe) => {
                         tracing::info!(
-                            event = "extension_runtime.warm_pool.startup",
+                            event = "extension_runtime.shards.startup",
                             phase = "cold_init",
                             cold_init_latency_ms,
                             memory_limit_bytes = init_config.limits.memory_limit_bytes.unwrap_or(0),
-                            module_cache_limit_bytes = init_config
-                                .limits
-                                .module_cache_limit_bytes
-                                .unwrap_or(0),
+                            module_cache_limit_bytes =
+                                init_config.limits.module_cache_limit_bytes.unwrap_or(0),
                             pool_created_count = warm_pool.created_count(),
                             pool_reset_count = warm_pool.reset_count(),
-                            "QuickJS warm runtime pool initialized"
+                            "QuickJS shard runtime configuration validated"
                         );
+                        // The probe executes no extension code. Production realms are
+                        // created below with an immutable Rust-owned extension id.
+                        drop(runtime_probe);
                         let _ = init_tx.send(&cx, Ok(()));
-                        runtime
                     }
                     Err(err) => {
                         let _ = init_tx.send(&cx, Err(err));
                         return;
                     }
-                };
+                }
 
-                let mut has_loaded_extensions = false;
-                let mut warm_reset_attempts = 0_u64;
-                let mut warm_reset_successes = 0_u64;
-                let mut warm_reset_failures = 0_u64;
-                let mut cold_fallbacks = 0_u64;
-                let mut warm_pool_state = WarmRuntimePoolState::default();
+                let mut shard_set = JsRuntimeShardSet::default();
 
                 while let Ok(cmd) = rx.recv(&cx).await {
                     match cmd {
                         JsRuntimeCommand::Shutdown => break,
-                        JsRuntimeCommand::LoadExtensions { specs, reply } => {
+                        JsRuntimeCommand::LoadExtensions {
+                            specs,
+                            deadline,
+                            reply,
+                        } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "load") {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
                             let startup_started = Instant::now();
-                            let load_fingerprint =
-                                warm_runtime_pool_fingerprint(&runtime_config, &runtime_policy, &specs);
+                            let load_fingerprint = warm_runtime_pool_fingerprint(
+                                &runtime_config,
+                                &runtime_policy,
+                                &specs,
+                            );
                             let fingerprint_short =
                                 short_warm_pool_fingerprint(&load_fingerprint).to_string();
-                            let previous_startup_latency_ms =
-                                warm_pool_state.last_startup_latency_ms;
-                            let pool_invalidated = has_loaded_extensions
-                                && warm_pool_state.active_fingerprint.as_deref()
-                                    != Some(load_fingerprint.as_str());
-                            let mut fallback_reason: Option<String> = None;
-                            let mut reset_report = None;
-                            let mut warm_reset_latency_ms = None;
-                            let mut cold_rebuild_latency_ms = None;
-
-                            if has_loaded_extensions {
-                                if pool_invalidated {
-                                    fallback_reason = Some("pool_key_changed".to_string());
-                                } else {
-                                    warm_reset_attempts = warm_reset_attempts.saturating_add(1);
-                                    let reset_started = Instant::now();
-                                    match js_runtime.reset_for_warm_reload().await {
-                                        Ok(report) => {
-                                            warm_reset_latency_ms =
-                                                Some(duration_ms_u64(reset_started.elapsed()));
-                                            if report.reused {
-                                                warm_reset_successes =
-                                                    warm_reset_successes.saturating_add(1);
-                                                warm_pool.record_reset();
-                                            } else {
-                                                warm_reset_failures =
-                                                    warm_reset_failures.saturating_add(1);
-                                                fallback_reason = report
-                                                    .reason_code
-                                                    .clone()
-                                                    .or_else(|| Some("warm_reset_unknown".to_string()));
-                                            }
-                                            reset_report = Some(report);
-                                        }
-                                        Err(err) => {
-                                            warm_reset_failures =
-                                                warm_reset_failures.saturating_add(1);
-                                            fallback_reason = Some("warm_reset_error".to_string());
+                            let next_provider_stream_id = shard_set.next_provider_stream_id;
+                            let build_result = timeout(
+                                wall_now(),
+                                Duration::from_millis(timeout_ms),
+                                Box::pin(build_js_runtime_shards(
+                                    &warm_pool,
+                                    &runtime_policy,
+                                    &host,
+                                    &specs,
+                                )),
+                            )
+                            .await;
+                            let result = match build_result {
+                                Err(_) => Err(Error::extension(
+                                    "JS extension runtime load expired during actor execution",
+                                )),
+                                Ok(Err(err)) => Err(err),
+                                Ok(Ok(mut candidate)) => {
+                                    if reply.is_closed() {
+                                        continue;
+                                    }
+                                    if let Err(err) =
+                                        js_runtime_remaining_timeout_ms(deadline, "load")
+                                    {
+                                        let _ = reply.send(&cx, Err(err));
+                                        continue;
+                                    }
+                                    let cleanup_budget = deadline
+                                        .checked_duration_since(Instant::now())
+                                        .map_or(Duration::ZERO, |remaining| {
+                                            remaining.min(ExtensionManager::DEFAULT_CLEANUP_BUDGET)
+                                        });
+                                    if !cleanup_budget.is_zero() {
+                                        cancel_active_provider_streams_for_replacement(
+                                            &mut shard_set,
+                                            &host,
+                                            cleanup_budget,
+                                        )
+                                        .await;
+                                    } else {
+                                        let dropped_routes = shard_set.provider_stream_routes.len();
+                                        shard_set.provider_stream_routes.clear();
+                                        if dropped_routes > 0 {
                                             tracing::warn!(
-                                                event = "extension_runtime.warm_reset.error",
-                                                error = %err,
-                                                "Warm reload reset failed; falling back to cold runtime rebuild"
+                                                event = "extension_runtime.provider_stream.reload_cleanup_budget_exhausted",
+                                                total = dropped_routes,
+                                                attempted = 0,
+                                                skipped = dropped_routes,
+                                                cleanup_budget_ms = 0,
+                                                "Provider stream cleanup budget expired before cold shard replacement"
                                             );
                                         }
                                     }
+                                    candidate.next_provider_stream_id = next_provider_stream_id;
+                                    let snapshots = candidate.snapshots();
+                                    let shard_count = candidate.shards.len();
+                                    shard_set = candidate;
+                                    tracing::info!(
+                                        event = "extension_runtime.shards.reload",
+                                        reload_mode = "cold_transactional",
+                                        shard_count,
+                                        pool_fingerprint = %fingerprint_short,
+                                        startup_latency_ms = duration_ms_u64(startup_started.elapsed()),
+                                        "Installed isolated JS extension runtime shards"
+                                    );
+                                    Ok(snapshots)
                                 }
-
-                                if fallback_reason.is_some() {
-                                    cold_fallbacks = cold_fallbacks.saturating_add(1);
-                                    let rebuild_started = Instant::now();
-                                    let rebuild_config = warm_pool.make_config();
-                                    let rebuild = PiJsRuntime::with_clock_and_config_with_policy(
-                                        crate::scheduler::WallClock,
-                                        rebuild_config,
-                                        Some(runtime_policy.clone()),
-                                    )
-                                    .await;
-                                    cold_rebuild_latency_ms =
-                                        Some(duration_ms_u64(rebuild_started.elapsed()));
-                                    match rebuild {
-                                        Ok(runtime) => {
-                                            js_runtime = runtime;
-                                            has_loaded_extensions = false;
-                                            warm_pool_state.active_fingerprint = None;
-                                        }
-                                        Err(err) => {
-                                            let _ = reply.send(&cx, Err(err));
-                                            continue;
-                                        }
-                                    }
-                                }
-                            }
-
-                            let result = load_all_extensions(&js_runtime, &host, &specs).await;
-                            let startup_latency_ms = duration_ms_u64(startup_started.elapsed());
-                            let reset_cleared_runtime =
-                                reset_report.as_ref().is_some_and(|report| report.reused);
-                            if result.is_ok() {
-                                has_loaded_extensions = true;
-                                warm_pool_state.active_fingerprint = Some(load_fingerprint);
-                                warm_pool_state.last_startup_latency_ms = Some(startup_latency_ms);
-                            } else if reset_cleared_runtime || fallback_reason.is_some() {
-                                has_loaded_extensions = false;
-                                warm_pool_state.active_fingerprint = None;
-                            }
-
-                            let warm_reuse_rate = if warm_reset_attempts == 0 {
-                                0.0
-                            } else {
-                                let successes =
-                                    u32::try_from(warm_reset_successes).unwrap_or(u32::MAX);
-                                let attempts =
-                                    u32::try_from(warm_reset_attempts).unwrap_or(u32::MAX);
-                                f64::from(successes) / f64::from(attempts)
                             };
-                            let has_previous_startup_latency =
-                                previous_startup_latency_ms.is_some();
-                            let previous_startup_latency_ms =
-                                previous_startup_latency_ms.unwrap_or(0);
-                            let startup_latency_delta_ms = i64::try_from(startup_latency_ms)
-                                .unwrap_or(i64::MAX)
-                                .saturating_sub(
-                                    i64::try_from(previous_startup_latency_ms)
-                                        .unwrap_or(i64::MAX),
-                                );
-
-                            if let Some(report) = reset_report.as_ref() {
-                                let module_cache_denominator =
-                                    report.module_cache_hits.saturating_add(report.module_cache_misses);
-                                let module_cache_hit_rate = if module_cache_denominator == 0 {
-                                    0.0
-                                } else {
-                                    let hits =
-                                        u32::try_from(report.module_cache_hits).unwrap_or(u32::MAX);
-                                    let denominator = u32::try_from(module_cache_denominator)
-                                        .unwrap_or(u32::MAX);
-                                    f64::from(hits) / f64::from(denominator)
-                                };
-                                tracing::info!(
-                                    event = "extension_runtime.warm_reload.metrics",
-                                    reused = report.reused,
-                                    reason_code = report.reason_code.as_deref().unwrap_or("none"),
-                                    pending_tasks_before = report.pending_tasks_before,
-                                    pending_hostcalls_before = report.pending_hostcalls_before,
-                                    pending_timers_before = report.pending_timers_before,
-                                    residual_entries_after = report.residual_entries_after,
-                                    module_cache_entries = report.module_cache_entries,
-                                    module_cache_bytes = report.module_cache_bytes,
-                                    module_cache_report_limit_bytes = report
-                                        .module_cache_limit_bytes
-                                        .unwrap_or(0),
-                                    module_cache_hit_rate,
-                                    pool_fingerprint = %fingerprint_short,
-                                    pool_invalidated,
-                                    capability_scope_reset = report.reused,
-                                    warm_reset_latency_ms = warm_reset_latency_ms.unwrap_or(0),
-                                    cold_rebuild_latency_ms = cold_rebuild_latency_ms.unwrap_or(0),
-                                    previous_startup_latency_ms,
-                                    has_previous_startup_latency,
-                                    startup_latency_ms,
-                                    startup_latency_delta_ms,
-                                    memory_limit_bytes = runtime_config
-                                        .limits
-                                        .memory_limit_bytes
-                                        .unwrap_or(0),
-                                    module_cache_limit_bytes = runtime_config
-                                        .limits
-                                        .module_cache_limit_bytes
-                                        .unwrap_or(0),
-                                    pool_created_count = warm_pool.created_count(),
-                                    pool_reset_count = warm_pool.reset_count(),
-                                    warm_reuse_rate,
-                                    warm_reset_attempts,
-                                    warm_reset_successes,
-                                    warm_reset_failures,
-                                    cold_fallbacks,
-                                    "Warm-reload reset diagnostics"
-                                );
-                            } else {
-                                tracing::info!(
-                                    event = "extension_runtime.warm_reload.metrics",
-                                    reused = false,
-                                    reason_code = fallback_reason.as_deref().unwrap_or("none"),
-                                    pool_fingerprint = %fingerprint_short,
-                                    pool_invalidated,
-                                    capability_scope_reset = false,
-                                    warm_reset_latency_ms = warm_reset_latency_ms.unwrap_or(0),
-                                    cold_rebuild_latency_ms = cold_rebuild_latency_ms.unwrap_or(0),
-                                    previous_startup_latency_ms,
-                                    has_previous_startup_latency,
-                                    startup_latency_ms,
-                                    startup_latency_delta_ms,
-                                    memory_limit_bytes = runtime_config
-                                        .limits
-                                        .memory_limit_bytes
-                                        .unwrap_or(0),
-                                    module_cache_limit_bytes = runtime_config
-                                        .limits
-                                        .module_cache_limit_bytes
-                                        .unwrap_or(0),
-                                    pool_created_count = warm_pool.created_count(),
-                                    pool_reset_count = warm_pool.reset_count(),
-                                    warm_reuse_rate,
-                                    warm_reset_attempts,
-                                    warm_reset_successes,
-                                    warm_reset_failures,
-                                    cold_fallbacks,
-                                    "Warm-reload reset diagnostics"
-                                );
+                            let _ = reply.send(&cx, result);
+                        }
+                        JsRuntimeCommand::GetRegisteredTools { deadline, reply } => {
+                            if reply.is_closed() {
+                                continue;
                             }
+                            if let Err(err) =
+                                js_runtime_remaining_timeout_ms(deadline, "tools query")
+                            {
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
+                            let result = get_registered_tools_from_shards(&shard_set).await;
                             let _ = reply.send(&cx, result);
                         }
-                        JsRuntimeCommand::GetRegisteredTools { reply } => {
-                            let result = js_runtime.get_registered_tools().await;
-                            let _ = reply.send(&cx, result);
-                        }
-                        JsRuntimeCommand::PumpOnce { reply } => {
-                            let result = pump_js_runtime_once(&js_runtime, &host).await;
+                        JsRuntimeCommand::PumpOnce { deadline, reply } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if let Err(err) = js_runtime_remaining_timeout_ms(deadline, "pump") {
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
+                            let result = pump_js_runtime_shards_once(&mut shard_set, &host).await;
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::DispatchEvent {
                             event_name,
                             event_payload,
                             ctx_payload,
-                            timeout_ms,
+                            timeout_ms: _,
+                            deadline,
                             reply,
                         } => {
-                            let result = dispatch_extension_event(
-                                &js_runtime,
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "event") {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
+                            let result = dispatch_extension_event_across_shards(
+                                &mut shard_set,
                                 &host,
                                 &event_name,
                                 event_payload,
@@ -18118,11 +18270,22 @@ impl JsExtensionRuntimeHandle {
                         JsRuntimeCommand::DispatchEventBatch {
                             events,
                             ctx_payload,
-                            timeout_ms,
+                            timeout_ms: _,
+                            deadline,
                             reply,
                         } => {
-                            let result = dispatch_extension_event_batch(
-                                &js_runtime,
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "event batch") {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
+                            let result = dispatch_extension_event_batch_across_shards(
+                                &mut shard_set,
                                 &host,
                                 events,
                                 ctx_payload.as_ref(),
@@ -18136,53 +18299,118 @@ impl JsExtensionRuntimeHandle {
                             tool_call_id,
                             input,
                             ctx_payload,
-                            timeout_ms,
+                            timeout_ms: _,
+                            deadline,
                             reply,
                         } => {
-                            let result = execute_extension_tool(
-                                &js_runtime,
-                                &host,
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "tool") {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
+                            let result = match shard_set.shard_index_for_route(
+                                &shard_set.tool_owner,
+                                "tool",
                                 &tool_name,
-                                &tool_call_id,
-                                input,
-                                ctx_payload.as_ref(),
-                                timeout_ms,
-                            )
-                            .await;
+                            ) {
+                                Ok(shard_index) => {
+                                    execute_extension_tool_sharded(
+                                        &mut shard_set,
+                                        &host,
+                                        shard_index,
+                                        &tool_name,
+                                        &tool_call_id,
+                                        input,
+                                        ctx_payload.as_ref(),
+                                        timeout_ms,
+                                    )
+                                    .await
+                                }
+                                Err(err) => Err(err),
+                            };
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::ExecuteCommand {
                             command_name,
                             args,
                             ctx_payload,
-                            timeout_ms,
+                            timeout_ms: _,
+                            deadline,
                             reply,
                         } => {
-                            let result = execute_extension_command(
-                                &js_runtime,
-                                &host,
-                                &command_name,
-                                &args,
-                                ctx_payload.as_ref(),
-                                timeout_ms,
-                            )
-                            .await;
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "command") {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
+                            let route_name = js_command_route_name(&command_name);
+                            let result = match shard_set.shard_index_for_route(
+                                &shard_set.command_owner,
+                                "command",
+                                route_name,
+                            ) {
+                                Ok(shard_index) => {
+                                    execute_extension_command_sharded(
+                                        &mut shard_set,
+                                        &host,
+                                        shard_index,
+                                        route_name,
+                                        &args,
+                                        ctx_payload.as_ref(),
+                                        timeout_ms,
+                                    )
+                                    .await
+                                }
+                                Err(err) => Err(err),
+                            };
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::ExecuteShortcut {
                             key_id,
                             ctx_payload,
-                            timeout_ms,
+                            timeout_ms: _,
+                            deadline,
                             reply,
                         } => {
-                            let result = execute_extension_shortcut(
-                                &js_runtime,
-                                &host,
-                                &key_id,
-                                ctx_payload.as_ref(),
-                                timeout_ms,
-                            )
-                            .await;
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(deadline, "shortcut") {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
+                            let route_name = key_id.trim().to_ascii_lowercase();
+                            let result = match shard_set.shard_index_for_route(
+                                &shard_set.shortcut_owner,
+                                "shortcut",
+                                &route_name,
+                            ) {
+                                Ok(shard_index) => {
+                                    execute_extension_shortcut_sharded(
+                                        &mut shard_set,
+                                        &host,
+                                        shard_index,
+                                        &route_name,
+                                        ctx_payload.as_ref(),
+                                        timeout_ms,
+                                    )
+                                    .await
+                                }
+                                Err(err) => Err(err),
+                            };
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::ProviderStreamSimpleStart {
@@ -18190,46 +18418,323 @@ impl JsExtensionRuntimeHandle {
                             model,
                             context,
                             options,
-                            timeout_ms,
+                            timeout_ms: _,
+                            deadline,
                             reply,
                         } => {
-                            let result = start_extension_provider_stream_simple(
-                                &js_runtime,
-                                &host,
-                                &provider_id,
-                                model,
-                                context,
-                                options,
-                                timeout_ms,
-                            )
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(
+                                deadline,
+                                "provider stream start",
+                            ) {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
+                            let result = async {
+                                let shard_index = shard_set.shard_index_for_route(
+                                    &shard_set.provider_owner,
+                                    "provider",
+                                    &provider_id,
+                                )?;
+                                let inner_stream_id =
+                                    start_extension_provider_stream_simple_sharded(
+                                        &mut shard_set,
+                                        &host,
+                                        shard_index,
+                                        &provider_id,
+                                        model,
+                                        context,
+                                        options,
+                                        timeout_ms,
+                                    )
+                                    .await?;
+                                let continuation_timeout_ms = match js_runtime_remaining_timeout_ms(
+                                    deadline,
+                                    "provider stream start",
+                                ) {
+                                    Ok(timeout_ms) if !reply.is_closed() => timeout_ms,
+                                    Ok(timeout_ms) => {
+                                        if let Err(cleanup_err) =
+                                            cancel_extension_provider_stream_simple_best_effort(
+                                                &mut shard_set,
+                                                &host,
+                                                shard_index,
+                                                &inner_stream_id,
+                                                timeout_ms,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                event = "extension_runtime.provider_stream.closed_reply_cleanup_failed",
+                                                shard_index,
+                                                inner_stream_id,
+                                                error = %cleanup_err,
+                                                "Failed to cancel inner provider stream after caller abandoned start"
+                                            );
+                                        }
+                                        return Err(Error::extension(
+                                            "Provider stream start caller closed before route publication",
+                                        ));
+                                    }
+                                    Err(err) => {
+                                        if let Err(cleanup_err) =
+                                            cancel_extension_provider_stream_simple_best_effort(
+                                                &mut shard_set,
+                                                &host,
+                                                shard_index,
+                                                &inner_stream_id,
+                                                1,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                event = "extension_runtime.provider_stream.expired_start_cleanup_failed",
+                                                shard_index,
+                                                inner_stream_id,
+                                                error = %cleanup_err,
+                                                "Failed to cancel inner provider stream after start deadline expired"
+                                            );
+                                        }
+                                        return Err(err);
+                                    }
+                                };
+                                let Some(sequence) =
+                                    shard_set.next_provider_stream_id.checked_add(1)
+                                else {
+                                    if let Err(cleanup_err) =
+                                        cancel_extension_provider_stream_simple_best_effort(
+                                            &mut shard_set,
+                                            &host,
+                                            shard_index,
+                                            &inner_stream_id,
+                                            continuation_timeout_ms,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            event = "extension_runtime.provider_stream.exhaustion_cleanup_failed",
+                                            shard_index,
+                                            inner_stream_id,
+                                            error = %cleanup_err,
+                                            "Failed to cancel inner provider stream after outer id exhaustion"
+                                        );
+                                    }
+                                    return Err(Error::extension(
+                                        "provider stream id space exhausted".to_string(),
+                                    ));
+                                };
+                                shard_set.next_provider_stream_id = sequence;
+                                let outer_stream_id = format!("provider-stream-{sequence}");
+                                shard_set.provider_stream_routes.insert(
+                                    outer_stream_id.clone(),
+                                    JsProviderStreamRoute {
+                                        shard_index,
+                                        inner_stream_id,
+                                    },
+                                );
+                                Ok(outer_stream_id)
+                            }
                             .await;
+                            if reply.is_closed() {
+                                if let Ok(outer_stream_id) = result.as_ref()
+                                    && let Some(route) = shard_set
+                                        .provider_stream_routes
+                                        .remove(outer_stream_id)
+                                {
+                                    let cleanup_timeout_ms = deadline
+                                        .checked_duration_since(Instant::now())
+                                        .map(|remaining| {
+                                            u64::try_from(remaining.as_millis())
+                                                .unwrap_or(u64::MAX)
+                                                .max(1)
+                                        })
+                                        .unwrap_or(1);
+                                    if let Err(cleanup_err) =
+                                        cancel_extension_provider_stream_simple_best_effort(
+                                            &mut shard_set,
+                                            &host,
+                                            route.shard_index,
+                                            &route.inner_stream_id,
+                                            cleanup_timeout_ms,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            event = "extension_runtime.provider_stream.route_publish_cleanup_failed",
+                                            outer_stream_id,
+                                            inner_stream_id = %route.inner_stream_id,
+                                            error = %cleanup_err,
+                                            "Failed to cancel provider stream whose caller closed during route publication"
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::ProviderStreamSimpleNext {
                             stream_id,
-                            timeout_ms,
+                            timeout_ms: _,
+                            deadline,
                             reply,
                         } => {
-                            let result = next_extension_provider_stream_simple(
-                                &js_runtime,
-                                &host,
-                                &stream_id,
-                                timeout_ms,
-                            )
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(
+                                deadline,
+                                "provider stream next",
+                            ) {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    let _ = reply.send(&cx, Err(err));
+                                    continue;
+                                }
+                            };
+                            let result = async {
+                                let route = shard_set
+                                    .provider_stream_routes
+                                    .get(&stream_id)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        Error::extension(format!(
+                                            "Unknown extension provider stream: {stream_id}"
+                                        ))
+                                    })?;
+                                let result = next_extension_provider_stream_simple_sharded(
+                                    &mut shard_set,
+                                    &host,
+                                    route.shard_index,
+                                    &route.inner_stream_id,
+                                    timeout_ms,
+                                )
+                                .await;
+                                match result {
+                                    Ok(Some(value)) => Ok(Some(value)),
+                                    Ok(None) => {
+                                        shard_set.provider_stream_routes.remove(&stream_id);
+                                        Ok(None)
+                                    }
+                                    Err(err) => {
+                                        shard_set.provider_stream_routes.remove(&stream_id);
+                                        let cleanup_timeout_ms = deadline
+                                            .checked_duration_since(Instant::now())
+                                            .map(|remaining| {
+                                                u64::try_from(remaining.as_millis())
+                                                    .unwrap_or(u64::MAX)
+                                                    .max(1)
+                                            })
+                                            .unwrap_or(1);
+                                        if let Err(cleanup_err) =
+                                            cancel_extension_provider_stream_simple_best_effort(
+                                                &mut shard_set,
+                                                &host,
+                                                route.shard_index,
+                                                &route.inner_stream_id,
+                                                cleanup_timeout_ms,
+                                            )
+                                            .await
+                                        {
+                                            tracing::warn!(
+                                                event = "extension_runtime.provider_stream.next_cleanup_failed",
+                                                outer_stream_id = %stream_id,
+                                                inner_stream_id = %route.inner_stream_id,
+                                                error = %cleanup_err,
+                                                "Failed to cancel inner provider stream after next error"
+                                            );
+                                        }
+                                        Err(err)
+                                    }
+                                }
+                            }
                             .await;
+                            if reply.is_closed() {
+                                if let Some(route) =
+                                    shard_set.provider_stream_routes.remove(&stream_id)
+                                {
+                                    let cleanup_timeout_ms = deadline
+                                        .checked_duration_since(Instant::now())
+                                        .map(|remaining| {
+                                            u64::try_from(remaining.as_millis())
+                                                .unwrap_or(u64::MAX)
+                                                .max(1)
+                                        })
+                                        .unwrap_or(1);
+                                    if let Err(cleanup_err) =
+                                        cancel_extension_provider_stream_simple_best_effort(
+                                            &mut shard_set,
+                                            &host,
+                                            route.shard_index,
+                                            &route.inner_stream_id,
+                                            cleanup_timeout_ms,
+                                        )
+                                        .await
+                                    {
+                                        tracing::warn!(
+                                            event = "extension_runtime.provider_stream.abandoned_next_cleanup_failed",
+                                            outer_stream_id = %stream_id,
+                                            inner_stream_id = %route.inner_stream_id,
+                                            error = %cleanup_err,
+                                            "Failed to cancel provider stream after its next caller closed"
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::ProviderStreamSimpleCancel {
                             stream_id,
-                            timeout_ms,
-                            reply,
+                            timeout_ms: _,
+                            deadline,
+                            mut reply,
                         } => {
-                            let result = cancel_extension_provider_stream_simple(
-                                &js_runtime,
-                                &host,
-                                &stream_id,
-                                timeout_ms,
-                            )
+                            if reply.as_ref().is_some_and(oneshot::Sender::is_closed) {
+                                continue;
+                            }
+                            let timeout_ms = match js_runtime_remaining_timeout_ms(
+                                deadline,
+                                "provider stream cancel",
+                            ) {
+                                Ok(timeout_ms) => timeout_ms,
+                                Err(err) => {
+                                    if let Some(reply) = reply.take() {
+                                        let _ = reply.send(&cx, Err(err));
+                                        continue;
+                                    }
+                                    // Fire-and-forget cancellation remains a cleanup
+                                    // command even when it waited in the queue. Give it
+                                    // a minimal bounded attempt rather than turning a
+                                    // caller timeout into a permanent resource leak.
+                                    1
+                                }
+                            };
+                            let result = async {
+                                let route = shard_set
+                                    .provider_stream_routes
+                                    .get(&stream_id)
+                                    .cloned()
+                                    .ok_or_else(|| {
+                                        Error::extension(format!(
+                                            "Unknown extension provider stream: {stream_id}"
+                                        ))
+                                    })?;
+                                let result = cancel_extension_provider_stream_simple_best_effort(
+                                    &mut shard_set,
+                                    &host,
+                                    route.shard_index,
+                                    &route.inner_stream_id,
+                                    timeout_ms,
+                                )
+                                .await;
+                                shard_set.provider_stream_routes.remove(&stream_id);
+                                result
+                            }
                             .await;
                             if let Some(reply) = reply {
                                 let _ = reply.send(&cx, result);
@@ -18239,49 +18744,102 @@ impl JsExtensionRuntimeHandle {
                             extension_id,
                             flag_name,
                             value,
+                            deadline,
                             reply,
                         } => {
-                            let result = js_runtime
-                                .with_ctx(|ctx| {
-                                    let global = ctx.globals();
-                                    let set_fn: rquickjs::Function<'_> =
-                                        global.get("__pi_set_flag_value")?;
-                                    let _: rquickjs::Value<'_> = set_fn.call((
-                                        extension_id.as_str(),
-                                        flag_name.as_str(),
-                                        json_to_js(&ctx, &value)?,
-                                    ))?;
-                                    Ok(())
-                                })
-                                .await;
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if let Err(err) =
+                                js_runtime_remaining_timeout_ms(deadline, "flag update")
+                            {
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
+                            let result = async {
+                                let shard_index =
+                                    shard_set.shard_index_for_extension(&extension_id)?;
+                                set_extension_flag_value(
+                                    &shard_set.shards[shard_index].runtime,
+                                    &extension_id,
+                                    &flag_name,
+                                    &value,
+                                )
+                                .await
+                            }
+                            .await;
                             let _ = reply.send(&cx, result);
                         }
                         JsRuntimeCommand::RegisterMcpServer {
                             extension_id,
                             name,
                             spec,
+                            deadline,
                             reply,
                         } => {
-                            let result = js_runtime
-                                .with_ctx(|ctx| {
-                                    let global = ctx.globals();
-                                    let register_fn: rquickjs::Function<'_> = global
-                                        .get("__pi_register_mcp_server_for_extension")?;
-                                    let spec_js = json_to_js(&ctx, &spec)?;
-                                    let value: rquickjs::Value<'_> =
-                                        register_fn.call((extension_id.as_str(), name.as_str(), spec_js))?;
-                                    js_to_json(&value)
-                                })
-                                .await;
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if let Err(err) =
+                                js_runtime_remaining_timeout_ms(deadline, "MCP registration")
+                            {
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
+                            let result = async {
+                                let shard_index =
+                                    shard_set.shard_index_for_extension(&extension_id)?;
+                                if let Some(previous) =
+                                    shard_set.mcp_server_owner.get(name.trim()).copied()
+                                    && previous != shard_index
+                                {
+                                    return Err(Error::extension(format!(
+                                        "registerMcpServer: server name collision: {}",
+                                        name.trim()
+                                    )));
+                                }
+                                let value = register_extension_mcp_server(
+                                    &shard_set.shards[shard_index].runtime,
+                                    &extension_id,
+                                    &name,
+                                    &spec,
+                                )
+                                .await?;
+                                refresh_runtime_shard_snapshot(&mut shard_set, shard_index).await?;
+                                Ok(value)
+                            }
+                            .await;
                             let _ = reply.send(&cx, result);
                         }
-                        JsRuntimeCommand::DrainRepairEvents { reply } => {
-                            let events = js_runtime.drain_repair_events();
+                        JsRuntimeCommand::DrainRepairEvents { deadline, reply } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if js_runtime_remaining_timeout_ms(deadline, "repair-event drain")
+                                .is_err()
+                            {
+                                let _ = reply.send(&cx, Vec::new());
+                                continue;
+                            }
+                            let events = shard_set
+                                .shards
+                                .iter()
+                                .flat_map(|shard| shard.runtime.drain_repair_events())
+                                .collect();
                             let _ = reply.send(&cx, events);
                         }
-                        JsRuntimeCommand::ResetTransientState { reply } => {
-                            js_runtime.reset_transient_state();
-                            let _ = reply.send(&cx, Ok(()));
+                        JsRuntimeCommand::ResetTransientState { deadline, reply } => {
+                            if reply.is_closed() {
+                                continue;
+                            }
+                            if let Err(err) =
+                                js_runtime_remaining_timeout_ms(deadline, "transient reset")
+                            {
+                                let _ = reply.send(&cx, Err(err));
+                                continue;
+                            }
+                            let result = scrub_and_drop_runtime_shards(&mut shard_set, &warm_pool).await;
+                            let _ = reply.send(&cx, result);
                         }
                     }
                 }
@@ -18365,10 +18923,12 @@ impl JsExtensionRuntimeHandle {
         specs: Vec<JsExtensionLoadSpec>,
     ) -> Result<Vec<JsExtensionSnapshot>> {
         let timeout_ms = EXTENSION_LOAD_BUDGET_MS;
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::LoadExtensions {
             specs,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18393,9 +18953,13 @@ impl JsExtensionRuntimeHandle {
 
     pub async fn get_registered_tools(&self) -> Result<Vec<ExtensionToolDef>> {
         let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::GetRegisteredTools { reply: reply_tx };
+        let command = JsRuntimeCommand::GetRegisteredTools {
+            deadline,
+            reply: reply_tx,
+        };
         let fut = async move {
             self.sender
                 .send(&cx, command)
@@ -18418,9 +18982,13 @@ impl JsExtensionRuntimeHandle {
 
     pub async fn pump_once(&self) -> Result<bool> {
         let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::PumpOnce { reply: reply_tx };
+        let command = JsRuntimeCommand::PumpOnce {
+            deadline,
+            reply: reply_tx,
+        };
         let fut = async move {
             self.sender
                 .send(&cx, command)
@@ -18448,6 +19016,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::DispatchEvent {
@@ -18455,6 +19024,7 @@ impl JsExtensionRuntimeHandle {
             event_payload,
             ctx_payload,
             timeout_ms,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18487,12 +19057,14 @@ impl JsExtensionRuntimeHandle {
         if events.is_empty() {
             return Ok(Vec::new());
         }
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::DispatchEventBatch {
             events,
             ctx_payload,
             timeout_ms,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18523,6 +19095,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteTool {
@@ -18531,6 +19104,7 @@ impl JsExtensionRuntimeHandle {
             input,
             ctx_payload,
             timeout_ms,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18560,6 +19134,7 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteCommand {
@@ -18567,6 +19142,7 @@ impl JsExtensionRuntimeHandle {
             args,
             ctx_payload,
             timeout_ms,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18595,12 +19171,14 @@ impl JsExtensionRuntimeHandle {
         ctx_payload: Arc<Value>,
         timeout_ms: u64,
     ) -> Result<Value> {
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ExecuteShortcut {
             key_id,
             ctx_payload,
             timeout_ms,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18630,12 +19208,14 @@ impl JsExtensionRuntimeHandle {
         value: Value,
     ) -> Result<()> {
         let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::SetFlagValue {
             extension_id,
             flag_name,
             value,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18665,12 +19245,14 @@ impl JsExtensionRuntimeHandle {
         spec: Value,
     ) -> Result<Value> {
         let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::RegisterMcpServer {
             extension_id,
             name,
             spec,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18695,25 +19277,34 @@ impl JsExtensionRuntimeHandle {
 
     /// Drain all accumulated auto-repair events from the JS runtime.
     pub async fn drain_repair_events(&self) -> Vec<ExtensionRepairEvent> {
-        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
+        let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let deadline = js_runtime_request_deadline(timeout_ms);
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::DrainRepairEvents { reply: reply_tx };
+        let command = JsRuntimeCommand::DrainRepairEvents {
+            deadline,
+            reply: reply_tx,
+        };
         let Ok(()) = self.sender.send(&cx, command).await else {
             return Vec::new();
         };
         reply_rx.recv(&cx).await.unwrap_or_default()
     }
 
-    /// Reset transient runtime state for warm isolate reuse.
+    /// Fully reset every isolated extension realm's transient state.
     ///
-    /// Clears extension roots, dynamic virtual modules, and repair events while
-    /// preserving the transpiled source cache (memory + disk). This enables a
-    /// runtime to be returned to a warm pool and reloaded with a fresh set of
-    /// extensions without paying the full cold-start cost.
+    /// This invokes the JS registry/task/timer/VFS/provider-stream reset gate,
+    /// validates its clean-reset report, and removes reset shards from actor
+    /// routing. Subsequent extension loading remains cold and transactional.
     pub async fn reset_transient_state(&self) -> Result<()> {
-        let cx = cx_with_deadline(EXTENSION_QUERY_BUDGET_MS);
+        let timeout_ms = EXTENSION_QUERY_BUDGET_MS;
+        let deadline = js_runtime_request_deadline(timeout_ms);
+        let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
-        let command = JsRuntimeCommand::ResetTransientState { reply: reply_tx };
+        let command = JsRuntimeCommand::ResetTransientState {
+            deadline,
+            reply: reply_tx,
+        };
         self.sender
             .send(&cx, command)
             .await
@@ -18732,6 +19323,7 @@ impl JsExtensionRuntimeHandle {
         options: Value,
         timeout_ms: u64,
     ) -> Result<String> {
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleStart {
@@ -18740,6 +19332,7 @@ impl JsExtensionRuntimeHandle {
             context,
             options,
             timeout_ms,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18767,11 +19360,13 @@ impl JsExtensionRuntimeHandle {
         stream_id: String,
         timeout_ms: u64,
     ) -> Result<Option<Value>> {
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleNext {
             stream_id,
             timeout_ms,
+            deadline,
             reply: reply_tx,
         };
         let fut = async move {
@@ -18799,11 +19394,13 @@ impl JsExtensionRuntimeHandle {
         stream_id: String,
         timeout_ms: u64,
     ) -> Result<()> {
+        let deadline = js_runtime_request_deadline(timeout_ms);
         let cx = cx_with_deadline(timeout_ms);
         let (reply_tx, mut reply_rx) = oneshot::channel();
         let command = JsRuntimeCommand::ProviderStreamSimpleCancel {
             stream_id,
             timeout_ms,
+            deadline,
             reply: Some(reply_tx),
         };
         let fut = async move {
@@ -18828,11 +19425,13 @@ impl JsExtensionRuntimeHandle {
 
     pub fn provider_stream_simple_cancel_best_effort(&self, stream_id: String) {
         let timeout_ms = 5000;
+        let deadline = js_runtime_request_deadline(timeout_ms);
         if self
             .sender
             .try_send(JsRuntimeCommand::ProviderStreamSimpleCancel {
                 stream_id: stream_id.clone(),
                 timeout_ms,
+                deadline,
                 reply: None,
             })
             .is_ok()
@@ -18857,6 +19456,7 @@ impl JsExtensionRuntimeHandle {
                             JsRuntimeCommand::ProviderStreamSimpleCancel {
                                 stream_id,
                                 timeout_ms,
+                                deadline,
                                 reply: None,
                             },
                         )
@@ -20546,20 +21146,248 @@ fn discover_related_extension_entries(primary: &Path) -> Result<Vec<PathBuf>> {
 }
 
 #[allow(clippy::future_not_send)]
-async fn load_all_extensions(
-    runtime: &PiJsRuntime,
+async fn build_js_runtime_shards(
+    warm_pool: &crate::extensions_js::WarmIsolatePool,
+    policy: &ExtensionPolicy,
     host: &JsRuntimeHost,
     specs: &[JsExtensionLoadSpec],
-) -> Result<Vec<JsExtensionSnapshot>> {
+) -> Result<JsRuntimeShardSet> {
     let explicit_entry_paths = specs
         .iter()
         .map(|spec| safe_canonicalize(&spec.entry_path))
         .collect::<HashSet<_>>();
 
+    // One logical extension can have multiple explicit entrypoints. Keep the
+    // first-seen extension order and the original entrypoint order within each
+    // realm so route resolution stays deterministic across reloads.
+    let mut group_by_id = HashMap::<String, usize>::new();
+    let mut grouped_specs = Vec::<(String, Vec<(&JsExtensionLoadSpec, Vec<PathBuf>)>)>::new();
     for spec in specs {
-        load_one_extension(runtime, host, spec, &explicit_entry_paths).await?;
+        if spec.extension_id.trim().is_empty() {
+            return Err(Error::extension("JS extension id cannot be empty"));
+        }
+        // Freeze discovery before any realm is created. The same exact entry
+        // set drives both peer-boundary metadata and the subsequent load, so a
+        // concurrent manifest/filesystem change cannot create an unclassified
+        // extension root between two discovery passes.
+        let entry_paths = resolve_extension_load_entry_paths(spec, &explicit_entry_paths)?;
+        let group_index = if let Some(index) = group_by_id.get(&spec.extension_id).copied() {
+            index
+        } else {
+            let index = grouped_specs.len();
+            group_by_id.insert(spec.extension_id.clone(), index);
+            grouped_specs.push((spec.extension_id.clone(), Vec::new()));
+            index
+        };
+        grouped_specs[group_index].1.push((spec, entry_paths));
     }
-    snapshot_extensions(runtime).await
+
+    let shard_count = grouped_specs.len();
+    let mut leaf_root_owner = HashMap::<PathBuf, String>::new();
+    for (extension_id, extension_specs) in &grouped_specs {
+        for (_, entry_paths) in extension_specs {
+            for entry_path in entry_paths {
+                let Some(parent) = entry_path.parent() else {
+                    continue;
+                };
+                let canonical_parent = safe_canonicalize(parent);
+                if let Some(previous_owner) =
+                    leaf_root_owner.insert(canonical_parent.clone(), extension_id.clone())
+                    && previous_owner != *extension_id
+                {
+                    return Err(Error::extension(format!(
+                        "Ambiguous JS extension ownership: {previous_owner} and {extension_id} both resolve entries under {}",
+                        canonical_parent.display()
+                    )));
+                }
+            }
+        }
+    }
+
+    let mut extension_roots_by_id = Vec::with_capacity(shard_count);
+    for (extension_id, extension_specs) in &grouped_specs {
+        let mut roots = Vec::new();
+        let mut seen = BTreeSet::new();
+        for (_, entry_paths) in extension_specs {
+            for root in collect_extension_roots_from_paths(entry_paths) {
+                if seen.insert(root.clone()) {
+                    roots.push(root);
+                }
+            }
+        }
+        extension_roots_by_id.push((extension_id.clone(), roots));
+    }
+
+    let mut candidate = JsRuntimeShardSet::default();
+    for (shard_index, (extension_id, extension_specs)) in grouped_specs.into_iter().enumerate() {
+        let mut shard_config = warm_pool.make_config();
+        shard_config.limits.memory_limit_bytes = shard_config
+            .limits
+            .memory_limit_bytes
+            .map(|total| split_shard_budget(total, shard_count, shard_index, "memory"))
+            .transpose()?;
+        shard_config.limits.module_cache_limit_bytes = shard_config
+            .limits
+            .module_cache_limit_bytes
+            .map(|total| split_shard_budget(total, shard_count, shard_index, "module cache"))
+            .transpose()?;
+        let fast_queue_total = if shard_config.limits.hostcall_fast_queue_capacity == 0 {
+            crate::hostcall_queue::HOSTCALL_FAST_RING_CAPACITY
+        } else {
+            shard_config.limits.hostcall_fast_queue_capacity
+        };
+        shard_config.limits.hostcall_fast_queue_capacity = split_shard_budget(
+            fast_queue_total,
+            shard_count,
+            shard_index,
+            "hostcall fast queue",
+        )?;
+        let overflow_queue_total = if shard_config.limits.hostcall_overflow_queue_capacity == 0 {
+            crate::hostcall_queue::HOSTCALL_OVERFLOW_CAPACITY
+        } else {
+            shard_config.limits.hostcall_overflow_queue_capacity
+        };
+        shard_config.limits.hostcall_overflow_queue_capacity = split_shard_budget(
+            overflow_queue_total,
+            shard_count,
+            shard_index,
+            "hostcall overflow queue",
+        )?;
+
+        let runtime = PiJsRuntime::with_clock_and_config_with_policy_for_extension(
+            crate::scheduler::WallClock,
+            shard_config,
+            Some(policy.clone()),
+            extension_id.clone(),
+        )
+        .await?;
+
+        // Files under another extension's root must remain a protected
+        // boundary even when both extensions live below the workspace cwd.
+        // Register peer roots as metadata only; this intentionally grants no
+        // read/write capability to the current shard.
+        for (foreign_extension_id, roots) in &extension_roots_by_id {
+            if foreign_extension_id == &extension_id {
+                continue;
+            }
+            for root in roots {
+                runtime
+                    .register_foreign_extension_root_boundary(root.clone(), foreign_extension_id);
+            }
+        }
+
+        for (spec, entry_paths) in extension_specs {
+            load_one_extension(&runtime, host, spec, &entry_paths).await?;
+        }
+
+        let snapshot =
+            require_single_shard_snapshot(snapshot_extensions(&runtime).await?, &extension_id)?;
+        candidate.shards.push(JsRuntimeShard {
+            extension_id,
+            runtime,
+            snapshot,
+            pump_fault: None,
+        });
+    }
+
+    candidate.rebuild_indexes()?;
+    Ok(candidate)
+}
+
+fn split_shard_budget(
+    total: usize,
+    shard_count: usize,
+    shard_index: usize,
+    budget_name: &str,
+) -> Result<usize> {
+    if shard_count == 0 || shard_index >= shard_count {
+        return Err(Error::extension(format!(
+            "Invalid JS runtime shard allocation for {budget_name}"
+        )));
+    }
+    if total < shard_count {
+        return Err(Error::extension(format!(
+            "Configured aggregate {budget_name} budget ({total}) is too small for {shard_count} isolated extension shards"
+        )));
+    }
+    let base = total / shard_count;
+    let remainder = total % shard_count;
+    Ok(base + usize::from(shard_index < remainder))
+}
+
+fn require_single_shard_snapshot(
+    mut snapshots: Vec<JsExtensionSnapshot>,
+    expected_extension_id: &str,
+) -> Result<JsExtensionSnapshot> {
+    if snapshots.len() != 1 {
+        return Err(Error::extension(format!(
+            "Extension runtime shard {expected_extension_id} produced {} registry snapshots; expected exactly one",
+            snapshots.len()
+        )));
+    }
+    let snapshot = snapshots.pop().expect("length checked above");
+    if snapshot.id != expected_extension_id {
+        return Err(Error::extension(format!(
+            "Extension runtime shard owner mismatch: expected {expected_extension_id}, got {}",
+            snapshot.id
+        )));
+    }
+    Ok(snapshot)
+}
+
+#[allow(clippy::future_not_send)]
+async fn get_registered_tools_from_shards(
+    shards: &JsRuntimeShardSet,
+) -> Result<Vec<ExtensionToolDef>> {
+    let mut tools = Vec::new();
+    for (shard_index, shard) in shards.shards.iter().enumerate() {
+        shards.ensure_shard_healthy(shard_index)?;
+        tools.extend(shard.runtime.get_registered_tools().await?);
+    }
+    Ok(tools)
+}
+
+#[allow(clippy::future_not_send)]
+async fn scrub_and_drop_runtime_shards(
+    shards: &mut JsRuntimeShardSet,
+    warm_pool: &crate::extensions_js::WarmIsolatePool,
+) -> Result<()> {
+    let mut errors = Vec::new();
+    for shard in &shards.shards {
+        match shard.runtime.scrub_for_cold_drop().await {
+            Ok(report) if report.scrubbed_cleanly => {
+                warm_pool.record_reset();
+            }
+            Ok(report) => errors.push(format!(
+                "{}: {} (residual_entries_after={})",
+                shard.extension_id,
+                report.reason_code.as_deref().unwrap_or("reset_not_clean"),
+                report.residual_entries_after
+            )),
+            Err(err) => errors.push(format!("{}: {err}", shard.extension_id)),
+        }
+    }
+
+    // A clean scrub is hygiene evidence, never realm-reuse authority. Arbitrary
+    // extension JavaScript can mutate module and global singleton state outside
+    // any finite registry inventory. Cold transactional loading is therefore
+    // the only supported next step: drop every attempted realm and every
+    // route/fault rather than retaining a Rust snapshot that cannot be proven
+    // equivalent to a fresh realm.
+    let next_provider_stream_id = shards.next_provider_stream_id;
+    *shards = JsRuntimeShardSet {
+        next_provider_stream_id,
+        ..JsRuntimeShardSet::default()
+    };
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::extension(format!(
+            "One or more JS extension shards failed full transient reset: {}",
+            errors.join("; ")
+        )))
+    }
 }
 
 #[allow(clippy::future_not_send)]
@@ -20567,16 +21395,8 @@ async fn load_one_extension(
     runtime: &PiJsRuntime,
     host: &JsRuntimeHost,
     spec: &JsExtensionLoadSpec,
-    explicit_entry_paths: &HashSet<PathBuf>,
+    entry_paths: &[PathBuf],
 ) -> Result<()> {
-    let explicit_primary = safe_canonicalize(&spec.entry_path);
-    let mut entry_paths = discover_related_extension_entries(&spec.entry_path)?;
-    if explicit_entry_paths.len() > 1 {
-        entry_paths.retain(|entry_path| {
-            let canonical = safe_canonicalize(entry_path);
-            canonical == explicit_primary || !explicit_entry_paths.contains(&canonical)
-        });
-    }
     if entry_paths.len() > 1 {
         tracing::info!(
             event = "ext.load.multi_entry",
@@ -20591,25 +21411,8 @@ async fn load_one_extension(
     // bundled assets (HTML templates, markdown docs, etc.) within the
     // extension's own directory tree, and so the resolver can detect
     // monorepo escape patterns (Pattern 3).
-    let mut registered_roots = BTreeSet::new();
-    for entry_path in &entry_paths {
-        let mut candidate_roots = Vec::new();
-        if let Some(ext_dir) = entry_path.parent() {
-            candidate_roots.push(ext_dir.to_path_buf());
-        }
-        for package_json in find_package_json_ancestors(entry_path.parent()) {
-            if let Some(package_dir) = package_json.parent() {
-                candidate_roots.push(package_dir.to_path_buf());
-            }
-        }
-
-        for root in candidate_roots {
-            if let Ok(canonical) = std::fs::canonicalize(&root).map(strip_unc_prefix)
-                && registered_roots.insert(canonical.clone())
-            {
-                runtime.add_extension_root_with_id(canonical, Some(spec.extension_id.as_str()));
-            }
-        }
+    for root in collect_extension_roots_from_paths(entry_paths) {
+        runtime.add_extension_root_with_id(root, Some(spec.extension_id.as_str()));
     }
 
     let meta = json!({
@@ -20618,11 +21421,12 @@ async fn load_one_extension(
         "apiVersion": spec.api_version,
     });
 
-    for (entry_index, entry_path) in entry_paths.into_iter().enumerate() {
+    for (entry_index, entry_path) in entry_paths.iter().enumerate() {
         // QuickJS module resolver requires forward-slash paths.
         let entry_specifier = entry_path.display().to_string().replace('\\', "/");
         let task_id = next_runtime_task_id("task-load");
         let meta_value = meta.clone();
+        let bridge_secret = runtime.bridge_secret().to_string();
 
         let bootstrap_result = runtime
             .with_ctx(|ctx| {
@@ -20630,16 +21434,27 @@ async fn load_one_extension(
                 let load_fn: rquickjs::Function<'_> = global.get("__pi_load_extension")?;
                 let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
                 let meta_js = json_to_js(&ctx, &meta_value)?;
-                let promise: rquickjs::Value<'_> =
-                    load_fn.call((spec.extension_id.clone(), entry_specifier.clone(), meta_js))?;
-                let _task: String = task_start.call((task_id.as_str(), promise))?;
+                let promise: rquickjs::Value<'_> = load_fn.call((
+                    bridge_secret.as_str(),
+                    spec.extension_id.clone(),
+                    entry_specifier.clone(),
+                    meta_js,
+                ))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
                 Ok(())
             })
             .await;
         let load_result = match bootstrap_result {
-            Ok(()) => await_js_task(runtime, host, &task_id, Duration::from_secs(10))
-                .await
-                .map(|_| ()),
+            Ok(()) => await_js_task(
+                runtime,
+                host,
+                Some(spec.extension_id.as_str()),
+                &task_id,
+                Duration::from_secs(10),
+            )
+            .await
+            .map(|_| ()),
             Err(err) => Err(err),
         };
 
@@ -20653,13 +21468,29 @@ async fn load_one_extension(
     Ok(())
 }
 
+fn resolve_extension_load_entry_paths(
+    spec: &JsExtensionLoadSpec,
+    explicit_entry_paths: &HashSet<PathBuf>,
+) -> Result<Vec<PathBuf>> {
+    let explicit_primary = safe_canonicalize(&spec.entry_path);
+    let mut entry_paths = discover_related_extension_entries(&spec.entry_path)?;
+    if explicit_entry_paths.len() > 1 {
+        entry_paths.retain(|entry_path| {
+            let canonical = safe_canonicalize(entry_path);
+            canonical == explicit_primary || !explicit_entry_paths.contains(&canonical)
+        });
+    }
+    Ok(entry_paths)
+}
+
 #[allow(clippy::future_not_send)]
 async fn snapshot_extensions(runtime: &PiJsRuntime) -> Result<Vec<JsExtensionSnapshot>> {
+    let bridge_secret = runtime.bridge_secret().to_string();
     let json = runtime
         .with_ctx(|ctx| {
             let global = ctx.globals();
             let snapshot_fn: rquickjs::Function<'_> = global.get("__pi_snapshot_extensions")?;
-            let value: rquickjs::Value<'_> = snapshot_fn.call(())?;
+            let value: rquickjs::Value<'_> = snapshot_fn.call((bridge_secret.as_str(),))?;
             js_to_json(&value)
         })
         .await?;
@@ -20669,6 +21500,131 @@ async fn snapshot_extensions(runtime: &PiJsRuntime) -> Result<Vec<JsExtensionSna
     Ok(snapshots)
 }
 
+#[allow(clippy::future_not_send)]
+async fn refresh_runtime_shard_snapshot(
+    shards: &mut JsRuntimeShardSet,
+    shard_index: usize,
+) -> Result<()> {
+    let extension_id = shards
+        .shards
+        .get(shard_index)
+        .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+        .extension_id
+        .clone();
+    let snapshots = match snapshot_extensions(&shards.shards[shard_index].runtime).await {
+        Ok(snapshots) => snapshots,
+        Err(err) => {
+            return Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                format!("registry snapshot failed: {err}"),
+            ));
+        }
+    };
+    let new_snapshot = match require_single_shard_snapshot(snapshots, &extension_id) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            return Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                format!("registry ownership validation failed: {err}"),
+            ));
+        }
+    };
+    let old_snapshot = std::mem::replace(&mut shards.shards[shard_index].snapshot, new_snapshot);
+    if let Err(err) = shards.rebuild_indexes() {
+        shards.shards[shard_index].snapshot = old_snapshot;
+        let restore_error = if let Err(restore_err) = shards.rebuild_indexes() {
+            tracing::error!(
+                event = "extension_runtime.shards.index_restore_failed",
+                extension_id,
+                error = %restore_err,
+                "Failed to restore JS extension route indexes after rejecting a dynamic registration"
+            );
+            Some(restore_err.to_string())
+        } else {
+            None
+        };
+        let reason = restore_error.map_or_else(
+            || format!("registry route validation failed: {err}"),
+            |restore_err| {
+                format!(
+                    "registry route validation failed: {err}; index restoration also failed: {restore_err}"
+                )
+            },
+        );
+        return Err(quarantine_runtime_shard(shards, shard_index, reason));
+    }
+    Ok(())
+}
+
+fn quarantine_runtime_shard(
+    shards: &mut JsRuntimeShardSet,
+    shard_index: usize,
+    reason: String,
+) -> Error {
+    let extension_id = shards.shards.get(shard_index).map_or_else(
+        || "<missing>".to_string(),
+        |shard| shard.extension_id.clone(),
+    );
+    let fault = format!("JS extension shard {extension_id} quarantined: {reason}");
+    if let Some(shard) = shards.shards.get_mut(shard_index) {
+        shard.pump_fault = Some(fault.clone());
+    }
+    tracing::error!(
+        event = "extension_runtime.shards.quarantined",
+        extension_id,
+        shard_index,
+        reason,
+        "Quarantined an inconsistent or unresponsive JS extension shard"
+    );
+    Error::extension(fault)
+}
+
+#[allow(clippy::future_not_send)]
+async fn set_extension_flag_value(
+    runtime: &PiJsRuntime,
+    extension_id: &str,
+    flag_name: &str,
+    value: &Value,
+) -> Result<()> {
+    let bridge_secret = runtime.bridge_secret().to_string();
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let set_fn: rquickjs::Function<'_> = global.get("__pi_set_flag_value")?;
+            let _: rquickjs::Value<'_> = set_fn.call((
+                bridge_secret.as_str(),
+                extension_id,
+                flag_name,
+                json_to_js(&ctx, value)?,
+            ))?;
+            Ok(())
+        })
+        .await
+}
+
+#[allow(clippy::future_not_send)]
+async fn register_extension_mcp_server(
+    runtime: &PiJsRuntime,
+    extension_id: &str,
+    name: &str,
+    spec: &Value,
+) -> Result<Value> {
+    let bridge_secret = runtime.bridge_secret().to_string();
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let register_fn: rquickjs::Function<'_> =
+                global.get("__pi_register_mcp_server_for_extension")?;
+            let spec_js = json_to_js(&ctx, spec)?;
+            let value: rquickjs::Value<'_> =
+                register_fn.call((bridge_secret.as_str(), extension_id, name, spec_js))?;
+            js_to_json(&value)
+        })
+        .await
+}
+
 #[inline]
 fn next_runtime_task_id(prefix: &str) -> String {
     static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
@@ -20676,119 +21632,511 @@ fn next_runtime_task_id(prefix: &str) -> String {
     format!("{prefix}-{id}")
 }
 
+#[derive(Debug, Deserialize)]
+struct JsEventPhaseEnvelope {
+    present: bool,
+    #[serde(default)]
+    value: Value,
+}
+
+fn remaining_js_task_timeout(deadline: Instant, operation: &str) -> Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .ok_or_else(|| {
+            Error::extension(format!(
+                "JS extension {operation} timed out before dispatch completed"
+            ))
+        })
+}
+
+fn json_value_is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().is_none_or(|number| number != 0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
 #[allow(clippy::future_not_send)]
-async fn dispatch_extension_event(
-    runtime: &PiJsRuntime,
+async fn dispatch_extension_event_phase_sharded(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    event_name: &str,
+    event_payload: Value,
+    ctx_payload: &Value,
+    phase: &str,
+    batch_id: Option<&str>,
+    deadline: Instant,
+) -> Result<Option<Value>> {
+    shards.ensure_shard_healthy(shard_index)?;
+    let task_id = next_runtime_task_id("task-event-phase");
+    {
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        let bridge_secret = runtime.bridge_secret().to_string();
+        runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let event_js = json_to_js(&ctx, &event_payload)?;
+                let promise: rquickjs::Value<'_> = if let Some(batch_id) = batch_id {
+                    let dispatch_fn: rquickjs::Function<'_> =
+                        global.get("__pi_dispatch_extension_event_phase_in_batch")?;
+                    dispatch_fn.call((
+                        bridge_secret.as_str(),
+                        event_name,
+                        event_js,
+                        batch_id,
+                        phase,
+                    ))?
+                } else {
+                    let dispatch_fn: rquickjs::Function<'_> =
+                        global.get("__pi_dispatch_extension_event_phase")?;
+                    let ctx_js = json_to_js(&ctx, ctx_payload)?;
+                    dispatch_fn.call((
+                        bridge_secret.as_str(),
+                        event_name,
+                        event_js,
+                        ctx_js,
+                        phase,
+                    ))?
+                };
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+                Ok(())
+            })
+            .await?;
+    }
+
+    let raw = await_js_task_in_shards_and_refresh(
+        shards,
+        host,
+        shard_index,
+        &task_id,
+        remaining_js_task_timeout(deadline, "event")?,
+    )
+    .await?;
+    let envelope: JsEventPhaseEnvelope = serde_json::from_value(raw)
+        .map_err(|err| Error::extension(format!("event phase envelope: {err}")))?;
+    Ok(envelope.present.then_some(envelope.value))
+}
+
+fn input_event_payload(text: &str, images: Option<&Value>, source: &Value) -> Value {
+    let mut payload = serde_json::Map::from_iter([
+        ("type".to_string(), Value::String("input".to_string())),
+        ("text".to_string(), Value::String(text.to_string())),
+        ("source".to_string(), source.clone()),
+    ]);
+    if let Some(images) = images {
+        payload.insert("images".to_string(), images.clone());
+    }
+    Value::Object(payload)
+}
+
+fn before_agent_start_payload(prompt: &str, images: Option<&Value>, system_prompt: &str) -> Value {
+    let mut payload = serde_json::Map::from_iter([
+        (
+            "type".to_string(),
+            Value::String("before_agent_start".to_string()),
+        ),
+        ("prompt".to_string(), Value::String(prompt.to_string())),
+        (
+            "systemPrompt".to_string(),
+            Value::String(system_prompt.to_string()),
+        ),
+    ]);
+    if let Some(images) = images {
+        payload.insert("images".to_string(), images.clone());
+    }
+    Value::Object(payload)
+}
+
+fn push_resource_paths(target: &mut Vec<Value>, value: Option<&Value>) {
+    match value {
+        Some(Value::Array(paths)) => {
+            target.extend(paths.iter().filter_map(|path| {
+                path.as_str()
+                    .map(str::trim)
+                    .filter(|path| !path.is_empty())
+                    .map(|path| Value::String(path.to_string()))
+            }));
+        }
+        Some(Value::String(path)) if !path.trim().is_empty() => {
+            target.push(Value::String(path.trim().to_string()));
+        }
+        _ => {}
+    }
+}
+
+#[allow(clippy::future_not_send, clippy::too_many_lines)]
+async fn dispatch_extension_event_across_shards_until(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    event_name: &str,
+    event_payload: Value,
+    ctx_payload: &Value,
+    batch_id: Option<&str>,
+    deadline: Instant,
+) -> Result<Value> {
+    let owners = shards
+        .event_owners
+        .get(event_name)
+        .cloned()
+        .unwrap_or_default();
+    if owners.is_empty() {
+        return Ok(Value::Null);
+    }
+
+    if event_name == "input" {
+        let original_text = event_payload
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| event_payload.get("content").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        let original_images = event_payload
+            .get("images")
+            .or_else(|| event_payload.get("attachments"))
+            .cloned();
+        let source = event_payload
+            .get("source")
+            .cloned()
+            .unwrap_or_else(|| Value::String("extension".to_string()));
+        let mut current_text = original_text.clone();
+        let mut current_images = original_images.clone();
+        let mut saw_handler_result = false;
+
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let payload = input_event_payload(&current_text, current_images.as_ref(), &source);
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    shard_index,
+                    event_name,
+                    payload,
+                    ctx_payload,
+                    phase,
+                    batch_id,
+                    deadline,
+                )
+                .await?
+                else {
+                    continue;
+                };
+                saw_handler_result = true;
+                if value.get("action").and_then(Value::as_str) == Some("handled") {
+                    return Ok(value);
+                }
+                if value.get("action").and_then(Value::as_str) == Some("transform")
+                    && let Some(text) = value.get("text").and_then(Value::as_str)
+                {
+                    current_text = text.to_string();
+                    if let Some(images) = value.get("images") {
+                        current_images = Some(images.clone());
+                    }
+                }
+            }
+        }
+
+        if current_text != original_text || current_images != original_images {
+            let mut result = serde_json::Map::from_iter([
+                ("action".to_string(), Value::String("transform".to_string())),
+                ("text".to_string(), Value::String(current_text)),
+            ]);
+            if let Some(images) = current_images {
+                result.insert("images".to_string(), images);
+            }
+            return Ok(Value::Object(result));
+        }
+        return Ok(if saw_handler_result {
+            json!({ "action": "continue" })
+        } else {
+            Value::Null
+        });
+    }
+
+    if event_name == "before_agent_start" {
+        let prompt = event_payload
+            .get("prompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let images = event_payload.get("images").cloned();
+        let mut system_prompt = event_payload
+            .get("systemPrompt")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let mut modified = false;
+        let mut messages = Vec::new();
+
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let payload = before_agent_start_payload(&prompt, images.as_ref(), &system_prompt);
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    shard_index,
+                    event_name,
+                    payload,
+                    ctx_payload,
+                    phase,
+                    batch_id,
+                    deadline,
+                )
+                .await?
+                else {
+                    continue;
+                };
+                if let Some(next_messages) = value.get("messages").and_then(Value::as_array) {
+                    messages.extend(next_messages.iter().cloned());
+                }
+                if let Some(next_prompt) = value.get("systemPrompt") {
+                    system_prompt = next_prompt
+                        .as_str()
+                        .map_or_else(|| next_prompt.to_string(), ToString::to_string);
+                    modified = true;
+                }
+            }
+        }
+
+        if messages.is_empty() && !modified {
+            return Ok(Value::Null);
+        }
+        let mut result = serde_json::Map::new();
+        if !messages.is_empty() {
+            result.insert("messages".to_string(), Value::Array(messages));
+        }
+        if modified {
+            result.insert("systemPrompt".to_string(), Value::String(system_prompt));
+        }
+        return Ok(Value::Object(result));
+    }
+
+    if event_name == "resources_discover" {
+        let mut skill_paths = Vec::new();
+        let mut prompt_paths = Vec::new();
+        let mut theme_paths = Vec::new();
+        for phase in ["direct", "event_bus"] {
+            for &shard_index in &owners {
+                let Some(value) = dispatch_extension_event_phase_sharded(
+                    shards,
+                    host,
+                    shard_index,
+                    event_name,
+                    event_payload.clone(),
+                    ctx_payload,
+                    phase,
+                    batch_id,
+                    deadline,
+                )
+                .await?
+                else {
+                    continue;
+                };
+                push_resource_paths(&mut skill_paths, value.get("skillPaths"));
+                push_resource_paths(&mut prompt_paths, value.get("promptPaths"));
+                push_resource_paths(&mut theme_paths, value.get("themePaths"));
+            }
+        }
+        let mut result = serde_json::Map::new();
+        if !skill_paths.is_empty() {
+            result.insert("skillPaths".to_string(), Value::Array(skill_paths));
+        }
+        if !prompt_paths.is_empty() {
+            result.insert("promptPaths".to_string(), Value::Array(prompt_paths));
+        }
+        if !theme_paths.is_empty() {
+            result.insert("themePaths".to_string(), Value::Array(theme_paths));
+        }
+        return Ok(if result.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(result)
+        });
+    }
+
+    let mut last = None;
+    for phase in ["direct", "event_bus"] {
+        for &shard_index in &owners {
+            let Some(value) = dispatch_extension_event_phase_sharded(
+                shards,
+                host,
+                shard_index,
+                event_name,
+                event_payload.clone(),
+                ctx_payload,
+                phase,
+                batch_id,
+                deadline,
+            )
+            .await?
+            else {
+                continue;
+            };
+            if event_name == "user_bash" {
+                return Ok(value);
+            }
+            let should_stop = (event_name == "tool_call"
+                && value.get("block").is_some_and(json_value_is_truthy))
+                || (event_name.starts_with("session_before_")
+                    && value.get("cancel").is_some_and(json_value_is_truthy));
+            last = Some(value);
+            if should_stop {
+                return Ok(last.expect("value assigned above"));
+            }
+        }
+    }
+    Ok(last.unwrap_or(Value::Null))
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_extension_event_across_shards(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     event_name: &str,
     event_payload: Value,
     ctx_payload: &Value,
     timeout_ms: u64,
 ) -> Result<Value> {
-    let task_id = next_runtime_task_id("task-event");
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let dispatch_fn: rquickjs::Function<'_> =
-                global.get("__pi_dispatch_extension_event")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let event_js = json_to_js(&ctx, &event_payload)?;
-            let ctx_js = json_to_js(&ctx, ctx_payload)?;
-            let promise: rquickjs::Value<'_> = dispatch_fn.call((event_name, event_js, ctx_js))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
-
-    await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| Error::extension("JS extension event deadline overflow"))?;
+    dispatch_extension_event_across_shards_until(
+        shards,
+        host,
+        event_name,
+        event_payload,
+        ctx_payload,
+        None,
+        deadline,
+    )
+    .await
 }
 
-/// Dispatch multiple events in a single JS bridge call, sharing context construction.
-///
-/// Returns one `Result<Value>` per event in the same order as the input.
 #[allow(clippy::future_not_send)]
-async fn dispatch_extension_event_batch(
-    runtime: &PiJsRuntime,
+async fn delete_event_batch_contexts(
+    shards: &JsRuntimeShardSet,
+    shard_indexes: &[usize],
+    batch_id: &str,
+) -> Result<()> {
+    let mut first_error = None;
+    for &shard_index in shard_indexes {
+        let Some(shard) = shards.shards.get(shard_index) else {
+            if first_error.is_none() {
+                first_error = Some(Error::extension("JS runtime shard disappeared"));
+            }
+            continue;
+        };
+        let bridge_secret = shard.runtime.bridge_secret().to_string();
+        let result = shard
+            .runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let delete_fn: rquickjs::Function<'_> =
+                    global.get("__pi_event_batch_context_delete")?;
+                let _: rquickjs::Value<'_> = delete_fn.call((bridge_secret.as_str(), batch_id))?;
+                Ok(())
+            })
+            .await;
+        if let Err(err) = result
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+#[allow(clippy::future_not_send)]
+async fn create_event_batch_contexts(
+    shards: &JsRuntimeShardSet,
+    batch_id: &str,
+    ctx_payload: &Value,
+) -> Result<Vec<usize>> {
+    let mut created = Vec::with_capacity(shards.shards.len());
+    for (shard_index, shard) in shards.shards.iter().enumerate() {
+        let bridge_secret = shard.runtime.bridge_secret().to_string();
+        let result = shard
+            .runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let create_fn: rquickjs::Function<'_> =
+                    global.get("__pi_event_batch_context_create")?;
+                let ctx_js = json_to_js(&ctx, ctx_payload)?;
+                let _: rquickjs::Value<'_> =
+                    create_fn.call((bridge_secret.as_str(), batch_id, ctx_js))?;
+                Ok(())
+            })
+            .await;
+        if let Err(err) = result {
+            if let Err(cleanup_err) = delete_event_batch_contexts(shards, &created, batch_id).await
+            {
+                tracing::warn!(
+                    event = "extension_runtime.event_batch.setup_cleanup_failed",
+                    batch_id,
+                    error = %cleanup_err,
+                    "Failed to clean up partial extension event batch contexts"
+                );
+            }
+            return Err(err);
+        }
+        created.push(shard_index);
+    }
+    Ok(created)
+}
+
+#[allow(clippy::future_not_send)]
+async fn dispatch_extension_event_batch_across_shards(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
     events: Vec<(String, Value)>,
     ctx_payload: &Value,
     timeout_ms: u64,
 ) -> Result<Vec<Result<Value>>> {
-    if events.is_empty() {
-        return Ok(Vec::new());
+    let deadline = Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or_else(|| Error::extension("JS extension batch event deadline overflow"))?;
+    let batch_id = next_runtime_task_id("event-batch-context");
+    let created_contexts = create_event_batch_contexts(shards, &batch_id, ctx_payload).await?;
+    let mut results = Vec::with_capacity(events.len());
+    for (event_name, event_payload) in events {
+        results.push(
+            dispatch_extension_event_across_shards_until(
+                shards,
+                host,
+                &event_name,
+                event_payload,
+                ctx_payload,
+                Some(batch_id.as_str()),
+                deadline,
+            )
+            .await,
+        );
     }
-
-    // Fast path: single event — delegate to non-batch path.
-    if events.len() == 1 {
-        let mut events = events;
-        let (name, payload) = events.pop().unwrap();
-        let result =
-            dispatch_extension_event(runtime, host, &name, payload, ctx_payload, timeout_ms).await;
-        return Ok(vec![result]);
-    }
-
-    let task_id = next_runtime_task_id("task-event-batch");
-
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let batch_fn: rquickjs::Function<'_> =
-                global.get("__pi_dispatch_extension_events_batch")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-
-            // Build the events array as a JS value.
-            let events_array = rquickjs::Array::new(ctx.clone())?;
-            for (i, (event_name, event_payload)) in events.iter().enumerate() {
-                let entry = rquickjs::Object::new(ctx.clone())?;
-                entry.set("event_name", event_name.as_str())?;
-                let payload_js = json_to_js(&ctx, event_payload)?;
-                entry.set("event_payload", payload_js)?;
-                events_array.set(i, entry)?;
-            }
-
-            let ctx_js = json_to_js(&ctx, ctx_payload)?;
-            let promise: rquickjs::Value<'_> = batch_fn.call((events_array, ctx_js))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
-
-    let raw_result =
-        await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
-
-    // Parse the batch results array.
-    let results_array = raw_result
-        .as_array()
-        .ok_or_else(|| Error::extension("batch dispatch: expected array result".to_string()))?;
-
-    let mut results = Vec::with_capacity(results_array.len());
-    for entry in results_array {
-        let ok = entry.get("ok").and_then(Value::as_bool).unwrap_or(false);
-        if ok {
-            results.push(Ok(entry.get("value").cloned().unwrap_or(Value::Null)));
-        } else {
-            let error_msg = entry
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown batch event error")
-                .to_string();
-            results.push(Err(Error::extension(error_msg)));
-        }
-    }
-
+    delete_event_batch_contexts(shards, &created_contexts, &batch_id).await?;
     Ok(results)
 }
 
 #[allow(clippy::future_not_send)]
-async fn execute_extension_tool(
-    runtime: &PiJsRuntime,
+async fn execute_extension_tool_sharded(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
+    shard_index: usize,
     tool_name: &str,
     tool_call_id: &str,
     input: Value,
     ctx_payload: &Value,
     timeout_ms: u64,
 ) -> Result<Value> {
+    shards.ensure_shard_healthy(shard_index)?;
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.tool.start",
@@ -20798,21 +22146,42 @@ async fn execute_extension_tool(
         "Extension tool execution start"
     );
     let task_id = next_runtime_task_id("task-tool");
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_tool")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let input_js = json_to_js(&ctx, &input)?;
-            let ctx_js = json_to_js(&ctx, ctx_payload)?;
-            let promise: rquickjs::Value<'_> =
-                exec_fn.call((tool_name, tool_call_id, input_js, ctx_js))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
+    {
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        let bridge_secret = runtime.bridge_secret().to_string();
+        runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_tool")?;
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let input_js = json_to_js(&ctx, &input)?;
+                let ctx_js = json_to_js(&ctx, ctx_payload)?;
+                let promise: rquickjs::Value<'_> = exec_fn.call((
+                    bridge_secret.as_str(),
+                    tool_name,
+                    tool_call_id,
+                    input_js,
+                    ctx_js,
+                ))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+                Ok(())
+            })
+            .await?;
+    }
 
-    let result = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await;
+    let result = await_js_task_in_shards_and_refresh(
+        shards,
+        host,
+        shard_index,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+    )
+    .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -20827,14 +22196,16 @@ async fn execute_extension_tool(
 }
 
 #[allow(clippy::future_not_send)]
-async fn execute_extension_command(
-    runtime: &PiJsRuntime,
+async fn execute_extension_command_sharded(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
+    shard_index: usize,
     command_name: &str,
     args: &str,
     ctx_payload: &Value,
     timeout_ms: u64,
 ) -> Result<Value> {
+    shards.ensure_shard_healthy(shard_index)?;
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.command.start",
@@ -20843,19 +22214,36 @@ async fn execute_extension_command(
         "Extension command execution start"
     );
     let task_id = next_runtime_task_id("task-cmd");
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let ctx_js = json_to_js(&ctx, ctx_payload)?;
-            let promise: rquickjs::Value<'_> = exec_fn.call((command_name, args, ctx_js))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
+    {
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        let bridge_secret = runtime.bridge_secret().to_string();
+        runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_command")?;
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let ctx_js = json_to_js(&ctx, ctx_payload)?;
+                let promise: rquickjs::Value<'_> =
+                    exec_fn.call((bridge_secret.as_str(), command_name, args, ctx_js))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+                Ok(())
+            })
+            .await?;
+    }
 
-    let result = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await;
+    let result = await_js_task_in_shards_and_refresh(
+        shards,
+        host,
+        shard_index,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+    )
+    .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -20869,13 +22257,15 @@ async fn execute_extension_command(
 }
 
 #[allow(clippy::future_not_send)]
-async fn execute_extension_shortcut(
-    runtime: &PiJsRuntime,
+async fn execute_extension_shortcut_sharded(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
+    shard_index: usize,
     key_id: &str,
     ctx_payload: &Value,
     timeout_ms: u64,
 ) -> Result<Value> {
+    shards.ensure_shard_healthy(shard_index)?;
     let started_at = Instant::now();
     tracing::info!(
         event = "ext.shortcut.start",
@@ -20884,19 +22274,36 @@ async fn execute_extension_shortcut(
         "Extension shortcut execution start"
     );
     let task_id = next_runtime_task_id("task-shortcut");
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let ctx_js = json_to_js(&ctx, ctx_payload)?;
-            let promise: rquickjs::Value<'_> = exec_fn.call((key_id, ctx_js))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
+    {
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        let bridge_secret = runtime.bridge_secret().to_string();
+        runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let exec_fn: rquickjs::Function<'_> = global.get("__pi_execute_shortcut")?;
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let ctx_js = json_to_js(&ctx, ctx_payload)?;
+                let promise: rquickjs::Value<'_> =
+                    exec_fn.call((bridge_secret.as_str(), key_id, ctx_js))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+                Ok(())
+            })
+            .await?;
+    }
 
-    let result = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await;
+    let result = await_js_task_in_shards_and_refresh(
+        shards,
+        host,
+        shard_index,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+    )
+    .await;
     let duration_ms = u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
     let is_err = result.is_err();
     tracing::info!(
@@ -20917,59 +22324,128 @@ struct JsProviderStreamNext {
 }
 
 #[allow(clippy::future_not_send)]
-async fn start_extension_provider_stream_simple(
-    runtime: &PiJsRuntime,
+async fn start_extension_provider_stream_simple_sharded(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
+    shard_index: usize,
     provider_id: &str,
     model: Value,
     context: Value,
     options: Value,
     timeout_ms: u64,
 ) -> Result<String> {
+    shards.ensure_shard_healthy(shard_index)?;
+    let timeout = Duration::from_millis(timeout_ms);
+    let deadline = Instant::now().checked_add(timeout);
     let task_id = next_runtime_task_id("task-provider-stream-start");
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let start_fn: rquickjs::Function<'_> =
-                global.get("__pi_provider_stream_simple_start")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let model_js = json_to_js(&ctx, &model)?;
-            let context_js = json_to_js(&ctx, &context)?;
-            let options_js = json_to_js(&ctx, &options)?;
-            let promise: rquickjs::Value<'_> =
-                start_fn.call((provider_id, model_js, context_js, options_js))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
+    {
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        let bridge_secret = runtime.bridge_secret().to_string();
+        runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let start_fn: rquickjs::Function<'_> =
+                    global.get("__pi_provider_stream_simple_start")?;
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let model_js = json_to_js(&ctx, &model)?;
+                let context_js = json_to_js(&ctx, &context)?;
+                let options_js = json_to_js(&ctx, &options)?;
+                let promise: rquickjs::Value<'_> = start_fn.call((
+                    bridge_secret.as_str(),
+                    provider_id,
+                    model_js,
+                    context_js,
+                    options_js,
+                ))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+                Ok(())
+            })
+            .await?;
+    }
 
-    let value = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
-    value
+    let value = await_js_task_in_shards(shards, host, shard_index, &task_id, timeout).await?;
+    let inner_stream_id = value
         .as_str()
         .map(ToString::to_string)
-        .ok_or_else(|| Error::extension("provider stream start: expected stream id".to_string()))
+        .ok_or_else(|| Error::extension("provider stream start: expected stream id".to_string()))?;
+
+    if let Err(refresh_err) = refresh_runtime_shard_snapshot(shards, shard_index).await {
+        let cleanup_timeout_ms = deadline
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+            .map(|remaining| {
+                u64::try_from(remaining.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1)
+            })
+            .unwrap_or(1);
+        if let Err(cleanup_err) = cancel_extension_provider_stream_simple_best_effort(
+            shards,
+            host,
+            shard_index,
+            &inner_stream_id,
+            cleanup_timeout_ms,
+        )
+        .await
+        {
+            tracing::warn!(
+                event = "extension_runtime.provider_stream.start_refresh_cleanup_failed",
+                inner_stream_id,
+                shard_index,
+                error = %cleanup_err,
+                "Failed to cancel an inner provider stream after registry refresh rejected its shard"
+            );
+        }
+        return Err(refresh_err);
+    }
+
+    Ok(inner_stream_id)
 }
 
 #[allow(clippy::future_not_send)]
-async fn next_extension_provider_stream_simple(
-    runtime: &PiJsRuntime,
+async fn next_extension_provider_stream_simple_sharded(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
+    shard_index: usize,
     stream_id: &str,
     timeout_ms: u64,
 ) -> Result<Option<Value>> {
+    shards.ensure_shard_healthy(shard_index)?;
     let task_id = next_runtime_task_id("task-provider-stream-next");
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let next_fn: rquickjs::Function<'_> = global.get("__pi_provider_stream_simple_next")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let promise: rquickjs::Value<'_> = next_fn.call((stream_id,))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
+    {
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        let bridge_secret = runtime.bridge_secret().to_string();
+        runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let next_fn: rquickjs::Function<'_> =
+                    global.get("__pi_provider_stream_simple_next")?;
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let promise: rquickjs::Value<'_> =
+                    next_fn.call((bridge_secret.as_str(), stream_id))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+                Ok(())
+            })
+            .await?;
+    }
 
-    let value = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    let value = await_js_task_in_shards_and_refresh(
+        shards,
+        host,
+        shard_index,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+    )
+    .await?;
     let result: JsProviderStreamNext = serde_json::from_value(value)
         .map_err(|err| Error::extension(format!("provider stream next: {err}")))?;
     if result.done {
@@ -20984,31 +22460,150 @@ async fn next_extension_provider_stream_simple(
 }
 
 #[allow(clippy::future_not_send)]
-async fn cancel_extension_provider_stream_simple(
-    runtime: &PiJsRuntime,
+async fn cancel_extension_provider_stream_simple_sharded(
+    shards: &mut JsRuntimeShardSet,
     host: &JsRuntimeHost,
+    shard_index: usize,
     stream_id: &str,
     timeout_ms: u64,
 ) -> Result<()> {
     let task_id = next_runtime_task_id("task-provider-stream-cancel");
-    runtime
-        .with_ctx(|ctx| {
-            let global = ctx.globals();
-            let cancel_fn: rquickjs::Function<'_> =
-                global.get("__pi_provider_stream_simple_cancel")?;
-            let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
-            let promise: rquickjs::Value<'_> = cancel_fn.call((stream_id,))?;
-            let _task: String = task_start.call((task_id.as_str(), promise))?;
-            Ok(())
-        })
-        .await?;
+    {
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        let bridge_secret = runtime.bridge_secret().to_string();
+        runtime
+            .with_ctx(|ctx| {
+                let global = ctx.globals();
+                let cancel_fn: rquickjs::Function<'_> =
+                    global.get("__pi_provider_stream_simple_cancel")?;
+                let task_start: rquickjs::Function<'_> = global.get("__pi_task_start")?;
+                let promise: rquickjs::Value<'_> =
+                    cancel_fn.call((bridge_secret.as_str(), stream_id))?;
+                let _task: String =
+                    task_start.call((bridge_secret.as_str(), task_id.as_str(), promise))?;
+                Ok(())
+            })
+            .await?;
+    }
 
-    let _ = await_js_task(runtime, host, &task_id, Duration::from_millis(timeout_ms)).await?;
+    let _ = await_js_task_in_shards_and_refresh(
+        shards,
+        host,
+        shard_index,
+        &task_id,
+        Duration::from_millis(timeout_ms),
+    )
+    .await?;
     Ok(())
 }
 
+#[allow(clippy::future_not_send)]
+async fn cancel_extension_provider_stream_simple_best_effort(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    stream_id: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    // Cleanup is the sole operation allowed to enter a quarantined realm. A
+    // prior logical fault may still leave an async iterator that can release a
+    // child process or host resource through return(). Preserve the original
+    // quarantine verdict after the best-effort attempt.
+    let prior_fault = shards
+        .shards
+        .get_mut(shard_index)
+        .and_then(|shard| shard.pump_fault.take());
+    let result = cancel_extension_provider_stream_simple_sharded(
+        shards,
+        host,
+        shard_index,
+        stream_id,
+        timeout_ms,
+    )
+    .await;
+    if let Some(prior_fault) = prior_fault
+        && let Some(shard) = shards.shards.get_mut(shard_index)
+    {
+        shard.pump_fault = Some(prior_fault);
+    }
+    result
+}
+
+#[allow(clippy::future_not_send)]
+async fn cancel_active_provider_streams_for_replacement(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    cleanup_budget: Duration,
+) {
+    let deadline = Instant::now().checked_add(cleanup_budget);
+    let mut routes = std::mem::take(&mut shards.provider_stream_routes)
+        .into_iter()
+        .collect::<Vec<_>>();
+    routes.sort_by(|(left, _), (right, _)| left.cmp(right));
+    let total = routes.len();
+    let mut attempted = 0usize;
+    let mut failures = 0usize;
+
+    for (outer_stream_id, route) in routes {
+        let Some(remaining) =
+            deadline.and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+        else {
+            tracing::warn!(
+                event = "extension_runtime.provider_stream.reload_cleanup_budget_exhausted",
+                total,
+                attempted,
+                skipped = total.saturating_sub(attempted),
+                cleanup_budget_ms = u64::try_from(cleanup_budget.as_millis()).unwrap_or(u64::MAX),
+                "Provider stream cleanup budget expired before cold shard replacement"
+            );
+            break;
+        };
+        let timeout_ms = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .max(1);
+        attempted = attempted.saturating_add(1);
+        if let Err(err) = cancel_extension_provider_stream_simple_best_effort(
+            shards,
+            host,
+            route.shard_index,
+            &route.inner_stream_id,
+            timeout_ms,
+        )
+        .await
+        {
+            failures = failures.saturating_add(1);
+            tracing::warn!(
+                event = "extension_runtime.provider_stream.reload_cleanup_failed",
+                outer_stream_id,
+                inner_stream_id = %route.inner_stream_id,
+                shard_index = route.shard_index,
+                error = %err,
+                "Failed to cancel an active provider stream before cold shard replacement"
+            );
+        }
+    }
+
+    if total > 0 {
+        tracing::info!(
+            event = "extension_runtime.provider_stream.reload_cleanup",
+            total,
+            attempted,
+            failures,
+            "Completed best-effort provider stream cleanup before cold shard replacement"
+        );
+    }
+}
+
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
-async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Result<bool> {
+async fn pump_js_runtime_once_for_owner(
+    runtime: &PiJsRuntime,
+    host: &JsRuntimeHost,
+    expected_owner: Option<&str>,
+) -> Result<bool> {
     fn drain_requests(runtime: &PiJsRuntime) -> std::collections::VecDeque<HostcallRequest> {
         runtime.drain_hostcall_requests()
     }
@@ -21018,6 +22613,7 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     async fn dispatch_one(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
+        expected_owner: Option<&str>,
         req: HostcallRequest,
     ) -> Option<(String, HostcallOutcome, u64)> {
         let call_id = req.call_id.clone();
@@ -21032,7 +22628,26 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
         let extension_id = req.extension_id.clone();
         let queue_wait_ms = runtime.hostcall_queue_wait_ms(&call_id).unwrap_or(0);
         let dispatch_started = Instant::now();
-        let outcome = dispatch_hostcall_with_runtime(Some(runtime), host, req).await;
+        let outcome = if let Some(expected_owner) = expected_owner
+            && req.extension_id.as_deref() != Some(expected_owner)
+        {
+            tracing::error!(
+                event = "pijs.hostcall.owner_mismatch",
+                call_id = %call_id,
+                expected_owner,
+                claimed_owner = ?req.extension_id,
+                "Rejected hostcall whose claimed extension owner does not match its runtime shard"
+            );
+            HostcallOutcome::Error {
+                code: "extension_identity_mismatch".to_string(),
+                message: format!(
+                    "Runtime shard {expected_owner} rejected hostcall claiming extension {:?}",
+                    req.extension_id
+                ),
+            }
+        } else {
+            dispatch_hostcall_with_runtime(Some(runtime), host, req).await
+        };
         let elapsed = dispatch_started.elapsed();
         let execution_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let elapsed_ns = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
@@ -21056,6 +22671,7 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     async fn dispatch_requests(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
+        expected_owner: Option<&str>,
         pending: std::collections::VecDeque<HostcallRequest>,
     ) {
         if pending.is_empty() {
@@ -21072,9 +22688,9 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
             .is_some_and(|mgr| mgr.any_safety_envelope_vetoing());
 
         if amac_enabled && !safety_vetoed {
-            dispatch_requests_amac(runtime, host, pending).await;
+            dispatch_requests_amac(runtime, host, expected_owner, pending).await;
         } else {
-            dispatch_requests_sequential(runtime, host, pending).await;
+            dispatch_requests_sequential(runtime, host, expected_owner, pending).await;
         }
     }
 
@@ -21082,11 +22698,14 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     async fn dispatch_requests_sequential(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
+        expected_owner: Option<&str>,
         pending: std::collections::VecDeque<HostcallRequest>,
     ) {
         let mut completions = Vec::with_capacity(pending.len());
         for req in pending {
-            if let Some((call_id, outcome, elapsed_ns)) = dispatch_one(runtime, host, req).await {
+            if let Some((call_id, outcome, elapsed_ns)) =
+                dispatch_one(runtime, host, expected_owner, req).await
+            {
                 // Feed timing to AMAC even when disabled, so telemetry
                 // is ready if toggled on later.
                 AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
@@ -21103,6 +22722,7 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     async fn dispatch_requests_amac(
         runtime: &PiJsRuntime,
         host: &JsRuntimeHost,
+        expected_owner: Option<&str>,
         pending: std::collections::VecDeque<HostcallRequest>,
     ) {
         let requests: Vec<HostcallRequest> = pending.into_iter().collect();
@@ -21133,7 +22753,8 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
             );
 
             for req in group.requests {
-                if let Some((call_id, outcome, elapsed_ns)) = dispatch_one(runtime, host, req).await
+                if let Some((call_id, outcome, elapsed_ns)) =
+                    dispatch_one(runtime, host, expected_owner, req).await
                 {
                     AMAC_EXECUTOR.with(|cell| cell.borrow_mut().observe_call(elapsed_ns));
                     completions.push((call_id, outcome));
@@ -21155,7 +22776,7 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     }
 
     // Process any hostcalls already queued before we advance the event loop.
-    dispatch_requests(runtime, host, drain_requests(runtime)).await;
+    dispatch_requests(runtime, host, expected_owner, drain_requests(runtime)).await;
 
     // Advance the event loop (may schedule hostcalls while running a task's microtasks).
     let _ = runtime.tick().await?;
@@ -21165,7 +22786,7 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     // calls (e.g. `pi.sendMessage()` without `await`) can be lost when a JS task resolves quickly.
     let after_tick = drain_requests(runtime);
     let has_after_tick = !after_tick.is_empty();
-    dispatch_requests(runtime, host, after_tick).await;
+    dispatch_requests(runtime, host, expected_owner, after_tick).await;
 
     // If we dispatched any hostcalls, run another tick so their completions are delivered and
     // microtasks reach a fixpoint before the caller observes the outcome.
@@ -21175,6 +22796,99 @@ async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Re
     }
 
     Ok(runtime.has_pending())
+}
+
+#[allow(clippy::future_not_send)]
+async fn pump_js_runtime_once(runtime: &PiJsRuntime, host: &JsRuntimeHost) -> Result<bool> {
+    pump_js_runtime_once_for_owner(runtime, host, None).await
+}
+
+#[allow(clippy::future_not_send)]
+async fn pump_js_runtime_shards_once(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+) -> Result<bool> {
+    pump_js_runtime_shards_once_for_target(shards, host, None).await
+}
+
+#[allow(clippy::future_not_send)]
+async fn pump_js_runtime_shards_once_for_target(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    target_shard_index: Option<usize>,
+) -> Result<bool> {
+    let shard_count = shards.shards.len();
+    if shard_count == 0 {
+        return Ok(false);
+    }
+
+    // A target wait must not drain a peer's arbitrary hostcall queue before it
+    // can re-check its own task/deadline. Pump only the target here; peers make
+    // progress when they are targeted by their own command or by an explicit
+    // untargeted PumpOnce round. This keeps per-extension latency independent
+    // from slow or adversarial work queued in another shard.
+    if let Some(shard_index) = target_shard_index {
+        shards.ensure_shard_healthy(shard_index)?;
+        let pending = {
+            let shard = &shards.shards[shard_index];
+            pump_js_runtime_once_for_owner(&shard.runtime, host, Some(&shard.extension_id)).await
+        };
+        return match pending {
+            Ok(pending) => {
+                shards.pump_cursor = (shard_index + 1) % shard_count;
+                Ok(pending)
+            }
+            Err(err) => {
+                let extension_id = shards.shards[shard_index].extension_id.clone();
+                let fault = format!(
+                    "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
+                );
+                shards.shards[shard_index].pump_fault = Some(fault.clone());
+                Err(Error::extension(fault))
+            }
+        };
+    }
+
+    let start = shards.pump_cursor % shard_count;
+    let mut has_pending = false;
+    let mut first_fault = None;
+    for offset in 0..shard_count {
+        let shard_index = (start + offset) % shard_count;
+        if shards.shards[shard_index].pump_fault.is_some() {
+            continue;
+        }
+        let pump_result = {
+            let shard = &shards.shards[shard_index];
+            pump_js_runtime_once_for_owner(&shard.runtime, host, Some(shard.extension_id.as_str()))
+                .await
+        };
+        match pump_result {
+            Ok(pending) => has_pending |= pending,
+            Err(err) => {
+                let extension_id = shards.shards[shard_index].extension_id.clone();
+                let fault = format!(
+                    "JS extension shard {extension_id} quarantined after runtime pump failure: {err}"
+                );
+                shards.shards[shard_index].pump_fault = Some(fault.clone());
+                if first_fault.is_none() {
+                    first_fault = Some(fault.clone());
+                }
+                tracing::error!(
+                    event = "extension_runtime.shards.pump_quarantined",
+                    extension_id,
+                    shard_index,
+                    error = %fault,
+                    "Quarantined a failed shard and continued pumping healthy peers"
+                );
+            }
+        }
+    }
+    shards.pump_cursor = (start + 1) % shard_count;
+    if let Some(fault) = first_fault {
+        Err(Error::extension(fault))
+    } else {
+        Ok(has_pending)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -22774,6 +24488,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "get_active_tools",
                 &call.params,
             )
@@ -22790,6 +24505,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "get_all_tools",
                 &call.params,
             )
@@ -22806,6 +24522,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "set_active_tools",
                 &call.params,
             )
@@ -22818,8 +24535,15 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events_ref(&call.call_id, manager, ctx.tools, "emit", &call.params)
-                .await
+            dispatch_hostcall_events_ref(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                ctx.extension_id,
+                "emit",
+                &call.params,
+            )
+            .await
         }
         CommonHostcallOpcode::EventsList => {
             let Some(ref manager) = ctx.manager else {
@@ -22828,8 +24552,15 @@ async fn dispatch_shared_allowed_fast(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events_ref(&call.call_id, manager, ctx.tools, "list", &call.params)
-                .await
+            dispatch_hostcall_events_ref(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                ctx.extension_id,
+                "list",
+                &call.params,
+            )
+            .await
         }
         // --- New fast-lane session getters (bd-3ar8v.4.12) ---
         CommonHostcallOpcode::SessionGetState => {
@@ -22889,6 +24620,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "get_model",
                 &call.params,
             )
@@ -22905,6 +24637,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "set_model",
                 &call.params,
             )
@@ -22921,6 +24654,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "get_thinking_level",
                 &call.params,
             )
@@ -22937,6 +24671,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "set_thinking_level",
                 &call.params,
             )
@@ -22953,6 +24688,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "get_flag",
                 &call.params,
             )
@@ -22969,6 +24705,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "list_flags",
                 &call.params,
             )
@@ -22985,6 +24722,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "append_entry",
                 &call.params,
             )
@@ -23001,6 +24739,7 @@ async fn dispatch_shared_allowed_fast(
                 &call.call_id,
                 manager,
                 ctx.tools,
+                ctx.extension_id,
                 "register_command",
                 &call.params,
             )
@@ -23222,7 +24961,15 @@ async fn dispatch_shared_allowed_legacy(
                     message: "Extension manager is shutting down".to_string(),
                 };
             };
-            dispatch_hostcall_events_ref(&call.call_id, manager, ctx.tools, op, &call.params).await
+            dispatch_hostcall_events_ref(
+                &call.call_id,
+                manager,
+                ctx.tools,
+                ctx.extension_id,
+                op,
+                &call.params,
+            )
+            .await
         }
         "log" => dispatch_hostcall_log(&call.call_id, ctx.extension_id, call.params.clone()).await,
         "env" => dispatch_hostcall_env(ctx, call.params.clone()).await,
@@ -24480,7 +26227,35 @@ async fn dispatch_hostcall_events(
     op: &str,
     payload: Value,
 ) -> HostcallOutcome {
-    dispatch_hostcall_events_ref(call_id, manager, tools, op, &payload).await
+    dispatch_hostcall_events_ref(call_id, manager, tools, None, op, &payload).await
+}
+
+fn authoritative_events_extension_id(
+    authoritative_extension_id: Option<&str>,
+    payload: &Value,
+    operation: &str,
+) -> std::result::Result<Option<String>, HostcallOutcome> {
+    let claimed_ids = ["extensionId", "extension_id"]
+        .into_iter()
+        .filter_map(|key| payload.get(key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|claimed| !claimed.is_empty())
+        .collect::<Vec<_>>();
+    let Some(authoritative) = authoritative_extension_id else {
+        return Ok(claimed_ids.first().map(|claimed| (*claimed).to_string()));
+    };
+    if let Some(claimed) = claimed_ids
+        .iter()
+        .find(|claimed| **claimed != authoritative)
+    {
+        return Err(HostcallOutcome::Error {
+            code: "extension_identity_mismatch".to_string(),
+            message: format!(
+                "{operation}: runtime owner {authoritative} rejected payload claiming extension {claimed}"
+            ),
+        });
+    }
+    Ok(Some(authoritative.to_string()))
 }
 
 #[allow(clippy::future_not_send, clippy::too_many_lines)]
@@ -24488,6 +26263,7 @@ async fn dispatch_hostcall_events_ref(
     call_id: &str,
     manager: &ExtensionManager,
     tools: &ToolRegistry,
+    authoritative_extension_id: Option<&str>,
     op: &str,
     payload: &Value,
 ) -> HostcallOutcome {
@@ -24578,11 +26354,14 @@ async fn dispatch_hostcall_events_ref(
                 };
             };
 
-            let extension_id = payload
-                .get("extensionId")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("extension_id").and_then(Value::as_str))
-                .map(ToString::to_string);
+            let extension_id = match authoritative_events_extension_id(
+                authoritative_extension_id,
+                payload,
+                "sendMessage",
+            ) {
+                Ok(extension_id) => extension_id,
+                Err(outcome) => return outcome,
+            };
 
             let message = payload.get("message").and_then(Value::as_object);
             let options = payload.get("options").and_then(Value::as_object);
@@ -24656,11 +26435,14 @@ async fn dispatch_hostcall_events_ref(
                 };
             };
 
-            let extension_id = payload
-                .get("extensionId")
-                .and_then(Value::as_str)
-                .or_else(|| payload.get("extension_id").and_then(Value::as_str))
-                .map(ToString::to_string);
+            let extension_id = match authoritative_events_extension_id(
+                authoritative_extension_id,
+                payload,
+                "sendUserMessage",
+            ) {
+                Ok(extension_id) => extension_id,
+                Err(outcome) => return outcome,
+            };
 
             let text = payload
                 .get("text")
@@ -24739,8 +26521,26 @@ async fn dispatch_hostcall_events_ref(
                 .get("description")
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
-            manager.register_command(&name, description.as_deref());
-            HostcallOutcome::Success(Value::Null)
+            let result = authoritative_extension_id.map_or_else(
+                || {
+                    manager.register_command(&name, description.as_deref());
+                    Ok(())
+                },
+                |extension_id| {
+                    manager.register_command_for_extension(
+                        extension_id,
+                        &name,
+                        description.as_deref(),
+                    )
+                },
+            );
+            match result {
+                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Err(err) => HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: err.to_string(),
+                },
+            }
         }
         EventsHostcallOp::RegisterProvider => {
             let id = payload
@@ -24784,8 +26584,23 @@ async fn dispatch_hostcall_events_ref(
                     };
                 }
             }
-            manager.register_provider(params_without_key(payload, "op"));
-            HostcallOutcome::Success(Value::Null)
+            let provider = params_without_key(payload, "op");
+            let result = match authoritative_extension_id {
+                Some(extension_id) => {
+                    manager.register_provider_for_extension(extension_id, provider)
+                }
+                None => {
+                    manager.register_provider(provider);
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Err(err) => HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: err.to_string(),
+                },
+            }
         }
         EventsHostcallOp::GetModel => {
             // Prefer session-authoritative state; fall back to in-memory cache.
@@ -24889,8 +26704,21 @@ async fn dispatch_hostcall_events_ref(
                     message: "registerFlag: name is required".to_string(),
                 };
             }
-            manager.register_flag(params_without_key(payload, "op"));
-            HostcallOutcome::Success(Value::Null)
+            let flag = params_without_key(payload, "op");
+            let result = match authoritative_extension_id {
+                Some(extension_id) => manager.register_flag_for_extension(extension_id, flag),
+                None => {
+                    manager.register_flag(flag);
+                    Ok(())
+                }
+            };
+            match result {
+                Ok(()) => HostcallOutcome::Success(Value::Null),
+                Err(err) => HostcallOutcome::Error {
+                    code: "invalid_request".to_string(),
+                    message: err.to_string(),
+                },
+            }
         }
         EventsHostcallOp::GetFlag => {
             let name = payload
@@ -24920,155 +26748,229 @@ async fn dispatch_hostcall_events_ref(
     }
 }
 
-#[allow(clippy::future_not_send, clippy::too_many_lines)]
+enum JsTaskTakeResult {
+    Missing,
+    Pending,
+    Resolved(Value),
+    Rejected {
+        code: Option<String>,
+        message: String,
+        stack: Option<String>,
+    },
+    Snapshot(Value),
+}
+
+#[allow(clippy::future_not_send)]
+async fn take_js_task_state(runtime: &PiJsRuntime, task_id: &str) -> Result<JsTaskTakeResult> {
+    let bridge_secret = runtime.bridge_secret().to_string();
+    runtime
+        .with_ctx(|ctx| {
+            let global = ctx.globals();
+            let take_fn: rquickjs::Function<'_> = global.get("__pi_task_take")?;
+            let value: rquickjs::Value<'_> = take_fn.call((bridge_secret.as_str(), task_id))?;
+            if value.is_null() || value.is_undefined() {
+                return Ok(JsTaskTakeResult::Missing);
+            }
+            if let Some(obj) = value.as_object()
+                && let Ok(status) = obj.get::<_, String>("status")
+            {
+                match status.as_str() {
+                    "pending" => return Ok(JsTaskTakeResult::Pending),
+                    "resolved" => {
+                        let resolved_js = obj.get::<_, rquickjs::Value<'_>>("value").ok();
+                        let resolved_json = if let Some(value) = resolved_js {
+                            js_to_json(&value)?
+                        } else {
+                            Value::Null
+                        };
+                        return Ok(JsTaskTakeResult::Resolved(resolved_json));
+                    }
+                    "rejected" => {
+                        let (code, message, stack) = obj
+                            .get::<_, rquickjs::Value<'_>>("error")
+                            .ok()
+                            .and_then(|error_value| error_value.as_object().cloned())
+                            .map_or_else(
+                                || (None, "Unknown JS task error".to_string(), None),
+                                |error_obj| {
+                                    (
+                                        error_obj.get::<_, String>("code").ok(),
+                                        error_obj.get::<_, String>("message").unwrap_or_else(
+                                            |_| "Unknown JS task error".to_string(),
+                                        ),
+                                        error_obj.get::<_, String>("stack").ok(),
+                                    )
+                                },
+                            );
+                        return Ok(JsTaskTakeResult::Rejected {
+                            code,
+                            message,
+                            stack,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(JsTaskTakeResult::Snapshot(js_to_json(&value)?))
+        })
+        .await
+}
+
+fn finish_js_task_take(task_take: JsTaskTakeResult) -> Result<Option<Value>> {
+    match task_take {
+        JsTaskTakeResult::Missing => Err(Error::extension("JS task state missing".to_string())),
+        JsTaskTakeResult::Pending => Ok(None),
+        JsTaskTakeResult::Resolved(value) => Ok(Some(value)),
+        JsTaskTakeResult::Rejected {
+            code,
+            mut message,
+            stack,
+        } => {
+            if let Some(code) = code {
+                message = format!("{code}: {message}");
+            }
+            if let Some(stack) = stack
+                && !stack.is_empty()
+            {
+                message.push('\n');
+                message.push_str(&stack);
+            }
+            Err(Error::extension(message))
+        }
+        JsTaskTakeResult::Snapshot(state_json) => {
+            let state: JsTaskState = serde_json::from_value(state_json)
+                .map_err(|err| Error::extension(err.to_string()))?;
+            match state.status.as_str() {
+                "pending" => Ok(None),
+                "resolved" => Ok(Some(state.value.unwrap_or(Value::Null))),
+                "rejected" => {
+                    let err = state.error.unwrap_or_else(|| JsTaskError {
+                        code: None,
+                        message: "Unknown JS task error".to_string(),
+                        stack: None,
+                    });
+                    let mut message = err.message;
+                    if let Some(code) = err.code {
+                        message = format!("{code}: {message}");
+                    }
+                    if let Some(stack) = err.stack
+                        && !stack.is_empty()
+                    {
+                        message.push('\n');
+                        message.push_str(&stack);
+                    }
+                    Err(Error::extension(message))
+                }
+                other => Err(Error::extension(format!(
+                    "Unexpected JS task status: {other}"
+                ))),
+            }
+        }
+    }
+}
+
+fn js_task_timed_out(
+    start: asupersync::types::Time,
+    started_at: Instant,
+    timeout: Duration,
+) -> bool {
+    let now = extension_wait_now();
+    Duration::from_nanos(now.duration_since(start)) > timeout || started_at.elapsed() > timeout
+}
+
+#[allow(clippy::future_not_send)]
 async fn await_js_task(
     runtime: &PiJsRuntime,
     host: &JsRuntimeHost,
+    expected_owner: Option<&str>,
     task_id: &str,
     timeout: Duration,
 ) -> Result<Value> {
-    enum TaskTakeResult {
-        Missing,
-        Pending,
-        Resolved(Value),
-        Rejected {
-            code: Option<String>,
-            message: String,
-            stack: Option<String>,
-        },
-        Snapshot(Value),
-    }
-
     let start = extension_wait_now();
-    let start_instant = Instant::now();
+    let started_at = Instant::now();
 
     loop {
-        let now = extension_wait_now();
-        if Duration::from_nanos(now.duration_since(start)) > timeout
-            || start_instant.elapsed() > timeout
-        {
+        if js_task_timed_out(start, started_at, timeout) {
             return Err(Error::extension(format!(
                 "JS task timed out after {}ms",
                 timeout.as_millis()
             )));
         }
 
-        let _has_pending = pump_js_runtime_once(runtime, host).await?;
+        let _has_pending = pump_js_runtime_once_for_owner(runtime, host, expected_owner).await?;
+        if let Some(value) = finish_js_task_take(take_js_task_state(runtime, task_id).await?)? {
+            return Ok(value);
+        }
+        if !runtime.has_pending() {
+            extension_wait_short_blocking_pause(Duration::from_millis(1));
+        }
+    }
+}
 
-        let task_take = runtime
-            .with_ctx(|ctx| {
-                let global = ctx.globals();
-                let take_fn: rquickjs::Function<'_> = global.get("__pi_task_take")?;
-                let value: rquickjs::Value<'_> = take_fn.call((task_id,))?;
-                if value.is_null() || value.is_undefined() {
-                    return Ok(TaskTakeResult::Missing);
-                }
-                if let Some(obj) = value.as_object()
-                    && let Ok(status) = obj.get::<_, String>("status")
-                {
-                    match status.as_str() {
-                        "pending" => return Ok(TaskTakeResult::Pending),
-                        "resolved" => {
-                            let resolved_js = obj.get::<_, rquickjs::Value<'_>>("value").ok();
-                            let resolved_json = if let Some(v) = resolved_js {
-                                js_to_json(&v)?
-                            } else {
-                                Value::Null
-                            };
-                            return Ok(TaskTakeResult::Resolved(resolved_json));
-                        }
-                        "rejected" => {
-                            let (code, message, stack) = obj
-                                .get::<_, rquickjs::Value<'_>>("error")
-                                .ok()
-                                .and_then(|error_value| error_value.as_object().cloned())
-                                .map_or_else(
-                                    || (None, "Unknown JS task error".to_string(), None),
-                                    |error_obj| {
-                                        (
-                                            error_obj.get::<_, String>("code").ok(),
-                                            error_obj.get::<_, String>("message").unwrap_or_else(
-                                                |_| "Unknown JS task error".to_string(),
-                                            ),
-                                            error_obj.get::<_, String>("stack").ok(),
-                                        )
-                                    },
-                                );
-                            return Ok(TaskTakeResult::Rejected {
-                                code,
-                                message,
-                                stack,
-                            });
-                        }
-                        _ => {}
-                    }
-                }
-                Ok(TaskTakeResult::Snapshot(js_to_json(&value)?))
-            })
-            .await?;
+#[allow(clippy::future_not_send)]
+async fn await_js_task_in_shards(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    task_id: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let start = extension_wait_now();
+    let started_at = Instant::now();
 
-        match task_take {
-            TaskTakeResult::Missing => {
-                return Err(Error::extension("JS task state missing".to_string()));
-            }
-            TaskTakeResult::Pending => {
-                if !runtime.has_pending() {
-                    extension_wait_short_blocking_pause(Duration::from_millis(1));
-                }
-            }
-            TaskTakeResult::Resolved(value) => return Ok(value),
-            TaskTakeResult::Rejected {
-                code,
-                mut message,
-                stack,
-            } => {
-                if let Some(code) = code {
-                    message = format!("{code}: {message}");
-                }
-                if let Some(stack) = stack
-                    && !stack.is_empty()
-                {
-                    message.push('\n');
-                    message.push_str(&stack);
-                }
-                return Err(Error::extension(message));
-            }
-            TaskTakeResult::Snapshot(state_json) => {
-                let state: JsTaskState = serde_json::from_value(state_json)
-                    .map_err(|err| Error::extension(err.to_string()))?;
+    loop {
+        if js_task_timed_out(start, started_at, timeout) {
+            return Err(quarantine_runtime_shard(
+                shards,
+                shard_index,
+                format!(
+                    "task {task_id} timed out after {}ms with unresolved JavaScript state",
+                    timeout.as_millis()
+                ),
+            ));
+        }
 
-                match state.status.as_str() {
-                    "pending" => {
-                        if !runtime.has_pending() {
-                            extension_wait_short_blocking_pause(Duration::from_millis(1));
-                        }
-                    }
-                    "resolved" => return Ok(state.value.unwrap_or(Value::Null)),
-                    "rejected" => {
-                        let err = state.error.unwrap_or_else(|| JsTaskError {
-                            code: None,
-                            message: "Unknown JS task error".to_string(),
-                            stack: None,
-                        });
-                        let mut message = err.message;
-                        if let Some(code) = err.code {
-                            message = format!("{code}: {message}");
-                        }
-                        if let Some(stack) = err.stack
-                            && !stack.is_empty()
-                        {
-                            message.push('\n');
-                            message.push_str(&stack);
-                        }
-                        return Err(Error::extension(message));
-                    }
-                    other => {
-                        return Err(Error::extension(format!(
-                            "Unexpected JS task status: {other}"
-                        )));
-                    }
-                }
+        let _has_pending =
+            pump_js_runtime_shards_once_for_target(shards, host, Some(shard_index)).await?;
+        let runtime = &shards
+            .shards
+            .get(shard_index)
+            .ok_or_else(|| Error::extension("JS runtime shard disappeared"))?
+            .runtime;
+        if let Some(value) = finish_js_task_take(take_js_task_state(runtime, task_id).await?)? {
+            return Ok(value);
+        }
+        if !shards.shards[shard_index].runtime.has_pending() {
+            extension_wait_short_blocking_pause(Duration::from_millis(1));
+        }
+    }
+}
+
+#[allow(clippy::future_not_send)]
+async fn await_js_task_in_shards_and_refresh(
+    shards: &mut JsRuntimeShardSet,
+    host: &JsRuntimeHost,
+    shard_index: usize,
+    task_id: &str,
+    timeout: Duration,
+) -> Result<Value> {
+    let task_result = await_js_task_in_shards(shards, host, shard_index, task_id, timeout).await;
+    let refresh_result = refresh_runtime_shard_snapshot(shards, shard_index).await;
+    match task_result {
+        Ok(value) => {
+            refresh_result?;
+            Ok(value)
+        }
+        Err(err) => {
+            if let Err(refresh_err) = refresh_result {
+                tracing::warn!(
+                    event = "extension_runtime.shards.refresh_after_task_error_failed",
+                    shard_index,
+                    error = %refresh_err,
+                    "Failed to refresh JS extension shard after a task error"
+                );
             }
+            Err(err)
         }
     }
 }
@@ -25201,6 +27103,9 @@ struct CachedEventContext {
 #[derive(Default)]
 struct ExtensionManagerInner {
     extensions: Vec<RegisterPayload>,
+    /// Runtime principal for each `extensions` entry at the same index.
+    /// Display names are intentionally kept separate from security identity.
+    extension_ids: Vec<String>,
     extension_roots: Vec<PathBuf>,
     extension_versions: HashMap<String, String>,
     runtime: Option<ExtensionRuntimeHandle>,
@@ -25507,6 +27412,34 @@ fn check_version_constraint(version: &str, range: &str) -> bool {
 }
 
 impl ExtensionManager {
+    fn validate_extension_identity_table(
+        registrations: &[RegisterPayload],
+        extension_ids: &[String],
+        source: &str,
+    ) -> Result<()> {
+        if registrations.len() != extension_ids.len() {
+            return Err(Error::extension(format!(
+                "{source} identity table mismatch: {} principals for {} registrations",
+                extension_ids.len(),
+                registrations.len()
+            )));
+        }
+        let mut seen = HashSet::with_capacity(extension_ids.len());
+        for extension_id in extension_ids {
+            if extension_id.trim().is_empty() {
+                return Err(Error::extension(format!(
+                    "{source} produced an empty authoritative extension id"
+                )));
+            }
+            if !seen.insert(extension_id) {
+                return Err(Error::extension(format!(
+                    "{source} produced duplicate authoritative extension id: {extension_id}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn record_extension_version(
         extension_versions: &mut HashMap<String, String>,
         extension_id: &str,
@@ -28509,6 +30442,7 @@ impl ExtensionManager {
         let snapshots = runtime.load_js_extensions_snapshots(specs).await?;
 
         let mut payloads = Vec::new();
+        let mut extension_ids = Vec::new();
         let mut extension_versions = HashMap::new();
         let mut active_tools: Option<Vec<String>> = None;
         let mut all_providers = Vec::new();
@@ -28540,7 +30474,12 @@ impl ExtensionManager {
                     hints,
                 );
             }
-            all_providers.extend(providers);
+            all_providers.extend(providers.into_iter().map(|mut provider| {
+                if let Some(obj) = provider.as_object_mut() {
+                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
+                }
+                provider
+            }));
             all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
                 if let Some(obj) = server.as_object_mut() {
                     obj.entry("extension_id".to_string())
@@ -28564,6 +30503,7 @@ impl ExtensionManager {
             if let Some(list) = ext_active_tools {
                 active_tools = Some(list);
             }
+            extension_ids.push(id);
             payloads.push(RegisterPayload {
                 name: extension_name,
                 version,
@@ -28582,12 +30522,14 @@ impl ExtensionManager {
             });
         }
 
+        Self::validate_extension_identity_table(&payloads, &extension_ids, "QuickJS load")?;
         {
             let mut guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.extensions = payloads;
+            guard.extension_ids = extension_ids;
             guard.extension_roots = extension_roots;
             guard.extension_versions = extension_versions;
             guard.active_tools = active_tools;
@@ -28635,6 +30577,7 @@ impl ExtensionManager {
 
         let snapshots = runtime.load_native_extensions_snapshots(specs).await?;
         let mut payloads = Vec::new();
+        let mut extension_ids = Vec::new();
         let mut extension_versions = HashMap::new();
         let mut active_tools: Option<Vec<String>> = None;
         let mut all_providers = Vec::new();
@@ -28656,7 +30599,12 @@ impl ExtensionManager {
                 event_hooks,
                 active_tools: ext_active_tools,
             } = snapshot;
-            all_providers.extend(providers);
+            all_providers.extend(providers.into_iter().map(|mut provider| {
+                if let Some(obj) = provider.as_object_mut() {
+                    obj.insert("extension_id".to_string(), Value::String(id.clone()));
+                }
+                provider
+            }));
             all_mcp_servers.extend(mcp_servers.into_iter().map(|mut server| {
                 if let Some(obj) = server.as_object_mut() {
                     obj.entry("extension_id".to_string())
@@ -28681,6 +30629,7 @@ impl ExtensionManager {
                 active_tools = Some(list);
             }
 
+            extension_ids.push(id);
             payloads.push(RegisterPayload {
                 name: extension_name,
                 version,
@@ -28699,12 +30648,14 @@ impl ExtensionManager {
             });
         }
 
+        Self::validate_extension_identity_table(&payloads, &extension_ids, "native-rust load")?;
         {
             let mut guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard.extensions = payloads;
+            guard.extension_ids = extension_ids;
             guard.extension_roots = extension_roots;
             guard.extension_versions = extension_versions;
             guard.active_tools = active_tools;
@@ -28748,8 +30699,10 @@ impl ExtensionManager {
 
         let mut wasm_handles = Vec::new();
         let mut registrations = Vec::new();
+        let mut registration_ids = Vec::new();
 
         for spec in specs {
+            let extension_id = spec.manifest.extension_id.clone();
             let extension = host.load_from_path(&spec.entry_path)?;
             let mut instance = host
                 .instantiate_with(&extension, Arc::clone(&tools), Some(self.handle()))
@@ -28771,13 +30724,28 @@ impl ExtensionManager {
 
             wasm_handles.push(WasmExtensionHandle::new(instance, registration.clone()));
             registrations.push(registration);
+            registration_ids.push(extension_id);
         }
 
+        Self::validate_extension_identity_table(&registrations, &registration_ids, "WASM load")?;
         {
             let mut guard = self
                 .inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::validate_extension_identity_table(
+                &guard.extensions,
+                &guard.extension_ids,
+                "existing manager state",
+            )?;
+            if registration_ids
+                .iter()
+                .any(|extension_id| guard.extension_ids.contains(extension_id))
+            {
+                return Err(Error::extension(
+                    "WASM load would duplicate an authoritative extension id",
+                ));
+            }
             if !extension_roots.is_empty() {
                 let mut seen = HashSet::new();
                 for root in &guard.extension_roots {
@@ -28790,12 +30758,16 @@ impl ExtensionManager {
                     }
                 }
             }
-            for registration in &registrations {
-                guard
-                    .extension_versions
-                    .insert(registration.name.clone(), registration.version.clone());
+            for (registration, extension_id) in registrations.iter().zip(&registration_ids) {
+                Self::record_extension_version(
+                    &mut guard.extension_versions,
+                    extension_id,
+                    &registration.name,
+                    &registration.version,
+                );
             }
             guard.extensions.extend(registrations);
+            guard.extension_ids.extend(registration_ids);
             guard.wasm_extensions.extend(wasm_handles);
             drop(guard);
         }
@@ -28887,6 +30859,7 @@ impl ExtensionManager {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let extension_id = payload.name.clone();
         // Update the hook bitmap with any new event hooks.
         for hook in &payload.event_hooks {
             guard.hook_bitmap.insert(hook.clone());
@@ -28895,6 +30868,7 @@ impl ExtensionManager {
             .extension_versions
             .insert(payload.name.clone(), payload.version.clone());
         guard.extensions.push(payload);
+        guard.extension_ids.push(extension_id);
         self.refresh_snapshot_with_guard_release(guard);
     }
 
@@ -28931,8 +30905,72 @@ impl ExtensionManager {
                 flags: Vec::new(),
                 event_hooks: Vec::new(),
             });
+            guard.extension_ids.push("__dynamic__".to_string());
         }
         self.refresh_snapshot_with_guard_release(guard);
+    }
+
+    fn extension_index_for_owner(
+        inner: &ExtensionManagerInner,
+        extension_id: &str,
+    ) -> Result<usize> {
+        if inner.extension_ids.len() != inner.extensions.len() {
+            return Err(Error::extension(format!(
+                "Extension identity table invariant violated: {} principals for {} registrations",
+                inner.extension_ids.len(),
+                inner.extensions.len()
+            )));
+        }
+        inner
+            .extension_ids
+            .iter()
+            .position(|candidate| candidate == extension_id)
+            .ok_or_else(|| {
+                Error::extension(format!(
+                    "Unknown authoritative extension owner: {extension_id}"
+                ))
+            })
+    }
+
+    /// Register a slash command against its authoritative runtime principal.
+    fn register_command_for_extension(
+        &self,
+        extension_id: &str,
+        name: &str,
+        description: Option<&str>,
+    ) -> Result<()> {
+        let normalized_name = js_command_route_name(name);
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let target_index = Self::extension_index_for_owner(&guard, extension_id)
+            .map_err(|err| Error::extension(format!("registerCommand: {err}")))?;
+        for (index, extension) in guard.extensions.iter().enumerate() {
+            if index == target_index {
+                continue;
+            }
+            if extension.slash_commands.iter().any(|command| {
+                extract_slash_command_name(command)
+                    .is_some_and(|existing| js_command_route_name(&existing) == normalized_name)
+            }) {
+                return Err(Error::extension(format!(
+                    "registerCommand: command name collision: {normalized_name}"
+                )));
+            }
+        }
+        let target = &mut guard.extensions[target_index];
+        target.slash_commands.retain(|command| {
+            extract_slash_command_name(command)
+                .is_none_or(|existing| js_command_route_name(&existing) != normalized_name)
+        });
+        target.slash_commands.push(json!({
+            "name": normalized_name,
+            "description": description,
+            "extension_id": extension_id,
+        }));
+        self.refresh_snapshot_with_guard_release(guard);
+        Ok(())
     }
 
     /// Dynamically register a provider at runtime (from a hostcall).
@@ -28943,6 +30981,53 @@ impl ExtensionManager {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.providers.push(payload);
         self.refresh_snapshot_with_guard_release(guard);
+    }
+
+    /// Register a provider against its authoritative runtime principal.
+    fn register_provider_for_extension(
+        &self,
+        extension_id: &str,
+        mut payload: Value,
+    ) -> Result<()> {
+        let provider_id = payload
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _target_index = Self::extension_index_for_owner(&guard, extension_id)
+            .map_err(|err| Error::extension(format!("registerProvider: {err}")))?;
+        if guard.providers.iter().any(|provider| {
+            provider.get("id").and_then(Value::as_str) == Some(provider_id.as_str())
+                && provider
+                    .get("extension_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|owner| owner != extension_id)
+        }) {
+            return Err(Error::extension(format!(
+                "registerProvider: provider id collision: {provider_id}"
+            )));
+        }
+        let Some(object) = payload.as_object_mut() else {
+            return Err(Error::extension(
+                "registerProvider: provider spec must be an object",
+            ));
+        };
+        object.insert(
+            "extension_id".to_string(),
+            Value::String(extension_id.to_string()),
+        );
+        guard.providers.retain(|provider| {
+            provider.get("id").and_then(Value::as_str) != Some(provider_id.as_str())
+                || provider.get("extension_id").and_then(Value::as_str) != Some(extension_id)
+        });
+        guard.providers.push(payload);
+        self.refresh_snapshot_with_guard_release(guard);
+        Ok(())
     }
 
     /// Dynamically register an MCP server at runtime (from a hostcall).
@@ -28990,6 +31075,49 @@ impl ExtensionManager {
             .retain(|f| f.get("name").and_then(Value::as_str).unwrap_or_default() != name);
         guard.flags.push(spec);
         self.refresh_snapshot_with_guard_release(guard);
+    }
+
+    /// Register a flag against its authoritative runtime principal.
+    fn register_flag_for_extension(&self, extension_id: &str, mut spec: Value) -> Result<()> {
+        let flag_name = spec
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _target_index = Self::extension_index_for_owner(&guard, extension_id)
+            .map_err(|err| Error::extension(format!("registerFlag: {err}")))?;
+        if guard.flags.iter().any(|flag| {
+            flag.get("name").and_then(Value::as_str) == Some(flag_name.as_str())
+                && flag
+                    .get("extension_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|owner| owner != extension_id)
+        }) {
+            return Err(Error::extension(format!(
+                "registerFlag: flag name collision: {flag_name}"
+            )));
+        }
+        let Some(object) = spec.as_object_mut() else {
+            return Err(Error::extension(
+                "registerFlag: flag spec must be an object",
+            ));
+        };
+        object.insert(
+            "extension_id".to_string(),
+            Value::String(extension_id.to_string()),
+        );
+        guard.flags.retain(|flag| {
+            flag.get("name").and_then(Value::as_str) != Some(flag_name.as_str())
+                || flag.get("extension_id").and_then(Value::as_str) != Some(extension_id)
+        });
+        guard.flags.push(spec);
+        self.refresh_snapshot_with_guard_release(guard);
+        Ok(())
     }
 
     /// Execute an extension slash command via the JS runtime.
@@ -30617,6 +32745,13 @@ fn extract_slash_command_name(value: &Value) -> Option<String> {
         .get("name")
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+/// Match the bridge's command-name normalization exactly: surrounding
+/// whitespace is ignored and at most one leading slash is syntactic sugar.
+fn js_command_route_name(name: &str) -> &str {
+    let trimmed = name.trim();
+    trimmed.strip_prefix('/').unwrap_or(trimmed)
 }
 
 fn normalize_command(name: &str) -> String {
@@ -32328,6 +34463,580 @@ mod tests {
             assert!(wrote, "expected out.txt to be created after pumping");
             let contents = std::fs::read_to_string(&out_path).expect("read out.txt");
             assert_eq!(contents, "hi");
+        });
+    }
+
+    #[test]
+    fn isolated_runtime_reset_drops_registry_routes_and_requires_cold_reload() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let entry_path = dir.path().join("resettable.mjs");
+            std::fs::write(
+                &entry_path,
+                r#"
+                export default function init(pi) {
+                  pi.registerTool({
+                    name: "reset_probe_tool",
+                    description: "reset probe",
+                    parameters: { type: "object", properties: {} },
+                    execute: async () => ({ content: [{ type: "text", text: "ok" }] }),
+                  });
+                  pi.registerCommand("reset-probe", {
+                    description: "reset probe",
+                    handler: async () => "ok",
+                  });
+                }
+                "#,
+            )
+            .expect("write extension entry");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec.clone()])
+                .await
+                .expect("load extension");
+            assert_eq!(
+                js_runtime
+                    .get_registered_tools()
+                    .await
+                    .expect("registered tools")
+                    .len(),
+                1
+            );
+            js_runtime
+                .execute_command(
+                    "reset-probe".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("command before reset");
+
+            js_runtime
+                .reset_transient_state()
+                .await
+                .expect("full transient reset");
+            assert!(
+                js_runtime
+                    .get_registered_tools()
+                    .await
+                    .expect("registered tools after reset")
+                    .is_empty(),
+                "reset must discard every shard registry"
+            );
+            let stale_route = js_runtime
+                .execute_command(
+                    "reset-probe".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect_err("reset must discard command routes");
+            assert!(
+                stale_route
+                    .to_string()
+                    .contains("Unknown JS extension command"),
+                "unexpected stale-route error: {stale_route}"
+            );
+
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("cold reload after reset");
+            js_runtime
+                .execute_command(
+                    "reset-probe".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("command after cold reload");
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
+        });
+    }
+
+    #[test]
+    fn isolated_runtime_actor_skips_expired_or_abandoned_commands_before_side_effects() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let marker = dir.path().join("expired-command-ran.txt");
+            let marker_js = serde_json::to_string(&marker.display().to_string())
+                .expect("serialize marker path");
+            let entry_path = dir.path().join("deadline.mjs");
+            std::fs::write(
+                &entry_path,
+                format!(
+                    r#"
+                    import * as fs from "node:fs";
+                    export default function init(pi) {{
+                      pi.registerCommand("expired-probe", {{
+                        handler: async () => {{
+                          fs.writeFileSync({marker_js}, "ran");
+                          return "ran";
+                        }},
+                      }});
+                    }}
+                    "#
+                ),
+            )
+            .expect("write deadline extension");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+            let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
+            manager
+                .load_js_extensions(vec![spec])
+                .await
+                .expect("load deadline extension");
+
+            let cx = Cx::for_request();
+            let (expired_tx, mut expired_rx) = oneshot::channel();
+            js_runtime
+                .sender
+                .send(
+                    &cx,
+                    JsRuntimeCommand::ExecuteCommand {
+                        command_name: "expired-probe".to_string(),
+                        args: String::new(),
+                        ctx_payload: Arc::new(json!({})),
+                        timeout_ms: 5_000,
+                        deadline: Instant::now()
+                            .checked_sub(Duration::from_millis(1))
+                            .expect("past deadline"),
+                        reply: expired_tx,
+                    },
+                )
+                .await
+                .expect("enqueue expired command");
+            let expired = expired_rx
+                .recv(&cx)
+                .await
+                .expect("expired command reply")
+                .expect_err("expired command must fail");
+            assert!(
+                expired
+                    .to_string()
+                    .contains("expired before actor execution")
+            );
+            assert!(!marker.exists(), "expired handler body must not run");
+
+            let (abandoned_tx, abandoned_rx) = oneshot::channel();
+            drop(abandoned_rx);
+            js_runtime
+                .sender
+                .send(
+                    &cx,
+                    JsRuntimeCommand::ExecuteCommand {
+                        command_name: "expired-probe".to_string(),
+                        args: String::new(),
+                        ctx_payload: Arc::new(json!({})),
+                        timeout_ms: 5_000,
+                        deadline: js_runtime_request_deadline(5_000),
+                        reply: abandoned_tx,
+                    },
+                )
+                .await
+                .expect("enqueue abandoned command");
+            // A following query is an actor-ordering barrier.
+            let _ = js_runtime
+                .get_registered_tools()
+                .await
+                .expect("actor ordering barrier");
+            assert!(!marker.exists(), "abandoned handler body must not run");
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
+        });
+    }
+
+    #[test]
+    fn isolated_runtime_timeout_quarantines_and_peer_work_skips_failed_shard() {
+        let manager = ExtensionManager::new();
+        let actions = Arc::new(MockHostActions::new());
+        manager.set_host_actions(actions.clone());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let slow_dir = dir.path().join("slow-extension");
+            let fast_dir = dir.path().join("fast-extension");
+            std::fs::create_dir_all(&slow_dir).expect("mkdir slow extension");
+            std::fs::create_dir_all(&fast_dir).expect("mkdir fast extension");
+
+            let slow_entry = slow_dir.join("index.mjs");
+            std::fs::write(
+                &slow_entry,
+                r#"
+                export default function init(pi) {
+                  pi.registerCommand("never-finishes", {
+                    handler: async () => {
+                      pi.sendMessage({ customType: "handler-start", content: "start" });
+                      setTimeout(() => {
+                        pi.sendMessage({ customType: "delayed-side-effect", content: "late" });
+                      }, 700);
+                      await new Promise(() => {});
+                    },
+                  });
+                }
+                "#,
+            )
+            .expect("write slow extension");
+            let fast_entry = fast_dir.join("index.mjs");
+            std::fs::write(
+                &fast_entry,
+                r#"
+                export default function init(pi) {
+                  pi.registerCommand("fast-peer", {
+                    handler: async () => "fast",
+                  });
+                }
+                "#,
+            )
+            .expect("write fast extension");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+            let slow_spec =
+                JsExtensionLoadSpec::from_entry_path(&slow_entry).expect("slow extension spec");
+            let fast_spec =
+                JsExtensionLoadSpec::from_entry_path(&fast_entry).expect("fast extension spec");
+            manager
+                .load_js_extensions(vec![slow_spec, fast_spec])
+                .await
+                .expect("load slow and fast shards");
+
+            let first = js_runtime
+                .execute_command(
+                    "never-finishes".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    500,
+                )
+                .await;
+            assert!(first.is_err(), "never-finishing handler must time out");
+            {
+                let messages = actions
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(messages.len(), 1, "the first handler must have started");
+                assert_eq!(messages[0].custom_type, "handler-start");
+            }
+            sleep(wall_now(), Duration::from_millis(400)).await;
+            js_runtime
+                .pump_once()
+                .await
+                .expect("untargeted pumping must skip an already-quarantined shard");
+
+            let fast_started = Instant::now();
+            let fast = js_runtime
+                .execute_command(
+                    "fast-peer".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("healthy peer command");
+            assert_eq!(fast, Value::String("fast".to_string()));
+            assert!(
+                fast_started.elapsed() < Duration::from_secs(1),
+                "healthy peer latency must not depend on quarantined shard work"
+            );
+            {
+                let messages = actions
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(
+                    messages.len(),
+                    1,
+                    "peer pumping must not revive a timed-out shard timer"
+                );
+            }
+
+            let second = js_runtime
+                .execute_command(
+                    "never-finishes".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect_err("quarantined shard must reject before invocation");
+            assert!(
+                second.to_string().contains("quarantined"),
+                "unexpected quarantine error: {second}"
+            );
+            let messages = actions
+                .messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(
+                messages.len(),
+                1,
+                "second direct call must fail before its handler body runs"
+            );
+            drop(messages);
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
+        });
+    }
+
+    #[test]
+    fn isolated_runtime_denies_peer_fs_and_module_access_inside_workspace() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let workspace = dir.path().join("workspace");
+            let extension_a = workspace.join("extensions").join("ext-a");
+            let extension_b = workspace.join("extensions").join("ext-b");
+            std::fs::create_dir_all(&extension_a).expect("mkdir extension a");
+            std::fs::create_dir_all(&extension_b).expect("mkdir extension b");
+
+            let foreign_secret = extension_b.join("secret.txt");
+            let foreign_write = extension_b.join("written-by-a.txt");
+            let foreign_module = extension_b.join("peer-module.mjs");
+            std::fs::write(&foreign_secret, "owned-by-b").expect("write extension b secret");
+            std::fs::write(&foreign_module, "export const peerSecret = 'module-owned-by-b';")
+                .expect("write extension b module");
+            let foreign_secret_js = serde_json::to_string(&foreign_secret.display().to_string())
+                .expect("serialize secret path");
+            let foreign_write_js = serde_json::to_string(&foreign_write.display().to_string())
+                .expect("serialize write path");
+            let foreign_module_js = serde_json::to_string("../ext-b/peer-module.mjs")
+                .expect("serialize foreign module path");
+
+            let entry_a = extension_a.join("index.mjs");
+            std::fs::write(
+                &entry_a,
+                format!(
+                    r#"
+                    import * as fs from "node:fs";
+                    export default function init(pi) {{
+                      pi.registerCommand("probe-peer-root", {{
+                        description: "attempt peer filesystem access",
+                        handler: async () => {{
+                          const result = {{}};
+                          try {{
+                            result.readValue = fs.readFileSync({foreign_secret_js}, "utf8");
+                            result.readOk = true;
+                          }} catch (error) {{
+                            result.readOk = false;
+                            result.readError = String(error && error.message ? error.message : error);
+                          }}
+                          try {{
+                            fs.writeFileSync({foreign_write_js}, "cross-owner-write");
+                            result.writeOk = true;
+                          }} catch (error) {{
+                            result.writeOk = false;
+                            result.writeError = String(error && error.message ? error.message : error);
+                          }}
+                          try {{
+                            const peer = await import({foreign_module_js});
+                            result.importValue = peer.peerSecret;
+                            result.importOk = true;
+                          }} catch (error) {{
+                            result.importOk = false;
+                            result.importError = String(error && error.message ? error.message : error);
+                          }}
+                          return result;
+                        }},
+                      }});
+                    }}
+                    "#
+                ),
+            )
+            .expect("write extension a entry");
+
+            let entry_b = extension_b.join("index.mjs");
+            std::fs::write(
+                &entry_b,
+                format!(
+                    r#"
+                    import * as fs from "node:fs";
+                    export default function init(pi) {{
+                      pi.registerCommand("read-own-root", {{
+                        description: "read own filesystem root",
+                        handler: async () => fs.readFileSync({foreign_secret_js}, "utf8"),
+                      }});
+                    }}
+                    "#
+                ),
+            )
+            .expect("write extension b entry");
+
+            let tools = Arc::new(ToolRegistry::new(&[], &workspace, None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: workspace.display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let spec_a = JsExtensionLoadSpec::from_entry_path(&entry_a).expect("extension a spec");
+            let spec_b = JsExtensionLoadSpec::from_entry_path(&entry_b).expect("extension b spec");
+            manager
+                .load_js_extensions(vec![spec_a, spec_b])
+                .await
+                .expect("load isolated extension shards");
+
+            let denied = js_runtime
+                .execute_command(
+                    "probe-peer-root".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("peer-root probe command");
+            assert_eq!(denied.get("readOk"), Some(&Value::Bool(false)));
+            assert_eq!(denied.get("writeOk"), Some(&Value::Bool(false)));
+            assert_eq!(denied.get("importOk"), Some(&Value::Bool(false)));
+            assert!(
+                denied
+                    .get("readError")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| error.contains("host read denied")),
+                "unexpected peer read result: {denied}"
+            );
+            assert!(
+                denied
+                    .get("writeError")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| error.contains("host write denied")),
+                "unexpected peer write result: {denied}"
+            );
+            assert!(
+                denied
+                    .get("importError")
+                    .and_then(Value::as_str)
+                    .is_some_and(|error| {
+                        error.contains("Module path") && error.contains("extension root")
+                    }),
+                "unexpected peer import result: {denied}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&foreign_secret).expect("read unchanged secret"),
+                "owned-by-b"
+            );
+            assert!(
+                !foreign_write.exists(),
+                "peer extension must not create a file inside a foreign root"
+            );
+
+            let own_read = js_runtime
+                .execute_command(
+                    "read-own-root".to_string(),
+                    String::new(),
+                    Arc::new(json!({})),
+                    5_000,
+                )
+                .await
+                .expect("owner read command");
+            assert_eq!(own_read, Value::String("owned-by-b".to_string()));
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
+        });
+    }
+
+    #[test]
+    fn isolated_runtime_rejects_distinct_owners_for_the_same_leaf_directory() {
+        let manager = ExtensionManager::new();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let entry_a = dir.path().join("first.mjs");
+            let entry_b = dir.path().join("second.mjs");
+            let source = "export default function init(_pi) {}";
+            std::fs::write(&entry_a, source).expect("write first extension");
+            std::fs::write(&entry_b, source).expect("write second extension");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime);
+
+            let spec_a = JsExtensionLoadSpec::from_entry_path(&entry_a).expect("first spec");
+            let spec_b = JsExtensionLoadSpec::from_entry_path(&entry_b).expect("second spec");
+            let err = manager
+                .load_js_extensions(vec![spec_a, spec_b])
+                .await
+                .expect_err("ambiguous leaf ownership must fail closed");
+            assert!(
+                err.to_string().contains("Ambiguous JS extension ownership"),
+                "unexpected ownership error: {err}"
+            );
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
         });
     }
 
@@ -37431,6 +40140,222 @@ mod tests {
                 .await
                 .expect("next after cancel");
             assert!(after_cancel.is_none(), "expected None after cancellation");
+        });
+    }
+
+    #[test]
+    fn isolated_runtime_cold_reload_calls_return_on_active_provider_iterators() {
+        let manager = ExtensionManager::new();
+        let actions = Arc::new(MockHostActions::new());
+        manager.set_host_actions(actions.clone());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let old_dir = dir.path().join("old-provider");
+            let new_dir = dir.path().join("replacement");
+            std::fs::create_dir_all(&old_dir).expect("mkdir old provider");
+            std::fs::create_dir_all(&new_dir).expect("mkdir replacement");
+            let old_entry = old_dir.join("index.mjs");
+            std::fs::write(
+                &old_entry,
+                r#"
+                    export default function init(pi) {
+                      pi.registerProvider("reload-cleanup-provider", {
+                        api: "openai-completions",
+                        baseUrl: "https://not-used.example.com",
+                        models: [{ id: "cleanup-model", name: "Cleanup Model" }],
+                        streamSimple: async function*() {
+                          try {
+                            yield "first";
+                            yield "second";
+                          } finally {
+                            pi.sendMessage({ customType: "provider-return", content: "return-called" });
+                          }
+                        },
+                      });
+                    }
+                    "#
+            )
+            .expect("write old provider extension");
+            let new_entry = new_dir.join("index.mjs");
+            std::fs::write(&new_entry, "export default function init(_pi) {}")
+                .expect("write replacement extension");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+
+            let old_spec = JsExtensionLoadSpec::from_entry_path(&old_entry).expect("old spec");
+            manager
+                .load_js_extensions(vec![old_spec])
+                .await
+                .expect("load old provider");
+            let stream_id = js_runtime
+                .provider_stream_simple_start(
+                    "reload-cleanup-provider".to_string(),
+                    json!({"id": "cleanup-model"}),
+                    json!({"messages": []}),
+                    json!({}),
+                    30_000,
+                )
+                .await
+                .expect("start active provider stream");
+            assert_eq!(
+                js_runtime
+                    .provider_stream_simple_next(stream_id, 30_000)
+                    .await
+                    .expect("first provider chunk"),
+                Some(Value::String("first".to_string()))
+            );
+            assert!(
+                actions
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .is_empty(),
+                "iterator must remain active before reload"
+            );
+
+            let new_spec = JsExtensionLoadSpec::from_entry_path(&new_entry).expect("new spec");
+            manager
+                .load_js_extensions(vec![new_spec])
+                .await
+                .expect("cold replacement load");
+            let messages = actions
+                .messages
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert_eq!(messages.len(), 1, "reload must invoke iterator.return()");
+            assert_eq!(messages[0].custom_type, "provider-return");
+            assert_eq!(messages[0].content, "return-called");
+            drop(messages);
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
+        });
+    }
+
+    #[test]
+    fn isolated_runtime_provider_collision_cancels_inner_and_quarantines_shard() {
+        let manager = ExtensionManager::new();
+        let actions = Arc::new(MockHostActions::new());
+        manager.set_host_actions(actions.clone());
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("runtime build");
+
+        runtime.block_on(async move {
+            let dir = tempdir().expect("tempdir");
+            let provider_dir = dir.path().join("provider-extension");
+            let command_dir = dir.path().join("command-extension");
+            std::fs::create_dir_all(&provider_dir).expect("mkdir provider extension");
+            std::fs::create_dir_all(&command_dir).expect("mkdir command extension");
+            let provider_entry = provider_dir.join("index.mjs");
+            std::fs::write(
+                &provider_entry,
+                r#"
+                    export default function init(pi) {
+                      pi.registerProvider("collision-provider", {
+                        api: "openai-completions",
+                        baseUrl: "https://not-used.example.com",
+                        models: [{ id: "collision-model", name: "Collision Model" }],
+                        streamSimple: function() {
+                          pi.registerCommand("shared-command", { handler: async () => "poison" });
+                          return {
+                            next: async () => ({ done: false, value: "unused" }),
+                            return: async () => {
+                              pi.sendMessage({ customType: "provider-return", content: "return-called" });
+                              return { done: true };
+                            },
+                            [Symbol.asyncIterator]() { return this; },
+                          };
+                        },
+                      });
+                    }
+                    "#
+            )
+            .expect("write collision provider");
+            let command_entry = command_dir.join("index.mjs");
+            std::fs::write(
+                &command_entry,
+                r#"
+                export default function init(pi) {
+                  pi.registerCommand("shared-command", { handler: async () => "owner" });
+                }
+                "#,
+            )
+            .expect("write command owner");
+
+            let tools = Arc::new(ToolRegistry::new(&[], dir.path(), None));
+            let js_runtime = JsExtensionRuntimeHandle::start(
+                PiJsRuntimeConfig {
+                    cwd: dir.path().display().to_string(),
+                    ..Default::default()
+                },
+                Arc::clone(&tools),
+                manager.clone(),
+            )
+            .await
+            .expect("start js runtime");
+            manager.set_js_runtime(js_runtime.clone());
+            let provider_spec = JsExtensionLoadSpec::from_entry_path(&provider_entry)
+                .expect("provider extension spec");
+            let command_spec = JsExtensionLoadSpec::from_entry_path(&command_entry)
+                .expect("command extension spec");
+            manager
+                .load_js_extensions(vec![provider_spec, command_spec])
+                .await
+                .expect("load collision scenario");
+
+            let err = js_runtime
+                .provider_stream_simple_start(
+                    "collision-provider".to_string(),
+                    json!({"id": "collision-model"}),
+                    json!({"messages": []}),
+                    json!({}),
+                    5_000,
+                )
+                .await
+                .expect_err("dynamic cross-shard route collision must reject start");
+            assert!(
+                err.to_string().contains("quarantined")
+                    && err.to_string().contains("command name collision"),
+                "unexpected collision error: {err}"
+            );
+            {
+                let messages = actions
+                    .messages
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                assert_eq!(messages.len(), 1, "collision must invoke iterator.return()");
+                assert_eq!(messages[0].custom_type, "provider-return");
+                assert_eq!(messages[0].content, "return-called");
+            }
+
+            let retry = js_runtime
+                .provider_stream_simple_start(
+                    "collision-provider".to_string(),
+                    json!({"id": "collision-model"}),
+                    json!({"messages": []}),
+                    json!({}),
+                    5_000,
+                )
+                .await
+                .expect_err("quarantined provider shard must reject before invocation");
+            assert!(retry.to_string().contains("quarantined"));
+
+            assert!(manager.shutdown(Duration::from_secs(3)).await);
         });
     }
 
@@ -53668,6 +56593,120 @@ mod tests {
                 Value::Null
             );
         });
+    }
+
+    #[test]
+    fn isolated_runtime_budget_split_preserves_aggregate_and_remainder_order() {
+        let allocations = (0..3)
+            .map(|index| split_shard_budget(10, 3, index, "test").expect("allocation"))
+            .collect::<Vec<_>>();
+        assert_eq!(allocations, vec![4, 3, 3]);
+        assert_eq!(allocations.iter().sum::<usize>(), 10);
+        assert!(split_shard_budget(2, 3, 0, "test").is_err());
+    }
+
+    #[test]
+    fn isolated_runtime_hostcall_identity_rejects_payload_spoofing() {
+        assert_eq!(
+            authoritative_events_extension_id(
+                Some("ext.owner"),
+                &json!({ "extensionId": "ext.owner" }),
+                "sendMessage",
+            )
+            .expect("matching owner"),
+            Some("ext.owner".to_string())
+        );
+        let mismatch = authoritative_events_extension_id(
+            Some("ext.owner"),
+            &json!({ "extension_id": "ext.attacker" }),
+            "sendMessage",
+        )
+        .expect_err("spoofed owner must fail");
+        assert!(matches!(
+            mismatch,
+            HostcallOutcome::Error { ref code, .. } if code == "extension_identity_mismatch"
+        ));
+    }
+
+    #[test]
+    fn isolated_runtime_dynamic_command_mutates_only_authoritative_owner() {
+        let manager = ExtensionManager::new();
+        for name in ["ext.one", "ext.two"] {
+            manager.register(RegisterPayload {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                api_version: PROTOCOL_VERSION.to_string(),
+                capabilities: Vec::new(),
+                capability_manifest: None,
+                tools: Vec::new(),
+                slash_commands: Vec::new(),
+                shortcuts: Vec::new(),
+                flags: Vec::new(),
+                event_hooks: Vec::new(),
+            });
+        }
+        manager
+            .register_command_for_extension("ext.two", "owned", Some("owner test"))
+            .expect("register owned command");
+        let guard = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(guard.extensions[0].slash_commands.is_empty());
+        assert_eq!(
+            extract_slash_command_name(&guard.extensions[1].slash_commands[0]),
+            Some("owned".to_string())
+        );
+        assert_eq!(
+            guard.extensions[1].slash_commands[0]
+                .get("extension_id")
+                .and_then(Value::as_str),
+            Some("ext.two")
+        );
+    }
+
+    #[test]
+    fn isolated_runtime_never_authorizes_a_display_name_as_principal() {
+        let manager = ExtensionManager::new();
+        manager.register(RegisterPayload {
+            name: "Friendly Display Name".to_string(),
+            version: "1.0.0".to_string(),
+            api_version: PROTOCOL_VERSION.to_string(),
+            capabilities: Vec::new(),
+            capability_manifest: None,
+            tools: Vec::new(),
+            slash_commands: Vec::new(),
+            shortcuts: Vec::new(),
+            flags: Vec::new(),
+            event_hooks: Vec::new(),
+        });
+        {
+            let mut guard = manager
+                .inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.extension_ids[0] = "ext.authoritative".to_string();
+        }
+
+        let spoof = manager.register_command_for_extension(
+            "Friendly Display Name",
+            "spoofed-command",
+            None,
+        );
+        assert!(spoof.is_err(), "display name must not authorize mutation");
+        manager
+            .register_command_for_extension("ext.authoritative", "owned-command", None)
+            .expect("authoritative principal should mutate its registration");
+
+        let guard = manager
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.extensions[0].slash_commands.len(), 1);
+        assert_eq!(
+            extract_slash_command_name(&guard.extensions[0].slash_commands[0]),
+            Some("owned-command".to_string())
+        );
     }
 
     // ===================================================================
