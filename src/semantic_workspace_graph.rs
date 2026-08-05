@@ -16,6 +16,7 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::time::UNIX_EPOCH;
 
 pub const SEMANTIC_WORKSPACE_GRAPH_SCHEMA: &str = "pi.semantic_workspace_graph.v1";
@@ -475,6 +476,7 @@ impl SemanticWorkspaceGraphBuilder {
                     &value,
                     content_sha256,
                     &self.options,
+                    &self.root,
                 );
                 apply_redaction_metadata(&mut evidence_node, &redaction);
                 state.push_edge(edge(
@@ -1885,9 +1887,362 @@ fn classify_in_progress_bead(
     }
 }
 
+fn classify_performance_budget_claim(
+    value: &Value,
+    options: &SemanticWorkspaceGraphBuildOptions,
+    repository_root: Option<&Path>,
+) -> Option<(EvidenceFreshnessStatus, bool, String)> {
+    let schema = value.get("schema").and_then(Value::as_str)?;
+    if schema == "pi.perf.budget_summary.v1" {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_schema_not_current".to_string(),
+        ));
+    }
+    if schema != "pi.perf.budget_summary.v2" {
+        return None;
+    }
+
+    let canonical_generated_at =
+        value
+            .get("generated_at")
+            .and_then(Value::as_str)
+            .and_then(|raw| {
+                DateTime::parse_from_rfc3339(raw)
+                    .ok()
+                    .filter(|parsed| {
+                        parsed.to_rfc3339_opts(chrono::SecondsFormat::Millis, true) == raw
+                    })
+                    .map(|parsed| parsed.with_timezone(&Utc))
+            });
+    let Some(generated_at) = canonical_generated_at else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    if options
+        .reference_time_utc
+        .is_some_and(|reference| generated_at > reference + Duration::minutes(5))
+    {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_generated_at_in_future".to_string(),
+        ));
+    }
+
+    let Some(strict_mode) = value.get("strict_mode").and_then(Value::as_bool) else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    let source_commit = match value.get("source_commit") {
+        Some(Value::Null) => None,
+        Some(Value::String(commit))
+            if commit.len() == 40
+                && commit
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                && !commit.bytes().all(|byte| byte == b'0') =>
+        {
+            Some(commit.as_str())
+        }
+        _ => {
+            return Some((
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "performance_budget_claim_readiness_malformed".to_string(),
+            ));
+        }
+    };
+    let optional_lineage = |field: &str| match value.get(field) {
+        Some(Value::Null) => Some(None),
+        Some(Value::String(lineage))
+            if !lineage.is_empty()
+                && lineage.trim() == lineage
+                && !lineage.chars().any(char::is_control) =>
+        {
+            Some(Some(lineage.as_str()))
+        }
+        _ => None,
+    };
+    let (Some(run_id), Some(correlation_id)) = (
+        optional_lineage("run_id"),
+        optional_lineage("correlation_id"),
+    ) else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    let counts = (
+        value.get("total_budgets").and_then(Value::as_u64),
+        value.get("pass").and_then(Value::as_u64),
+        value.get("fail").and_then(Value::as_u64),
+        value.get("no_data").and_then(Value::as_u64),
+        value.get("ci_enforced").and_then(Value::as_u64),
+        value.get("ci_with_data").and_then(Value::as_u64),
+        value.get("ci_fail").and_then(Value::as_u64),
+        value.get("ci_no_data").and_then(Value::as_u64),
+        value
+            .get("data_contract_failures_count")
+            .and_then(Value::as_u64),
+    );
+    let (
+        Some(total_budgets),
+        Some(pass),
+        Some(fail),
+        Some(no_data),
+        Some(ci_enforced),
+        Some(ci_with_data),
+        Some(ci_fail),
+        Some(ci_no_data),
+        Some(contract_failures),
+    ) = counts
+    else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    if total_budgets == 0
+        || ci_enforced == 0
+        || pass
+            .checked_add(fail)
+            .and_then(|count| count.checked_add(no_data))
+            != Some(total_budgets)
+        || ci_enforced > total_budgets
+        || ci_with_data
+            .checked_add(ci_no_data)
+            .is_none_or(|count| count != ci_enforced)
+        || ci_fail > ci_enforced
+        || ci_fail > fail
+    {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    }
+
+    let mut expected_blockers = BTreeSet::new();
+    if !strict_mode {
+        expected_blockers.insert("strict_mode_disabled");
+    }
+    if source_commit.is_none() {
+        expected_blockers.insert("source_commit_unbound");
+    }
+    if run_id.is_none() {
+        expected_blockers.insert("run_id_missing");
+    }
+    if correlation_id.is_none() || run_id != correlation_id {
+        expected_blockers.insert("correlation_id_missing");
+    }
+    if ci_with_data != ci_enforced || ci_no_data != 0 {
+        expected_blockers.insert("ci_budget_data_missing");
+    }
+    if ci_fail != 0 {
+        expected_blockers.insert("ci_budget_failed");
+    }
+    if no_data != 0 {
+        expected_blockers.insert("budget_data_missing");
+    }
+    if fail != 0 {
+        expected_blockers.insert("budget_failed");
+    }
+    if contract_failures != 0 {
+        expected_blockers.insert("data_contract_failure");
+    }
+
+    let Some(claim) = value.get("claim_readiness").and_then(Value::as_object) else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    let status = claim.get("status").and_then(Value::as_str);
+    let authorized = claim
+        .get("performance_claims_authorized")
+        .and_then(Value::as_bool);
+    let Some(blockers) = claim.get("blocking_reason_codes").and_then(Value::as_array) else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    let blockers = blockers
+        .iter()
+        .map(Value::as_str)
+        .collect::<Option<Vec<_>>>();
+    let Some(blockers) = blockers else {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    };
+    let expected = expected_blockers.into_iter().collect::<Vec<_>>();
+    let claims_ready = expected.is_empty();
+    if blockers != expected
+        || status
+            != Some(if claims_ready {
+                "claim_ready"
+            } else {
+                "blocked"
+            })
+        || authorized != Some(claims_ready)
+    {
+        return Some((
+            EvidenceFreshnessStatus::Malformed,
+            false,
+            "performance_budget_claim_readiness_malformed".to_string(),
+        ));
+    }
+    if claims_ready {
+        let Some(source_commit) = source_commit else {
+            return Some((
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                "performance_budget_claim_readiness_malformed".to_string(),
+            ));
+        };
+        match performance_source_binding_failure(repository_root, source_commit) {
+            None => None,
+            Some(PerformanceSourceBindingFailure::Unavailable) => Some((
+                EvidenceFreshnessStatus::Uncertified,
+                false,
+                "performance_budget_source_binding_unavailable".to_string(),
+            )),
+            Some(PerformanceSourceBindingFailure::Invalid(reason)) => Some((
+                EvidenceFreshnessStatus::Malformed,
+                false,
+                reason.to_string(),
+            )),
+        }
+    } else {
+        Some((
+            EvidenceFreshnessStatus::Uncertified,
+            false,
+            "performance_claims_not_authorized".to_string(),
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum PerformanceSourceBindingFailure {
+    Unavailable,
+    Invalid(&'static str),
+}
+
+fn performance_source_binding_failure(
+    repository_root: Option<&Path>,
+    source_commit: &str,
+) -> Option<PerformanceSourceBindingFailure> {
+    let Some(repository_root) = repository_root else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(head) = git_stdout(repository_root, &["rev-parse", "--verify", "HEAD^{commit}"])
+    else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    let Some(resolved_source) = git_stdout(
+        repository_root,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("{source_commit}^{{commit}}"),
+        ],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_unresolvable",
+        ));
+    };
+    if resolved_source != source_commit {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_not_exact",
+        ));
+    }
+
+    let ancestor = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(["merge-base", "--is-ancestor", source_commit, &head])
+        .status()
+        .is_ok_and(|status| status.success());
+    if !ancestor {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_not_ancestor",
+        ));
+    }
+    if source_commit == head {
+        return None;
+    }
+
+    let Some(changed_paths) = git_stdout(
+        repository_root,
+        &["diff", "--name-only", "--no-renames", source_commit, &head],
+    ) else {
+        return Some(PerformanceSourceBindingFailure::Unavailable);
+    };
+    if changed_paths.is_empty() {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_not_release_bound",
+        ));
+    }
+    let evidence_only = changed_paths.lines().all(|path| {
+        [
+            "tests/perf/reports/",
+            "tests/e2e_results/",
+            "tests/ext_conformance/reports/",
+            "tests/certification/",
+            "docs/evidence/",
+        ]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    });
+    if !evidence_only {
+        return Some(PerformanceSourceBindingFailure::Invalid(
+            "performance_budget_source_commit_not_release_bound",
+        ));
+    }
+    None
+}
+
+fn git_stdout(repository_root: &Path, args: &[&str]) -> Option<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository_root)
+        .args(args)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|stdout| stdout.trim().to_string())
+}
+
 pub fn classify_evidence_freshness(
     value: &Value,
     options: &SemanticWorkspaceGraphBuildOptions,
+) -> (EvidenceFreshnessStatus, bool, String) {
+    classify_evidence_freshness_in_repository(value, options, None)
+}
+
+fn classify_evidence_freshness_in_repository(
+    value: &Value,
+    options: &SemanticWorkspaceGraphBuildOptions,
+    repository_root: Option<&Path>,
 ) -> (EvidenceFreshnessStatus, bool, String) {
     if value
         .get("claim_surface")
@@ -1899,6 +2254,11 @@ pub fn classify_evidence_freshness(
             false,
             "claim_surface_is_historical_snapshot".to_string(),
         );
+    }
+
+    if let Some(classification) = classify_performance_budget_claim(value, options, repository_root)
+    {
+        return classification;
     }
 
     if value
@@ -2105,6 +2465,7 @@ fn evidence_artifact_node(
     value: &Value,
     content_sha256: &str,
     options: &SemanticWorkspaceGraphBuildOptions,
+    repository_root: &Path,
 ) -> SemanticGraphNode {
     let artifact_schema = value
         .get("schema")
@@ -2112,7 +2473,7 @@ fn evidence_artifact_node(
         .unwrap_or("schema_missing");
     let stable_key = format!("{source_path}:{artifact_schema}");
     let (freshness_status, release_claim_allowed, reason) =
-        classify_evidence_freshness(value, options);
+        classify_evidence_freshness_in_repository(value, options, Some(repository_root));
     let mut metadata = BTreeMap::new();
     let privacy = classify_node_privacy(source_path, Some(value));
     metadata.insert("artifact_schema".to_string(), json!(artifact_schema));
@@ -2124,6 +2485,26 @@ fn evidence_artifact_node(
     }
     if let Some(overall_verdict) = value.get("overall_verdict").and_then(Value::as_str) {
         metadata.insert("overall_verdict".to_string(), json!(overall_verdict));
+    }
+    if let Some(claim_readiness) = value.get("claim_readiness").and_then(Value::as_object) {
+        if let Some(status) = claim_readiness.get("status").and_then(Value::as_str) {
+            metadata.insert("claim_readiness_status".to_string(), json!(status));
+        }
+        if let Some(authorized) = claim_readiness
+            .get("performance_claims_authorized")
+            .and_then(Value::as_bool)
+        {
+            metadata.insert(
+                "performance_claims_authorized".to_string(),
+                json!(authorized),
+            );
+        }
+        if let Some(blockers) = claim_readiness
+            .get("blocking_reason_codes")
+            .and_then(Value::as_array)
+        {
+            metadata.insert("blocking_reason_codes".to_string(), json!(blockers));
+        }
     }
     if let Some(source_generated_at) = value
         .get("source_report_generated_at")

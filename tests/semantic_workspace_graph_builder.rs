@@ -14,8 +14,8 @@ use pi::semantic_workspace_graph::{
     BeadActionabilityStatus, ContextArtifactCacheScope, ContextArtifactCacheStatus,
     ContextBundleBudget, ContextBundleCacheProbe, ContextBundleRequest, EvidenceFreshnessStatus,
     GraphInputStatus, RedactionStatus, SemanticContextBundlePlanner, SemanticEdgeType,
-    SemanticNodeType, SemanticWorkspaceGraph, SemanticWorkspaceGraphBuilder,
-    normalize_context_artifact_path,
+    SemanticNodeType, SemanticWorkspaceGraph, SemanticWorkspaceGraphBuildOptions,
+    SemanticWorkspaceGraphBuilder, classify_evidence_freshness, normalize_context_artifact_path,
 };
 use pi::session::Session;
 use pi::tools::ToolRegistry;
@@ -60,6 +60,20 @@ fn run_fixture_git(root: &Path, args: &[&str]) -> TestResult {
     Ok(())
 }
 
+fn fixture_git_output(root: &Path, args: &[&str]) -> TestResult<String> {
+    let output = Command::new("git").args(args).current_dir(root).output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "git {} failed: stdout={} stderr={}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
 fn initialize_fixture_git_workspace(root: &Path) -> TestResult {
     run_fixture_git(root, &["init", "-b", "main"])?;
     run_fixture_git(
@@ -69,6 +83,18 @@ fn initialize_fixture_git_workspace(root: &Path) -> TestResult {
     run_fixture_git(root, &["config", "user.name", "Pi Context E2E"])?;
     run_fixture_git(root, &["add", "."])?;
     run_fixture_git(root, &["commit", "-m", "fixture baseline"])?;
+    Ok(())
+}
+
+fn bind_fixture_performance_summary_to_source(root: &Path) -> TestResult {
+    initialize_fixture_git_workspace(root)?;
+    let source_commit = fixture_git_output(root, &["rev-parse", "HEAD"])?;
+    let summary_path = root.join("tests/perf/reports/budget_summary.json");
+    let mut summary: serde_json::Value = serde_json::from_slice(&fs::read(&summary_path)?)?;
+    summary["source_commit"] = json!(source_commit);
+    fs::write(&summary_path, serde_json::to_vec_pretty(&summary)?)?;
+    run_fixture_git(root, &["add", "tests/perf/reports/budget_summary.json"])?;
+    run_fixture_git(root, &["commit", "-m", "bind performance evidence"])?;
     Ok(())
 }
 
@@ -193,8 +219,26 @@ Parity ledger claims cite docs/evidence/dropin-parity-gap-ledger.json.
         root,
         "tests/perf/reports/budget_summary.json",
         r#"{
-  "schema": "pi.perf.budget_summary.v1",
-  "generated_at": "2026-05-13T00:00:00Z",
+  "schema": "pi.perf.budget_summary.v2",
+  "generated_at": "2026-05-13T00:00:00.000Z",
+  "source_commit": "0123456789abcdef0123456789abcdef01234567",
+  "run_id": "fixture-run",
+  "correlation_id": "fixture-run",
+  "strict_mode": true,
+  "total_budgets": 2,
+  "pass": 2,
+  "fail": 0,
+  "no_data": 0,
+  "ci_enforced": 2,
+  "ci_with_data": 2,
+  "ci_fail": 0,
+  "ci_no_data": 0,
+  "data_contract_failures_count": 0,
+  "claim_readiness": {
+    "status": "claim_ready",
+    "performance_claims_authorized": true,
+    "blocking_reason_codes": []
+  },
   "claim_surface": "release_facing"
 }"#,
     )?;
@@ -684,9 +728,130 @@ fn graph_cache_validation_enforces_scope_ttl_and_path_policy() -> TestResult {
     Ok(())
 }
 
+fn semantic_perf_budget_fixture() -> serde_json::Value {
+    json!({
+        "schema": "pi.perf.budget_summary.v2",
+        "generated_at": "2026-05-13T00:00:00.000Z",
+        "source_commit": "0123456789abcdef0123456789abcdef01234567",
+        "run_id": "fixture-run",
+        "correlation_id": "fixture-run",
+        "strict_mode": true,
+        "total_budgets": 2,
+        "pass": 2,
+        "fail": 0,
+        "no_data": 0,
+        "ci_enforced": 2,
+        "ci_with_data": 2,
+        "ci_fail": 0,
+        "ci_no_data": 0,
+        "data_contract_failures_count": 0,
+        "claim_readiness": {
+            "status": "claim_ready",
+            "performance_claims_authorized": true,
+            "blocking_reason_codes": []
+        },
+        "claim_surface": "release_facing"
+    })
+}
+
+#[test]
+fn performance_budget_freshness_requires_current_global_claim_readiness() -> TestResult {
+    let options = SemanticWorkspaceGraphBuildOptions {
+        reference_time_utc: Some(reference_time()?),
+        ..SemanticWorkspaceGraphBuildOptions::default()
+    };
+
+    let mut legacy = semantic_perf_budget_fixture();
+    legacy["schema"] = json!("pi.perf.budget_summary.v1");
+    let legacy_classification = classify_evidence_freshness(&legacy, &options);
+    assert_eq!(legacy_classification.0, EvidenceFreshnessStatus::Malformed);
+    assert!(!legacy_classification.1);
+
+    let mut blocked = semantic_perf_budget_fixture();
+    blocked["pass"] = json!(1);
+    blocked["no_data"] = json!(1);
+    blocked["claim_readiness"] = json!({
+        "status": "blocked",
+        "performance_claims_authorized": false,
+        "blocking_reason_codes": ["budget_data_missing"]
+    });
+    let blocked_classification = classify_evidence_freshness(&blocked, &options);
+    assert_eq!(
+        blocked_classification.0,
+        EvidenceFreshnessStatus::Uncertified
+    );
+    assert!(!blocked_classification.1);
+
+    let mut ci_exceeds_total = semantic_perf_budget_fixture();
+    ci_exceeds_total["ci_enforced"] = json!(99);
+    ci_exceeds_total["ci_with_data"] = json!(99);
+    let mut incomplete_ci_partition = semantic_perf_budget_fixture();
+    incomplete_ci_partition["ci_with_data"] = json!(1);
+    let mut ci_fail_exceeds_global_fail = semantic_perf_budget_fixture();
+    ci_fail_exceeds_global_fail["ci_fail"] = json!(1);
+    for contradictory in [
+        ci_exceeds_total,
+        incomplete_ci_partition,
+        ci_fail_exceeds_global_fail,
+    ] {
+        let classification = classify_evidence_freshness(&contradictory, &options);
+        assert_eq!(classification.0, EvidenceFreshnessStatus::Malformed);
+        assert!(!classification.1);
+    }
+
+    let ready_classification =
+        classify_evidence_freshness(&semantic_perf_budget_fixture(), &options);
+    assert_eq!(ready_classification.0, EvidenceFreshnessStatus::Uncertified);
+    assert!(!ready_classification.1);
+    assert_eq!(
+        ready_classification.2,
+        "performance_budget_source_binding_unavailable"
+    );
+
+    let historical = json!({
+        "schema": "pi.perf.budget_summary.v1",
+        "generated_at": "2026-05-13T00:00:00Z",
+        "claim_surface": "historical_snapshot"
+    });
+    let historical_classification = classify_evidence_freshness(&historical, &options);
+    assert_eq!(
+        historical_classification.0,
+        EvidenceFreshnessStatus::HistoricalSnapshot
+    );
+    assert!(!historical_classification.1);
+    Ok(())
+}
+
+#[test]
+fn performance_budget_freshness_rejects_unresolvable_source_commit() -> TestResult {
+    let temp = fixture_workspace()?;
+    initialize_fixture_git_workspace(temp.path())?;
+    let graph = build_fixture_graph(temp.path())?;
+    let perf_budget = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "tests/perf/reports/budget_summary.json",
+    )?;
+
+    assert_eq!(
+        perf_budget.freshness_status,
+        Some(EvidenceFreshnessStatus::Malformed)
+    );
+    assert_eq!(
+        perf_budget.metadata.get("release_claim_allowed"),
+        Some(&json!(false))
+    );
+    assert_eq!(
+        perf_budget.metadata.get("freshness_reason"),
+        Some(&json!("performance_budget_source_commit_unresolvable"))
+    );
+    Ok(())
+}
+
 #[test]
 fn builder_indexes_workspace_surfaces_and_classifies_fail_closed() -> TestResult {
     let temp = fixture_workspace()?;
+    bind_fixture_performance_summary_to_source(temp.path())?;
     let graph = build_fixture_graph(temp.path())?;
     let graph_again = build_fixture_graph(temp.path())?;
 
@@ -756,6 +921,18 @@ fn builder_indexes_workspace_surfaces_and_classifies_fail_closed() -> TestResult
     assert_eq!(
         perf_budget.metadata.get("claim_gate_status"),
         Some(&json!("allowed"))
+    );
+    assert_eq!(
+        perf_budget.metadata.get("claim_readiness_status"),
+        Some(&json!("claim_ready"))
+    );
+    assert_eq!(
+        perf_budget.metadata.get("performance_claims_authorized"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        perf_budget.metadata.get("blocking_reason_codes"),
+        Some(&json!([]))
     );
 
     let extension_closeout = node_with_source(
