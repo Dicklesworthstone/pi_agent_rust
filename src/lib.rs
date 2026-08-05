@@ -1,4 +1,4 @@
-//! Pi - High-performance AI coding agent CLI
+//! Pi - Native AI coding agent CLI
 //!
 //! This library provides the core functionality for the Pi CLI tool,
 //! a Rust port of pi-mono (TypeScript) with emphasis on:

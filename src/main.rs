@@ -1,4 +1,4 @@
-//! Pi - High-performance AI coding agent CLI
+//! Pi - Native AI coding agent CLI
 //!
 //! Rust port of pi-mono (TypeScript) with emphasis on:
 //! - Performance-oriented native architecture with instrumented startup and TUI paths
