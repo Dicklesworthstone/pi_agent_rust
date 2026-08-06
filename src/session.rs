@@ -5989,7 +5989,7 @@ mod tests {
     #[cfg(unix)]
     fn assert_permission_denied(error: &crate::Error) {
         let crate::Error::Io(io_error) = error else {
-            test_fail!("expected typed I/O error, got {error}");
+            test_fail!("expected typed I/O error, got {}", error);
         };
         assert_eq!(io_error.kind(), std::io::ErrorKind::PermissionDenied);
     }

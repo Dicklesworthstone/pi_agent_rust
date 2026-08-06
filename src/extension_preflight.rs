@@ -504,29 +504,46 @@ impl<'a> PreflightAnalyzer<'a> {
             })
             .unwrap_or_else(|| "unknown".to_string());
 
-        if !path.exists() {
-            return PreflightReport::from_findings(
-                ext_id,
-                vec![PreflightFinding {
-                    severity: FindingSeverity::Error,
-                    category: FindingCategory::AnalysisInput,
-                    message: format!("Extension path does not exist: {}", path.display()),
-                    remediation: Some(
-                        "Verify the extension path exists and points to a readable file or directory."
-                            .to_string(),
-                    ),
-                    file: Some(path.display().to_string()),
-                    line: None,
-                }],
-            );
+        match validate_extension_scan_input(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return PreflightReport::from_findings(
+                    ext_id,
+                    vec![PreflightFinding {
+                        severity: FindingSeverity::Error,
+                        category: FindingCategory::AnalysisInput,
+                        message: format!("Extension path does not exist: {}", path.display()),
+                        remediation: Some(
+                            "Verify the extension path exists and points to a readable file or directory."
+                                .to_string(),
+                        ),
+                        file: Some(path.display().to_string()),
+                        line: None,
+                    }],
+                );
+            }
+            Err(err) => {
+                return PreflightReport::from_findings(
+                    ext_id,
+                    vec![PreflightFinding {
+                        severity: FindingSeverity::Error,
+                        category: FindingCategory::AnalysisInput,
+                        message: format!(
+                            "Failed to access extension source at {}: {err}",
+                            path.display()
+                        ),
+                        remediation: Some(
+                            "Verify the extension files and their parent directories are readable and searchable, then retry the preflight check."
+                                .to_string(),
+                        ),
+                        file: Some(path.display().to_string()),
+                        line: None,
+                    }],
+                );
+            }
         }
 
         let scanner = CompatibilityScanner::new(path.to_path_buf());
-        #[cfg(unix)]
-        let scan_result = validate_extension_scan_permissions(path)
-            .map_err(crate::error::Error::from)
-            .and_then(|()| scanner.scan_path(path));
-        #[cfg(not(unix))]
         let scan_result = scanner.scan_path(path);
 
         let ledger = match scan_result {
@@ -800,37 +817,51 @@ impl<'a> PreflightAnalyzer<'a> {
     }
 }
 
-/// Enforce ordinary Unix source-read and directory-traversal semantics even
-/// when Pi runs as UID 0. Root can bypass mode-bit checks, but an extension
-/// path for which no permission class grants the required access is
-/// intentionally inaccessible and must fail preflight just as it would for an
-/// unprivileged process.
+/// Validate whether an extension path exists and can be scanned.
+///
+/// Unlike [`Path::exists`], this preserves `PermissionDenied` and other typed
+/// probe errors. On Unix, ancestors are checked before interpreting a missing
+/// leaf so UID 0 cannot report a path below an inaccessible directory as merely
+/// absent.
+fn validate_extension_scan_input(path: &Path) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    ensure_extension_scan_ancestors_searchable(path)?;
+
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+
+    validate_extension_scan_permissions(path)?;
+    Ok(true)
+}
+
+/// Require search access through both the lexical input path and its canonical
+/// target, then validate every directory and source file either path scanner
+/// can visit. Checking the canonical path closes terminal-symlink escapes such
+/// as `input.js -> locked/extension.js`.
 #[cfg(unix)]
 fn validate_extension_scan_permissions(path: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
+    use crate::platform::{
+        UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, ensure_effective_mode_access,
+    };
 
-    const DIRECTORY_ACCESS_CLASSES: [u32; 3] = [0o500, 0o050, 0o005];
-    const FILE_READ_CLASSES: [u32; 3] = [0o400, 0o040, 0o004];
+    ensure_extension_scan_ancestors_searchable(path)?;
+    let canonical_path = std::fs::canonicalize(path)?;
+    ensure_extension_scan_ancestors_searchable(&canonical_path)?;
 
-    let mut pending = vec![path.to_path_buf()];
+    let mut pending = vec![canonical_path];
     while let Some(scan_path) = pending.pop() {
         let metadata = std::fs::metadata(&scan_path)?;
-        let mode = metadata.permissions().mode();
 
         if metadata.is_file() {
-            let has_read = FILE_READ_CLASSES
-                .iter()
-                .any(|required| mode & required == *required);
-            if extension_scan_file_is_js_like(&scan_path) && !has_read {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    format!(
-                        "Permission denied while scanning extension source file {}: mode {:04o} grants no permission class read access",
-                        scan_path.display(),
-                        mode & 0o7777
-                    ),
-                ));
-            }
+            // A direct security-scan input is read even when its extension is
+            // not JS-like. Descendant files enter `pending` only when scannable.
+            ensure_effective_mode_access(
+                &metadata,
+                &scan_path,
+                UNIX_ACCESS_READ,
+                "extension source reading",
+            )?;
             continue;
         }
 
@@ -838,41 +869,79 @@ fn validate_extension_scan_permissions(path: &Path) -> std::io::Result<()> {
             continue;
         }
 
-        let has_read_and_search = DIRECTORY_ACCESS_CLASSES
-            .iter()
-            .any(|required| mode & required == *required);
-        if !has_read_and_search {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "Permission denied while scanning extension source directory {}: mode {:04o} grants no permission class both read and search access",
-                    scan_path.display(),
-                    mode & 0o7777
-                ),
-            ));
-        }
+        ensure_effective_mode_access(
+            &metadata,
+            &scan_path,
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+            "extension source directory scanning",
+        )?;
 
         for entry in std::fs::read_dir(&scan_path)? {
             let entry = entry?;
             let file_type = entry.file_type()?;
             let child = entry.path();
             if file_type.is_dir() {
-                let ignored = child
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        matches!(name, "node_modules" | "target" | "dist" | ".git")
-                    });
-                if !ignored {
+                if !extension_scan_directory_is_ignored_by_all(&child) {
                     pending.push(child);
                 }
             } else if file_type.is_file() && extension_scan_file_is_js_like(&child) {
                 pending.push(child);
             }
+            // Both scanners intentionally ignore nested symlinks. The caller's
+            // terminal symlink is followed through `canonicalize` above.
         }
     }
 
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_extension_scan_permissions(_path: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_extension_scan_ancestors_searchable(path: &Path) -> std::io::Result<()> {
+    use crate::platform::{UNIX_ACCESS_SEARCH, ensure_effective_mode_access};
+
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+
+    for directory in absolute_path.ancestors().skip(1) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        match std::fs::metadata(directory) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        format!("Not a directory: {}", directory.display()),
+                    ));
+                }
+                ensure_effective_mode_access(
+                    &metadata,
+                    directory,
+                    UNIX_ACCESS_SEARCH,
+                    "extension path traversal",
+                )?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(unix)]
+fn extension_scan_directory_is_ignored_by_all(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "node_modules" | ".git"))
 }
 
 #[cfg(unix)]

@@ -882,7 +882,7 @@ mod edit_tool {
 
     #[cfg(unix)]
     #[test]
-    fn test_edit_unsearchable_parent_is_reported() {
+    fn test_edit_permission_denied_for_unsearchable_parent_is_reported() {
         asupersync::test_utils::run_test(|| async {
             let harness = TestHarness::new("edit_unsearchable_parent_is_reported");
             let locked_dir = harness.create_dir("locked_parent");

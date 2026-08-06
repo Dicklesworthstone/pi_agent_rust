@@ -11,6 +11,9 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::extensions::{safe_canonicalize, strip_unc_prefix};
 use crate::model::{ContentBlock, ImageContent, TextContent};
+use crate::platform::{
+    UNIX_ACCESS_READ, UNIX_ACCESS_SEARCH, UNIX_ACCESS_WRITE, ensure_effective_mode_access,
+};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
 use async_trait::async_trait;
@@ -2064,69 +2067,9 @@ fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
     Ok(canonical_path)
 }
 
-const MODE_ACCESS_READ: u32 = 0o4;
-const MODE_ACCESS_WRITE: u32 = 0o2;
-const MODE_ACCESS_SEARCH: u32 = 0o1;
-
-trait ModeMetadata {
-    #[cfg(unix)]
-    fn unix_mode(&self) -> u32;
-}
-
-impl ModeMetadata for std::fs::Metadata {
-    #[cfg(unix)]
-    fn unix_mode(&self) -> u32 {
-        use std::os::unix::fs::PermissionsExt as _;
-
-        self.permissions().mode()
-    }
-}
-
-impl ModeMetadata for asupersync::fs::Metadata {
-    #[cfg(unix)]
-    fn unix_mode(&self) -> u32 {
-        self.permissions().mode()
-    }
-}
-
-/// Enforce the access represented by Unix mode bits before attempting I/O.
-///
-/// UID 0 may bypass discretionary access-control mode bits. Tools should not
-/// silently read or mutate a path that its owner deliberately made inaccessible,
-/// so a mode with no owner/group/other class granting the complete requested
-/// access is treated as `PermissionDenied` even for a privileged process. The
-/// real filesystem operation still runs afterwards and remains authoritative
-/// for identity-specific mode checks, ACLs, mount policy, and races.
-fn ensure_mode_access(
-    metadata: &impl ModeMetadata,
-    path: &Path,
-    required: u32,
-    operation: &str,
-) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let mode = metadata.unix_mode();
-        let permitted_for_some_class = [6, 3, 0]
-            .into_iter()
-            .any(|shift| ((mode >> shift) & required) == required);
-        if !permitted_for_some_class {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                format!(
-                    "Permission denied: Unix mode {:04o} on {} does not allow {operation}",
-                    mode & 0o7777,
-                    path.display()
-                ),
-            ));
-        }
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = (metadata, path, required, operation);
-    }
-
-    Ok(())
+async fn std_metadata_async(path: &Path) -> std::io::Result<std::fs::Metadata> {
+    let path = path.to_path_buf();
+    asupersync::runtime::spawn_blocking_io(move || std::fs::metadata(path)).await
 }
 
 /// Require directory-search access on every existing ancestor of `path`.
@@ -2135,24 +2078,24 @@ fn ensure_mode_access(
 /// Checking the traversal chain keeps privileged and unprivileged tool
 /// behavior aligned before the real operation performs its identity-specific
 /// checks.
-fn ensure_ancestors_searchable(path: &Path) -> std::io::Result<()> {
+async fn ensure_ancestors_searchable(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         for directory in path.ancestors().skip(1) {
             if directory.as_os_str().is_empty() {
                 continue;
             }
-            let metadata = std::fs::metadata(directory)?;
+            let metadata = std_metadata_async(directory).await?;
             if !metadata.is_dir() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotADirectory,
                     format!("Not a directory: {}", directory.display()),
                 ));
             }
-            ensure_mode_access(
+            ensure_effective_mode_access(
                 &metadata,
                 directory,
-                MODE_ACCESS_SEARCH,
+                UNIX_ACCESS_SEARCH,
                 "directory traversal",
             )?;
         }
@@ -2172,12 +2115,12 @@ fn ensure_ancestors_searchable(path: &Path) -> std::io::Result<()> {
 /// from creating missing descendants beneath an explicitly non-writable
 /// ancestor. Newly-created parents are covered by their normal creation mode;
 /// the eventual create/rename syscall is still the final authority.
-fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
+async fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         let mut candidate = path.parent();
         while let Some(directory) = candidate {
-            match std::fs::metadata(directory) {
+            match std_metadata_async(directory).await {
                 Ok(metadata) => {
                     if !metadata.is_dir() {
                         return Err(std::io::Error::new(
@@ -2185,13 +2128,13 @@ fn ensure_parent_allows_creation(path: &Path) -> std::io::Result<()> {
                             format!("Not a directory: {}", directory.display()),
                         ));
                     }
-                    ensure_mode_access(
+                    ensure_effective_mode_access(
                         &metadata,
                         directory,
-                        MODE_ACCESS_WRITE | MODE_ACCESS_SEARCH,
+                        UNIX_ACCESS_WRITE | UNIX_ACCESS_SEARCH,
                         "file creation",
                     )?;
-                    return ensure_ancestors_searchable(directory);
+                    return ensure_ancestors_searchable(directory).await;
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     candidate = directory.parent();
@@ -3060,7 +3003,7 @@ impl Tool for ReadTool {
         let path = resolve_read_path(&input.path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd)?;
 
-        let meta = asupersync::fs::metadata(&path)
+        let meta = std_metadata_async(&path)
             .await
             .map_err(|err| Error::tool("read", err.to_string()))?;
         if !meta.is_file() {
@@ -3069,8 +3012,10 @@ impl Tool for ReadTool {
                 format!("Path {} is not a regular file", path.display()),
             ));
         }
-        ensure_ancestors_searchable(&path).map_err(|err| Error::tool("read", err.to_string()))?;
-        ensure_mode_access(&meta, &path, MODE_ACCESS_READ, "file reading")
+        ensure_ancestors_searchable(&path)
+            .await
+            .map_err(|err| Error::tool("read", err.to_string()))?;
+        ensure_effective_mode_access(&meta, &path, UNIX_ACCESS_READ, "file reading")
             .map_err(|err| Error::tool("read", err.to_string()))?;
 
         let cache_key = tool_cache_key("read", &self.cwd, &input_value);
@@ -4657,7 +4602,7 @@ impl Tool for EditTool {
         let absolute_path = resolve_read_path(&input.path, &self.cwd);
         let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit")?;
 
-        let meta = asupersync::fs::metadata(&absolute_path)
+        let meta = std_metadata_async(&absolute_path)
             .await
             .map_err(|err| {
                 let message = match err.kind() {
@@ -4676,10 +4621,10 @@ impl Tool for EditTool {
                 format!("Path {} is not a regular file", absolute_path.display()),
             ));
         }
-        ensure_mode_access(
+        ensure_effective_mode_access(
             &meta,
             &absolute_path,
-            MODE_ACCESS_READ | MODE_ACCESS_WRITE,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE,
             "file editing",
         )
         .map_err(|err| {
@@ -4691,15 +4636,17 @@ impl Tool for EditTool {
             };
             Error::tool("edit", message)
         })?;
-        ensure_parent_allows_creation(&absolute_path).map_err(|err| {
-            let message = match err.kind() {
-                std::io::ErrorKind::PermissionDenied => {
-                    format!("Permission denied: {}", input.path)
-                }
-                _ => format!("Failed to access parent directory: {err}"),
-            };
-            Error::tool("edit", message)
-        })?;
+        ensure_parent_allows_creation(&absolute_path)
+            .await
+            .map_err(|err| {
+                let message = match err.kind() {
+                    std::io::ErrorKind::PermissionDenied => {
+                        format!("Permission denied: {}", input.path)
+                    }
+                    _ => format!("Failed to access parent directory: {err}"),
+                };
+                Error::tool("edit", message)
+            })?;
         if meta.len() > READ_TOOL_MAX_BYTES {
             return Err(Error::tool(
                 "edit",
@@ -5022,40 +4969,50 @@ impl Tool for WriteTool {
         let path = resolve_path(&input.path, &self.cwd);
         let path = enforce_cwd_scope(&path, &self.cwd, "write")?;
 
-        if let Ok(meta) = asupersync::fs::metadata(&path).await {
-            if !meta.is_file() {
+        match std_metadata_async(&path).await {
+            Ok(meta) => {
+                if !meta.is_file() {
+                    return Err(Error::tool(
+                        "write",
+                        format!("Path {} is not a regular file", path.display()),
+                    ));
+                }
+                ensure_effective_mode_access(&meta, &path, UNIX_ACCESS_WRITE, "file writing")
+                    .map_err(|err| {
+                        let message = match err.kind() {
+                            std::io::ErrorKind::PermissionDenied => {
+                                format!("Permission denied: {}", input.path)
+                            }
+                            _ => format!("Failed to access file for writing: {err}"),
+                        };
+                        Error::tool("write", message)
+                    })?;
+                if let Err(err) = asupersync::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .await
+                {
+                    let message = match err.kind() {
+                        std::io::ErrorKind::PermissionDenied => {
+                            format!("Permission denied: {}", input.path)
+                        }
+                        _ => format!("Failed to open file for writing: {err}"),
+                    };
+                    return Err(Error::tool("write", message));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
                 return Err(Error::tool(
                     "write",
-                    format!("Path {} is not a regular file", path.display()),
+                    format!("Failed to access file for writing: {err}"),
                 ));
-            }
-            ensure_mode_access(&meta, &path, MODE_ACCESS_WRITE, "file writing").map_err(|err| {
-                let message = match err.kind() {
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Failed to access file for writing: {err}"),
-                };
-                Error::tool("write", message)
-            })?;
-            if let Err(err) = asupersync::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .await
-            {
-                let message = match err.kind() {
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Failed to open file for writing: {err}"),
-                };
-                return Err(Error::tool("write", message));
             }
         }
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            ensure_parent_allows_creation(&path).map_err(|err| {
+            ensure_parent_allows_creation(&path).await.map_err(|err| {
                 let message = match err.kind() {
                     std::io::ErrorKind::PermissionDenied => {
                         format!("Permission denied: {}", input.path)
@@ -5351,25 +5308,27 @@ impl Tool for GrepTool {
         let search_path = resolve_read_path(search_dir, &self.cwd);
         let search_path = enforce_cwd_scope(&search_path, &self.cwd, "grep")?;
 
-        let search_metadata = asupersync::fs::metadata(&search_path).await.map_err(|e| {
+        let search_metadata = std_metadata_async(&search_path).await.map_err(|e| {
             Error::tool(
                 "grep",
                 format!("Cannot access path {}: {e}", search_path.display()),
             )
         })?;
-        ensure_ancestors_searchable(&search_path).map_err(|err| {
-            Error::tool(
-                "grep",
-                format!("Cannot access path {}: {err}", search_path.display()),
-            )
-        })?;
+        ensure_ancestors_searchable(&search_path)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "grep",
+                    format!("Cannot access path {}: {err}", search_path.display()),
+                )
+            })?;
         let is_directory = search_metadata.is_dir();
         let required_access = if is_directory {
-            MODE_ACCESS_READ | MODE_ACCESS_SEARCH
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
         } else {
-            MODE_ACCESS_READ
+            UNIX_ACCESS_READ
         };
-        ensure_mode_access(
+        ensure_effective_mode_access(
             &search_metadata,
             &search_path,
             required_access,
@@ -5890,7 +5849,7 @@ impl Tool for FindTool {
         // Overfetch one result so limit notices only appear after confirmed overflow.
         let scan_limit = effective_limit.saturating_add(1);
 
-        let search_metadata = asupersync::fs::metadata(&search_path)
+        let search_metadata = std_metadata_async(&search_path)
             .await
             .map_err(|err| {
                 if err.kind() == std::io::ErrorKind::NotFound {
@@ -5902,19 +5861,21 @@ impl Tool for FindTool {
                     )
                 }
             })?;
-        ensure_ancestors_searchable(&search_path).map_err(|err| {
-            Error::tool(
-                "find",
-                format!("Cannot access path {}: {err}", search_path.display()),
-            )
-        })?;
+        ensure_ancestors_searchable(&search_path)
+            .await
+            .map_err(|err| {
+                Error::tool(
+                    "find",
+                    format!("Cannot access path {}: {err}", search_path.display()),
+                )
+            })?;
         let search_is_directory = search_metadata.is_dir();
         let required_access = if search_is_directory {
-            MODE_ACCESS_READ | MODE_ACCESS_SEARCH
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
         } else {
-            MODE_ACCESS_READ
+            UNIX_ACCESS_READ
         };
-        ensure_mode_access(
+        ensure_effective_mode_access(
             &search_metadata,
             &search_path,
             required_access,
@@ -6313,7 +6274,7 @@ impl Tool for LsTool {
 
         let effective_limit = input.limit.unwrap_or(DEFAULT_LS_LIMIT);
 
-        let dir_metadata = asupersync::fs::metadata(&dir_path).await.map_err(|err| {
+        let dir_metadata = std_metadata_async(&dir_path).await.map_err(|err| {
             if err.kind() == std::io::ErrorKind::NotFound {
                 Error::tool("ls", format!("Path not found: {}", dir_path.display()))
             } else {
@@ -6327,11 +6288,12 @@ impl Tool for LsTool {
             ));
         }
         ensure_ancestors_searchable(&dir_path)
+            .await
             .map_err(|err| Error::tool("ls", format!("Cannot read directory: {err}")))?;
-        ensure_mode_access(
+        ensure_effective_mode_access(
             &dir_metadata,
             &dir_path,
-            MODE_ACCESS_READ | MODE_ACCESS_SEARCH,
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
             "directory listing",
         )
         .map_err(|err| Error::tool("ls", format!("Cannot read directory: {err}")))?;
@@ -7248,7 +7210,7 @@ async fn get_file_lines_async<'a>(
 ) -> &'a [String] {
     // Recheck access even for cached content so a mode change cannot expose
     // lines that are no longer readable during the same scan.
-    let metadata = match asupersync::fs::metadata(path).await {
+    let metadata = match std_metadata_async(path).await {
         Ok(metadata) => metadata,
         Err(err) => {
             tracing::debug!("Failed to inspect grep file {}: {err}", path.display());
@@ -7260,12 +7222,13 @@ async fn get_file_lines_async<'a>(
         cache.insert(path.to_path_buf(), Vec::new());
         return &[];
     }
-    if let Err(err) = ensure_ancestors_searchable(path) {
+    if let Err(err) = ensure_ancestors_searchable(path).await {
         tracing::debug!("Failed to read grep file {}: {err}", path.display());
         cache.insert(path.to_path_buf(), Vec::new());
         return &[];
     }
-    if let Err(err) = ensure_mode_access(&metadata, path, MODE_ACCESS_READ, "file reading") {
+    if let Err(err) = ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_READ, "file reading")
+    {
         tracing::debug!("Failed to read grep file {}: {err}", path.display());
         cache.insert(path.to_path_buf(), Vec::new());
         return &[];
@@ -9112,7 +9075,7 @@ mod tests {
 
             let metadata = std::fs::metadata(&path).expect("stat unreadable fixture");
             let permission_error =
-                ensure_mode_access(&metadata, &path, MODE_ACCESS_READ, "file reading")
+                ensure_effective_mode_access(&metadata, &path, UNIX_ACCESS_READ, "file reading")
                     .expect_err("mode invariant must reject an unreadable file");
             assert_eq!(
                 permission_error.kind(),
@@ -9137,6 +9100,7 @@ mod tests {
             let _mode_guard = UnixModeGuard::set(&locked_dir, 0o000);
 
             let permission_error = ensure_ancestors_searchable(&path)
+                .await
                 .expect_err("mode invariant must reject an unsearchable parent");
             assert_eq!(
                 permission_error.kind(),
