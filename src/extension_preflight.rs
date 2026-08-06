@@ -1544,17 +1544,32 @@ impl SecurityScanner {
 
     /// Scan extension files under a directory.
     pub fn scan_path(extension_id: &str, path: &Path, root: &Path) -> SecurityScanReport {
-        if !path.exists() {
-            return SecurityScanReport::from_findings(
-                extension_id.to_string(),
-                vec![Self::scan_input_failure_finding(
-                    Some(path.display().to_string()),
-                    format!(
-                        "Extension path does not exist, so the security scan could not inspect any source: {}",
-                        path.display()
-                    ),
-                )],
-            );
+        match validate_extension_scan_input(path) {
+            Ok(true) => {}
+            Ok(false) => {
+                return SecurityScanReport::from_findings(
+                    extension_id.to_string(),
+                    vec![Self::scan_input_failure_finding(
+                        Some(path.display().to_string()),
+                        format!(
+                            "Extension path does not exist, so the security scan could not inspect any source: {}",
+                            path.display()
+                        ),
+                    )],
+                );
+            }
+            Err(err) => {
+                return SecurityScanReport::from_findings(
+                    extension_id.to_string(),
+                    vec![Self::scan_input_failure_finding(
+                        Some(path.display().to_string()),
+                        format!(
+                            "Failed to access extension source at {}: {err}",
+                            path.display()
+                        ),
+                    )],
+                );
+            }
         }
 
         let files = match collect_scannable_files(path) {
@@ -2353,14 +2368,15 @@ fn collect_scannable_files(path: &Path) -> std::io::Result<Vec<std::path::PathBu
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
         let p = entry.path();
-        if p.is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
             // Skip node_modules and hidden dirs.
             let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if name == "node_modules" || name.starts_with('.') {
                 continue;
             }
             files.extend(collect_scannable_files(&p)?);
-        } else if p.is_file()
+        } else if file_type.is_file()
             && let Some(ext) = p.extension().and_then(|e| e.to_str())
             && matches!(
                 ext,
@@ -3074,27 +3090,43 @@ mod tests {
 
     #[cfg(unix)]
     impl ModeRestoreGuard {
-        fn deny_all(path: &Path) -> Self {
+        fn apply(path: &Path, mode: u32) -> Self {
             use std::os::unix::fs::PermissionsExt as _;
 
             let original = std::fs::metadata(path)
                 .expect("stat permission fixture")
                 .permissions();
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000))
-                .expect("block permission fixture");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+                .expect("apply permission fixture mode");
             Self {
                 path: path.to_path_buf(),
                 original: Some(original),
             }
         }
 
+        fn deny_all(path: &Path) -> Self {
+            Self::apply(path, 0o000)
+        }
+
         fn restore(mut self) {
+            use std::os::unix::fs::PermissionsExt as _;
+
             let original = self
                 .original
                 .as_ref()
                 .expect("permission guard must be armed")
                 .clone();
+            let expected_mode = original.mode();
             std::fs::set_permissions(&self.path, original).expect("restore permission fixture");
+            let restored_mode = std::fs::metadata(&self.path)
+                .expect("stat restored permission fixture")
+                .permissions()
+                .mode();
+            assert_eq!(
+                restored_mode & 0o7777,
+                expected_mode & 0o7777,
+                "permission fixture mode must be restored exactly"
+            );
             self.original = None;
         }
     }
@@ -3597,8 +3629,11 @@ pi.exec("ls");
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let missing = temp_dir.path().join("missing-extension.js");
 
+        let exists = validate_extension_scan_input(&missing)
+            .expect("a genuinely missing extension path is not a probe error");
         let report = analyzer.analyze(&missing);
 
+        assert!(!exists);
         assert_eq!(report.extension_id, "missing-extension.js");
         assert_eq!(report.verdict, PreflightVerdict::Fail);
         assert!(report.findings.iter().any(|finding| {
@@ -3651,7 +3686,7 @@ pi.exec("ls");
         assert_eq!(report.verdict, PreflightVerdict::Fail);
         assert!(report.findings.iter().any(|finding| {
             finding.category == FindingCategory::AnalysisInput
-                && finding.message.contains("Failed to scan extension source")
+                && finding.message.contains("Failed to access extension source")
                 && finding.message.contains("Permission denied")
                 && finding.message.contains(&blocked_dir.display().to_string())
         }));
@@ -3689,7 +3724,7 @@ pi.exec("ls");
         assert_eq!(report.verdict, PreflightVerdict::Fail);
         assert!(report.findings.iter().any(|finding| {
             finding.category == FindingCategory::AnalysisInput
-                && finding.message.contains("Failed to scan extension source")
+                && finding.message.contains("Failed to access extension source")
                 && finding.message.contains("Permission denied")
                 && finding
                     .message

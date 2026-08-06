@@ -1746,10 +1746,12 @@ fn cache_dependency_for_path(
 }
 
 fn fingerprint_file_content(path: &Path) -> Option<[u8; 32]> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
         return None;
     }
+    ensure_ancestors_searchable_sync(path).ok()?;
+    ensure_effective_mode_access(&metadata, path, UNIX_ACCESS_READ, "cache fingerprinting").ok()?;
 
     let bytes = std::fs::read(path).ok()?;
     let mut hasher = sha2::Sha256::new();
@@ -1759,10 +1761,18 @@ fn fingerprint_file_content(path: &Path) -> Option<[u8; 32]> {
 }
 
 fn fingerprint_directory_immediate(path: &Path) -> Option<[u8; 32]> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_dir() {
         return None;
     }
+    ensure_ancestors_searchable_sync(path).ok()?;
+    ensure_effective_mode_access(
+        &metadata,
+        path,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        "cache directory scanning",
+    )
+    .ok()?;
 
     let mut entries = std::fs::read_dir(path)
         .ok()?
@@ -1790,13 +1800,21 @@ fn fingerprint_directory_immediate(path: &Path) -> Option<[u8; 32]> {
 }
 
 fn fingerprint_directory_recursive(path: &Path) -> Option<[u8; 32]> {
-    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let metadata = std::fs::metadata(path).ok()?;
     if metadata.is_file() {
         return fingerprint_file_content(path);
     }
     if !metadata.is_dir() {
         return None;
     }
+    ensure_ancestors_searchable_sync(path).ok()?;
+    ensure_effective_mode_access(
+        &metadata,
+        path,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        "cache directory scanning",
+    )
+    .ok()?;
 
     let mut budget = FingerprintBudget::default();
     let mut hasher = sha2::Sha256::new();
@@ -1817,6 +1835,14 @@ fn fingerprint_tree(
     budget: &mut FingerprintBudget,
     hasher: &mut sha2::Sha256,
 ) -> Option<()> {
+    let dir_metadata = std::fs::metadata(dir).ok()?;
+    ensure_effective_mode_access(
+        &dir_metadata,
+        dir,
+        UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH,
+        "cache directory scanning",
+    )
+    .ok()?;
     let mut entries = std::fs::read_dir(dir)
         .ok()?
         .collect::<std::result::Result<Vec<_>, _>>()
@@ -1842,6 +1868,13 @@ fn fingerprint_tree(
             if metadata.len() > TOOL_OUTPUT_CACHE_MAX_FILE_HASH_BYTES {
                 return None;
             }
+            ensure_effective_mode_access(
+                &metadata,
+                &entry_path,
+                UNIX_ACCESS_READ,
+                "cache file reading",
+            )
+            .ok()?;
             budget.bytes = budget.bytes.saturating_add(metadata.len());
             if budget.bytes > TOOL_OUTPUT_CACHE_MAX_FINGERPRINT_BYTES {
                 return None;
@@ -2070,6 +2103,28 @@ fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
 async fn std_metadata_async(path: &Path) -> std::io::Result<std::fs::Metadata> {
     let path = path.to_path_buf();
     asupersync::runtime::spawn_blocking_io(move || std::fs::metadata(path)).await
+}
+
+fn ensure_ancestors_searchable_sync(path: &Path) -> std::io::Result<()> {
+    for directory in path.ancestors().skip(1) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = std::fs::metadata(directory)?;
+        if !metadata.is_dir() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                format!("Not a directory: {}", directory.display()),
+            ));
+        }
+        ensure_effective_mode_access(
+            &metadata,
+            directory,
+            UNIX_ACCESS_SEARCH,
+            "directory traversal",
+        )?;
+    }
+    Ok(())
 }
 
 /// Require directory-search access on every existing ancestor of `path`.
@@ -2474,6 +2529,20 @@ pub fn process_file_arguments(
                 format!("Cannot access file {}: {e}", absolute_path.display()),
             )
         })?;
+        ensure_ancestors_searchable_sync(&absolute_path)
+            .map_err(|err| Error::tool("read", err.to_string()))?;
+        let required_access = if meta.is_dir() {
+            UNIX_ACCESS_READ | UNIX_ACCESS_SEARCH
+        } else {
+            UNIX_ACCESS_READ
+        };
+        ensure_effective_mode_access(
+            &meta,
+            &absolute_path,
+            required_access,
+            "@file reading",
+        )
+        .map_err(|err| Error::tool("read", err.to_string()))?;
         if meta.is_dir() {
             append_file_notice_block(
                 &mut out.text,
@@ -7670,7 +7739,7 @@ impl Tool for HashlineEditTool {
         let absolute_path = enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit")?;
 
         // Check file size
-        let metadata = asupersync::fs::metadata(&absolute_path)
+        let metadata = std_metadata_async(&absolute_path)
             .await
             .map_err(|err| {
                 let message = match err.kind() {
@@ -7688,6 +7757,19 @@ impl Tool for HashlineEditTool {
                 format!("Path {} is not a regular file", absolute_path.display()),
             ));
         }
+        ensure_ancestors_searchable(&absolute_path)
+            .await
+            .map_err(|err| Error::tool("hashline_edit", err.to_string()))?;
+        ensure_effective_mode_access(
+            &metadata,
+            &absolute_path,
+            UNIX_ACCESS_READ | UNIX_ACCESS_WRITE,
+            "hashline editing",
+        )
+        .map_err(|err| Error::tool("hashline_edit", err.to_string()))?;
+        ensure_parent_allows_creation(&absolute_path)
+            .await
+            .map_err(|err| Error::tool("hashline_edit", err.to_string()))?;
         if metadata.len() > READ_TOOL_MAX_BYTES {
             return Err(Error::tool(
                 "hashline_edit",
