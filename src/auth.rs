@@ -12,9 +12,25 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+#[cfg(not(unix))]
 use tempfile::NamedTempFile;
+
+/// Maximum wait for a short-lived auth save before credential resolution fails closed.
+pub const AUTH_RESOLUTION_LOCK_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// `auth.json` is a compact credential map. Bound both reads and the persisted
+/// representation so a corrupt or hostile store cannot cause unbounded work or
+/// produce a file that a subsequent load must reject.
+const MAX_AUTH_FILE_BYTES: usize = 1024 * 1024;
+/// OAuth, device-flow, and token-exchange responses are small JSON documents.
+/// Bound every such body before parsing or redaction so a hostile endpoint
+/// cannot turn credential setup or refresh into an unbounded allocation.
+const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1024;
 
 const ANTHROPIC_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const ANTHROPIC_OAUTH_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
@@ -341,6 +357,782 @@ pub struct AuthStorage {
     entries: HashMap<String, AuthCredential>,
 }
 
+#[derive(Debug)]
+pub enum AuthStorageLoadFailure {
+    LockTimeout(std::io::Error),
+    Other(Error),
+}
+
+impl AuthStorageLoadFailure {
+    #[must_use]
+    pub fn into_error(self) -> Error {
+        match self {
+            Self::LockTimeout(error) => Error::auth(format!("auth lock: {error}")),
+            Self::Other(error) => error,
+        }
+    }
+}
+
+fn read_open_auth_file_bounded(mut file: File, path: &Path) -> std::io::Result<String> {
+    let mut bytes = Vec::new();
+    std::io::Read::by_ref(&mut file)
+        .take(
+            u64::try_from(MAX_AUTH_FILE_BYTES)
+                .unwrap_or(u64::MAX.saturating_sub(1))
+                .saturating_add(1),
+        )
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_AUTH_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("auth.json exceeds {MAX_AUTH_FILE_BYTES} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} is not valid UTF-8: {error}", path.display()),
+        )
+    })
+}
+
+#[cfg(not(unix))]
+fn read_auth_file_bounded(path: &Path) -> std::io::Result<Option<String>> {
+    let initial_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    #[cfg(windows)]
+    let initial_is_reparse_point = {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        initial_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    };
+    #[cfg(not(any(unix, windows)))]
+    let initial_is_reparse_point = false;
+
+    if initial_metadata.file_type().is_symlink()
+        || initial_is_reparse_point
+        || !initial_metadata.is_file()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "auth.json must be a regular non-link file: {}",
+                path.display()
+            ),
+        ));
+    }
+
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+
+        // Open the link itself if the path is swapped to any reparse point between
+        // the initial lstat-style check and this open. Handle metadata can then
+        // reject it without ever following it to credential material elsewhere.
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let opened_metadata = file.metadata()?;
+        if !opened_metadata.is_file()
+            || opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || opened_metadata.creation_time() != initial_metadata.creation_time()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "auth.json changed or became a link while it was being opened: {}",
+                    path.display()
+                ),
+            ));
+        }
+        let current_metadata = fs::symlink_metadata(path)?;
+        if !current_metadata.is_file()
+            || current_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || current_metadata.creation_time() != opened_metadata.creation_time()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("auth.json changed after it was opened: {}", path.display()),
+            ));
+        }
+        file
+    };
+
+    #[cfg(not(windows))]
+    let file = {
+        let file = File::open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("auth.json is not a regular file: {}", path.display()),
+            ));
+        }
+        file
+    };
+
+    read_open_auth_file_bounded(file, path).map(Some)
+}
+
+#[cfg(unix)]
+fn open_auth_directory_nofollow(path: &Path, create: bool) -> std::io::Result<File> {
+    use std::path::Component;
+
+    let descriptor = rustix::fs::open(
+        if path.is_absolute() { "/" } else { "." },
+        rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?;
+    let mut directory = File::from(descriptor);
+
+    for component in path.components() {
+        let name = match component {
+            Component::RootDir | Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::ParentDir | Component::Prefix(_) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "secure auth paths must not contain parent or prefix components: {}",
+                        path.display()
+                    ),
+                ));
+            }
+        };
+
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let child = match rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty()) {
+            Ok(child) => child,
+            Err(rustix::io::Errno::NOENT) if create => {
+                match rustix::fs::mkdirat(
+                    &directory,
+                    name,
+                    rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR | rustix::fs::Mode::XUSR,
+                ) {
+                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                    Err(error) => return Err(std::io::Error::from(error)),
+                }
+                rustix::fs::openat(&directory, name, flags, rustix::fs::Mode::empty())
+                    .map_err(std::io::Error::from)?
+            }
+            Err(error) => return Err(std::io::Error::from(error)),
+        };
+        directory = File::from(child);
+    }
+
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn auth_target_parts(path: &Path) -> std::io::Result<(&Path, &std::ffi::OsStr)> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let target_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("auth path has no filename: {}", path.display()),
+        )
+    })?;
+    Ok((parent, target_name))
+}
+
+#[cfg(unix)]
+fn auth_parent_identity_matches(path: &Path, expected: &File) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let (parent, _) = auth_target_parts(path)?;
+    let current = open_auth_directory_nofollow(parent, false)?;
+    let expected_metadata = expected.metadata()?;
+    let current_metadata = current.metadata()?;
+    Ok(expected_metadata.dev() == current_metadata.dev()
+        && expected_metadata.ino() == current_metadata.ino())
+}
+
+#[cfg(unix)]
+fn read_auth_file_bounded_at(
+    directory: &File,
+    target_name: &std::ffi::OsStr,
+    path: &Path,
+) -> std::io::Result<Option<String>> {
+    let descriptor = match rustix::fs::openat(
+        directory,
+        target_name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(rustix::io::Errno::LOOP) => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "auth.json must be a regular non-link file: {}",
+                    path.display()
+                ),
+            ));
+        }
+        Err(error) => return Err(std::io::Error::from(error)),
+    };
+    let file = File::from(descriptor);
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "auth.json must be a regular non-link file: {}",
+                path.display()
+            ),
+        ));
+    }
+    read_open_auth_file_bounded(file, path).map(Some)
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct AuthTempFile {
+    file: File,
+    directory: File,
+    name: std::ffi::OsString,
+    persisted: bool,
+}
+
+#[cfg(unix)]
+impl AuthTempFile {
+    fn persist_to(&mut self, target_name: &std::ffi::OsStr) -> std::io::Result<()> {
+        rustix::fs::renameat(&self.directory, &self.name, &self.directory, target_name)
+            .map_err(std::io::Error::from)?;
+        self.persisted = true;
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AuthTempFile {
+    fn drop(&mut self) {
+        if !self.persisted {
+            let _ = rustix::fs::unlinkat(&self.directory, &self.name, rustix::fs::AtFlags::empty());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn create_auth_temp_file(directory: &File) -> std::io::Result<AuthTempFile> {
+    let owned_directory = directory.try_clone()?;
+    for _ in 0..16 {
+        let name =
+            std::ffi::OsString::from(format!(".auth.json.tmp-{}", uuid::Uuid::new_v4().simple()));
+        match rustix::fs::openat(
+            directory,
+            &name,
+            rustix::fs::OFlags::WRONLY
+                | rustix::fs::OFlags::CREATE
+                | rustix::fs::OFlags::EXCL
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+        ) {
+            Ok(descriptor) => {
+                return Ok(AuthTempFile {
+                    file: File::from(descriptor),
+                    directory: owned_directory,
+                    name,
+                    persisted: false,
+                });
+            }
+            Err(rustix::io::Errno::EXIST) => {}
+            Err(error) => return Err(std::io::Error::from(error)),
+        }
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique auth.json temporary file",
+    ))
+}
+
+#[cfg(windows)]
+#[derive(Debug)]
+struct WindowsAuthDirectoryGuard {
+    path: PathBuf,
+    creation_time: u64,
+    handle: File,
+}
+
+#[cfg(windows)]
+fn open_or_create_windows_auth_parent(
+    path: &Path,
+    create: bool,
+) -> std::io::Result<(PathBuf, Vec<WindowsAuthDirectoryGuard>)> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use std::path::Component;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let parent = absolute_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut current = PathBuf::new();
+    let mut guards = Vec::new();
+
+    for component in parent.components() {
+        match component {
+            Component::Prefix(prefix) => {
+                current.push(prefix.as_os_str());
+                continue;
+            }
+            Component::RootDir => {
+                current.push(component.as_os_str());
+                continue;
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "secure auth paths must not contain parent components: {}",
+                        path.display()
+                    ),
+                ));
+            }
+            Component::Normal(name) => current.push(name),
+        }
+
+        let initial_metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
+                match fs::create_dir(&current) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error),
+                }
+                fs::symlink_metadata(&current)?
+            }
+            Err(error) => return Err(error),
+        };
+        if !initial_metadata.is_dir()
+            || initial_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "auth path traverses a non-directory or Windows reparse point: {}",
+                    current.display()
+                ),
+            ));
+        }
+
+        // Omitting FILE_SHARE_DELETE pins every opened directory component against
+        // rename/replacement for the duration of the credential write.
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&current)?;
+        let opened_metadata = handle.metadata()?;
+        if !opened_metadata.is_dir()
+            || opened_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || opened_metadata.creation_time() != initial_metadata.creation_time()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "auth directory changed while it was being opened: {}",
+                    current.display()
+                ),
+            ));
+        }
+        guards.push(WindowsAuthDirectoryGuard {
+            path: current.clone(),
+            creation_time: opened_metadata.creation_time(),
+            handle,
+        });
+    }
+
+    validate_windows_auth_parent(&guards)?;
+    Ok((absolute_path, guards))
+}
+
+#[cfg(windows)]
+fn validate_windows_auth_parent(guards: &[WindowsAuthDirectoryGuard]) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt as _;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    for guard in guards {
+        let handle_metadata = guard.handle.metadata()?;
+        let path_metadata = fs::symlink_metadata(&guard.path)?;
+        if !handle_metadata.is_dir()
+            || !path_metadata.is_dir()
+            || handle_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || path_metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || handle_metadata.creation_time() != guard.creation_time
+            || path_metadata.creation_time() != guard.creation_time
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "auth directory changed during credential write: {}",
+                    guard.path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn classify_auth_lock_error(error: std::io::Error) -> AuthStorageLoadFailure {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        AuthStorageLoadFailure::LockTimeout(error)
+    } else {
+        AuthStorageLoadFailure::Other(Error::auth(format!("auth lock: {error}")))
+    }
+}
+
+fn auth_load_other_error(context: &str, error: &std::io::Error) -> AuthStorageLoadFailure {
+    AuthStorageLoadFailure::Other(Error::auth(format!("{context}: {error}")))
+}
+
+#[cfg(unix)]
+struct GuardedAuthRead {
+    content: Option<String>,
+    parent_directory: File,
+    _lock: crate::file_lock::DirLockAt,
+}
+
+#[cfg(windows)]
+struct GuardedAuthRead {
+    content: Option<String>,
+    operation_path: PathBuf,
+    _lock: crate::file_lock::DirLock,
+    _parent_guards: Vec<WindowsAuthDirectoryGuard>,
+}
+
+#[cfg(not(any(unix, windows)))]
+struct GuardedAuthRead {
+    content: Option<String>,
+    operation_path: PathBuf,
+    _lock: crate::file_lock::DirLock,
+}
+
+#[cfg(unix)]
+fn read_auth_file_guarded<F>(
+    path: &Path,
+    lock_timeout: Duration,
+    before_read: F,
+) -> std::result::Result<Option<GuardedAuthRead>, AuthStorageLoadFailure>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let (parent, target_name) =
+        auth_target_parts(path).map_err(|error| auth_load_other_error("auth path", &error))?;
+    let parent_directory = match open_auth_directory_nofollow(parent, false) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(auth_load_other_error("auth.json parent directory", &error)),
+    };
+    let target_name = target_name.to_os_string();
+    let lock =
+        crate::file_lock::DirLockAt::acquire_for(&parent_directory, &target_name, lock_timeout)
+            .map_err(classify_auth_lock_error)?;
+    before_read().map_err(|error| auth_load_other_error("auth read preparation", &error))?;
+    if !auth_parent_identity_matches(path, &parent_directory)
+        .map_err(|error| auth_load_other_error("auth.json parent identity", &error))?
+    {
+        return Err(AuthStorageLoadFailure::Other(Error::auth(format!(
+            "auth directory changed before credential read: {}",
+            parent.display()
+        ))));
+    }
+    let content = read_auth_file_bounded_at(&parent_directory, &target_name, path)
+        .map_err(|error| auth_load_other_error("auth.json", &error))?;
+    Ok(Some(GuardedAuthRead {
+        content,
+        parent_directory,
+        _lock: lock,
+    }))
+}
+
+#[cfg(windows)]
+fn read_auth_file_guarded<F>(
+    path: &Path,
+    lock_timeout: Duration,
+    before_read: F,
+) -> std::result::Result<Option<GuardedAuthRead>, AuthStorageLoadFailure>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let (operation_path, parent_guards) = match open_or_create_windows_auth_parent(path, false) {
+        Ok(guarded) => guarded,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(auth_load_other_error("auth.json parent directory", &error)),
+    };
+    let lock = crate::file_lock::DirLock::acquire_for(&operation_path, lock_timeout)
+        .map_err(classify_auth_lock_error)?;
+    validate_windows_auth_parent(&parent_guards)
+        .map_err(|error| auth_load_other_error("auth.json parent identity", &error))?;
+    before_read().map_err(|error| auth_load_other_error("auth read preparation", &error))?;
+    validate_windows_auth_parent(&parent_guards)
+        .map_err(|error| auth_load_other_error("auth.json parent identity", &error))?;
+    let content = read_auth_file_bounded(&operation_path)
+        .map_err(|error| auth_load_other_error("auth.json", &error))?;
+    validate_windows_auth_parent(&parent_guards)
+        .map_err(|error| auth_load_other_error("auth.json parent identity", &error))?;
+    Ok(Some(GuardedAuthRead {
+        content,
+        operation_path,
+        _lock: lock,
+        _parent_guards: parent_guards,
+    }))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_auth_file_guarded<F>(
+    path: &Path,
+    lock_timeout: Duration,
+    before_read: F,
+) -> std::result::Result<Option<GuardedAuthRead>, AuthStorageLoadFailure>
+where
+    F: FnOnce() -> std::io::Result<()>,
+{
+    let operation_path = path.to_path_buf();
+    let parent = operation_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if !parent
+        .try_exists()
+        .map_err(|error| auth_load_other_error("auth.json parent directory", &error))?
+    {
+        return Ok(None);
+    }
+    let lock = crate::file_lock::DirLock::acquire_for(&operation_path, lock_timeout)
+        .map_err(classify_auth_lock_error)?;
+    before_read().map_err(|error| auth_load_other_error("auth read preparation", &error))?;
+    let content = read_auth_file_bounded(&operation_path)
+        .map_err(|error| auth_load_other_error("auth.json", &error))?;
+    Ok(Some(GuardedAuthRead {
+        content,
+        operation_path,
+        _lock: lock,
+    }))
+}
+
+#[cfg(unix)]
+fn backup_corrupt_auth(read: &GuardedAuthRead, path: &Path, content: &str) -> Result<()> {
+    let backup_path = path.with_extension("json.corrupt");
+    let backup_name = backup_path.file_name().ok_or_else(|| {
+        Error::auth(format!(
+            "corrupt auth backup path has no filename: {}",
+            backup_path.display()
+        ))
+    })?;
+    AuthStorage::save_data_sync_at(&read.parent_directory, backup_name, content, Duration::ZERO)
+}
+
+#[cfg(not(unix))]
+fn backup_corrupt_auth(read: &GuardedAuthRead, _path: &Path, content: &str) -> Result<()> {
+    AuthStorage::save_data_sync_with_lock_timeout(
+        &read.operation_path.with_extension("json.corrupt"),
+        content,
+        Duration::ZERO,
+    )
+}
+
+fn parse_auth_entries(path: &Path, read: &GuardedAuthRead) -> HashMap<String, AuthCredential> {
+    let Some(content) = read.content.as_deref() else {
+        return HashMap::new();
+    };
+    let parsed: AuthFile = match serde_json::from_str(content) {
+        Ok(file) => file,
+        Err(error) => {
+            let backup_path = path.with_extension("json.corrupt");
+            let backup_succeeded = match backup_corrupt_auth(read, path, content) {
+                Ok(()) => true,
+                Err(backup_error) => {
+                    tracing::error!(
+                        event = "pi.auth.backup_failed",
+                        error = %backup_error,
+                        backup = %backup_path.display(),
+                        "Failed to backup corrupted auth.json"
+                    );
+                    false
+                }
+            };
+            if backup_succeeded {
+                tracing::warn!(
+                    event = "pi.auth.parse_error",
+                    error = %error,
+                    backup = %backup_path.display(),
+                    "auth.json is corrupted; backed up and starting with empty credentials"
+                );
+            } else {
+                tracing::warn!(
+                    event = "pi.auth.parse_error",
+                    error = %error,
+                    backup = %backup_path.display(),
+                    "auth.json is corrupted; backup failed; starting with empty credentials"
+                );
+            }
+            AuthFile::default()
+        }
+    };
+    parsed.entries
+}
+
+#[cfg(unix)]
+fn save_auth_data_platform<F, G>(
+    path: &Path,
+    data: &str,
+    lock_timeout: Duration,
+    before_persist: F,
+    after_persist: G,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+    G: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let (parent_path, target_name) = auth_target_parts(path)?;
+    let directory = open_auth_directory_nofollow(parent_path, true)?;
+    let _lock = crate::file_lock::DirLockAt::acquire_for(&directory, target_name, lock_timeout)
+        .map_err(|error| Error::auth(format!("auth lock: {error}")))?;
+    if !auth_parent_identity_matches(path, &directory).map_err(|error| {
+        Error::auth(format!(
+            "could not revalidate auth directory after acquiring the lock at {}: {error}",
+            parent_path.display()
+        ))
+    })? {
+        return Err(Error::auth(format!(
+            "auth directory changed while acquiring the lock: {}",
+            parent_path.display()
+        )));
+    }
+
+    let mut temp = create_auth_temp_file(&directory)?;
+    temp.file
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    let temp_path = parent_path.join(&temp.name);
+    temp.file.write_all(data.as_bytes())?;
+    temp.file.sync_all()?;
+    before_persist(&temp_path)?;
+    if !auth_parent_identity_matches(path, &directory).map_err(|error| {
+        Error::auth(format!(
+            "could not revalidate auth directory before credential persistence at {}: {error}",
+            parent_path.display()
+        ))
+    })? {
+        return Err(Error::auth(format!(
+            "auth directory changed before credential persistence: {}",
+            parent_path.display()
+        )));
+    }
+    temp.persist_to(target_name)?;
+    directory.sync_all()?;
+    after_persist(path).map_err(|error| {
+        Error::auth(format!(
+            "auth.json was persisted and synced in the pinned directory, but post-persist verification preparation failed: {error}"
+        ))
+    })?;
+    match auth_parent_identity_matches(path, &directory) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Error::auth(format!(
+            "auth.json was persisted and synced in the pinned directory, but its configured parent path changed before completion: {}",
+            parent_path.display()
+        ))),
+        Err(error) => Err(Error::auth(format!(
+            "auth.json was persisted and synced in the pinned directory, but its configured parent path could not be revalidated: {}: {error}",
+            parent_path.display()
+        ))),
+    }
+}
+
+#[cfg(windows)]
+fn save_auth_data_platform<F, G>(
+    path: &Path,
+    data: &str,
+    lock_timeout: Duration,
+    before_persist: F,
+    after_persist: G,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+    G: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let (operation_path, parent_guards) = open_or_create_windows_auth_parent(path, true)?;
+    let _lock = crate::file_lock::DirLock::acquire_for(&operation_path, lock_timeout)
+        .map_err(|error| Error::auth(format!("auth lock: {error}")))?;
+    validate_windows_auth_parent(&parent_guards)?;
+    let parent = operation_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = NamedTempFile::new_in(parent)?;
+    temp.write_all(data.as_bytes())?;
+    temp.as_file().sync_all()?;
+    before_persist(temp.path())?;
+    validate_windows_auth_parent(&parent_guards)?;
+    temp.persist(&operation_path).map_err(|error| error.error)?;
+    sync_parent_dir(&operation_path)?;
+    after_persist(&operation_path).map_err(|error| {
+        Error::auth(format!(
+            "auth.json was persisted, but post-persist verification preparation failed: {error}"
+        ))
+    })?;
+    validate_windows_auth_parent(&parent_guards)?;
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn save_auth_data_platform<F, G>(
+    path: &Path,
+    data: &str,
+    lock_timeout: Duration,
+    before_persist: F,
+    after_persist: G,
+) -> Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+    G: FnOnce(&Path) -> std::io::Result<()>,
+{
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let _lock = crate::file_lock::DirLock::acquire_for(path, lock_timeout)
+        .map_err(|error| Error::auth(format!("auth lock: {error}")))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp = NamedTempFile::new_in(parent)?;
+    temp.write_all(data.as_bytes())?;
+    temp.as_file().sync_all()?;
+    before_persist(temp.path())?;
+    temp.persist(path).map_err(|error| error.error)?;
+    sync_parent_dir(path)?;
+    after_persist(path).map_err(|error| {
+        Error::auth(format!(
+            "auth.json was persisted, but post-persist verification preparation failed: {error}"
+        ))
+    })?;
+    Ok(())
+}
+
 impl AuthStorage {
     fn allow_external_provider_lookup(&self) -> bool {
         // External credential auto-detection is intended for Pi's global auth
@@ -382,37 +1174,38 @@ impl AuthStorage {
 
     /// Load auth.json (creates empty if missing).
     pub fn load(path: PathBuf) -> Result<Self> {
-        let entries = if path.exists() {
-            let _locked = crate::file_lock::DirLock::acquire_for(&path, Duration::from_secs(30))
-                .map_err(|e| Error::auth(format!("auth lock: {e}")))?;
-            let content =
-                fs::read_to_string(&path).map_err(|e| Error::auth(format!("auth.json: {e}")))?;
-            let parsed: AuthFile = match serde_json::from_str(&content) {
-                Ok(file) => file,
-                Err(e) => {
-                    let backup_path = path.with_extension("json.corrupt");
-                    if let Err(backup_err) = fs::copy(&path, &backup_path) {
-                        tracing::error!(
-                            event = "pi.auth.backup_failed",
-                            error = %backup_err,
-                            backup = %backup_path.display(),
-                            "Failed to backup corrupted auth.json"
-                        );
-                    }
-                    tracing::warn!(
-                        event = "pi.auth.parse_error",
-                        error = %e,
-                        backup = %backup_path.display(),
-                        "auth.json is corrupted; backed up and starting with empty credentials"
-                    );
-                    AuthFile::default()
-                }
-            };
-            parsed.entries
-        } else {
-            HashMap::new()
-        };
+        Self::load_with_lock_timeout(path, Duration::from_secs(30))
+    }
 
+    /// Load auth.json while bounding how long a concurrently held lock may delay the read.
+    pub fn load_with_lock_timeout(path: PathBuf, lock_timeout: Duration) -> Result<Self> {
+        Self::load_with_lock_timeout_classified(path, lock_timeout)
+            .map_err(AuthStorageLoadFailure::into_error)
+    }
+
+    pub fn load_with_lock_timeout_classified(
+        path: PathBuf,
+        lock_timeout: Duration,
+    ) -> std::result::Result<Self, AuthStorageLoadFailure> {
+        Self::load_with_lock_timeout_classified_and_hook(path, lock_timeout, || Ok(()))
+    }
+
+    fn load_with_lock_timeout_classified_and_hook<F>(
+        path: PathBuf,
+        lock_timeout: Duration,
+        before_read: F,
+    ) -> std::result::Result<Self, AuthStorageLoadFailure>
+    where
+        F: FnOnce() -> std::io::Result<()>,
+    {
+        // Keep the lock and pinned parent descriptor alive through corrupt-backup handling.
+        let Some(read) = read_auth_file_guarded(&path, lock_timeout, before_read)? else {
+            return Ok(Self {
+                path,
+                entries: HashMap::new(),
+            });
+        };
+        let entries = parse_auth_entries(&path, &read);
         Ok(Self { path, entries })
     }
 
@@ -440,37 +1233,101 @@ impl AuthStorage {
     }
 
     fn save_data_sync(path: &Path, data: &str) -> Result<()> {
-        Self::save_data_sync_with_hook(path, data, |_| Ok(()))
+        Self::save_data_sync_with_lock_timeout(path, data, Duration::from_secs(30))
+    }
+
+    fn save_data_sync_with_lock_timeout(
+        path: &Path,
+        data: &str,
+        lock_timeout: Duration,
+    ) -> Result<()> {
+        Self::save_data_sync_with_hooks_and_lock_timeout(
+            path,
+            data,
+            lock_timeout,
+            |_| Ok(()),
+            |_| Ok(()),
+        )
+    }
+
+    #[cfg(unix)]
+    fn save_data_sync_at(
+        directory: &File,
+        target_name: &std::ffi::OsStr,
+        data: &str,
+        lock_timeout: Duration,
+    ) -> Result<()> {
+        if data.len() > MAX_AUTH_FILE_BYTES {
+            return Err(Error::auth(format!(
+                "auth.json exceeds {MAX_AUTH_FILE_BYTES} bytes"
+            )));
+        }
+
+        let _locked =
+            crate::file_lock::DirLockAt::acquire_for(directory, target_name, lock_timeout)
+                .map_err(|error| Error::auth(format!("auth lock: {error}")))?;
+        let mut temp = create_auth_temp_file(directory)?;
+        temp.file
+            .set_permissions(fs::Permissions::from_mode(0o600))?;
+        (|| -> Result<()> {
+            temp.file.write_all(data.as_bytes())?;
+            temp.file.sync_all()?;
+            temp.persist_to(target_name)?;
+            directory.sync_all()?;
+            Ok(())
+        })()
     }
 
     fn save_data_sync_with_hook<F>(path: &Path, data: &str, before_persist: F) -> Result<()>
     where
-        F: FnOnce(&NamedTempFile) -> std::io::Result<()>,
+        F: FnOnce(&Path) -> std::io::Result<()>,
     {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        Self::save_data_sync_with_hooks_and_lock_timeout(
+            path,
+            data,
+            Duration::from_secs(30),
+            before_persist,
+            |_| Ok(()),
+        )
+    }
+
+    #[cfg(test)]
+    fn save_data_sync_with_hooks<F, G>(
+        path: &Path,
+        data: &str,
+        before_persist: F,
+        after_persist: G,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+        G: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        Self::save_data_sync_with_hooks_and_lock_timeout(
+            path,
+            data,
+            Duration::from_secs(30),
+            before_persist,
+            after_persist,
+        )
+    }
+
+    fn save_data_sync_with_hooks_and_lock_timeout<F, G>(
+        path: &Path,
+        data: &str,
+        lock_timeout: Duration,
+        before_persist: F,
+        after_persist: G,
+    ) -> Result<()>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+        G: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        if data.len() > MAX_AUTH_FILE_BYTES {
+            return Err(Error::auth(format!(
+                "auth.json exceeds {MAX_AUTH_FILE_BYTES} bytes"
+            )));
         }
-
-        let _locked = crate::file_lock::DirLock::acquire_for(path, Duration::from_secs(30))
-            .map_err(|e| Error::auth(format!("auth lock: {e}")))?;
-
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        let mut temp = NamedTempFile::new_in(parent)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            temp.as_file()
-                .set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-
-        temp.write_all(data.as_bytes())?;
-        temp.as_file().sync_all()?;
-        before_persist(&temp)?;
-        temp.persist(path).map_err(|err| err.error)?;
-        sync_parent_dir(path)?;
-
-        Ok(())
+        save_auth_data_platform(path, data, lock_timeout, before_persist, after_persist)
     }
     /// Get raw credential.
     pub fn get(&self, provider: &str) -> Option<&AuthCredential> {
@@ -497,6 +1354,24 @@ impl AuthStorage {
     pub fn api_key(&self, provider: &str) -> Option<String> {
         self.credential_for_provider(provider)
             .and_then(api_key_from_credential)
+    }
+
+    /// Get only credentials that are safe to pass through the generic bearer/API-key lane.
+    ///
+    /// Every stored Bedrock credential and legacy SAP API-key entry is consumed by its
+    /// provider-owned chain so documented ambient/stored precedence is identical across CLI, RPC,
+    /// and SDK surfaces. In particular, returning an AWS access-key ID would lose the accompanying
+    /// secret, while returning a legacy SAP API key here would incorrectly promote the lowest
+    /// stored tier into the explicit-caller lane.
+    fn generic_api_key(&self, provider: &str) -> Option<String> {
+        let canonical = canonical_provider_id(provider).unwrap_or(provider);
+        let credential = self.credential_for_provider(provider)?;
+        if canonical.eq_ignore_ascii_case("amazon-bedrock")
+            || canonical.eq_ignore_ascii_case("sap-ai-core")
+        {
+            return None;
+        }
+        api_key_from_credential(credential)
     }
 
     /// Return the names of all providers that have stored credentials.
@@ -609,9 +1484,14 @@ impl AuthStorage {
             }
         }
 
+        let canonical_provider = canonical_provider_id(provider).unwrap_or(provider);
+
         // Prefer explicit stored OAuth/Bearer credentials over ambient env vars.
         // This prevents stale shell env keys from silently overriding successful `/login` flows.
-        if let Some(credential) = self.credential_for_provider(provider)
+        // Bedrock is the exception: all stored variants stay in its provider-owned AWS chain so
+        // an ambient AWS bearer/key/profile and a stored fallback have one consistent precedence.
+        if !canonical_provider.eq_ignore_ascii_case("amazon-bedrock")
+            && let Some(credential) = self.credential_for_provider(provider)
             && let Some(key) = match credential {
                 AuthCredential::OAuth { .. }
                     if canonical_provider_id(provider)
@@ -630,7 +1510,17 @@ impl AuthStorage {
             return Some(key);
         }
 
-        if let Some(key) = env_keys_for_provider(provider).iter().find_map(|var| {
+        let generic_env_keys: &[&str] = match canonical_provider {
+            // The remaining AWS variables form a credential chain; none is a standalone bearer
+            // token. Bedrock resolves the complete chain at request time.
+            "amazon-bedrock" => &["AWS_BEARER_TOKEN_BEDROCK"],
+            // SAP service-key JSON and split client credentials require an OAuth exchange before
+            // they can be used as an Authorization bearer value.
+            "sap-ai-core" => &[],
+            _ => env_keys_for_provider(provider),
+        };
+
+        if let Some(key) = generic_env_keys.iter().find_map(|var| {
             env_lookup(var).and_then(|value| {
                 let trimmed = value.trim();
                 if trimmed.is_empty() {
@@ -643,7 +1533,7 @@ impl AuthStorage {
             return Some(key);
         }
 
-        if let Some(key) = self.api_key(provider) {
+        if let Some(key) = self.generic_api_key(provider) {
             return Some(key);
         }
 
@@ -656,7 +1546,7 @@ impl AuthStorage {
         canonical_provider_id(provider)
             .filter(|canonical| canonical.ne(&provider))
             .and_then(|canonical| {
-                self.api_key(canonical).or_else(|| {
+                self.generic_api_key(canonical).or_else(|| {
                     self.allow_external_provider_lookup()
                         .then(|| resolve_external_provider_api_key(canonical))
                         .flatten()
@@ -1486,6 +2376,9 @@ fn decode_project_scoped_access_token(payload: &str) -> Option<(String, String)>
 
 // ── AWS Credential Chain ────────────────────────────────────────
 
+const MAX_AWS_SHARED_CONFIG_BYTES: usize = 1024 * 1024;
+const MAX_AWS_SSO_CACHE_BYTES: usize = 256 * 1024;
+
 /// Resolved AWS credentials ready for Sigv4 signing or bearer auth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AwsResolvedCredentials {
@@ -1514,17 +2407,35 @@ pub fn resolve_aws_credentials(auth: &AuthStorage) -> Option<AwsResolvedCredenti
     resolve_aws_credentials_with_env(auth, |var| std::env::var(var).ok())
 }
 
-fn resolve_aws_credentials_with_env<F>(
+fn preferred_non_empty_env<F>(env: &mut F, primary: &str, fallback: &str) -> Option<String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let normalized = |value: String| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    };
+    env(primary)
+        .and_then(&normalized)
+        .or_else(|| env(fallback).and_then(normalized))
+}
+
+fn resolve_aws_credentials_with_env<F>(auth: &AuthStorage, env: F) -> Option<AwsResolvedCredentials>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    resolve_aws_credentials_with_env_policy(auth, env, true)
+}
+
+fn resolve_aws_credentials_with_env_policy<F>(
     auth: &AuthStorage,
     mut env: F,
+    include_stored_credentials: bool,
 ) -> Option<AwsResolvedCredentials>
 where
     F: FnMut(&str) -> Option<String>,
 {
-    let env_region = env("AWS_REGION")
-        .or_else(|| env("AWS_DEFAULT_REGION"))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let env_region = preferred_non_empty_env(&mut env, "AWS_REGION", "AWS_DEFAULT_REGION");
     let region = env_region
         .clone()
         .unwrap_or_else(|| "us-east-1".to_string());
@@ -1559,17 +2470,16 @@ where
     }
 
     // 3. Profile-based credentials (AWS_PROFILE / AWS_DEFAULT_PROFILE)
-    if let Some(profile) = env("AWS_PROFILE").or_else(|| env("AWS_DEFAULT_PROFILE")) {
-        let profile = profile.trim().to_string();
-        if !profile.is_empty() {
-            if let Some(resolved) = resolve_aws_profile_credentials_with_env(
-                &profile,
-                env_region.as_deref(),
-                &region,
-                &mut env,
-            ) {
-                return Some(resolved);
-            }
+    if let Some(profile) = preferred_non_empty_env(&mut env, "AWS_PROFILE", "AWS_DEFAULT_PROFILE") {
+        if let Some(resolved) = resolve_aws_profile_credentials_with_env(
+            &profile,
+            env_region.as_deref(),
+            &region,
+            &mut env,
+        ) {
+            return Some(resolved);
+        }
+        if include_stored_credentials {
             tracing::warn!(
                 event = "pi.auth.aws_profile_missing",
                 profile = %profile,
@@ -1578,7 +2488,17 @@ where
         }
     }
 
-    // 4. Stored credentials in auth.json
+    if include_stored_credentials {
+        resolve_stored_aws_credentials(auth, region)
+    } else {
+        None
+    }
+}
+
+fn resolve_stored_aws_credentials(
+    auth: &AuthStorage,
+    region: String,
+) -> Option<AwsResolvedCredentials> {
     let provider = "amazon-bedrock";
     match auth.credential_for_provider(provider) {
         Some(AuthCredential::AwsCredentials {
@@ -1707,6 +2627,28 @@ where
     Some(home.join(".aws").join("config"))
 }
 
+fn read_bounded_aws_text(
+    path: &Path,
+    max_bytes: usize,
+    description: &str,
+) -> std::io::Result<String> {
+    let file = File::open(path)?;
+    let mut bytes = Vec::new();
+    file.take((max_bytes + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > max_bytes {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{description} exceeds {max_bytes} bytes"),
+        ));
+    }
+    String::from_utf8(bytes).map_err(|error| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{description} is not valid UTF-8: {error}"),
+        )
+    })
+}
+
 fn parse_aws_ini(contents: &str) -> HashMap<String, HashMap<String, String>> {
     let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut current: Option<String> = None;
@@ -1748,11 +2690,15 @@ where
     F: FnMut(&str) -> Option<String>,
 {
     let (credentials_path, config_path) = aws_credentials_paths_from_env(env)?;
-    let credentials = std::fs::read_to_string(&credentials_path)
-        .ok()
-        .as_deref()
-        .map(parse_aws_ini)
-        .unwrap_or_default();
+    let credentials = read_bounded_aws_text(
+        &credentials_path,
+        MAX_AWS_SHARED_CONFIG_BYTES,
+        "AWS shared credentials file",
+    )
+    .ok()
+    .as_deref()
+    .map(parse_aws_ini)
+    .unwrap_or_default();
     let profile_key = profile.trim().to_ascii_lowercase();
     let section = credentials.get(&profile_key)?;
 
@@ -1778,7 +2724,13 @@ where
         }
     }
 
-    if allow_config_region && let Ok(config_text) = std::fs::read_to_string(&config_path) {
+    if allow_config_region
+        && let Ok(config_text) = read_bounded_aws_text(
+            &config_path,
+            MAX_AWS_SHARED_CONFIG_BYTES,
+            "AWS shared config file",
+        )
+    {
         let config = parse_aws_ini(&config_text);
         for name in profile_section_candidates(&profile_key) {
             if let Some(section) = config.get(&name)
@@ -1868,6 +2820,9 @@ pub struct AwsSsoTokenLocator {
     pub target_region: String,
 }
 
+const MAX_AWS_SSO_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_AWS_SSO_ERROR_SNIPPET_BYTES: usize = 16 * 1024;
+
 /// Detect an AWS SSO profile in `~/.aws/config` and resolve the cached
 /// access token from `~/.aws/sso/cache/<sha1>.json`.
 ///
@@ -1898,8 +2853,19 @@ where
     let Some(config_path) = aws_config_path_from_env(env) else {
         return Ok(None);
     };
-    let Ok(config_text) = std::fs::read_to_string(&config_path) else {
-        return Ok(None);
+    let config_text = match read_bounded_aws_text(
+        &config_path,
+        MAX_AWS_SHARED_CONFIG_BYTES,
+        "AWS shared config file",
+    ) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::auth(format!(
+                "Failed to read AWS shared config {}: {error}",
+                config_path.display()
+            )));
+        }
     };
     let config = parse_aws_ini(&config_text);
     let profile_key = profile.trim().to_ascii_lowercase();
@@ -2089,12 +3055,13 @@ struct SsoCachedToken {
 
 fn load_aws_sso_token_cache(cache_dir: &Path, cache_key: &str, profile: &str) -> Result<String> {
     let path = aws_sso_cache_path(cache_dir, cache_key);
-    let text = std::fs::read_to_string(&path).map_err(|err| {
-        Error::auth(format!(
-            "AWS SSO token cache not found ({}: {err}); run: aws sso login --profile {profile}",
-            path.display()
-        ))
-    })?;
+    let text = read_bounded_aws_text(&path, MAX_AWS_SSO_CACHE_BYTES, "AWS SSO token cache")
+        .map_err(|err| {
+            Error::auth(format!(
+                "AWS SSO token cache unavailable ({}: {err}); run: aws sso login --profile {profile}",
+                path.display()
+            ))
+        })?;
     let cached: SsoCachedToken = serde_json::from_str(&text).map_err(|err| {
         Error::auth(format!(
             "AWS SSO token cache at {} is malformed ({err}); run: aws sso login --profile {profile}",
@@ -2257,10 +3224,18 @@ async fn exchange_aws_sso_credentials_with_client(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_AWS_SSO_RESPONSE_BYTES)
         .await
-        .unwrap_or_else(|_| "<failed to read body>".to_string());
-    let redacted = redact_known_secrets(&text, &[locator.access_token.as_str()]);
+        .map_err(|error| {
+            Error::auth(format!(
+                "AWS SSO GetRoleCredentials returned an unreadable or oversized response body (HTTP {status}): {error}"
+            ))
+        })?;
+    let redacted = redact_known_secrets_bounded(
+        &text,
+        &[locator.access_token.as_str()],
+        MAX_AWS_SSO_ERROR_SNIPPET_BYTES,
+    );
 
     if matches!(status, 401 | 403) {
         return Err(Error::auth(format!(
@@ -2311,6 +3286,16 @@ pub async fn resolve_aws_credentials_async(
     resolve_aws_credentials_async_with_env(auth, client, |var| std::env::var(var).ok()).await
 }
 
+pub(crate) async fn resolve_ambient_aws_credentials_async(
+    client: &crate::http::client::Client,
+) -> Result<Option<AwsResolvedCredentials>> {
+    let empty_auth = AuthStorage {
+        path: PathBuf::new(),
+        entries: HashMap::new(),
+    };
+    resolve_aws_credentials_async(&empty_auth, client).await
+}
+
 async fn resolve_aws_credentials_async_with_env<F>(
     auth: &AuthStorage,
     client: &crate::http::client::Client,
@@ -2319,9 +3304,11 @@ async fn resolve_aws_credentials_async_with_env<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    // Phase 1: synchronous chain (env vars, static profile credentials,
-    // stored auth.json) covers the existing fast paths without HTTP.
-    if let Some(resolved) = resolve_aws_credentials_with_env(auth, &mut env) {
+    // Phase 1: synchronous ambient sources (bearer env, complete env keys,
+    // static profile credentials) cover the fast paths without HTTP. Stored
+    // auth.json credentials are deliberately deferred until after an explicitly
+    // selected SSO profile has had its chance at the profile tier.
+    if let Some(resolved) = resolve_aws_credentials_with_env_policy(auth, &mut env, false) {
         return Ok(Some(resolved));
     }
 
@@ -2329,17 +3316,11 @@ where
     // None when AWS_PROFILE points at a profile that has no static IAM
     // credentials in `~/.aws/credentials`. SSO profiles routinely look that
     // way, so we re-read the config here and try the SSO path.
-    let env_region = env("AWS_REGION")
-        .or_else(|| env("AWS_DEFAULT_REGION"))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let env_region = preferred_non_empty_env(&mut env, "AWS_REGION", "AWS_DEFAULT_REGION");
     let region_default = env_region
         .clone()
         .unwrap_or_else(|| "us-east-1".to_string());
-    let profile = env("AWS_PROFILE")
-        .or_else(|| env("AWS_DEFAULT_PROFILE"))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+    let profile = preferred_non_empty_env(&mut env, "AWS_PROFILE", "AWS_DEFAULT_PROFILE");
 
     if let Some(profile) = profile {
         match detect_aws_sso_profile_with_env(
@@ -2357,10 +3338,12 @@ where
         }
     }
 
-    Ok(None)
+    Ok(resolve_stored_aws_credentials(auth, region_default))
 }
 
 // ── SAP AI Core Service Key Resolution ──────────────────────────
+
+const MAX_SAP_TOKEN_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Resolved SAP AI Core credentials ready for client-credentials token exchange.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2378,6 +3361,10 @@ pub struct SapResolvedCredentials {
 /// 2. Individual env vars: `SAP_AI_CORE_CLIENT_ID`, `SAP_AI_CORE_CLIENT_SECRET`,
 ///    `SAP_AI_CORE_TOKEN_URL`, `SAP_AI_CORE_SERVICE_URL`
 /// 3. Stored `ServiceKey` in auth.json
+///
+/// A present, non-empty `AICORE_SERVICE_KEY` is authoritative. If it is malformed, resolution
+/// fails closed (`None`) instead of silently falling through to a different account's split or
+/// stored credentials.
 pub fn resolve_sap_credentials(auth: &AuthStorage) -> Option<SapResolvedCredentials> {
     resolve_sap_credentials_with_env(auth, |var| std::env::var(var).ok())
 }
@@ -2389,11 +3376,13 @@ fn resolve_sap_credentials_with_env<F>(
 where
     F: FnMut(&str) -> Option<String>,
 {
-    // 1. JSON-encoded service key from env
-    if let Some(key_json) = env("AICORE_SERVICE_KEY")
-        && let Some(creds) = parse_sap_service_key_json(&key_json)
-    {
-        return Some(creds);
+    // 1. JSON-encoded service key from env. A non-empty invalid value is authoritative and must
+    // stop the chain; falling through could silently authenticate to a different SAP account.
+    if let Some(key_json) = env("AICORE_SERVICE_KEY") {
+        let key_json = key_json.trim();
+        if !key_json.is_empty() {
+            return parse_sap_service_key_json(key_json);
+        }
     }
 
     // 2. Individual env vars
@@ -2420,6 +3409,10 @@ where
     }
 
     // 3. Stored service key in auth.json
+    stored_sap_service_key(auth)
+}
+
+fn stored_sap_service_key(auth: &AuthStorage) -> Option<SapResolvedCredentials> {
     let provider = "sap-ai-core";
     if let Some(AuthCredential::ServiceKey {
         client_id,
@@ -2433,16 +3426,16 @@ where
             token_url.as_ref(),
             service_url.as_ref(),
         )
-        && !id.is_empty()
-        && !secret.is_empty()
-        && !turl.is_empty()
-        && !surl.is_empty()
+        && !id.trim().is_empty()
+        && !secret.trim().is_empty()
+        && !turl.trim().is_empty()
+        && !surl.trim().is_empty()
     {
         return Some(SapResolvedCredentials {
-            client_id: id.clone(),
-            client_secret: secret.clone(),
-            token_url: turl.clone(),
-            service_url: surl.clone(),
+            client_id: id.trim().to_string(),
+            client_secret: secret.trim().to_string(),
+            token_url: turl.trim().to_string(),
+            service_url: surl.trim().to_string(),
         });
     }
 
@@ -2460,22 +3453,26 @@ fn parse_sap_service_key_json(json_str: &str) -> Option<SapResolvedCredentials> 
         .get("clientid")
         .or_else(|| obj.get("client_id"))
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let client_secret = obj
         .get("clientsecret")
         .or_else(|| obj.get("client_secret"))
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let token_url = obj
         .get("url")
         .or_else(|| obj.get("token_url"))
         .and_then(|v| v.as_str())
+        .map(str::trim)
         .filter(|s| !s.is_empty())?;
     let service_url = obj
         .get("serviceurls")
         .and_then(|v| v.get("AI_API_URL"))
         .and_then(|v| v.as_str())
         .or_else(|| obj.get("service_url").and_then(|v| v.as_str()))
+        .map(str::trim)
         .filter(|s| !s.is_empty())?;
 
     Some(SapResolvedCredentials {
@@ -2491,11 +3488,239 @@ struct SapTokenExchangeResponse {
     access_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SapAuthMaterial {
+    DirectBearer(String),
+    ServiceKey(SapResolvedCredentials),
+}
+
+fn classify_sap_auth_candidate(candidate: &str) -> Result<Option<SapAuthMaterial>> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return Ok(None);
+    }
+    if candidate.starts_with('{') || candidate.starts_with('[') {
+        let credentials = parse_sap_service_key_json(candidate).ok_or_else(|| {
+            Error::auth(
+                "SAP AI Core credential is JSON-shaped but is not a valid service key".to_string(),
+            )
+        })?;
+        return Ok(Some(SapAuthMaterial::ServiceKey(credentials)));
+    }
+    Ok(Some(SapAuthMaterial::DirectBearer(candidate.to_string())))
+}
+
+fn stored_sap_candidate(auth: &AuthStorage, direct: bool) -> Option<String> {
+    let credential = auth.credential_for_provider("sap-ai-core")?;
+    match (direct, credential) {
+        (
+            true,
+            credential @ (AuthCredential::OAuth { .. } | AuthCredential::BearerToken { .. }),
+        )
+        | (false, credential @ AuthCredential::ApiKey { .. }) => {
+            api_key_from_credential(credential)
+        }
+        _ => None,
+    }
+}
+
+fn resolve_sap_credentials_for_exchange_with_env<F>(
+    auth: &AuthStorage,
+    mut env: F,
+) -> Result<Option<SapResolvedCredentials>>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    if let Some(service_key) = env("AICORE_SERVICE_KEY") {
+        let service_key = service_key.trim();
+        if !service_key.is_empty() {
+            return parse_sap_service_key_json(service_key)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::auth(
+                        "AICORE_SERVICE_KEY is set but is not a valid SAP AI Core service key"
+                            .to_string(),
+                    )
+                });
+        }
+    }
+
+    let split_names = [
+        "SAP_AI_CORE_CLIENT_ID",
+        "SAP_AI_CORE_CLIENT_SECRET",
+        "SAP_AI_CORE_TOKEN_URL",
+        "SAP_AI_CORE_SERVICE_URL",
+    ];
+    let split_values = split_names.map(|name| {
+        env(name)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    });
+    if split_values.iter().any(Option::is_some) {
+        let [
+            Some(client_id),
+            Some(client_secret),
+            Some(token_url),
+            Some(service_url),
+        ] = split_values
+        else {
+            return Err(Error::auth(
+                "SAP AI Core split credentials are partially configured; set all of SAP_AI_CORE_CLIENT_ID, SAP_AI_CORE_CLIENT_SECRET, SAP_AI_CORE_TOKEN_URL, and SAP_AI_CORE_SERVICE_URL, or unset the partial values"
+                    .to_string(),
+            ));
+        };
+        return Ok(Some(SapResolvedCredentials {
+            client_id,
+            client_secret,
+            token_url,
+            service_url,
+        }));
+    }
+
+    Ok(stored_sap_service_key(auth))
+}
+
+fn resolve_sap_auth_material_with_env<F>(
+    auth: &AuthStorage,
+    candidate: Option<&str>,
+    env: F,
+) -> Result<Option<SapAuthMaterial>>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    // 1. Explicit caller candidate.
+    if let Some(material) = candidate
+        .map(classify_sap_auth_candidate)
+        .transpose()?
+        .flatten()
+    {
+        return Ok(Some(material));
+    }
+
+    // 2. Stored OAuth/Bearer credentials intentionally beat ambient configuration, matching the
+    // generic auth contract and preventing a stale shell environment from overriding `/login`.
+    if let Some(material) = stored_sap_candidate(auth, true)
+        .as_deref()
+        .map(classify_sap_auth_candidate)
+        .transpose()?
+        .flatten()
+    {
+        return Ok(Some(material));
+    }
+
+    // 3-5. Valid AICORE_SERVICE_KEY, then complete split env credentials, then a structured
+    // stored ServiceKey. A malformed non-empty AICORE_SERVICE_KEY returns an error here.
+    if let Some(credentials) = resolve_sap_credentials_for_exchange_with_env(auth, env)? {
+        return Ok(Some(SapAuthMaterial::ServiceKey(credentials)));
+    }
+
+    // 6. Legacy ApiKey entries are the lowest stored tier. Their payload may itself be service-key
+    // JSON, so it still goes through the same classifier and can never become a raw bearer header.
+    stored_sap_candidate(auth, false)
+        .as_deref()
+        .map(classify_sap_auth_candidate)
+        .transpose()
+        .map(Option::flatten)
+}
+
+async fn resolve_sap_auth_material_with_client(
+    client: &crate::http::client::Client,
+    material: SapAuthMaterial,
+) -> Result<String> {
+    match material {
+        SapAuthMaterial::DirectBearer(token) => Ok(token),
+        SapAuthMaterial::ServiceKey(credentials) => {
+            exchange_sap_access_token_with_client(client, &credentials).await
+        }
+    }
+}
+
+async fn resolve_ambient_sap_auth_token_with_client_and_env<F>(
+    client: &crate::http::client::Client,
+    env: F,
+) -> Result<Option<String>>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let empty_auth = AuthStorage {
+        path: PathBuf::new(),
+        entries: HashMap::new(),
+    };
+    let Some(material) = resolve_sap_auth_material_with_env(&empty_auth, None, env)? else {
+        return Ok(None);
+    };
+    resolve_sap_auth_material_with_client(client, material)
+        .await
+        .map(Some)
+}
+
+pub(crate) async fn resolve_ambient_sap_auth_token_with_client(
+    client: &crate::http::client::Client,
+) -> Result<Option<String>> {
+    resolve_ambient_sap_auth_token_with_client_and_env(client, |name| std::env::var(name).ok())
+        .await
+}
+
+/// Resolve SAP authentication from ambient service-key variables only.
+pub async fn resolve_ambient_sap_auth_token() -> Result<Option<String>> {
+    let client = crate::http::client::Client::new();
+    resolve_ambient_sap_auth_token_with_client(&client).await
+}
+
+/// Resolve one candidate SAP auth value without ever treating service-key JSON as a bearer.
+///
+/// Non-JSON candidates are direct bearer tokens. JSON-shaped candidates must be valid SAP
+/// service keys and are exchanged; malformed JSON-shaped values fail closed instead of being sent
+/// verbatim in an `Authorization` header.
+pub(crate) async fn resolve_sap_auth_candidate_with_client(
+    client: &crate::http::client::Client,
+    candidate: &str,
+) -> Result<Option<String>> {
+    let Some(material) = classify_sap_auth_candidate(candidate)? else {
+        return Ok(None);
+    };
+    resolve_sap_auth_material_with_client(client, material)
+        .await
+        .map(Some)
+}
+
+/// Resolve one explicit SAP auth candidate as either a direct bearer or exchanged service key.
+pub async fn resolve_sap_auth_candidate(candidate: &str) -> Result<Option<String>> {
+    let client = crate::http::client::Client::new();
+    resolve_sap_auth_candidate_with_client(&client, candidate).await
+}
+
+pub(crate) async fn resolve_sap_auth_token_with_client(
+    client: &crate::http::client::Client,
+    auth: &AuthStorage,
+    candidate: Option<&str>,
+) -> Result<Option<String>> {
+    let Some(material) =
+        resolve_sap_auth_material_with_env(auth, candidate, |name| std::env::var(name).ok())?
+    else {
+        return Ok(None);
+    };
+    resolve_sap_auth_material_with_client(client, material)
+        .await
+        .map(Some)
+}
+
+/// Resolve SAP authentication across direct-bearer and service-key credential forms.
+pub async fn resolve_sap_auth_token(
+    auth: &AuthStorage,
+    candidate: Option<&str>,
+) -> Result<Option<String>> {
+    let client = crate::http::client::Client::new();
+    resolve_sap_auth_token_with_client(&client, auth, candidate).await
+}
+
 /// Exchange SAP AI Core service-key credentials for an access token.
 ///
 /// Returns `Ok(None)` when SAP credentials are not configured.
 pub async fn exchange_sap_access_token(auth: &AuthStorage) -> Result<Option<String>> {
-    let Some(creds) = resolve_sap_credentials(auth) else {
+    let Some(creds) =
+        resolve_sap_credentials_for_exchange_with_env(auth, |name| std::env::var(name).ok())?
+    else {
         return Ok(None);
     };
 
@@ -2504,7 +3729,7 @@ pub async fn exchange_sap_access_token(auth: &AuthStorage) -> Result<Option<Stri
     Ok(Some(token))
 }
 
-async fn exchange_sap_access_token_with_client(
+pub(crate) async fn exchange_sap_access_token_with_client(
     client: &crate::http::client::Client,
     creds: &SapResolvedCredentials,
 ) -> Result<String> {
@@ -2526,15 +3751,19 @@ async fn exchange_sap_access_token_with_client(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_SAP_TOKEN_RESPONSE_BYTES)
         .await
-        .unwrap_or_else(|_| "<failed to read body>".to_string());
-    let redacted_text = redact_known_secrets(
-        &text,
-        &[creds.client_id.as_str(), creds.client_secret.as_str()],
-    );
-
+        .map_err(|error| {
+            Error::auth(format!(
+                "SAP AI Core token exchange returned an unreadable or oversized response body (HTTP {status}): {error}"
+            ))
+        })?;
     if !(200..300).contains(&status) {
+        let redacted_text = redact_known_secrets_bounded(
+            &text,
+            &[creds.client_id.as_str(), creds.client_secret.as_str()],
+            MAX_SAP_TOKEN_RESPONSE_BYTES,
+        );
         return Err(Error::auth(format!(
             "SAP AI Core token exchange failed (HTTP {status}): {redacted_text}"
         )));
@@ -2552,47 +3781,217 @@ async fn exchange_sap_access_token_with_client(
     Ok(access_token.to_string())
 }
 
-fn redact_known_secrets(text: &str, secrets: &[&str]) -> String {
-    let mut redacted = text.to_string();
+const DEFAULT_REDACTED_ERROR_BYTES: usize = 64 * 1024;
+
+fn known_secret_variants(secrets: &[&str]) -> Vec<(String, bool)> {
+    let mut variants = Vec::with_capacity(secrets.len().saturating_mul(12));
     for secret in secrets {
         let trimmed = secret.trim();
-        if !trimmed.is_empty() {
-            redacted = redacted.replace(trimmed, "[REDACTED]");
+        if trimmed.is_empty() {
+            continue;
+        }
+        for value in [*secret, trimmed] {
+            variants.push((value.to_string(), false));
+            // A gateway can embed an upstream JSON fragment inside otherwise non-JSON text.
+            // Include the JSON string's escaped payload (without its surrounding quotes) so the
+            // bounded raw scanner still catches quotes, backslashes, and control characters when
+            // parsing the complete diagnostic as JSON is impossible.
+            if let Ok(json_string) = serde_json::to_string(value)
+                && let Some(json_payload) = json_string
+                    .strip_prefix('"')
+                    .and_then(|payload| payload.strip_suffix('"'))
+            {
+                variants.push((json_payload.to_string(), false));
+            }
+            // OAuth servers and proxies sometimes echo the submitted form body rather than the
+            // decoded credential. Redacting only the raw value would expose credentials that
+            // contain spaces or reserved characters as `%XX` sequences in an error message.
+            let percent_encoded = percent_encode_component(value);
+            variants.push((percent_encoded.clone(), true));
+            variants.push((percent_encoded.replace("%20", "+"), true));
         }
     }
 
-    redact_sensitive_json_fields(&redacted)
+    // Replace longer values first so a client ID that is a prefix of the client secret cannot
+    // partially redact the latter and leave its suffix visible.
+    variants.sort_unstable_by(|left, right| {
+        right
+            .0
+            .len()
+            .cmp(&left.0.len())
+            .then_with(|| left.cmp(right))
+    });
+    variants.dedup();
+    variants
 }
 
-fn redact_sensitive_json_fields(text: &str) -> String {
-    let Ok(mut json) = serde_json::from_str::<serde_json::Value>(text) else {
-        return text.to_string();
+pub(crate) fn redact_known_secrets(text: &str, secrets: &[&str]) -> String {
+    redact_known_secrets_bounded(text, secrets, DEFAULT_REDACTED_ERROR_BYTES)
+}
+
+pub(crate) fn redact_known_secrets_bounded(
+    text: &str,
+    secrets: &[&str],
+    max_bytes: usize,
+) -> String {
+    let variants = known_secret_variants(secrets);
+
+    let redacted = serde_json::from_str::<serde_json::Value>(text).map_or_else(
+        |_| text.to_string(),
+        |mut json| {
+            redact_sensitive_json_value(&mut json, &variants);
+            serde_json::to_string(&json).unwrap_or_else(|_| text.to_string())
+        },
+    );
+    redact_known_secret_variants_bounded(&redacted, &variants, max_bytes)
+}
+
+fn redact_known_secret_variants_bounded(
+    text: &str,
+    variants: &[(String, bool)],
+    max_bytes: usize,
+) -> String {
+    const TRUNCATION_MARKER: &str = "...[truncated]";
+    const REDACTION_MARKER: &str = "[REDACTED]";
+    let mut result = String::with_capacity(text.len().min(max_bytes));
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let remaining = &text[cursor..];
+        if let Some((variant, _)) = variants
+            .iter()
+            .find(|(variant, encoded)| variant_matches_at(remaining, variant, *encoded))
+        {
+            if REDACTION_MARKER.len() > max_bytes.saturating_sub(result.len()) {
+                return append_truncation_marker(result, max_bytes, TRUNCATION_MARKER);
+            }
+            result.push_str(REDACTION_MARKER);
+            cursor += variant.len();
+            continue;
+        }
+
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        if character.len_utf8() > max_bytes.saturating_sub(result.len()) {
+            return append_truncation_marker(result, max_bytes, TRUNCATION_MARKER);
+        }
+        result.push(character);
+        cursor += character.len_utf8();
+    }
+    result
+}
+
+fn append_truncation_marker(
+    mut output: String,
+    max_bytes: usize,
+    truncation_marker: &str,
+) -> String {
+    if max_bytes <= truncation_marker.len() {
+        return truncation_marker[..max_bytes].to_string();
+    }
+    let mut end = output.len().min(max_bytes - truncation_marker.len());
+    while !output.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.truncate(end);
+    output.push_str(truncation_marker);
+    output
+}
+
+fn variant_matches_at(text: &str, pattern: &str, percent_escape_case_insensitive: bool) -> bool {
+    let Some(candidate) = text.as_bytes().get(..pattern.len()) else {
+        return false;
     };
-    redact_sensitive_json_value(&mut json);
-    serde_json::to_string(&json).unwrap_or_else(|_| text.to_string())
+    if percent_escape_case_insensitive {
+        percent_encoded_variant_matches(candidate, pattern.as_bytes())
+    } else {
+        candidate == pattern.as_bytes()
+    }
 }
 
-fn redact_sensitive_json_value(value: &mut serde_json::Value) {
+const fn percent_encoded_variant_matches(candidate: &[u8], pattern: &[u8]) -> bool {
+    if candidate.len() != pattern.len() {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < pattern.len() {
+        if pattern[index] == b'%'
+            && index + 2 < pattern.len()
+            && pattern[index + 1].is_ascii_hexdigit()
+            && pattern[index + 2].is_ascii_hexdigit()
+        {
+            if candidate[index] != b'%'
+                || !candidate[index + 1].eq_ignore_ascii_case(&pattern[index + 1])
+                || !candidate[index + 2].eq_ignore_ascii_case(&pattern[index + 2])
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            if candidate[index] != pattern[index] {
+                return false;
+            }
+            index += 1;
+        }
+    }
+    true
+}
+
+fn lowercase_percent_escape_hex(value: &str) -> String {
+    let mut bytes = value.as_bytes().to_vec();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == b'%'
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+        {
+            bytes[index + 1].make_ascii_lowercase();
+            bytes[index + 2].make_ascii_lowercase();
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    String::from_utf8(bytes).unwrap_or_else(|_| value.to_string())
+}
+
+fn redact_sensitive_json_value(value: &mut serde_json::Value, variants: &[(String, bool)]) {
     match value {
         serde_json::Value::Object(map) => {
-            for (key, nested) in map {
-                if is_sensitive_json_key(key) {
-                    *nested = serde_json::Value::String("[REDACTED]".to_string());
+            let entries = std::mem::take(map);
+            for (key, mut nested) in entries {
+                if is_sensitive_json_key(&key) {
+                    nested = serde_json::Value::String("[REDACTED]".to_string());
                 } else {
-                    redact_sensitive_json_value(nested);
+                    redact_sensitive_json_value(&mut nested, variants);
                 }
+                map.insert(redact_known_secret_variants(&key, variants), nested);
             }
         }
         serde_json::Value::Array(items) => {
             for item in items {
-                redact_sensitive_json_value(item);
+                redact_sensitive_json_value(item, variants);
             }
         }
-        serde_json::Value::Null
-        | serde_json::Value::Bool(_)
-        | serde_json::Value::Number(_)
-        | serde_json::Value::String(_) => {}
+        serde_json::Value::String(text) => {
+            *text = redact_known_secret_variants(text, variants);
+        }
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {}
     }
+}
+
+fn redact_known_secret_variants(text: &str, variants: &[(String, bool)]) -> String {
+    for (start, _) in text.char_indices() {
+        let remaining = &text[start..];
+        if variants
+            .iter()
+            .any(|(variant, encoded)| variant_matches_at(remaining, variant, *encoded))
+        {
+            return "[REDACTED]".to_string();
+        }
+    }
+    text.to_string()
 }
 
 fn is_sensitive_json_key(key: &str) -> bool {
@@ -3289,7 +4688,7 @@ pub async fn complete_anthropic_oauth(code_input: &str, verifier: &str) -> Resul
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[code.as_str(), verifier, state.as_str()]);
@@ -3334,7 +4733,7 @@ async fn refresh_anthropic_oauth_token(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[refresh_token]);
@@ -3433,7 +4832,7 @@ pub async fn complete_openai_codex_oauth(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[code.as_str(), verifier]);
@@ -3553,7 +4952,7 @@ async fn discover_google_gemini_cli_project_id(
         .map_err(|e| Error::auth(format!("Google Cloud project discovery failed: {e}")))?;
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
 
@@ -3600,7 +4999,10 @@ async fn discover_google_antigravity_project_id(
         if !(200..300).contains(&status) {
             continue;
         }
-        let text = response.text().await.unwrap_or_default();
+        let text = response
+            .text_limited(MAX_OAUTH_RESPONSE_BYTES)
+            .await
+            .unwrap_or_default();
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
             && let Some(project_id) = parse_code_assist_project_id(&value)
         {
@@ -3658,7 +5060,7 @@ async fn exchange_google_authorization_code(
         .map_err(|e| Error::auth(format!("OAuth token exchange failed: {e}")))?;
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[code, verifier, client_secret]);
@@ -3791,7 +5193,7 @@ async fn refresh_google_oauth_token_with_project(
         .map_err(|e| Error::auth(format!("{provider_name} token refresh failed: {e}")))?;
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[client_secret, refresh_token]);
@@ -3883,7 +5285,7 @@ async fn start_kimi_code_device_flow_with_client(
         .map_err(|e| Error::auth(format!("Kimi device authorization request failed: {e}")))?;
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[&kimi_client_id]);
@@ -3933,7 +5335,7 @@ async fn poll_kimi_code_device_flow_with_client(
     };
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let json: serde_json::Value = match serde_json::from_str(&text) {
@@ -4012,7 +5414,7 @@ async fn refresh_kimi_code_oauth_token(
         .map_err(|e| Error::auth(format!("Kimi token refresh failed: {e}")))?;
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[refresh_token]);
@@ -4122,7 +5524,7 @@ pub async fn complete_extension_oauth_with_client(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[code.as_str(), verifier, state.as_str()]);
@@ -4166,7 +5568,7 @@ async fn refresh_extension_oauth_token(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[refresh_token]);
@@ -4216,7 +5618,7 @@ async fn refresh_self_contained_oauth_token(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted_text = redact_known_secrets(&text, &[refresh_token]);
@@ -4358,7 +5760,7 @@ pub async fn complete_copilot_browser_oauth(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted = redact_known_secrets(&text, &[code.as_str(), verifier, state.as_str()]);
@@ -4421,7 +5823,7 @@ pub async fn start_copilot_device_flow(config: &CopilotOAuthConfig) -> Result<De
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
 
@@ -4476,7 +5878,7 @@ pub async fn poll_copilot_device_flow(
     };
 
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
 
@@ -4672,7 +6074,7 @@ pub async fn complete_gitlab_oauth(
 
     let status = response.status();
     let text = response
-        .text()
+        .text_limited(MAX_OAUTH_RESPONSE_BYTES)
         .await
         .unwrap_or_else(|_| "<failed to read body>".to_string());
     let redacted = redact_known_secrets(&text, &[code.as_str(), verifier, state.as_str()]);
@@ -4975,6 +6377,184 @@ mod tests {
         let loaded = AuthStorage::load(auth_path.clone()).expect("load");
         assert!(loaded.entries.is_empty());
         assert_eq!(loaded.path, auth_path);
+    }
+
+    #[test]
+    fn test_auth_storage_load_missing_parent_does_not_create_directories() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let missing_parent = dir.path().join("not-created");
+        let auth_path = missing_parent.join("auth.json");
+
+        let loaded = AuthStorage::load(auth_path.clone()).expect("load missing auth storage");
+
+        assert!(loaded.entries.is_empty());
+        assert_eq!(loaded.path, auth_path);
+        assert!(
+            !missing_parent.exists(),
+            "loading a missing auth store must not create its parent directory"
+        );
+    }
+
+    #[test]
+    fn test_auth_storage_classifies_live_lock_timeout_separately_from_read_failure() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        assert!(!auth_path.exists());
+
+        let held_lock = crate::file_lock::DirLock::acquire_for(&auth_path, Duration::from_secs(1))
+            .expect("hold auth lock");
+        let lock_failure = AuthStorage::load_with_lock_timeout_classified(
+            auth_path.clone(),
+            Duration::from_millis(25),
+        )
+        .expect_err("a first-write lock must produce a typed timeout before auth.json exists");
+        assert!(matches!(
+            lock_failure,
+            AuthStorageLoadFailure::LockTimeout(ref error)
+                if error.kind() == std::io::ErrorKind::TimedOut
+        ));
+        drop(held_lock);
+
+        std::fs::write(&auth_path, [0xff]).expect("write invalid UTF-8 auth fixture");
+        let read_failure =
+            AuthStorage::load_with_lock_timeout_classified(auth_path, Duration::from_secs(1))
+                .expect_err("an unreadable auth file must be a non-contention failure");
+        assert!(matches!(read_failure, AuthStorageLoadFailure::Other(_)));
+    }
+
+    #[test]
+    fn test_auth_storage_rejects_oversized_file_before_parsing() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        std::fs::write(&auth_path, vec![b' '; MAX_AUTH_FILE_BYTES + 1])
+            .expect("write oversized auth fixture");
+
+        let failure =
+            AuthStorage::load_with_lock_timeout_classified(auth_path, Duration::from_secs(1))
+                .expect_err("oversized auth.json must fail before JSON parsing");
+        let AuthStorageLoadFailure::Other(error) = failure else {
+            panic!("oversized auth.json must not be classified as lock contention");
+        };
+        assert!(error.to_string().contains("exceeds"), "{error}");
+        assert!(
+            error.to_string().contains(&MAX_AUTH_FILE_BYTES.to_string()),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_auth_storage_rejects_final_symlink_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let target_path = dir.path().join("credential-target.json");
+        let target_contents = br#"{"openai":{"type":"api_key","key":"target-secret"}}"#;
+        std::fs::write(&target_path, target_contents).expect("write auth symlink target");
+        let auth_path = dir.path().join("auth.json");
+        symlink(&target_path, &auth_path).expect("create auth symlink");
+
+        let failure = AuthStorage::load_with_lock_timeout_classified(
+            auth_path.clone(),
+            Duration::from_secs(1),
+        )
+        .expect_err("auth.json symlink must fail closed");
+        let AuthStorageLoadFailure::Other(error) = failure else {
+            panic!("auth.json symlink must not be classified as lock contention");
+        };
+        assert!(error.to_string().contains("non-link"), "{error}");
+        assert!(
+            std::fs::symlink_metadata(auth_path)
+                .expect("auth symlink metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::read(&target_path).expect("read preserved target"),
+            target_contents
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_auth_storage_rejects_intermediate_symlink_without_reading_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let redirected_parent = dir.path().join("redirected");
+        fs::create_dir(&redirected_parent).expect("create redirected parent");
+        let target_contents = br#"{"openai":{"type":"api_key","key":"redirected-secret"}}"#;
+        fs::write(redirected_parent.join("auth.json"), target_contents)
+            .expect("write redirected auth target");
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&redirected_parent, &linked_parent).expect("create intermediate symlink");
+        let auth_path = linked_parent.join("auth.json");
+
+        let failure =
+            AuthStorage::load_with_lock_timeout_classified(auth_path, Duration::from_secs(1))
+                .expect_err("an intermediate auth symlink must fail closed");
+
+        assert!(
+            matches!(failure, AuthStorageLoadFailure::Other(_)),
+            "an intermediate symlink is a path-integrity failure, not lock contention"
+        );
+        assert_eq!(
+            fs::read(redirected_parent.join("auth.json")).expect("read redirected target"),
+            target_contents,
+            "the rejected read must not modify the redirected credential target"
+        );
+        assert!(
+            !redirected_parent.join("auth.json.lock").exists(),
+            "the redirected parent must never receive lock state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_auth_storage_detects_parent_swap_before_descriptor_relative_read() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let parent = dir.path().join("agent");
+        let moved_parent = dir.path().join("moved-agent");
+        let redirected_parent = dir.path().join("redirected");
+        fs::create_dir(&parent).expect("create auth parent");
+        fs::create_dir(&redirected_parent).expect("create redirected parent");
+        fs::write(
+            parent.join("auth.json"),
+            br#"{"openai":{"type":"api_key","key":"original-secret"}}"#,
+        )
+        .expect("write original auth");
+        fs::write(
+            redirected_parent.join("auth.json"),
+            br#"{"openai":{"type":"api_key","key":"redirected-secret"}}"#,
+        )
+        .expect("write redirected auth");
+        let auth_path = parent.join("auth.json");
+
+        let failure = AuthStorage::load_with_lock_timeout_classified_and_hook(
+            auth_path,
+            Duration::from_secs(1),
+            || {
+                fs::rename(&parent, &moved_parent)?;
+                symlink(&redirected_parent, &parent)?;
+                Ok(())
+            },
+        )
+        .expect_err("a swapped auth parent must fail before credential read");
+
+        assert!(
+            matches!(failure, AuthStorageLoadFailure::Other(_)),
+            "a parent swap is a path-integrity failure, not lock contention"
+        );
+        assert!(
+            !moved_parent.join("auth.json.lock").exists(),
+            "the descriptor-relative read lock must be released from the moved parent"
+        );
+        assert!(
+            !redirected_parent.join("auth.json.lock").exists(),
+            "the replacement parent must never receive read-lock state"
+        );
     }
 
     #[test]
@@ -6176,11 +7756,75 @@ mod tests {
     fn test_auth_storage_load_corrupted_json_returns_empty() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let auth_path = dir.path().join("auth.json");
-        fs::write(&auth_path, "not valid json {{").expect("write");
+        let corrupt_content = "not valid json {{";
+        fs::write(&auth_path, corrupt_content).expect("write");
 
-        let auth = AuthStorage::load(auth_path).expect("load");
-        // Corrupted JSON falls through to `unwrap_or_default()`.
+        let auth = AuthStorage::load(auth_path.clone()).expect("load");
         assert!(auth.entries.is_empty());
+        assert_eq!(
+            fs::read_to_string(auth_path.with_extension("json.corrupt"))
+                .expect("read corrupt auth backup"),
+            corrupt_content,
+            "the backup must contain the exact bounded bytes that were parsed"
+        );
+    }
+
+    #[test]
+    fn test_corrupt_auth_load_is_not_delayed_by_busy_backup_lock() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        fs::write(&auth_path, "not valid json {{").expect("write corrupt auth");
+        let backup_path = auth_path.with_extension("json.corrupt");
+        let held_backup_lock =
+            crate::file_lock::DirLock::acquire_for(&backup_path, Duration::from_secs(1))
+                .expect("hold backup lock");
+
+        let auth = AuthStorage::load_with_lock_timeout(auth_path, Duration::from_secs(1))
+            .expect("a busy diagnostic-backup lock must not fail credential loading");
+
+        assert!(auth.entries.is_empty());
+        assert!(
+            !backup_path.exists(),
+            "a contended best-effort backup must not be written without its lock"
+        );
+        drop(held_backup_lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_corrupt_auth_backup_replaces_symlink_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let corrupt_content = "not valid json {{";
+        fs::write(&auth_path, corrupt_content).expect("write corrupt auth");
+
+        let unrelated_path = dir.path().join("unrelated.json");
+        let unrelated_content = b"must remain unchanged";
+        fs::write(&unrelated_path, unrelated_content).expect("write unrelated target");
+        let backup_path = auth_path.with_extension("json.corrupt");
+        symlink(&unrelated_path, &backup_path).expect("create hostile backup symlink");
+
+        let auth = AuthStorage::load(auth_path).expect("load corrupt auth");
+
+        assert!(auth.entries.is_empty());
+        assert_eq!(
+            fs::read(&unrelated_path).expect("read unrelated target"),
+            unrelated_content,
+            "backup creation must never follow the pre-existing destination symlink"
+        );
+        assert!(
+            !fs::symlink_metadata(&backup_path)
+                .expect("backup metadata")
+                .file_type()
+                .is_symlink(),
+            "atomic backup persistence must replace rather than follow the symlink"
+        );
+        assert_eq!(
+            fs::read_to_string(backup_path).expect("read safe backup"),
+            corrupt_content
+        );
     }
 
     #[test]
@@ -6627,6 +8271,206 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn test_save_rejects_intermediate_symlink_without_writing_credentials() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let redirected_directory = dir.path().join("redirected");
+        fs::create_dir(&redirected_directory).expect("create redirected directory");
+        let linked_parent = dir.path().join("linked-parent");
+        symlink(&redirected_directory, &linked_parent).expect("create intermediate symlink");
+        let auth_path = linked_parent.join("nested").join("auth.json");
+        let mut auth = AuthStorage {
+            path: auth_path,
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "must-not-be-redirected".to_string(),
+            },
+        );
+
+        auth.save()
+            .expect_err("an intermediate auth-directory symlink must fail closed");
+
+        assert!(
+            !redirected_directory.join("nested").exists(),
+            "the symlink target must not receive directories, lock state, or credentials"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_detects_parent_swap_before_descriptor_relative_persist() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let parent = dir.path().join("agent");
+        let moved_parent = dir.path().join("moved-agent");
+        let redirected_directory = dir.path().join("redirected");
+        fs::create_dir(&parent).expect("create auth parent");
+        fs::create_dir(&redirected_directory).expect("create redirected directory");
+        let auth_path = parent.join("auth.json");
+        let mut entries = HashMap::new();
+        entries.insert(
+            "anthropic".to_string(),
+            AuthCredential::ApiKey {
+                key: "must-not-survive-parent-swap".to_string(),
+            },
+        );
+        let data = serde_json::to_string_pretty(&AuthFileRef { entries: &entries })
+            .expect("serialize auth data");
+        let mut moved_temp_path = None;
+
+        let error = AuthStorage::save_data_sync_with_hook(&auth_path, &data, |temp_path| {
+            let temp_name = temp_path.file_name().expect("temporary filename");
+            moved_temp_path = Some(moved_parent.join(temp_name));
+            fs::rename(&parent, &moved_parent)?;
+            symlink(&redirected_directory, &parent)?;
+            Ok(())
+        })
+        .expect_err("a swapped auth parent must fail closed");
+
+        assert!(
+            error.to_string().contains("revalidate")
+                || error.to_string().contains("directory changed"),
+            "unexpected parent-swap error: {error}"
+        );
+        assert!(
+            !redirected_directory.join("auth.json").exists(),
+            "the replacement parent must not receive auth.json"
+        );
+        assert!(
+            !moved_parent.join("auth.json").exists(),
+            "descriptor-relative persistence must stop after the parent identity changes"
+        );
+        assert!(
+            !moved_temp_path.expect("captured moved temp path").exists(),
+            "the descriptor-relative temporary credential file must be cleaned up"
+        );
+        assert!(
+            !moved_parent.join("auth.json.lock").exists(),
+            "the descriptor-relative compatibility lock must be released from the moved parent"
+        );
+        assert!(
+            !redirected_directory.join("auth.json.lock").exists(),
+            "the replacement parent must never receive compatibility lock state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_reports_parent_swap_after_descriptor_relative_persist() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let parent = dir.path().join("agent");
+        let moved_parent = dir.path().join("moved-agent");
+        let redirected_directory = dir.path().join("redirected");
+        fs::create_dir(&parent).expect("create auth parent");
+        fs::create_dir(&redirected_directory).expect("create redirected directory");
+        let auth_path = parent.join("auth.json");
+        let mut entries = HashMap::new();
+        entries.insert(
+            "anthropic".to_string(),
+            AuthCredential::ApiKey {
+                key: "committed-to-pinned-directory".to_string(),
+            },
+        );
+        let data = serde_json::to_string_pretty(&AuthFileRef { entries: &entries })
+            .expect("serialize auth data");
+
+        let error = AuthStorage::save_data_sync_with_hooks(
+            &auth_path,
+            &data,
+            |_| Ok(()),
+            |_| {
+                fs::rename(&parent, &moved_parent)?;
+                symlink(&redirected_directory, &parent)?;
+                Ok(())
+            },
+        )
+        .expect_err("a post-persist parent swap must be reported as partial success");
+
+        assert!(
+            error.to_string().contains("persisted and synced")
+                && error.to_string().contains("configured parent path"),
+            "the error must disclose that bytes committed before path verification failed: {error}"
+        );
+        assert_eq!(
+            fs::read(moved_parent.join("auth.json")).expect("read committed auth data"),
+            data.as_bytes(),
+            "the descriptor-relative write must remain in the pinned directory"
+        );
+        assert!(
+            !redirected_directory.join("auth.json").exists(),
+            "the replacement parent must not receive credential bytes"
+        );
+        assert!(
+            !moved_parent.join("auth.json.lock").exists(),
+            "the descriptor-relative compatibility lock must be released"
+        );
+        assert!(
+            !redirected_directory.join("auth.json.lock").exists(),
+            "the replacement parent must never receive compatibility lock state"
+        );
+        let moved_entries = fs::read_dir(&moved_parent)
+            .expect("read moved auth directory")
+            .map(|entry| entry.expect("auth directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            moved_entries,
+            vec![std::ffi::OsString::from("auth.json")],
+            "the committed auth file must not leave a temporary artifact"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_replaces_final_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let unrelated_path = dir.path().join("unrelated.json");
+        let unrelated_contents = b"must remain byte-for-byte unchanged";
+        fs::write(&unrelated_path, unrelated_contents).expect("write unrelated target");
+        symlink(&unrelated_path, &auth_path).expect("create hostile final symlink");
+        let mut auth = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+        auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "replacement-key".to_string(),
+            },
+        );
+
+        auth.save()
+            .expect("descriptor-relative rename should replace the final symlink itself");
+
+        assert_eq!(
+            fs::read(&unrelated_path).expect("read unrelated target"),
+            unrelated_contents,
+            "the final symlink target must never receive credential bytes"
+        );
+        let metadata = fs::symlink_metadata(&auth_path).expect("auth path metadata");
+        assert!(metadata.is_file(), "auth.json must now be a regular file");
+        assert!(
+            !metadata.file_type().is_symlink(),
+            "the hostile final symlink must have been replaced"
+        );
+        let loaded = AuthStorage::load(auth_path).expect("load replaced auth.json");
+        assert_eq!(
+            loaded.api_key("anthropic").as_deref(),
+            Some("replacement-key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn test_save_sets_600_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -6690,7 +8534,7 @@ mod tests {
 
         let mut temp_path = None;
         let err = AuthStorage::save_data_sync_with_hook(&auth_path, &replacement_data, |temp| {
-            temp_path = Some(temp.path().to_path_buf());
+            temp_path = Some(temp.to_path_buf());
             Err(std::io::Error::other("injected persist failure"))
         })
         .expect_err("persist hook should abort save");
@@ -6707,6 +8551,55 @@ mod tests {
 
         let reloaded = AuthStorage::load(auth_path).expect("reload auth");
         assert_eq!(reloaded.api_key("anthropic").as_deref(), Some("old-key"));
+    }
+
+    #[test]
+    fn test_save_rejects_oversized_serialization_before_mutating_existing_file() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let auth_path = dir.path().join("auth.json");
+        let original_data = br#"{"anthropic":{"type":"api_key","key":"old-key"}}"#;
+        fs::write(&auth_path, original_data).expect("write original auth");
+        let entries_before = fs::read_dir(dir.path())
+            .expect("read auth directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        let mut oversized_auth = AuthStorage {
+            path: auth_path.clone(),
+            entries: HashMap::new(),
+        };
+        oversized_auth.set(
+            "anthropic",
+            AuthCredential::ApiKey {
+                key: "x".repeat(MAX_AUTH_FILE_BYTES + 1),
+            },
+        );
+
+        let error = oversized_auth
+            .save()
+            .expect_err("oversized serialized auth must be rejected");
+
+        assert!(error.to_string().contains("exceeds"), "{error}");
+        assert!(
+            error.to_string().contains(&MAX_AUTH_FILE_BYTES.to_string()),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read(&auth_path).expect("read preserved auth"),
+            original_data,
+            "a rejected save must preserve the existing auth.json byte-for-byte"
+        );
+        assert!(
+            !crate::file_lock::lock_path_for(&auth_path).exists(),
+            "a rejected save must not acquire or leave an auth lock"
+        );
+        let entries_after = fs::read_dir(dir.path())
+            .expect("read auth directory after rejection")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries_after, entries_before,
+            "a rejected save must not create temp or sidecar files"
+        );
     }
 
     // ── Missing key handling ──────────────────────────────────────────
@@ -7157,6 +9050,49 @@ mod tests {
     }
 
     #[test]
+    fn test_redact_known_secrets_covers_encoded_and_overlapping_values() {
+        let client_id = "sap client+id@example.com";
+        let client_secret = "sap client+id@example.com&secret=100%";
+        let encoded_id = percent_encode_component(client_id);
+        let encoded_secret = percent_encode_component(client_secret);
+        let lowercase_encoded_secret = lowercase_percent_escape_hex(&encoded_secret);
+        let mixed_case_encoded_secret = encoded_secret.replace("%2B", "%2b");
+        let text = format!(
+            "client_id={encoded_id}&client_secret={encoded_secret}&plus={}&lower={lowercase_encoded_secret}&lower_plus={}&mixed={mixed_case_encoded_secret}",
+            encoded_secret.replace("%20", "+"),
+            lowercase_encoded_secret.replace("%20", "+")
+        );
+
+        let redacted = redact_known_secrets(&text, &[client_id, client_secret]);
+        assert!(!redacted.contains(client_id));
+        assert!(!redacted.contains(client_secret));
+        assert!(!redacted.contains(&encoded_id));
+        assert!(!redacted.contains(&encoded_secret));
+        assert!(!redacted.contains(&lowercase_encoded_secret));
+        assert!(!redacted.contains(&mixed_case_encoded_secret));
+        assert!(!redacted.contains("secret%3D100%25"));
+        assert!(!redacted.contains("secret%3d100%25"));
+        assert_eq!(redacted.matches("[REDACTED]").count(), 6);
+
+        let expanding = redact_known_secrets_bounded(
+            &"x".repeat(128),
+            &["x", "R", "E", "D", "A", "C", "T"],
+            64,
+        );
+        assert_eq!(expanding.len(), 64);
+        assert!(expanding.ends_with("...[truncated]"), "{expanding}");
+        assert_eq!(
+            redact_known_secrets("x", &["x", "R", "E", "D", "A", "C", "T"]),
+            "[REDACTED]",
+            "introduced redaction markers must never be reprocessed and amplified"
+        );
+
+        let default_bounded = redact_known_secrets(&"safe".repeat(32 * 1024), &[]);
+        assert_eq!(default_bounded.len(), DEFAULT_REDACTED_ERROR_BYTES);
+        assert!(default_bounded.ends_with("...[truncated]"));
+    }
+
+    #[test]
     fn test_redact_known_secrets_no_match() {
         let text = "safe text with no secrets";
         let redacted = redact_known_secrets(text, &["not-present"]);
@@ -7174,6 +9110,42 @@ mod tests {
         assert!(!redacted.contains("new-access"));
         assert!(!redacted.contains("new-refresh"));
         assert!(!redacted.contains("new-id"));
+    }
+
+    #[test]
+    fn test_redact_known_secrets_handles_json_escaped_values_and_keys() {
+        let secret = "quoted-\"credential\\with\ncontrols";
+        let mut object = serde_json::Map::new();
+        object.insert(
+            "echo".to_string(),
+            serde_json::Value::String(secret.to_string()),
+        );
+        object.insert(
+            secret.to_string(),
+            serde_json::Value::String("credential appeared as an object key".to_string()),
+        );
+        let text = serde_json::Value::Object(object).to_string();
+        assert!(text.contains(r#"quoted-\"credential\\with\ncontrols"#));
+
+        let redacted = redact_known_secrets(&text, &[secret]);
+        assert!(
+            !redacted.contains("quoted-"),
+            "credential prefix leaked: {redacted}"
+        );
+        assert!(
+            !redacted.contains("credential\\\\with"),
+            "credential leaked: {redacted}"
+        );
+        assert_eq!(redacted.matches("[REDACTED]").count(), 2, "{redacted}");
+
+        let prefixed = format!("upstream error: {text}");
+        let prefixed_redacted = redact_known_secrets(&prefixed, &[secret]);
+        assert!(prefixed_redacted.starts_with("upstream error: "));
+        assert!(prefixed_redacted.contains("[REDACTED]"));
+        assert!(
+            !prefixed_redacted.contains(r#"quoted-\"credential\\with\ncontrols"#),
+            "JSON-escaped credential leaked from mixed-text diagnostic: {prefixed_redacted}"
+        );
     }
 
     // ── PKCE determinism ──────────────────────────────────────────────
@@ -7577,6 +9549,28 @@ mod tests {
             assert_eq!(
                 response.verification_uri_complete.as_deref(),
                 Some("https://auth.kimi.com/device?user_code=ABCD-1234")
+            );
+        });
+    }
+
+    #[test]
+    fn test_start_kimi_code_device_flow_rejects_oversized_response() {
+        let oversized = "x".repeat(MAX_OAUTH_RESPONSE_BYTES + 1);
+        let host = spawn_oauth_host_server(200, &oversized);
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let client = crate::http::client::Client::new();
+            let error = start_kimi_code_device_flow_with_client(&client, &host)
+                .await
+                .expect_err("oversized device authorization body must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains("Invalid Kimi device authorization response"),
+                "{message}"
+            );
+            assert!(
+                !message.contains(&"x".repeat(256)),
+                "oversized untrusted body must not be copied into the diagnostic"
             );
         });
     }
@@ -8093,6 +10087,157 @@ mod tests {
         assert!(auth.api_key("sap-ai-core").is_none());
     }
 
+    #[test]
+    fn generic_api_key_resolution_defers_all_stored_bedrock_credentials_to_provider_chain() {
+        let mut auth = empty_auth();
+        auth.set(
+            "amazon-bedrock",
+            AuthCredential::AwsCredentials {
+                access_key_id: "AKIA_STORED".to_string(),
+                // ubs:ignore test fixture credential, not live secret.
+                secret_access_key: "stored-secret".to_string(),
+                session_token: Some("stored-session".to_string()),
+                region: Some("us-west-2".to_string()),
+            },
+        );
+
+        let resolved = auth.resolve_api_key_with_env_lookup("bedrock", None, |var| match var {
+            "AWS_ACCESS_KEY_ID" => Some("AKIA_ENV".to_string()),
+            // ubs:ignore test fixture credential, not live secret.
+            "AWS_SECRET_ACCESS_KEY" => Some("env-secret".to_string()),
+            "AWS_SESSION_TOKEN" => Some("env-session".to_string()),
+            "AWS_PROFILE" => Some("developer".to_string()),
+            "AWS_REGION" => Some("eu-west-1".to_string()),
+            _ => None,
+        });
+
+        assert!(
+            resolved.is_none(),
+            "structured AWS credentials must reach the Bedrock resolver, not the bearer lane"
+        );
+
+        auth.set(
+            "amazon-bedrock",
+            AuthCredential::BearerToken {
+                token: "stored-bearer".to_string(),
+            },
+        );
+        assert!(
+            auth.resolve_api_key_with_env_lookup("bedrock", None, |_| None)
+                .is_none(),
+            "stored bearer must retain the provider-owned AWS chain's precedence"
+        );
+
+        auth.set(
+            "amazon-bedrock",
+            AuthCredential::ApiKey {
+                key: "legacy-stored-bearer".to_string(),
+            },
+        );
+        assert!(
+            auth.resolve_api_key_with_env_lookup("amazon-bedrock", None, |_| None)
+                .is_none(),
+            "legacy stored bearer must also be resolved by the Bedrock provider"
+        );
+    }
+
+    #[test]
+    fn generic_bedrock_resolution_accepts_only_direct_bearer_inputs() {
+        let auth = empty_auth();
+        let from_env = auth.resolve_api_key_with_env_lookup("amazon-bedrock", None, |var| {
+            (var == "AWS_BEARER_TOKEN_BEDROCK").then(|| "bedrock-bearer".to_string())
+        });
+        assert_eq!(from_env.as_deref(), Some("bedrock-bearer"));
+
+        let explicit =
+            auth.resolve_api_key_with_env_lookup("bedrock", Some("explicit-bearer"), |_| {
+                Some("must-not-win".to_string())
+            });
+        assert_eq!(explicit.as_deref(), Some("explicit-bearer"));
+    }
+
+    #[test]
+    fn generic_api_key_resolution_never_flattens_sap_service_credentials() {
+        let auth = empty_auth();
+        let service_key_json = serde_json::json!({
+            "clientid": "sap-client",
+            "clientsecret": "sap-secret",
+            "url": "https://auth.sap.example.com/oauth/token",
+            "serviceurls": {"AI_API_URL": "https://api.ai.sap.example.com"}
+        })
+        .to_string();
+
+        let from_service_key = auth.resolve_api_key_with_env_lookup("sap-ai-core", None, |var| {
+            (var == "AICORE_SERVICE_KEY").then(|| service_key_json.clone())
+        });
+        assert!(from_service_key.is_none());
+
+        let from_split_env = auth.resolve_api_key_with_env_lookup("sap", None, |var| match var {
+            "SAP_AI_CORE_CLIENT_ID" => Some("sap-client".to_string()),
+            // ubs:ignore test fixture credential, not live secret.
+            "SAP_AI_CORE_CLIENT_SECRET" => Some("sap-secret".to_string()),
+            "SAP_AI_CORE_TOKEN_URL" => Some("https://auth.sap.example.com/oauth/token".to_string()),
+            "SAP_AI_CORE_SERVICE_URL" => Some("https://api.ai.sap.example.com".to_string()),
+            _ => None,
+        });
+        assert!(from_split_env.is_none());
+    }
+
+    #[test]
+    fn generic_sap_resolution_preserves_provider_owned_legacy_precedence() {
+        let ambient_service_key = serde_json::json!({
+            "clientid": "ambient-client",
+            "clientsecret": "ambient-secret",
+            "url": "https://ambient-token.example.com",
+            "serviceurls": {"AI_API_URL": "https://ambient-api.example.com"}
+        })
+        .to_string();
+        let mut auth = empty_auth();
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::ApiKey {
+                key: "legacy-stored-bearer".to_string(),
+            },
+        );
+
+        assert!(
+            auth.resolve_api_key_with_env_lookup("sap", None, |_| None)
+                .is_none(),
+            "legacy SAP ApiKey must remain in the provider-owned lowest-precedence tier"
+        );
+        let provider_owned = resolve_sap_auth_material_with_env(&auth, None, |name| {
+            (name == "AICORE_SERVICE_KEY").then(|| ambient_service_key.clone())
+        })
+        .expect("provider-owned SAP resolution");
+        assert!(matches!(
+            provider_owned,
+            Some(SapAuthMaterial::ServiceKey(SapResolvedCredentials {
+                client_id,
+                ..
+            })) if client_id == "ambient-client"
+        ));
+
+        let explicit = auth.resolve_api_key_with_env_lookup(
+            "sap-ai-core",
+            Some("explicit-sap-bearer"),
+            |_| None,
+        );
+        assert_eq!(explicit.as_deref(), Some("explicit-sap-bearer"));
+
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::BearerToken {
+                token: "stored-direct-bearer".to_string(),
+            },
+        );
+        assert_eq!(
+            auth.resolve_api_key_with_env_lookup("sap", None, |_| None)
+                .as_deref(),
+            Some("stored-direct-bearer"),
+            "stored direct bearer must retain its documented precedence over ambient service keys"
+        );
+    }
+
     // ── AWS Credential Chain ─────────────────────────────────────────
 
     fn empty_auth() -> AuthStorage {
@@ -8463,6 +10608,24 @@ mod tests {
     }
 
     #[test]
+    fn test_aws_whitespace_primary_region_falls_back_to_default_region_env() {
+        let auth = empty_auth();
+        let result = resolve_aws_credentials_with_env(&auth, |var| match var {
+            "AWS_BEARER_TOKEN_BEDROCK" => Some("bedrock-bearer".to_string()),
+            "AWS_REGION" => Some("   ".to_string()),
+            "AWS_DEFAULT_REGION" => Some("  ca-central-1  ".to_string()),
+            _ => None,
+        });
+        assert_eq!(
+            result,
+            Some(AwsResolvedCredentials::Bearer {
+                token: "bedrock-bearer".to_string(),
+                region: "ca-central-1".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn test_aws_access_key_without_secret_skipped() {
         let auth = empty_auth();
         let result = resolve_aws_credentials_with_env(&auth, |var| match var {
@@ -8470,6 +10633,37 @@ mod tests {
             _ => None,
         });
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_aws_sso_oversized_explicit_config_fails_before_stored_fallback() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let directory = tempfile::tempdir().expect("tmpdir");
+            let config_path = directory.path().join("config");
+            std::fs::write(&config_path, vec![b'x'; MAX_AWS_SHARED_CONFIG_BYTES + 1])
+                .expect("write oversized AWS config");
+
+            let mut auth = empty_auth();
+            auth.set(
+                "amazon-bedrock",
+                AuthCredential::BearerToken {
+                    token: "stored-different-account".to_string(),
+                },
+            );
+            let client = crate::http::client::Client::new();
+            let error = resolve_aws_credentials_async_with_env(&auth, &client, |name| match name {
+                "AWS_PROFILE" => Some("explicit-sso-profile".to_string()),
+                "AWS_CONFIG_FILE" => Some(config_path.to_string_lossy().to_string()),
+                _ => None,
+            })
+            .await
+            .expect_err("oversized explicit profile config must fail closed");
+
+            let message = error.to_string();
+            assert!(message.contains("exceeds"), "{message}");
+            assert!(!message.contains("stored-different-account"), "{message}");
+        });
     }
 
     // ── AWS SSO ──────────────────────────────────────────────────────
@@ -8706,6 +10900,43 @@ sso_region = us-east-1
     }
 
     #[test]
+    fn test_aws_sso_oversized_token_cache_is_rejected() {
+        let directory = tempfile::tempdir().expect("tmpdir");
+        let config_text = "\
+[profile dev]
+sso_session = my-sso
+sso_account_id = 123456789012
+sso_role_name = MyRole
+
+[sso-session my-sso]
+sso_start_url = https://example.awsapps.com/start
+sso_region = us-east-1
+";
+        let expires = far_future_iso();
+        let (_credentials_path, config_path, cache_dir) = write_sso_sandbox(
+            directory.path(),
+            "my-sso",
+            "initial-token",
+            Some(&expires),
+            config_text,
+        );
+        let cache_path = aws_sso_cache_path(&cache_dir, "my-sso");
+        std::fs::write(&cache_path, vec![b'x'; MAX_AWS_SSO_CACHE_BYTES + 1])
+            .expect("write oversized token cache");
+
+        let mut env = |name: &str| match name {
+            "AWS_CONFIG_FILE" => Some(config_path.to_string_lossy().to_string()),
+            "PI_AWS_SSO_CACHE_DIR" => Some(cache_dir.to_string_lossy().to_string()),
+            _ => None,
+        };
+        let error = detect_aws_sso_profile_with_env("dev", None, "us-east-1", &mut env)
+            .expect_err("oversized token cache must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("exceeds"), "{message}");
+        assert!(message.contains("aws sso login --profile dev"), "{message}");
+    }
+
+    #[test]
     fn test_aws_sso_sso_session_block_missing_errors() {
         let dir = tempfile::tempdir().expect("tmpdir");
         let aws_dir = dir.path().join(".aws");
@@ -8824,7 +11055,17 @@ sso_region = us-east-1
                 cache_dir.to_string_lossy().to_string(),
             );
 
-            let auth = empty_auth();
+            let mut auth = empty_auth();
+            auth.set(
+                "amazon-bedrock",
+                AuthCredential::AwsCredentials {
+                    access_key_id: "AKIA_STORED_FALLBACK".to_string(),
+                    // ubs:ignore test fixture credential, not live secret.
+                    secret_access_key: "stored-fallback-secret".to_string(),
+                    session_token: None,
+                    region: Some("eu-west-1".to_string()),
+                },
+            );
             let client = crate::http::client::Client::new();
             let result = resolve_aws_credentials_async_with_env(&auth, &client, |var| {
                 env_map.get(var).cloned()
@@ -8842,6 +11083,8 @@ sso_region = us-east-1
                     session_token,
                     region,
                 } => {
+                    // An explicitly selected SSO profile is the profile tier and
+                    // must not be shadowed by a stored auth.json fallback.
                     assert_eq!(access_key_id, "AKIASTSTOKEN");
                     assert_eq!(secret_access_key, "sts-secret");
                     assert_eq!(session_token.as_deref(), Some("sts-session"));
@@ -8976,6 +11219,37 @@ sso_start_url = https://example.awsapps.com/start
     }
 
     #[test]
+    #[allow(clippy::await_holding_lock)] // intentional — see sso_portal_override_lock docs
+    fn test_aws_sso_exchange_rejects_oversized_response_body() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let body = "x".repeat(MAX_AWS_SSO_RESPONSE_BYTES + 1);
+            let portal_url = spawn_json_server(200, &body);
+            let portal_base = portal_url.trim_end_matches("/token").to_string();
+            let _override_guard = sso_portal_override_lock();
+            set_sso_portal_base_url_override(Some(portal_base));
+
+            let locator = AwsSsoTokenLocator {
+                access_token: "bounded-response-token".to_string(),
+                sso_region: "us-east-1".to_string(),
+                account_id: "123456789012".to_string(),
+                role_name: "BoundedRole".to_string(),
+                target_region: "us-west-2".to_string(),
+            };
+            let client = crate::http::client::Client::new();
+            let error = exchange_aws_sso_credentials_with_client(&client, &locator)
+                .await
+                .expect_err("oversized SSO response must be rejected");
+
+            set_sso_portal_base_url_override(None);
+
+            let message = error.to_string();
+            assert!(message.contains("oversized response body"), "{message}");
+            assert!(!message.contains(&body), "response body leaked: {message}");
+        });
+    }
+
+    #[test]
     fn test_aws_sso_async_resolver_falls_through_when_static_creds_present() {
         // Static IAM credentials in env vars must short-circuit the SSO
         // path: no HTTP, no cache lookups.
@@ -9100,12 +11374,12 @@ sso_region = us-east-1
         auth.set(
             "sap-ai-core",
             AuthCredential::ServiceKey {
-                client_id: Some("stored-id".to_string()),
+                client_id: Some("  stored-id  ".to_string()),
                 // ubs:ignore test fixture credential, not live secret.
-                client_secret: Some("stored-secret".to_string()),
+                client_secret: Some("  stored-secret  ".to_string()),
                 // ubs:ignore test fixture credential endpoint, not live secret.
-                token_url: Some("https://stored-token.sap.com".to_string()),
-                service_url: Some("https://stored-api.sap.com".to_string()),
+                token_url: Some("  https://stored-token.sap.com  ".to_string()),
+                service_url: Some("  https://stored-api.sap.com  ".to_string()),
             },
         );
         let result = resolve_sap_credentials_with_env(&auth, |_| -> Option<String> { None });
@@ -9188,7 +11462,34 @@ sso_region = us-east-1
     }
 
     #[test]
-    fn test_sap_invalid_json_falls_through() {
+    fn test_sap_partial_split_env_does_not_fall_through_to_stored_account() {
+        let mut auth = empty_auth();
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::ServiceKey {
+                client_id: Some("stored-client".to_string()),
+                // ubs:ignore test fixture credential, not live secret.
+                client_secret: Some("stored-secret".to_string()),
+                token_url: Some("https://stored-token.example.com".to_string()),
+                service_url: Some("https://stored-api.example.com".to_string()),
+            },
+        );
+
+        let error = resolve_sap_auth_material_with_env(&auth, None, |name| match name {
+            "SAP_AI_CORE_CLIENT_ID" => Some("ambient-client".to_string()),
+            "SAP_AI_CORE_CLIENT_SECRET" => Some("ambient-secret".to_string()),
+            _ => None,
+        })
+        .expect_err("a partial higher-precedence account must fail closed");
+        let message = error.to_string();
+        assert!(message.contains("partially configured"), "{message}");
+        assert!(!message.contains("ambient-client"), "{message}");
+        assert!(!message.contains("ambient-secret"), "{message}");
+        assert!(!message.contains("stored-client"), "{message}");
+    }
+
+    #[test]
+    fn test_sap_invalid_nonempty_json_fails_closed() {
         let auth = empty_auth();
         let result = resolve_sap_credentials_with_env(&auth, |var| match var {
             "AICORE_SERVICE_KEY" => Some("not-valid-json".to_string()),
@@ -9198,7 +11499,120 @@ sso_region = us-east-1
             "SAP_AI_CORE_SERVICE_URL" => Some("https://api.example.com".to_string()),
             _ => None,
         });
-        assert_eq!(result.unwrap().client_id, "env-id");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sap_nonempty_json_with_whitespace_required_field_fails_closed() {
+        let whitespace_json = serde_json::json!({
+            "clientid": "   ",
+            "clientsecret": "json-secret",
+            "url": "https://json-token.example.com",
+            "serviceurls": {"AI_API_URL": "https://json-api.example.com"}
+        })
+        .to_string();
+        let auth = empty_auth();
+        let result = resolve_sap_credentials_with_env(&auth, |var| match var {
+            "AICORE_SERVICE_KEY" => Some(whitespace_json.clone()),
+            "SAP_AI_CORE_CLIENT_ID" => Some("env-id".to_string()),
+            "SAP_AI_CORE_CLIENT_SECRET" => Some("env-secret".to_string()),
+            "SAP_AI_CORE_TOKEN_URL" => Some("https://token.example.com".to_string()),
+            "SAP_AI_CORE_SERVICE_URL" => Some("https://api.example.com".to_string()),
+            _ => None,
+        });
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_sap_auth_material_precedence_is_explicit_and_account_safe() {
+        let ambient_service_key = serde_json::json!({
+            "clientid": "ambient-client",
+            "clientsecret": "ambient-secret",
+            "url": "https://ambient-token.example.com",
+            "serviceurls": {"AI_API_URL": "https://ambient-api.example.com"}
+        })
+        .to_string();
+        let mut auth = empty_auth();
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::BearerToken {
+                token: "stored-direct-bearer".to_string(),
+            },
+        );
+
+        let stored_direct = resolve_sap_auth_material_with_env(&auth, None, |name| {
+            (name == "AICORE_SERVICE_KEY").then(|| ambient_service_key.clone())
+        })
+        .expect("resolve stored direct bearer");
+        assert_eq!(
+            stored_direct,
+            Some(SapAuthMaterial::DirectBearer(
+                "stored-direct-bearer".to_string()
+            ))
+        );
+
+        let explicit =
+            resolve_sap_auth_material_with_env(&auth, Some("explicit-direct-bearer"), |_| None)
+                .expect("resolve explicit bearer");
+        assert_eq!(
+            explicit,
+            Some(SapAuthMaterial::DirectBearer(
+                "explicit-direct-bearer".to_string()
+            ))
+        );
+
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::ApiKey {
+                key: "legacy-stored-bearer".to_string(),
+            },
+        );
+        let ambient = resolve_sap_auth_material_with_env(&auth, None, |name| {
+            (name == "AICORE_SERVICE_KEY").then(|| ambient_service_key.clone())
+        })
+        .expect("resolve ambient service key over legacy ApiKey");
+        assert!(matches!(
+            ambient,
+            Some(SapAuthMaterial::ServiceKey(SapResolvedCredentials {
+                client_id,
+                ..
+            })) if client_id == "ambient-client"
+        ));
+
+        let legacy = resolve_sap_auth_material_with_env(&auth, None, |_| None)
+            .expect("resolve legacy ApiKey without ambient service credentials");
+        assert_eq!(
+            legacy,
+            Some(SapAuthMaterial::DirectBearer(
+                "legacy-stored-bearer".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_sap_auth_material_rejects_malformed_authoritative_service_key() {
+        let mut auth = empty_auth();
+        auth.set(
+            "sap-ai-core",
+            AuthCredential::ApiKey {
+                key: "legacy-stored-bearer".to_string(),
+            },
+        );
+        let err = resolve_sap_auth_material_with_env(&auth, None, |name| {
+            (name == "AICORE_SERVICE_KEY").then(|| "{\"clientid\":\"incomplete\"}".to_string())
+        })
+        .expect_err("malformed authoritative service key must not fall through");
+        assert!(
+            err.to_string().contains("AICORE_SERVICE_KEY is set"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_sap_structured_array_credential_fails_closed() {
+        let error = classify_sap_auth_candidate(r#"[{"clientsecret":"must-not-leak"}]"#)
+            .expect_err("structured non-object credentials must never become bearer tokens");
+        assert!(error.to_string().contains("JSON-shaped"), "{error}");
     }
 
     #[test]
@@ -9241,6 +11655,24 @@ sso_region = us-east-1
         assert!(parse_sap_service_key_json(&key_json).is_none());
     }
 
+    #[test]
+    fn test_sap_json_shaped_auth_candidate_fails_closed_when_invalid() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let client = crate::http::client::Client::new();
+            let err = resolve_sap_auth_candidate_with_client(
+                &client,
+                r#"{"clientid":"id","clientsecret":"secret"}"#,
+            )
+            .await
+            .expect_err("incomplete service key must not become a bearer token");
+            assert!(
+                err.to_string().contains("not a valid service key"),
+                "unexpected error: {err}"
+            );
+        });
+    }
+
     // ── SAP AI Core metadata ─────────────────────────────────────────
 
     #[test]
@@ -9280,15 +11712,53 @@ sso_region = us-east-1
     }
 
     #[test]
+    fn test_ambient_sap_auth_exchange_does_not_require_stored_auth() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let token_url = spawn_json_server(200, r#"{"access_token":"ambient-token"}"#);
+            let service_key = serde_json::json!({
+                "clientid": "ambient-client",
+                // ubs:ignore test fixture credential, not live secret.
+                "clientsecret": "ambient-secret",
+                "url": token_url,
+                "serviceurls": {"AI_API_URL": "https://ambient-api.example.com"}
+            })
+            .to_string();
+            let client = crate::http::client::Client::new();
+
+            let token = resolve_ambient_sap_auth_token_with_client_and_env(&client, |name| {
+                (name == "AICORE_SERVICE_KEY").then(|| service_key.clone())
+            })
+            .await
+            .expect("resolve complete ambient service key");
+
+            assert_eq!(token.as_deref(), Some("ambient-token"));
+            assert!(
+                resolve_ambient_sap_auth_token_with_client_and_env(&client, |_| None)
+                    .await
+                    .expect("resolve absent ambient credentials")
+                    .is_none()
+            );
+        });
+    }
+
+    #[test]
     fn test_exchange_sap_access_token_with_client_http_error() {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
         rt.expect("runtime").block_on(async {
-            let token_url = spawn_json_server(401, r#"{"error":"unauthorized"}"#);
+            let client_id = "sap client+id@example.com";
+            let client_secret = "sap&secret=100%";
+            let encoded_client_id = percent_encode_component(client_id);
+            let encoded_client_secret = percent_encode_component(client_secret);
+            let echoed_form = format!(
+                "invalid_client client_id={encoded_client_id}&client_secret={encoded_client_secret}"
+            );
+            let token_url = spawn_json_server(401, &echoed_form);
             let client = crate::http::client::Client::new();
             let creds = SapResolvedCredentials {
-                client_id: "sap-client".to_string(),
+                client_id: client_id.to_string(),
                 // ubs:ignore test fixture credential, not live secret.
-                client_secret: "sap-secret".to_string(),
+                client_secret: client_secret.to_string(),
                 token_url,
                 service_url: "https://api.ai.sap.example.com".to_string(),
             };
@@ -9300,6 +11770,24 @@ sso_region = us-east-1
                 err.to_string().contains("HTTP 401"),
                 "unexpected error: {err}"
             );
+            let message = err.to_string();
+            assert!(
+                !message.contains(client_id),
+                "raw client ID leaked: {message}"
+            );
+            assert!(
+                !message.contains(client_secret),
+                "raw client secret leaked: {message}"
+            );
+            assert!(
+                !message.contains(&encoded_client_id),
+                "encoded client ID leaked: {message}"
+            );
+            assert!(
+                !message.contains(&encoded_client_secret),
+                "encoded client secret leaked: {message}"
+            );
+            assert!(message.contains("[REDACTED]"), "{message}");
         });
     }
 
@@ -9462,6 +11950,34 @@ sso_region = us-east-1
                 }
                 other => unreachable!("unexpected credential variant: {other:?}"),
             }
+        });
+    }
+
+    #[test]
+    fn test_self_contained_refresh_rejects_oversized_response() {
+        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
+        rt.expect("runtime").block_on(async {
+            let oversized = "x".repeat(MAX_OAUTH_RESPONSE_BYTES + 1);
+            let server_url = spawn_json_server(200, &oversized);
+            let client = crate::http::client::Client::new();
+            let error = refresh_self_contained_oauth_token(
+                &client,
+                &server_url,
+                "test-client",
+                "test-refresh-token",
+                "custom-provider",
+            )
+            .await
+            .expect_err("oversized self-contained refresh body must be rejected");
+            let message = error.to_string();
+            assert!(
+                message.contains("Invalid refresh response from custom-provider"),
+                "{message}"
+            );
+            assert!(
+                !message.contains(&"x".repeat(256)),
+                "oversized untrusted body must not be copied into the diagnostic"
+            );
         });
     }
 
