@@ -1,6 +1,7 @@
 {
   "schema": "pi.sec.traceability_matrix.v1",
   "generated_at": "2026-02-14T11:50:00Z",
+  "locator_owners_refreshed_at": "2026-08-06T13:19:31Z",
   "version": "1.0.0",
   "description": "Machine-readable traceability matrix mapping SEC implementation beads to unit and integration test targets.",
   "beads": [
@@ -10,8 +11,8 @@
       "title": "Extension manifest v2: explicit capabilities, behavioral intents, and trust metadata",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "capability_manifest_*",
+        "file": "src/extensions/tests/core.rs",
+        "test_prefix": "parse_register_message*, extension_manifest_*, permission_drift_*",
         "count": 12,
         "categories": ["success", "edge-case"]
       },
@@ -35,8 +36,8 @@
       "title": "Deterministic extension lockfile and provenance verification pipeline",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "lockfile_*, provenance_*",
+        "file": "src/package_manager.rs",
+        "test_prefix": "evaluate_lock_transition_*, digest_package_path_*, verify_and_record_lock_*, reconcile_lockfile_*",
         "count": 8,
         "categories": ["success", "failure"]
       },
@@ -49,8 +50,8 @@
       "title": "Install-time static scanner with deterministic risk classifier",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "install_risk_*, classify_*",
+        "file": "src/extension_preflight.rs",
+        "test_prefix": "risk_tier_*, scan_*, detect_*, install_time_risk_*",
         "count": 15,
         "categories": ["success", "failure", "edge-case"]
       },
@@ -69,7 +70,7 @@
       "title": "Quarantine-to-trust promotion workflow for unknown/high-risk extensions",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extension_preflight.rs",
+        "file": "tests/extension_trust_promotion.rs",
         "test_prefix": "trust_*, promote_*",
         "count": 10,
         "categories": ["success", "failure"]
@@ -89,8 +90,8 @@
       "title": "Runtime hostcall telemetry schema and feature extraction pipeline",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "runtime_hostcall_*, feature_extract_*",
+        "file": "src/extensions/tests/shared_dispatch.rs",
+        "test_prefix": "runtime_hostcall_*",
         "count": 20,
         "categories": ["success", "edge-case"]
       },
@@ -109,8 +110,8 @@
       "title": "Baseline modeling with robust statistics and Markov transition profiles",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "runtime_risk_baseline_*, markov_*",
+        "file": "src/extensions/tests/baseline.rs",
+        "test_prefix": "baseline_*",
         "count": 15,
         "categories": ["success", "edge-case", "determinism"]
       },
@@ -134,8 +135,8 @@
       "title": "Online deterministic risk scorer with explainable reason codes",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "runtime_risk_score_*, risk_explain_*",
+        "file": "src/extensions/tests/baseline.rs",
+        "test_prefix": "runtime_risk_*, explanation_*, golden_*",
         "count": 30,
         "categories": ["success", "failure", "edge-case", "determinism"]
       },
@@ -159,8 +160,8 @@
       "title": "Enforcement state machine: allow/harden/prompt/deny/terminate with hysteresis",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "enforcement_*, score_band_*",
+        "file": "src/extensions/tests/enforcement.rs",
+        "test_prefix": "enforcement_*, score_bands_*",
         "count": 29,
         "categories": ["success", "failure", "edge-case", "determinism", "anti-flapping"]
       },
@@ -194,8 +195,8 @@
       "title": "Hash-chained decision ledger and offline threshold calibration",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "ledger_*, hash_chain_*, calibrat_*",
+        "file": "src/extensions/tests/shared_dispatch.rs",
+        "test_prefix": "shared_dispatch_runtime_risk_ledger_*, runtime_risk_calibration_*",
         "count": 25,
         "categories": ["success", "failure", "determinism", "tamper-detection"]
       },
@@ -214,7 +215,7 @@
       "title": "Per-extension resource quotas (CPU, memory, hostcalls, subprocess budget)",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
+        "file": "src/extensions/tests/risk_math.rs",
         "test_prefix": "quota_*",
         "count": 20,
         "categories": ["success", "failure", "edge-case"]
@@ -234,8 +235,8 @@
       "title": "Capability-scoped filesystem/network allowlists with least-privilege defaults",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "fs_connector_*, capability_*",
+        "file": "src/extensions/tests/core.rs",
+        "test_prefix": "fs_connector_*, required_capability_*",
         "count": 25,
         "categories": ["success", "failure", "edge-case"]
       },
@@ -269,8 +270,8 @@
       "title": "Exec and secret mediation hardening (command policy + secret broker)",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "exec_mediat_*, secret_broker_*, dangerous_command_*",
+        "file": "src/extensions/tests/exec_security.rs",
+        "test_prefix": "exec_mediation_*, secret_broker_*, dangerous_command_*",
         "count": 20,
         "categories": ["success", "failure", "edge-case"]
       },
@@ -289,7 +290,7 @@
       "title": "Policy profile hardening and explicit dangerous-capability opt-in semantics",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
+        "file": "src/extensions/tests/policy_transition.rs",
         "test_prefix": "explain_effective_*, dangerous_*, profile_transition_*",
         "count": 16,
         "categories": ["success", "edge-case", "serde"]
@@ -322,8 +323,8 @@
       "title": "Security control center and real-time runtime alerts with reason codes",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "alert_*, sha256_short_*, emit_*, query_*",
+        "file": "src/extensions/tests/security_alerts.rs",
+        "test_prefix": "alert_*, sha256_short_*",
         "count": 21,
         "categories": ["success", "edge-case", "serde", "filtering"]
       },
@@ -352,8 +353,8 @@
       "title": "Trust onboarding wizard and emergency kill-switch workflow",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "kill_switch_*, lift_kill_switch_*, trust_*, promote_trust_*, is_killed_*, full_trust_*, multiple_ext_*",
+        "file": "src/extensions/tests/security_alerts.rs",
+        "test_prefix": "kill_switch_*, lift_kill_switch_*, trust_*, promote_trust_*, is_killed_*, full_trust_*, multiple_extensions_*",
         "count": 27,
         "categories": ["success", "failure", "edge-case", "lifecycle", "audit"]
       },
@@ -386,8 +387,8 @@
       "title": "Incident evidence bundle export and forensic replay UX",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
-        "test_prefix": "incident_bundle_*, export_incident_*",
+        "file": "tests/incident_evidence_bundle.rs",
+        "test_prefix": "empty_bundle_*, bundle_summary_*, bundle_peak_*, same_inputs_*, different_generated_at_*",
         "count": 5,
         "categories": ["success", "determinism"]
       },
@@ -411,7 +412,7 @@
       "title": "Shadow-mode rollout with score-only telemetry dashboards",
       "status": "closed",
       "unit_tests": {
-        "file": "src/extensions.rs",
+        "file": "tests/enforcement_state_machine_sec34.rs",
         "test_prefix": "shadow_mode_*",
         "count": 3,
         "categories": ["success", "failure"]

@@ -202,6 +202,56 @@ fn count_tests_in_file(path: &Path) -> usize {
     content.matches("#[test]").count()
 }
 
+fn count_tests_in_rust_tree(path: &Path) -> std::io::Result<usize> {
+    if path.is_file() {
+        return Ok(if path.extension().is_some_and(|ext| ext == "rs") {
+            count_tests_in_file(path)
+        } else {
+            0
+        });
+    }
+
+    let mut count = 0;
+    for entry in std::fs::read_dir(path)? {
+        count += count_tests_in_rust_tree(&entry?.path())?;
+    }
+    Ok(count)
+}
+
+fn test_names_in_file(path: &Path) -> std::io::Result<BTreeSet<String>> {
+    let content = std::fs::read_to_string(path)?;
+    let mut names = BTreeSet::new();
+    let mut saw_test_attribute = false;
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed == "#[test]" {
+            saw_test_attribute = true;
+            continue;
+        }
+        if !saw_test_attribute
+            || trimmed.is_empty()
+            || trimmed.starts_with("//")
+            || trimmed.starts_with("#[")
+        {
+            continue;
+        }
+
+        let declaration = trimmed
+            .strip_prefix("fn ")
+            .or_else(|| trimmed.strip_prefix("async fn "));
+        if let Some(declaration) = declaration {
+            let end = declaration
+                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .unwrap_or(declaration.len());
+            names.insert(declaration[..end].to_string());
+        }
+        saw_test_attribute = false;
+    }
+
+    Ok(names)
+}
+
 // ── Matrix completeness ──
 
 #[test]
@@ -443,6 +493,158 @@ fn sec_beads_present_in_traceability_matrix_json() {
     );
 }
 
+type TestLocator = (String, String);
+type PrefixedTestLocator = (String, String, String);
+
+fn assert_locator_refresh_is_current(matrix: &serde_json::Value) {
+    let generated_at = matrix
+        .get("generated_at")
+        .and_then(serde_json::Value::as_str)
+        .expect("sec traceability matrix must retain its count-generation timestamp");
+    let locator_refresh = matrix
+        .get("locator_owners_refreshed_at")
+        .and_then(serde_json::Value::as_str)
+        .expect("sec traceability matrix must record its locator-owner refresh timestamp");
+    let generated_at = chrono::DateTime::parse_from_rfc3339(generated_at)
+        .expect("generated_at must be an RFC 3339 timestamp");
+    let locator_refresh = chrono::DateTime::parse_from_rfc3339(locator_refresh)
+        .expect("locator_owners_refreshed_at must be an RFC 3339 timestamp");
+    assert!(
+        locator_refresh >= generated_at,
+        "locator-owner refresh cannot predate the certified count baseline"
+    );
+}
+
+fn collect_machine_readable_test_locators(
+    matrix: &serde_json::Value,
+) -> (Vec<TestLocator>, Vec<PrefixedTestLocator>) {
+    let mut locators = Vec::new();
+    let mut prefixed_test_locators = Vec::new();
+    for bead in matrix
+        .get("beads")
+        .and_then(serde_json::Value::as_array)
+        .expect("sec traceability matrix must contain a beads array")
+    {
+        let sec_id = bead
+            .get("sec_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown SEC requirement");
+        for field in ["unit_tests", "config_tests"] {
+            let Some(target) = bead.get(field) else {
+                continue;
+            };
+            let count = target
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            match target.get("file").and_then(serde_json::Value::as_str) {
+                Some(file) => {
+                    let owner = format!("{sec_id}.{field}");
+                    locators.push((owner.clone(), file.to_string()));
+                    if count > 0 {
+                        let prefixes = target
+                            .get("test_prefix")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_else(|| {
+                                panic!("{owner} has {count} tests but no test_prefix locator")
+                            });
+                        prefixed_test_locators.push((
+                            owner,
+                            file.to_string(),
+                            prefixes.to_string(),
+                        ));
+                    }
+                }
+                None if count > 0 => {
+                    panic!("{sec_id}.{field} has {count} tests but no file locator")
+                }
+                None => {}
+            }
+        }
+        for target in bead
+            .get("integration_tests")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let file = target
+                .get("file")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_else(|| panic!("{sec_id}.integration_tests entry has no file locator"));
+            locators.push((format!("{sec_id}.integration_tests"), file.to_string()));
+        }
+    }
+    for target in matrix
+        .get("cross_cutting_test_files")
+        .and_then(serde_json::Value::as_array)
+        .expect("sec traceability matrix must contain cross_cutting_test_files")
+    {
+        let file = target
+            .get("file")
+            .and_then(serde_json::Value::as_str)
+            .expect("cross-cutting test entry must have a file locator");
+        locators.push(("cross_cutting_test_files".to_string(), file.to_string()));
+    }
+    (locators, prefixed_test_locators)
+}
+
+fn unresolved_test_prefixes(root: &Path, locators: &[PrefixedTestLocator]) -> Vec<String> {
+    let mut unresolved = Vec::new();
+    for (owner, file, prefixes) in locators {
+        let path = root.join(file);
+        let names = test_names_in_file(&path)
+            .unwrap_or_else(|e| panic!("cannot inspect {} for {owner}: {e}", path.display()));
+        for pattern in prefixes.split(',').map(str::trim) {
+            let prefix = pattern.strip_suffix('*').unwrap_or(pattern);
+            if prefix.is_empty() || !names.iter().any(|name| name.starts_with(prefix)) {
+                unresolved.push(format!("  {owner}: {file}::{pattern}"));
+            }
+        }
+    }
+    unresolved
+}
+
+#[test]
+fn machine_readable_sec_test_locators_exist() {
+    let root = repo_root();
+    let path = root.join("docs/sec_traceability_matrix.json");
+    let content = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let matrix: serde_json::Value =
+        serde_json::from_str(&content).unwrap_or_else(|e| panic!("invalid JSON: {e}"));
+
+    assert_locator_refresh_is_current(&matrix);
+    let (locators, prefixed_test_locators) = collect_machine_readable_test_locators(&matrix);
+
+    let stale_facade_owners: Vec<_> = locators
+        .iter()
+        .filter(|(_, file)| file == "src/extensions.rs")
+        .map(|(owner, _)| owner.clone())
+        .collect();
+    assert!(
+        stale_facade_owners.is_empty(),
+        "SEC unit-test locators must name decomposed owners, not src/extensions.rs: {stale_facade_owners:?}"
+    );
+
+    let unresolved_prefixes = unresolved_test_prefixes(&root, &prefixed_test_locators);
+    assert!(
+        unresolved_prefixes.is_empty(),
+        "SEC test-prefix locators without a matching #[test] definition:\n{}",
+        unresolved_prefixes.join("\n")
+    );
+
+    let missing: Vec<_> = locators
+        .iter()
+        .filter(|(_, file)| !root.join(file).is_file())
+        .map(|(owner, file)| format!("  {owner}: {file}"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "SEC test locators that do not resolve to files:\n{}",
+        missing.join("\n")
+    );
+}
+
 // ── Coverage summary report ──
 
 #[test]
@@ -570,21 +772,36 @@ fn all_matrix_files_are_classified_in_suite_toml() {
     );
 }
 
-// ── Inline test coverage in extensions.rs ──
+// ── Inline test coverage across the decomposed extension surface ──
 
 #[test]
-fn extensions_rs_has_security_inline_tests() {
+fn extension_surface_has_security_inline_tests() {
     let root = repo_root();
-    let path = root.join("src/extensions.rs");
-    let content = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let facade = root.join("src/extensions.rs");
+    let modules = root.join("src/extensions");
+    assert!(
+        facade.is_file(),
+        "missing extension facade: {}",
+        facade.display()
+    );
+    assert!(
+        modules.is_dir(),
+        "missing decomposed extension module tree: {}",
+        modules.display()
+    );
 
-    let test_count = content.matches("#[test]").count();
+    let facade_test_count = count_tests_in_file(&facade);
+    let module_test_count = count_tests_in_rust_tree(&modules)
+        .unwrap_or_else(|e| panic!("cannot scan {}: {e}", modules.display()));
+    let test_count = facade_test_count + module_test_count;
 
-    // extensions.rs should have a substantial number of inline tests
+    // The decomposed extension surface should retain the substantial inline
+    // security coverage that previously lived in the monolithic facade.
     assert!(
         test_count >= 400,
-        "Expected at least 400 inline #[test] in extensions.rs, found {test_count}"
+        "Expected at least 400 inline #[test] across src/extensions.rs and src/extensions/, found {test_count}"
     );
-    eprintln!("extensions.rs inline test count: {test_count}");
+    eprintln!(
+        "extension inline test count: {test_count} (facade={facade_test_count}, modules={module_test_count})"
+    );
 }

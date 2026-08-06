@@ -53,7 +53,7 @@
     },
     {
       "surface": "extension_hostcall_shutdown",
-      "test": "extensions::tests::js_hostcall_manager_shutdown_maps_to_denied",
+      "test": "extensions::tests::runtime_parity::js_hostcall_manager_shutdown_maps_to_denied",
       "proof": {
         "shutdownCode": "denied",
         "legacyShutdownCodeAllowed": false

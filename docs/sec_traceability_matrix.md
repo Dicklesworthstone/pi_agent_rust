@@ -1,13 +1,13 @@
 # SEC Workstream Unit-Test Traceability Matrix
 
-Version: 1.0.0 | Generated: 2026-02-14 | Bead: bd-2jkio (SEC-6.5)
+Version: 1.0.0 | Counts generated: 2026-02-14 | Locator ownership refreshed: 2026-08-06 | Bead: bd-2jkio (SEC-6.5)
 
 ## Overview
 
 This matrix maps every SEC implementation bead to its concrete unit and integration test targets.
 A machine-readable version is available at `docs/sec_traceability_matrix.json`.
 
-**Grand total: 1,155 SEC-related tests** across 18 beads, 29 integration test files, and 2 source-level test modules.
+**Grand total: 1,155 SEC-related tests** across 18 beads and 29 integration test files. The certified counts remain the 2026-02-14 baseline; source-level test owners in the machine-readable matrix were refreshed after the extension-runtime decomposition.
 
 ---
 

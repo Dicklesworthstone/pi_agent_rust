@@ -1233,7 +1233,7 @@ fn certification_dossier() {
         },
         AllowlistEntry {
             identifier: "MockHostActions".to_string(),
-            location: "src/extensions.rs".to_string(),
+            location: "src/extensions/tests/registration.rs".to_string(),
             suite: "vcr".to_string(),
             owner: "bd-m9rk".to_string(),
             replacement_plan: "Replace with real session-based dispatch".to_string(),

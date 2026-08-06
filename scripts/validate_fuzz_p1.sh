@@ -197,7 +197,7 @@ SUITE=(
     "bd-25xci|vcr::tests::proptest_vcr::request_matches_never_panics|256"
     "bd-1y7y6|conformance::tests::proptest_compare_conformance_output_reflexive|128"
     "bd-3tb42|session_index::tests::proptest_index_session_snapshot_roundtrip_metadata|128"
-    "bd-388hn|extensions::tests::proptest_dispatch::events_dispatch_never_panics|512"
+    "bd-388hn|extensions::tests::concurrency::proptest_dispatch::events_dispatch_never_panics|512"
 )
 
 TOTAL_FUNCTIONS=${#SUITE[@]}

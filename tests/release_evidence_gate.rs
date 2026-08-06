@@ -645,6 +645,1000 @@ fn all_evidence_artifacts_are_valid_json() {
 }
 
 #[test]
+fn release_publication_never_builds_with_the_registry_token() {
+    let workflow = require_text(".github/workflows/release.yml");
+    assert_eq!(
+        workflow
+            .matches("PI_CRATES_IO_RELEASE_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}")
+            .count(),
+        1,
+        "the registry secret must be injected into exactly one workflow step"
+    );
+    let publish_job = workflow
+        .split_once("\n  publish_crate:")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("\n  publish_github_release:")
+                .map(|(job, _)| job)
+        })
+        .expect("release workflow must retain an isolated crates publication job");
+    assert!(
+        publish_job.contains("environment:\n      name: release")
+            && publish_job.contains("permissions:\n      contents: read")
+            && !publish_job.contains("contents: write"),
+        "crates publication must remain review-gated with read-only repository permissions"
+    );
+    let publish_step = workflow
+        .split_once("- name: Publish only when Cargo proves the exact verified crate checksum")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| suffix.split_once("\n      - name:").map(|(step, _)| step))
+        .expect("release workflow must retain the checksum-gated publication step");
+    assert!(
+        publish_step.contains("PI_CRATES_IO_RELEASE_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}"),
+        "publication step must receive the registry credential only in its secret-scoped environment"
+    );
+    let token_capture = publish_step
+        .find(concat!(
+            "release_crates_io_token=\"$",
+            "{PI_CRATES_IO_RELEASE_TOKEN:-}\""
+        ))
+        .expect("publication step must capture the injected token in a shell-only variable");
+    let token_unset = publish_step
+        .find("unset PI_CRATES_IO_RELEASE_TOKEN")
+        .expect("publication step must remove the exported token before invoking subprocesses");
+    let crate_reverification = publish_step
+        .find("actual_crate_sha=\"$(sha256sum")
+        .expect("publication step must reverify the crate after narrowing token scope");
+    let token_handoff = publish_step
+        .find("PI_CRATES_IO_RELEASE_TOKEN=\"$release_crates_io_token\"")
+        .expect("publication step must hand the token only to the publish process");
+    let cargo_publish = publish_step
+        .find("cargo publish")
+        .expect("publication step must retain the Cargo upload boundary");
+    let token_clear = publish_step[token_handoff..]
+        .find("unset release_crates_io_token")
+        .map(|offset| token_handoff + offset)
+        .expect("publication step must clear its shell-only token after Cargo returns");
+    let receipt_validation = publish_step
+        .find("if [ -f \"$PI_CREDENTIAL_RECEIPT\"")
+        .expect("publication step must validate the credential receipt after token clearing");
+    assert!(
+        publish_step.contains(concat!(
+            "run: |\n          set -euo pipefail\n          set +x\n          ",
+            "release_crates_io_token=\"$",
+            "{PI_CRATES_IO_RELEASE_TOKEN:-}\""
+        ),) && publish_step.contains("export -n release_crates_io_token")
+            && publish_step
+                .matches("PI_CRATES_IO_RELEASE_TOKEN=\"$release_crates_io_token\"")
+                .count()
+                == 1
+            && token_capture < token_unset
+            && token_unset < crate_reverification
+            && crate_reverification < token_handoff
+            && token_handoff < cargo_publish
+            && cargo_publish < token_clear
+            && token_clear < receipt_validation,
+        "registry credential must remain unavailable to pre-publication verification subprocesses"
+    );
+    assert!(
+        publish_step.contains("cargo publish") && publish_step.contains("--no-verify"),
+        "secret-scoped Cargo publication must not run Cargo's package build verification"
+    );
+
+    let runbook = require_text("docs/releasing.md");
+    let manual_lane = runbook
+        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("## Pre-release flow (rc)")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release lane must have stable section boundaries");
+    let manual_xtrace_disable = manual_lane
+        .find("set -euo pipefail\nset +x\numask 077")
+        .expect("manual lane must disable shell tracing before reading the registry token");
+    let manual_token_capture = manual_lane
+        .find(
+            "release_crates_io_token=\"${CARGO_REGISTRY_TOKEN:-${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}}\"",
+        )
+        .expect("manual lane must capture the registry token in a shell-only variable");
+    let manual_token_nonempty = manual_lane
+        .find("[[ -n \"$release_crates_io_token\" ]]")
+        .expect("manual lane must require a registry token before its first subprocess");
+    let manual_token_unset = manual_lane
+        .find(
+            "builtin unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN \\\n  PI_CRATES_IO_RELEASE_TOKEN",
+        )
+        .expect("manual lane must remove every exported registry-token spelling");
+    let manual_token_length = manual_lane
+        .find("(( ${#release_crates_io_token} <= 4096 ))")
+        .expect("manual lane must bound the token before its first subprocess");
+    let manual_token_line_guard = manual_lane
+        .find("case \"$release_crates_io_token\" in *$'\\n'*|*$'\\r'*) exit 1 ;; esac")
+        .expect("manual lane must reject line-breaking token bytes before its first subprocess");
+    let first_tool_resolution = manual_lane
+        .find("release_cargo_entrypoint=\"$(builtin type -P -- cargo)\"")
+        .expect("manual lane must resolve its Cargo entrypoint");
+    assert!(
+        manual_xtrace_disable < manual_token_capture
+            && manual_token_capture < manual_token_nonempty
+            && manual_token_nonempty < manual_token_length
+            && manual_token_length < manual_token_line_guard
+            && manual_token_line_guard < manual_token_unset
+            && manual_token_unset < first_tool_resolution,
+        "manual release must validate and narrow the token before its first subprocess"
+    );
+    assert!(
+        !manual_lane[manual_xtrace_disable..manual_token_unset].contains("$("),
+        "manual release bootstrap must not spawn a token-inheriting command substitution"
+    );
+    assert!(
+        manual_lane.contains("builtin export -n release_crates_io_token")
+            && !manual_lane.contains("PI_CRATES_IO_RELEASE_TOKEN=\"$release_crates_io_token\"")
+            && manual_lane.contains("builtin printf '%s\\n' \"$controller_token\" |")
+            && manual_lane.contains("\"$release_bash_path\" --noprofile --norc -c")
+            && manual_lane.contains("[[ -z \"${PI_CRATES_IO_RELEASE_TOKEN:-}\" ]]")
+            && manual_lane.contains("IFS= read -r scoped_release_token")
+            && manual_lane.contains("export PI_CRATES_IO_RELEASE_TOKEN=\"$scoped_release_token\"",)
+            && manual_lane.contains("unset scoped_release_token")
+            && manual_lane.contains("exec 0</dev/null"),
+        "manual release must pass the token through an anonymous pipe into exactly one clean child, never argv"
+    );
+    assert!(
+        manual_lane.contains("release_build_env() {\n  env -i")
+            && manual_lane.contains("HOME=\"$RELEASE_BUILD_HOME\"")
+            && manual_lane.contains("CARGO_HOME=\"$RELEASE_BUILD_CARGO_HOME\"")
+            && manual_lane.contains("GIT_CONFIG_GLOBAL=/dev/null")
+            && manual_lane.contains("GIT_CONFIG_NOSYSTEM=1"),
+        "manual build, test, and package commands must use an isolated allowlisted environment"
+    );
+    let publisher_setup = manual_lane
+        .split_once("publisher_env() {")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("record_exact_crates_state() {")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release must define an isolated publisher environment");
+    assert!(
+        manual_lane.contains("publisher_home=\"$MANUAL_RELEASE_STATE_DIR/publisher-home\"")
+            && manual_lane.contains(
+                "publisher_cargo_home=\"$MANUAL_RELEASE_STATE_DIR/publisher-cargo-home\"",
+            )
+            && publisher_setup.starts_with("\n     env -i")
+            && publisher_setup.contains("HOME=\"$publisher_home\"")
+            && publisher_setup.contains("CARGO_HOME=\"$publisher_cargo_home\"")
+            && publisher_setup.contains("GIT_CONFIG_GLOBAL=/dev/null")
+            && publisher_setup.contains("publisher_env cargo publish --manifest-path")
+            && publisher_setup.contains("--dry-run --locked --registry crates-io")
+            && !publisher_setup.contains("env -u CARGO_REGISTRY_TOKEN"),
+        "publisher dry-run and configuration proofs must not inherit operator home or credentials"
+    );
+    let workflow_sha256 = format!("{:x}", Sha256::digest(workflow.as_bytes()));
+    assert!(
+        runbook.contains(&workflow_sha256),
+        "manual release workflow pin must match the exact reviewed workflow bytes"
+    );
+    let provider_raw = workflow
+        .split_once("          source = r'''")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once(
+                    "          '''\n          Path(os.environ[\"PROVIDER_PATH\"]).write_text(source, encoding=\"utf-8\")",
+                )
+                .map(|(source, _)| source)
+        })
+        .expect("release workflow must contain one extractable credential provider");
+    let mut provider_lines = provider_raw.split_inclusive('\n');
+    let provider_header = provider_lines
+        .next()
+        .expect("credential provider must not be empty");
+    assert_eq!(
+        provider_header, "#!/usr/bin/env python3\n",
+        "credential provider must retain its exact header"
+    );
+    let mut provider_source = provider_header.to_owned();
+    for line in provider_lines {
+        if line == "\n" {
+            provider_source.push('\n');
+        } else {
+            provider_source.push_str(
+                line.strip_prefix("          ")
+                    .expect("credential provider must retain auditable YAML indentation"),
+            );
+        }
+    }
+    let provider_sha256 = format!("{:x}", Sha256::digest(provider_source.as_bytes()));
+    assert!(
+        runbook.contains(&provider_sha256),
+        "manual release provider pin must match the exact extracted provider bytes"
+    );
+    let crates_reconciler = runbook
+        .split_once("reconcile_exact_crates_publication() {")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("CRATES_ATTEMPT_ID=")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release runbook must define the exact crates.io reconciler");
+    let registry_read = crates_reconciler
+        .find("record_exact_crates_state \"$before_state\" 1")
+        .expect("crates.io reconciler must query authority before publication");
+    let scoped_publish = crates_reconciler
+        .find("publish_exact_crate_with_scoped_token \"$actual_receipt\"")
+        .expect("crates.io reconciler must use the audited credential handoff");
+    assert!(
+        registry_read < scoped_publish,
+        "manual publication must reconcile first, then use the scoped upload boundary"
+    );
+    assert!(
+        crates_reconciler.contains(
+            "set +e\n       (\n         set -euo pipefail\n         publish_exact_crate_with_scoped_token \"$actual_receipt\""
+        ),
+        "the status-capturing parent must not disable fail-fast semantics inside the credential-scoped publish child"
+    );
+
+    let scoped_handoff = manual_lane
+        .split_once("publish_exact_crate_with_scoped_token() {")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| suffix.split_once("precrate_ruleset=").map(|(body, _)| body))
+        .expect("manual release must define one scoped credential handoff");
+    let pipe_write = scoped_handoff
+        .find("builtin printf '%s\\n' \"$controller_token\" |")
+        .expect("controller must write the token only through an anonymous pipe");
+    let clean_child = scoped_handoff[pipe_write..]
+        .find("publisher_env \\")
+        .map(|offset| pipe_write + offset)
+        .expect("token reader must start through the isolated publisher environment");
+    let token_read = scoped_handoff[clean_child..]
+        .find("IFS= read -r scoped_release_token")
+        .map(|offset| clean_child + offset)
+        .expect("clean publisher child must read the token from its pipe");
+    let token_export = scoped_handoff[token_read..]
+        .find("export PI_CRATES_IO_RELEASE_TOKEN=\"$scoped_release_token\"")
+        .map(|offset| token_read + offset)
+        .expect("clean publisher child must export the token only after reading it");
+    let stdin_close = scoped_handoff[token_export..]
+        .find("exec 0</dev/null")
+        .map(|offset| token_export + offset)
+        .expect("Cargo stdin must be detached from the credential pipe");
+    let cargo_exec = scoped_handoff[stdin_close..]
+        .find("exec cargo publish --manifest-path \"$1\" --locked --no-verify")
+        .map(|offset| stdin_close + offset)
+        .expect("clean publisher child must exec the no-verify Cargo upload");
+    assert!(
+        pipe_write < clean_child
+            && clean_child < token_read
+            && token_read < token_export
+            && token_export < stdin_close
+            && stdin_close < cargo_exec
+            && scoped_handoff.contains("set -euo pipefail"),
+        "manual token handoff must remain pipefail-protected and ordered read/export/close/exec"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn manual_release_token_handoff_is_not_argv_and_propagates_publish_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    const FAKE_TOKEN: &str = "fake release token +=:_[]/7391";
+    let runbook = require_text("docs/releasing.md");
+    let manual_lane = runbook
+        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("## Pre-release flow (rc)")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release lane must have stable section boundaries");
+    let helper_start = manual_lane
+        .find("   publish_exact_crate_with_scoped_token() {")
+        .expect("manual release must define the scoped-token helper");
+    let helper_tail = &manual_lane[helper_start..];
+    let helper_end = helper_tail
+        .find("\n   }\n\n   precrate_ruleset=")
+        .map(|offset| offset + "\n   }".len())
+        .expect("scoped-token helper must have a stable end boundary");
+    let helper = &helper_tail[..helper_end];
+
+    let temp = tempfile::tempdir().expect("create isolated token-handoff fixture");
+    let fake_cargo = temp.path().join("cargo");
+    let success_receipt = temp.path().join("success.receipt");
+    let failure_receipt = temp.path().join("failure.receipt");
+    std::fs::write(
+        &fake_cargo,
+        format!(
+            r#"#!/bin/bash
+set -euo pipefail
+expected_token='fake release token +=:_[]/7391'
+test "${{PI_CRATES_IO_RELEASE_TOKEN:-}}" = "$expected_token"
+test "${{PI_EXPECTED_CRATE_NAME:-}}" = pi_agent_rust
+test "${{PI_EXPECTED_CRATE_VERSION:-}}" = 0.2.0
+test "${{PI_EXPECTED_CRATE_SHA256:-}}" = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+test "$#" -eq 11
+test "$1" = publish
+test "$2" = --manifest-path
+test "$4" = --locked
+test "$5" = --no-verify
+test "$6" = --registry
+test "$7" = crates-io
+test "$8" = --config
+test "${{10}}" = --config
+cmdline="$(tr '\0' '\n' < "/proc/$$/cmdline")"
+case "$cmdline" in *"$expected_token"*) exit 91 ;; esac
+stdin_target="$(readlink "/proc/$$/fd/0")"
+test "$stdin_target" = /dev/null
+printf 'token_exact=yes\nargv_token=no\nstdin=%s\n' "$stdin_target" \
+  > "$PI_CREDENTIAL_RECEIPT"
+case "$3" in *failure.toml) exit 47 ;; esac
+{empty}"#,
+            empty = "",
+        ),
+    )
+    .expect("write fake Cargo executable");
+    let mut permissions = std::fs::metadata(&fake_cargo)
+        .expect("stat fake Cargo executable")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&fake_cargo, permissions).expect("make fake Cargo executable");
+
+    let harness = format!(
+        r#"set -euo pipefail
+release_crates_io_token="${{CARGO_REGISTRY_TOKEN:-}}"
+test -n "$release_crates_io_token"
+export -n release_crates_io_token
+unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN PI_CRATES_IO_RELEASE_TOKEN
+fixture_dir="$1"
+success_receipt="$2"
+failure_receipt="$3"
+PATH="$fixture_dir:/usr/bin:/bin"
+export PATH
+RELEASE_VERSION=0.2.0
+expected_crate_sha256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+publisher_cwd="$fixture_dir"
+manifest_abs="$fixture_dir/success.toml"
+registry_credential_config='registry.credential-provider="/fake/provider"'
+named_credential_config='registries.crates-io.credential-provider="/fake/provider"'
+release_bash_path=/bin/bash
+publisher_env() {{
+  local argument
+  for argument in "$@"; do
+    case "$argument" in
+      *"$release_crates_io_token"*) return 93 ;;
+    esac
+  done
+  /usr/bin/env -i PATH="$PATH" LANG=C.UTF-8 LC_ALL=C.UTF-8 "$@"
+}}
+{helper}
+publish_exact_crate_with_scoped_token "$success_receipt"
+manifest_abs="$fixture_dir/failure.toml"
+set +e
+publish_exact_crate_with_scoped_token "$failure_receipt"
+failure_status=$?
+set -e
+test "$failure_status" -eq 47
+printf 'failure_status=%s\n' "$failure_status"
+"#,
+    );
+    let output = Command::new("/bin/bash")
+        .args([
+            "--noprofile",
+            "--norc",
+            "-c",
+            &harness,
+            "bash",
+            temp.path().to_str().expect("UTF-8 fixture path"),
+            success_receipt.to_str().expect("UTF-8 success receipt"),
+            failure_receipt.to_str().expect("UTF-8 failure receipt"),
+        ])
+        .env_clear()
+        .env("CARGO_REGISTRY_TOKEN", FAKE_TOKEN)
+        .output()
+        .expect("execute scoped-token helper simulation");
+    assert!(
+        output.status.success(),
+        "scoped-token helper simulation failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&success_receipt).expect("read success receipt"),
+        "token_exact=yes\nargv_token=no\nstdin=/dev/null\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&failure_receipt).expect("read failure receipt"),
+        "token_exact=yes\nargv_token=no\nstdin=/dev/null\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("simulation stdout must be UTF-8"),
+        "failure_status=47\n"
+    );
+}
+
+#[test]
+fn manual_release_reconciliation_binds_durable_identity_and_live_asset_bytes() {
+    let runbook = require_text("docs/releasing.md");
+    assert!(
+        runbook.contains(
+            "release_identity_receipt=\"$MANUAL_RELEASE_STATE_DIR/github-release-identity.json\""
+        ),
+        "manual release must retain a durable GitHub release identity receipt"
+    );
+
+    let verifier = runbook
+        .split_once("verify_exact_release() {")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("reconcile_exact_github_publication() {")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release runbook must define the exact GitHub verifier");
+    assert!(
+        verifier.contains("--arg target_commitish \"$recorded_target_commitish\"")
+            && verifier.contains(".target_commitish == $target_commitish"),
+        "API target_commitish metadata must bind to the durable identity receipt"
+    );
+    assert!(
+        !verifier.contains("--arg target \"$expected_source_commit\"")
+            && !verifier.contains("upload_receipts"),
+        "verifier must not misuse ignored target_commitish metadata or a function-local upload path"
+    );
+    assert!(
+        verifier.contains("test \"$remote_tag_object\" = \"$local_tag_object\"")
+            && verifier.contains("test \"$remote_tag_commit\" = \"$expected_source_commit\"")
+            && verifier.contains("cmp \"$local_asset\" \"$downloaded_asset\""),
+        "annotated tag identity, peeled commit, and authoritative downloaded bytes must be proved"
+    );
+
+    let publication = runbook
+        .split_once("reconcile_exact_github_publication() {")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| suffix.split_once("```\n").map(|(body, _)| body))
+        .expect("manual release runbook must define public-state reconciliation");
+    let state_read = publication
+        .find("github-release-before-publication.json")
+        .expect("publication reconciler must read current state first");
+    let draft_guard = publication
+        .find("if test \"$current_draft\" = true; then")
+        .expect("publication reconciler must mutate only an exact draft");
+    let patch = publication
+        .find("gh api --method PATCH")
+        .expect("publication reconciler must retain an explicit PATCH boundary");
+    assert!(
+        state_read < draft_guard && draft_guard < patch,
+        "publication retry must inspect authority before deciding whether to PATCH"
+    );
+    assert!(
+        publication.contains("verify_exact_release false \"after-public-${attempt_id}\""),
+        "public state must be authoritatively reverified after an attempted or adopted transition"
+    );
+}
+
+#[test]
+fn manual_release_lane_is_actions_independent_and_preserves_ambiguous_crates_state() {
+    let runbook = require_text("docs/releasing.md");
+    let manual_lane = runbook
+        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("## Pre-release flow (rc)")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release lane must have stable section boundaries");
+
+    for forbidden in [
+        "/actions/",
+        "gh run",
+        "WORKFLOW_BASELINE",
+        "verify_workflow_baseline_unchanged",
+        "workflow_runs",
+        "run_attempt",
+    ] {
+        assert!(
+            !manual_lane.contains(forbidden),
+            "manual no-Actions lane must not depend on {forbidden}"
+        );
+    }
+    assert!(
+        manual_lane.contains("reconcile_exact_crates_publication() {")
+            && manual_lane.contains("crates_reconcile_status=0")
+            && manual_lane.contains("crates_reconcile_status=$?")
+            && !manual_lane.contains("crates_reconcile_pid=$!")
+            && !manual_lane.contains("wait \"$crates_reconcile_pid\"")
+            && manual_lane.contains("crates-publication-unresolved.txt")
+            && manual_lane.contains("unset release_crates_io_token")
+            && !manual_lane
+                .contains("if (\n     set -euo pipefail\n     reconcile_exact_crates_publication"),
+        "crates publication must use a foreground fail-fast child with durable unresolved state"
+    );
+    let evidence_commit = manual_lane
+        .find("git commit -m \"Record ${RELEASE_TAG} release evidence [skip actions]\"")
+        .expect("manual lane must create an explicitly skipped evidence commit");
+    let evidence_subject_check = manual_lane[evidence_commit..]
+        .find("release-evidence HEAD lacks [skip actions]")
+        .map(|offset| evidence_commit + offset)
+        .expect("manual lane must verify the resulting evidence-commit subject");
+    let branch_push = manual_lane
+        .find("origin_push_guarded \\\n     refs/heads/main:refs/heads/main")
+        .expect("manual lane must retain its guarded branch push");
+    let branch_subject_check = manual_lane[..branch_push]
+        .rfind("branch-push HEAD lacks [skip actions]")
+        .expect("manual lane must reverify the commit marker immediately before branch push");
+    let local_tag = manual_lane
+        .find("git tag -a \"$RELEASE_TAG\"")
+        .expect("manual lane must create the annotated release tag");
+    let tag_subject_check = manual_lane[..local_tag]
+        .rfind("tag source lacks [skip actions]")
+        .expect("manual lane must verify the tagged commit marker before tag creation");
+    assert!(
+        evidence_commit < evidence_subject_check
+            && evidence_subject_check < branch_subject_check
+            && branch_subject_check < branch_push
+            && branch_push < tag_subject_check
+            && tag_subject_check < local_tag,
+        "source, evidence, branch-push, and tag boundaries must all retain [skip actions]"
+    );
+    let reconciliation_call = manual_lane
+        .rfind("reconcile_exact_crates_publication \\")
+        .expect("manual lane must invoke the reconciler inside its foreground child");
+    let crates_foreground_sequence = concat!(
+        "set +e\n",
+        "   (\n",
+        "     set -euo pipefail\n",
+        "     reconcile_exact_crates_publication \\\n",
+        "       \"$CRATES_ATTEMPT_ID\" \"$crates_attempt_dir\"\n",
+        "   )\n",
+        "   crates_reconcile_status=$?\n",
+        "   set -e",
+    );
+    let foreground_child = manual_lane
+        .find(crates_foreground_sequence)
+        .expect("crates reconciler must have an exact foreground status boundary");
+    let captured_status = manual_lane[reconciliation_call..]
+        .find("crates_reconcile_status=$?")
+        .map(|offset| reconciliation_call + offset)
+        .expect("parent must capture the crates child exit status");
+    let token_clear = manual_lane[reconciliation_call..]
+        .find("unset release_crates_io_token")
+        .expect("successful reconciliation must clear the parent-shell token");
+    let unresolved_receipt = manual_lane[reconciliation_call..]
+        .find("crates-publication-unresolved.txt")
+        .expect("failed reconciliation must preserve a durable unresolved receipt");
+    assert!(
+        foreground_child < reconciliation_call
+            && reconciliation_call < captured_status
+            && token_clear < unresolved_receipt,
+        "foreground child, captured status, success, and unresolved branches must remain explicit and ordered"
+    );
+    assert!(
+        !crates_foreground_sequence.contains(") &") && !crates_foreground_sequence.contains("$!"),
+        "irreversible crates reconciliation must not outlive the controller"
+    );
+    assert!(
+        manual_lane.contains("assert_origin_push_disabled() {")
+            && manual_lane.contains("git push --atomic \"$release_remote_url\" \"$@\"")
+            && !manual_lane.contains("enable_origin_push")
+            && !manual_lane.contains("git remote set-url --push origin \"$release_remote_url\"",),
+        "the persistent origin push URL must remain guarded across every push attempt"
+    );
+
+    let github_publication = manual_lane
+        .find("PUBLICATION_ATTEMPT_ID=\"$(uuidgen")
+        .expect("manual lane must retain the GitHub publication boundary");
+    let successful_crates_gate = manual_lane[..github_publication]
+        .rfind("test \"$crates_reconcile_status\" -eq 0")
+        .expect("GitHub publication must reassert successful crates reconciliation");
+    let successful_receipt_gate = manual_lane[..github_publication]
+        .rfind("crates-publication-reconciliation.txt")
+        .expect("GitHub publication must require the successful crates receipt");
+    assert!(
+        reconciliation_call < successful_crates_gate
+            && successful_crates_gate < successful_receipt_gate
+            && successful_receipt_gate < github_publication,
+        "successful crates state and its durable receipt must gate the GitHub public transition"
+    );
+    assert!(
+        manual_lane[successful_receipt_gate..github_publication]
+            .contains("grep -Fxc 'registry_state=exact'"),
+        "the successful crates receipt gate must require one exact registry-state line"
+    );
+    assert!(
+        manual_lane.contains("release_bash_path=\"$(operator_tool_path bash)\"")
+            && manual_lane.contains("release_bwrap_path=\"$(operator_tool_path bwrap)\"")
+            && manual_lane.contains("release_git_path=\"$(operator_tool_path git)\"")
+            && manual_lane.contains("release_sha256sum_path=\"$(operator_tool_path sha256sum)\"")
+            && manual_lane.contains("\"$release_bash_path\" --noprofile --norc -c")
+            && manual_lane.matches("\"$release_bwrap_path\" \\").count() == 2
+            && manual_lane.contains("' bash \"$release_git_path\" \"$source_commit\"")
+            && manual_lane.contains("' bash \"$release_sha256sum_path\" \"$preserved_inputs\"")
+            && !manual_lane.contains("/usr/local/bin/git")
+            && !manual_lane.contains("command -v bwrap")
+            && !manual_lane.contains("\n     bwrap --die-with-parent")
+            && !manual_lane.contains("/usr/bin/bash --noprofile --norc -c")
+            && !manual_lane.contains("/usr/bin/sha256sum --check"),
+        "bubblewrap checkpoints must execute the exact reverified operator-tool paths"
+    );
+    assert!(
+        manual_lane
+            .contains("sed find chmod head tail tee tr cat mkdir env uname df nproc sysctl ubs br")
+            && manual_lane.contains(
+                "rg timeout base64 flock mv od basename sleep cp paste am bv cut dd fd mkfifo"
+            )
+            && manual_lane
+                .contains("pgrep ps rch rm sh tmux touch which install rmdir xz yes ls seq whoami"),
+        "operator-tool inventory must cover audited pre-existing E2E and quality-gate subprocesses"
+    );
+    assert!(
+        manual_lane
+            .contains("This operator-tool receipt does **not** claim complete transitive process",)
+            && manual_lane.contains(
+                "descendants selected internally by Cargo,\nrustc, native linker drivers",
+            )
+            && manual_lane
+                .contains("fixture executables generated\ninside isolated test directories",)
+            && manual_lane.contains("no byte-identity claim for those excluded descendants",)
+            && !manual_lane.contains("record every controller tool\nused by a release gate"),
+        "the operator-tool receipt must not overclaim complete compiler or fixture process closure"
+    );
+    assert!(
+        manual_lane.contains("bin-sh usr-bin-node home-bun home-bun-node bin-bash bin-echo",)
+            && manual_lane.contains(
+                "/bin/sh /usr/bin/node /home/ubuntu/.bun/bin/bun /home/ubuntu/.bun/bin/node",
+            )
+            && manual_lane.contains("/bin/bash /bin/echo")
+            && manual_lane.contains("record_operator_tool() {")
+            && manual_lane.contains("printf '%s\\t%s\\t%s\\t%s\\n'")
+            && manual_lane.contains("'$1 == tool { print $4 }'")
+            && manual_lane
+                .matches("builtin type -P -- \"$release_tool\"")
+                .count()
+                == 3
+            && manual_lane
+                .matches("builtin type -t -- \"$release_tool\"")
+                .count()
+                == 2
+            && manual_lane.matches("builtin hash -r").count() == 1
+            && manual_lane.contains("[[ \"$requested_path\" == /* ]]")
+            && manual_lane.contains(
+                "[[ \"$expected_requested_path\" == /* && \"$expected_resolved_path\" == /* ]]",
+            )
+            && manual_lane.contains("[[ -n \"${BASH_VERSION:-}\" && \"$-\" == *p* ]]")
+            && manual_lane.contains("builtin unset BASH_ENV ENV CDPATH GLOBIGNORE")
+            && manual_lane.contains("[[ ! -v BASH_ENV && ! -v ENV ]]")
+            && manual_lane.contains("done < \"/proc/$$/environ\"")
+            && manual_lane.contains("release_path_descendant_tool_names=(kill)")
+            && manual_lane.contains(
+                "record_operator_tool \"path-$release_tool\" \"$release_tool_requested_path\""
+            )
+            && manual_lane.contains("release_realpath_path=\"$(operator_tool_path realpath)\"")
+            && manual_lane.contains(
+                "release_controller_bash=\"$(\"$release_realpath_path\" -e -- \"/proc/$$/exe\")\"",
+            )
+            && manual_lane.contains("test \"$release_controller_bash\" = \"$release_bash_path\"")
+            && manual_lane.contains("$(builtin pwd -P)")
+            && manual_lane.contains("The `path-kill` row separately binds the external"),
+        "operator-tool receipts must bind PATH and hard-coded entrypoints to their resolved targets"
+    );
+
+    let clean_launch = manual_lane
+        .find("exec /bin/bash\n--noprofile --norc -p")
+        .expect("manual lane must launch one clean privileged Bash controller");
+    let fail_fast = manual_lane
+        .find("```bash\nset -euo pipefail\nset +x\numask 077")
+        .expect("controller must become fail-fast before any hygiene assertion");
+    let privileged_check = manual_lane
+        .find("[[ -n \"${BASH_VERSION:-}\" && \"$-\" == *p* ]]")
+        .expect("controller must verify privileged Bash mode");
+    let hash_clear = manual_lane
+        .find("builtin hash -r")
+        .expect("controller must clear any inherited command cache once");
+    let hash_disable = manual_lane
+        .find("builtin set +h")
+        .expect("controller must disable command hashing");
+    let alias_disable = manual_lane
+        .find("builtin shopt -u expand_aliases")
+        .expect("controller must disable aliases");
+    let raw_function_guard = manual_lane
+        .find("done < \"/proc/$$/environ\"")
+        .expect("controller must reject raw exported Bash functions");
+    let environment_unset = manual_lane
+        .find("builtin unset BASH_ENV ENV CDPATH GLOBIGNORE")
+        .expect("controller must clear child-shell startup controls");
+    let environment_absent = manual_lane
+        .find("[[ ! -v BASH_ENV && ! -v ENV ]]")
+        .expect("controller must prove startup controls absent");
+    let function_shadow_guard = manual_lane
+        .find("if builtin declare -F \"$release_tool\" >/dev/null; then")
+        .expect("controller must reject live tool-shadowing functions");
+    let token_capture = manual_lane
+        .find(
+            "release_crates_io_token=\"${CARGO_REGISTRY_TOKEN:-${CARGO_REGISTRIES_CRATES_IO_TOKEN:-}}\"",
+        )
+        .expect("controller must capture the registry credential");
+    let token_unset = manual_lane
+        .find("builtin unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN")
+        .expect("controller must clear exported credential spellings");
+    let first_path_lookup = manual_lane
+        .find("release_cargo_entrypoint=\"$(builtin type -P -- cargo)\"")
+        .expect("controller must defer PATH resolution until credentials are narrowed");
+    let operator_receipt = manual_lane
+        .find("release_tool_receipt=\"$MANUAL_RELEASE_STATE_DIR/operator-tools.tsv\"")
+        .expect("controller must create its operator-tool receipt");
+    let verified_binding = manual_lane
+        .find("verify_operator_tools\nrelease_bash_path=\"$(operator_tool_path bash)\"")
+        .expect("controller must verify tools before binding its running Bash");
+    let controller_resolution = manual_lane
+        .find("release_controller_bash=\"$(\"$release_realpath_path\" -e -- \"/proc/$$/exe\")\"")
+        .expect("controller must resolve its running executable through a verified tool");
+    let controller_binding = manual_lane
+        .find("test \"$release_controller_bash\" = \"$release_bash_path\"")
+        .expect("controller must equal the receipted Bash executable");
+    assert!(
+        clean_launch < fail_fast
+            && fail_fast < privileged_check
+            && privileged_check < hash_clear
+            && hash_clear < hash_disable
+            && hash_disable < alias_disable
+            && alias_disable < raw_function_guard
+            && raw_function_guard < environment_unset
+            && environment_unset < environment_absent
+            && environment_absent < function_shadow_guard
+            && function_shadow_guard < token_capture
+            && token_capture < token_unset
+            && token_unset < first_path_lookup
+            && first_path_lookup < operator_receipt
+            && operator_receipt < verified_binding
+            && verified_binding < controller_resolution
+            && controller_resolution < controller_binding,
+        "clean-shell, credential, tool-receipt, and running-Bash bindings must remain ordered"
+    );
+}
+
+#[test]
+fn manual_release_controller_preamble_rejects_dispatch_shadowing() {
+    let runbook = require_text("docs/releasing.md");
+    let manual_lane = runbook
+        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("## Pre-release flow (rc)")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release lane must have stable section boundaries");
+    let preamble = manual_lane
+        .split_once("```bash\n")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("export RUSTUP_TOOLCHAIN")
+                .map(|(body, _)| body)
+        })
+        .expect("manual controller preamble must precede toolchain export");
+
+    let run = |script: &str, raw_function: bool| {
+        let mut command = std::process::Command::new("/bin/bash");
+        command
+            .args(["--noprofile", "--norc", "-p", "-c", script])
+            .env_clear();
+        if raw_function {
+            command.env("BASH_FUNC_git%%", format!("() {{  :\n}}"));
+        }
+        command.output().expect("execute controller preamble")
+    };
+
+    let clean = run(preamble, false);
+    assert!(
+        clean.status.success(),
+        "clean controller preamble failed: {}",
+        String::from_utf8_lossy(&clean.stderr)
+    );
+
+    let function_shadow = run(&format!("git() {{ :; }}\n{preamble}"), false);
+    assert!(
+        !function_shadow.status.success(),
+        "tool-shadowing function must fail the controller preamble"
+    );
+
+    let alias_shadow = run(&format!("alias git='printf shadowed'\n{preamble}"), false);
+    assert!(
+        !alias_shadow.status.success(),
+        "tool-shadowing alias must fail the controller preamble"
+    );
+
+    let raw_function = run(preamble, true);
+    assert!(
+        !raw_function.status.success()
+            && String::from_utf8_lossy(&raw_function.stderr)
+                .contains("refusing exported shell function environment"),
+        "raw exported function must fail before any controller subprocess"
+    );
+}
+
+#[test]
+fn manual_release_retries_use_fresh_attempts_and_exact_success_receipts() {
+    let runbook = require_text("docs/releasing.md");
+    let manual_lane = runbook
+        .split_once("## Manual DSR lane (no GitHub Actions)")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("## Pre-release flow (rc)")
+                .map(|(body, _)| body)
+        })
+        .expect("manual release lane must have stable section boundaries");
+
+    for rooted_path in [
+        "MANUAL_RELEASE_STATE_DIR=\"$MANUAL_RELEASE_ROOT/state\"",
+        "release_checkout=\"$MANUAL_RELEASE_ROOT/checkout\"",
+        "PRESERVED_DSR_STATE_DIR=\"$MANUAL_RELEASE_ROOT/dsr-state-$DSR_BUILD_RUN_ID\"",
+        "RAW_RELEASE_DIR=\"$MANUAL_RELEASE_ROOT/raw-assets-$DSR_BUILD_RUN_ID\"",
+        "release_cargo_parent=\"$MANUAL_RELEASE_STATE_DIR/controller-cargo\"",
+        "publisher_home=\"$MANUAL_RELEASE_STATE_DIR/publisher-home\"",
+        "publisher_cargo_home=\"$MANUAL_RELEASE_STATE_DIR/publisher-cargo-home\"",
+        "publisher_target_dir=\"$MANUAL_RELEASE_STATE_DIR/publisher-target\"",
+        "publisher_tmp_dir=\"$MANUAL_RELEASE_STATE_DIR/publisher-tmp\"",
+        "smoke_attempt_dir=\"$MANUAL_RELEASE_STATE_DIR/target-smoke-$SMOKE_ATTEMPT_ID\"",
+        "post_boundary_attempt_dir=\"$MANUAL_RELEASE_STATE_DIR/post-boundary-$POST_BOUNDARY_ATTEMPT_ID\"",
+        "crates_attempt_dir=\"$MANUAL_RELEASE_STATE_DIR/crates-$CRATES_ATTEMPT_ID\"",
+        "publication_attempt_dir=\"$MANUAL_RELEASE_STATE_DIR/publication-$PUBLICATION_ATTEMPT_ID\"",
+        "installer_root=\"$MANUAL_RELEASE_STATE_DIR/post-public-installer-linux-amd64\"",
+    ] {
+        assert!(
+            manual_lane.contains(rooted_path),
+            "isolated manual release root is missing {rooted_path}"
+        );
+    }
+    assert!(
+        !manual_lane.contains("/data/tmp/pi-v0.2.0-dsr-state-")
+            && !manual_lane.contains("/data/tmp/pi-v0.2.0-raw-assets-"),
+        "mutable DSR state and raw outputs must not escape the isolated release root"
+    );
+
+    let smoke_stage = manual_lane
+        .split_once("run_target_runtime_smoke_attempt() (")
+        .map(|(_, suffix)| suffix)
+        .and_then(|suffix| {
+            suffix
+                .split_once("reconcile_post_boundary_attempt() (")
+                .map(|(body, _)| body)
+        })
+        .expect("target-runtime smoke stage must be isolated from the remote boundary");
+    for required in [
+        "set -euo pipefail",
+        "$MANUAL_RELEASE_STATE_DIR/target-smoke-$SMOKE_ATTEMPT_ID",
+        concat!("$", "{attempt_id}-$", "{label}"),
+        "${attempt_id}-windows-amd64",
+        "$attempt_dir/smoke-linux-amd64.txt",
+        "$attempt_dir/smoke-linux-arm64-qemu-emulated.txt",
+        "$attempt_dir/smoke-darwin-amd64.txt",
+        "$attempt_dir/smoke-darwin-arm64.txt",
+        "$attempt_dir/smoke-windows-amd64.txt",
+        "test \"${#SMOKE_RECEIPTS[@]}\" = 5",
+        "smoke_attempt_limit=3",
+        "run_target_runtime_smoke_attempt \\",
+        "smoke_attempt_pid=$!",
+        "wait \"$smoke_attempt_pid\"",
+        "target-runtime-smokes-unresolved.txt",
+        "target-runtime-smokes-success.txt",
+        "canonical_smoke_proof=\"$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256\"",
+    ] {
+        assert!(
+            smoke_stage.contains(required),
+            "target smoke retry contract is missing {required}"
+        );
+    }
+    assert!(
+        !smoke_stage.contains("if run_target_runtime_smoke_attempt")
+            && !smoke_stage.contains("&& run_target_runtime_smoke_attempt")
+            && !smoke_stage.contains("|| run_target_runtime_smoke_attempt"),
+        "the fail-fast smoke child must not execute in a Bash conditional context"
+    );
+    for destructive in ["rm ", "unlink ", "Remove-Item", "git clean"] {
+        assert!(
+            !smoke_stage.contains(destructive),
+            "target-smoke recovery must retain partial state, but found {destructive}"
+        );
+    }
+    let canonical_proof = smoke_stage
+        .find("canonical_smoke_proof=\"$MANUAL_RELEASE_STATE_DIR/target-runtime-smokes.sha256\"")
+        .expect("successful smoke proof must be promoted canonically");
+    let success_receipt = smoke_stage
+        .find(
+            "smoke_success_receipt=\"$MANUAL_RELEASE_STATE_DIR/target-runtime-smoke-success.txt\"",
+        )
+        .expect("successful smoke attempt must retain an exact root receipt");
+    assert!(
+        canonical_proof < success_receipt
+            && smoke_stage[canonical_proof..success_receipt]
+                .contains("sha256sum --check --strict \"$canonical_smoke_proof\""),
+        "the exact five-receipt proof must validate before success is recorded"
+    );
+
+    for (label, sequence, status, unresolved, success) in [
+        (
+            "post-boundary tag/draft",
+            concat!(
+                "set +e\n",
+                "   (\n",
+                "     set -euo pipefail\n",
+                "     reconcile_post_boundary_attempt \\\n",
+                "       \"$POST_BOUNDARY_ATTEMPT_ID\" \"$post_boundary_attempt_dir\"\n",
+                "   )\n",
+                "   post_boundary_reconcile_status=$?\n",
+                "   set -e",
+            ),
+            "post_boundary_reconcile_status=$?",
+            "post-boundary-unresolved.txt",
+            "post-boundary-reconciliation.txt",
+        ),
+        (
+            "final GitHub publication",
+            concat!(
+                "set +e\n",
+                "   (\n",
+                "     set -euo pipefail\n",
+                "     reconcile_final_publication_attempt \\\n",
+                "       \"$PUBLICATION_ATTEMPT_ID\" \"$publication_attempt_dir\" \\\n",
+                "       \"$successful_crates_receipt\"\n",
+                "   )\n",
+                "   publication_reconcile_status=$?\n",
+                "   set -e",
+            ),
+            "publication_reconcile_status=$?",
+            "publication-attempt-unresolved.txt",
+            "publication-attempt-success.txt",
+        ),
+    ] {
+        let sequence_position = manual_lane
+            .find(sequence)
+            .unwrap_or_else(|| panic!("{label} must use the exact foreground child boundary"));
+        let status_position = sequence_position
+            + sequence
+                .find(status)
+                .unwrap_or_else(|| panic!("{label} sequence must capture child status"));
+        assert!(
+            sequence_position < status_position
+                && manual_lane[status_position..].contains(unresolved)
+                && manual_lane[status_position..].contains(success)
+                && !sequence.contains(") &")
+                && !sequence.contains("$!"),
+            "{label} must retain separate exact and unresolved attempt receipts"
+        );
+    }
+
+    assert!(
+        manual_lane.contains("test \"$post_boundary_reconcile_status\" -eq 0")
+            && manual_lane.contains("test \"$publication_reconcile_status\" -eq 0"),
+        "later irreversible steps must require exact successful retry receipts"
+    );
+    for retained_installer_control in [
+        "TMPDIR=\"$installer_root/tmp\"",
+        "PI_INSTALLER_RETAIN_TEMP=1",
+        "PI_INSTALLER_LOCK_DIR=\"$installer_lock\"",
+        "test -d \"$installer_lock\" && test ! -L \"$installer_lock\"",
+        "test -f \"$installer_lock/pid\" && test ! -L \"$installer_lock/pid\"",
+        "Retaining installer temporary directory:",
+        "Retaining installer lock directory: $installer_lock",
+    ] {
+        assert!(
+            manual_lane.contains(retained_installer_control),
+            "post-public installer proof must retain {retained_installer_control}"
+        );
+    }
+}
+
+#[test]
 fn agent_release_profile_guidance_matches_cargo_and_readme() {
     let cargo_text = require_text("Cargo.toml");
     let cargo = cargo_text.parse::<toml::Table>();

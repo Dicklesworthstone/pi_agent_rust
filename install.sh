@@ -36,6 +36,7 @@ FORCE_INSTALL=0
 OFFLINE="${PI_INSTALLER_OFFLINE:-0}"
 OFFLINE_TARBALL="${PI_INSTALLER_OFFLINE_TARBALL:-}"
 AGENT_SKILLS_ENABLED="${AGENT_SKILLS_ENABLED:-1}"
+RETAIN_TEMP="${PI_INSTALLER_RETAIN_TEMP:-0}"
 
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
@@ -93,7 +94,7 @@ STATE_FILE="$STATE_DIR/install-state.env"
 STATE_VERSION="1"
 
 TMP=""
-LOCK_DIR="/tmp/pi-agent-rust-install.lock.d"
+LOCK_DIR="${PI_INSTALLER_LOCK_DIR:-/tmp/pi-agent-rust-install.lock.d}"
 LOCKED=0
 MIGRATION_MOVED=0
 INSTALL_COMMITTED=0
@@ -1157,6 +1158,30 @@ preflight_checks() {
 }
 
 validate_options() {
+  case "$RETAIN_TEMP" in
+    0|1)
+      ;;
+    *)
+      err "PI_INSTALLER_RETAIN_TEMP must be 0 or 1"
+      exit 1
+      ;;
+  esac
+
+  case "$LOCK_DIR" in
+    /*)
+      ;;
+    *)
+      err "PI_INSTALLER_LOCK_DIR must be an absolute path"
+      exit 1
+      ;;
+  esac
+  case "$LOCK_DIR" in
+    /|*/|*//*|*/./*|*/.|*/../*|*/..|*$'\t'*|*$'\n'*|*$'\r'*)
+      err "PI_INSTALLER_LOCK_DIR is unsafe"
+      exit 1
+      ;;
+  esac
+
   case "$AGENT_SKILLS_ENABLED" in
     0|1)
       ;;
@@ -1281,17 +1306,29 @@ acquire_lock() {
     return 0
   fi
 
-  if [ -f "$LOCK_DIR/pid" ]; then
-    local old_pid
+  if [ -d "$LOCK_DIR" ] && [ ! -L "$LOCK_DIR" ] \
+    && [ -f "$LOCK_DIR/pid" ] && [ ! -L "$LOCK_DIR/pid" ]; then
+    local old_pid stale_lock_dir
     old_pid=$(cat "$LOCK_DIR/pid" 2>/dev/null || true)
-    if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
-      rmdir "$LOCK_DIR" 2>/dev/null || true
-      if mkdir "$LOCK_DIR" 2>/dev/null; then
-        LOCKED=1
-        echo $$ > "$LOCK_DIR/pid"
-        return 0
-      fi
-    fi
+    case "$old_pid" in
+      ''|*[!0-9]*|0)
+        ;;
+      *)
+        if ! kill -0 "$old_pid" 2>/dev/null \
+          && command -v ps >/dev/null 2>&1 \
+          && ! ps -p "$old_pid" >/dev/null 2>&1; then
+          stale_lock_dir="${LOCK_DIR}.stale.$(date -u +%Y%m%dT%H%M%SZ).$$.${RANDOM}"
+          if [ ! -e "$stale_lock_dir" ] && [ ! -L "$stale_lock_dir" ] \
+            && mv "$LOCK_DIR" "$stale_lock_dir" 2>/dev/null \
+            && mkdir "$LOCK_DIR" 2>/dev/null; then
+            LOCKED=1
+            echo $$ > "$LOCK_DIR/pid"
+            warn "Preserved stale installer lock: $stale_lock_dir"
+            return 0
+          fi
+        fi
+        ;;
+    esac
   fi
 
   err "Another installer appears to be running: $LOCK_DIR"
@@ -1308,12 +1345,21 @@ cleanup() {
     fi
   fi
 
-  if [ -n "$TMP" ] && [ -d "$TMP" ]; then
-    remove_path_recursively "$TMP" 2>/dev/null || true
-  fi
-  if [ "$LOCKED" -eq 1 ]; then
-    rm -f "$LOCK_DIR/pid" 2>/dev/null || true
-    rmdir "$LOCK_DIR" 2>/dev/null || true
+  if [ "$RETAIN_TEMP" -eq 1 ]; then
+    if [ -n "$TMP" ] && [ -d "$TMP" ]; then
+      warn "Retaining installer temporary directory: $TMP"
+    fi
+    if [ "$LOCKED" -eq 1 ] && [ -d "$LOCK_DIR" ]; then
+      warn "Retaining installer lock directory: $LOCK_DIR"
+    fi
+  else
+    if [ -n "$TMP" ] && [ -d "$TMP" ]; then
+      remove_path_recursively "$TMP" 2>/dev/null || true
+    fi
+    if [ "$LOCKED" -eq 1 ]; then
+      rm -f "$LOCK_DIR/pid" 2>/dev/null || true
+      rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
   fi
 
   trap - EXIT

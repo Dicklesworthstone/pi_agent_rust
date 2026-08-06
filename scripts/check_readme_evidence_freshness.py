@@ -242,18 +242,19 @@ def classify_claim_surface(claim_text: str, artifact_path: str) -> str:
     # path after containment checks; only prose outside citations and that
     # canonical path participate in classification.
     prose = re.sub(r"\*\(from [^)]+\)\*", "", claim_text)
-    lowered = f"{prose} {artifact_path}".lower()
-    if any(
-        marker in lowered
-        for marker in (
-            "historical",
-            "snapshot",
-            "baseline",
-            "planning/",
-            "docs/planning/",
-            "retained",
-            "not treated as current",
-        )
+    normalized_prose = " ".join(prose.casefold().split())
+    # Historical evidence is an explicit semantic contract, not a keyword
+    # heuristic.  Generic words such as "baseline", "snapshot", or "retained"
+    # routinely appear in current comparative claims and must never disable
+    # freshness or strict performance-proof validation.  Historical-only
+    # citations live under docs/planning and carry the exact, whole-line label
+    # below.  Requiring equality (rather than accepting the label as a prefix)
+    # prevents a current claim appended to the disclaimer from inheriting the
+    # historical exemption.
+    if (
+        artifact_path.startswith("docs/planning/")
+        and normalized_prose
+        == "historical-only; not a current release claim: benchmark snapshot"
     ):
         return "historical_snapshot"
     return "release_facing"
@@ -2238,12 +2239,67 @@ def run_self_test() -> int:
         os.utime(historical, (old_ts, old_ts))
         result, output = run_check(
             generic_root,
-            "Historical benchmark snapshot: *(from docs/planning/historical_snapshot.json, "
-            "run historical-run)*\n",
+            "Historical-only; not a current release claim: benchmark snapshot "
+            "*(from docs/planning/historical_snapshot.json, run historical-run)*\n",
         )
         if result != 0 or "surface=historical_snapshot" not in output:
             print(output)
             print("SELF-TEST FAIL: historical freshness behavior must remain intentional")
+            return 2
+
+        historical_keyword_bypasses = (
+            "Startup is 5 ms versus the baseline",
+            "The retained result shows startup is 5 ms",
+            "Current release snapshot: startup is 5 ms",
+            "Historical benchmark shows the current release starts in 5 ms",
+            "Not treated as current by the baseline; startup is 5 ms",
+            "This says historical-only and not a current release claim: startup is 5 ms",
+            "Not historical-only; not a current release claim: startup is 5 ms",
+        )
+        for claim in historical_keyword_bypasses:
+            if (
+                classify_claim_surface(
+                    claim,
+                    "tests/perf/reports/budget_summary.json",
+                )
+                != "release_facing"
+            ):
+                print(
+                    "SELF-TEST FAIL: generic historical vocabulary must not "
+                    f"downgrade a current quantitative claim: {claim!r}"
+                )
+                return 2
+        malformed_historical_disclaimers = (
+            "This says historical-only and not a current release claim: startup is 5 ms",
+            "Not historical-only; not a current release claim: startup is 5 ms",
+            "Historical-only — not a current release claim: startup is 5 ms",
+            "Historical-only; not a current release claim: benchmark snapshot. "
+            "Current release starts in 5 ms",
+        )
+        for claim in malformed_historical_disclaimers:
+            if (
+                classify_claim_surface(
+                    claim,
+                    "docs/planning/historical_snapshot.json",
+                )
+                != "release_facing"
+            ):
+                print(
+                    "SELF-TEST FAIL: only the exact leading historical disclaimer "
+                    f"may downgrade a planning citation: {claim!r}"
+                )
+                return 2
+        if (
+            classify_claim_surface(
+                "Historical-only; not a current release claim: old result",
+                "tests/perf/reports/budget_summary.json",
+            )
+            != "release_facing"
+        ):
+            print(
+                "SELF-TEST FAIL: the historical-only exemption must be limited "
+                "to planning artifacts"
+            )
             return 2
 
         result, output = run_check(

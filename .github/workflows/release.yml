@@ -2914,6 +2914,14 @@ jobs:
           VERIFIED_CRATE_SIZE: ${{ steps.payload.outputs.crate_size }}
         run: |
           set -euo pipefail
+          set +x
+          release_crates_io_token="${PI_CRATES_IO_RELEASE_TOKEN:-}"
+          export -n release_crates_io_token
+          unset PI_CRATES_IO_RELEASE_TOKEN
+          if [ -z "$release_crates_io_token" ]; then
+            echo "::error::Registry publication token is empty"
+            exit 1
+          fi
           if [ ! -f "$PROVIDER_PATH" ] || [ -L "$PROVIDER_PATH" ] \
             || [ "$(sha256sum "$PROVIDER_PATH" | awk '{print $1}')" != "$PROVIDER_SHA256" ] \
             || [ -e "$PI_CREDENTIAL_RECEIPT" ]; then
@@ -2999,14 +3007,21 @@ jobs:
           print("Verified exact CLI-precedence credential provider configuration")
           PY
           set +e
-          env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
+          # All compilation and package verification completed before this
+          # secret-scoped step. --no-verify is mandatory here: Cargo's normal
+          # publish verification builds the package and would expose the
+          # credential environment to package/dependency build scripts.
+          PI_CRATES_IO_RELEASE_TOKEN="$release_crates_io_token" \
+            env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
             cargo publish \
               --manifest-path "$manifest_abs" \
               --locked \
+              --no-verify \
               --registry crates-io \
               --config "$registry_credential_config" \
               --config "$named_credential_config"
           cargo_status=$?
+          unset release_crates_io_token
           set -e
           if [ -f "$PI_CREDENTIAL_RECEIPT" ] && [ ! -L "$PI_CREDENTIAL_RECEIPT" ]; then
             RECEIPT_PATH="$PI_CREDENTIAL_RECEIPT" python3 - <<'PY'
