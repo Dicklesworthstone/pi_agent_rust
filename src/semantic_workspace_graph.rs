@@ -119,7 +119,7 @@ impl<'de> Visitor<'de> for DuplicateRejectingJsonVisitor {
     }
 }
 
-fn parse_evidence_json(content: &str) -> serde_json::Result<Value> {
+pub(crate) fn parse_json_rejecting_duplicate_keys(content: &str) -> serde_json::Result<Value> {
     let mut deserializer = serde_json::Deserializer::from_str(content);
     let value = DuplicateRejectingJsonValue::deserialize(&mut deserializer)?.0;
     deserializer.end()?;
@@ -578,7 +578,7 @@ impl SemanticWorkspaceGraphBuilder {
         let file_node_id = file_node.id.clone();
         state.push_node(file_node);
 
-        match parse_evidence_json(content) {
+        match parse_json_rejecting_duplicate_keys(content) {
             Ok(value) => {
                 let redaction = assess_redaction(&input.source_path, content, Some(&value));
                 let mut evidence_node = evidence_artifact_node(
@@ -2919,10 +2919,9 @@ fn classify_performance_budget_claim(
             "performance_budget_claim_readiness_malformed".to_string(),
         ));
     };
-    if options
-        .reference_time_utc
-        .is_some_and(|reference| generated_at > reference + Duration::minutes(5))
-    {
+    if options.reference_time_utc.is_some_and(|reference| {
+        generated_at.signed_duration_since(reference) > Duration::minutes(5)
+    }) {
         return Some((
             EvidenceFreshnessStatus::Malformed,
             false,
@@ -3002,7 +3001,8 @@ fn evidence_age_exceeds_policy(
     } else if value.get("claim_surface").and_then(Value::as_str) == Some("release_facing") {
         evidence_age > Duration::days(RELEASE_FACING_EVIDENCE_STALE_AFTER_DAYS)
     } else {
-        evidence_age > Duration::days(options.stale_after_days)
+        Duration::try_days(options.stale_after_days)
+            .is_none_or(|stale_after| evidence_age > stale_after)
     }
 }
 
@@ -3088,8 +3088,36 @@ fn trusted_git_executable() -> Option<PathBuf> {
     None
 }
 
+fn canonical_real_directory(path: &Path) -> Option<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir().ok()?.join(path)
+    };
+    let mut lexical = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::Prefix(prefix) => lexical.push(prefix.as_os_str()),
+            Component::RootDir => lexical.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // An absolute filesystem root is its own parent.
+                lexical.pop();
+            }
+            Component::Normal(segment) => {
+                lexical.push(segment);
+                let metadata = fs::symlink_metadata(&lexical).ok()?;
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return None;
+                }
+            }
+        }
+    }
+    fs::canonicalize(lexical).ok()
+}
+
 fn repository_git_context(repository_root: &Path) -> Option<RepositoryGitContext> {
-    let worktree = fs::canonicalize(repository_root).ok()?;
+    let worktree = canonical_real_directory(repository_root)?;
     let git_executable = trusted_git_executable()?;
     let git_marker = worktree.join(".git");
     let marker_metadata = fs::symlink_metadata(&git_marker).ok()?;
@@ -4219,7 +4247,7 @@ fn dropin_lane_time_is_current(
 ) -> Result<DateTime<Utc>, DropinClaimFailure> {
     let generated_at = performance_generated_at(value)
         .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
-    if generated_at > reference_time + Duration::minutes(5)
+    if generated_at.signed_duration_since(reference_time) > Duration::minutes(5)
         || reference_time.signed_duration_since(generated_at)
             > Duration::hours(DROPIN_MAX_EVIDENCE_AGE_HOURS)
     {
@@ -4423,6 +4451,7 @@ fn dropin_lane_waiver_audit(
 fn validate_dropin_certification_lane(
     lane: &Value,
     reference_time: DateTime<Utc>,
+    verdict_generated_at: DateTime<Utc>,
 ) -> Result<(), DropinClaimFailure> {
     let lane = performance_exact_object(
         lane,
@@ -4440,6 +4469,18 @@ fn validate_dropin_certification_lane(
         ));
     }
     let lane_generated_at = dropin_lane_time_is_current(&lane["generated_at"], reference_time)?;
+    let verdict_lane_delta = verdict_generated_at.signed_duration_since(lane_generated_at);
+    let verdict_within_policy = verdict_generated_at.signed_duration_since(reference_time)
+        <= Duration::minutes(5)
+        && reference_time.signed_duration_since(verdict_generated_at)
+            <= Duration::hours(DROPIN_MAX_EVIDENCE_AGE_HOURS);
+    if verdict_within_policy
+        && !(-Duration::minutes(5)..=Duration::minutes(5)).contains(&verdict_lane_delta)
+    {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
     let waiver_audit = dropin_lane_waiver_audit(&lane["waiver_audit"], reference_time)?;
     if waiver_audit.generated_at > lane_generated_at
         || lane_generated_at.signed_duration_since(waiver_audit.generated_at) > Duration::minutes(5)
@@ -4528,6 +4569,14 @@ fn validate_dropin_certification_lane(
         gate_rows.push((id, status, blocking));
     }
     if waived.iter().any(|gate_id| !gate_ids.contains(gate_id)) {
+        return Err(DropinClaimFailure::Invalid(
+            "dropin_verdict_source_lane_invalid",
+        ));
+    }
+    // The ordinary CI lane schema can represent warnings, skips, and
+    // time-bounded waivers. A strict drop-in replacement claim is narrower:
+    // its committed source lane must be an unwaived, all-pass snapshot.
+    if !waived.is_empty() || gate_rows.iter().any(|(_, status, _)| *status != "pass") {
         return Err(DropinClaimFailure::Invalid(
             "dropin_verdict_source_lane_invalid",
         ));
@@ -4896,6 +4945,13 @@ fn validate_dropin_verdict_claim(
     let reference_time = reference_time_utc.ok_or(DropinClaimFailure::Unavailable(
         "dropin_verdict_source_lane_freshness_unavailable",
     ))?;
+    let verdict_generated_at = verdict_object["generated_at_utc"]
+        .as_str()
+        .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
+        .map(|parsed| parsed.with_timezone(&Utc))
+        .ok_or(DropinClaimFailure::Invalid(
+            "dropin_verdict_contract_invalid",
+        ))?;
     let context = repository_git_context(repository_root).ok_or(
         DropinClaimFailure::Unavailable("dropin_verdict_source_binding_unavailable"),
     )?;
@@ -4915,7 +4971,7 @@ fn validate_dropin_verdict_claim(
         dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_CONTRACT_PATH, true)?;
     let contract_text = std::str::from_utf8(&contract_bytes)
         .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"))?;
-    let contract = parse_evidence_json(contract_text)
+    let contract = parse_json_rejecting_duplicate_keys(contract_text)
         .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_contract_invalid"))?;
     let gate_specs = dropin_contract_gate_specs(&contract)?;
     let (source_commit, evidence_paths) = dropin_verdict_payload(value, &gate_specs)?;
@@ -4923,9 +4979,9 @@ fn validate_dropin_verdict_claim(
         dropin_head_regular_blob(&context, &head, DROPIN_CERTIFICATION_LANE_PATH, true)?;
     let lane_text = std::str::from_utf8(&lane_bytes)
         .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
-    let lane = parse_evidence_json(lane_text)
+    let lane = parse_json_rejecting_duplicate_keys(lane_text)
         .map_err(|_| DropinClaimFailure::Invalid("dropin_verdict_source_lane_invalid"))?;
-    validate_dropin_certification_lane(&lane, reference_time)?;
+    validate_dropin_certification_lane(&lane, reference_time, verdict_generated_at)?;
     dropin_source_binding(&context, &source_commit, &head)?;
 
     let mut provenance_paths = vec![
@@ -5114,7 +5170,7 @@ fn classify_evidence_freshness_in_repository(
     };
 
     let generated_at_utc = generated_at.with_timezone(&Utc);
-    if generated_at_utc > reference_time_utc + Duration::minutes(5) {
+    if generated_at_utc.signed_duration_since(reference_time_utc) > Duration::minutes(5) {
         return (
             EvidenceFreshnessStatus::Malformed,
             false,

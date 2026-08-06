@@ -2639,8 +2639,10 @@ for index, event in enumerate(parity_events):
     record_key = (extension_id, scenario_id)
     if record_key in parity_main_records:
         raise ValueError(f"parity event[{index}] duplicates {extension_id}/{scenario_id}")
-    run_id = canonical_lineage(event.get("run_id"), f"parity event[{index}].run_id")
-    parity_run_ids.add(run_id)
+    parity_run_id = canonical_lineage(
+        event.get("run_id"), f"parity event[{index}].run_id"
+    )
+    parity_run_ids.add(parity_run_id)
     for field in ("kind", "summary", "runtime_tier"):
         if not isinstance(event.get(field), str) or not event[field]:
             raise ValueError(f"parity event[{index}].{field} is invalid")

@@ -1097,17 +1097,90 @@ fn print_compatibility_matrix_summary(matrix: &CompatibilityMatrix, artifact_pat
     println!("  Artifact: {}", artifact_path.display());
 }
 
+fn verify_or_generate_compatibility_matrix(
+    matrix: &CompatibilityMatrix,
+    reports: &Path,
+    artifact_path: &Path,
+) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(matrix)
+        .map_err(|error| format!("serialize computed compatibility matrix: {error}"))?;
+    let generate = matches!(
+        std::env::var("PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        std::fs::create_dir_all(reports)
+            .map_err(|error| format!("create reports directory {}: {error}", reports.display()))?;
+        std::fs::write(artifact_path, format!("{json}\n")).map_err(|error| {
+            format!(
+                "write compatibility matrix artifact {}: {error}",
+                artifact_path.display()
+            )
+        })?;
+        return Ok(());
+    }
+
+    let committed_json = std::fs::read_to_string(artifact_path).map_err(|error| {
+        format!(
+            "read committed compatibility matrix artifact {}: {error}",
+            artifact_path.display()
+        )
+    })?;
+    let mut committed: serde_json::Value =
+        serde_json::from_str(&committed_json).map_err(|error| {
+            format!(
+                "committed compatibility matrix artifact {} contains malformed JSON: {error}",
+                artifact_path.display()
+            )
+        })?;
+    serde_json::from_str::<CompatibilityMatrix>(&committed_json).map_err(|error| {
+        format!(
+            "committed compatibility matrix artifact {} does not match the expected schema: {error}",
+            artifact_path.display()
+        )
+    })?;
+    let mut computed = serde_json::to_value(matrix)
+        .map_err(|error| format!("encode computed compatibility matrix value: {error}"))?;
+    committed
+        .as_object_mut()
+        .ok_or_else(|| {
+            format!(
+                "committed compatibility matrix artifact {} must be a JSON object",
+                artifact_path.display()
+            )
+        })?
+        .remove("generated_at")
+        .ok_or_else(|| {
+            format!(
+                "committed compatibility matrix artifact {} is missing generated_at",
+                artifact_path.display()
+            )
+        })?;
+    computed
+        .as_object_mut()
+        .ok_or_else(|| "computed compatibility matrix must be a JSON object".to_string())?
+        .remove("generated_at")
+        .ok_or_else(|| "computed compatibility matrix is missing generated_at".to_string())?;
+    assert_eq!(
+        committed, computed,
+        "committed FrankenNode compatibility matrix is stale; regenerate explicitly with \
+         PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX=1 cargo test \
+         --test franken_node_compat_harness generate_compatibility_matrix -- --exact"
+    );
+    Ok(())
+}
+
 #[test]
-fn generate_compatibility_matrix() {
+fn generate_compatibility_matrix() -> Result<(), String> {
     if find_node().is_none() || find_bun().is_none() {
         eprintln!("SKIP: generate_compatibility_matrix requires both Node.js and Bun");
-        return;
+        return Ok(());
     }
     let matrix = match run_compatibility_matrix() {
         Ok(matrix) => matrix,
         Err(err) => {
             eprintln!("SKIP: generate_compatibility_matrix runtime discovery failed: {err}");
-            return;
+            return Ok(());
         }
     };
 
@@ -1177,45 +1250,10 @@ fn generate_compatibility_matrix() {
     // source tree. Regeneration is an explicit maintainer operation.
     let reports = reports_dir();
     let artifact_path = reports.join("compatibility_matrix.json");
-    let json = serde_json::to_string_pretty(&matrix).expect("serialize matrix");
-    let generate = matches!(
-        std::env::var("PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX").as_deref(),
-        Ok("1")
-    );
-    if generate {
-        std::fs::create_dir_all(&reports).expect("create reports dir");
-        std::fs::write(&artifact_path, format!("{json}\n"))
-            .expect("write compatibility matrix artifact");
-    } else {
-        let committed_json = std::fs::read_to_string(&artifact_path)
-            .expect("read committed compatibility matrix artifact");
-        let mut committed: serde_json::Value = serde_json::from_str(&committed_json)
-            .expect("parse committed compatibility matrix artifact");
-        let mut computed: serde_json::Value =
-            serde_json::from_str(&json).expect("parse computed compatibility matrix artifact");
-        let committed_generated_at = committed
-            .as_object_mut()
-            .and_then(|object| object.remove("generated_at"));
-        let computed_generated_at = computed
-            .as_object_mut()
-            .and_then(|object| object.remove("generated_at"));
-        assert!(
-            committed_generated_at.is_some(),
-            "committed compatibility matrix is missing generated_at"
-        );
-        assert!(
-            computed_generated_at.is_some(),
-            "computed compatibility matrix is missing generated_at"
-        );
-        assert_eq!(
-            committed, computed,
-            "committed FrankenNode compatibility matrix is stale; regenerate explicitly with \
-             PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX=1 cargo test \
-             --test franken_node_compat_harness generate_compatibility_matrix -- --exact"
-        );
-    }
+    verify_or_generate_compatibility_matrix(&matrix, &reports, &artifact_path)?;
 
     print_compatibility_matrix_summary(&matrix, &artifact_path);
+    Ok(())
 }
 
 #[test]

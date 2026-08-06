@@ -26,16 +26,20 @@ diagnostic. It validates an annotated tag, the exact root package identity, a
 clean frozen checkout, the release gate, and `cargo publish --dry-run --locked`.
 It has no registry secret and never publishes anything.
 
-Stable crates.io publication is owned only by `.github/workflows/release.yml`.
-That workflow first creates or safely completes a verified GitHub draft, builds
-and inspects the exact `.crate` without a secret, then passes the crate and a
-source-bound checksum receipt to a fresh review-gated runner. The fresh runner
-executes `cargo publish --locked --registry crates-io`; its custom
-Cargo credential provider releases the token only when Cargo identifies the
-canonical crates.io registry and presents the exact verified crate
-name/version/SHA-256. The workflow then requires crates.io to report the exact,
-non-yanked version before it makes the GitHub release public. Pre-releases skip
-crates.io entirely.
+Stable crates.io publication has exactly two authorized lanes: the automated
+`.github/workflows/release.yml` lane and the audited manual DSR lane documented
+below. No other workflow or ad hoc operator command is an authorized publisher.
+In the automated lane, `release.yml` first creates or safely completes a
+verified GitHub draft, builds and inspects the exact `.crate` without a secret,
+then passes the crate and a source-bound checksum receipt to a fresh
+review-gated runner. The fresh runner executes
+`cargo publish --locked --registry crates-io`; its custom Cargo credential
+provider supplies the token
+for canonical crates.io read requests without writing a publication receipt,
+and supplies it for a publish request only when Cargo presents the exact
+verified crate name/version/SHA-256. The workflow then requires crates.io to
+report the exact, non-yanked version before it makes the GitHub release public.
+Pre-releases skip crates.io entirely.
 
 Release and publish workflows resolve the sibling-project crates from crates.io
 under `Cargo.lock`; they do not build against arbitrary sibling repository
@@ -232,9 +236,14 @@ source commit, never from a shared development checkout. Create the clone from
 that exact local commit without hardlinks, keep its `main` branch at the source
 commit, repoint its fetch URL to the canonical GitHub repository, and disable
 its push URL until the explicit branch-push checkpoint below. Do not copy
-ignored or untracked files into it. Record the resolved paths and SHA-256
-digests of `bash`, `git`, `python3`, `cargo`, `rustc`, `gh`, `jq`, `ssh`, and
-`sha256sum` in the state directory before relying on them. During the E2E run,
+ignored or untracked files into it. Pin `RUSTUP_TOOLCHAIN` for the entire
+fail-fast session, bypass the RCH Cargo wrapper, and put the rustup-selected
+actual Cargo/Rust compiler directory first on `PATH`. Record the original
+Cargo/Rust entrypoints and the selected actual binaries, including resolved
+paths, SHA-256 digests, and verbose versions. Also record the resolved paths and
+SHA-256 digests of `bash`, `git`, `python3`, `rustup`, `cargo`, `rustc`, `gh`,
+`jq`, `ssh`, `sha256sum`, and `bwrap` in the state directory before relying on
+them for a release gate or publication step. During the E2E run,
 make the clone's `.git` metadata non-writable so tests cannot move HEAD or
 alter the index, and keep Cargo target and temporary output outside the clone.
 The worktree remains writable because ordinary tests legitimately emit ignored
@@ -264,6 +273,35 @@ explicit operator-supplied values before running this block:
 ```bash
 set -euo pipefail
 umask 077
+export RUSTUP_TOOLCHAIN="nightly-2026-07-05"
+export RCH_CARGO_WRAPPER_BYPASS=1
+test "$RUSTUP_TOOLCHAIN" = nightly-2026-07-05
+test "$RCH_CARGO_WRAPPER_BYPASS" = 1
+release_cargo_entrypoint="$(type -P cargo)"
+release_rustc_entrypoint="$(type -P rustc)"
+release_rustup_entrypoint="$(type -P rustup)"
+test -n "$release_cargo_entrypoint"
+test -n "$release_rustc_entrypoint"
+test -n "$release_rustup_entrypoint"
+release_cargo_actual="$(realpath -e -- \
+  "$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" cargo)")"
+release_rustc_actual="$(realpath -e -- \
+  "$(rustup which --toolchain "$RUSTUP_TOOLCHAIN" rustc)")"
+test -f "$release_cargo_actual" && test ! -L "$release_cargo_actual"
+test -f "$release_rustc_actual" && test ! -L "$release_rustc_actual"
+release_rust_bin="$(dirname -- "$release_cargo_actual")"
+test "$(dirname -- "$release_rustc_actual")" = "$release_rust_bin"
+export PATH="$release_rust_bin:$PATH"
+test "$(realpath -e -- "$(type -P cargo)")" = "$release_cargo_actual"
+test "$(realpath -e -- "$(type -P rustc)")" = "$release_rustc_actual"
+case "$(cargo --version)" in
+  'cargo 1.98.0-nightly ('*) ;;
+  *) printf 'unexpected pinned Cargo version\n' >&2; exit 1 ;;
+esac
+case "$(rustc --version)" in
+  'rustc 1.98.0-nightly ('*) ;;
+  *) printf 'unexpected pinned rustc version\n' >&2; exit 1 ;;
+esac
 export RELEASE_VERSION="X.Y.Z"
 export MANUAL_RELEASE_STATE_DIR="/path/outside/checkout/pi_agent_rust-vX.Y.Z-release-state"
 export LINUX_AMD64_SMOKE_HOST="trj"
@@ -345,16 +383,40 @@ export -n release_crates_io_token
 unset CARGO_REGISTRY_TOKEN CARGO_REGISTRIES_CRATES_IO_TOKEN
 test ! -e "$MANUAL_RELEASE_STATE_DIR"
 mkdir -m 700 "$MANUAL_RELEASE_STATE_DIR"
+release_rust_tool_receipt="$MANUAL_RELEASE_STATE_DIR/operator-rust-tools.txt"
+test ! -e "$release_rust_tool_receipt"
+record_release_rust_tool() {
+  local label="$1"
+  local entrypoint="$2"
+  local resolved
+  [[ "$label" =~ ^(cargo|rustc)-(entrypoint|actual)$ ]]
+  resolved="$(realpath -e -- "$entrypoint")"
+  test -f "$resolved" && test ! -L "$resolved"
+  printf '[%s]\nentrypoint=%s\nresolved=%s\nsha256=%s\n' \
+    "$label" "$entrypoint" "$resolved" \
+    "$(sha256sum -- "$resolved" | awk '{print $1}')"
+  "$entrypoint" --version --verbose
+}
+(set -C; {
+  record_release_rust_tool cargo-entrypoint "$release_cargo_entrypoint"
+  record_release_rust_tool rustc-entrypoint "$release_rustc_entrypoint"
+  record_release_rust_tool cargo-actual "$release_cargo_actual"
+  record_release_rust_tool rustc-actual "$release_rustc_actual"
+} > "$release_rust_tool_receipt")
+test "$(grep -Ec '^\[(cargo|rustc)-(entrypoint|actual)\]$' \
+  "$release_rust_tool_receipt")" = 4
+test "$(grep -Fc 'release: 1.98.0-nightly' \
+  "$release_rust_tool_receipt")" = 4
 release_tool_receipt="$MANUAL_RELEASE_STATE_DIR/operator-tools.sha256"
 test ! -e "$release_tool_receipt"
-for release_tool in bash git python3 cargo rustc gh jq ssh sha256sum bwrap; do
+for release_tool in bash git python3 rustup cargo rustc gh jq ssh sha256sum bwrap; do
   release_tool_path="$(command -v "$release_tool")"
   test -n "$release_tool_path"
   release_tool_path="$(realpath -e -- "$release_tool_path")"
   test -f "$release_tool_path" && test ! -L "$release_tool_path"
   sha256sum -- "$release_tool_path"
 done > "$release_tool_receipt"
-test "$(wc -l < "$release_tool_receipt")" -eq 10
+test "$(wc -l < "$release_tool_receipt")" -eq 11
 release_cargo_parent="$MANUAL_RELEASE_STATE_DIR/controller-cargo"
 test ! -e "$release_cargo_parent" && test ! -L "$release_cargo_parent"
 mkdir -m 700 "$release_cargo_parent"
@@ -379,8 +441,11 @@ test -z "$(git status --porcelain=v2 --untracked-files=all)"
 # Fuzz and conformance have daily 02:00 UTC schedules. A baseline is valid only
 # after both current-day scheduled run IDs exist, and this lane must finish on
 # the same UTC date. Their queued/running/completed states may evolve and are
-# recorded but are not part of the invariant; only addition of a run ID after
-# this point is a stop condition. Never recapture the baseline mid-release.
+# recorded but are not part of the invariant. A new current-day run ID or any
+# incremented run_attempt in the fixed window spanning the 31 prior UTC days
+# plus the baseline UTC day is a stop condition. This conservative 32-day
+# interval covers GitHub's 30-day rerun eligibility even at a boundary. Never
+# recapture either baseline mid-release.
 WORKFLOW_BASELINE_UTC_DATE="$(date -u +%F)"
 export WORKFLOW_BASELINE_UTC_DATE
 workflow_window_start="${WORKFLOW_BASELINE_UTC_DATE}T02:00:00Z"
@@ -417,10 +482,16 @@ workflow_baseline_proof="$MANUAL_RELEASE_STATE_DIR/github-actions-baseline.txt"
 test ! -e "$workflow_baseline" && test ! -e "$workflow_baseline_proof"
 gh api --paginate -H 'Accept: application/vnd.github+json' \
   "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-  | jq -s '[.[].workflow_runs[]] as $runs |
-    {total_count: ($runs | length), workflow_runs: $runs}' \
+  | jq -s '(.[0].total_count // -1) as $reported |
+    [.[].workflow_runs[]] as $runs |
+    {reported_total_count: $reported,
+     page_total_counts_consistent: all(.[]; .total_count == $reported),
+     total_count: ($runs | length), workflow_runs: $runs}' \
   > "$workflow_baseline"
 jq -e '
+  (.reported_total_count | type) == "number" and
+  .reported_total_count == .total_count and
+  .page_total_counts_consistent == true and
   (.total_count | type) == "number" and .total_count > 0 and
   (.workflow_runs | type) == "array" and
   .total_count == (.workflow_runs | length) and
@@ -434,6 +505,46 @@ jq -e '
 test -s "$workflow_baseline_proof"
 export WORKFLOW_BASELINE_IDS="$workflow_baseline_proof"
 
+WORKFLOW_RERUN_WINDOW_START="$(python3 - "$WORKFLOW_BASELINE_UTC_DATE" <<'PY'
+from datetime import date, datetime, time, timedelta, timezone
+import sys
+
+day = date.fromisoformat(sys.argv[1]) - timedelta(days=31)
+print(datetime.combine(day, time.min, tzinfo=timezone.utc).isoformat().replace("+00:00", "Z"))
+PY
+)"
+WORKFLOW_RERUN_WINDOW_END="$workflow_window_end"
+export WORKFLOW_RERUN_WINDOW_START WORKFLOW_RERUN_WINDOW_END
+workflow_attempt_baseline="$MANUAL_RELEASE_STATE_DIR/github-actions-attempt-baseline.json"
+workflow_attempt_baseline_proof="$MANUAL_RELEASE_STATE_DIR/github-actions-attempt-baseline.txt"
+test ! -e "$workflow_attempt_baseline" \
+  && test ! -e "$workflow_attempt_baseline_proof"
+gh api --paginate -H 'Accept: application/vnd.github+json' \
+  "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_RERUN_WINDOW_START}..${WORKFLOW_RERUN_WINDOW_END}&per_page=100" \
+  | jq -s '(.[0].total_count // -1) as $reported |
+    [.[].workflow_runs[]] as $runs |
+    {reported_total_count: $reported,
+     page_total_counts_consistent: all(.[]; .total_count == $reported),
+     total_count: ($runs | length), workflow_runs: $runs}' \
+  > "$workflow_attempt_baseline"
+jq -e '
+  (.reported_total_count | type) == "number" and
+  .reported_total_count == .total_count and
+  .page_total_counts_consistent == true and
+  (.total_count | type) == "number" and .total_count > 0 and
+  (.workflow_runs | type) == "array" and
+  .total_count == (.workflow_runs | length) and
+  all(.workflow_runs[];
+    (.id | type) == "number" and .id > 0 and
+    (.run_attempt | type) == "number" and .run_attempt >= 1) and
+  ([.workflow_runs[].id] | length) == ([.workflow_runs[].id] | unique | length)
+' "$workflow_attempt_baseline" >/dev/null
+(set -C; jq -r '.workflow_runs[] | [.id, .run_attempt] | @tsv' \
+  "$workflow_attempt_baseline" | LC_ALL=C sort -n -k1,1 \
+  > "$workflow_attempt_baseline_proof")
+test -s "$workflow_attempt_baseline_proof"
+export WORKFLOW_BASELINE_ATTEMPTS="$workflow_attempt_baseline_proof"
+
 verify_workflow_baseline_unchanged() {
   local checkpoint="$1"
   [[ "$checkpoint" =~ ^[a-z0-9-]+$ ]]
@@ -443,10 +554,16 @@ verify_workflow_baseline_unchanged() {
   test ! -e "$snapshot" && test ! -e "$ids"
   gh api --paginate -H 'Accept: application/vnd.github+json' \
     "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-    | jq -s '[.[].workflow_runs[]] as $runs |
-      {total_count: ($runs | length), workflow_runs: $runs}' \
+    | jq -s '(.[0].total_count // -1) as $reported |
+      [.[].workflow_runs[]] as $runs |
+      {reported_total_count: $reported,
+       page_total_counts_consistent: all(.[]; .total_count == $reported),
+       total_count: ($runs | length), workflow_runs: $runs}' \
     > "$snapshot"
   jq -e '
+    (.reported_total_count | type) == "number" and
+    .reported_total_count == .total_count and
+    .page_total_counts_consistent == true and
     (.total_count | type) == "number" and .total_count > 0 and
     (.workflow_runs | type) == "array" and
     .total_count == (.workflow_runs | length) and
@@ -459,6 +576,34 @@ verify_workflow_baseline_unchanged() {
   (set -C; jq -r '.workflow_runs[].id' "$snapshot" \
     | LC_ALL=C sort -n > "$ids")
   cmp "$WORKFLOW_BASELINE_IDS" "$ids"
+
+  local attempt_snapshot="$MANUAL_RELEASE_STATE_DIR/github-actions-attempts-${checkpoint}.json"
+  local attempts="$MANUAL_RELEASE_STATE_DIR/github-actions-attempts-${checkpoint}.txt"
+  test ! -e "$attempt_snapshot" && test ! -e "$attempts"
+  gh api --paginate -H 'Accept: application/vnd.github+json' \
+    "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_RERUN_WINDOW_START}..${WORKFLOW_RERUN_WINDOW_END}&per_page=100" \
+    | jq -s '(.[0].total_count // -1) as $reported |
+      [.[].workflow_runs[]] as $runs |
+      {reported_total_count: $reported,
+       page_total_counts_consistent: all(.[]; .total_count == $reported),
+       total_count: ($runs | length), workflow_runs: $runs}' \
+    > "$attempt_snapshot"
+  jq -e '
+    (.reported_total_count | type) == "number" and
+    .reported_total_count == .total_count and
+    .page_total_counts_consistent == true and
+    (.total_count | type) == "number" and .total_count > 0 and
+    (.workflow_runs | type) == "array" and
+    .total_count == (.workflow_runs | length) and
+    all(.workflow_runs[];
+      (.id | type) == "number" and .id > 0 and
+      (.run_attempt | type) == "number" and .run_attempt >= 1) and
+    ([.workflow_runs[].id] | length) ==
+      ([.workflow_runs[].id] | unique | length)
+  ' "$attempt_snapshot" >/dev/null
+  (set -C; jq -r '.workflow_runs[] | [.id, .run_attempt] | @tsv' \
+    "$attempt_snapshot" | LC_ALL=C sort -n -k1,1 > "$attempts")
+  cmp "$WORKFLOW_BASELINE_ATTEMPTS" "$attempts"
 }
 ```
 
@@ -1826,10 +1971,16 @@ proof is not proof of an empty bypass list.
    test "$(date -u +%F)" = "$WORKFLOW_BASELINE_UTC_DATE"
    gh api --paginate -H 'Accept: application/vnd.github+json' \
      "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-     | jq -s '[.[].workflow_runs[]] as $runs |
-       {total_count: ($runs | length), workflow_runs: $runs}' \
+     | jq -s '(.[0].total_count // -1) as $reported |
+       [.[].workflow_runs[]] as $runs |
+       {reported_total_count: $reported,
+        page_total_counts_consistent: all(.[]; .total_count == $reported),
+        total_count: ($runs | length), workflow_runs: $runs}' \
      > "$posttag_workflows"
    jq -e '
+     (.reported_total_count | type) == "number" and
+     .reported_total_count == .total_count and
+     .page_total_counts_consistent == true and
      (.total_count | type) == "number" and .total_count > 0 and
      .total_count == (.workflow_runs | length) and
      all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
@@ -1838,6 +1989,7 @@ proof is not proof of an empty bypass list.
    (set -C; jq -r '.workflow_runs[].id' "$posttag_workflows" \
      | LC_ALL=C sort -n > "$posttag_workflow_ids")
    cmp "$WORKFLOW_BASELINE_IDS" "$posttag_workflow_ids"
+   verify_workflow_baseline_unchanged immediately-after-tag-push
    ```
 
 7. Create one new GitHub draft directly by API, bind it to the returned release
@@ -1940,34 +2092,21 @@ proof is not proof of an empty bypass list.
    PY
    sha256sum "$release_body" > "$MANUAL_RELEASE_STATE_DIR/release-body.sha256"
 
-   # Prove that the tag has no release. `gh api --include` preserves the exact
-   # HTTP status and JSON body; only an authenticated 404 is acceptable here.
-   precreate_proof="$MANUAL_RELEASE_STATE_DIR/github-release-precreate-404.txt"
-   test ! -e "$precreate_proof"
-   set +e
-   (set -C; gh api --include \
-     -H 'Accept: application/vnd.github+json' \
-     "/repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
-     > "$precreate_proof")
-   precreate_exit=$?
-   set -e
-   test "$precreate_exit" -ne 0
-   PRECREATE_PROOF="$precreate_proof" python3 - <<'PY'
-   import json
-   import os
-   import re
-   from pathlib import Path
-
-   raw = Path(os.environ["PRECREATE_PROOF"]).read_bytes().replace(b"\r\n", b"\n")
-   parts = raw.split(b"\n\n")
-   status_lines = [line for part in parts[:-1] for line in part.splitlines()
-                   if line.startswith(b"HTTP/")]
-   if not status_lines or re.fullmatch(rb"HTTP/[0-9.]+ 404 .+", status_lines[-1]) is None:
-       raise SystemExit("pre-create release lookup did not return HTTP 404")
-   payload = json.loads(parts[-1])
-   if payload.get("message") != "Not Found" or str(payload.get("status")) != "404":
-       raise SystemExit("pre-create 404 body has an unexpected shape")
-   PY
+   # The tag endpoint intentionally hides drafts. Prove nonexistence from the
+   # authenticated, fully paginated release inventory, which includes drafts.
+   precreate_inventory="$MANUAL_RELEASE_STATE_DIR/github-releases-precreate.json"
+   test ! -e "$precreate_inventory"
+   gh api --paginate -H 'Accept: application/vnd.github+json' \
+     "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
+     | jq -s 'add' > "$precreate_inventory"
+   jq -e --arg tag "$RELEASE_TAG" '
+     type == "array" and
+     all(.[];
+       (.id | type) == "number" and .id > 0 and
+       (.tag_name | type) == "string") and
+     ([.[].id] | length) == ([.[].id] | unique | length) and
+     ([.[] | select(.tag_name == $tag)] | length) == 0
+   ' "$precreate_inventory" >/dev/null
 
    draft_payload="$MANUAL_RELEASE_STATE_DIR/github-draft-create-payload.json"
    draft_created="$MANUAL_RELEASE_STATE_DIR/github-draft-created.json"
@@ -1991,19 +2130,44 @@ proof is not proof of an empty bypass list.
    created_target_commitish="$(jq -er '
      .target_commitish | select(type == "string" and length > 0)
    ' "$draft_created")"
+   test "$created_target_commitish" = "$expected_source_commit"
+   release_id_receipt="$MANUAL_RELEASE_STATE_DIR/github-release-id.txt"
+   test ! -e "$release_id_receipt"
+   (set -C; printf 'release_id=%s\ntag=%s\ntarget_commitish=%s\n' \
+     "$release_id" "$RELEASE_TAG" "$created_target_commitish" \
+     > "$release_id_receipt")
    expected_upload_template="https://uploads.github.com/repos/${RELEASE_REPOSITORY}/releases/${release_id}/assets{?name,label}"
    jq -e \
      --argjson id "$release_id" \
      --arg tag "$RELEASE_TAG" \
-     --arg target "$created_target_commitish" \
+     --arg target "$expected_source_commit" \
      --arg upload "$expected_upload_template" \
      --rawfile body "$release_body" \
      '.id == $id and .draft == true and .prerelease == false and
-      .tag_name == $tag and .target_commitish == $target and
-      .name == $tag and .body == $body and
-      .upload_url == $upload and
-      (.assets | type) == "array" and (.assets | length) == 0' \
+       .tag_name == $tag and .target_commitish == $target and
+       .name == $tag and .body == $body and
+       .upload_url == $upload and
+       (.assets | type) == "array" and (.assets | length) == 0' \
      "$draft_created" >/dev/null
+   postcreate_inventory="$MANUAL_RELEASE_STATE_DIR/github-releases-postcreate.json"
+   test ! -e "$postcreate_inventory"
+   gh api --paginate -H 'Accept: application/vnd.github+json' \
+     "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
+     | jq -s 'add' > "$postcreate_inventory"
+   jq -e \
+     --argjson id "$release_id" \
+     --arg tag "$RELEASE_TAG" \
+     --arg target "$expected_source_commit" '
+     type == "array" and
+     all(.[];
+       (.id | type) == "number" and .id > 0 and
+       (.tag_name | type) == "string") and
+     ([.[].id] | length) == ([.[].id] | unique | length) and
+     ([.[] | select(.tag_name == $tag)] | length) == 1 and
+     ([.[] | select(.tag_name == $tag and .id == $id and
+       .draft == true and .prerelease == false and
+       .target_commitish == $target)] | length) == 1
+   ' "$postcreate_inventory" >/dev/null
    release_upload_url="$(jq -er '
      .upload_url | sub("\\{\\?name,label\\}$"; "") |
      select(startswith("https://uploads.github.com/"))
@@ -2087,32 +2251,86 @@ proof is not proof of an empty bypass list.
    verify_exact_release() {
      local expected_draft="$1"
      local label="$2"
+     local inventory="$MANUAL_RELEASE_STATE_DIR/github-releases-${label}.json"
      local metadata="$MANUAL_RELEASE_STATE_DIR/github-release-${label}.json"
      local download_dir="$MANUAL_RELEASE_STATE_DIR/github-assets-${label}"
      test "$expected_draft" = true || test "$expected_draft" = false
-     test ! -e "$metadata" && test ! -e "$download_dir"
+     test ! -e "$inventory" && test ! -e "$metadata"
+     test ! -e "$download_dir"
+     gh api --paginate -H 'Accept: application/vnd.github+json' \
+       "/repos/${RELEASE_REPOSITORY}/releases?per_page=100" \
+       | jq -s 'add' > "$inventory"
+     jq -e \
+       --argjson id "$release_id" \
+       --argjson draft "$expected_draft" \
+       --arg tag "$RELEASE_TAG" \
+       --arg target "$expected_source_commit" '
+       type == "array" and
+       all(.[];
+         (.id | type) == "number" and .id > 0 and
+         (.tag_name | type) == "string") and
+       ([.[].id] | length) == ([.[].id] | unique | length) and
+       ([.[] | select(.tag_name == $tag)] | length) == 1 and
+       ([.[] | select(.tag_name == $tag and .id == $id and
+         .draft == $draft and .prerelease == false and
+         .target_commitish == $target)] | length) == 1
+     ' "$inventory" >/dev/null
      gh api -H 'Accept: application/vnd.github+json' \
-       "/repos/${RELEASE_REPOSITORY}/releases/tags/${RELEASE_TAG}" \
+       "/repos/${RELEASE_REPOSITORY}/releases/${release_id}" \
        > "$metadata"
      jq -e \
        --argjson id "$release_id" \
        --argjson draft "$expected_draft" \
        --arg tag "$RELEASE_TAG" \
-       --arg target "$created_target_commitish" \
+       --arg target "$expected_source_commit" \
        --rawfile body "$release_body" \
        '.id == $id and .draft == $draft and .prerelease == false and
         .tag_name == $tag and .target_commitish == $target and
         .name == $tag and .body == $body and
         (.assets | type) == "array" and (.assets | length) == 12 and
-        ([.assets[].name] | length) == ([.assets[].name] | unique | length)' \
+        ([.assets[].name] | length) == ([.assets[].name] | unique | length) and
+        ([.assets[].id] | length) == ([.assets[].id] | unique | length) and
+        all(.assets[];
+          (.id | type) == "number" and .id > 0 and
+          (.name | type) == "string" and .name != "" and
+          .state == "uploaded" and
+          (.size | type) == "number" and .size > 0)' \
        "$metadata" >/dev/null
      local remote_assets
      remote_assets="$(jq -r '.assets[].name' "$metadata" | LC_ALL=C sort)"
      test "$remote_assets" = "$expected_assets"
      mkdir -m 700 "$download_dir"
-     gh release download "$RELEASE_TAG" --dir "$download_dir"
      for asset in "${EXPECTED_ASSETS[@]}"; do
-       cmp "$RELEASE_ARTIFACT_DIR/$asset" "$download_dir/$asset"
+       local local_asset upload_response recorded_asset_id recorded_asset_size
+       local downloaded_asset
+       local_asset="$RELEASE_ARTIFACT_DIR/$asset"
+       upload_response="$upload_receipts/${asset}.json"
+       downloaded_asset="$download_dir/$asset"
+       test -f "$upload_response" && test ! -L "$upload_response"
+       recorded_asset_id="$(jq -er \
+         --arg name "$asset" \
+         --argjson size "$(wc -c < "$local_asset" | tr -d '[:space:]')" '
+         select(.name == $name and .size == $size and .state == "uploaded" and
+           (.id | type) == "number" and .id > 0) | .id
+       ' "$upload_response")"
+       recorded_asset_size="$(wc -c < "$local_asset" | tr -d '[:space:]')"
+       jq -e \
+         --arg name "$asset" \
+         --argjson id "$recorded_asset_id" \
+         --argjson size "$recorded_asset_size" '
+         ([.assets[] | select(
+           .id == $id and .name == $name and .state == "uploaded" and
+           .size == $size)] | length) == 1
+       ' "$metadata" >/dev/null
+       test ! -e "$downloaded_asset" && test ! -L "$downloaded_asset"
+       (set -C; gh api \
+         -H 'Accept: application/octet-stream' \
+         "/repos/${RELEASE_REPOSITORY}/releases/assets/${recorded_asset_id}" \
+         > "$downloaded_asset")
+       test -f "$downloaded_asset" && test ! -L "$downloaded_asset"
+       test "$(wc -c < "$downloaded_asset" | tr -d '[:space:]')" = \
+         "$recorded_asset_size"
+       cmp "$local_asset" "$downloaded_asset"
      done
      local remote_tag_object remote_tag_commit
      remote_tag_object="$(git ls-remote --tags origin \
@@ -2444,9 +2662,10 @@ proof is not proof of an empty bypass list.
    ```
 
    Adversarially self-test allow and deny behavior before any real token is
-   read. A successful exact publish request must create the exact receipt;
-   wrong checksum, registry, identity, or extra fields must be rejected without
-   creating one.
+   read. Cargo's exact canonical-registry read request is allowed without a
+   publication receipt. A successful exact publish request must create the
+   exact receipt; wrong checksum, registry, identity, or extra fields must be
+   rejected without creating one.
 
    ```bash
    set -euo pipefail
@@ -2525,9 +2744,11 @@ proof is not proof of an empty bypass list.
 
    Recreate the package on this isolated publisher path and match the source
    proof before reading the token. Then force both Cargo credential settings to
-   the reviewed provider at command-line precedence. The provider releases the
-   token only when Cargo itself presents the exact crate name, version, registry,
-   and SHA-256 in a publish operation.
+   the reviewed provider at command-line precedence. The provider supplies the
+   token for Cargo's canonical crates.io read request without creating a
+   publication receipt. For a publish request, it supplies the token and writes
+   the receipt only when Cargo itself presents the exact crate name, version,
+   registry, and SHA-256.
 
    ```bash
    set -euo pipefail
@@ -2538,16 +2759,23 @@ proof is not proof of an empty bypass list.
    manifest_abs="$(realpath Cargo.toml)"
    publisher_cargo_home="$MANUAL_RELEASE_STATE_DIR/publisher-cargo-home"
    publisher_cwd="$MANUAL_RELEASE_STATE_DIR/publisher-cwd"
+   publisher_target_dir="$MANUAL_RELEASE_STATE_DIR/publisher-target"
    test ! -e "$publisher_cargo_home" && test ! -e "$publisher_cwd"
-   mkdir -m 700 "$publisher_cargo_home" "$publisher_cwd"
+   test ! -e "$publisher_target_dir" && test ! -L "$publisher_target_dir"
+   mkdir -m 700 \
+     "$publisher_cargo_home" "$publisher_cwd" "$publisher_target_dir"
+   (set -C; printf 'publisher_cargo_home=%s\npublisher_cwd=%s\npublisher_target_dir=%s\n' \
+     "$publisher_cargo_home" "$publisher_cwd" "$publisher_target_dir" \
+     > "$MANUAL_RELEASE_STATE_DIR/publisher-paths.txt")
    (
      cd "$publisher_cwd"
      env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
        CARGO_HOME="$publisher_cargo_home" \
+       CARGO_TARGET_DIR="$publisher_target_dir" \
        cargo publish --manifest-path "$manifest_abs" --dry-run --locked \
          --registry crates-io
    )
-   publisher_crate="${CARGO_TARGET_DIR:-target}/package/pi_agent_rust-${RELEASE_VERSION}.crate"
+   publisher_crate="$publisher_target_dir/package/pi_agent_rust-${RELEASE_VERSION}.crate"
    test -f "$publisher_crate" && test ! -L "$publisher_crate"
    test "$(sha256sum "$publisher_crate" | awk '{print $1}')" = "$expected_crate_sha256"
    test "$(wc -c < "$publisher_crate" | tr -d '[:space:]')" = "$expected_crate_size"
@@ -2619,6 +2847,7 @@ proof is not proof of an empty bypass list.
      cd "$publisher_cwd"
      env -u CARGO_REGISTRY_TOKEN -u CARGO_REGISTRIES_CRATES_IO_TOKEN \
        CARGO_HOME="$publisher_cargo_home" \
+       CARGO_TARGET_DIR="$publisher_target_dir" \
        PI_EXPECTED_CRATE_NAME=pi_agent_rust \
        PI_EXPECTED_CRATE_VERSION="$RELEASE_VERSION" \
        PI_EXPECTED_CRATE_SHA256="$expected_crate_sha256" \
@@ -2632,6 +2861,11 @@ proof is not proof of an empty bypass list.
    set -e
    unset PI_CRATES_IO_RELEASE_TOKEN
    trap - EXIT
+   test -f "$publisher_crate" && test ! -L "$publisher_crate"
+   test "$(sha256sum "$publisher_crate" | awk '{print $1}')" = \
+     "$expected_crate_sha256"
+   test "$(wc -c < "$publisher_crate" | tr -d '[:space:]')" = \
+     "$expected_crate_size"
    test -f "$actual_receipt" && test ! -L "$actual_receipt"
    jq -e \
      --arg version "$RELEASE_VERSION" \
@@ -2699,7 +2933,8 @@ proof is not proof of an empty bypass list.
    ```
 
 9. Make GitHub public last. Immediately before the PATCH, re-check the unchanged
-   current-day workflow run-ID set, immutable tag rule, tag object/target, exact
+   current-day workflow run-ID set and fixed 32-day run-attempt ledger, immutable tag
+   rule, tag object/target, exact
    draft ID/state/title/body/prerelease, all 12 names and bytes, retained runtime
    receipts, and the crates.io checksum. PATCH by the recorded release database
    ID, then repeat the exact release verifier immediately afterward.
@@ -2714,10 +2949,16 @@ proof is not proof of an empty bypass list.
    test ! -e "$prepublic_workflows" && test ! -e "$prepublic_workflow_ids"
    gh api --paginate -H 'Accept: application/vnd.github+json' \
      "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-     | jq -s '[.[].workflow_runs[]] as $runs |
-       {total_count: ($runs | length), workflow_runs: $runs}' \
+     | jq -s '(.[0].total_count // -1) as $reported |
+       [.[].workflow_runs[]] as $runs |
+       {reported_total_count: $reported,
+        page_total_counts_consistent: all(.[]; .total_count == $reported),
+        total_count: ($runs | length), workflow_runs: $runs}' \
      > "$prepublic_workflows"
    jq -e '
+     (.reported_total_count | type) == "number" and
+     .reported_total_count == .total_count and
+     .page_total_counts_consistent == true and
      (.total_count | type) == "number" and .total_count > 0 and
      .total_count == (.workflow_runs | length) and
      all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
@@ -2726,6 +2967,7 @@ proof is not proof of an empty bypass list.
    (set -C; jq -r '.workflow_runs[].id' "$prepublic_workflows" \
      | LC_ALL=C sort -n > "$prepublic_workflow_ids")
    cmp "$WORKFLOW_BASELINE_IDS" "$prepublic_workflow_ids"
+   verify_workflow_baseline_unchanged immediately-before-publication
    prepublic_ruleset="$MANUAL_RELEASE_STATE_DIR/pre-public-ruleset.json"
    test ! -e "$prepublic_ruleset"
    gh api -H 'Accept: application/vnd.github+json' \
@@ -2768,13 +3010,14 @@ proof is not proof of an empty bypass list.
    jq -e \
      --argjson id "$release_id" \
      --arg tag "$RELEASE_TAG" \
-     --arg target "$created_target_commitish" \
+     --arg target "$expected_source_commit" \
      --rawfile body "$release_body" \
      '.id == $id and .draft == false and .prerelease == false and
       .tag_name == $tag and .target_commitish == $target and
       .name == $tag and .body == $body' \
-     "$public_response" >/dev/null
+   "$public_response" >/dev/null
    verify_exact_release false immediately-after-publication
+   verify_workflow_baseline_unchanged immediately-after-publication
    test "$(curl -fsS -A 'pi-agent-rust-manual-release' \
      "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
      | jq -er '.version.checksum')" = "$expected_crate_sha256"
@@ -2790,12 +3033,14 @@ proof is not proof of an empty bypass list.
 
 10. Verify the now-public installer path from an isolated home, confirm
     crates.io still serves the exact non-yanked version/checksum, and prove the
-    current-day GitHub Actions run-ID set is byte-for-byte identical to the
-    pre-release baseline. This is installer and publication verification, not
+    current-day GitHub Actions run-ID set plus fixed 32-day `(run ID, run_attempt)`
+    ledger are byte-for-byte identical to their pre-release baselines. This is
+    installer and publication verification, not
     the first binary smoke: all five exact binaries already executed in step 7
     and their retained receipt hashes must still pass. Workflow run statuses
-    may evolve, but a new run ID is a stop condition. Do not dispatch or rerun a
-    workflow to obtain evidence and do not recapture the baseline.
+    may evolve, but a new run ID or incremented run attempt is a stop condition.
+    Do not dispatch or rerun a workflow to obtain evidence and do not recapture
+    either baseline.
 
     ```bash
     set -euo pipefail
@@ -2851,10 +3096,16 @@ proof is not proof of an empty bypass list.
     test ! -e "$postrelease_workflows" && test ! -e "$postrelease_workflow_ids"
     gh api --paginate -H 'Accept: application/vnd.github+json' \
       "/repos/${RELEASE_REPOSITORY}/actions/runs?created=${WORKFLOW_BASELINE_UTC_DATE}&per_page=100" \
-      | jq -s '[.[].workflow_runs[]] as $runs |
-        {total_count: ($runs | length), workflow_runs: $runs}' \
+      | jq -s '(.[0].total_count // -1) as $reported |
+        [.[].workflow_runs[]] as $runs |
+        {reported_total_count: $reported,
+         page_total_counts_consistent: all(.[]; .total_count == $reported),
+         total_count: ($runs | length), workflow_runs: $runs}' \
       > "$postrelease_workflows"
     jq -e '
+      (.reported_total_count | type) == "number" and
+      .reported_total_count == .total_count and
+      .page_total_counts_consistent == true and
       (.total_count | type) == "number" and .total_count > 0 and
       .total_count == (.workflow_runs | length) and
       all(.workflow_runs[]; (.id | type) == "number" and .id > 0) and
@@ -2863,6 +3114,7 @@ proof is not proof of an empty bypass list.
     (set -C; jq -r '.workflow_runs[].id' "$postrelease_workflows" \
       | LC_ALL=C sort -n > "$postrelease_workflow_ids")
     cmp "$WORKFLOW_BASELINE_IDS" "$postrelease_workflow_ids"
+    verify_workflow_baseline_unchanged after-post-public-installer
     curl -fsS -A 'pi-agent-rust-manual-release' \
       "https://crates.io/api/v1/crates/pi_agent_rust/${RELEASE_VERSION}" \
       | jq -e \
@@ -2906,7 +3158,13 @@ For branches opened before this gate was introduced:
 5. Re-run CI and merge only after the DoD evidence guard passes.
 
 ## Pre-release checklist
-- CI is green on `main` (Linux/macOS/Windows).
+- The selected publication lane has its own complete proof:
+  - automated lane: CI is green on `main` (Linux/macOS/Windows), and the
+    protected automated release-governance gate is satisfied
+  - manual/no-Actions lane: every fail-fast manual gate above is green, the
+    current-day workflow run-ID set and fixed 32-day `(run ID, run_attempt)` ledger
+    remain identical to their original baselines, and no workflow was dispatched
+    or rerun to manufacture evidence
 - Local gates are green:
   - `cargo fmt --check`
   - `cargo check --locked --all-targets --features internal-legacy-capture`

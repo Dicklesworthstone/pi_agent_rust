@@ -1455,20 +1455,23 @@ fn canonical_dropin_verdict_freshness_uses_only_generated_at_utc() -> TestResult
 
 #[test]
 fn canonical_dropin_verdict_uses_release_gate_age_limit() -> TestResult {
-    for (generated_at, expected_status, expected_allowed) in [
+    for (generated_at, lane_generated_at, expected_status, expected_allowed) in [
         (
             "2026-05-06T00:00:00Z",
+            "2026-05-06T00:00:00.000Z",
             EvidenceFreshnessStatus::Current,
             true,
         ),
         (
             "2026-05-05T23:59:59Z",
+            "2026-05-13T00:00:00.000Z",
             EvidenceFreshnessStatus::Stale,
             false,
         ),
     ] {
         let temp = fixture_workspace()?;
-        install_canonical_dropin_claim_fixture(temp.path())?;
+        let lane = canonical_certification_lane_fixture(lane_generated_at)?;
+        install_canonical_dropin_claim_fixture_with_lane(temp.path(), &lane)?;
         let path = temp
             .path()
             .join("docs/evidence/dropin-certification-verdict.json");
@@ -1504,6 +1507,8 @@ fn canonical_dropin_verdict_requires_actual_passing_lane_bytes() -> TestResult {
         "non_full_lane",
         "partial_inventory",
         "gate_identity",
+        "nonblocking_warn",
+        "nonblocking_skip",
         "summary_contradiction",
         "gate_status_contradiction",
         "promotion_contradiction",
@@ -1533,6 +1538,16 @@ fn canonical_dropin_verdict_requires_actual_passing_lane_bytes() -> TestResult {
                 lane["summary"]["blocking_total"] = json!(13);
             }
             "gate_identity" => lane["gates"][0]["id"] = json!("attacker_gate"),
+            "nonblocking_warn" => {
+                lane["gates"][1]["status"] = json!("warn");
+                lane["summary"]["passed"] = json!(19);
+                lane["summary"]["warned"] = json!(1);
+            }
+            "nonblocking_skip" => {
+                lane["gates"][1]["status"] = json!("skip");
+                lane["summary"]["passed"] = json!(19);
+                lane["summary"]["skipped"] = json!(1);
+            }
             "summary_contradiction" => lane["summary"]["passed"] = json!(19),
             "gate_status_contradiction" => lane["gates"][0]["status"] = json!("fail"),
             "promotion_contradiction" => {
@@ -1644,6 +1659,17 @@ fn canonical_dropin_lane_uses_exact_168_hour_age_boundary() -> TestResult {
         let temp = fixture_workspace()?;
         let lane = canonical_certification_lane_fixture(generated_at)?;
         install_canonical_dropin_claim_fixture_with_lane(temp.path(), &lane)?;
+        let verdict_path = temp
+            .path()
+            .join("docs/evidence/dropin-certification-verdict.json");
+        let mut verdict: serde_json::Value = serde_json::from_slice(&fs::read(&verdict_path)?)?;
+        verdict["generated_at_utc"] = json!(generated_at.replace(".000Z", "Z"));
+        fs::write(&verdict_path, serde_json::to_vec_pretty(&verdict)?)?;
+        commit_fixture_path(
+            temp.path(),
+            "docs/evidence/dropin-certification-verdict.json",
+            &format!("align verdict timestamp to lane {generated_at}"),
+        )?;
         let graph = build_fixture_graph(temp.path())?;
         let verdict = node_with_source(
             &graph,
@@ -1656,6 +1682,113 @@ fn canonical_dropin_lane_uses_exact_168_hour_age_boundary() -> TestResult {
             Some(&json!(expected_allowed))
         );
     }
+    Ok(())
+}
+
+#[test]
+fn canonical_dropin_verdict_and_lane_timestamps_must_describe_the_same_run() -> TestResult {
+    for (lane_generated_at, expected_status, expected_allowed) in [
+        (
+            "2026-05-12T23:55:00.000Z",
+            EvidenceFreshnessStatus::Current,
+            true,
+        ),
+        (
+            "2026-05-12T23:54:59.999Z",
+            EvidenceFreshnessStatus::Malformed,
+            false,
+        ),
+    ] {
+        let temp = fixture_workspace()?;
+        let lane = canonical_certification_lane_fixture(lane_generated_at)?;
+        install_canonical_dropin_claim_fixture_with_lane(temp.path(), &lane)?;
+
+        let graph = build_fixture_graph(temp.path())?;
+        let verdict = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(verdict.freshness_status, Some(expected_status));
+        assert_eq!(
+            verdict.metadata.get("release_claim_allowed"),
+            Some(&json!(expected_allowed))
+        );
+        if !expected_allowed {
+            assert_eq!(
+                verdict.metadata.get("freshness_reason"),
+                Some(&json!("dropin_verdict_source_lane_invalid"))
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn canonical_dropin_verdict_rejects_symlinked_repository_path_components() -> TestResult {
+    use std::os::unix::fs::symlink;
+
+    let repository = fixture_workspace()?;
+    install_canonical_dropin_claim_fixture(repository.path())?;
+    let alias_parent = tempfile::tempdir()?;
+    let alias = alias_parent.path().join("repository-alias");
+    symlink(repository.path(), &alias)?;
+    let disguised_alias = alias.join(".");
+    let repository_parent = repository
+        .path()
+        .parent()
+        .ok_or("fixture repository must have a parent")?;
+    let repository_name = repository
+        .path()
+        .file_name()
+        .ok_or("fixture repository must have a final path component")?;
+    let parent_alias = alias_parent.path().join("repository-parent-alias");
+    symlink(repository_parent, &parent_alias)?;
+    let intermediate_alias = parent_alias.join(repository_name);
+    let parent_dir_disguised_alias = intermediate_alias.join("..").join(repository_name);
+
+    for repository_root in [
+        &alias,
+        &disguised_alias,
+        &intermediate_alias,
+        &parent_dir_disguised_alias,
+    ] {
+        let graph = build_fixture_graph(repository_root)?;
+        let verdict = node_with_source(
+            &graph,
+            SemanticNodeType::EvidenceArtifact,
+            "docs/evidence/dropin-certification-verdict.json",
+        )?;
+        assert_eq!(
+            verdict.freshness_status,
+            Some(EvidenceFreshnessStatus::Uncertified)
+        );
+        assert_eq!(
+            verdict.metadata.get("release_claim_allowed"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            verdict.metadata.get("freshness_reason"),
+            Some(&json!("dropin_verdict_source_binding_unavailable"))
+        );
+    }
+
+    let real_parent_dir_path = repository.path().join("..").join(repository_name);
+    let graph = build_fixture_graph(&real_parent_dir_path)?;
+    let verdict = node_with_source(
+        &graph,
+        SemanticNodeType::EvidenceArtifact,
+        "docs/evidence/dropin-certification-verdict.json",
+    )?;
+    assert_eq!(
+        verdict.freshness_status,
+        Some(EvidenceFreshnessStatus::Current)
+    );
+    assert_eq!(
+        verdict.metadata.get("release_claim_allowed"),
+        Some(&json!(true))
+    );
     Ok(())
 }
 
@@ -1857,6 +1990,48 @@ fn ordinary_evidence_defaults_to_exact_twenty_four_hour_freshness() -> TestResul
         assert_eq!(classification.1, expected_allowed);
     }
     Ok(())
+}
+
+#[test]
+fn invalid_generic_freshness_window_fails_closed_without_panicking() -> TestResult {
+    let options = SemanticWorkspaceGraphBuildOptions {
+        reference_time_utc: Some(reference_time()?),
+        stale_after_days: i64::MAX,
+        ..SemanticWorkspaceGraphBuildOptions::default()
+    };
+    let evidence = json!({
+        "schema": "fixture.ordinary_evidence.v1",
+        "generated_at": "2026-05-13T00:00:00Z"
+    });
+    assert_eq!(
+        classify_evidence_freshness(&evidence, &options),
+        (
+            EvidenceFreshnessStatus::Stale,
+            false,
+            "generated_at_older_than_policy".to_string()
+        )
+    );
+    Ok(())
+}
+
+#[test]
+fn extreme_reference_time_does_not_overflow_future_skew_check() {
+    let options = SemanticWorkspaceGraphBuildOptions {
+        reference_time_utc: Some(DateTime::<Utc>::MAX_UTC),
+        ..SemanticWorkspaceGraphBuildOptions::default()
+    };
+    let evidence = json!({
+        "schema": "fixture.ordinary_evidence.v1",
+        "generated_at": "2026-05-13T00:00:00Z"
+    });
+    assert_eq!(
+        classify_evidence_freshness(&evidence, &options),
+        (
+            EvidenceFreshnessStatus::Stale,
+            false,
+            "generated_at_older_than_policy".to_string()
+        )
+    );
 }
 
 #[test]

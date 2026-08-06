@@ -3061,7 +3061,7 @@ fn install_hostile_head_replacement(root: &Path) -> String {
     let head = fixture_git_output(root, &["rev-parse", "--verify", "HEAD^{commit}"])
         .trim()
         .to_string();
-    let tree = fixture_git_output(root, &["rev-parse", "--verify", "HEAD^{tree}"])
+    let tree = fixture_git_output(root, &["rev-parse", "--verify", concat!("HEAD^", "{tree}")])
         .trim()
         .to_string();
     let replacement = fixture_git_output(
@@ -3803,16 +3803,16 @@ fn retained_conformance_evidence_fixture() -> (PathBuf, PathBuf, String) {
                     "entry_path": "fixture-a/index.ts",
                     "source_tier": "fixture-tier",
                     "conformance_tier": 1,
-                    "capabilities": capabilities.clone(),
-                    "registrations": registrations.clone()
+                    "capabilities": capabilities,
+                    "registrations": registrations
                 },
                 {
                     "id": "fixture-b",
                     "entry_path": "fixture-b/index.ts",
                     "source_tier": "fixture-tier",
                     "conformance_tier": 1,
-                    "capabilities": capabilities.clone(),
-                    "registrations": registrations.clone()
+                    "capabilities": capabilities,
+                    "registrations": registrations
                 }
             ]
         }))
@@ -4603,13 +4603,13 @@ fn retained_certified_dropin_lane_fixture(
         serde_json::to_vec_pretty(&json!({
             "schema": "pi.ci.certification_lane.v1",
             "lane": "full",
-            "generated_at": lane_generated_at.clone(),
+            "generated_at": lane_generated_at,
             "verdict": actual_lane_verdict,
             "policy": "Full certification: all blocking gates must pass for release. Waived gates are tracked but do not block. Expired waivers fail the waiver_lifecycle gate.",
             "gates": lane_gates,
             "waiver_audit": {
                 "schema": "pi.ci.waiver_audit.v1",
-                "generated_at": lane_generated_at.clone(),
+                "generated_at": lane_generated_at,
                 "total_waivers": 0,
                 "active": 0,
                 "expired": 0,
@@ -5247,7 +5247,12 @@ fn release_gate_embedded_conformance_validator_detects_product_to_evidence_renam
         .expect("copy product bytes into the conformance evidence namespace");
     fixture_git_output(
         &root,
-        &["add", "tests/ext_conformance/reports/renamed_product.rs"],
+        &[
+            "add",
+            "--force",
+            "--",
+            "tests/ext_conformance/reports/renamed_product.rs",
+        ],
     );
     fixture_git_output(&root, &["update-index", "--force-remove", "src/lib.rs"]);
     fixture_git_output(
@@ -5439,7 +5444,7 @@ fn release_gate_embedded_dropin_validator_binds_parsed_bytes_and_modes() {
         let wrapper = wrapper_dir.join("git");
         std::fs::write(
             &wrapper,
-            "#!/bin/sh\nif [ ! -f \"$PI_DROPIN_RESTORE_MARKER\" ]; then\n  cp \"$PI_DROPIN_ORIGINAL\" \"$PI_DROPIN_TARGET\" || exit 97\n  : > \"$PI_DROPIN_RESTORE_MARKER\" || exit 98\nfi\nexec \"$PI_DROPIN_REAL_GIT\" \"$@\"\n",
+            "#!/bin/sh\ncase \" $* \" in\n  *\" rev-parse --verify HEAD^{commit} \"*)\n    if [ ! -f \"$PI_DROPIN_RESTORE_MARKER\" ]; then\n      cp \"$PI_DROPIN_ORIGINAL\" \"$PI_DROPIN_TARGET\" || exit 97\n      : > \"$PI_DROPIN_RESTORE_MARKER\" || exit 98\n    fi\n    ;;\nesac\nexec \"$PI_DROPIN_REAL_GIT\" \"$@\"\n",
         )
         .expect("write drop-in Git wrapper");
         let mut wrapper_permissions = std::fs::metadata(&wrapper)
@@ -5943,6 +5948,7 @@ fn release_gate_embedded_dropin_validator_rejects_future_and_stale_evidence() {
         serde_json::to_vec_pretty(&verdict).expect("serialize future drop-in verdict fixture"),
     )
     .expect("write future drop-in verdict fixture");
+    fixture_git_output(&root, &["init", "--quiet", "--initial-branch=main"]);
     let root_arg = root.to_str().expect("UTF-8 drop-in fixture root");
     let contract_arg = contract_path.to_str().expect("UTF-8 contract fixture path");
     let verdict_arg = verdict_path.to_str().expect("UTF-8 verdict fixture path");
