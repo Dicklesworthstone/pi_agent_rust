@@ -295,6 +295,30 @@ Then `pi --provider ollama --model Qwen3.6-35B-A3B-4bit`. See
 [docs/models.md](docs/models.md) for the full `models.json` schema, provider
 aliases, and secret resolution (env vars and `!command` shell lookups).
 
+### Refreshing provider model catalogs
+
+For OpenAI-compatible providers, model discovery is a standalone command: it
+prints one model ID per stdout line and exits without starting the TUI.
+
+```bash
+# Use a successful live response, the short-lived process cache, or (with a
+# warning on stderr) the static registry when live discovery is unavailable
+pi --fetch-models openrouter
+
+# Bypass the cache and require a genuinely live response; never fall back
+pi --fetch-models openrouter --refresh-models
+
+# Make a successful live/cache catalog available to future --list-models and
+# interactive /model pickers
+pi --fetch-models openrouter --refresh-models --persist-models
+```
+
+Persistence is opt-in and writes only provider/model IDs to
+`~/.pi/agent/models.fetched.json`. Pi never persists a static fallback or API
+credentials. The generated catalog is loaded first; your hand-written
+`~/.pi/agent/models.json` is loaded afterward and remains authoritative. Pi
+does not rewrite or merge that user-authored file.
+
 ---
 
 ## Features
@@ -753,6 +777,9 @@ Interactive file references:
 | `--repair-policy off|suggest|auto-safe|auto-strict` | Extension auto-repair policy |
 | `--list-models [PATTERN]` | List available models (optional fuzzy filter) |
 | `--list-providers` | List canonical provider IDs, aliases, and auth env keys |
+| `--fetch-models <PROVIDER>` | Print provider model IDs to stdout and exit; warns when using the static fallback |
+| `--refresh-models` | With `--fetch-models`, bypass cache and require a successful live response |
+| `--persist-models` | With `--fetch-models`, atomically save a successful live/cache catalog for future model pickers |
 | `--export <PATH>` | Export session file to HTML |
 
 Additional high-leverage flags:
