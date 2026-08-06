@@ -771,7 +771,49 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "redox")))]
+struct PrivateReadDir {
+    inner: fs::ReadDir,
+    #[cfg(windows)]
+    _component_guards: Vec<WindowsArtifactDirectoryGuard>,
+}
+
+impl Iterator for PrivateReadDir {
+    type Item = std::io::Result<fs::DirEntry>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+}
+
+fn read_private_directory(path: &Path) -> std::io::Result<PrivateReadDir> {
+    #[cfg(windows)]
+    {
+        let (operation_path, component_guards) =
+            open_or_create_windows_artifact_directory_components(path, false)?;
+        let inner = fs::read_dir(&operation_path)?;
+        validate_windows_artifact_directory_guards(&component_guards)?;
+        Ok(PrivateReadDir {
+            inner,
+            _component_guards: component_guards,
+        })
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(PrivateReadDir {
+            inner: fs::read_dir(path)?,
+        })
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(target_os = "redox"),
+    any(
+        test,
+        not(any(target_os = "linux", target_vendor = "apple"))
+    )
+))]
 fn publish_regular_file_via_hard_link_no_replace(
     source_directory: &File,
     source_name: &std::ffi::OsStr,
@@ -808,15 +850,19 @@ fn rename_regular_file(source: &Path, target: &Path) -> Result<()> {
     if let Some(target_file) = open_regular_file_for_read(target)? {
         drop(target_file);
     }
+    #[cfg(unix)]
     let source_parent = source
         .parent()
         .ok_or_else(|| Error::session("artifact source has no parent directory"))?;
+    #[cfg(unix)]
     let target_parent = target
         .parent()
         .ok_or_else(|| Error::session("artifact target has no parent directory"))?;
+    #[cfg(unix)]
     let source_name = source
         .file_name()
         .ok_or_else(|| Error::session("artifact source has no filename"))?;
+    #[cfg(unix)]
     let target_name = target
         .file_name()
         .ok_or_else(|| Error::session("artifact target has no filename"))?;
@@ -873,15 +919,19 @@ where
     let source_file = open_regular_file_for_read(source)?
         .ok_or_else(|| Error::session(format!("artifact not found: {}", source.display())))?;
     drop(source_file);
+    #[cfg(unix)]
     let source_parent = source
         .parent()
         .ok_or_else(|| Error::session("artifact source has no parent directory"))?;
+    #[cfg(unix)]
     let target_parent = target
         .parent()
         .ok_or_else(|| Error::session("artifact target has no parent directory"))?;
+    #[cfg(unix)]
     let source_name = source
         .file_name()
         .ok_or_else(|| Error::session("artifact source has no filename"))?;
+    #[cfg(unix)]
     let target_name = target
         .file_name()
         .ok_or_else(|| Error::session("artifact target has no filename"))?;
@@ -942,9 +992,11 @@ fn remove_regular_file(path: &Path) -> Result<()> {
     let file = open_regular_file_for_read(path)?
         .ok_or_else(|| Error::session(format!("artifact not found: {}", path.display())))?;
     drop(file);
+    #[cfg(unix)]
     let parent = path
         .parent()
         .ok_or_else(|| Error::session("artifact has no parent directory"))?;
+    #[cfg(unix)]
     let name = path
         .file_name()
         .ok_or_else(|| Error::session("artifact has no filename"))?;
@@ -2412,7 +2464,7 @@ impl SessionStoreV2 {
     fn list_segment_files(&self) -> Result<Vec<(u64, PathBuf)>> {
         let segments_dir = self.root.join("segments");
         let mut segment_files = Vec::new();
-        let entries = match fs::read_dir(segments_dir) {
+        let entries = match read_private_directory(&segments_dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(err) => return Err(Error::Io(Box::new(err))),
@@ -2757,7 +2809,7 @@ impl SessionStoreV2 {
         let checkpoint_dir = self.root.join("checkpoints");
         drop(open_private_directory(&checkpoint_dir, false)?);
         let mut checkpoints = Vec::new();
-        for entry in fs::read_dir(&checkpoint_dir)? {
+        for entry in read_private_directory(&checkpoint_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
@@ -3582,7 +3634,7 @@ impl SessionStoreV2 {
         }
         let segments_dir = self.root.join("segments");
         let mut seen_segment_sequences = BTreeSet::new();
-        for entry in fs::read_dir(&segments_dir)? {
+        for entry in read_private_directory(&segments_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("seg") {
                 continue;
@@ -3620,7 +3672,7 @@ impl SessionStoreV2 {
             return Ok(());
         }
         drop(open_private_directory(&checkpoint_dir, false)?);
-        let entries = match fs::read_dir(&checkpoint_dir) {
+        let entries = match read_private_directory(&checkpoint_dir) {
             Ok(entries) => entries,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(Error::Io(Box::new(err))),
@@ -3813,7 +3865,7 @@ impl SessionStoreV2 {
     ) -> Result<()> {
         let segments_dir = self.root.join("segments");
         let mut seen_segment_sequences = std::collections::HashSet::new();
-        for entry in fs::read_dir(&segments_dir)? {
+        for entry in read_private_directory(&segments_dir)? {
             let path = entry?.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("seg") {
                 continue;
