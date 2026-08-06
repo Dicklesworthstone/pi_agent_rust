@@ -65,6 +65,8 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "no-prompt-templates"
         | "no-themes"
         | "list-providers"
+        | "refresh-models"
+        | "persist-models"
         | "hide-cwd-in-prompt" => (false, false),
         "provider"
         | "model"
@@ -86,7 +88,8 @@ fn known_long_option(name: &str) -> Option<LongOptionSpec> {
         | "theme"
         | "theme-path"
         | "max-tool-iterations"
-        | "export" => (true, false),
+        | "export"
+        | "fetch-models" => (true, false),
         "list-models" => (true, true),
         _ => return None,
     };
@@ -517,10 +520,16 @@ pub struct Cli {
     #[arg(long, value_name = "PROVIDER")]
     pub fetch_models: Option<String>,
 
-    /// When used with `--fetch-models`, ignore any cached entry and force a
-    /// fresh network call (still falls back to the static registry on error).
+    /// When used with `--fetch-models`, ignore any cached entry and require a
+    /// successful fresh network call. Live-refresh failures are reported
+    /// instead of being disguised as static-registry results.
     #[arg(long, requires = "fetch_models")]
     pub refresh_models: bool,
+
+    /// Persist a successful live or cached `--fetch-models` catalog to
+    /// `models.fetched.json`. Static fallback results are never persisted.
+    #[arg(long, requires = "fetch_models")]
+    pub persist_models: bool,
 
     // === Subcommands ===
     #[command(subcommand)]
@@ -535,7 +544,7 @@ pub struct Cli {
 #[cfg(test)]
 mod tests {
     use super::{Cli, Commands, ROOT_SUBCOMMANDS, parse_with_extension_flags};
-    use clap::{CommandFactory, Parser};
+    use clap::{CommandFactory, Parser, error::ErrorKind};
 
     // ── 1. Basic flag parsing ────────────────────────────────────────
 
@@ -1001,6 +1010,38 @@ mod tests {
         };
         assert_eq!(pat, "claude*");
         Ok(())
+    }
+
+    #[test]
+    fn fetch_models_flags_survive_extension_flag_preprocessing() {
+        let parsed = parse_with_extension_flags(
+            [
+                "pi",
+                "--fetch-models",
+                "openrouter",
+                "--refresh-models",
+                "--persist-models",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        )
+        .expect("parse fetch-models flags");
+
+        assert_eq!(parsed.cli.fetch_models.as_deref(), Some("openrouter"));
+        assert!(parsed.cli.refresh_models);
+        assert!(parsed.cli.persist_models);
+        assert!(
+            parsed.extension_flags.is_empty(),
+            "built-in model flags must not be reclassified as extension flags"
+        );
+    }
+
+    #[test]
+    fn persist_models_requires_fetch_models() {
+        let error = Cli::try_parse_from(["pi", "--persist-models"])
+            .expect_err("persist-models without fetch-models must be rejected");
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
     }
 
     // ── 5b. --list-providers (bool) ────────────────────────────────────

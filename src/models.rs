@@ -850,25 +850,40 @@ impl ModelRegistry {
         F: Fn(&str) -> Option<String>,
     {
         let mut models = built_in_models(resolve_api_key, mode);
-        let mut error = None;
+        let mut errors = Vec::new();
 
-        if let Some(path) = models_path
-            && path.exists()
-        {
-            match std::fs::read_to_string(&path)
-                .map_err(|e| Error::config(format!("Failed to read models.json: {e}")))
-                .and_then(|s| serde_json::from_str::<ModelsConfig>(&s).map_err(Error::from))
-            {
-                Ok(config) => {
-                    apply_custom_models(resolve_api_key, &mut models, &config, path.parent());
+        if let Some(path) = models_path {
+            let fetched_path = fetched_models_path(&path);
+            for catalog_path in [&fetched_path, &path] {
+                if !catalog_path.exists() {
+                    continue;
                 }
-                Err(e) => {
-                    error = Some(format!("{e}\n\nFile: {}", path.display()));
+                match load_models_config(catalog_path) {
+                    Ok(config) => {
+                        // Generated catalogs are intentionally applied first.
+                        // The user's models.json is applied second so every
+                        // manual provider/model override keeps final authority.
+                        apply_custom_models(
+                            resolve_api_key,
+                            &mut models,
+                            &config,
+                            catalog_path.parent(),
+                        );
+                    }
+                    Err(error) => {
+                        errors.push(format!(
+                            "{error}\n\nFile: {}",
+                            catalog_path.display()
+                        ));
+                    }
                 }
             }
         }
 
-        Self { models, error }
+        Self {
+            models,
+            error: (!errors.is_empty()).then(|| errors.join("\n\n")),
+        }
     }
 
     pub fn models(&self) -> &[ModelEntry] {
@@ -2500,6 +2515,25 @@ pub fn default_models_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("models.json")
 }
 
+/// Path for the generated, opt-in provider catalog stored beside
+/// `models.json`. The generated file is loaded before `models.json`, ensuring
+/// that user-authored configuration always wins without either file being
+/// merged or rewritten on disk.
+pub fn fetched_models_path(models_path: &Path) -> PathBuf {
+    models_path.with_file_name("models.fetched.json")
+}
+
+fn load_models_config(path: &Path) -> std::result::Result<ModelsConfig, Error> {
+    std::fs::read_to_string(path)
+        .map_err(|error| {
+            Error::config(format!(
+                "Failed to read model catalog {}: {error}",
+                path.display()
+            ))
+        })
+        .and_then(|contents| serde_json::from_str::<ModelsConfig>(&contents).map_err(Error::from))
+}
+
 // === Ad-hoc model support ===
 
 #[derive(Debug, Clone, Copy)]
@@ -3895,6 +3929,66 @@ mod tests {
             Some("model-level")
         );
         assert_eq!(acme.model.input, vec![InputType::Text, InputType::Image]);
+    }
+
+    #[test]
+    fn model_registry_loads_fetched_catalog_before_manual_models_json() {
+        let (dir, auth) = test_auth_storage();
+        let models_path = dir.path().join("models.json");
+        let fetched_path = fetched_models_path(&models_path);
+        let fetched_json = serde_json::json!({
+            "schema": "pi.models.fetched.v1",
+            "providers": {
+                "shared-provider": {
+                    "baseUrl": "https://generated.example/v1",
+                    "models": [{"id": "generated-shared"}]
+                },
+                "fetched-only": {
+                    "baseUrl": "https://fetched.example/v1",
+                    "models": [{"id": "fetched-model"}]
+                }
+            }
+        });
+        std::fs::write(
+            &fetched_path,
+            serde_json::to_string_pretty(&fetched_json).expect("serialize fetched catalog"),
+        )
+        .expect("write fetched catalog");
+
+        let manual_json = serde_json::json!({
+            "futureUserField": {"mustRemain": true},
+            "providers": {
+                "shared-provider": {
+                    "baseUrl": "https://manual.example/v1",
+                    "models": [{"id": "manual-shared", "name": "Manual wins"}]
+                }
+            }
+        });
+        let manual_bytes = serde_json::to_vec_pretty(&manual_json).expect("serialize manual config");
+        std::fs::write(&models_path, &manual_bytes).expect("write manual models.json");
+
+        let registry = ModelRegistry::load(&auth, Some(models_path.clone()));
+
+        assert!(
+            registry.find("fetched-only", "fetched-model").is_some(),
+            "providers absent from manual config must survive"
+        );
+        let manual = registry
+            .find("shared-provider", "manual-shared")
+            .expect("manual provider catalog should win");
+        assert_eq!(manual.model.name, "Manual wins");
+        assert_eq!(manual.model.base_url, "https://manual.example/v1");
+        assert!(
+            registry
+                .find("shared-provider", "generated-shared")
+                .is_none(),
+            "manual models list should retain its existing full-provider override semantics"
+        );
+        assert_eq!(
+            std::fs::read(&models_path).expect("re-read manual models.json"),
+            manual_bytes,
+            "loading generated models must never rewrite user models.json"
+        );
     }
 
     #[test]
