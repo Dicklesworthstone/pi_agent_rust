@@ -9,9 +9,26 @@
 //!
 //! Run:
 //!   cargo test --test `ci_cross_platform_matrix` -- --nocapture
+//!
+//! Regenerate the tracked report for the current platform explicitly with:
+//!   `PI_GENERATE_CROSS_PLATFORM_MATRIX=1 cargo test --test ci_cross_platform_matrix cross_platform_matrix -- --exact --nocapture`
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+const GENERATE_CROSS_PLATFORM_MATRIX_ENV: &str = "PI_GENERATE_CROSS_PLATFORM_MATRIX";
+
+fn cross_platform_matrix_generation_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn cross_platform_matrix_generation_requested() -> bool {
+    cross_platform_matrix_generation_enabled(
+        std::env::var(GENERATE_CROSS_PLATFORM_MATRIX_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -434,7 +451,6 @@ fn cross_platform_matrix() {
         .join("tests")
         .join("cross_platform_reports")
         .join(platform);
-    let _ = std::fs::create_dir_all(&report_dir);
 
     eprintln!("\n=== Cross-Platform CI Matrix (bd-1f42.6.7) ===");
     eprintln!("  Platform:  {platform}");
@@ -519,12 +535,13 @@ fn cross_platform_matrix() {
         },
     };
 
-    // ── Write JSON report ──
+    // Render every output during ordinary tests so serialization and report
+    // construction remain covered. Writing the tracked artifacts is an
+    // explicit maintainer operation because timestamps and host capabilities
+    // are inherently run-specific.
     let report_path = report_dir.join("platform_report.json");
-    let _ = std::fs::write(
-        &report_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
-    );
+    let report_json =
+        serde_json::to_string_pretty(&report).expect("serialize cross-platform report");
 
     // ── Write JSONL events ──
     let events_path = report_dir.join("platform_events.jsonl");
@@ -539,44 +556,50 @@ fn cross_platform_matrix() {
             "platform_tag": check.platform_tag,
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         });
-        event_lines.push(serde_json::to_string(&line).unwrap_or_default());
+        event_lines
+            .push(serde_json::to_string(&line).expect("serialize cross-platform check event"));
     }
-    let _ = std::fs::write(&events_path, event_lines.join("\n") + "\n");
+    let events_jsonl = event_lines.join("\n") + "\n";
 
     // ── Write Markdown report ──
     let mut md = String::new();
-    let _ = write!(
+    write!(
         md,
         "# Cross-Platform CI Matrix — {}\n\n",
         platform.to_uppercase()
-    );
-    let _ = writeln!(
+    )
+    .expect("render cross-platform report title");
+    writeln!(
         md,
         "> Generated: {}",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
-    );
-    let _ = writeln!(
+    )
+    .expect("render cross-platform report timestamp");
+    writeln!(
         md,
         "> OS: {} / {}",
         std::env::consts::OS,
         std::env::consts::ARCH
-    );
-    let _ = writeln!(
+    )
+    .expect("render cross-platform report host");
+    writeln!(
         md,
         "> Required checks: {required_pass}/{required_total} passed\n"
-    );
+    )
+    .expect("render cross-platform required-check summary");
 
     md.push_str("## Check Results\n\n");
     md.push_str("| Check | Policy | Status | Tag |\n|-------|--------|--------|-----|\n");
     for check in &checks {
-        let _ = writeln!(
+        writeln!(
             md,
             "| {} | {} | {} | {} |",
             check.name,
             check.policy,
             check.status.to_uppercase(),
             check.platform_tag.as_deref().unwrap_or("-"),
-        );
+        )
+        .expect("render cross-platform check row");
     }
     md.push('\n');
 
@@ -594,19 +617,30 @@ fn cross_platform_matrix() {
     if !platform_failures.is_empty() {
         md.push_str("## Platform-Specific Issues\n\n");
         for f in &platform_failures {
-            let _ = writeln!(
+            writeln!(
                 md,
                 "- **{}** ({}): {}",
                 f.name,
                 f.status,
                 f.reason.as_deref().unwrap_or("unknown"),
-            );
+            )
+            .expect("render cross-platform failure row");
         }
         md.push('\n');
     }
 
     let md_path = report_dir.join("platform_report.md");
-    let _ = std::fs::write(&md_path, &md);
+    let generate = cross_platform_matrix_generation_requested();
+    if generate {
+        std::fs::create_dir_all(&report_dir).expect("create cross-platform report directory");
+        std::fs::write(&report_path, report_json).expect("write cross-platform JSON report");
+        std::fs::write(&events_path, events_jsonl).expect("write cross-platform JSONL events");
+        std::fs::write(&md_path, &md).expect("write cross-platform Markdown report");
+    } else {
+        eprintln!(
+            "  Reports not written; set {GENERATE_CROSS_PLATFORM_MATRIX_ENV}=1 to regenerate the tracked artifacts"
+        );
+    }
 
     // ── Print summary ──
     eprintln!("=== Platform Summary ({platform}) ===");
@@ -617,7 +651,10 @@ fn cross_platform_matrix() {
     eprintln!("  Unsupported: {unsupported}");
     eprintln!("  Required:    {required_pass}/{required_total}");
     eprintln!();
-    eprintln!("  Reports:");
+    eprintln!(
+        "  Reports ({}):",
+        if generate { "generated" } else { "not written" }
+    );
     eprintln!("    JSON:  {}", report_path.display());
     eprintln!("    JSONL: {}", events_path.display());
     eprintln!("    MD:    {}", md_path.display());
@@ -642,6 +679,17 @@ fn cross_platform_matrix() {
                 .collect::<Vec<_>>()
         );
     }
+}
+
+#[test]
+fn cross_platform_matrix_generation_requires_exact_one() {
+    assert!(!cross_platform_matrix_generation_enabled(None));
+    assert!(!cross_platform_matrix_generation_enabled(Some("")));
+    assert!(!cross_platform_matrix_generation_enabled(Some("0")));
+    assert!(!cross_platform_matrix_generation_enabled(Some("true")));
+    assert!(!cross_platform_matrix_generation_enabled(Some(" 1")));
+    assert!(!cross_platform_matrix_generation_enabled(Some("1 ")));
+    assert!(cross_platform_matrix_generation_enabled(Some("1")));
 }
 
 /// Verify cross-platform report schema.

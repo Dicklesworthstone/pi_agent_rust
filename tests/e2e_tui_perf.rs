@@ -40,6 +40,7 @@ use pi::session::Session;
 use pi::tools::ToolRegistry;
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -176,11 +177,166 @@ impl MockRssReader {
     }
 }
 
-/// Artifact output directory for perf tests.
-fn perf_artifact_dir() -> std::path::PathBuf {
-    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/artifacts/perf");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+const TUI_PERF_ARTIFACT_GENERATION_ENV: &str = "PI_GENERATE_TUI_PERF_ARTIFACTS";
+
+fn tui_perf_artifact_generation_enabled() -> bool {
+    match std::env::var(TUI_PERF_ARTIFACT_GENERATION_ENV) {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "1" => true,
+        Ok(value) => {
+            panic!("{TUI_PERF_ARTIFACT_GENERATION_ENV} must be unset or exactly '1', got {value:?}")
+        }
+        Err(std::env::VarError::NotUnicode(value)) => {
+            panic!("{TUI_PERF_ARTIFACT_GENERATION_ENV} must contain valid UTF-8, got {value:?}")
+        }
+    }
+}
+
+fn validate_perf_log_jsonl(payload: &str) {
+    assert!(!payload.is_empty(), "perf log JSONL must not be empty");
+    assert!(
+        payload.ends_with('\n'),
+        "perf log JSONL must end with a newline"
+    );
+
+    let validation_errors = common::logging::validate_jsonl_v2_only(payload);
+    assert!(
+        validation_errors.is_empty(),
+        "perf log JSONL must satisfy the v2 logging schema: {}",
+        validation_errors
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+
+    let mut record_count = 0usize;
+    let mut log_record_count = 0usize;
+    for (index, line) in payload.lines().enumerate() {
+        assert!(
+            !line.trim().is_empty(),
+            "perf log JSONL record {} must not be empty",
+            index + 1
+        );
+        let record: serde_json::Value = serde_json::from_str(line).unwrap_or_else(|error| {
+            panic!("perf log JSONL record {} must parse: {error}", index + 1)
+        });
+        let schema = record.get("schema").and_then(serde_json::Value::as_str);
+        let record_type = record.get("type").and_then(serde_json::Value::as_str);
+        assert!(
+            matches!(
+                (schema, record_type),
+                (Some("pi.test.log.v2"), Some("log"))
+                    | (Some("pi.test.artifact.v1"), Some("artifact"))
+            ),
+            "perf log JSONL record {} must be a v2 log or v1 artifact record",
+            index + 1
+        );
+        log_record_count += usize::from(record_type == Some("log"));
+        assert_eq!(
+            record.get("seq").and_then(serde_json::Value::as_u64),
+            Some(u64::try_from(index + 1).expect("perf log sequence must fit u64")),
+            "perf log JSONL sequence must be contiguous"
+        );
+        record_count += 1;
+    }
+    assert!(record_count > 0, "perf log JSONL must contain records");
+    assert!(
+        log_record_count > 0,
+        "perf log JSONL must contain at least one log record"
+    );
+}
+
+fn write_verified_perf_artifact(path: &Path, payload: &str) {
+    let parent = path.parent().expect("perf artifact must have a parent");
+    std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+        panic!(
+            "failed to create perf artifact directory {}: {error}",
+            parent.display()
+        )
+    });
+    let parent_metadata = std::fs::symlink_metadata(parent).unwrap_or_else(|error| {
+        panic!(
+            "failed to stat perf artifact directory {}: {error}",
+            parent.display()
+        )
+    });
+    assert!(
+        parent_metadata.file_type().is_dir(),
+        "perf artifact parent must be a real directory, not a symlink: {}",
+        parent.display()
+    );
+
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => assert!(
+            metadata.file_type().is_file(),
+            "existing perf artifact must be a regular file, not a symlink: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "failed to inspect existing perf artifact {}: {error}",
+            path.display()
+        ),
+    }
+
+    std::fs::write(path, payload).unwrap_or_else(|error| {
+        panic!("failed to write perf artifact {}: {error}", path.display())
+    });
+    let metadata = std::fs::symlink_metadata(path).unwrap_or_else(|error| {
+        panic!(
+            "failed to stat written perf artifact {}: {error}",
+            path.display()
+        )
+    });
+    assert!(
+        metadata.file_type().is_file(),
+        "written perf artifact must be a regular file: {}",
+        path.display()
+    );
+    assert_eq!(
+        metadata.len(),
+        u64::try_from(payload.len()).expect("perf artifact length must fit u64"),
+        "written perf artifact length mismatch: {}",
+        path.display()
+    );
+    let retained = std::fs::read_to_string(path).unwrap_or_else(|error| {
+        panic!(
+            "failed to read back written perf artifact {}: {error}",
+            path.display()
+        )
+    });
+    assert_eq!(
+        retained,
+        payload,
+        "written perf artifact bytes differ from the validated payload: {}",
+        path.display()
+    );
+}
+
+fn validate_or_generate_perf_logs(harness: &TestHarness, filename: &str, artifact_name: &str) {
+    assert!(
+        matches!(
+            filename,
+            "long_conversation.jsonl"
+                | "streaming_with_history.jsonl"
+                | "degradation_under_load.jsonl"
+                | "memory_pressure.jsonl"
+        ),
+        "unexpected canonical TUI perf artifact filename: {filename}"
+    );
+
+    let payload = harness.log().dump_jsonl();
+    validate_perf_log_jsonl(&payload);
+    if !tui_perf_artifact_generation_enabled() {
+        return;
+    }
+
+    let artifact_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/artifacts/perf")
+        .join(filename);
+    write_verified_perf_artifact(&artifact_path, &payload);
+    harness.record_artifact(artifact_name, &artifact_path);
 }
 
 /// Emit a structured JSONL perf event record.
@@ -352,10 +508,11 @@ fn e2e_perf_long_conversation_responsiveness() {
         }),
     );
 
-    // Write JSONL artifact
-    let artifact_path = perf_artifact_dir().join("long_conversation.jsonl");
-    let _ = harness.write_jsonl_logs(&artifact_path);
-    harness.record_artifact("long_conversation_logs", &artifact_path);
+    validate_or_generate_perf_logs(
+        &harness,
+        "long_conversation.jsonl",
+        "long_conversation_logs",
+    );
 
     harness.log().info(
         "verdict",
@@ -446,10 +603,11 @@ fn e2e_perf_streaming_with_history() {
         }),
     );
 
-    // Write JSONL artifact
-    let artifact_path = perf_artifact_dir().join("streaming_with_history.jsonl");
-    let _ = harness.write_jsonl_logs(&artifact_path);
-    harness.record_artifact("streaming_history_logs", &artifact_path);
+    validate_or_generate_perf_logs(
+        &harness,
+        "streaming_with_history.jsonl",
+        "streaming_history_logs",
+    );
 
     harness.log().info(
         "verdict",
@@ -552,9 +710,7 @@ fn e2e_perf_degradation_under_load() {
         }),
     );
 
-    let artifact_path = perf_artifact_dir().join("degradation_under_load.jsonl");
-    let _ = harness.write_jsonl_logs(&artifact_path);
-    harness.record_artifact("degradation_logs", &artifact_path);
+    validate_or_generate_perf_logs(&harness, "degradation_under_load.jsonl", "degradation_logs");
 
     harness.log().info(
         "verdict",
@@ -715,10 +871,7 @@ fn e2e_perf_memory_pressure_response() {
         }),
     );
 
-    // Write artifact
-    let artifact_path = perf_artifact_dir().join("memory_pressure.jsonl");
-    let _ = harness.write_jsonl_logs(&artifact_path);
-    harness.record_artifact("memory_pressure_logs", &artifact_path);
+    validate_or_generate_perf_logs(&harness, "memory_pressure.jsonl", "memory_pressure_logs");
 
     // Assertions
     // Under Pressure, at least some tool outputs should be collapsed

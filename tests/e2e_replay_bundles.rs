@@ -7,10 +7,47 @@
 //! artifacts with a single deterministic command sequence. Also validates that
 //! replay metadata is consistent across scenario matrix, CI gates, and suite
 //! classification.
+//!
+//! Ordinary test runs validate replay bundles in memory without modifying
+//! tracked evidence. Set `PI_GENERATE_REPLAY_BUNDLE_ARTIFACTS=1` to regenerate
+//! the canonical examples explicitly.
 
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+
+const GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV: &str = "PI_GENERATE_REPLAY_BUNDLE_ARTIFACTS";
+
+fn replay_bundle_artifact_generation_requested() -> bool {
+    let raw = std::env::var(GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV).ok();
+    replay_bundle_artifact_generation_requested_from(raw.as_deref())
+}
+
+fn replay_bundle_artifact_generation_requested_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
+}
+
+fn write_non_empty_replay_artifact(path: &Path, payload: &str) {
+    assert!(
+        !payload.trim().is_empty(),
+        "refusing to emit empty replay artifact {}",
+        path.display()
+    );
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap_or_else(|err| {
+            panic!(
+                "failed to create replay artifact directory {}: {err}",
+                parent.display()
+            )
+        });
+    }
+    std::fs::write(path, payload)
+        .unwrap_or_else(|err| panic!("failed to write replay artifact {}: {err}", path.display()));
+    let size = std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("failed to stat replay artifact {}: {err}", path.display()))
+        .len();
+    assert!(size > 0, "replay artifact is empty: {}", path.display());
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -361,12 +398,17 @@ fn replay_bundle_schema_validation() {
     eprintln!("  One-command replay: OK");
     eprintln!();
 
-    // Write the schema example as an artifact
+    // Write the schema example only in the explicit generation lane.
     let artifact_dir = repo_root().join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&artifact_dir);
     let artifact_path = artifact_dir.join("replay_bundle_schema_example.json");
-    let _ = std::fs::write(&artifact_path, &json);
-    eprintln!("  Schema example: {}", artifact_path.display());
+    if replay_bundle_artifact_generation_requested() {
+        write_non_empty_replay_artifact(&artifact_path, &json);
+        eprintln!("  Schema example: {}", artifact_path.display());
+    } else {
+        eprintln!(
+            "  Schema example validated in memory; set {GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV}=1 to write it"
+        );
+    }
 }
 
 /// Validate that env context restoration is properly captured in replay commands.
@@ -475,7 +517,6 @@ fn generate_and_validate_replay_bundle() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
     let classified = all_classified_suites(&root);
 
     eprintln!("\n=== Generate and Validate Replay Bundle ===\n");
@@ -624,12 +665,25 @@ fn generate_and_validate_replay_bundle() {
     // ── Write the replay bundle ──
     let bundle_path = report_dir.join("replay_bundle.json");
     let json = serde_json::to_string_pretty(&bundle).expect("bundle must serialize");
-    let _ = std::fs::write(&bundle_path, &json);
+    assert!(
+        !json.trim().is_empty(),
+        "generated replay bundle must be non-empty"
+    );
+    let generate = replay_bundle_artifact_generation_requested();
+    if generate {
+        write_non_empty_replay_artifact(&bundle_path, &json);
+    }
 
     eprintln!("  Failed gates: {}", failed_gates.len());
     eprintln!("  Covered workflows: {covered_workflows}");
     eprintln!("  All commands valid: {all_valid}");
-    eprintln!("  Bundle: {}", bundle_path.display());
+    if generate {
+        eprintln!("  Bundle: {}", bundle_path.display());
+    } else {
+        eprintln!(
+            "  Bundle validated in memory; set {GENERATE_REPLAY_BUNDLE_ARTIFACTS_ENV}=1 to write it"
+        );
+    }
     eprintln!();
 
     // ── Verify the bundle is valid ──
@@ -647,6 +701,17 @@ fn generate_and_validate_replay_bundle() {
             !gate.reproduce_command.is_empty(),
             "gate '{}' has empty reproduce_command",
             gate.gate_id
+        );
+    }
+}
+
+#[test]
+fn replay_bundle_artifact_generation_requires_exact_one() {
+    assert!(replay_bundle_artifact_generation_requested_from(Some("1")));
+    for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1 ")] {
+        assert!(
+            !replay_bundle_artifact_generation_requested_from(raw),
+            "unexpected generation request for {raw:?}"
         );
     }
 }

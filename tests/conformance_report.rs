@@ -387,8 +387,17 @@ fn read_jsonl_file(path: &Path) -> Vec<Value> {
     };
     content
         .lines()
-        .filter(|line| !line.trim().is_empty())
-        .filter_map(|line| serde_json::from_str(line).ok())
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str(line).unwrap_or_else(|error| {
+                panic!(
+                    "malformed JSONL record in {} at line {}: {error}",
+                    path.display(),
+                    index + 1
+                )
+            })
+        })
         .collect()
 }
 
@@ -447,13 +456,21 @@ fn ingest_scenario_report(statuses: &mut BTreeMap<String, ExtensionStatus>, repo
         let status = statuses.entry(ext_id.to_string()).or_default();
         match status_str {
             "pass" => status.scenario_pass += 1,
-            "fail" => {
+            "fail" | "error" => {
                 status.scenario_fail += 1;
                 if let Some(summary) = entry.get("summary").and_then(Value::as_str) {
                     status.scenario_failures.push(summary.to_string());
+                } else if let Some(error) = entry.get("error").and_then(Value::as_str) {
+                    status.scenario_failures.push(error.to_string());
                 }
             }
-            _ => status.scenario_skip += 1,
+            "skip" => status.scenario_skip += 1,
+            unknown => {
+                status.scenario_fail += 1;
+                status
+                    .scenario_failures
+                    .push(format!("unknown scenario status {unknown:?}"));
+            }
         }
     }
 }
@@ -473,12 +490,14 @@ fn ingest_smoke_report(statuses: &mut BTreeMap<String, ExtensionStatus>, reports
         let status = statuses.entry(ext_id.to_string()).or_default();
         let pass = entry.get("pass").and_then(Value::as_u64).unwrap_or(0);
         let fail = entry.get("fail").and_then(Value::as_u64).unwrap_or(0);
+        let error = entry.get("error").and_then(Value::as_u64).unwrap_or(0);
         status.smoke_pass = status
             .smoke_pass
             .saturating_add(u32_from_u64_saturating(pass));
         status.smoke_fail = status
             .smoke_fail
-            .saturating_add(u32_from_u64_saturating(fail));
+            .saturating_add(u32_from_u64_saturating(fail))
+            .saturating_add(u32_from_u64_saturating(error));
     }
 }
 
@@ -530,13 +549,14 @@ fn ingest_parity_report(statuses: &mut BTreeMap<String, ExtensionStatus>, report
         let status_str = event
             .get("status")
             .and_then(Value::as_str)
-            .unwrap_or("skip");
+            .unwrap_or("malformed");
 
         let status = statuses.entry(ext_id.to_string()).or_default();
         match status_str {
             "match" => status.parity_match += 1,
-            "mismatch" => status.parity_mismatch += 1,
-            _ => {}
+            "mismatch" | "ts_error" | "rust_error" => status.parity_mismatch += 1,
+            "skip" => {}
+            _ => status.parity_mismatch += 1,
         }
     }
 }
@@ -1370,6 +1390,90 @@ fn ingest_smoke_report_falls_back_to_legacy_path() {
         .expect("git-checkpoint present");
     assert_eq!(status.smoke_pass, 0);
     assert_eq!(status.smoke_fail, 1);
+}
+
+#[test]
+fn ingest_scenario_report_treats_errors_and_unknown_statuses_as_failures() {
+    let tmp = tempdir().expect("create tempdir");
+    std::fs::write(
+        tmp.path().join("scenario_conformance.json"),
+        r#"{
+  "results": [
+    {"extension_id": "runtime-error", "status": "error", "error": "boom"},
+    {"extension_id": "unknown", "status": "unexpected"}
+  ]
+}"#,
+    )
+    .expect("write scenario report");
+
+    let mut statuses = BTreeMap::new();
+    ingest_scenario_report(&mut statuses, tmp.path());
+    assert_eq!(statuses["runtime-error"].scenario_fail, 1);
+    assert_eq!(statuses["unknown"].scenario_fail, 1);
+    assert_eq!(overall_status(&statuses["runtime-error"]), "FAIL");
+    assert_eq!(overall_status(&statuses["unknown"]), "FAIL");
+}
+
+#[test]
+fn ingest_smoke_report_counts_runtime_errors_as_failures() {
+    let tmp = tempdir().expect("create tempdir");
+    std::fs::write(
+        tmp.path().join("smoke_triage.json"),
+        r#"{
+  "generated_at": "2026-08-06T00:00:00Z",
+  "extensions": [
+    {"extension_id": "runtime-error", "pass": 0, "fail": 0, "error": 1}
+  ]
+}"#,
+    )
+    .expect("write smoke report");
+
+    let mut statuses = BTreeMap::new();
+    ingest_smoke_report(&mut statuses, tmp.path());
+    assert_eq!(statuses["runtime-error"].smoke_fail, 1);
+    assert_eq!(overall_status(&statuses["runtime-error"]), "FAIL");
+}
+
+#[test]
+fn ingest_parity_report_treats_runtime_errors_as_mismatches() {
+    let tmp = tempdir().expect("create tempdir");
+    let parity = tmp.path().join("parity");
+    std::fs::create_dir_all(&parity).expect("create parity dir");
+    std::fs::write(
+        parity.join("parity_events.jsonl"),
+        concat!(
+            "{\"extension_id\":\"ts-broken\",\"status\":\"ts_error\"}\n",
+            "{\"extension_id\":\"rust-broken\",\"status\":\"rust_error\"}\n",
+            "{\"extension_id\":\"matched\",\"status\":\"match\"}\n",
+            "{\"extension_id\":\"unknown\",\"status\":\"surprise\"}\n",
+            "{\"extension_id\":\"missing\"}\n"
+        ),
+    )
+    .expect("write parity events");
+
+    let mut statuses = BTreeMap::new();
+    ingest_parity_report(&mut statuses, tmp.path());
+    assert_eq!(statuses["ts-broken"].parity_mismatch, 1);
+    assert_eq!(statuses["rust-broken"].parity_mismatch, 1);
+    assert_eq!(statuses["matched"].parity_match, 1);
+    assert_eq!(statuses["unknown"].parity_mismatch, 1);
+    assert_eq!(statuses["missing"].parity_mismatch, 1);
+    assert_eq!(overall_status(&statuses["ts-broken"]), "FAIL");
+    assert_eq!(overall_status(&statuses["rust-broken"]), "FAIL");
+    assert_eq!(overall_status(&statuses["unknown"]), "FAIL");
+    assert_eq!(overall_status(&statuses["missing"]), "FAIL");
+}
+
+#[test]
+#[should_panic(expected = "malformed JSONL record")]
+fn ingest_parity_report_rejects_malformed_records() {
+    let tmp = tempdir().expect("create tempdir");
+    let parity = tmp.path().join("parity");
+    std::fs::create_dir_all(&parity).expect("create parity dir");
+    std::fs::write(parity.join("parity_events.jsonl"), "{not-json}\n")
+        .expect("write malformed parity events");
+    let mut statuses = BTreeMap::new();
+    ingest_parity_report(&mut statuses, tmp.path());
 }
 
 #[test]

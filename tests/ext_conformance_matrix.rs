@@ -2,7 +2,8 @@
 //!
 //! Loads the inclusion list and API matrix, builds the full conformance matrix
 //! via `build_test_plan()`, and validates coverage against requirements.
-//! Writes the output to `docs/extension-conformance-test-plan.json`.
+//! Ordinary runs verify `docs/extension-conformance-test-plan.json`; set
+//! `PI_GENERATE_CONFORMANCE_TEST_PLAN=1` to regenerate it explicitly.
 
 use pi::extension_conformance_matrix::{
     ApiMatrix, ConformanceTestPlan, HostCapability, build_test_plan,
@@ -703,10 +704,46 @@ fn generate_conformance_test_plan() {
     let (plan, inclusion, _) = load_test_plan();
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
 
-    // Write the plan as evidence
+    // Ordinary test runs must not rewrite the source tree they are validating.
+    // Generation remains an explicit maintainer operation; otherwise compare
+    // every integrity-bearing field with the committed plan.
     let json = serde_json::to_string_pretty(&plan).expect("serialize plan");
     let output_path = repo_root.join("docs/extension-conformance-test-plan.json");
-    fs::write(&output_path, format!("{json}\n")).expect("write test plan");
+    let generate = matches!(
+        std::env::var("PI_GENERATE_CONFORMANCE_TEST_PLAN").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        fs::write(&output_path, format!("{json}\n")).expect("write test plan");
+    } else {
+        let committed_json =
+            fs::read_to_string(&output_path).expect("read committed conformance test plan");
+        let mut committed: Value =
+            serde_json::from_str(&committed_json).expect("parse committed conformance test plan");
+        let mut computed: Value =
+            serde_json::from_str(&json).expect("parse computed conformance test plan");
+
+        let committed_generated_at = committed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        let computed_generated_at = computed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        assert!(
+            committed_generated_at.is_some(),
+            "committed conformance test plan is missing generated_at"
+        );
+        assert!(
+            computed_generated_at.is_some(),
+            "computed conformance test plan is missing generated_at"
+        );
+        assert_eq!(
+            committed, computed,
+            "committed conformance test plan is stale; regenerate explicitly with \
+             PI_GENERATE_CONFORMANCE_TEST_PLAN=1 cargo test \
+             --test ext_conformance_matrix generate_conformance_test_plan -- --exact"
+        );
+    }
 
     // Print summary
     eprintln!("\n=== Conformance Test Plan (bd-2kyq) ===");
@@ -770,7 +807,11 @@ fn generate_conformance_test_plan() {
         }
     }
 
-    eprintln!("\nOutput written to: {}", output_path.display());
+    eprintln!(
+        "\nOutput {}: {}",
+        if generate { "written" } else { "verified" },
+        output_path.display()
+    );
 
     // ── Assertions ──
 

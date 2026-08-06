@@ -5,7 +5,8 @@
 //! 2. Security red flags (eval, dynamic code, cookie access, etc.)
 //! 3. Runtime dependency risks (npm deps, `node_modules` requirements)
 //!
-//! Generates `tests/ext_conformance/artifacts/RISK_REVIEW.json` evidence log.
+//! Verifies the committed `tests/ext_conformance/artifacts/RISK_REVIEW.json`
+//! evidence log. Set `PI_GENERATE_RISK_REVIEW=1` to regenerate it explicitly.
 
 use pi::extension_license::{
     License, Redistributable, SecuritySeverity, detect_license_from_content,
@@ -413,10 +414,44 @@ fn risk_review_evidence_log() {
         npm_dependency_risks,
     };
 
-    // Write evidence log
+    // Ordinary test runs must be read-only so that a release gate cannot
+    // mutate the source tree it is trying to certify. Regeneration is an
+    // explicit maintainer action; otherwise every integrity-bearing field is
+    // compared with the committed evidence (the timestamp is informational).
     let json = serde_json::to_string_pretty(&review).expect("serialize risk review");
     let output_path = repo_root.join("tests/ext_conformance/artifacts/RISK_REVIEW.json");
-    fs::write(&output_path, &json).expect("write risk review");
+    let generate = matches!(std::env::var("PI_GENERATE_RISK_REVIEW").as_deref(), Ok("1"));
+    if generate {
+        fs::write(&output_path, format!("{json}\n")).expect("write risk review");
+    } else {
+        let committed_json =
+            fs::read_to_string(&output_path).expect("read committed risk review evidence");
+        let mut committed: serde_json::Value =
+            serde_json::from_str(&committed_json).expect("parse committed risk review evidence");
+        let mut computed: serde_json::Value =
+            serde_json::from_str(&json).expect("parse computed risk review evidence");
+
+        let committed_generated_at = committed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        let computed_generated_at = computed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        assert!(
+            committed_generated_at.is_some(),
+            "committed risk review evidence is missing generated_at"
+        );
+        assert!(
+            computed_generated_at.is_some(),
+            "computed risk review evidence is missing generated_at"
+        );
+        assert_eq!(
+            committed, computed,
+            "committed risk review evidence is stale; regenerate explicitly with \
+             PI_GENERATE_RISK_REVIEW=1 cargo test --test ext_risk_review \
+             risk_review_evidence_log -- --exact"
+        );
+    }
 
     // Print summary
     eprintln!(
@@ -432,8 +467,9 @@ fn risk_review_evidence_log() {
          Has npm deps: {has_npm_deps}\n\
          Has heavy deps: {has_heavy_deps}\n\
          Overall risk: {overall_risk}\n\
-         Evidence log: {}\n",
-        output_path.display()
+         Evidence log: {} ({})\n",
+        output_path.display(),
+        if generate { "generated" } else { "verified" }
     );
 
     // Assertions: no critical security issues in vendored artifacts

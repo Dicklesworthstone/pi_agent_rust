@@ -1,9 +1,11 @@
 //! `FrankenNode` Semantic Compatibility Harness (bd-3ar8v.7.3)
 //!
 //! Executes JS fixture scripts against Node.js and Bun to capture baseline
-//! compatibility data, then produces a machine-readable compatibility matrix.
+//! compatibility data, then verifies a machine-readable compatibility matrix.
 //! If `FRANKEN_NODE_RUNTIME` points at a runtime executable, the same fixtures
 //! are also executed against that runtime and reported as a separate leg.
+//! Set `PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX=1` to regenerate the
+//! committed matrix explicitly.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -1171,12 +1173,47 @@ fn generate_compatibility_matrix() {
         }
     }
 
-    // Write artifact
+    // Ordinary test runs verify the committed artifact without mutating the
+    // source tree. Regeneration is an explicit maintainer operation.
     let reports = reports_dir();
-    std::fs::create_dir_all(&reports).expect("create reports dir");
     let artifact_path = reports.join("compatibility_matrix.json");
     let json = serde_json::to_string_pretty(&matrix).expect("serialize matrix");
-    std::fs::write(&artifact_path, &json).expect("write matrix artifact");
+    let generate = matches!(
+        std::env::var("PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        std::fs::create_dir_all(&reports).expect("create reports dir");
+        std::fs::write(&artifact_path, format!("{json}\n"))
+            .expect("write compatibility matrix artifact");
+    } else {
+        let committed_json = std::fs::read_to_string(&artifact_path)
+            .expect("read committed compatibility matrix artifact");
+        let mut committed: serde_json::Value = serde_json::from_str(&committed_json)
+            .expect("parse committed compatibility matrix artifact");
+        let mut computed: serde_json::Value =
+            serde_json::from_str(&json).expect("parse computed compatibility matrix artifact");
+        let committed_generated_at = committed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        let computed_generated_at = computed
+            .as_object_mut()
+            .and_then(|object| object.remove("generated_at"));
+        assert!(
+            committed_generated_at.is_some(),
+            "committed compatibility matrix is missing generated_at"
+        );
+        assert!(
+            computed_generated_at.is_some(),
+            "computed compatibility matrix is missing generated_at"
+        );
+        assert_eq!(
+            committed, computed,
+            "committed FrankenNode compatibility matrix is stale; regenerate explicitly with \
+             PI_GENERATE_FRANKEN_NODE_COMPATIBILITY_MATRIX=1 cargo test \
+             --test franken_node_compat_harness generate_compatibility_matrix -- --exact"
+        );
+    }
 
     print_compatibility_matrix_summary(&matrix, &artifact_path);
 }

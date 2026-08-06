@@ -22,6 +22,21 @@ use pi::tools::{ToolOutput, ToolRegistry};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+const GENERATE_LIFECYCLE_HOOK_PARITY_ARTIFACT_ENV: &str =
+    "PI_GENERATE_LIFECYCLE_HOOK_PARITY_ARTIFACT";
+
+fn lifecycle_hook_parity_artifact_generation_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn lifecycle_hook_parity_artifact_generation_requested() -> bool {
+    lifecycle_hook_parity_artifact_generation_enabled(
+        std::env::var(GENERATE_LIFECYCLE_HOOK_PARITY_ARTIFACT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -232,15 +247,11 @@ fn collect_cancellable_lifecycle_results(cancel_manager: &ExtensionManager) -> V
     cancellable_results
 }
 
-fn write_lifecycle_hook_parity_artifact(ordering_trace: &[String], cancellable_results: &[Value]) {
-    let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("ext_conformance")
-        .join("reports")
-        .join("lifecycle_hooks");
-    std::fs::create_dir_all(&artifact_dir).expect("create lifecycle hook report dir");
-    let artifact_path = artifact_dir.join("lifecycle_hook_parity_matrix.json");
-    let artifact = json!({
+fn build_lifecycle_hook_parity_artifact(
+    ordering_trace: &[String],
+    cancellable_results: &[Value],
+) -> Value {
+    json!({
         "schema": "pi.ext.lifecycle_hook_parity_matrix.v1",
         "generated_at": chrono::Utc::now()
             .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -261,13 +272,74 @@ fn write_lifecycle_hook_parity_artifact(ordering_trace: &[String], cancellable_r
         ],
         "ordering_trace": ordering_trace,
         "cancellable_assertions": cancellable_results,
-        "reproduce_command": "cargo test --test extensions_event_wiring -- lifecycle_hook_parity_matrix_writes_evidence_artifact --nocapture --exact",
-    });
-    std::fs::write(
-        &artifact_path,
-        serde_json::to_string_pretty(&artifact).expect("serialize lifecycle hook artifact"),
-    )
-    .expect("write lifecycle hook artifact");
+        "reproduce_command": "PI_GENERATE_LIFECYCLE_HOOK_PARITY_ARTIFACT=1 cargo test --test extensions_event_wiring lifecycle_hook_parity_matrix_writes_evidence_artifact -- --exact --nocapture",
+    })
+}
+
+fn validate_and_maybe_write_lifecycle_hook_parity_artifact(
+    ordering_trace: &[String],
+    cancellable_results: &[Value],
+) {
+    let artifact = build_lifecycle_hook_parity_artifact(ordering_trace, cancellable_results);
+    let payload =
+        serde_json::to_string_pretty(&artifact).expect("serialize lifecycle hook parity artifact");
+    assert!(
+        !payload.trim().is_empty(),
+        "lifecycle hook parity payload must be non-empty"
+    );
+
+    let roundtripped: Value =
+        serde_json::from_str(&payload).expect("parse serialized lifecycle hook parity artifact");
+    assert_eq!(roundtripped, artifact, "lifecycle hook artifact roundtrip");
+    assert_eq!(
+        roundtripped.get("schema").and_then(Value::as_str),
+        Some("pi.ext.lifecycle_hook_parity_matrix.v1")
+    );
+    assert_eq!(
+        roundtripped.get("status").and_then(Value::as_str),
+        Some("pass")
+    );
+    assert_eq!(
+        roundtripped
+            .get("coverage")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(12)
+    );
+    assert_eq!(
+        roundtripped.get("ordering_trace"),
+        Some(&json!(ordering_trace))
+    );
+    assert_eq!(
+        roundtripped.get("cancellable_assertions"),
+        Some(&json!(cancellable_results))
+    );
+
+    if lifecycle_hook_parity_artifact_generation_requested() {
+        let artifact_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("ext_conformance")
+            .join("reports")
+            .join("lifecycle_hooks");
+        std::fs::create_dir_all(&artifact_dir)
+            .expect("create lifecycle hook parity artifact directory");
+        let artifact_path = artifact_dir.join("lifecycle_hook_parity_matrix.json");
+        std::fs::write(&artifact_path, payload.as_bytes())
+            .expect("write lifecycle hook parity artifact");
+        let metadata = std::fs::metadata(&artifact_path)
+            .expect("stat generated lifecycle hook parity artifact");
+        assert!(metadata.is_file(), "lifecycle hook artifact is not a file");
+        assert_eq!(
+            metadata.len(),
+            u64::try_from(payload.len()).expect("lifecycle hook payload length fits u64"),
+            "generated lifecycle hook artifact length mismatch"
+        );
+    } else {
+        eprintln!(
+            "Lifecycle hook artifact validated in memory; set \
+             {GENERATE_LIFECYCLE_HOOK_PARITY_ARTIFACT_ENV}=1 to write tracked evidence"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -991,7 +1063,26 @@ fn lifecycle_hook_parity_matrix_writes_evidence_artifact() {
         common::TestHarness::new("lifecycle_hook_parity_matrix_cancellable_session_hooks");
     let cancel_manager = load_js_extension(&cancel_harness, SESSION_CANCEL_EXT);
     let cancellable_results = collect_cancellable_lifecycle_results(&cancel_manager);
-    write_lifecycle_hook_parity_artifact(&ordering_trace, &cancellable_results);
+    validate_and_maybe_write_lifecycle_hook_parity_artifact(&ordering_trace, &cancellable_results);
+}
+
+#[test]
+fn lifecycle_hook_parity_artifact_generation_requires_exact_one() {
+    assert!(!lifecycle_hook_parity_artifact_generation_enabled(None));
+    assert!(!lifecycle_hook_parity_artifact_generation_enabled(Some("")));
+    assert!(!lifecycle_hook_parity_artifact_generation_enabled(Some(
+        "0"
+    )));
+    assert!(!lifecycle_hook_parity_artifact_generation_enabled(Some(
+        "true"
+    )));
+    assert!(!lifecycle_hook_parity_artifact_generation_enabled(Some(
+        " 1"
+    )));
+    assert!(!lifecycle_hook_parity_artifact_generation_enabled(Some(
+        "1 "
+    )));
+    assert!(lifecycle_hook_parity_artifact_generation_enabled(Some("1")));
 }
 
 // ---------------------------------------------------------------------------

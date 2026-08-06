@@ -12,6 +12,10 @@
 //!
 //! Schema: `pi.security.compat_dashboard.v1`
 //!
+//! Regenerate tracked compatibility evidence explicitly with:
+//!   PI_GENERATE_SECURITY_COMPAT_DASHBOARD=1 cargo test --test security_conformance_benign generate_compat_dashboard_artifact -- --exact --nocapture
+//!   PI_GENERATE_SECURITY_COMPAT_EVENTS=1 cargo test --test security_conformance_benign emit_compat_events_jsonl -- --exact --nocapture
+//!
 //! Acceptance criteria addressed:
 //! - Benign extension compatibility is continuously measured.
 //! - Security regressions block merge by default.
@@ -37,6 +41,32 @@ use std::path::{Path, PathBuf};
 
 /// Schema version for the compatibility dashboard.
 const COMPAT_DASHBOARD_SCHEMA: &str = "pi.security.compat_dashboard.v1";
+const GENERATE_SECURITY_COMPAT_DASHBOARD_ENV: &str = "PI_GENERATE_SECURITY_COMPAT_DASHBOARD";
+const GENERATE_SECURITY_COMPAT_EVENTS_ENV: &str = "PI_GENERATE_SECURITY_COMPAT_EVENTS";
+
+fn security_compat_dashboard_generation_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn security_compat_dashboard_generation_requested() -> bool {
+    security_compat_dashboard_generation_enabled(
+        std::env::var(GENERATE_SECURITY_COMPAT_DASHBOARD_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn security_compat_events_generation_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn security_compat_events_generation_requested() -> bool {
+    security_compat_events_generation_enabled(
+        std::env::var(GENERATE_SECURITY_COMPAT_EVENTS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
 
 /// A single compatibility check result.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -116,15 +146,18 @@ fn repo_root() -> PathBuf {
 }
 
 fn report_dir() -> PathBuf {
-    let dir = repo_root().join("tests").join("security_compat");
-    let _ = std::fs::create_dir_all(&dir);
-    dir
+    repo_root().join("tests").join("security_compat")
 }
 
 fn load_compat_checks_from_events(path: &Path) -> Vec<CompatCheck> {
     let Ok(text) = std::fs::read_to_string(path) else {
         return Vec::new();
     };
+
+    parse_compat_checks_from_events(&text)
+}
+
+fn parse_compat_checks_from_events(text: &str) -> Vec<CompatCheck> {
     let mut checks = Vec::new();
     for (idx, line) in text.lines().enumerate() {
         let line = line.trim();
@@ -207,6 +240,70 @@ fn build_dashboard_from_checks(checks: Vec<CompatCheck>, generated_at: String) -
         checks,
         regression_detected: failed > 0,
     }
+}
+
+fn assert_compat_dashboard_schema(value: &serde_json::Value) {
+    assert_eq!(
+        value["schema"].as_str(),
+        Some(COMPAT_DASHBOARD_SCHEMA),
+        "Wrong schema"
+    );
+    assert!(value["generated_at"].is_string(), "Missing generated_at");
+    assert!(value["bead"].is_string(), "Missing bead");
+    assert!(
+        value["profiles_tested"].is_array(),
+        "Missing profiles_tested"
+    );
+    assert!(value["total_checks"].is_number(), "Missing total_checks");
+    assert!(value["total_passed"].is_number(), "Missing total_passed");
+    assert!(value["total_failed"].is_number(), "Missing total_failed");
+    assert!(
+        value["overall_pass_rate_pct"].is_number(),
+        "Missing overall_pass_rate_pct"
+    );
+    assert!(value["per_profile"].is_array(), "Missing per_profile");
+    assert!(value["checks"].is_array(), "Missing checks");
+    assert!(
+        value["regression_detected"].is_boolean(),
+        "Missing regression_detected"
+    );
+
+    if let Some(checks) = value["checks"].as_array() {
+        for check in checks {
+            assert!(check["name"].is_string(), "Check missing name");
+            assert!(check["profile"].is_string(), "Check missing profile");
+            assert!(check["capability"].is_string(), "Check missing capability");
+            assert!(check["passed"].is_boolean(), "Check missing passed");
+        }
+    }
+}
+
+fn validate_compat_dashboard_payload(dashboard: &CompatDashboard) -> String {
+    assert_eq!(dashboard.total_checks, dashboard.checks.len());
+    assert_eq!(
+        dashboard.total_passed + dashboard.total_failed,
+        dashboard.total_checks,
+        "dashboard counters must partition all checks"
+    );
+    assert_eq!(
+        dashboard.regression_detected,
+        dashboard.total_failed > 0,
+        "dashboard regression flag must follow failed count"
+    );
+
+    let payload =
+        serde_json::to_string_pretty(dashboard).expect("serialize compatibility dashboard");
+    assert!(
+        !payload.trim().is_empty(),
+        "compatibility dashboard payload must be non-empty"
+    );
+    let value: serde_json::Value =
+        serde_json::from_str(&payload).expect("parse serialized compatibility dashboard");
+    assert_compat_dashboard_schema(&value);
+    let roundtripped: CompatDashboard =
+        serde_json::from_value(value).expect("deserialize compatibility dashboard payload");
+    assert_eq!(roundtripped, *dashboard, "dashboard payload roundtrip");
+    payload
 }
 
 const fn default_risk_config() -> RuntimeRiskConfig {
@@ -623,8 +720,24 @@ fn generate_compat_dashboard_artifact() {
 
     let dir = report_dir();
     let path = dir.join("security_compat_dashboard.json");
-    let json = serde_json::to_string_pretty(&dashboard).expect("serialize dashboard");
-    std::fs::write(&path, &json).expect("write dashboard artifact");
+    let payload = validate_compat_dashboard_payload(&dashboard);
+    let generate = security_compat_dashboard_generation_requested();
+    if generate {
+        std::fs::create_dir_all(&dir).expect("create security compatibility report directory");
+        std::fs::write(&path, payload.as_bytes())
+            .expect("write security compatibility dashboard artifact");
+        let metadata = std::fs::metadata(&path)
+            .expect("stat generated security compatibility dashboard artifact");
+        assert!(
+            metadata.is_file(),
+            "security compatibility dashboard is not a file"
+        );
+        assert_eq!(
+            metadata.len(),
+            u64::try_from(payload.len()).expect("dashboard payload length fits u64"),
+            "generated security compatibility dashboard length mismatch"
+        );
+    }
 
     eprintln!("\n=== Security Compatibility Dashboard (SEC-6.4) ===");
     eprintln!("  Total checks:   {total}");
@@ -637,11 +750,40 @@ fn generate_compat_dashboard_artifact() {
             ps.profile, ps.passed, ps.total_checks, ps.pass_rate_pct
         );
     }
-    eprintln!("  Artifact:       {}", path.display());
+    if generate {
+        eprintln!("  Artifact:       {}", path.display());
+    } else {
+        eprintln!(
+            "  Artifact:       validated in memory; set \
+             {GENERATE_SECURITY_COMPAT_DASHBOARD_ENV}=1 to write tracked evidence"
+        );
+    }
     eprintln!();
 
     // The test passes even if there are failures — the artifact captures them.
     // The CI gate (in ci_full_suite_gate.rs) reads the artifact and enforces.
+}
+
+#[test]
+fn security_compat_dashboard_generation_requires_exact_one() {
+    assert!(!security_compat_dashboard_generation_enabled(None));
+    assert!(!security_compat_dashboard_generation_enabled(Some("")));
+    assert!(!security_compat_dashboard_generation_enabled(Some("0")));
+    assert!(!security_compat_dashboard_generation_enabled(Some("true")));
+    assert!(!security_compat_dashboard_generation_enabled(Some(" 1")));
+    assert!(!security_compat_dashboard_generation_enabled(Some("1 ")));
+    assert!(security_compat_dashboard_generation_enabled(Some("1")));
+}
+
+#[test]
+fn security_compat_events_generation_requires_exact_one() {
+    assert!(!security_compat_events_generation_enabled(None));
+    assert!(!security_compat_events_generation_enabled(Some("")));
+    assert!(!security_compat_events_generation_enabled(Some("0")));
+    assert!(!security_compat_events_generation_enabled(Some("true")));
+    assert!(!security_compat_events_generation_enabled(Some(" 1")));
+    assert!(!security_compat_events_generation_enabled(Some("1 ")));
+    assert!(security_compat_events_generation_enabled(Some("1")));
 }
 
 // ============================================================================
@@ -660,38 +802,7 @@ fn compat_dashboard_schema_valid() {
         return;
     }
     let val: serde_json::Value = serde_json::from_str(&text).expect("parse dashboard");
-
-    assert_eq!(
-        val["schema"].as_str(),
-        Some(COMPAT_DASHBOARD_SCHEMA),
-        "Wrong schema"
-    );
-    assert!(val["generated_at"].is_string(), "Missing generated_at");
-    assert!(val["bead"].is_string(), "Missing bead");
-    assert!(val["profiles_tested"].is_array(), "Missing profiles_tested");
-    assert!(val["total_checks"].is_number(), "Missing total_checks");
-    assert!(val["total_passed"].is_number(), "Missing total_passed");
-    assert!(val["total_failed"].is_number(), "Missing total_failed");
-    assert!(
-        val["overall_pass_rate_pct"].is_number(),
-        "Missing overall_pass_rate_pct"
-    );
-    assert!(val["per_profile"].is_array(), "Missing per_profile");
-    assert!(val["checks"].is_array(), "Missing checks");
-    assert!(
-        val["regression_detected"].is_boolean(),
-        "Missing regression_detected"
-    );
-
-    // Each check has required fields
-    if let Some(checks) = val["checks"].as_array() {
-        for check in checks {
-            assert!(check["name"].is_string(), "Check missing name");
-            assert!(check["profile"].is_string(), "Check missing profile");
-            assert!(check["capability"].is_string(), "Check missing capability");
-            assert!(check["passed"].is_boolean(), "Check missing passed");
-        }
-    }
+    assert_compat_dashboard_schema(&val);
 }
 
 #[test]
@@ -1187,6 +1298,7 @@ fn emit_compat_events_jsonl() {
     let checks = run_full_compatibility_matrix();
     let dir = report_dir();
     let path = dir.join("security_compat_events.jsonl");
+    let generated_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
 
     let mut lines = Vec::new();
     for check in &checks {
@@ -1198,10 +1310,60 @@ fn emit_compat_events_jsonl() {
             "expected": check.expected_decision,
             "actual": check.actual_decision,
             "passed": check.passed,
-            "ts": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            "ts": generated_at,
         });
-        lines.push(serde_json::to_string(&event).unwrap_or_default());
+        let line = serde_json::to_string(&event).expect("serialize security compatibility event");
+        let roundtripped: serde_json::Value =
+            serde_json::from_str(&line).expect("parse serialized security compatibility event");
+        assert_eq!(roundtripped, event, "compatibility event roundtrip");
+        assert_eq!(
+            roundtripped.get("schema").and_then(|value| value.as_str()),
+            Some("pi.security.compat_event.v1")
+        );
+        assert!(
+            roundtripped
+                .get("ts")
+                .is_some_and(|value| value.is_string()),
+            "compatibility event timestamp must be a string"
+        );
+        lines.push(line);
     }
-    std::fs::write(&path, lines.join("\n") + "\n").expect("write JSONL events");
-    eprintln!("  JSONL events: {}", path.display());
+    assert!(
+        !lines.is_empty(),
+        "compatibility event stream must be non-empty"
+    );
+    let payload = lines.join("\n") + "\n";
+    let roundtripped_checks = parse_compat_checks_from_events(&payload);
+    assert_eq!(roundtripped_checks.len(), checks.len());
+    for (roundtripped, check) in roundtripped_checks.iter().zip(&checks) {
+        assert_eq!(roundtripped.name, check.name);
+        assert_eq!(roundtripped.profile, check.profile);
+        assert_eq!(roundtripped.capability, check.capability);
+        assert_eq!(roundtripped.expected_decision, check.expected_decision);
+        assert_eq!(roundtripped.actual_decision, check.actual_decision);
+        assert_eq!(roundtripped.passed, check.passed);
+    }
+
+    if security_compat_events_generation_requested() {
+        std::fs::create_dir_all(&dir).expect("create security compatibility report directory");
+        std::fs::write(&path, payload.as_bytes())
+            .expect("write security compatibility JSONL events");
+        let metadata =
+            std::fs::metadata(&path).expect("stat generated security compatibility JSONL events");
+        assert!(
+            metadata.is_file(),
+            "security compatibility event artifact is not a file"
+        );
+        assert_eq!(
+            metadata.len(),
+            u64::try_from(payload.len()).expect("compatibility event payload length fits u64"),
+            "generated security compatibility event artifact length mismatch"
+        );
+        eprintln!("  JSONL events: {}", path.display());
+    } else {
+        eprintln!(
+            "  JSONL events validated in memory; set \
+             {GENERATE_SECURITY_COMPAT_EVENTS_ENV}=1 to write tracked evidence"
+        );
+    }
 }

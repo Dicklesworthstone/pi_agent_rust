@@ -21,12 +21,25 @@
 //!
 //! Run:
 //!   cargo test --test `ci_evidence_bundle` -- --nocapture
+//!
+//! Regenerate the tracked bundle explicitly with:
+//!   `PI_GENERATE_EVIDENCE_BUNDLE=1 cargo test --test ci_evidence_bundle build_evidence_bundle -- --exact --nocapture`
 
 use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+
+const GENERATE_EVIDENCE_BUNDLE_ENV: &str = "PI_GENERATE_EVIDENCE_BUNDLE";
+
+fn evidence_bundle_generation_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn evidence_bundle_generation_requested() -> bool {
+    evidence_bundle_generation_enabled(std::env::var(GENERATE_EVIDENCE_BUNDLE_ENV).ok().as_deref())
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2054,7 +2067,6 @@ fn build_evidence_bundle() {
 
     let root = repo_root();
     let bundle_dir = root.join("tests").join("evidence_bundle");
-    let _ = std::fs::create_dir_all(&bundle_dir);
 
     let git_ref = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -2145,12 +2157,13 @@ fn build_evidence_bundle() {
         },
     };
 
-    // ── Write index.json ──
+    // Render every output during ordinary tests so serialization and report
+    // construction remain covered. Writing the tracked bundle is an explicit
+    // maintainer operation because its timestamp, CI run ID, and collected
+    // evidence inventory are inherently run-specific.
     let index_path = bundle_dir.join("index.json");
-    let _ = std::fs::write(
-        &index_path,
-        serde_json::to_string_pretty(&bundle).unwrap_or_default(),
-    );
+    let index_json =
+        serde_json::to_string_pretty(&bundle).expect("serialize unified evidence bundle");
 
     // ── Write events.jsonl ──
     let events_path = bundle_dir.join("events.jsonl");
@@ -2166,34 +2179,40 @@ fn build_evidence_bundle() {
             "artifact_path": section.artifact_path,
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         });
-        event_lines.push(serde_json::to_string(&line).unwrap_or_default());
+        event_lines.push(serde_json::to_string(&line).expect("serialize evidence bundle event"));
     }
-    let _ = std::fs::write(&events_path, event_lines.join("\n") + "\n");
+    let events_jsonl = event_lines.join("\n") + "\n";
 
     // ── Write bundle_report.md ──
     let mut md = String::new();
     md.push_str("# Unified CI Evidence Bundle\n\n");
-    let _ = writeln!(
+    writeln!(
         md,
         "> Generated: {}",
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
-    );
-    let _ = writeln!(md, "> Git ref: {git_ref}");
-    let _ = writeln!(md, "> CI run: {ci_run_id}");
-    let _ = writeln!(md, "> Verdict: **{}**\n", verdict.to_uppercase());
+    )
+    .expect("render evidence bundle timestamp");
+    writeln!(md, "> Git ref: {git_ref}").expect("render evidence bundle Git ref");
+    writeln!(md, "> CI run: {ci_run_id}").expect("render evidence bundle CI run ID");
+    writeln!(md, "> Verdict: **{}**\n", verdict.to_uppercase())
+        .expect("render evidence bundle verdict");
 
     md.push_str("## Summary\n\n");
     md.push_str("| Metric | Value |\n|--------|-------|\n");
-    let _ = writeln!(md, "| Total sections | {} |", sections.len());
-    let _ = writeln!(md, "| Present | {present} |");
-    let _ = writeln!(md, "| Missing | {missing} |");
-    let _ = writeln!(md, "| Invalid | {invalid} |");
-    let _ = writeln!(md, "| Total artifacts | {total_artifacts} |");
-    let _ = writeln!(md, "| Total size | {:.1} KB |", total_bytes as f64 / 1024.0);
-    let _ = writeln!(
+    writeln!(md, "| Total sections | {} |", sections.len())
+        .expect("render evidence bundle total sections");
+    writeln!(md, "| Present | {present} |").expect("render evidence bundle present count");
+    writeln!(md, "| Missing | {missing} |").expect("render evidence bundle missing count");
+    writeln!(md, "| Invalid | {invalid} |").expect("render evidence bundle invalid count");
+    writeln!(md, "| Total artifacts | {total_artifacts} |")
+        .expect("render evidence bundle artifact count");
+    writeln!(md, "| Total size | {:.1} KB |", total_bytes as f64 / 1024.0)
+        .expect("render evidence bundle total size");
+    writeln!(
         md,
         "| Required present | {required_present}/{required_total} |"
-    );
+    )
+    .expect("render evidence bundle required count");
     md.push('\n');
 
     // Group by category.
@@ -2212,7 +2231,8 @@ fn build_evidence_bundle() {
         let cat_sections: Vec<&BundleSection> =
             sections.iter().filter(|s| s.category == *cat).collect();
 
-        let _ = writeln!(md, "## {} ({})\n", capitalize(cat), cat_sections.len());
+        writeln!(md, "## {} ({})\n", capitalize(cat), cat_sections.len())
+            .expect("render evidence bundle category heading");
         md.push_str(
             "| Section | Status | Files | Size | Path |\n|---------|--------|-------|------|------|\n",
         );
@@ -2222,7 +2242,7 @@ fn build_evidence_bundle() {
                 "invalid" => "WARN",
                 _ => "MISS",
             };
-            let _ = writeln!(
+            writeln!(
                 md,
                 "| {} | {} | {} | {} B | `{}` |",
                 s.label,
@@ -2230,7 +2250,8 @@ fn build_evidence_bundle() {
                 s.file_count,
                 s.total_bytes,
                 s.artifact_path.as_deref().unwrap_or("-"),
-            );
+            )
+            .expect("render evidence bundle section row");
         }
         md.push('\n');
     }
@@ -2251,7 +2272,7 @@ fn build_evidence_bundle() {
             } else {
                 ""
             };
-            let _ = writeln!(
+            writeln!(
                 md,
                 "- **{}** ({}): {}{}\n  Path: `{}`",
                 s.label,
@@ -2259,13 +2280,24 @@ fn build_evidence_bundle() {
                 s.diagnostics.as_deref().unwrap_or(""),
                 required_marker,
                 s.artifact_path.as_deref().unwrap_or("-"),
-            );
+            )
+            .expect("render evidence bundle failure row");
         }
         md.push('\n');
     }
 
     let md_path = bundle_dir.join("bundle_report.md");
-    let _ = std::fs::write(&md_path, &md);
+    let generate = evidence_bundle_generation_requested();
+    if generate {
+        std::fs::create_dir_all(&bundle_dir).expect("create evidence bundle directory");
+        std::fs::write(&index_path, index_json).expect("write evidence bundle index");
+        std::fs::write(&events_path, events_jsonl).expect("write evidence bundle events");
+        std::fs::write(&md_path, &md).expect("write evidence bundle Markdown report");
+    } else {
+        eprintln!(
+            "  Bundle not written; set {GENERATE_EVIDENCE_BUNDLE_ENV}=1 to regenerate the tracked artifacts"
+        );
+    }
 
     // ── Print summary ──
     eprintln!("\n=== Evidence Bundle Summary ===");
@@ -2277,11 +2309,25 @@ fn build_evidence_bundle() {
     eprintln!("  Size:       {:.1} KB", total_bytes as f64 / 1024.0);
     eprintln!("  Required:   {required_present}/{required_total}");
     eprintln!();
-    eprintln!("  Reports:");
+    eprintln!(
+        "  Reports ({}):",
+        if generate { "generated" } else { "not written" }
+    );
     eprintln!("    Index: {}", index_path.display());
     eprintln!("    JSONL: {}", events_path.display());
     eprintln!("    MD:    {}", md_path.display());
     eprintln!();
+}
+
+#[test]
+fn evidence_bundle_generation_requires_exact_one() {
+    assert!(!evidence_bundle_generation_enabled(None));
+    assert!(!evidence_bundle_generation_enabled(Some("")));
+    assert!(!evidence_bundle_generation_enabled(Some("0")));
+    assert!(!evidence_bundle_generation_enabled(Some("true")));
+    assert!(!evidence_bundle_generation_enabled(Some(" 1")));
+    assert!(!evidence_bundle_generation_enabled(Some("1 ")));
+    assert!(evidence_bundle_generation_enabled(Some("1")));
 }
 
 /// Verify the evidence bundle index has the correct structure.

@@ -148,6 +148,25 @@ const WAIVER_REQUIRED_FIELDS: &[&str] = &[
 const WAIVER_VALID_SCOPES: &[&str] = &["full", "preflight", "both"];
 const WAIVER_MAX_DURATION_DAYS: i64 = 30;
 const WAIVER_EXPIRY_WARN_DAYS: i64 = 3;
+const GENERATE_FULL_SUITE_GATE_ARTIFACTS_ENV: &str = "PI_GENERATE_FULL_SUITE_GATE_ARTIFACTS";
+
+fn full_suite_gate_artifact_generation_requested() -> bool {
+    let raw = std::env::var(GENERATE_FULL_SUITE_GATE_ARTIFACTS_ENV).ok();
+    full_suite_gate_artifact_generation_requested_from(raw.as_deref())
+}
+
+fn full_suite_gate_artifact_generation_requested_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
+}
+
+fn prepare_report_dir_for_generation(report_dir: &Path) {
+    std::fs::create_dir_all(report_dir).unwrap_or_else(|err| {
+        panic!(
+            "failed to create full-suite report directory {}: {err}",
+            report_dir.display()
+        )
+    });
+}
 
 /// Parse all `[waiver.*]` sections from suite_classification.toml.
 fn parse_waivers(root: &Path) -> (Vec<Waiver>, Vec<WaiverValidation>) {
@@ -3294,16 +3313,6 @@ fn write_non_empty_artifact(
     Ok(bytes)
 }
 
-fn write_json_artifact(
-    path: &Path,
-    artifact_rel: &str,
-    value: &impl serde::Serialize,
-) -> Result<u64, String> {
-    let payload = serde_json::to_string_pretty(value)
-        .map_err(|err| format!("failed to serialize {artifact_rel}: {err}"))?;
-    write_non_empty_artifact(path, artifact_rel, &payload)
-}
-
 fn assert_non_empty_text_artifact(path: &Path, artifact_rel: &str) -> Result<u64, String> {
     let contents = std::fs::read_to_string(path)
         .map_err(|err| format!("failed to read {artifact_rel} at {}: {err}", path.display()))?;
@@ -3826,7 +3835,10 @@ fn full_suite_gate() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
+    let generate = full_suite_gate_artifact_generation_requested();
+    if generate {
+        prepare_report_dir_for_generation(&report_dir);
+    }
 
     eprintln!("\n=== Full-Suite CI Gate (bd-1f42.6.5) ===\n");
 
@@ -3892,9 +3904,11 @@ fn full_suite_gate() {
 
     // ── Write JSON verdict ──
     let verdict_path = report_dir.join("full_suite_verdict.json");
-    let _ = std::fs::write(
-        &verdict_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    let verdict_payload =
+        serde_json::to_string_pretty(&report).expect("full-suite verdict must serialize as JSON");
+    assert!(
+        !verdict_payload.trim().is_empty(),
+        "full-suite verdict payload must be non-empty"
     );
 
     // ── Write JSONL events ──
@@ -3911,9 +3925,15 @@ fn full_suite_gate() {
             "artifact_path": gate.artifact_path,
             "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         });
-        lines.push(serde_json::to_string(&line).unwrap_or_default());
+        lines.push(
+            serde_json::to_string(&line).expect("full-suite gate event must serialize as JSON"),
+        );
     }
-    let _ = std::fs::write(&events_path, lines.join("\n") + "\n");
+    let events_payload = lines.join("\n") + "\n";
+    assert!(
+        !events_payload.trim().is_empty(),
+        "full-suite event payload must be non-empty"
+    );
 
     // ── Write Markdown report ──
     let mut md = String::new();
@@ -3982,7 +4002,27 @@ fn full_suite_gate() {
     }
 
     let md_path = report_dir.join("full_suite_report.md");
-    let _ = std::fs::write(&md_path, &md);
+    assert!(
+        !md.trim().is_empty(),
+        "full-suite markdown report must be non-empty"
+    );
+
+    if generate {
+        write_non_empty_artifact(
+            &verdict_path,
+            "tests/full_suite_gate/full_suite_verdict.json",
+            &verdict_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed full-suite verdict emission: {detail}"));
+        write_non_empty_artifact(
+            &events_path,
+            "tests/full_suite_gate/full_suite_events.jsonl",
+            &events_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed full-suite events emission: {detail}"));
+        write_non_empty_artifact(&md_path, "tests/full_suite_gate/full_suite_report.md", &md)
+            .unwrap_or_else(|detail| panic!("fail-closed full-suite report emission: {detail}"));
+    }
 
     // ── Print summary ──
     eprintln!(
@@ -3998,10 +4038,16 @@ fn full_suite_gate() {
         eprintln!("  Warned:   {warned}");
     }
     eprintln!();
-    eprintln!("  Reports:");
-    eprintln!("    JSON:  {}", verdict_path.display());
-    eprintln!("    JSONL: {}", events_path.display());
-    eprintln!("    MD:    {}", md_path.display());
+    if generate {
+        eprintln!("  Reports:");
+        eprintln!("    JSON:  {}", verdict_path.display());
+        eprintln!("    JSONL: {}", events_path.display());
+        eprintln!("    MD:    {}", md_path.display());
+    } else {
+        eprintln!(
+            "  Reports validated in memory; set {GENERATE_FULL_SUITE_GATE_ARTIFACTS_ENV}=1 to write tracked artifacts"
+        );
+    }
     eprintln!();
 
     // ── Block release if blocking gates fail ──
@@ -4089,7 +4135,10 @@ fn preflight_fast_fail() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
+    let generate = full_suite_gate_artifact_generation_requested();
+    if generate {
+        prepare_report_dir_for_generation(&report_dir);
+    }
 
     eprintln!("\n=== Preflight Fast-Fail Lane (bd-1f42.8.8.1) ===\n");
 
@@ -4186,17 +4235,33 @@ fn preflight_fast_fail() {
     };
 
     let verdict_path = report_dir.join("preflight_verdict.json");
-    let _ = std::fs::write(
-        &verdict_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    let verdict_payload =
+        serde_json::to_string_pretty(&report).expect("preflight verdict must serialize as JSON");
+    assert!(
+        !verdict_payload.trim().is_empty(),
+        "preflight verdict payload must be non-empty"
     );
+    if generate {
+        write_non_empty_artifact(
+            &verdict_path,
+            "tests/full_suite_gate/preflight_verdict.json",
+            &verdict_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed preflight verdict emission: {detail}"));
+    }
 
     eprintln!("=== Preflight Verdict: {} ===", verdict.to_uppercase());
     eprintln!(
         "  Blocking: {pass_count} pass, {fail_count} fail, {skip_count} skip, {waived_count} waived / {} total",
         blocking_gates.len()
     );
-    eprintln!("  Report: {}", verdict_path.display());
+    if generate {
+        eprintln!("  Report: {}", verdict_path.display());
+    } else {
+        eprintln!(
+            "  Report validated in memory; set {GENERATE_FULL_SUITE_GATE_ARTIFACTS_ENV}=1 to write it"
+        );
+    }
     eprintln!();
 }
 
@@ -4263,24 +4328,44 @@ fn full_certification() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
+    let generate = full_suite_gate_artifact_generation_requested();
+    if generate {
+        prepare_report_dir_for_generation(&report_dir);
+    }
     let perf3x_coverage_audit_report =
         build_perf3x_bead_coverage_audit_report(&root, &perf3x_bead_coverage_contract());
     let perf3x_coverage_audit_path = report_dir.join("perf3x_bead_coverage_audit.json");
-    write_json_artifact(
-        &perf3x_coverage_audit_path,
-        PERF3X_COVERAGE_AUDIT_ARTIFACT_REL,
-        &perf3x_coverage_audit_report,
-    )
-    .unwrap_or_else(|detail| panic!("fail-closed perf3x coverage audit emission: {detail}"));
+    let perf3x_payload = serde_json::to_string_pretty(&perf3x_coverage_audit_report)
+        .expect("PERF-3X coverage audit must serialize as JSON");
+    assert!(
+        !perf3x_payload.trim().is_empty(),
+        "PERF-3X coverage audit payload must be non-empty"
+    );
     let practical_finish_checkpoint_report = build_practical_finish_checkpoint_report(&root);
     let practical_finish_checkpoint_path = report_dir.join("practical_finish_checkpoint.json");
-    write_json_artifact(
-        &practical_finish_checkpoint_path,
-        PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL,
-        &practical_finish_checkpoint_report,
-    )
-    .unwrap_or_else(|detail| panic!("fail-closed practical-finish checkpoint emission: {detail}"));
+    let practical_finish_payload =
+        serde_json::to_string_pretty(&practical_finish_checkpoint_report)
+            .expect("practical-finish checkpoint must serialize as JSON");
+    assert!(
+        !practical_finish_payload.trim().is_empty(),
+        "practical-finish checkpoint payload must be non-empty"
+    );
+    if generate {
+        write_non_empty_artifact(
+            &perf3x_coverage_audit_path,
+            PERF3X_COVERAGE_AUDIT_ARTIFACT_REL,
+            &perf3x_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed perf3x coverage audit emission: {detail}"));
+        write_non_empty_artifact(
+            &practical_finish_checkpoint_path,
+            PRACTICAL_FINISH_CHECKPOINT_ARTIFACT_REL,
+            &practical_finish_payload,
+        )
+        .unwrap_or_else(|detail| {
+            panic!("fail-closed practical-finish checkpoint emission: {detail}")
+        });
+    }
 
     eprintln!("\n=== Full Certification Lane (bd-1f42.8.8.1) ===\n");
 
@@ -4311,10 +4396,20 @@ fn full_certification() {
 
     // Write standalone waiver audit
     let waiver_path = report_dir.join("waiver_audit.json");
-    let _ = std::fs::write(
-        &waiver_path,
-        serde_json::to_string_pretty(&waiver_audit).unwrap_or_default(),
+    let waiver_payload =
+        serde_json::to_string_pretty(&waiver_audit).expect("waiver audit must serialize as JSON");
+    assert!(
+        !waiver_payload.trim().is_empty(),
+        "waiver audit payload must be non-empty"
     );
+    if generate {
+        write_non_empty_artifact(
+            &waiver_path,
+            "tests/full_suite_gate/waiver_audit.json",
+            &waiver_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed waiver audit emission: {detail}"));
+    }
 
     // Evaluate gates with waiver application
     let mut waivers_applied = Vec::new();
@@ -4454,12 +4549,20 @@ fn full_certification() {
 
     // Write certification verdict
     let cert_path = report_dir.join("certification_verdict.json");
-    write_json_artifact(
-        &cert_path,
-        "tests/full_suite_gate/certification_verdict.json",
-        &report,
-    )
-    .unwrap_or_else(|detail| panic!("fail-closed certification verdict emission: {detail}"));
+    let cert_payload = serde_json::to_string_pretty(&report)
+        .expect("certification verdict must serialize as JSON");
+    assert!(
+        !cert_payload.trim().is_empty(),
+        "certification verdict payload must be non-empty"
+    );
+    if generate {
+        write_non_empty_artifact(
+            &cert_path,
+            "tests/full_suite_gate/certification_verdict.json",
+            &cert_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed certification verdict emission: {detail}"));
+    }
 
     // Write JSONL events for certification
     let cert_events_path = report_dir.join("certification_events.jsonl");
@@ -4482,12 +4585,19 @@ fn full_certification() {
             }),
         );
     }
-    write_non_empty_artifact(
-        &cert_events_path,
-        "tests/full_suite_gate/certification_events.jsonl",
-        &(lines.join("\n") + "\n"),
-    )
-    .unwrap_or_else(|detail| panic!("fail-closed certification events emission: {detail}"));
+    let cert_events_payload = lines.join("\n") + "\n";
+    assert!(
+        !cert_events_payload.trim().is_empty(),
+        "certification events payload must be non-empty"
+    );
+    if generate {
+        write_non_empty_artifact(
+            &cert_events_path,
+            "tests/full_suite_gate/certification_events.jsonl",
+            &cert_events_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed certification events emission: {detail}"));
+    }
 
     // Write certification markdown report
     let mut md = String::new();
@@ -4570,17 +4680,23 @@ fn full_certification() {
     md.push('\n');
 
     let cert_md_path = report_dir.join("certification_report.md");
-    write_non_empty_artifact(
-        &cert_md_path,
-        "tests/full_suite_gate/certification_report.md",
-        &md,
-    )
-    .unwrap_or_else(|detail| panic!("fail-closed certification report emission: {detail}"));
-    assert_non_empty_text_artifact(
-        &cert_md_path,
-        "tests/full_suite_gate/certification_report.md",
-    )
-    .unwrap_or_else(|detail| panic!("fail-closed certification report verification: {detail}"));
+    assert!(
+        !md.trim().is_empty(),
+        "certification markdown report must be non-empty"
+    );
+    if generate {
+        write_non_empty_artifact(
+            &cert_md_path,
+            "tests/full_suite_gate/certification_report.md",
+            &md,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed certification report emission: {detail}"));
+        assert_non_empty_text_artifact(
+            &cert_md_path,
+            "tests/full_suite_gate/certification_report.md",
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed certification report verification: {detail}"));
+    }
 
     // Print summary
     eprintln!("=== Certification Verdict: {} ===", verdict.to_uppercase());
@@ -4594,16 +4710,22 @@ fn full_certification() {
         eprintln!("  Expired waivers: {expired}");
     }
     eprintln!();
-    eprintln!("  Reports:");
-    eprintln!("    Cert:    {}", cert_path.display());
-    eprintln!("    Waiver:  {}", waiver_path.display());
-    eprintln!("    Events:  {}", cert_events_path.display());
-    eprintln!("    Coverage: {}", perf3x_coverage_audit_path.display());
-    eprintln!(
-        "    Practical Finish: {}",
-        practical_finish_checkpoint_path.display()
-    );
-    eprintln!("    MD:      {}", cert_md_path.display());
+    if generate {
+        eprintln!("  Reports:");
+        eprintln!("    Cert:    {}", cert_path.display());
+        eprintln!("    Waiver:  {}", waiver_path.display());
+        eprintln!("    Events:  {}", cert_events_path.display());
+        eprintln!("    Coverage: {}", perf3x_coverage_audit_path.display());
+        eprintln!(
+            "    Practical Finish: {}",
+            practical_finish_checkpoint_path.display()
+        );
+        eprintln!("    MD:      {}", cert_md_path.display());
+    } else {
+        eprintln!(
+            "  Reports validated in memory; set {GENERATE_FULL_SUITE_GATE_ARTIFACTS_ENV}=1 to write tracked artifacts"
+        );
+    }
     eprintln!();
 }
 
@@ -4623,7 +4745,10 @@ fn waiver_lifecycle_audit() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
+    let generate = full_suite_gate_artifact_generation_requested();
+    if generate {
+        prepare_report_dir_for_generation(&report_dir);
+    }
 
     eprintln!("\n=== Waiver Lifecycle Audit (bd-1f42.8.8.1) ===\n");
 
@@ -4671,12 +4796,28 @@ fn waiver_lifecycle_audit() {
     };
 
     let waiver_path = report_dir.join("waiver_audit.json");
-    let _ = std::fs::write(
-        &waiver_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    let waiver_payload = serde_json::to_string_pretty(&report)
+        .expect("waiver lifecycle audit must serialize as JSON");
+    assert!(
+        !waiver_payload.trim().is_empty(),
+        "waiver lifecycle audit payload must be non-empty"
     );
+    if generate {
+        write_non_empty_artifact(
+            &waiver_path,
+            "tests/full_suite_gate/waiver_audit.json",
+            &waiver_payload,
+        )
+        .unwrap_or_else(|detail| panic!("fail-closed waiver audit emission: {detail}"));
+    }
 
-    eprintln!("  Report: {}", waiver_path.display());
+    if generate {
+        eprintln!("  Report: {}", waiver_path.display());
+    } else {
+        eprintln!(
+            "  Report validated in memory; set {GENERATE_FULL_SUITE_GATE_ARTIFACTS_ENV}=1 to write it"
+        );
+    }
     eprintln!(
         "  Summary: {} total, {} active, {} expiring_soon, {} expired, {} invalid",
         report.total_waivers, active, expiring_soon, expired, invalid
@@ -4692,6 +4833,19 @@ fn waiver_lifecycle_audit() {
         invalid, 0,
         "Invalid waivers must have all required fields and valid dates"
     );
+}
+
+#[test]
+fn full_suite_gate_artifact_generation_requires_exact_one() {
+    assert!(full_suite_gate_artifact_generation_requested_from(Some(
+        "1"
+    )));
+    for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1 ")] {
+        assert!(
+            !full_suite_gate_artifact_generation_requested_from(raw),
+            "unexpected generation request for {raw:?}"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

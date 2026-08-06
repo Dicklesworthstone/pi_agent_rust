@@ -1943,7 +1943,26 @@ fn test_generate_validated_manifest() {
 
     let manifest_path = repo_root.join("tests/ext_conformance/VALIDATED_MANIFEST.json");
     let json = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
-    fs::write(&manifest_path, &json).expect("write VALIDATED_MANIFEST.json");
+    let generate = matches!(
+        std::env::var("PI_GENERATE_VALIDATED_MANIFEST").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        fs::write(&manifest_path, format!("{json}\n")).expect("write VALIDATED_MANIFEST.json");
+    } else {
+        let committed_json =
+            fs::read_to_string(&manifest_path).expect("read committed VALIDATED_MANIFEST.json");
+        let committed: serde_json::Value =
+            serde_json::from_str(&committed_json).expect("parse committed VALIDATED_MANIFEST.json");
+        let computed: serde_json::Value =
+            serde_json::from_str(&json).expect("parse computed VALIDATED_MANIFEST.json");
+        assert_eq!(
+            committed, computed,
+            "committed validated manifest is stale; regenerate explicitly with \
+             PI_GENERATE_VALIDATED_MANIFEST=1 cargo test \
+             --test ext_conformance_artifacts test_generate_validated_manifest -- --exact"
+        );
+    }
 
     eprintln!("=== Validated Manifest Summary ===");
     eprintln!("Extensions:          {}", manifest.extensions.len());
@@ -1970,7 +1989,11 @@ fn test_generate_validated_manifest() {
         eprintln!("  Source {tier}: {count}");
     }
 
-    eprintln!("Manifest: {}", manifest_path.display());
+    eprintln!(
+        "Manifest {}: {}",
+        if generate { "written" } else { "verified" },
+        manifest_path.display()
+    );
 
     assert!(
         manifest.extensions.len() >= 150,

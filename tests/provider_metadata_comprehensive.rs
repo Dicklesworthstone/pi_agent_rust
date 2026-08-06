@@ -611,13 +611,28 @@ fn generate_canonical_id_alias_table_json() {
 
     let json_str = serde_json::to_string_pretty(&table).expect("JSON serialization");
 
-    // Write to docs directory
-    let path = std::path::Path::new("docs/provider-canonical-id-table.json");
-    std::fs::write(path, &json_str).expect("write canonical ID table");
+    // Ordinary test runs verify the committed table without mutating source.
+    // Maintainers can opt into regeneration explicitly when metadata changes.
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("docs/provider-canonical-id-table.json");
+    let generate = matches!(
+        std::env::var("PI_GENERATE_PROVIDER_CANONICAL_ID_TABLE").as_deref(),
+        Ok("1")
+    );
+    if generate {
+        std::fs::write(&path, &json_str).expect("write canonical ID table");
+    }
 
-    // Verify the file round-trips
-    let readback = std::fs::read_to_string(path).expect("read back");
+    // Verify the committed/generated file round-trips and exactly represents
+    // the metadata used by the running test binary.
+    let readback = std::fs::read_to_string(&path).expect("read canonical ID table");
     let parsed: Value = serde_json::from_str(&readback).expect("parse back");
+    assert_eq!(
+        parsed, table,
+        "committed provider canonical ID table is stale; regenerate explicitly with \
+         PI_GENERATE_PROVIDER_CANONICAL_ID_TABLE=1 cargo test \
+         --test provider_metadata_comprehensive generate_canonical_id_alias_table_json -- --exact"
+    );
     assert_eq!(
         usize::try_from(parsed["total_providers"].as_u64().unwrap()).unwrap(),
         PROVIDER_METADATA.len()

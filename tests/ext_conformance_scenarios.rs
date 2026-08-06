@@ -4301,12 +4301,11 @@ fn parity_runner() {
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
     );
     let parity_dir = reports_dir().join("parity");
-    let _ = fs::create_dir_all(&parity_dir);
+    fs::create_dir_all(&parity_dir).expect("create parity report directory");
 
     eprintln!("[parity] run_id={run_id}");
 
     let mut results: Vec<ParityResult> = Vec::new();
-    let mut events: Vec<Value> = Vec::new();
 
     for ext in &sample.scenario_suite.items {
         let item = sample.items.iter().find(|i| i.id == ext.extension_id);
@@ -4447,22 +4446,6 @@ fn parity_runner() {
                 eprintln!("         {diff}");
             }
 
-            // Build per-event log
-            events.push(serde_json::json!({
-                "schema": "pi.ext.parity.v1",
-                "run_id": run_id,
-                "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                "extension_id": ext.extension_id,
-                "scenario_id": scenario.id,
-                "kind": scenario.kind,
-                "source_tier": source_tier,
-                "runtime_tier": runtime_tier,
-                "status": status,
-                "ts_ms": ts_ms,
-                "rust_ms": rust_ms,
-                "diffs": diffs,
-            }));
-
             results.push(ParityResult {
                 status: status.to_string(),
                 diffs: diffs.clone(),
@@ -4475,17 +4458,43 @@ fn parity_runner() {
         }
     }
 
-    // Write parity JSONL
+    assert!(!results.is_empty(), "parity runner executed no scenarios");
+
+    // Write one canonical event for every result. In particular, skips and
+    // Rust/TS execution errors must not disappear into only the per-extension
+    // diagnostics, because aggregate release evidence consumes this stream.
     let parity_jsonl = parity_dir.join("parity_events.jsonl");
+    let events: Vec<Value> = results
+        .iter()
+        .map(|result| {
+            serde_json::json!({
+                "schema": "pi.ext.parity.v1",
+                "run_id": run_id,
+                "ts": Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                "extension_id": result.extension_id,
+                "scenario_id": result.scenario_id,
+                "kind": result.kind,
+                "summary": result.summary,
+                "source_tier": result.source_tier,
+                "runtime_tier": result.runtime_tier,
+                "status": result.status,
+                "ts_ms": result.ts_ms,
+                "rust_ms": result.rust_ms,
+                "diffs": result.diffs,
+                "error": result.error,
+                "skip_reason": result.skip_reason,
+            })
+        })
+        .collect();
     let lines: Vec<String> = events
         .iter()
-        .filter_map(|e| serde_json::to_string(e).ok())
+        .map(|event| serde_json::to_string(event).expect("serialize parity event"))
         .collect();
-    let _ = fs::write(&parity_jsonl, lines.join("\n") + "\n");
+    fs::write(&parity_jsonl, lines.join("\n") + "\n").expect("write canonical parity event stream");
 
     // Write per-extension parity diffs
     let ext_dir = parity_dir.join("extensions");
-    let _ = fs::create_dir_all(&ext_dir);
+    fs::create_dir_all(&ext_dir).expect("create per-extension parity report directory");
     let mut by_ext: HashMap<String, Vec<&ParityResult>> = HashMap::new();
     for r in &results {
         by_ext.entry(r.extension_id.clone()).or_default().push(r);
@@ -4494,9 +4503,11 @@ fn parity_runner() {
         let path = ext_dir.join(format!("{ext_id}.jsonl"));
         let ext_lines: Vec<String> = ext_results
             .iter()
-            .filter_map(|r| serde_json::to_string(r).ok())
+            .map(|result| {
+                serde_json::to_string(result).expect("serialize per-extension parity result")
+            })
             .collect();
-        let _ = fs::write(&path, ext_lines.join("\n") + "\n");
+        fs::write(&path, ext_lines.join("\n") + "\n").expect("write per-extension parity results");
     }
 
     // Write triage summary
@@ -4526,10 +4537,14 @@ fn parity_runner() {
         },
     });
     let triage_path = parity_dir.join("triage.json");
-    let _ = fs::write(
+    fs::write(
         &triage_path,
-        serde_json::to_string_pretty(&triage).unwrap_or_default(),
-    );
+        format!(
+            "{}\n",
+            serde_json::to_string_pretty(&triage).expect("serialize parity triage")
+        ),
+    )
+    .expect("write parity triage");
 
     eprintln!(
         "[parity] Results: {matched} match, {mismatched} mismatch, {skipped} skip, {ts_errors} ts_error, {rust_errors} rust_error"
@@ -4551,6 +4566,27 @@ fn parity_runner() {
                 r.scenario_id,
                 r.extension_id,
                 r.diffs.join("; ")
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let execution_errors: Vec<&ParityResult> = results
+        .iter()
+        .filter(|result| matches!(result.status.as_str(), "ts_error" | "rust_error"))
+        .collect();
+    assert!(
+        execution_errors.is_empty(),
+        "Parity execution errors ({}):\n{}",
+        execution_errors.len(),
+        execution_errors
+            .iter()
+            .map(|result| format!(
+                "  {} ({}): {}: {}",
+                result.scenario_id,
+                result.extension_id,
+                result.status,
+                result.error.as_deref().unwrap_or("missing error detail")
             ))
             .collect::<Vec<_>>()
             .join("\n")

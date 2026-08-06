@@ -14,9 +14,29 @@
 //! ```bash
 //! cargo test --test ci_artifact_retention -- --nocapture
 //! ```
+//!
+//! Regenerate the tracked summary explicitly with:
+//! ```bash
+//! PI_GENERATE_ARTIFACT_RETENTION_REPORT=1 \
+//!   cargo test --test ci_artifact_retention artifact_retention_summary_report -- --exact --nocapture
+//! ```
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
+
+const GENERATE_ARTIFACT_RETENTION_REPORT_ENV: &str = "PI_GENERATE_ARTIFACT_RETENTION_REPORT";
+
+fn artifact_retention_report_generation_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn artifact_retention_report_generation_requested() -> bool {
+    artifact_retention_report_generation_enabled(
+        std::env::var(GENERATE_ARTIFACT_RETENTION_REPORT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -394,6 +414,17 @@ fn provider_test_infrastructure_produces_structured_output() {
     eprintln!("[OK] Provider test infrastructure produces structured output");
 }
 
+#[test]
+fn artifact_retention_report_generation_requires_exact_one() {
+    assert!(!artifact_retention_report_generation_enabled(None));
+    assert!(!artifact_retention_report_generation_enabled(Some("")));
+    assert!(!artifact_retention_report_generation_enabled(Some("0")));
+    assert!(!artifact_retention_report_generation_enabled(Some("true")));
+    assert!(!artifact_retention_report_generation_enabled(Some(" 1")));
+    assert!(!artifact_retention_report_generation_enabled(Some("1 ")));
+    assert!(artifact_retention_report_generation_enabled(Some("1")));
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Summary: Comprehensive artifact retention report
 // ═══════════════════════════════════════════════════════════════════════
@@ -402,7 +433,6 @@ fn provider_test_infrastructure_produces_structured_output() {
 fn artifact_retention_summary_report() {
     let root = repo_root();
     let report_dir = root.join("tests/full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
 
     let ci_path = root.join(".github/workflows/ci.yml");
     let ci_content = load_text(&ci_path).unwrap_or_default();
@@ -457,16 +487,27 @@ fn artifact_retention_summary_report() {
     });
 
     let report_path = report_dir.join("artifact_retention_report.json");
-    let _ = std::fs::write(
-        &report_path,
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
-    );
+    let report_json =
+        serde_json::to_string_pretty(&report).expect("serialize artifact retention report");
+    let generate = artifact_retention_report_generation_requested();
+    if generate {
+        std::fs::create_dir_all(&report_dir).expect("create artifact retention report directory");
+        std::fs::write(&report_path, report_json).expect("write artifact retention report");
+    } else {
+        eprintln!(
+            "  Report not written; set {GENERATE_ARTIFACT_RETENTION_REPORT_ENV}=1 to regenerate the tracked artifact"
+        );
+    }
 
     eprintln!("\n=== Artifact Retention Report ===");
     eprintln!("  Upload steps: {upload_count}");
     eprintln!("  Explicit 30d retention: {retention_30d}");
     eprintln!("  Test path references: {total_paths}");
-    eprintln!("  Report: {}", report_path.display());
+    eprintln!(
+        "  Report: {} ({})",
+        report_path.display(),
+        if generate { "generated" } else { "not written" }
+    );
     eprintln!();
 
     assert!(

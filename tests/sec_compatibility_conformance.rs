@@ -15,6 +15,9 @@
 //!
 //! Run:
 //!   cargo test --test sec_compatibility_conformance -- --nocapture
+//!
+//! Regenerate the tracked verdict explicitly with:
+//!   PI_GENERATE_SEC_CONFORMANCE_VERDICT=1 cargo test --test sec_compatibility_conformance generate_sec_conformance_verdict -- --exact --nocapture
 
 mod common;
 
@@ -26,11 +29,25 @@ use pi::extensions::{
 };
 use std::collections::BTreeMap;
 
+const GENERATE_SEC_CONFORMANCE_VERDICT_ENV: &str = "PI_GENERATE_SEC_CONFORMANCE_VERDICT";
+
+fn sec_conformance_verdict_generation_enabled(raw: Option<&str>) -> bool {
+    raw == Some("1")
+}
+
+fn sec_conformance_verdict_generation_requested() -> bool {
+    sec_conformance_verdict_generation_enabled(
+        std::env::var(GENERATE_SEC_CONFORMANCE_VERDICT_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
 // ============================================================================
 // Conformance verdict artifact infrastructure
 // ============================================================================
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct ConformanceCheck {
     id: String,
     category: String,
@@ -41,7 +58,7 @@ struct ConformanceCheck {
     detail: Option<String>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct SecConformanceVerdict {
     schema: String,
     generated_at: String,
@@ -57,15 +74,15 @@ struct SecConformanceVerdict {
     categories: BTreeMap<String, CategorySummary>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct CategorySummary {
     pass: usize,
     fail: usize,
     skip: usize,
 }
 
-/// Collect all conformance check results and write the verdict artifact.
-fn write_verdict(checks: &[ConformanceCheck]) {
+/// Collect all conformance check results into a verdict payload.
+fn build_verdict(checks: &[ConformanceCheck], generated_at: String) -> SecConformanceVerdict {
     let pass_count = checks.iter().filter(|c| c.status == "pass").count();
     let fail_count = checks.iter().filter(|c| c.status == "fail").count();
     let skip_count = checks.iter().filter(|c| c.status == "skip").count();
@@ -101,7 +118,7 @@ fn write_verdict(checks: &[ConformanceCheck]) {
 
     let report = SecConformanceVerdict {
         schema: "pi.sec.compatibility_conformance.v1".to_string(),
-        generated_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        generated_at,
         bead: "bd-1a2cu".to_string(),
         verdict: verdict.to_string(),
         pass_count,
@@ -114,13 +131,64 @@ fn write_verdict(checks: &[ConformanceCheck]) {
         categories,
     };
 
+    report
+}
+
+fn validate_verdict_payload(report: &SecConformanceVerdict, checks: &[ConformanceCheck]) -> String {
+    assert_eq!(report.schema, "pi.sec.compatibility_conformance.v1");
+    assert!(!report.generated_at.is_empty(), "generated_at must be set");
+    assert_eq!(report.bead, "bd-1a2cu");
+    assert_eq!(report.total, checks.len());
+    assert_eq!(
+        report.pass_count + report.fail_count + report.skip_count,
+        report.total,
+        "verdict counters must partition all checks"
+    );
+    assert_eq!(report.checks, checks);
+
+    let category_total: usize = report
+        .categories
+        .values()
+        .map(|summary| summary.pass + summary.fail + summary.skip)
+        .sum();
+    assert_eq!(
+        category_total, report.total,
+        "category counters must partition all checks"
+    );
+
+    let payload =
+        serde_json::to_string_pretty(report).expect("serialize SEC conformance verdict payload");
+    assert!(
+        !payload.trim().is_empty(),
+        "SEC conformance verdict payload must be non-empty"
+    );
+    let roundtripped: SecConformanceVerdict =
+        serde_json::from_str(&payload).expect("parse serialized SEC conformance verdict payload");
+    assert_eq!(roundtripped, *report, "SEC verdict payload roundtrip");
+    payload
+}
+
+fn maybe_write_verdict(payload: &str) {
+    if !sec_conformance_verdict_generation_requested() {
+        eprintln!(
+            "SEC conformance verdict validated in memory; set \
+             {GENERATE_SEC_CONFORMANCE_VERDICT_ENV}=1 to write tracked evidence"
+        );
+        return;
+    }
+
     let out_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&out_dir);
-    let _ = std::fs::write(
-        out_dir.join("sec_conformance_verdict.json"),
-        serde_json::to_string_pretty(&report).unwrap_or_default(),
+    std::fs::create_dir_all(&out_dir).expect("create SEC conformance verdict directory");
+    let path = out_dir.join("sec_conformance_verdict.json");
+    std::fs::write(&path, payload.as_bytes()).expect("write SEC conformance verdict artifact");
+    let metadata = std::fs::metadata(&path).expect("stat generated SEC conformance verdict");
+    assert!(metadata.is_file(), "SEC conformance verdict is not a file");
+    assert_eq!(
+        metadata.len(),
+        u64::try_from(payload.len()).expect("SEC conformance verdict length fits u64"),
+        "generated SEC conformance verdict length mismatch"
     );
 }
 
@@ -1008,9 +1076,9 @@ fn generate_sec_conformance_verdict() {
 
     // Category 7: Serde roundtrip for profiles
     for (pname, profile) in all_profiles() {
-        let json_str = serde_json::to_string(&profile).unwrap_or_default();
+        let json_str = serde_json::to_string(&profile).expect("serialize policy profile");
         let restored: Result<PolicyProfile, _> = serde_json::from_str(&json_str);
-        let status = if restored.is_ok() && restored.unwrap() == profile {
+        let status = if restored.as_ref().is_ok_and(|value| *value == profile) {
             "pass"
         } else {
             "fail"
@@ -1025,8 +1093,14 @@ fn generate_sec_conformance_verdict() {
         });
     }
 
-    // Write verdict artifact
-    write_verdict(&checks);
+    // Build and validate the exact serialized verdict on every run. Writing
+    // tracked evidence remains an explicit maintainer operation.
+    let report = build_verdict(
+        &checks,
+        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    );
+    let payload = validate_verdict_payload(&report, &checks);
+    maybe_write_verdict(&payload);
 
     // Assert that verdict passes (informational — individual tests above are
     // the real gates)
@@ -1049,4 +1123,15 @@ fn generate_sec_conformance_verdict() {
         };
         eprintln!("  [{icon}] {}: {}", check.id, check.description);
     }
+}
+
+#[test]
+fn sec_conformance_verdict_generation_requires_exact_one() {
+    assert!(!sec_conformance_verdict_generation_enabled(None));
+    assert!(!sec_conformance_verdict_generation_enabled(Some("")));
+    assert!(!sec_conformance_verdict_generation_enabled(Some("0")));
+    assert!(!sec_conformance_verdict_generation_enabled(Some("true")));
+    assert!(!sec_conformance_verdict_generation_enabled(Some(" 1")));
+    assert!(!sec_conformance_verdict_generation_enabled(Some("1 ")));
+    assert!(sec_conformance_verdict_generation_enabled(Some("1")));
 }

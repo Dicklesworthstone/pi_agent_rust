@@ -31,6 +31,34 @@ const CANONICAL_223_FAILURE_TRIO: [&str; 3] = [
     "npm/aliou-pi-synthetic",
     "npm/pi-package-test",
 ];
+const GENERATE_QA_CERTIFICATION_DOSSIER_ENV: &str = "PI_GENERATE_QA_CERTIFICATION_DOSSIER";
+
+fn qa_certification_dossier_generation_requested() -> bool {
+    let raw = std::env::var(GENERATE_QA_CERTIFICATION_DOSSIER_ENV).ok();
+    qa_certification_dossier_generation_requested_from(raw.as_deref())
+}
+
+fn qa_certification_dossier_generation_requested_from(raw: Option<&str>) -> bool {
+    matches!(raw, Some("1"))
+}
+
+fn write_non_empty_certification_artifact(path: &Path, contents: &str) {
+    assert!(
+        !contents.trim().is_empty(),
+        "refusing to emit empty certification artifact {}",
+        path.display()
+    );
+    std::fs::write(path, contents)
+        .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
+    let size = std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("failed to stat {}: {err}", path.display()))
+        .len();
+    assert!(
+        size > 0,
+        "certification artifact is empty: {}",
+        path.display()
+    );
+}
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1039,7 +1067,15 @@ fn certification_dossier() {
 
     let root = repo_root();
     let report_dir = root.join("tests").join("full_suite_gate");
-    let _ = std::fs::create_dir_all(&report_dir);
+    let generate = qa_certification_dossier_generation_requested();
+    if generate {
+        std::fs::create_dir_all(&report_dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create certification report directory {}: {err}",
+                report_dir.display()
+            )
+        });
+    }
 
     eprintln!("\n=== QA Certification Dossier (bd-1f42.8.10) ===\n");
 
@@ -1412,9 +1448,16 @@ fn certification_dossier() {
     };
 
     // ── Write artifacts ──
-    let dossier_json = serde_json::to_string_pretty(&dossier).unwrap_or_default();
+    let dossier_json =
+        serde_json::to_string_pretty(&dossier).expect("certification dossier must serialize");
+    assert!(
+        !dossier_json.trim().is_empty(),
+        "certification dossier JSON must be non-empty"
+    );
     let dossier_path = report_dir.join("certification_dossier.json");
-    let _ = std::fs::write(&dossier_path, &dossier_json);
+    if generate {
+        write_non_empty_certification_artifact(&dossier_path, &dossier_json);
+    }
     let dossier_value: Value =
         serde_json::from_str(&dossier_json).expect("dossier must be valid JSON");
 
@@ -1428,14 +1471,32 @@ fn certification_dossier() {
         &dossier.generated_at,
     );
 
-    let remediation_backlog_json =
-        serde_json::to_string_pretty(&remediation_backlog).unwrap_or_default();
+    let remediation_backlog_json = serde_json::to_string_pretty(&remediation_backlog)
+        .expect("extension remediation backlog must serialize");
+    assert!(
+        !remediation_backlog_json.trim().is_empty(),
+        "extension remediation backlog JSON must be non-empty"
+    );
     let remediation_backlog_path = report_dir.join("extension_remediation_backlog.json");
-    let _ = std::fs::write(&remediation_backlog_path, &remediation_backlog_json);
+    if generate {
+        write_non_empty_certification_artifact(
+            &remediation_backlog_path,
+            &remediation_backlog_json,
+        );
+    }
 
     let remediation_backlog_md = render_extension_remediation_backlog_md(&remediation_backlog);
+    assert!(
+        !remediation_backlog_md.trim().is_empty(),
+        "extension remediation backlog markdown must be non-empty"
+    );
     let remediation_backlog_md_path = report_dir.join("extension_remediation_backlog.md");
-    let _ = std::fs::write(&remediation_backlog_md_path, &remediation_backlog_md);
+    if generate {
+        write_non_empty_certification_artifact(
+            &remediation_backlog_md_path,
+            &remediation_backlog_md,
+        );
+    }
 
     // ── Write markdown summary ──
     let mut md = String::new();
@@ -1596,19 +1657,31 @@ fn certification_dossier() {
     );
 
     let md_path = report_dir.join("certification_dossier.md");
-    let _ = std::fs::write(&md_path, &md);
+    assert!(
+        !md.trim().is_empty(),
+        "certification dossier markdown must be non-empty"
+    );
+    if generate {
+        write_non_empty_certification_artifact(&md_path, &md);
+    }
 
     eprintln!("\n  Verdict: {}", dossier.verdict.to_uppercase());
-    eprintln!("  JSON: {}", dossier_path.display());
-    eprintln!("  Markdown: {}", md_path.display());
-    eprintln!(
-        "  Extension remediation backlog JSON: {}",
-        remediation_backlog_path.display()
-    );
-    eprintln!(
-        "  Extension remediation backlog Markdown: {}",
-        remediation_backlog_md_path.display()
-    );
+    if generate {
+        eprintln!("  JSON: {}", dossier_path.display());
+        eprintln!("  Markdown: {}", md_path.display());
+        eprintln!(
+            "  Extension remediation backlog JSON: {}",
+            remediation_backlog_path.display()
+        );
+        eprintln!(
+            "  Extension remediation backlog Markdown: {}",
+            remediation_backlog_md_path.display()
+        );
+    } else {
+        eprintln!(
+            "  Artifacts validated in memory; set {GENERATE_QA_CERTIFICATION_DOSSIER_ENV}=1 to write tracked reports"
+        );
+    }
     eprintln!();
 
     // ── Assertions ──
@@ -1709,6 +1782,19 @@ fn certification_dossier() {
         assert_eq!(
             readiness_decision, "NO_DECISION",
             "missing opportunity matrix must remain fail-closed (NO_DECISION)"
+        );
+    }
+}
+
+#[test]
+fn certification_dossier_generation_requires_exact_one() {
+    assert!(qa_certification_dossier_generation_requested_from(Some(
+        "1"
+    )));
+    for raw in [None, Some(""), Some("0"), Some("true"), Some(" 1 ")] {
+        assert!(
+            !qa_certification_dossier_generation_requested_from(raw),
+            "unexpected generation request for {raw:?}"
         );
     }
 }

@@ -5234,7 +5234,7 @@ fn pijs_workload_admission_requires_exact_quickjs_perf_contract() {
         (
             "binary_sha256",
             json!("not-a-digest"),
-            "binary_sha256 must be a 64-character hexadecimal string",
+            "binary_sha256 must be lowercase SHA-256",
         ),
         (
             "allocator_effective",
