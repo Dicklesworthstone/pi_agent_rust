@@ -126,7 +126,10 @@ struct WindowsArtifactDirectoryGuard {
 }
 
 #[cfg(windows)]
-fn validate_windows_directory_metadata(path: &Path, metadata: &fs::Metadata) -> std::io::Result<()> {
+fn validate_windows_directory_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> std::io::Result<()> {
     use std::os::windows::fs::MetadataExt as _;
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
@@ -376,12 +379,12 @@ fn open_nofollow(
 
 fn open_regular_file_for_read(path: &Path) -> Result<Option<File>> {
     #[cfg(windows)]
-    let (operation_path, parent_guards) =
-        match open_or_create_windows_artifact_parent(path, false) {
-            Ok(context) => context,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(Error::Io(Box::new(error))),
-        };
+    let (operation_path, parent_guards) = match open_or_create_windows_artifact_parent(path, false)
+    {
+        Ok(context) => context,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(Error::Io(Box::new(error))),
+    };
     #[cfg(windows)]
     let path = operation_path.as_path();
     let initial_metadata = match fs::symlink_metadata(path) {
@@ -522,8 +525,7 @@ fn open_regular_file_for_write(
     write_mode: ArtifactWriteMode,
 ) -> Result<File> {
     #[cfg(windows)]
-    let (operation_path, parent_guards) =
-        open_or_create_windows_artifact_parent(path, create)?;
+    let (operation_path, parent_guards) = open_or_create_windows_artifact_parent(path, create)?;
     #[cfg(windows)]
     let path = operation_path.as_path();
     let initial_metadata = match fs::symlink_metadata(path) {
@@ -809,10 +811,7 @@ fn read_private_directory(path: &Path) -> std::io::Result<PrivateReadDir> {
 #[cfg(all(
     unix,
     not(target_os = "redox"),
-    any(
-        test,
-        not(any(target_os = "linux", target_vendor = "apple"))
-    )
+    any(test, not(any(target_os = "linux", target_vendor = "apple")))
 ))]
 fn publish_regular_file_via_hard_link_no_replace(
     source_directory: &File,
@@ -833,12 +832,8 @@ fn publish_regular_file_via_hard_link_no_replace(
     )
     .map_err(std::io::Error::from)?;
     target_directory.sync_all()?;
-    rustix::fs::unlinkat(
-        source_directory,
-        source_name,
-        rustix::fs::AtFlags::empty(),
-    )
-    .map_err(std::io::Error::from)?;
+    rustix::fs::unlinkat(source_directory, source_name, rustix::fs::AtFlags::empty())
+        .map_err(std::io::Error::from)?;
     source_directory.sync_all()?;
     Ok(())
 }
@@ -5234,6 +5229,97 @@ mod proptests {
             .sync_all()
             .expect("sync existing file");
         assert_eq!(fs::read(&path).expect("read existing file"), b"seed\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn no_replace_publication_rejects_target_created_at_publish_boundary() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        drop(open_private_directory(tmp.path(), true).expect("privatize tempdir"));
+        let source = tmp.path().join("source.tmp");
+        let target = tmp.path().join("immutable.json");
+        let mut source_file =
+            open_regular_file_for_write(&source, true, ArtifactWriteMode::CreateNew)
+                .expect("create source artifact");
+        source_file
+            .write_all(b"source")
+            .expect("write source artifact");
+        source_file.sync_all().expect("sync source artifact");
+        drop(source_file);
+
+        rename_regular_file_no_replace_with(&source, &target, || {
+            fs::write(&target, b"racing publisher")
+        })
+        .expect_err("an atomic no-replace publication must lose to an existing target");
+
+        assert_eq!(
+            fs::read(&target).expect("read winning target"),
+            b"racing publisher"
+        );
+        assert_eq!(fs::read(&source).expect("read retained source"), b"source");
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn hard_link_publication_helper_never_replaces_an_existing_target() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let directory = open_private_directory(tmp.path(), true).expect("privatize tempdir");
+        let source = tmp.path().join("source.tmp");
+        let target = tmp.path().join("immutable.json");
+        for (path, bytes) in [
+            (&source, b"source".as_slice()),
+            (&target, b"target".as_slice()),
+        ] {
+            let mut file = open_regular_file_for_write(path, true, ArtifactWriteMode::CreateNew)
+                .expect("create private publication artifact");
+            file.write_all(bytes).expect("write publication artifact");
+            file.sync_all().expect("sync publication artifact");
+        }
+
+        let error = publish_regular_file_via_hard_link_no_replace(
+            &directory,
+            source.file_name().expect("source name"),
+            &directory,
+            target.file_name().expect("target name"),
+        )
+        .expect_err("hard-link publication must reject an occupied target name");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&source).expect("read source"), b"source");
+        assert_eq!(fs::read(&target).expect("read target"), b"target");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_artifact_handles_pin_parent_components_and_final_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let parent = tmp.path().join("store").join("segments");
+        drop(open_private_directory(&parent, true).expect("create pinned parent"));
+        let artifact = parent.join("0000000000000001.seg");
+        let mut created =
+            open_regular_file_for_write(&artifact, true, ArtifactWriteMode::CreateNew)
+                .expect("create private artifact");
+        created.write_all(b"frame\n").expect("write artifact");
+        created.sync_all().expect("sync artifact");
+        drop(created);
+
+        let (_operation_path, parent_guards) =
+            open_or_create_windows_artifact_parent(&artifact, false)
+                .expect("pin artifact parent components");
+        assert!(!parent_guards.is_empty());
+        let moved_parent = tmp.path().join("moved-segments");
+        fs::rename(&parent, &moved_parent)
+            .expect_err("a pinned directory component must reject replacement");
+
+        let artifact_handle = open_regular_file_for_read(&artifact)
+            .expect("open pinned artifact")
+            .expect("artifact exists");
+        let moved_artifact = parent.join("moved.seg");
+        fs::rename(&artifact, &moved_artifact)
+            .expect_err("a final artifact opened without FILE_SHARE_DELETE must reject rename");
+        assert_eq!(
+            artifact_handle.metadata().expect("opened metadata").len(),
+            6
+        );
     }
 
     #[test]
